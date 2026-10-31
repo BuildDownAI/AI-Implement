@@ -18,7 +18,7 @@ import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
-import { VARIANTS, callService, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
@@ -126,6 +126,8 @@ const authorizationTools = restate.service({
 // A counting stand-in for the SelfDeploy object that start_deploy and get_deploy_posture address.
 let selfDeployStarts = 0;
 let selfDeployStatusThrows = false;
+let selfDeployRecord: SelfDeployRecord | null = null;
+let applyGate = gate("apply");
 const stubDeployRecord: SelfDeployRecord = {
   deployId: "deploy-1", phase: "draining", target: { repo: "owner/repo", branch: "testing", commit: "a".repeat(40), image: "registry.fly.io/img:testing-aaaaaaa", source: "published" },
   requestedBy: "cp", startedAt: 1, finishedAt: null, reason: null,
@@ -133,13 +135,14 @@ const stubDeployRecord: SelfDeployRecord = {
 const selfDeployStub = restate.object({
   name: "SelfDeploy",
   handlers: {
+    apply: async (ctx: restate.ObjectContext) => { await ctx.run("blocked apply", () => applyGate.wait()); },
     start: async (_ctx: restate.ObjectContext, _input: unknown): Promise<SelfDeployStartResult> => {
       selfDeployStarts++;
       return { deployId: stubDeployRecord.deployId, commit: stubDeployRecord.target.commit, image: stubDeployRecord.target.image, alreadyActive: false };
     },
     status: restate.handlers.object.shared(async (_ctx: restate.ObjectSharedContext): Promise<SelfDeployStatus> => {
       if (selfDeployStatusThrows) throw new restate.TerminalError("unavailable");
-      return { deploy: stubDeployRecord, options: { applyFlyToml: false } };
+      return { deploy: selfDeployRecord, options: { applyFlyToml: false } };
     }),
   },
 });
@@ -239,8 +242,45 @@ describe("orchestratorTools (Restate)", () => {
     expect(selfDeployStarts).toBe(before + 1);
   });
 
+  it.each(VARIANTS.map(([label]) => label))("start_deploy answers while exclusive apply is blocked without queueing start (%s)", async (label) => {
+    const env = environments.get(label)!;
+    selfDeployRecord = { ...stubDeployRecord, phase: "applying" };
+    applyGate = gate("exclusive apply");
+    const before = selfDeployStarts;
+    const starts = () => queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'SelfDeploy' AND target_handler_name = 'start'");
+    const previous = (await starts()).map(row => row.id);
+    const applying = callObject(env.baseUrl(), "SelfDeploy", process.env.FLY_APP_NAME ?? "orchestrator", "apply", {});
+    let pending: Promise<ToolCallResult> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await applyGate.reached();
+      pending = callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", {
+        caller: serviceCaller({ grants: ["deploy"] }), args: { branch: "main", requestedBy: "cp" },
+      });
+      const result = await Promise.race([pending, new Promise<never>((_, reject) => {
+        // restate-test-allow: enforce the one-second response deadline while apply stays blocked, not a sleep.
+        timer = setTimeout(() => reject(new Error("start_deploy did not return within one second")), 1_000);
+      })]);
+      expect(JSON.parse(result.content![0]!.text)).toEqual({
+        deployId: stubDeployRecord.deployId, commit: stubDeployRecord.target.commit,
+        image: stubDeployRecord.target.image, alreadyActive: true,
+      });
+      expect((await starts()).map(row => row.id)).toEqual(previous);
+      expect(selfDeployStarts).toBe(before);
+    } finally {
+      clearTimeout(timer);
+      applyGate.release();
+      await applying;
+      await pending;
+      selfDeployRecord = null;
+    }
+    expect((await starts()).map(row => row.id)).toEqual(previous);
+    expect(selfDeployStarts).toBe(before);
+  });
+
   it.each(VARIANTS.map(([label]) => label))("get_deploy_posture carries the SelfDeploy record, and null when the object is unreadable (%s)", async (label) => {
     const env = environments.get(label)!;
+    selfDeployRecord = stubDeployRecord;
     const read = async () => JSON.parse((await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_deploy_posture", { caller: serviceCaller(), args: {} })).content![0]!.text);
     expect((await read()).selfDeploy).toEqual(stubDeployRecord);
     selfDeployStatusThrows = true;
@@ -248,7 +288,7 @@ describe("orchestratorTools (Restate)", () => {
       const posture = await read();
       expect(posture.selfDeploy).toBeNull();
       expect(posture).toHaveProperty("deploy");
-    } finally { selfDeployStatusThrows = false; }
+    } finally { selfDeployStatusThrows = false; selfDeployRecord = null; }
   });
 
   it.each(VARIANTS.map(([label]) => label))("deploy grants cannot reach any registered admin tool (%s)", async (label) => {

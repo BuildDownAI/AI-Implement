@@ -47,7 +47,7 @@ import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.j
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
-import type { SelfDeployDefinition, SelfDeployRecord } from "./self-deploy.js";
+import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
   setRunnerModeAction,
   pauseProjectAction,
@@ -653,7 +653,7 @@ export const getDeployPostureTool = tool(
 );
 
 export const START_DEPLOY_DESCRIPTION =
-  "Start a self-deploy of this orchestrator to the published build of the head of `branch` (testing | main) (admin role, or the control plane's deploy-scoped token). Args: branch, requestedBy (1..200 characters). Returns { deployId, commit, image, alreadyActive }; a second start that reaches the handler while a deploy is active returns the same deployId with alreadyActive true. A refusal is one fixed code as the error text: image-not-published, head-unknown or not-configured. Progress is get_deploy_posture's selfDeploy record.";
+  "Start a self-deploy of this orchestrator to the published build of the head of `branch` (testing | main) (admin role, or the control plane's deploy-scoped token). Args: branch, requestedBy (1..200 characters). Returns { deployId, commit, image, alreadyActive }. Shared SelfDeploy.status is read first: during draining, applying or verifying, returns the active deploy immediately with alreadyActive true without calling SelfDeploy.start. Otherwise calls SelfDeploy.start, which retains its alreadyActive race check. A refusal is one fixed code as the error text: image-not-published, head-unknown or not-configured. Progress is get_deploy_posture's selfDeploy record.";
 
 /** The SelfDeploy object key: the same fallback as createSelfDeployIngressClient, so the tool and the admin routes address one object. */
 const selfDeployKey = (): string => process.env.FLY_APP_NAME ?? "orchestrator";
@@ -671,7 +671,14 @@ export const startDeployTool = tool(
     auditDetail: (input) => `branch=${input.args.branch}`,
   },
   async (ctx, input): Promise<ToolResponse> => {
-    const result = await ctx.objectClient(SelfDeploy, selfDeployKey()).start(input.args);
+    const client = ctx.objectClient(SelfDeploy, selfDeployKey());
+    // Shared status stays available while exclusive apply holds the object.
+    const { deploy } = await client.status();
+    if (isActiveSelfDeploy(deploy)) {
+      const result = { deployId: deploy.deployId, commit: deploy.target.commit, image: deploy.target.image, alreadyActive: true };
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
+    const result = await client.start(input.args);
     if ("reason" in result) return toolError(result.reason);
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   },
