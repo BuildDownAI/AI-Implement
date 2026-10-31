@@ -1,6 +1,7 @@
 // Unit tests for the review-fix Restate ingress client (src/restate/review-fix-client.ts).
 // No Docker, no live Restate server: the client runs against a faked fetch.
 import { describe, expect, it } from "vitest";
+import { toRecordedUsage } from "../agent-usage.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createReviewFixIngressClient, reviewFixResultForwardKey } from "../restate/review-fix-client.js";
@@ -127,6 +128,22 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
       expect(calls).toHaveLength(1);
       expect(calls[0]!.url.href).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
       expect(calls[0]!.headers.get("idempotency-key")).toBe("att-1.result.k");
+    });
+
+    it("contract: ReviewFixAttempt.report", async () => {
+      // The result handler passes this usage separately from validated metadata to
+      // acceptOwnedRunReport(ctx, "report", ...); the producer must preserve both.
+      const body = { ...result, usage: toRecordedUsage({ invocations: [], pushedCommits: ["a".repeat(40)] }) };
+      const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/result": { json: stored } });
+      expect(await ingressFor(fake).result("att-1", body, { idempotencyKey: "usage-key" }))
+        .toEqual({ status: "accepted", outcome: stored });
+      expect(fake.calls).toHaveLength(1);
+      expect(fake.calls[0]!.url.href).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
+      const sent = JSON.parse(fake.calls[0]!.body);
+      expect(sent).toEqual(body);
+      expect(validateReviewFixResultMetadata(sent)).toEqual({ ok: true, value: result });
+      expect(sent.usage).toEqual(body.usage);
+      expect(fake.calls[0]!.headers.get("idempotency-key")).toBe("usage-key");
     });
 
     it("maps 409 to conflict, 404 to not-found, and other failures to unavailable", async () => {
