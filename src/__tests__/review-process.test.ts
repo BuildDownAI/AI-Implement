@@ -221,6 +221,25 @@ describe("Codex Code Review", () => {
       expect(read(comments).verdict).toBe("changes_requested");
     }
   });
+  it.each([
+    [false, HEAD, "approve"], [false, "old", "approve"],
+    [true, HEAD, "changes_requested"], [true, "old", "changes_requested"],
+  ] as const)("uses thread openness=%s across commit %s", (threadOpen, commitId, verdict) => {
+    const inlineComments = [
+      comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(1), commitId, threadOpen }),
+      comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(2), threadOpen: true }),
+    ];
+    expect(codex.readVerdict(input({ issueComments: [stateComment("completed", true)], inlineComments })).verdict).toBe(verdict);
+  });
+  it("approves successfully read empty or all-closed threads, but falls back on partial state", () => {
+    const read = (inlineComments: ReviewVerdictInput["inlineComments"], inlineCommentThreadsRead = true) =>
+      codex.readVerdict(input({ issueComments: [stateComment("completed", true)], inlineComments, inlineCommentThreadsRead }));
+    expect(read([]).verdict).toBe("approve");
+    const p1 = comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(1) });
+    expect(read([{ ...p1, threadOpen: false }]).verdict).toBe("approve");
+    expect(read([p1]).verdict).toBe("changes_requested");
+    expect(read([], false).verdict).toBe("changes_requested");
+  });
   it("includes only trusted badge findings on the exact head", () => {
     const comments = [0, 1, 2].map((p) => comment({ authorLogin: "chatgpt-codex-connector[bot]", body: codexBadge(p) }));
     const result = codex.readVerdict(input({ issueComments: [stateComment("completed", true)], inlineComments: [

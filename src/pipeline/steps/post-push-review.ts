@@ -863,10 +863,19 @@ function readProcessVerdict(
     }
   }
 
+  const closedUrls = opts.process.id === "codex-code-review"
+    ? collectClosedReviewThreadCommentUrls(ghSpawn, prNumber) : undefined;
+  if (closedUrls !== undefined) {
+    for (const comment of inlineComments) {
+      if (comment.url) comment.threadOpen = !closedUrls.has(comment.url);
+    }
+  }
+
   const verdict = opts.process.readVerdict({
     headSha,
     checkRuns: matchedRuns.map((run) => ({ ...run, conclusion: run.conclusion || null })),
     inlineComments,
+    inlineCommentThreadsRead: closedUrls !== undefined,
     issueComments: (issuePayload as unknown[]).flat().map((item) => {
       const c = asRecord(item);
       const user = recordProp(c, "user");

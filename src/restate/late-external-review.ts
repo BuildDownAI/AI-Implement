@@ -360,6 +360,58 @@ async function readInlineComments(token: string, input: { owner: string; repo: s
   return comments;
 }
 
+/** Strict thread snapshot: incomplete pages must never release a blocking finding. */
+async function readCommentThreadState(token: string, input: { owner: string; repo: string; prNumber: number }): Promise<Map<string, boolean>> {
+  const states = new Map<string, boolean>();
+  const cursors = new Set<string>();
+  let after: string | null = null;
+  for (;;) {
+    const res = await fetch("https://api.github.com/graphql", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: `query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
+            reviewThreads(first: 100, after: $after) {
+              nodes { isResolved isOutdated comments(first: 100) { nodes { url } pageInfo { hasNextPage } } }
+              pageInfo { hasNextPage endCursor }
+            }
+          } }
+        }`,
+        variables: { owner: input.owner, repo: input.repo, number: input.prNumber, after },
+      }),
+      signal: defaultFetchSignal(),
+    });
+    const unreadable = () => new Error("late-external-review: review threads unreadable or incomplete");
+    if (!res.ok) throw unreadable();
+    const data = await res.json() as {
+      errors?: unknown[];
+      data?: { repository?: { pullRequest?: { reviewThreads?: {
+        nodes?: Array<{ isResolved?: boolean; isOutdated?: boolean; comments?: {
+          nodes?: Array<{ url?: string }>; pageInfo?: { hasNextPage?: boolean };
+        } }>;
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+      } } } };
+    };
+    const threads = data?.data?.repository?.pullRequest?.reviewThreads;
+    if (data.errors?.length || !Array.isArray(threads?.nodes)
+      || typeof threads.pageInfo?.hasNextPage !== "boolean") throw unreadable();
+    for (const thread of threads.nodes) {
+      if (!thread || typeof thread.isResolved !== "boolean" || typeof thread.isOutdated !== "boolean"
+        || !Array.isArray(thread.comments?.nodes) || thread.comments.pageInfo?.hasNextPage !== false) throw unreadable();
+      for (const comment of thread.comments.nodes) {
+        if (!comment || typeof comment.url !== "string" || !comment.url) throw unreadable();
+        states.set(comment.url, !thread.isResolved && !thread.isOutdated);
+      }
+    }
+    if (!threads.pageInfo.hasNextPage) return states;
+    const cursor = threads.pageInfo.endCursor;
+    if (!cursor || cursors.has(cursor)) throw unreadable();
+    cursors.add(cursor);
+    after = cursor;
+  }
+}
+
 /** Production deps. A fresh installation token per call; it is never journaled. */
 export function createProductionLateExternalReviewDependencies(config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">): LateExternalReviewDependencies {
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
@@ -399,8 +451,15 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       let rejected: HeldReason | undefined;
       if (commentVerdict) {
         const comments = await listPrComments(t, input.owner, input.repo, input.prNumber, { strict: true });
+        const inlineComments = await readInlineComments(t, input);
+        const threads = process.id === "codex-code-review" ? await readCommentThreadState(t, input) : undefined;
+        if (threads) {
+          for (const comment of inlineComments) {
+            if (comment.url) comment.threadOpen = threads.get(comment.url);
+          }
+        }
         const { verdict } = process.readVerdict({
-          headSha: pr.headSha, checkRuns: [], inlineComments: await readInlineComments(t, input), blocks: [],
+          headSha: pr.headSha, checkRuns: [], inlineComments, inlineCommentThreadsRead: threads !== undefined, blocks: [],
           issueComments: comments.map((c) => ({
             body: c.body, authorLogin: c.user?.login ?? "", authorType: c.user?.type ?? "",
             updatedAt: c.updatedAt ?? c.createdAt,
