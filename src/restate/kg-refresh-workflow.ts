@@ -16,6 +16,9 @@
  * asynchronously. kg-refresh has one owner, so none of the pilot's admission/selector
  * machinery is needed here — see `docs/adr/032-a-fully-migrated-run-kind-coordinates-through-a-virtual-object.md`.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
+import { isDeepStrictEqual } from "node:util";
+import { recordUsage, type RecordedUsage } from "../agent-usage.js";
 import type { SourceResult } from "../kg-source-results.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
@@ -46,7 +49,7 @@ import { parseKgSourceRepo } from "../deploy.js";
 import type { Step } from "../pipeline/types.js";
 import type { RunConfigV1 } from "../run-config.js";
 import { KG_REFRESH_RUNNER_STEPS, type KgRepoDefinition } from "./kg-refresh-types.js";
-import { readBoundedOwnedRun } from "./owned-run-lifecycle.js";
+import { acceptOwnedRunReport, readBoundedOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 import { restateRetentionMs } from "./retention.js";
 
@@ -136,6 +139,7 @@ export const kgRefreshDecideSchema = z.object({
 export type KgRefreshDecideInput = z.infer<typeof kgRefreshDecideSchema>;
 
 export interface KgRefreshReportBody {
+  usage?: RecordedUsage;
   ok: boolean;
   failureCode?: string;
   failureReason?: string;
@@ -1229,31 +1233,32 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     }
   }
 
-  async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate" }> {
+  // Producer: handleRunnerResult in src/runner-callback.ts (the verify-only runner callback).
+  async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate"; fingerprint?: string }> {
     const body = raw as KgRefreshReportBody;
     await requireStarted(ctx);
-    // Producer: handleRunnerResult in src/runner-callback.ts (the verify-only runner callback).
-    const promise = ctx.promise<KgRefreshReportBody>("report");
-    const existing = await promise.peek();
-    const isDuplicate = existing !== undefined && JSON.stringify(existing) === JSON.stringify(body);
-
     if (await ctx.get<boolean>("completed")) {
-      // A retried callback delivering the same body it already delivered is not an error —
-      // only a body that conflicts with what the run actually consumed is.
-      if (isDuplicate) return { status: "duplicate" };
+      // Retried callbacks remain duplicates, including reordered JSON object keys.
+      const existing = await ctx.promise<KgRefreshReportBody>("report").peek();
+      if (existing !== undefined && isDeepStrictEqual(existing, body)) return { status: "duplicate", fingerprint: ownedRunReportFingerprint(body) };
       throw new restate.TerminalError("kg-refresh report received after run completed", { errorCode: 409 });
     }
-    if (existing !== undefined) {
-      if (!isDuplicate) {
+    // Only original runs dispatch a runner; resumed runs consume the held report instead.
+    const dispatchId = (await ctx.get<string>("triggerId"))!;
+    try {
+      const result = await acceptOwnedRunReport(ctx, "report", body, (value) => value.usage && recordUsage(dispatchId, value.usage));
+      return { ...result, fingerprint: ownedRunReportFingerprint(body) };
+    } catch (err) {
+      // Preserve the KG callback's existing conflict diagnostic; intake owns the decision.
+      if (err instanceof restate.TerminalError && err.code === 409 && err.message === "conflicting owned-run report") {
+        const existing = await ctx.promise<KgRefreshReportBody>("report").peek();
         throw new restate.TerminalError(
           `conflicting report: existing=${JSON.stringify(existing)} incoming=${JSON.stringify(body)}`,
           { errorCode: 409 },
         );
       }
-      return { status: "duplicate" };
+      throw err;
     }
-    await promise.resolve(body);
-    return { status: "accepted" };
   }
 
   async function progress(ctx: WorkflowSharedContext, raw: { step?: Step }): Promise<void> {

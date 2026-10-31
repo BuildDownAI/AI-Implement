@@ -9,13 +9,15 @@
  * `finally` release. Contract: ADR 034 / ADR 035, `docs/restate.md` § "The owned-run wait".
  * No production path calls it yet; a later change supplies the real deps and registers it.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { PLANNING_TTL_SECONDS } from "../runner-tokens.js";
-import { cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "./owned-run-lifecycle.js";
+import { recordUsage, type RecordedUsage } from "../agent-usage.js";
+import { acceptOwnedRunReport, cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun, type OwnedRunReportResult } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 import { restateRetentionMs } from "./retention.js";
 
@@ -405,12 +407,13 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
     }
   }
 
-  async function report(ctx: WorkflowSharedContext): Promise<void> {
+  async function report(ctx: WorkflowSharedContext, body?: { usage?: RecordedUsage }): Promise<OwnedRunReportResult> {
     await requireStarted(ctx);
     // Producer: handleRunnerResult in src/runner-callback.ts, through createPlanningAdmissionTerminationHook.
     // The promise resolves with a body: awaitOwnedRun reads `undefined` as "not resolved".
-    const promise = ctx.promise<{ ok: true }>("report");
-    if ((await promise.peek()) === undefined) await promise.resolve({ ok: true });
+    const result = await acceptOwnedRunReport(ctx, "report", { ok: true, ...(body?.usage ? { usage: body.usage } : {}) },
+      (value) => value.usage && recordUsage(ctx.key, value.usage));
+    return { ...result, fingerprint: ownedRunReportFingerprint(body ?? {}) };
   }
 
   async function status(ctx: WorkflowSharedContext): Promise<PlanningRunStatusResult> {
@@ -429,7 +432,7 @@ export function createPlanningRunWorkflow(deps: PlanningRunDependencies) {
         input: serde.zod(planningRunInputSchema),
         journalRetention: retentionMs,
       }, run),
-      report: restate.handlers.workflow.shared({
+      report: restate.handlers.workflow.shared<OwnedRunReportResult, { usage?: RecordedUsage }>({
         journalRetention: retentionMs,
         idempotencyRetention: retentionMs,
       }, report),

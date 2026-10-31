@@ -4,6 +4,13 @@
 // deadlines), `window` (a short confirm window) and `deadline` (short bootstrap and total deadlines).
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
+import { randomUUID } from "node:crypto";
+import { getDb } from "../../dedup.js";
+import { appendLog, initLogTable } from "../../log.js";
+import { toRecordedUsage } from "../../agent-usage.js";
+import { orchestratorTools } from "../../restate/tools.js";
+import { JobAccountingPageSchema } from "../../job-accounting.js";
+import type { OwnedRunReportResult } from "../../restate/owned-run-lifecycle.js";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { DispatchAdmissionReleaseReason } from "../../dispatch-admission.js";
@@ -18,7 +25,7 @@ import {
   type PlanningRunStatusResult,
 } from "../../restate/planning-run-workflow.js";
 import {
-  VARIANTS, callWorkflow, cancelInvocation, crashAfterFirstCall, eventually, gate, queryInvocations, startVariants, stopAll, waitForStep, type Gate,
+  VARIANTS, callService, callWorkflow, cancelInvocation, crashAfterFirstCall, eventually, gate, queryInvocations, startVariants, stopAll, waitForStep, type Gate,
 } from "./harness.js";
 import { registerOwnedRunContract, type OwnedRunAdapter, type OwnedRunFaults } from "./owned-run-contract.js";
 
@@ -142,6 +149,29 @@ function makeDeps(seams: typeof SLOW): PlanningRunDependencies {
   };
 }
 
+/** Seed the accepted planning selection so the production usage writer must store real rows. */
+function seedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
+  const snapshotId = `snapshot-${dispatchId}`;
+  const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "planning-profile", invocationTimeoutMs: 60_000 };
+  const profile = { id: "planning-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
+  getDb().prepare(`INSERT OR IGNORE INTO run_agent_config_snapshots
+    (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+    VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snapshotId, dispatchId,
+      JSON.stringify({ stages: { planning: selection, implementation: selection, review: selection }, profiles: { planning: profile, implementation: profile, review: profile } }),
+      JSON.stringify(Object.fromEntries(["planning", "implementation", "review"].map((stage) => [stage, Object.fromEntries(Object.keys(selection).map((field) => [field, "project"]))]))),
+      JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }));
+  return toRecordedUsage({ invocations: items.map((item) => ({ attribution: {
+    version: 1, invocationId: `${dispatchId}-inv-${item}`, snapshotId, stage: "planning",
+    agent: selection.agent, provider: selection.provider, model: selection.model,
+    profileId: profile.id, authMode: profile.authMode, limit: null, outcome: "success",
+    usage: { availability: "complete", tokensIn: tokens, tokensOut: 2, costUsd: cost, costStatus: "reported" },
+  } })) });
+}
+
+const storedRows = (dispatchId: string) => getDb().prepare(
+  "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
+).all(dispatchId);
+
 describe("PlanningRun durable workflow", () => {
   let slow: Map<string, RestateEnvironment>;
   let window: Map<string, RestateEnvironment>;
@@ -149,8 +179,10 @@ describe("PlanningRun durable workflow", () => {
   let counter = 0;
 
   beforeAll(async () => {
+    getDb();
+    initLogTable();
     [slow, window, deadline] = await Promise.all([
-      startVariants([createPlanningRunWorkflow(makeDeps(SLOW))]),
+      startVariants([createPlanningRunWorkflow(makeDeps(SLOW)), orchestratorTools]),
       startVariants([createPlanningRunWorkflow(makeDeps(WINDOW))]),
       startVariants([createPlanningRunWorkflow(makeDeps(DEADLINE))]),
     ]);
@@ -169,8 +201,7 @@ describe("PlanningRun durable workflow", () => {
   }
 
   /** Registers a scenario and starts `PlanningRun.run`; `done` settles with the run's result. */
-  function begin(envs: Map<string, RestateEnvironment>, label: string, overrides: Partial<Scenario> = {}) {
-    const dispatchId = `planning-${label}-${counter++}`;
+  function begin(envs: Map<string, RestateEnvironment>, label: string, overrides: Partial<Scenario> = {}, dispatchId = `planning-${label}-${counter++}`) {
     const sc: Scenario = {
       launchResult: { outcome: "accepted", jobId: `job-${dispatchId}` },
       runId: `job-${dispatchId}`,
@@ -187,9 +218,43 @@ describe("PlanningRun durable workflow", () => {
     // A scenario that expects `run` to fail reads `done` itself; keep the early rejection from being unhandled.
     done.catch(() => undefined);
     const read = () => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", dispatchId, "status");
-    const report = () => callWorkflow(url, "PlanningRun", dispatchId, "report");
+    const report = (usage?: ReturnType<typeof seedUsage>) => callWorkflow<OwnedRunReportResult>(url, "PlanningRun", dispatchId, "report", usage ? { usage } : undefined);
     return { dispatchId, sc, done, read, report };
   }
+
+  it.each(labels)("stores each invocation once and serves its job accounting (%s)", async (label) => {
+    const w = begin(slow, label, {}, randomUUID());
+    await waitForStep(w.read, "wait");
+    const id = appendLog({ dispatchId: w.dispatchId, issueId: "usage-issue", phase: "planning" });
+    const usage = seedUsage(w.dispatchId);
+    w.sc.status = "ended";
+    expect(await w.report(usage)).toMatchObject({ status: "accepted" });
+    const first = storedRows(w.dispatchId);
+    expect(first).toHaveLength(2);
+    expect(await w.report(usage)).toMatchObject({ status: "duplicate" });
+    expect(storedRows(w.dispatchId)).toEqual(first);
+    w.sc.status = "ended";
+    await w.done;
+    getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(Date.now(), id);
+    const result = await callService<{ content: Array<{ text: string }> }>(
+      baseUrl(slow, label), "orchestratorTools", "list_job_accounting",
+      { caller: { kind: "service", email: null, role: "user" }, args: { includeUnsettled: true } },
+    );
+    const page = JobAccountingPageSchema.parse(JSON.parse(result.content[0].text));
+    const job = page.records.find((r) => r.dispatchId === w.dispatchId);
+    expect(job).toBeDefined();
+    expect(job?.invocations).toHaveLength(2);
+  });
+
+  it.each(labels)("accepts an empty HTTP report body (%s)", async (label) => {
+    const w = begin(slow, label);
+    await waitForStep(w.read, "wait");
+    const response = await fetch(`${baseUrl(slow, label)}/PlanningRun/${w.dispatchId}/report`, { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "accepted" });
+    w.sc.status = "ended";
+    await w.done;
+  });
 
   /** Waits for the first tick to be parked, then until the wall clock is past `afterMs` from it. */
   async function pastDeadlineAtTick(sc: Scenario, afterMs: number, label: string): Promise<void> {
@@ -495,6 +560,7 @@ describe("PlanningRun durable workflow", () => {
         launchImpl: faults.crashAfterLaunch ? crashAfterFirstCall(launch) : launch,
       };
       scenarios.set(key, sc);
+      seedUsage(key, 12, 1, [1]);
       // A short total deadline needs the seam set built for it; the others hold the run until `finish`.
       const envs = totalMs <= 5_000 ? deadline : slow;
       const input: PlanningRunInput = { dispatchId: key, teamKey: "ENG", issueId: `issue-${key}`, issueIdentifier: "ENG-1", planningContext: {}, backend: "github-actions" };
@@ -503,6 +569,14 @@ describe("PlanningRun durable workflow", () => {
       return {
         runId,
         done,
+        report: async (value) => {
+          const { usage, items } = value as { usage: { tokens: number; cost: number }; items: number[] };
+          sc.status = "ended";
+          // Map generic contract values deterministically into the production usage shape.
+          return callWorkflow<OwnedRunReportResult>(baseUrl(envs, label), "PlanningRun", key, "report",
+            { usage: seedUsage(key, usage.tokens, usage.cost, [items.reduce((sum, item) => sum + item, 0)]) });
+        },
+        acceptedCount: () => storedRows(key).length,
         read: async () => {
           const status = await callWorkflow<PlanningRunStatusResult>(baseUrl(envs, label), "PlanningRun", key, "status");
           return { step: status.step === "wait" ? "waiting" : status.step };

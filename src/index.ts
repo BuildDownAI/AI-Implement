@@ -104,7 +104,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -4138,12 +4138,12 @@ export function sweepLegacyKgRefreshRows(): number {
   return rows.length;
 }
 
-async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
+async function onReviewFixResult(result: ReviewFixResultMetadataV1 & { usage?: import("./agent-usage.js").RecordedUsage }, opts: { idempotencyKey: string }): Promise<ResultIntakeOutcome> {
   // Verify-only (AII-1185): the callback forwards the validated result to
   // ReviewFixAttempt.result, whose `store-result` step is the sole SQLite writer.
   // Restate unreachable throws, which the route answers 503 with nothing written;
   // the runner retries the same body under the same key.
-  const out = await reviewFixIngressClient.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) });
+  const out = await reviewFixIngressClient.result(result.attemptId, result, opts);
   const outcome = reviewFixResultIntakeFromForward(result.attemptId, out);
   if (!outcome) throw new ReviewFixIntakeUnavailableError();
   return outcome;

@@ -1,7 +1,14 @@
+import { loadStoredSnapshot } from "./agent-run-preparation.js";
+import { getDb } from "./dedup.js";
+import { recordInvocationAttribution, recordPushedCommits, recordInvocationsComplete } from "./log.js";
+import { isFailureRecord } from "./pipeline/failure-classification.js";
 import type { AccountAuthMode, StageName } from "./agent-config.js";
 import type { ResolvedAgentSnapshotV1 } from "./run-config.js";
 import {
   sanitizeAttribution,
+  sanitizeInvocationRecords,
+  sanitizePushedCommits,
+  type InvocationRecordV1,
   type AttributionCostStatus,
   type AttributionLimitKind,
   type InvocationAttributionV1,
@@ -12,8 +19,8 @@ import {
 /**
  * Invocation usage and configuration attribution (AII-954).
  *
- * Pure helpers: they normalize already-produced attribution/telemetry against the frozen
- * `agentConfig` snapshot and aggregate the result. Nothing here does I/O, emits, or persists.
+ * Normalization helpers use the frozen `agentConfig` snapshot; the dispatch-level writer
+ * persists sanitized runner accounting against that same snapshot.
  *
  * Authority rules:
  *  - stage/agent/provider/model/profile/authMode/timeout come from the snapshot, never from a
@@ -303,3 +310,137 @@ export function summarizeInvocations(
 }
 
 export type { InvocationAttributionV1 };
+
+/**
+ * Stores every invocation of a job result (AII-1562), one row per invocation id, plus the legacy single
+ * `attribution`. List records go in first and the legacy attribution last, so the "latest row per dispatch"
+ * read keeps resolving to the same row it did before the list existed (insert-or-ignore never reorders).
+ * An invocation with no usage is stored with availability "unavailable" and null cost, never dropped or zeroed.
+ * Returns how many records were not stored (not matching the dispatch snapshot, or without an invocation id).
+ */
+function recordResultInvocations(
+  dispatchId: string,
+  snapshot: NonNullable<ReturnType<typeof loadStoredSnapshot>>,
+  records: readonly InvocationRecordV1[],
+  legacy: InvocationAttributionV1 | undefined,
+  opts: { timedOut: boolean; accepts: (row: NonNullable<ReturnType<typeof normalizeInvocation>>) => boolean },
+): number {
+  let mismatched = 0;
+  const store = (attribution: InvocationAttributionV1, record: InvocationRecordV1 | undefined, timedOut: boolean): void => {
+    const usage = attribution.usage;
+    const row = normalizeInvocation(snapshot, {
+      attribution,
+      telemetry: {
+        outcome: attribution.outcome,
+        numTurns: null,
+        durationMs: null,
+        costUsd: usage?.costUsd ?? null,
+        tokensIn: usage?.tokensIn ?? null,
+        tokensOut: usage?.tokensOut ?? null,
+        cacheReadTokens: record?.cacheReadTokens ?? null,
+        cacheCreationTokens: record?.cacheCreationTokens ?? null,
+      },
+      ...(record ? { attempts: record.attempts } : {}),
+    });
+    // A row with no invocation id cannot be stored, so it counts as unstored; a repeat of a stored row does not.
+    if (row && row.invocationId !== null && opts.accepts(row)) recordInvocationAttribution(dispatchId, row, { timedOut });
+    else mismatched++;
+  };
+  const legacyRecord = legacy ? records.find((r) => r.attribution.invocationId === legacy.invocationId) : undefined;
+  for (const record of records) {
+    if (legacy && record.attribution.invocationId === legacy.invocationId) continue;
+    store(record.attribution, record, false);
+  }
+  if (legacy) store(legacy, legacyRecord, opts.timedOut);
+  return mismatched;
+}
+
+
+/** Allowlisted JSON projection safe to journal; never includes runner credentials or failure text. */
+export interface RecordedUsage {
+  records: InvocationRecordV1[];
+  attribution: InvocationAttributionV1 | null;
+  pushedCommits: string[] | null;
+  listWhole: boolean;
+  timedOut: boolean;
+}
+
+export function toRecordedUsage(body: {
+  attribution?: unknown; invocations?: unknown; invocationsDropped?: unknown;
+  pushedCommits?: unknown; failureCode?: unknown; failure?: unknown;
+}): RecordedUsage {
+  const attribution = sanitizeAttribution(body.attribution);
+  if (body.attribution !== undefined && !attribution) console.warn("[runner-callback] Dropped 1 invalid attribution record(s)");
+  const { valid, dropped } = sanitizeInvocationRecords(body.invocations);
+  if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid invocation record(s)`);
+  const pushedCommits = sanitizePushedCommits(body.pushedCommits);
+  if (body.pushedCommits !== undefined && pushedCommits === null) console.warn("[runner-callback] Dropped invalid pushed commit list");
+  const runnerDropped = typeof body.invocationsDropped === "number" && body.invocationsDropped > 0;
+  return {
+    records: valid, attribution, pushedCommits,
+    listWhole: Array.isArray(body.invocations) && dropped === 0 && !runnerDropped,
+    timedOut: body.failureCode === "INVOCATION_TIMEOUT"
+      || (isFailureRecord(body.failure) && body.failure.code === "INVOCATION_TIMEOUT"),
+  };
+}
+
+/** KG dispatches deliberately have no managed configuration. Keep reported calls without
+ * treating runner-supplied profile or snapshot identifiers as verified configuration. */
+function recordUnconfiguredKgUsage(dispatchId: string, usage: RecordedUsage): void {
+  const store = (claim: InvocationAttributionV1, record?: InvocationRecordV1, timedOut = false): void => {
+    const u = claim.usage;
+    recordInvocationAttribution(dispatchId, {
+      snapshotId: null, configRevisions: null,
+      // Reserved placeholders for the non-null legacy schema fields; no account is attributed.
+      profileId: "unconfigured", profileRevision: 1, authMode: "unknown",
+      invocationId: claim.invocationId, stage: claim.stage,
+      agent: claim.agent, provider: claim.provider, model: claim.model,
+      limit: claim.limit, outcome: claim.outcome,
+      usage: {
+        availability: availabilityOf(u?.tokensIn ?? null, u?.tokensOut ?? null),
+        tokensIn: u?.tokensIn ?? null, tokensOut: u?.tokensOut ?? null,
+        costUsd: u?.costUsd ?? null, costStatus: u?.costUsd == null ? "unavailable" : "reported",
+        cacheReadTokens: record?.cacheReadTokens ?? null,
+        cacheCreationTokens: record?.cacheCreationTokens ?? null,
+      },
+      attempts: record?.attempts ?? 1, attribution: "absent", mismatches: [],
+    }, { timedOut });
+  };
+  for (const record of usage.records) {
+    if (record.attribution.invocationId !== usage.attribution?.invocationId) store(record.attribution, record);
+  }
+  if (usage.attribution) store(usage.attribution,
+    usage.records.find((r) => r.attribution.invocationId === usage.attribution!.invocationId), usage.timedOut);
+}
+
+/** Writes are replay-safe. Acceptance policy comes from trusted dispatch ownership, never the payload. */
+export function recordUsage(dispatchId: string, usage: RecordedUsage): number {
+  if (usage.pushedCommits) recordPushedCommits(dispatchId, usage.pushedCommits);
+  let mismatched = 0;
+  if (usage.attribution || usage.records.length > 0) {
+    // Managed review-fix attempts have their own durable identity, even after admission release.
+    const managed = getDb().prepare("SELECT 1 FROM review_fix_attempts WHERE dispatch_id = ?").get(dispatchId) !== undefined;
+    const snapshot = loadStoredSnapshot(dispatchId);
+    if (!snapshot && !managed
+      && getDb().prepare(`SELECT 1 FROM dispatch_log WHERE dispatch_id = ? AND phase = 'kg-refresh'
+        AND NOT EXISTS (SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?)`)
+        .get(dispatchId, dispatchId)) {
+      recordUnconfiguredKgUsage(dispatchId, usage);
+      if (usage.listWhole) recordInvocationsComplete(dispatchId);
+      return 0;
+    }
+    if (!snapshot) {
+      if (managed) console.warn("[runner-callback] Dropped 1 managed attribution record(s) not matching accepted snapshot");
+      return 1;
+    }
+    mismatched = recordResultInvocations(dispatchId, snapshot, usage.records, usage.attribution ?? undefined, {
+      timedOut: usage.timedOut,
+      accepts: (row) => managed ? row.attribution === "verified" : row.attribution !== "rejected",
+    });
+    if (mismatched > 0) console.warn(managed
+      ? `[runner-callback] Dropped ${mismatched} managed attribution record(s) not matching accepted snapshot`
+      : `[runner-callback] Dropped ${mismatched} attribution record(s) not matching the dispatch snapshot`);
+  }
+  if (usage.listWhole && mismatched === 0) recordInvocationsComplete(dispatchId);
+  return mismatched;
+}

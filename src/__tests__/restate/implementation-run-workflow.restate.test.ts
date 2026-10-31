@@ -6,6 +6,10 @@
 // the final-state table runs the production decision with the callback's writes planted in the row.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
+import { getDb } from "../../dedup.js";
+import { initLogTable } from "../../log.js";
+import { toRecordedUsage } from "../../agent-usage.js";
+import type { OwnedRunReportResult } from "../../restate/owned-run-lifecycle.js";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { DispatchAdmissionReleaseReason } from "../../dispatch-admission.js";
@@ -174,6 +178,29 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
   };
 }
 
+/** Seed the accepted implementation selection so the production usage writer must store real rows. */
+function seedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
+  const snapshotId = `snapshot-${dispatchId}`;
+  const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "implementation-profile", invocationTimeoutMs: 60_000 };
+  const profile = { id: "implementation-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
+  getDb().prepare(`INSERT OR IGNORE INTO run_agent_config_snapshots
+    (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+    VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snapshotId, dispatchId,
+      JSON.stringify({ stages: { planning: selection, implementation: selection, review: selection }, profiles: { planning: profile, implementation: profile, review: profile } }),
+      JSON.stringify(Object.fromEntries(["planning", "implementation", "review"].map((stage) => [stage, Object.fromEntries(Object.keys(selection).map((field) => [field, "project"]))]))),
+      JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }));
+  return toRecordedUsage({ invocations: items.map((item) => ({ attribution: {
+    version: 1, invocationId: `${dispatchId}-inv-${item}`, snapshotId, stage: "implementation",
+    agent: selection.agent, provider: selection.provider, model: selection.model,
+    profileId: profile.id, authMode: profile.authMode, limit: null, outcome: "success",
+    usage: { availability: "complete", tokensIn: tokens, tokensOut: 2, costUsd: cost, costStatus: "reported" },
+  } })) });
+}
+
+const storedRows = (dispatchId: string) => getDb().prepare(
+  "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
+).all(dispatchId);
+
 describe("ImplementationRun durable workflow", () => {
   let slow: Map<string, RestateEnvironment>;
   let window: Map<string, RestateEnvironment>;
@@ -181,6 +208,8 @@ describe("ImplementationRun durable workflow", () => {
   let counter = 0;
 
   beforeAll(async () => {
+    getDb();
+    initLogTable();
     [slow, window, deadline] = await Promise.all([
       startVariants([createImplementationRunWorkflow(makeDeps(SLOW))]),
       startVariants([createImplementationRunWorkflow(makeDeps(WINDOW))]),
@@ -225,6 +254,16 @@ describe("ImplementationRun durable workflow", () => {
     return { dispatchId, sc, done, read, report };
   }
 
+  it.each(labels)("accepts an empty HTTP report body (%s)", async (label) => {
+    const w = begin(slow, label);
+    await waitForStep(w.read, "wait");
+    const response = await fetch(`${baseUrl(slow, label)}/ImplementationRun/${w.dispatchId}/report`, { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "accepted" });
+    w.sc.status = "ended";
+    await w.done;
+  });
+
   /** Waits for the first tick to be parked, then until the wall clock is past `afterMs` from it. */
   async function pastDeadlineAtTick(sc: Scenario, afterMs: number, label: string): Promise<void> {
     await sc.tickGate!.reached();
@@ -259,7 +298,7 @@ describe("ImplementationRun durable workflow", () => {
     w.sc.status = "ended";
     expect(await w.done).toEqual({ reason: "finalized" });
     expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
-    // `report` carries no payload, so the finish step still runs once, after the ended read.
+    // `report` carries no job outcome, so the finish step still runs once, after the ended read.
     expect(w.sc.finishCalls).toEqual([{ kind: "run_ended" }]);
   }, 60_000);
 
@@ -677,6 +716,7 @@ describe("ImplementationRun durable workflow", () => {
         launchImpl: faults.crashAfterLaunch ? crashAfterFirstCall(launch) : launch,
       };
       scenarios.set(key, sc);
+      seedUsage(key, 12, 1, [1]);
       // A short total deadline needs the seam set built for it; the others hold the run until `finish`.
       const envs = totalMs <= 5_000 ? deadline : slow;
       const input: ImplementationRunInput = { dispatchId: key, teamKey: "ENG", issueId: `issue-${key}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions" };
@@ -685,6 +725,14 @@ describe("ImplementationRun durable workflow", () => {
       return {
         runId,
         done,
+        report: async (value) => {
+          const { usage, items } = value as { usage: { tokens: number; cost: number }; items: number[] };
+          sc.status = "ended";
+          // Map generic contract values deterministically into the production usage shape.
+          return callWorkflow<OwnedRunReportResult>(baseUrl(envs, label), "ImplementationRun", key, "report",
+            { usage: seedUsage(key, usage.tokens, usage.cost, [items.reduce((sum, item) => sum + item, 0)]) });
+        },
+        acceptedCount: () => storedRows(key).length,
         read: async () => {
           const status = await callWorkflow<ImplementationRunStatusResult>(baseUrl(envs, label), "ImplementationRun", key, "status");
           return { step: status.step === "wait" ? "waiting" : status.step };

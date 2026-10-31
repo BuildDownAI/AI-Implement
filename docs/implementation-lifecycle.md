@@ -59,7 +59,7 @@ flowchart TD
 | `outcome` | `reportTerminalJob` with `ownerCall: true`: breaker count, failure comment, completion notice | `outcome` |
 | `release` | releases the admission after termination is confirmed | `release` |
 
-There is no separate ticket step. The ticket transition is part of `finish-job`, through the shared finalizer `finalizeImplementation` (`src/implementation-finalize.ts`, AII-1556). `report` carries no payload, so the step reads the `dispatch_log` row (`approved`, `conclusion`, `failure_commented_at`, `pr_url`) to learn what the runner callback already did, and does only the rest (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`; see D34 to D40). A callback that made the transition is never repeated, and `runner_approved` survives.
+There is no separate ticket step. The ticket transition is part of `finish-job`, through the shared finalizer `finalizeImplementation` (`src/implementation-finalize.ts`, AII-1556). `report` carries optional model usage but no job outcome, so the step reads the `dispatch_log` row (`approved`, `conclusion`, `failure_commented_at`, `pr_url`) to learn what the runner callback already did, and does only the rest (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`; see D34 to D40). A callback that made the transition is never repeated, and `runner_approved` survives.
 
 ## Duty table
 
@@ -117,11 +117,13 @@ There is no separate ticket step. The ticket transition is part of `finish-job`,
 
 ### Runner callback (`handleRunnerResult`, `src/runner-callback.ts`)
 
-The callback is the runner's authenticated self-report: it consumes the run token and holds the payload (comments, failure record, dispositions), so its tracker writes **stay outside the workflow**. What changes for an owned job is who closes the row and who runs the cleanup. `handleRunnerResult` is therefore an input to `wait` (the `report` signal), as in planning, where the callback sends `report` through a hook after it writes the row.
+The callback is the runner's authenticated self-report: it checks the run token (consuming it only for Legacy runs) and holds the payload (comments, failure record, dispositions), so its tracker writes **stay outside the workflow**. What changes for an owned job is who closes the row and who runs the cleanup. `handleRunnerResult` is therefore an input to `wait` (the `report` signal), as in planning, where the callback sends `report` through a hook after it writes the row.
+
+For an owned planning or implementation result, `callback_lifecycle_completed_at` records that callback lifecycle handling finished, before the workflow forward. Retries skip those effects even while the workflow has not closed the job row, and still forward sanitized usage on every request. A failed forward leaves both this marker and the check-only token available for the retry.
 
 | ID | Branch | What it does for an implementation job | Trigger | Owner |
 |---|---|---|---|---|
-| D34 | Shared pre-branch work | Posts the runner's `comments`; posts the missing reference-repo warning; for `follow-up` dispositions marks the findings deferred (`markReviewFindingsDeferredByKeys`) and posts the deferred-findings comment | every accepted result | **Stays outside the workflow:** needs the payload and runs before the run token's single use is spent |
+| D34 | Shared pre-branch work | Posts the runner's `comments`; posts the missing reference-repo warning; for `follow-up` dispositions marks the findings deferred (`markReviewFindingsDeferredByKeys`) and posts the deferred-findings comment | every accepted result | **Stays outside the workflow:** needs the payload and runs after authentication |
 | D35 | `outcome: "failure"` with `OPERATOR_CANCELLED` | `clearWorkingState`; writes `failed` / `operator_cancelled` with `skipAdmissionRelease` (the self-report is not proof the backend exited) | the operator closed the PR mid-run | Tracker write and row write **stay in the callback** (payload and token). `report` then reaches `wait`; `stop` and `release` confirm termination; the notice is D31 in `outcome`; no breaker, no remediation |
 | D36 | `outcome: "failure"`, other codes | `updateJobFailure`; `markImplementationFailed` (failure comment, then `markJobFailureCommented`); `updateJobPrUrl` for a coded draft-PR failure (`REVIEW_UNAPPROVED`, `MAX_TURNS_EXHAUSTED`); `remediateFailedJob` **only when the body has no `prUrl`** | failure that is not `OPERATOR_CANCELLED` | Comment and failure record **stay in the callback**. The `remediateFailedJob` call is a no-op for an owned job (the fence), so `finish-job` runs it through the finalizer (with `ownerCall: true`) when the job has no PR. Row close: `finish-job` |
 | D37 | `outcome: "failure"` with `GIT_LEASE_REJECTED` and a `prUrl` | `handleLeaseRejectedFailure`: bot-authored head: re-enqueue the review-fix (`acceptReviewFixWebhookEvent`); human head or unknown: sticky comment, no retry | lease rejected on an existing PR | **Stays outside the workflow:** it hands the work to the review-fix rail, not the implementation job |
@@ -142,7 +144,7 @@ Settled 2026-10-26; the table above already uses them.
 1. **Step names.** The real names are `reserve`, `dispatch`, `wait`, `stop`, `finish-job`, `cleanup`, `outcome`, `release`. There is no `ticket` step (the ticket move is part of `finish-job`, through `finalizeImplementation`), and `launch` is `dispatch`.
 2. `remediateStuckJob` takes `ownerCall` (D20, added by AII-1556); the `finishJob` dep passes `ownerCall: true`.
 3. **No ticket-lifecycle read in `wait`** (D23 `issue-terminal`). An owned run whose ticket closes runs to its `report`, its end, or its deadline; the reaper's 4 h `max-age-exceeded` rule stays the backstop.
-4. **`finish-job` learns what the callback did from `dispatch_log`** (`approved`, `conclusion`, `failure_commented_at`, `failure`, `pr_url`), because `report` carries no payload (D16, D19, D40).
+4. **`finish-job` learns what the callback did from `dispatch_log`** (`approved`, `conclusion`, `failure_commented_at`, `failure`, `pr_url`), because `report` carries optional model usage but no job outcome (D16, D19, D40).
 5. **The `running` mark** (D5, D10, D18) is written by the `readStatus` dep of the wait, as the monitors write it today. The write is idempotent.
 6. `reconcileFilesystemFailures` (`src/filesystem-ticket-lifecycle.ts`) runs from `monitorJobs` but concerns filesystem-ticket mappings, not a job's backend; it is outside this table.
 

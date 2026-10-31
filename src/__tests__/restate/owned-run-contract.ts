@@ -35,12 +35,15 @@ export interface OwnedRunHandle {
   read(): Promise<{ step: string | null }>;
   /** Makes the run end normally (the result signal). */
   finish(): Promise<void>;
+  /** Required when scenario 6 is active; pending consumers need no implementation yet. */
+  report?(value: unknown): Promise<{ status: "accepted" | "duplicate" }>;
+  acceptedCount?(): number;
 }
 
 export interface OwnedRunAdapter {
   /** Names the describe block. */
   name: string;
-  /** The scenario numbers that apply to this run kind; all five when absent. The adapter's test file states why each other one does not apply. */
+  /** The scenario numbers that apply to this run kind; all six when absent. The adapter's test file states why each other one does not apply. */
   scenarios?: number[];
   /** False when the run kind has no cleanup step (its marker release is the cleanup); scenario 1 then expects no `cleanup:<runId>` call. Default true. */
   hasCleanup?: boolean;
@@ -126,6 +129,16 @@ export function registerOwnedRunContract(
       expect(calls).toContain("outcome");
       expect(calls[calls.length - 1]).toBe("release");
       expect(calls.filter((call) => call === "release")).toHaveLength(1);
+    }, 30_000);
+    scenario(6)("6. a report is accepted once, a repeat is a duplicate, a different report is a 409, and onAccept ran exactly once (%s)", async (label) => {
+      const run = begin(label, { faults: {}, totalMs: LONG_MS });
+      await waitForStep(run.read, "waiting");
+      if (!run.report || !run.acceptedCount) throw new Error("scenario 6 requires report and acceptedCount");
+      expect(await run.report({ usage: { tokens: 12, cost: 1 }, items: [1, 2] })).toMatchObject({ status: "accepted" });
+      await run.done;
+      expect(await run.report({ items: [1, 2], usage: { cost: 1, tokens: 12 } })).toMatchObject({ status: "duplicate" });
+      await expect(run.report({ usage: { tokens: 13, cost: 1 }, items: [1, 2] })).rejects.toThrow(/409/);
+      expect(run.acceptedCount()).toBe(1);
     }, 30_000);
   });
 }

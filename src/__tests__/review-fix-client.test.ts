@@ -1,9 +1,11 @@
 // Unit tests for the review-fix Restate ingress client (src/restate/review-fix-client.ts).
 // No Docker, no live Restate server: the client runs against a faked fetch.
 import { describe, expect, it } from "vitest";
+import { ownedRunReportFingerprint } from "../restate/owned-run-report-fingerprint.js";
+import { toRecordedUsage } from "../agent-usage.js";
 import fs from "node:fs";
 import path from "node:path";
-import { createReviewFixIngressClient, reviewFixResultForwardKey } from "../restate/review-fix-client.js";
+import { createReviewFixIngressClient } from "../restate/review-fix-client.js";
 import { validateReviewFixResultMetadata } from "../review-fix-contract.js";
 import { makeReviewFixResult, makeScopedPrIdentity } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
@@ -22,16 +24,17 @@ const ingressFor = (fake: FakeFetch, timeoutMs?: number) =>
 describe("createReviewFixIngressClient — producer contract", () => {
   it("contract: ReviewFixAttempt.wake — a result forward posts to the attempt's result handler with a body the handler's validator accepts", async () => {
     const result = makeReviewFixResult({ attemptId: "attempt-wake", installationId: 7, repository: "acme/app", prNumber: 42, githubRunId: 100 });
-    const fake = fakeFetch({ "POST /ReviewFixAttempt/attempt-wake/result": { json: { status: "stored", result } } });
+    const fake = fakeFetch({ "POST /ReviewFixAttempt/attempt-wake/result": { json: { status: "stored", result, fingerprint: ownedRunReportFingerprint(result) } } });
     const ingress = createReviewFixIngressClient("http://ingress.test", { fetchImpl: fake.fetch });
 
-    await ingress.result("attempt-wake", result, { idempotencyKey: reviewFixResultForwardKey(result) });
+    await ingress.result("attempt-wake", result, { idempotencyKey: "dispatch-wake" });
 
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0]!.url.href).toBe("http://ingress.test/ReviewFixAttempt/attempt-wake/result");
     const sent = JSON.parse(fake.calls[0]!.body);
     expect(validateReviewFixResultMetadata(sent).ok).toBe(true);
     expect(sent.attemptId).toBe("attempt-wake");
+    expect(fake.calls[0]!.headers.get("idempotency-key")).toBe("dispatch-wake");
   });
 });
 
@@ -122,11 +125,59 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
     };
 
     it("posts to /ReviewFixAttempt/<id>/result with the idempotency-key and returns the handler outcome", async () => {
-      const { outcome, calls } = await run({ json: stored });
+      const { outcome, calls } = await run({ json: { ...stored, fingerprint: ownedRunReportFingerprint(result) } });
       expect(outcome).toEqual({ status: "accepted", outcome: stored });
       expect(calls).toHaveLength(1);
       expect(calls[0]!.url.href).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
       expect(calls[0]!.headers.get("idempotency-key")).toBe("att-1.result.k");
+    });
+
+    it("contract: ReviewFixAttempt.report", async () => {
+      // The result handler passes this usage separately from validated metadata to
+      // acceptOwnedRunReport(ctx, "report", ...); the producer must preserve both.
+      const body = { ...result, usage: toRecordedUsage({ invocations: [], pushedCommits: ["a".repeat(40)] }) };
+      const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/result": { json: { ...stored, fingerprint: ownedRunReportFingerprint(body) } } });
+      expect(await ingressFor(fake).result("att-1", body, { idempotencyKey: "usage-key" }))
+        .toEqual({ status: "accepted", outcome: stored });
+      expect(fake.calls).toHaveLength(1);
+      expect(fake.calls[0]!.url.href).toBe("http://sidecar/ReviewFixAttempt/att-1/result");
+      const sent = JSON.parse(fake.calls[0]!.body);
+      expect(sent).toEqual(body);
+      expect(validateReviewFixResultMetadata(sent)).toEqual({ ok: true, value: result });
+      expect(sent.usage).toEqual(body.usage);
+      expect(fake.calls[0]!.headers.get("idempotency-key")).toBe("usage-key");
+    });
+
+    it("rejects changed metadata or usage behind a cached dispatch acknowledgement", async () => {
+      const body = { ...result, usage: toRecordedUsage({ invocations: [], pushedCommits: ["a".repeat(40)] }) };
+      const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/result": {
+        json: { ...stored, fingerprint: ownedRunReportFingerprint(body) },
+      } });
+      const client = ingressFor(fake);
+      const opts = { idempotencyKey: "dispatch-1" };
+      expect(await client.result("att-1", body, opts)).toEqual({ status: "accepted", outcome: stored });
+      expect(await client.result("att-1", { ...body, outputCommit: "b".repeat(40) }, opts)).toEqual({ status: "conflict" });
+      expect(await client.result("att-1", { ...body, usage: toRecordedUsage({ invocations: [] }) }, opts)).toEqual({ status: "conflict" });
+      expect(fake.calls.map((call) => call.headers.get("idempotency-key")))
+        .toEqual(["dispatch-1", "dispatch-1", null, "dispatch-1", null]);
+      expect(JSON.parse(fake.calls[2]!.body)).toEqual({ ...body, outputCommit: "b".repeat(40) });
+      expect(JSON.parse(fake.calls[4]!.body)).toEqual({ ...body, usage: toRecordedUsage({ invocations: [] }) });
+    });
+
+    it("keeps conflict persistence failures retryable", async () => {
+      const changed = { ...result, outputCommit: "b".repeat(40) };
+      const fake = fakeFetch({ "POST /ReviewFixAttempt/att-1/result": [
+        { json: { ...stored, fingerprint: ownedRunReportFingerprint(result) } },
+        { status: 503, text: "unavailable" },
+      ] });
+      expect(await ingressFor(fake).result("att-1", changed, { idempotencyKey: "dispatch-1" }))
+        .toEqual({ status: "unavailable" });
+      expect(fake.calls).toHaveLength(2);
+      expect(fake.calls[1]!.headers.get("idempotency-key")).toBeNull();
+    });
+
+    it("fails closed when the acknowledgement has no fingerprint", async () => {
+      expect((await run({ json: stored })).outcome).toEqual({ status: "unavailable" });
     });
 
     it("maps 409 to conflict, 404 to not-found, and other failures to unavailable", async () => {
@@ -134,14 +185,6 @@ describe("createReviewFixIngressClient (AII-1184)", () => {
       expect((await run({ status: 404, text: "x" })).outcome).toEqual({ status: "not-found" });
       expect((await run({ status: 503, text: "x" })).outcome).toEqual({ status: "unavailable" });
       expect((await run(() => { throw new Error("ECONNREFUSED"); })).outcome).toEqual({ status: "unavailable" });
-    });
-
-    it("keys on attempt and body so a conflicting body never shares a key with the first", () => {
-      const a = makeReviewFixResult({ attemptId: "att-1", outputCommit: "a".repeat(40) });
-      const b = makeReviewFixResult({ attemptId: "att-1", outputCommit: "b".repeat(40), deadlineAt: a.deadlineAt });
-      expect(reviewFixResultForwardKey(a)).toBe(reviewFixResultForwardKey({ ...a }));
-      expect(reviewFixResultForwardKey(a)).not.toBe(reviewFixResultForwardKey(b));
-      expect(reviewFixResultForwardKey(a)).toMatch(/^att-1\.result\.[0-9a-f]{64}$/);
     });
   });
 });
