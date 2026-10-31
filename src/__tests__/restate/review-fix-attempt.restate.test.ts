@@ -315,7 +315,6 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect(storedRows(handle.runId)).toEqual(recorded);
   }, 30_000);
 
-
   it.each(VARIANTS.map(([label]) => label))("response loss reconciles one execution and one launch effect (%s)", async (label) => {
     const fake = newFake("response_lost");
     attempts.set(fake.prepared.attemptId, fake);
