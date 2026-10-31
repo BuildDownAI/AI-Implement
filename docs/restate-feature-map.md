@@ -49,7 +49,7 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 
 The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__tests__/restate/owned-run-contract.ts`. All four runner workflows call `acceptOwnedRunReport` from their shared result handler, recording usage in `record-usage` before resolving the report promise (ADR 036). The authenticated callback checks the token without consuming it and forwards sanitized usage with a dispatch-scoped idempotency key; it does not write usage for Restate-owned runs. KgRefresh excludes scenarios 2–5 for the lifecycle reasons documented in ADR 036.
 
-Review-fix retains its existing `<attemptId>.result.<body hash>` forwarding key so changed results reach conflict detection; identical retries reuse the cached acknowledgement, including after admission release. Other owned-run report clients use the dispatch id.
+Every owned-run result uses the authenticated dispatch id as its forwarding idempotency key, including ReviewFixAttempt. Identical retries reuse the cached acknowledgement, including after admission release. The review-fix client compares the returned result fingerprint with the forwarded metadata and usage, rejecting changed bodies even when ingress returns a cached acknowledgement.
 
 ## 2. Feature matrix
 
@@ -78,7 +78,7 @@ Review-fix retains its existing `<attemptId>.result.<body hash>` forwarding key 
 | `TerminalError` with `errorCode` | yes: 404 and 409 (AII-975) | no | no | |
 | Invocation cancellation (`ctx.cancel`, admin cancel) | no (own `cancel` promise) | no (own `cancel` promise) | no | § 5.1 |
 | `ctx.attach` / `/restate/attach` | tests only | no | no | |
-| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: webhook delivery id, attempt result key (`<attemptId>.result.<body hash>`), cancel keys (`<attemptId>.closed`, `<attemptId>.cancel`), drain nudge (`<queue id>.<event id>.<30 s bucket>`) | when the caller supplies one | |
+| Ingress `idempotency-key` | yes: runner report (dispatch id), webhook enqueue (delivery id) | yes: webhook delivery id, attempt result key (dispatch id), cancel keys (`<attemptId>.closed`, `<attemptId>.cancel`), drain nudge (`<queue id>.<event id>.<30 s bucket>`) | when the caller supplies one | |
 | SDK ingress client (`@restatedev/restate-sdk-clients`) | yes: `createKgRefreshIngressClient` (AII-975) | no | no | |
 | Service options: `workflowRetention`, `journalRetention` | yes | yes | no | |
 | Service options: `idempotencyRetention` | on `report`, `cancel` | on `result`, `cancel` | no | KG `status` and `progress` carry no retention (AII-973) |

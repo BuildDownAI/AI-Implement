@@ -323,7 +323,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       "run", { attemptId: fake.prepared.attemptId });
     await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
     expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", resultOf(fake)))
-      .toEqual({ status: "stored", result: resultOf(fake) });
+      .toMatchObject({ status: "stored", result: resultOf(fake) });
     fake.terminal = { status: "succeeded", outputCommit: SHA };
     expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "applied" });
     expect([fake.launchEffects, fake.approvalEffects, fake.releaseEffects, fake.occupied]).toEqual([1, 1, 1, false]);

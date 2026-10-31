@@ -56,7 +56,7 @@ import type { ReviewFixActivityEvent } from "../../review-fix-contract.js";
 import { acquire as acquireDispatchAdmission, release as releaseDispatchAdmission } from "../../dispatch-admission.js";
 import { handleGitHubWebhook } from "../../webhook.js";
 import { appendLog, initLogTable, updateJobStatus } from "../../log.js";
-import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
 import { createReviewFixPR, reviewFixPRKey } from "../../restate/review-fix-pr.js";
 import {
@@ -816,14 +816,14 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const result = resultOf(fixture, prepared);
     const first = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
-    expect(first).toEqual({ status: "stored", result });
+    expect(first).toMatchObject({ status: "stored", result });
     const second = await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", result);
-    expect(second).toEqual({ status: "duplicate", attemptId: fixture.attemptId });
+    expect(second).toMatchObject({ status: "duplicate", attemptId: fixture.attemptId });
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!)).status).toBe("finalized");
     expect(fixture.commentPosts).toBe(1);
   }, 25_000);
 
-  it("authenticated result callback forwards over the ingress keyed by attempt and body, writes only through store-result, classifies retries/conflicts, and never approves", async () => {
+  it("authenticated result callback forwards over the ingress keyed by dispatch id, writes only through store-result, classifies retries/conflicts, and never approves", async () => {
     const env = envFor("alwaysReplay");
     const fixture = freshScenario("result-ingress");
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
@@ -837,8 +837,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // Same forward as `onReviewFixResult` in src/index.ts: key, client call and shared outcome mapping.
     const forwardTo = (baseUrl: string) => {
       const ingress = createReviewFixIngressClient(baseUrl);
-      return async (validated: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => {
-        const out = await ingress.result(validated.attemptId, validated, { idempotencyKey: reviewFixResultForwardKey(validated) });
+      return async (validated: ReviewFixResultMetadataV1, opts: { idempotencyKey: string }): Promise<ResultIntakeOutcome> => {
+        const out = await ingress.result(validated.attemptId, validated, opts);
         const outcome = reviewFixResultIntakeFromForward(validated.attemptId, out);
         if (!outcome) throw new ReviewFixIntakeUnavailableError();
         return outcome;
@@ -869,6 +869,12 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(await intake(resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
       .toMatchObject({ status: 409, body: { outcome: "conflict" } });
     expect(legacyProviderLookups).toBe(0);
+    // A cached response refuses the changed body without entering the handler.
+    expect(rowOf().result_conflict_at).toBeNull();
+    // A fresh invocation still exercises the handler's durable conflict/revocation path.
+    expect(await callWorkflow<ResultIntakeOutcome>(env.baseUrl(), "ReviewFixAttempt", attemptId, "result",
+      resultOf(fixture, prepared, { outputCommit: sha("callback-conflict") })))
+      .toMatchObject({ status: "conflict" });
     expect(rowOf().result_conflict_at).not.toBeNull();
 
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: fixture.runAttempt };
@@ -886,7 +892,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8_000, label: "fixture.runId !== null" });
     const prepared = (await sqliteStore.getPreparedAttempt(fixture.attemptId!))!;
     const first = resultOf(fixture, prepared);
-    expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", first)).toEqual({ status: "stored", result: first });
+    expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", first)).toMatchObject({ status: "stored", result: first });
     const conflicting = resultOf(fixture, prepared, { outputCommit: sha("conflicting-commit") });
     const conflictOutcome = await callWorkflow<ResultIntakeOutcome>(env.baseUrl(), "ReviewFixAttempt", fixture.attemptId!, "result", conflicting);
     expect(conflictOutcome).toMatchObject({ status: "conflict" });

@@ -73,4 +73,4 @@ The AII-1058 gaps are closed in `PlanningRun`. The table above lists each fenced
 
 The authenticated runner callback checks a Restate-owned run's token without consuming it and forwards sanitized usage with a dispatch-scoped idempotency key. It does not write usage itself. Runner result posts use one bounded retry policy: deadline plus grace, or eight attempts. AI-Implement records model usage; the control plane calculates costs from its own price table, and the `list_job_accounting` contract is unchanged.
 
-Review-fix retains its existing `<attemptId>.result.<body hash>` forwarding key so changed results reach conflict detection; identical retries reuse the cached acknowledgement, including after admission release. Other owned-run report clients use the dispatch id.
+Every owned-run result uses the authenticated dispatch id as its forwarding idempotency key, including ReviewFixAttempt. Identical retries reuse the cached acknowledgement, including after admission release. The review-fix client compares the returned result fingerprint with the forwarded metadata and usage, rejecting changed bodies even when ingress returns a cached acknowledgement.

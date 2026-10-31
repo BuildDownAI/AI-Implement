@@ -17,7 +17,7 @@ import { createReviewFixAttempt, type ReviewFixAttemptDependencies } from "../..
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "../../restate/planning-run-client.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "../../restate/implementation-run-client.js";
 import { createKgRefreshIngressClient } from "../../restate/kg-refresh-production.js";
-import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "../../restate/review-fix-client.js";
 import { orchestratorTools } from "../../restate/tools.js";
 import { JobAccountingPageSchema } from "../../job-accounting.js";
 import { makeReviewFixResult } from "../helpers/builders.js";
@@ -178,9 +178,10 @@ describe("runner result to workflow accounting", () => {
           checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({ ingress: planning, legacy: async () => {}, readAdmission: read }),
           checkImplementationAdmissionTermination: createImplementationAdmissionTerminationHook({ ingress: implementation, legacy: async () => {}, readAdmission: read }),
           kgRefreshClient: kg,
-          onReviewFixResult: async (result) => {
+          onReviewFixResult: async (result, opts) => {
+            expect(opts.idempotencyKey).toBe(dispatchId);
             const outcome = reviewFixResultIntakeFromForward(result.attemptId,
-              await review.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) }));
+              await review.result(result.attemptId, result, opts));
             if (!outcome) throw new ReviewFixIntakeUnavailableError();
             return outcome;
           },

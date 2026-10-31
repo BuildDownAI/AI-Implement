@@ -4723,7 +4723,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(onReviewFixResult).toHaveBeenCalledWith({ ...validReviewFix, usage: expect.any(Object) });
+    expect(onReviewFixResult).toHaveBeenCalledWith({ ...validReviewFix, usage: expect.any(Object) }, { idempotencyKey: validReviewFix.attemptId });
     expect(fake.getPhase("i")).toBeUndefined();
     expect(fake.recordedCalls()).toEqual([]);
     expect(stampApprovedSpy).not.toHaveBeenCalled();
@@ -5674,7 +5674,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     ...over,
   });
 
-  async function deliver(attribution: unknown, opts: { snapshot?: boolean; extra?: Record<string, unknown>; dispatchId?: string } = {}) {
+  async function deliver(attribution: unknown, opts: { snapshot?: boolean; extra?: Record<string, unknown> } = {}) {
     const dispatchId = opts.dispatchId ?? "disp-attr";
     const { token } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
@@ -6093,7 +6093,7 @@ describe("owned result accounting boundary", () => {
       expect(result.status).toBe(200);
       expect(record).not.toHaveBeenCalled();
       expect(consume).not.toHaveBeenCalled();
-      if (kind === "review-fix") expect(review).toHaveBeenCalledWith(expect.objectContaining({ usage: expect.objectContaining({ listWhole: true }) }));
+      if (kind === "review-fix") expect(review).toHaveBeenCalledWith(expect.objectContaining({ usage: expect.objectContaining({ listWhole: true }) }), { idempotencyKey: "boundary-attempt" });
       else expect(report).toHaveBeenCalledTimes(1);
     },
   );
