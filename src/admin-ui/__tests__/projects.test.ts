@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { projectsHtml, projectsScript } from "../pages/projects.js";
+import { componentsCss } from "../components.js";
 import type { RepoMapping } from "../../config.js";
 import { makeMapping } from "../../__tests__/helpers/builders.js";
 import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
@@ -45,6 +46,23 @@ async function save(win: { saveMappingDialog: () => Promise<void> }): Promise<vo
 function reviewerRows(doc: Document): HTMLElement[] {
   return Array.from(doc.querySelectorAll<HTMLElement>("#md-reviewer-list > div"));
 }
+
+describe("projects table containment", () => {
+  it("uses a shared horizontal scroll container for the table and its Edit action", async () => {
+    const tightBodyRule = /\.card-body\.tight\s*\{([^}]*)\}/.exec(componentsCss)?.[1] ?? "";
+    expect(tightBodyRule).toContain("overflow-x: auto");
+
+    const { win, doc } = mountProjects();
+    await win.loadMappings();
+    const table = doc.querySelector("#mappings-body")!.closest("table.tbl")!;
+    expect(table.parentElement?.matches(".card > .card-body.tight")).toBe(true);
+    const edit = Array.from(table.querySelectorAll("button")).find((button) => button.textContent === "Edit");
+    expect(edit).toBeDefined();
+    edit!.click();
+    expect(doc.querySelector<HTMLDialogElement>("#mapping-dialog")!.open).toBe(true);
+    expect(doc.querySelector<HTMLInputElement>("#md-team-key-orig")!.value).toBe("AII");
+  });
+});
 
 describe("projects page reviewer control", () => {
   it("declares the reviewer controls and uses escAttr for reviewer attribute contexts", () => {
