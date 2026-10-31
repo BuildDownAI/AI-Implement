@@ -6880,7 +6880,7 @@ describe("postPushReviewStep review process gate", () => {
   });
   const thread = (body: string, oid = SHA) => ({
     isResolved: false, isOutdated: false, path: "a.ts", line: 3,
-    comments: { nodes: [{ body, url: "https://x/1", commit: { oid }, author: { login: "claude" } }] },
+    comments: { pageInfo: { hasNextPage: false }, nodes: [{ body, url: "https://x/1", commit: { oid }, author: { login: "claude" } }] },
   });
 
   function fixture(opts: { runs: Run[]; inlineComments?: unknown[]; threads?: unknown[]; issueComments?: unknown[] }) {
@@ -6959,6 +6959,47 @@ describe("postPushReviewStep review process gate", () => {
     expect(f.posted.join("\n")).toContain("starting fix pass");
     expect(invoke).toHaveBeenCalled();
     expect(JSON.stringify(invoke.mock.calls)).toContain("Fix the head bug");
+  });
+
+  it.each(["resolved", "outdated", "open", "failed"] as const)("Codex P1 thread %s controls the gate", async (state) => {
+    const body = "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Fix bug**";
+    const comment = inline(body, "older");
+    comment.user.login = "chatgpt-codex-connector[bot]";
+    const t = thread(body, "older");
+    t.comments.nodes[0]!.author.login = "chatgpt-codex-connector";
+    t.isResolved = state === "resolved";
+    t.isOutdated = state === "outdated";
+    const f = fixture({ runs: [], inlineComments: [comment], threads: [t], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":true}} -->`,
+    }] });
+    if (state === "failed") {
+      const base = f.ghSpawn.getMockImplementation()!;
+      f.ghSpawn.mockImplementation((args: string[]) => args[1] === "graphql" ? { stdout: "", exitCode: 1 } : base(args));
+    }
+    const { out } = await run(f, { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(state === "resolved" || state === "outdated");
+  });
+
+  it.each([
+    { nodes: [] },
+    { nodes: [], pageInfo: {} },
+    { nodes: [], pageInfo: { hasNextPage: false }, errors: true },
+  ])("Codex incomplete empty thread snapshot retains unresolved hold: %j", async (snapshot) => {
+    const f = fixture({ runs: [], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":true}} -->`,
+    }] });
+    const base = f.ghSpawn.getMockImplementation()!;
+    f.ghSpawn.mockImplementation((args: string[]) => args[1] === "graphql" ? {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        ...("errors" in snapshot ? { errors: [{ message: "Partial response" }] } : {}),
+        data: { repository: { pullRequest: { reviewThreads: snapshot } } },
+      }),
+    } : base(args));
+    const { out } = await run(f, { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(false);
   });
 
   it.each([[false, false], [true, false], [false, true], [true, true]])("Codex P2 threads stay advisory with unresolved=%s, human reply=%s and do not start an in-run fix", async (unresolved, reply) => {
@@ -7093,7 +7134,7 @@ describe("postPushReviewStep review process gate", () => {
     const urlInline = (body: string, id: number) => ({ ...inline(body), html_url: `https://x/pull/42#discussion_r${id}` });
     const urlThread = (urls: string[], state: { isResolved?: boolean; isOutdated?: boolean }, body = "x") => ({
       isResolved: false, isOutdated: false, path: "a.ts", line: 3, ...state,
-      comments: { nodes: urls.map((url) => ({ body, url, commit: { oid: SHA }, author: { login: "claude" } })) },
+      comments: { pageInfo: { hasNextPage: false }, nodes: urls.map((url) => ({ body, url, commit: { oid: SHA }, author: { login: "claude" } })) },
     });
     const u = (id: number) => `https://x/pull/42#discussion_r${id}`;
 

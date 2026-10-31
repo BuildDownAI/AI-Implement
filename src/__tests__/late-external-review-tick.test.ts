@@ -51,10 +51,16 @@ describe("Codex late review", () => {
     user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
     updatedAt: new Date(2000).toISOString(),
   });
+  const threadPage = (nodes: unknown[] = [], hasNextPage = false, endCursor: string | null = null) => ({
+    json: { data: { repository: { pullRequest: { reviewThreads: { nodes, pageInfo: { hasNextPage, endCursor } } } } } },
+  });
+  const thread = (url: string, isResolved = false, isOutdated = false) => ({
+    isResolved, isOutdated, comments: { nodes: [{ url }], pageInfo: { hasNextPage: false } },
+  });
   let inlineFetch: FakeFetch;
   const inlinePath = "GET /repos/o/r/pulls/5/comments" as const;
   beforeEach(() => {
-    inlineFetch = fakeFetch({ [inlinePath]: { json: [] } }).install();
+    inlineFetch = fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: { json: [] } }).install();
     vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess: "codex-code-review" } } as never);
     vi.mocked(listCheckRuns).mockReset().mockResolvedValue([]);
   });
@@ -64,7 +70,7 @@ describe("Codex late review", () => {
   });
   it.each([1, 2])("maps P%s head badges into the shared verdict", async (priority) => {
     vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
-    inlineFetch = fakeFetch({ [inlinePath]: { json: [
+    inlineFetch = fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: { json: [
       { ...badge(1), commit_id: "old" }, { ...badge(1), user: { login: "human", type: "User" } },
       { ...badge(1), user: { login: "untrusted", type: "Bot" } }, badge(priority),
     ] } }).install();
@@ -79,11 +85,33 @@ describe("Codex late review", () => {
     const firstPage = { json: [badge(2)],
       headers: { link: '<https://api.github.com/repos/o/r/pulls/5/comments?page=2>; rel="next"' },
     };
-    inlineFetch = fakeFetch({ [inlinePath]: [firstPage, { json: [badge(1)] }] }).install();
+    inlineFetch = fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: [firstPage, { json: [badge(1)] }] }).install();
     expect((await deps().readTick({ ...input, headSha: "b", followHead: false })).heldBy).toBe("changes_requested");
     expect(inlineFetch.calls[1]!.url.href).toBe("https://api.github.com/repos/o/r/pulls/5/comments?page=2");
-    fakeFetch({ [inlinePath]: [firstPage, { status: 503 }] }).install();
+    fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: [firstPage, { status: 503 }] }).install();
     await expect(deps().readTick({ ...input, headSha: "b", followHead: false })).rejects.toThrow("inline comments unreadable");
+  });
+  it.each([
+    [true, false, "b", undefined], [false, true, "b", undefined],
+    [false, false, "b", "changes_requested"], [false, false, "old", "changes_requested"],
+  ] as const)("reads resolved=%s outdated=%s P1 on %s", async (resolved, outdated, commit_id, heldBy) => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    const f = fakeFetch({
+      [inlinePath]: { json: [{ ...badge(1), commit_id, html_url: "p1" }, { ...badge(2), html_url: "p2" }] },
+      "POST /graphql": [threadPage([thread("p1", resolved, outdated)], true, "next"), threadPage([thread("p2")])],
+    }).install();
+    expect((await deps().readTick({ ...input, headSha: "b" })).heldBy).toBe(heldBy);
+    const calls = f.calls.filter((c) => c.path === "/graphql");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer tok");
+    expect(JSON.parse(calls[1]!.body).variables.after).toBe("next");
+  });
+  it.each([
+    { status: 503 }, { json: { errors: [{ message: "denied" }] } }, { json: {} },
+    threadPage([], true), threadPage([{ ...thread("p1"), comments: { nodes: [], pageInfo: { hasNextPage: true } } }]),
+  ])("throws on failed or incomplete thread reads: %j", async (reply) => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    fakeFetch({ [inlinePath]: { json: [] }, "POST /graphql": reply }).install();
+    await expect(deps().readTick({ ...input, headSha: "b" })).rejects.toThrow("review threads unreadable");
   });
   it("expects the reviewer without check runs", async () => {
     expect(await deps().readReviewerExpected!({ ...input, headSha: "b" })).toBe(true);
@@ -94,7 +122,7 @@ describe("Codex late review", () => {
       ["completed", false, "b", "success", undefined],
       ["running", false, "b", "pending", undefined],
       ["completed", false, "old", "pending", undefined],
-      ["completed", true, "b", "success", "changes_requested"],
+      ["completed", true, "b", "success", undefined],
       ["failed", false, "b", "success", "review-failed"],
       ["absent", false, "b", "pending", undefined],
     ] as const)(`gapFill=${gapFill}: %s unresolved=%s head=%s`, async (status, unresolved, sha, checks, heldBy) => {

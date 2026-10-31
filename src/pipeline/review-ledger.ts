@@ -801,26 +801,37 @@ function collectUnresolvedReviewThreads(
  */
 export function collectClosedReviewThreadCommentUrls(ghSpawn: GhSpawn, prNumber: string): Set<string> | undefined {
   const closed = new Set<string>();
+  const cursors = new Set<string>();
   let after: string | undefined;
 
   for (;;) {
     const result = safeGhSpawn(ghSpawn, buildReviewThreadsArgs(prNumber, after, closedThreadCommentsQuery));
     if (!result || result.exitCode !== 0) return undefined;
 
-    const reviewThreads = getReviewThreadsConnection(parseJson(result.stdout));
-    if (!reviewThreads) return undefined;
+    const payload = parseJson(result.stdout);
+    // GraphQL can return partial data alongside errors even with a successful exit.
+    if (!isRecord(payload) || (payload.errors !== undefined
+      && (!Array.isArray(payload.errors) || payload.errors.length > 0))) return undefined;
+    const reviewThreads = getReviewThreadsConnection(payload);
+    if (!reviewThreads || typeof reviewThreads.pageInfo?.hasNextPage !== "boolean") return undefined;
 
     for (const thread of reviewThreads.nodes) {
-      if (!isRecord(thread) || (thread.isResolved !== true && thread.isOutdated !== true)) continue;
-      for (const comment of getCommentNodes(thread) ?? []) {
-        if (isRecord(comment) && typeof comment.url === "string" && comment.url) closed.add(comment.url);
+      if (!isRecord(thread) || typeof thread.isResolved !== "boolean"
+        || typeof thread.isOutdated !== "boolean") return undefined;
+      const comments = getCommentNodes(thread);
+      if (!comments || !isRecord(thread.comments) || !isRecord(thread.comments.pageInfo)
+        || thread.comments.pageInfo.hasNextPage !== false) return undefined;
+      for (const comment of comments) {
+        if (!isRecord(comment) || typeof comment.url !== "string" || !comment.url) return undefined;
+        if (thread.isResolved || thread.isOutdated) closed.add(comment.url);
       }
     }
 
-    if (reviewThreads.pageInfo?.hasNextPage !== true) return closed;
-    if (typeof reviewThreads.pageInfo.endCursor !== "string" || !reviewThreads.pageInfo.endCursor) return undefined;
-
-    after = reviewThreads.pageInfo.endCursor;
+    if (!reviewThreads.pageInfo.hasNextPage) return closed;
+    const cursor = reviewThreads.pageInfo.endCursor;
+    if (typeof cursor !== "string" || !cursor || cursors.has(cursor)) return undefined;
+    cursors.add(cursor);
+    after = cursor;
   }
 }
 
@@ -1114,6 +1125,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           isResolved
           isOutdated
           comments(first: 100) {
+            pageInfo { hasNextPage }
             nodes {
               url
             }

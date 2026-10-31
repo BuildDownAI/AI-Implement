@@ -16,7 +16,9 @@ export interface ReviewCheckPair {
 export interface ReviewVerdictInput {
   headSha: string;
   checkRuns: Array<{ name: string; appSlug: string; status: string; conclusion: string | null; outputText: string | null }>;
-  inlineComments: Array<{ authorLogin: string; authorType: string; body: string; path?: string; line?: number; commitId?: string; url?: string }>;
+  inlineComments: Array<{ authorLogin: string; authorType: string; body: string; path?: string; line?: number; commitId?: string; url?: string; threadOpen?: boolean }>;
+  /** Successful thread read, including an empty comment list. Partial per-comment state still falls back. */
+  inlineCommentThreadsRead?: boolean;
   issueComments: Array<{ authorLogin: string; authorType: string; body: string; updatedAt?: string }>;
   /** Findings blocks (ADR 020) already extracted from trusted comments, newest first. */
   blocks: ReviewFindingsBlockResult[];
@@ -91,9 +93,16 @@ function codexVerdict(input: ReviewVerdictInput): ReviewVerdictResult {
     if (!state || state.commit_sha !== input.headSha) continue;
     if (state.status === "failed") return { ...waiting, verdict: "no-real-verdict" };
     if (state.status !== "completed" || typeof state.has_unresolved_findings !== "boolean") return waiting;
-    const findings = inlineFindings({ ...input, inlineComments: input.inlineComments.filter((c) => c.commitId === input.headSha && classifyCodexBadge(c.body) !== "untagged") }, CODEX_AUTHORS, classifyCodexBadge);
-    // An unresolved state approves only when readable head badges establish P2-only advice.
-    const minorOnly = findings.length > 0 && findings.every((f) => f.severity === "minor");
+    const threadStateKnown = input.inlineComments.length === 0
+      ? input.inlineCommentThreadsRead === true
+      : input.inlineComments.every((c) => typeof c.threadOpen === "boolean");
+    const badges = input.inlineComments.filter((c) => classifyCodexBadge(c.body) !== "untagged"
+      && (threadStateKnown ? c.threadOpen : c.commitId === input.headSha));
+    // Only the thread-aware Codex path bypasses the shared current-head filter.
+    const findings = inlineFindings({
+      ...input, inlineComments: threadStateKnown ? badges.map((c) => ({ ...c, commitId: undefined })) : badges,
+    }, CODEX_AUTHORS, classifyCodexBadge);
+    const minorOnly = (threadStateKnown || findings.length > 0) && findings.every((f) => f.severity === "minor");
     return {
       verdict: state.has_unresolved_findings && !minorOnly ? "changes_requested" : "approve",
       source: "codex-state",
