@@ -671,7 +671,14 @@ export const startDeployTool = tool(
     auditDetail: (input) => `branch=${input.args.branch}`,
   },
   async (ctx, input): Promise<ToolResponse> => {
-    const result = await ctx.objectClient(SelfDeploy, selfDeployKey()).start(input.args);
+    const client = ctx.objectClient(SelfDeploy, selfDeployKey());
+    // Shared status stays available while exclusive apply holds the object.
+    const { deploy } = await client.status();
+    if (deploy && ["draining", "applying", "verifying"].includes(deploy.phase)) {
+      const result = { deployId: deploy.deployId, commit: deploy.target.commit, image: deploy.target.image, alreadyActive: true };
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
+    const result = await client.start(input.args);
     if ("reason" in result) return toolError(result.reason);
     return { content: [{ type: "text", text: JSON.stringify(result) }] };
   },
