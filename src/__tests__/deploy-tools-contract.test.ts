@@ -27,11 +27,12 @@ const record = (over: Partial<SelfDeployRecord> = {}): SelfDeployRecord => ({
 /** A SelfDeploy object that answers `start` and `status` with canned, typed values; `starts` counts the start calls. */
 function selfDeploy(start: SelfDeployStartResult, deploy: SelfDeployRecord | null = null) {
   const starts: unknown[] = [];
+  let statuses = 0;
   const client: Pick<SelfDeployClient, "start" | "status"> = {
     start: async (input) => { starts.push(input); return start; },
-    status: async (): Promise<SelfDeployStatus> => ({ deploy, options: { applyFlyToml: false } }),
+    status: async (): Promise<SelfDeployStatus> => { statuses++; return { deploy, options: { applyFlyToml: false } }; },
   };
-  return { starts, objectClient: (_definition: unknown, _key: string) => client };
+  return { starts, get statuses() { return statuses; }, objectClient: (_definition: unknown, _key: string) => client };
 }
 
 const started: SelfDeployStartResult = { deployId: DEPLOY_ID, commit: COMMIT, image: IMAGE, alreadyActive: false };
@@ -64,10 +65,35 @@ describe("recorded start_deploy exchanges", () => {
     const active = { ...started, alreadyActive: true };
     // SelfDeploy.start sets the hold, so a retry during a drain goes through the real gate.
     setDeployHold();
-    const recorded = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: selfDeploy(active, record()).objectClient, realHoldGate: true });
+    const object = selfDeploy(active, record());
+    const recorded = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: object.objectClient, realHoldGate: true });
+    expect(object.starts).toEqual([]);
+    expect(object.statuses).toBe(1);
     // A second start while a deploy drains returns the same deployId.
     expect(JSON.parse(textOf(recorded))).toEqual({ ...started, alreadyActive: true });
     checkExchange("start_deploy", "already-active", recorded);
+  });
+
+  it.each(["draining", "applying", "verifying"] as const)("bypasses start for %s", async (phase) => {
+    const object = selfDeploy({ reason: "not-configured" }, record({ phase }));
+    const response = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: object.objectClient });
+    expect(JSON.parse(textOf(response))).toEqual({ ...started, alreadyActive: true });
+    expect(object.starts).toEqual([]);
+  });
+
+  it.each([null, "succeeded", "failed", "cancelled"] as const)("starts for inactive status %s", async (phase) => {
+    const object = selfDeploy(started, phase ? record({ phase }) : null);
+    const response = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: object.objectClient });
+    expect(JSON.parse(textOf(response))).toEqual(started);
+    expect(object.starts).toEqual([ARGS]);
+  });
+
+  it("preserves the alreadyActive race fallback from start", async () => {
+    const active = { ...started, alreadyActive: true };
+    const object = selfDeploy(active);
+    const response = await recordExchange("start_deploy", { args: ARGS }, { ...DEPLOY, objectClient: object.objectClient });
+    expect(JSON.parse(textOf(response))).toEqual(active);
+    expect(object.starts).toEqual([ARGS]);
   });
 
   it("image-not-published", async () => {
@@ -91,6 +117,7 @@ describe("recorded start_deploy exchanges", () => {
     expect(recorded.response.body.isError).toBe(true);
     expect(textOf(recorded)).toBe("forbidden: start_deploy requires the admin role");
     expect(object.starts).toEqual([]);
+    expect(object.statuses).toBe(0);
     checkExchange("start_deploy", "read-scope-refused", recorded);
   });
 
