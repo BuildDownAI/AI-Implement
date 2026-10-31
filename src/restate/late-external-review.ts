@@ -16,13 +16,13 @@ import { z } from "zod";
 import type { AppConfig } from "../index.js";
 import { parse as parseYaml } from "yaml";
 import { parseReviewCheckNamesConfig } from "../pipeline/steps/install.js";
-import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
+import { defaultFetchSignal, parseLinkNext, getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, getJobById, recordLateReviewEnding, stampJobApproved } from "../log.js";
 import { getReviewFindingsByKeys, listOpenReviewFindings, stableReviewFindingKey } from "../review-ledger-store.js";
 import { getMappings } from "../config.js";
 import { classifyReviewIssueComment, type ReviewLedgerOptions } from "../pipeline/review-ledger.js";
-import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES } from "../review-process.js";
+import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES, type ReviewVerdictInput } from "../review-process.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -337,6 +337,29 @@ async function newestReviewRejectsHead(token: string, input: { owner: string; re
   return undefined;
 }
 
+/** Read every inline page strictly: a partial list could hide a blocking badge. */
+async function readInlineComments(token: string, input: { owner: string; repo: string; prNumber: number }): Promise<ReviewVerdictInput["inlineComments"]> {
+  const comments: ReviewVerdictInput["inlineComments"] = [];
+  let url: string | null = `https://api.github.com/repos/${input.owner}/${input.repo}/pulls/${input.prNumber}/comments?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+      signal: defaultFetchSignal(),
+    });
+    if (!res.ok) throw new Error(`late-external-review: inline comments unreadable (HTTP ${res.status})`);
+    const data = await res.json() as Array<{ user?: { login?: string; type?: string } | null; body?: string; commit_id?: string; path?: string; line?: number | null; html_url?: string }>;
+    comments.push(...data.map((c) => ({
+      authorLogin: c.user?.login ?? "", authorType: c.user?.type ?? "", body: c.body ?? "",
+      ...(c.commit_id ? { commitId: c.commit_id } : {}),
+      ...(c.path ? { path: c.path } : {}),
+      ...(c.line != null ? { line: c.line } : {}),
+      ...(c.html_url ? { url: c.html_url } : {}),
+    })));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return comments;
+}
+
 /** Production deps. A fresh installation token per call; it is never journaled. */
 export function createProductionLateExternalReviewDependencies(config: Pick<AppConfig, "githubAppId" | "githubAppPrivateKey">): LateExternalReviewDependencies {
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
@@ -377,7 +400,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       if (commentVerdict) {
         const comments = await listPrComments(t, input.owner, input.repo, input.prNumber, { strict: true });
         const { verdict } = process.readVerdict({
-          headSha: pr.headSha, checkRuns: [], inlineComments: [], blocks: [],
+          headSha: pr.headSha, checkRuns: [], inlineComments: await readInlineComments(t, input), blocks: [],
           issueComments: comments.map((c) => ({
             body: c.body, authorLogin: c.user?.login ?? "", authorType: c.user?.type ?? "",
             updatedAt: c.updatedAt ?? c.createdAt,

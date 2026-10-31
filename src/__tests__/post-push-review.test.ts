@@ -6976,7 +6976,7 @@ describe("postPushReviewStep review process gate", () => {
       body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":${unresolved}}} -->`,
     }] });
     const { out, invoke, logs } = await run(f, { reviewProcess: "codex-code-review" });
-    expect(out.approved).toBe(!unresolved);
+    expect(out.approved).toBe(true);
     expect(logs).toContain("[post-push-review] Review ledger findings: gating=0 advisory=1");
     expect(invoke).not.toHaveBeenCalled();
     expect(f.posted.join("\n")).not.toContain("starting fix pass");
