@@ -11,6 +11,8 @@ import { z } from "zod";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { orchestratorTools, tool, setReviewFixAttemptsFacade, type ToolResponse } from "../../restate/tools.js";
 import type { ReviewFixAttemptsFacade, ReviewFixAttemptDetail } from "../../admin.js";
+import type { SelfDeployRecord, SelfDeployStartResult, SelfDeployStatus } from "../../restate/self-deploy.js";
+import { serviceCaller, systemCaller, type Caller } from "../../mcp-identity.js";
 import * as dedup from "../../dedup.js";
 import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
@@ -105,6 +107,43 @@ const replayCounterTools = restate.service({
   handlers: { increment: replayCounterTool },
 });
 
+// Echoing the caller proves grants survive serde; execution counts prove denials
+// return before the handler body, including on the replay runtime.
+let authorizationExecutions = 0;
+const authorizationHandler = async (_ctx: restate.Context, input: { caller: Caller }): Promise<ToolResponse> => {
+  authorizationExecutions += 1;
+  return { content: [{ type: "text", text: JSON.stringify(input.caller) }] };
+};
+const authorizationTools = restate.service({
+  name: "authorizationTools",
+  handlers: {
+    read: tool({ description: "test read", input: z.object({}), role: "user" }, authorizationHandler),
+    admin: tool({ description: "test admin", input: z.object({}), role: "admin" }, authorizationHandler),
+    deploy: tool({ description: "test deploy", input: z.object({}), role: "admin", grant: "deploy" }, authorizationHandler),
+  },
+});
+
+// A counting stand-in for the SelfDeploy object that start_deploy and get_deploy_posture address.
+let selfDeployStarts = 0;
+let selfDeployStatusThrows = false;
+const stubDeployRecord: SelfDeployRecord = {
+  deployId: "deploy-1", phase: "draining", target: { repo: "owner/repo", branch: "testing", commit: "a".repeat(40), image: "registry.fly.io/img:testing-aaaaaaa", source: "published" },
+  requestedBy: "cp", startedAt: 1, finishedAt: null, reason: null,
+};
+const selfDeployStub = restate.object({
+  name: "SelfDeploy",
+  handlers: {
+    start: async (_ctx: restate.ObjectContext, _input: unknown): Promise<SelfDeployStartResult> => {
+      selfDeployStarts++;
+      return { deployId: stubDeployRecord.deployId, commit: stubDeployRecord.target.commit, image: stubDeployRecord.target.image, alreadyActive: false };
+    },
+    status: restate.handlers.object.shared(async (_ctx: restate.ObjectSharedContext): Promise<SelfDeployStatus> => {
+      if (selfDeployStatusThrows) throw new restate.TerminalError("unavailable");
+      return { deploy: stubDeployRecord, options: { applyFlyToml: false } };
+    }),
+  },
+});
+
 interface ToolCallResult {
   content?: Array<{ type: string; text: string }>;
   isError?: boolean;
@@ -130,11 +169,110 @@ describe("orchestratorTools (Restate)", () => {
     ).run("BDS", "BuildDownAI", "skills", "claude.yml", "testing", JSON.stringify({ SUPER_SECRET: "leak-me" }));
     setKgMemoryProvider(null);
 
-    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools]);
+    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools, authorizationTools, selfDeployStub]);
   }, 60_000);
 
   afterAll(async () => {
     await stopAll(environments);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("enforces every authorization state-table cell (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const rows: Array<[string, Caller, boolean[]]> = [
+      ["read token", serviceCaller(), [true, false, false]],
+      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true]],
+      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true]],
+      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false]],
+      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true]],
+      ["system", systemCaller(), [true, true, true]],
+    ];
+    for (const [row, caller, allowed] of rows) {
+      for (const [index, name] of ["read", "admin", "deploy"].entries()) {
+        const before = authorizationExecutions;
+        const result = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", name, { caller, args: {} });
+        if (allowed[index]) {
+          expect(result.isError, `${row}: ${name}`).not.toBe(true);
+          expect(JSON.parse(result.content![0]!.text)).toEqual(caller);
+          expect(authorizationExecutions).toBeGreaterThan(before);
+        } else {
+          expect(result.isError, `${row}: ${name}`).toBe(true);
+          expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+          expect(authorizationExecutions).toBe(before);
+        }
+      }
+    }
+    // Journaled calls from before grants existed retain empty grants and no authority.
+    const legacy = { kind: "service", email: null, role: "user" };
+    const read = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", "read", { caller: legacy, args: {} });
+    expect(JSON.parse(read.content![0]!.text).grants).toEqual([]);
+    const denied = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", "deploy", { caller: legacy, args: {} });
+    expect(denied.isError).toBe(true);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("start_deploy: deploy token and human admin start a deploy; read token and human user are forbidden (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const args = { branch: "testing", requestedBy: "cp" };
+    const call = (caller: Caller) => callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", { caller, args });
+    const before = selfDeployStarts;
+    for (const caller of [serviceCaller({ grants: ["deploy"] }), { kind: "human", email: "a@example.com", role: "admin", grants: [] } as Caller]) {
+      const result = await call(caller);
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content![0]!.text)).toEqual({ deployId: "deploy-1", commit: "a".repeat(40), image: stubDeployRecord.target.image, alreadyActive: false });
+    }
+    expect(selfDeployStarts).toBe(before + 2);
+    for (const caller of [serviceCaller(), { kind: "human", email: "u@example.com", role: "user", grants: [] } as Caller]) {
+      const result = await call(caller);
+      expect(result.isError).toBe(true);
+      expect(result.content?.[0]?.text).toBe("forbidden: start_deploy requires the admin role");
+    }
+    expect(selfDeployStarts).toBe(before + 2);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("start_deploy: two calls with one idempotency key run SelfDeploy.start once (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const key = `start-deploy-dedup-${label}`;
+    const before = selfDeployStarts;
+    const body = { caller: serviceCaller({ grants: ["deploy"] }), args: { branch: "main", requestedBy: "cp" } };
+    const first = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", body, { "idempotency-key": key });
+    const second = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "start_deploy", body, { "idempotency-key": key });
+    expect(second).toEqual(first);
+    expect(selfDeployStarts).toBe(before + 1);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("get_deploy_posture carries the SelfDeploy record, and null when the object is unreadable (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const read = async () => JSON.parse((await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_deploy_posture", { caller: serviceCaller(), args: {} })).content![0]!.text);
+    expect((await read()).selfDeploy).toEqual(stubDeployRecord);
+    selfDeployStatusThrows = true;
+    try {
+      const posture = await read();
+      expect(posture.selfDeploy).toBeNull();
+      expect(posture).toHaveProperty("deploy");
+    } finally { selfDeployStatusThrows = false; }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("deploy grants cannot reach any registered admin tool (%s)", async (label) => {
+    const env = environments.get(label)!;
+    // Bootstrap discovery with a harmless read, then select from the actual registry.
+    await callService(env.baseUrl(), "orchestratorTools", "get_runner_mode", { caller: SYSTEM, args: {} });
+    const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+    expect(response.ok).toBe(true);
+    const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
+    const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
+    expect(admins.length).toBeGreaterThan(0);
+    // A superset of schema-valid fields covers every current admin handler. Unknown
+    // fields are stripped by its schema; missing/new required fields fail ingress.
+    const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
+      backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
+      paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
+    // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
+    for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
+        caller: serviceCaller({ grants: ["deploy"] }), args,
+      });
+      expect(result.isError, name).toBe(true);
+      expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+    }
   });
 
   it.each(VARIANTS.map(([label]) => label))(

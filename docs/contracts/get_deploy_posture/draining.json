@@ -1,0 +1,14 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"autoDeploy\": false,\n  \"watchedRepo\": null,\n  \"watchedRef\": null,\n  \"runningCommit\": null,\n  \"headCommit\": null,\n  \"upToDate\": null,\n  \"deploy\": {\n    \"held\": true,\n    \"inFlight\": false,\n    \"lastOutcome\": null\n  },\n  \"runnerChannel\": {\n    \"image\": \"ghcr.io/builddownai/ai-implement-runner\",\n    \"channelTag\": null,\n    \"channelCommit\": null,\n    \"matchesHead\": null\n  },\n  \"mergeCost\": \"none\",\n  \"selfDeploy\": {\n    \"deployId\": \"5d1f1c58-6a52-4d3e-9a0e-0c1b7d8f2e41\",\n    \"phase\": \"draining\",\n    \"target\": {\n      \"repo\": \"owner/repo\",\n      \"branch\": \"testing\",\n      \"commit\": \"0123456789abcdef0123456789abcdef01234567\",\n      \"image\": \"registry.fly.io/builddown-orchestrator-image:testing-0123456\",\n      \"source\": \"published\"\n    },\n    \"requestedBy\": \"control-plane\",\n    \"startedAt\": 1700000000000,\n    \"finishedAt\": null,\n    \"reason\": null\n  }\n}"
+      }
+    ]
+  }
+}

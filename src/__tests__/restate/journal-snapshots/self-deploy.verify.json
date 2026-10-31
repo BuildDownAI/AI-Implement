@@ -1,0 +1,22 @@
+[
+  {
+    "type": "Input",
+    "name": ""
+  },
+  {
+    "type": "GetEagerState",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "read source commit"
+  },
+  {
+    "type": "OneWayCall",
+    "name": ""
+  },
+  {
+    "type": "Output",
+    "name": ""
+  }
+]

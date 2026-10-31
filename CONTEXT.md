@@ -205,3 +205,15 @@ The refresher is the single holder of a ChatGPT plan account's refresh token: th
 An access-token grant is one checkout of the `chatgpt-access-token` secret kind: an access token and its expiry, valid for about an hour. Renewing is another checkout.
 
 **Not to be confused with:** The refresh token, which stays with the refresher; or a reservation, which hosted ChatGPT plan accounts do not take.
+
+## Self-deploy
+
+A self-deploy is the orchestrator moving itself to a newer build of its watched branch. It drains work, changes the image of its own machine, and checks after the restart that it runs the target commit.
+
+**Not to be confused with:** A KG refresh, which changes the knowledge graph and not the orchestrator's code.
+
+## Deploy hold
+
+The deploy hold is the flag that stops new work while a self-deploy drains. The self-deploy sets it at the start and clears it when the deploy ends, whether it succeeds, fails, or is cancelled.
+
+**Not to be confused with:** A KG hold, which pauses one KG refresh for an operator decision.

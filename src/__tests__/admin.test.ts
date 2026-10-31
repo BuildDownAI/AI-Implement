@@ -7,6 +7,7 @@ import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
 import { createModelSessionStore } from "../model-session-store.js";
 import type * as AdminModule from "../admin.js";
+import type { SelfDeployClient } from "../restate/self-deploy.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { AIImplementSnapshot } from "../providers/types.js";
@@ -4226,27 +4227,40 @@ describe("github-install-state endpoint", () => {
   });
 });
 
+/** A fake `SelfDeploy` ingress client: each method is a spy a test can override. */
+function fakeSelfDeploy(over: Partial<SelfDeployClient> = {}): SelfDeployClient {
+  return {
+    releaseUnownedHold: vi.fn(async () => ({ released: true })),
+    start: vi.fn(async () => ({ deployId: "d1", commit: "abc1234", image: "registry.fly.io/app:testing-abc1234", alreadyActive: false })),
+    cancel: vi.fn(async () => ({ cancelled: true })),
+    status: vi.fn(async () => ({ deploy: null, options: { applyFlyToml: false } })),
+    setOptions: vi.fn(async (options) => ({ ok: true as const, options })),
+    ...over,
+  };
+}
+const DEPLOY_TARGET = { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" };
+
 describe("POST /api/deploy", () => {
   // The shared harness never passes deps, which is itself the 501 case; the rest need
-  // a stubbed starter, so the route is exercised without touching Fly or GitHub.
+  // a fake ingress client, so the route is exercised without touching Restate, Fly or GitHub.
   async function deployRequest(
     token: string,
     deps: AdminModule.AdminDeps,
+    url = "/api/deploy",
   ): Promise<{ statusCode: number; body: string }> {
-    const req = new MockRequest("/api/deploy", "POST", { authorization: `Bearer ${token}` }, undefined);
+    const req = new MockRequest(url, "POST", { authorization: `Bearer ${token}` }, undefined);
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
+  const adminToken = () => adminSession.createSession({ email: "ada@eudoxus.ai", sub: "google|ada", provider: "google", name: "Ada" });
 
-  it("rejects an unauthenticated request before consulting the starter", async () => {
-    let called = false;
-    const res = await deployRequest("not-a-session", {
-      startDeploy: async () => { called = true; return { started: true, commit: "abc1234" }; },
-    });
+  it("rejects an unauthenticated request before consulting SelfDeploy", async () => {
+    const selfDeploy = fakeSelfDeploy();
+    const res = await deployRequest("not-a-session", { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
     expect(res.statusCode).toBe(401);
-    expect(called).toBe(false);
+    expect(selfDeploy.start).not.toHaveBeenCalled();
   });
 
   it("answers 501 when the orchestrator is not configured to deploy itself", async () => {
@@ -4255,40 +4269,71 @@ describe("POST /api/deploy", () => {
     expect(res.statusCode).toBe(501);
   });
 
-  it("answers 202 with the commit when a deploy starts", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => ({ started: true, commit: "abc1234" }),
-    });
+  it("starts the watched branch as the admin's email and answers 202 with the deploy", async () => {
+    const selfDeploy = fakeSelfDeploy();
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
     expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).deploying).toBe("abc1234");
+    expect(JSON.parse(res.body)).toEqual({ deployId: "d1", commit: "abc1234", image: "registry.fly.io/app:testing-abc1234", alreadyActive: false });
+    expect(selfDeploy.start).toHaveBeenCalledWith({ branch: "testing", requestedBy: "ada@eudoxus.ai" });
   });
 
-  it("answers 409 when a deploy is already running", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => ({ started: false, reason: "deploy-in-progress" }),
-    });
-    expect(res.statusCode).toBe(409);
+  it("returns the same deployId with alreadyActive on a second call while active", async () => {
+    const active = { deployId: "d1", commit: "abc1234", image: "img", alreadyActive: true };
+    const selfDeploy = fakeSelfDeploy({ start: vi.fn(async () => active) });
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toMatchObject({ deployId: "d1", alreadyActive: true });
   });
 
-  it("answers 503 when HEAD cannot be resolved", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => ({ started: false, reason: "head-unknown" }),
-    });
-    expect(res.statusCode).toBe(503);
+  it.each([
+    ["head-unknown", 503, { error: "head-unknown" }],
+    ["image-not-published", 409, { error: "image-not-published" }],
+    ["not-configured", 501, { error: "not-configured" }],
+  ] as const)("maps %s to %i", async (reason, status, body) => {
+    const selfDeploy = fakeSelfDeploy({ start: vi.fn(async () => ({ reason })) });
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
+    expect(res.statusCode).toBe(status);
+    expect(JSON.parse(res.body)).toEqual(body);
+  });
+
+  it("refuses a watched ref with no published image channel instead of failing input validation", async () => {
+    const selfDeploy = fakeSelfDeploy();
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: { ...DEPLOY_TARGET, branch: "v1.2.3" } });
+    expect(res.statusCode).toBe(400);
+    expect(selfDeploy.start).not.toHaveBeenCalled();
   });
 
   it("answers 500 without echoing the error text", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => { throw new Error("kg_token=super-secret"); },
-    });
+    const selfDeploy = fakeSelfDeploy({ start: vi.fn(async () => { throw new Error("kg_token=super-secret"); }) });
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
     expect(res.statusCode).toBe(500);
     // Admin 5xx bodies leaking raw error text is a known defect elsewhere; this route
     // must not add to it, and the thrown message here would carry a build secret.
     expect(res.body).not.toContain("super-secret");
+  });
+
+  describe("POST /api/deploy-cancel", () => {
+    const cancel = (token: string, deps: AdminModule.AdminDeps) => deployRequest(token, deps, "/api/deploy-cancel");
+
+    it("answers 403 to a user-role session without calling SelfDeploy", async () => {
+      const selfDeploy = fakeSelfDeploy();
+      const user = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+      const res = await cancel(user, { selfDeploy });
+      expect(res.statusCode).toBe(403);
+      expect(selfDeploy.cancel).not.toHaveBeenCalled();
+    });
+
+    it("calls cancel with the admin's email and returns its answer unchanged", async () => {
+      const selfDeploy = fakeSelfDeploy({ cancel: vi.fn(async () => ({ cancelled: false, reason: "too-late" })) });
+      const res = await cancel(adminToken(), { selfDeploy });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ cancelled: false, reason: "too-late" });
+      expect(selfDeploy.cancel).toHaveBeenCalledWith({ requestedBy: "ada@eudoxus.ai" });
+    });
+
+    it("answers 501 when self-deploy is not configured", async () => {
+      expect((await cancel(adminToken(), {})).statusCode).toBe(501);
+    });
   });
 });
 
@@ -4443,7 +4488,7 @@ describe("POST /api/tools/<name>", () => {
     expect(captured).toEqual({
       name: "get_tenant_health",
       args: { foo: "bar" },
-      caller: { kind: "human", email: null, role: "admin" },
+      caller: { kind: "human", email: null, role: "admin", grants: [] },
     });
   });
 
@@ -4469,7 +4514,7 @@ describe("POST /api/tools/<name>", () => {
       },
     }, "some_write_tool");
     expect(res.statusCode).toBe(200);
-    expect(capturedCaller).toEqual({ kind: "human", email: "reader@eudoxus.ai", role: "user" });
+    expect(capturedCaller).toEqual({ kind: "human", email: "reader@eudoxus.ai", role: "user", grants: [] });
     expect(JSON.parse(res.body)).toEqual({
       content: [{ type: "text", text: "forbidden: some_write_tool requires the admin role" }],
       isError: true,
@@ -4645,13 +4690,13 @@ describe("control-plane token on /api (AII-1514)", () => {
     const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
     const res = await call("/api/tools/get_tenant_health", "POST", await cpToken(), { callTool });
     expect(res.statusCode).toBe(200);
-    expect(callTool).toHaveBeenCalledWith("get_tenant_health", {}, { kind: "service", email: null, role: "user" }, undefined);
+    expect(callTool).toHaveBeenCalledWith("get_tenant_health", {}, { kind: "service", email: null, role: "user", grants: [] }, undefined);
   });
 
   it("hands a write tool the user-role service caller, which the tool() wrapper refuses", async () => {
     const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
     await call("/api/tools/set_runner_mode", "POST", await cpToken(), { callTool });
-    expect(callTool.mock.calls[0]?.[2]).toEqual({ kind: "service", email: null, role: "user" });
+    expect(callTool.mock.calls[0]?.[2]).toEqual({ kind: "service", email: null, role: "user", grants: [] });
   });
 
   it("answers 401 for a token for another orchestrator, without running the tool", async () => {
@@ -4666,6 +4711,7 @@ describe("control-plane token on /api (AII-1514)", () => {
     ["/api/mappings", "GET"],
     ["/api/mappings", "POST"],
     ["/api/deploy", "POST"],
+    ["/api/deploy-cancel", "POST"],
     ["/api/tools/get_tenant_health", "GET"],
   ])("answers 401 to the token on %s %s", async (url, method) => {
     const res = await call(url, method, await cpToken());
@@ -5176,10 +5222,32 @@ describe("GET /api/deployment-status", () => {
 
   it("reports configured when a starter is injected", async () => {
     const token = await login("secret");
-    const res = await statusRequest(token, {
-      startDeploy: async () => ({ started: true, commit: "abc1234" }),
-    });
+    const res = await statusRequest(token, { selfDeploy: fakeSelfDeploy() });
     expect(res.body.configured).toBe(true);
+  });
+
+  it("includes SelfDeploy's status, and null when it is not configured", async () => {
+    const token = await login("secret");
+    const status = { deploy: null, options: { applyFlyToml: true } };
+    const res = await statusRequest(token, { selfDeploy: fakeSelfDeploy({ status: vi.fn(async () => status) }) });
+    expect(res.body.selfDeploy).toEqual(status);
+    expect((await statusRequest(token, {})).body.selfDeploy).toBeNull();
+  });
+
+  it("still answers when the SelfDeploy status call fails", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, { selfDeploy: fakeSelfDeploy({ status: vi.fn(async () => { throw new Error("down"); }) }) });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.selfDeploy).toBeNull();
+  });
+
+  it("reports applyFlyTomlAllowed only while FLY_IMAGE_APP is unset", async () => {
+    const token = await login("secret");
+    vi.stubEnv("FLY_IMAGE_APP", "");
+    expect((await statusRequest(token)).body.applyFlyTomlAllowed).toBe(true);
+    vi.stubEnv("FLY_IMAGE_APP", "owned-images");
+    expect((await statusRequest(token)).body.applyFlyTomlAllowed).toBe(false);
+    vi.unstubAllEnvs();
   });
 
   it("passes an unresolved availability through as null, never as false", async () => {
@@ -5313,10 +5381,10 @@ describe("GET /api/deployment-status", () => {
 });
 
 describe("POST /api/deploy-policy", () => {
-  async function policyRequest(token: string, body: unknown): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+  async function policyRequest(token: string, body: unknown, deps: AdminModule.AdminDeps = {}): Promise<{ statusCode: number; body: Record<string, unknown> }> {
     const req = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${token}` }, JSON.stringify(body));
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
     await res.done;
     return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
   }
@@ -5332,6 +5400,30 @@ describe("POST /api/deploy-policy", () => {
     const token = await login("secret");
     const res = await policyRequest(token, { autoDeploy: "false" });
     expect(res.statusCode).toBe(400);
+  });
+
+  it("stores applyFlyToml in SelfDeploy state, not in SQLite", async () => {
+    const token = await login("secret");
+    const selfDeploy = fakeSelfDeploy();
+    const res = await policyRequest(token, { applyFlyToml: true }, { selfDeploy });
+    expect(res.statusCode).toBe(200);
+    expect(selfDeploy.setOptions).toHaveBeenCalledWith({ applyFlyToml: true });
+  });
+
+  it("answers 409 apply-fly-toml-refused when SelfDeploy refuses, leaving the rest of the policy alone", async () => {
+    const token = await login("secret");
+    const selfDeploy = fakeSelfDeploy({ setOptions: vi.fn(async () => ({ ok: false as const, reason: "apply-fly-toml-refused" as const })) });
+    const res = await policyRequest(token, { applyFlyToml: true, autoDeploy: true }, { selfDeploy });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: "apply-fly-toml-refused" });
+    expect(modules.deployPolicy.getDeployPolicy().autoDeploy).toBe(false);
+  });
+
+  it("rejects a non-boolean applyFlyToml", async () => {
+    const token = await login("secret");
+    const selfDeploy = fakeSelfDeploy();
+    expect((await policyRequest(token, { applyFlyToml: "true" }, { selfDeploy })).statusCode).toBe(400);
+    expect(selfDeploy.setOptions).not.toHaveBeenCalled();
   });
 
   it("returns the full policy so the page renders the server's view", async () => {
