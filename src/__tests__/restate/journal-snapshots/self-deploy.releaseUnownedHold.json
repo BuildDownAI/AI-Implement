@@ -1,0 +1,18 @@
+[
+  {
+    "type": "Input",
+    "name": ""
+  },
+  {
+    "type": "GetEagerState",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "clear unowned hold"
+  },
+  {
+    "type": "Output",
+    "name": ""
+  }
+]

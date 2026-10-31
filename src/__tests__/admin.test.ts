@@ -4230,6 +4230,7 @@ describe("github-install-state endpoint", () => {
 /** A fake `SelfDeploy` ingress client: each method is a spy a test can override. */
 function fakeSelfDeploy(over: Partial<SelfDeployClient> = {}): SelfDeployClient {
   return {
+    releaseUnownedHold: vi.fn(async () => ({ released: true })),
     start: vi.fn(async () => ({ deployId: "d1", commit: "abc1234", image: "registry.fly.io/app:testing-abc1234", alreadyActive: false })),
     cancel: vi.fn(async () => ({ cancelled: true })),
     status: vi.fn(async () => ({ deploy: null, options: { applyFlyToml: false } })),

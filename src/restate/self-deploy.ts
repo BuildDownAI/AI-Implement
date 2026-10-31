@@ -206,6 +206,11 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     await finish(ctx, record, "cancelled");
     return { cancelled: true };
   }
+  async function releaseUnownedHold(ctx: restate.ObjectContext) {
+    if (active(await read(ctx))) return { released: false };
+    await ctx.run("clear unowned hold", () => deps.setHold(false));
+    return { released: true };
+  }
   async function setOptions(ctx: restate.ObjectContext, input: SelfDeployOptions): Promise<SelfDeploySetOptionsResult> {
     // The control plane owns that machine's config; fly.toml would change its VM size and mount.
     if (input.applyFlyToml && await ctx.run("read image app", () => deps.config().imageApp ?? null)) {
@@ -226,9 +231,21 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     verify: restate.handlers.object.exclusive({ ingressPrivate: true, input: serde.zod(z.object({ attempt: z.number().int().min(1).max(5) }).strict()) }, verify),
     cancel: restate.handlers.object.exclusive({ input: serde.zod(z.object({ requestedBy: requester }).strict()) }, cancel),
     setOptions: restate.handlers.object.exclusive({ input: serde.zod(z.object({ applyFlyToml: z.boolean() }).strict()) }, setOptions),
+    releaseUnownedHold: restate.handlers.object.exclusive({ ingressPrivate: true }, releaseUnownedHold),
     status: restate.handlers.object.shared(status),
   } });
 }
+
+/** Loopback boot entry point: Restate ingress cannot call private object handlers directly. */
+export const selfDeployRecovery = restate.service({
+  name: "SelfDeployRecovery",
+  handlers: {
+    releaseUnownedHold: restate.handlers.handler({
+      input: serde.zod(z.object({ key: z.string().min(1) }).strict()),
+    }, async (ctx: restate.Context, input: { key: string }) =>
+      ctx.objectClient<SelfDeployDefinition>({ name: "SelfDeploy" }, input.key).releaseUnownedHold()),
+  },
+});
 
 /** Registry authentication is performed by the effect's caller; only the status is journaled. */
 export async function publishedImageManifestHead(image: string, token: string, fetchImpl: typeof fetch = fetch): Promise<number> {
@@ -246,16 +263,18 @@ export type SelfDeployDefinition = ReturnType<typeof createSelfDeploy>;
 export interface SelfDeployClient {
   start(input: { branch: "testing" | "main"; requestedBy: string }): Promise<SelfDeployStartResult>;
   cancel(input: { requestedBy: string }): Promise<{ cancelled: boolean; reason?: string }>;
+  releaseUnownedHold(): Promise<{ released: boolean }>;
   status(): Promise<SelfDeployStatus>;
   setOptions(input: SelfDeployOptions): Promise<SelfDeploySetOptionsResult>;
 }
 
 export function createSelfDeployIngressClient(key: () => string = () => process.env.FLY_APP_NAME ?? "orchestrator", baseUrl: string = RESTATE_INGRESS_BASE_URL): SelfDeployClient {
-  const obj = () => restateClients.connect({ url: baseUrl, fetch: (input, init) => fetch(input as never, { ...init, signal: AbortSignal.timeout(INGRESS_TIMEOUT_MS) }) })
-    .objectClient<SelfDeployDefinition>({ name: "SelfDeploy" }, key());
+  const ingress = () => restateClients.connect({ url: baseUrl, fetch: (input, init) => fetch(input as never, { ...init, signal: AbortSignal.timeout(INGRESS_TIMEOUT_MS) }) });
+  const obj = () => ingress().objectClient<SelfDeployDefinition>({ name: "SelfDeploy" }, key());
   return {
     start: async (input) => await obj().start(input),
     cancel: async (input) => await obj().cancel(input),
+    releaseUnownedHold: async () => await ingress().serviceClient(selfDeployRecovery).releaseUnownedHold({ key: key() }),
     status: async () => await obj().status(),
     setOptions: async (input) => await obj().setOptions(input),
   };
