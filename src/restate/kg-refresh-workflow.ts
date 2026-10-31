@@ -1232,6 +1232,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
     }
   }
 
+  // Producer: handleRunnerResult in src/runner-callback.ts (the verify-only runner callback).
   async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate" }> {
     const body = raw as KgRefreshReportBody;
     await requireStarted(ctx);

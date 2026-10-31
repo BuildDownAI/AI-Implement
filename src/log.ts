@@ -1225,7 +1225,11 @@ const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
  */
 export function recordInvocationAttribution(
   dispatchId: string,
-  row: InvocationUsageRow,
+  row: Omit<InvocationUsageRow, "snapshotId" | "configRevisions" | "authMode"> & {
+    authMode: InvocationUsageRow["authMode"] | "unknown";
+    snapshotId: string | null;
+    configRevisions: InvocationUsageRow["configRevisions"] | null;
+  },
   opts: { timedOut?: boolean; now?: number } = {},
 ): boolean {
   if (row.invocationId === null) return false;
@@ -1254,7 +1258,7 @@ export function recordInvocationAttribution(
     )
     .run(
       row.invocationId, dispatchId, row.stage, row.profileId, row.profileRevision, row.agent, row.provider,
-      row.model, row.authMode, row.configRevisions.project.configRevisionId, row.snapshotId, status, now, now,
+      row.model, row.authMode, row.configRevisions?.project.configRevisionId ?? null, row.snapshotId, status, now, now,
       JSON.stringify(usage),
     );
   return info.changes > 0;

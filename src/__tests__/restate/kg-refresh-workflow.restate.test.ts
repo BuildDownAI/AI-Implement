@@ -58,16 +58,10 @@ import {
   journalText,
 } from "./harness.js";
 
-function seedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
+function reportedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
   const snapshotId = `snapshot-${dispatchId}`;
   const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "kg-profile", invocationTimeoutMs: 60_000 };
   const profile = { id: "kg-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
-  getDb().prepare(`INSERT OR IGNORE INTO run_agent_config_snapshots
-    (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
-    VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snapshotId, dispatchId,
-      JSON.stringify({ stages: { planning: selection, implementation: selection, review: selection }, profiles: { planning: profile, implementation: profile, review: profile } }),
-      JSON.stringify(Object.fromEntries(["planning", "implementation", "review"].map((stage) => [stage, Object.fromEntries(Object.keys(selection).map((field) => [field, "project"]))]))),
-      JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }));
   return toRecordedUsage({ invocations: items.map((item) => ({ attribution: {
     version: 1, invocationId: `${dispatchId}-inv-${item}`, snapshotId, stage: "planning",
     agent: selection.agent, provider: selection.provider, model: selection.model,
@@ -1153,13 +1147,15 @@ describe("KgRefresh durable workflow", () => {
     const done = runWorkflow(url, key);
     await eventually(() => scenarios.get(key)!.dispatchCalls === 1, Boolean, { label: "dispatch" });
     const id = appendLog({ dispatchId: key, issueId: "kg-refresh", phase: "kg-refresh" });
-    const body = { ...STALE_REPORT, usage: seedUsage(key) };
+    const body = { ...STALE_REPORT, usage: reportedUsage(key) };
     expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toEqual({ status: "accepted" });
     const rows = storedRows(key);
     expect(rows).toHaveLength(2);
+    expect(rows).toMatchObject([{ snapshot_id: null, config_revision_id: null }, { snapshot_id: null, config_revision_id: null }]);
+    expect(getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(key)).toBeUndefined();
     await done;
     expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toEqual({ status: "duplicate" });
-    await expect(callWorkflow(url, "KgRefresh", key, "report", { ...body, usage: seedUsage(key, 99) })).rejects.toThrow(/409/);
+    await expect(callWorkflow(url, "KgRefresh", key, "report", { ...body, usage: reportedUsage(key, 99) })).rejects.toThrow(/409/);
     expect(storedRows(key)).toEqual(rows);
     // Job-log effects are faked in this fixture; mirror production closing its dispatch row.
     getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(Date.now(), id);
@@ -1721,6 +1717,7 @@ describe("KgRefresh durable workflow", () => {
           const label = VARIANTS.map(([label]) => label).find((label) => key.startsWith(`contract-${label}-`))!;
           const url = envFor(label).baseUrl();
           makeScenario(key, { runId: runIdCounter++, executionMode: "fly-machines" });
+          appendLog({ dispatchId: key, issueId: "kg-refresh", phase: "kg-refresh" });
           const done = runWorkflow(url, key);
           return {
             runId: key, done,
@@ -1728,7 +1725,7 @@ describe("KgRefresh durable workflow", () => {
             finish: async () => { await callWorkflow(url, "KgRefresh", key, "report", STALE_REPORT); },
             report: async (value: unknown) => {
               const { usage, items } = value as { usage: { tokens: number; cost: number }; items: number[] };
-              const body = { ...STALE_REPORT, usage: seedUsage(key, usage.tokens, usage.cost, [items.reduce((sum, item) => sum + item, 0)]) };
+              const body = { ...STALE_REPORT, usage: reportedUsage(key, usage.tokens, usage.cost, [items.reduce((sum, item) => sum + item, 0)]) };
               // Preserve the contract's reordered delivery through the KG-specific mapping,
               // including nested usage objects, without changing array order.
               const reordered = Object.keys(value as object)[0] === "items";
