@@ -856,6 +856,7 @@ export async function handleRunnerResult(
         lostTeams: input.body.lostTeams,
         warnings: input.body.warnings,
         guardVerdict: input.body.guardVerdict,
+        usage: toRecordedUsage(body),
       },
       { idempotencyKey: dispatchId },
     );

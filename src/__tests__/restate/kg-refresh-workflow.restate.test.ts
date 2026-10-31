@@ -11,6 +11,10 @@
 // dispatches `KgRefresh.run` directly with a test-chosen triggerId, and the real KgRepo's
 // `release` send for that unrelated key is a harmless no-op.
 import { buildKgRefreshRunConfig } from "../../run-config.js";
+import { getDb } from "../../dedup.js";
+import { appendLog, initLogTable } from "../../log.js";
+import { toRecordedUsage } from "../../agent-usage.js";
+import { JobAccountingPageSchema } from "../../job-accounting.js";
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -53,6 +57,30 @@ import {
   journalEntryNames,
   journalText,
 } from "./harness.js";
+
+function reportedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
+  const snapshotId = `snapshot-${dispatchId}`;
+  const selection = { agent: "claude", provider: "anthropic", model: "claude-model", accountProfileId: "kg-profile", invocationTimeoutMs: 60_000 };
+  const profile = { id: "kg-profile", identity: "account", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
+  return toRecordedUsage({ invocations: items.map((item) => ({ attribution: {
+    version: 1, invocationId: `${dispatchId}-inv-${item}`, snapshotId, stage: "planning",
+    agent: selection.agent, provider: selection.provider, model: selection.model,
+    profileId: profile.id, authMode: profile.authMode, limit: null, outcome: "success",
+    usage: { availability: "complete", tokensIn: tokens, tokensOut: 2, costUsd: cost, costStatus: "reported" },
+  } })) });
+}
+
+const storedRows = (dispatchId: string) => getDb().prepare(
+  "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
+).all(dispatchId);
+
+function reverseObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseObjectKeys);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).reverse().map(([key, entry]) => [key, reverseObjectKeys(entry)]));
+  }
+  return value;
+}
 
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
@@ -688,7 +716,8 @@ describe("KgRefresh durable workflow", () => {
   let deadlineEnvs: Map<string, RestateEnvironment>;
   let bootstrapEnvs: Map<string, RestateEnvironment>;
   beforeAll(async () => {
-    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
+    initLogTable();
+    envs = await startVariants([workflow, kgRepo, starter, flyMachineProfile, ghaRunProfile, orchestratorTools]);
     deadlineEnvs = await startVariants([deadlineWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
     bootstrapEnvs = await startVariants([bootstrapOnlyWorkflow, kgRepo, starter, flyMachineProfile, ghaRunProfile]);
   }, 120_000);
@@ -1110,6 +1139,31 @@ describe("KgRefresh durable workflow", () => {
     },
     30_000,
   );
+
+  it.each(VARIANTS.map(([label]) => label))("stores KG usage once and serves job accounting (%s)", async (label) => {
+    const url = envFor(label).baseUrl();
+    const key = newTriggerId();
+    makeScenario(key, { runId: runIdCounter++, executionMode: "fly-machines" });
+    const done = runWorkflow(url, key);
+    await eventually(() => scenarios.get(key)!.dispatchCalls === 1, Boolean, { label: "dispatch" });
+    const id = appendLog({ dispatchId: key, issueId: "kg-refresh", phase: "kg-refresh" });
+    const body = { ...STALE_REPORT, usage: reportedUsage(key) };
+    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toEqual({ status: "accepted" });
+    const rows = storedRows(key);
+    expect(rows).toHaveLength(2);
+    expect(rows).toMatchObject([{ snapshot_id: null, config_revision_id: null }, { snapshot_id: null, config_revision_id: null }]);
+    expect(getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(key)).toBeUndefined();
+    await done;
+    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toEqual({ status: "duplicate" });
+    await expect(callWorkflow(url, "KgRefresh", key, "report", { ...body, usage: reportedUsage(key, 99) })).rejects.toThrow(/409/);
+    expect(storedRows(key)).toEqual(rows);
+    // Job-log effects are faked in this fixture; mirror production closing its dispatch row.
+    getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(Date.now(), id);
+    const result = await callService<{ content: Array<{ text: string }> }>(url, "orchestratorTools", "list_job_accounting",
+      { caller: { kind: "service", email: null, role: "user" }, args: { includeUnsettled: true } });
+    const page = JobAccountingPageSchema.parse(JSON.parse(result.content[0].text));
+    expect(page.records.find((row) => row.dispatchId === key)?.invocations).toHaveLength(2);
+  });
 
   // ---- W2: idempotency-key semantics on `report` ----
   it.each(VARIANTS.map(([label]) => label))(
@@ -1643,8 +1697,8 @@ describe("KgRefresh durable workflow", () => {
 
   // ---- AII-1066: the owned-run contract suite (src/__tests__/restate/owned-run-contract.ts) ----
   // Applies: scenario 1 (a failing status read still reaches the deadline, stops the run, and
-  // releases the KgRepo marker). The adapter drives the real KgRepo, so `release` is observed as
-  // the marker clearing. Does not apply:
+  // releases the KgRepo marker), and scenario 6 (report intake persists usage once). Scenario 1
+  // drives the real KgRepo, so `release` is observed as the marker clearing. Does not apply:
   //  - 2 (a crash after the launch adopts the run): KgRefresh's `dispatch` step already looks the
   //    run up by title before it dispatches, and W8 covers the adoption with its own fixture.
   //  - 3 and 5 (a normal end, a failed cleanup): a normal end runs the rail gates, which the W-
@@ -1658,7 +1712,29 @@ describe("KgRefresh durable workflow", () => {
       name: "KgRefresh",
       scenarios: [1, 6],
       hasCleanup: false,
-      start(baseUrl, _key, { faults }) {
+      start(baseUrl, key, { faults }) {
+        if (!faults.failStatusRead) {
+          const label = VARIANTS.map(([label]) => label).find((label) => key.startsWith(`contract-${label}-`))!;
+          const url = envFor(label).baseUrl();
+          makeScenario(key, { runId: runIdCounter++, executionMode: "fly-machines" });
+          appendLog({ dispatchId: key, issueId: "kg-refresh", phase: "kg-refresh" });
+          const done = runWorkflow(url, key);
+          return {
+            runId: key, done,
+            read: async () => ({ step: scenarios.get(key)!.dispatchCalls > 0 ? "waiting" : null }),
+            finish: async () => { await callWorkflow(url, "KgRefresh", key, "report", STALE_REPORT); },
+            report: async (value: unknown) => {
+              const { usage, items } = value as { usage: { tokens: number; cost: number }; items: number[] };
+              const body = { ...STALE_REPORT, usage: reportedUsage(key, usage.tokens, usage.cost, [items.reduce((sum, item) => sum + item, 0)]) };
+              // Preserve the contract's reordered delivery through the KG-specific mapping,
+              // including nested usage objects, without changing array order.
+              const reordered = Object.keys(value as object)[0] === "items";
+              return callWorkflow<{ status: "accepted" | "duplicate" }>(url, "KgRefresh", key, "report",
+                reordered ? reverseObjectKeys(body) : body);
+            },
+            acceptedCount: () => storedRows(key).length,
+          };
+        }
         const recorded: string[] = [];
         contractCalls = recorded;
         lastContractCalls = recorded;
@@ -1683,7 +1759,6 @@ describe("KgRefresh durable workflow", () => {
       calls: () => lastContractCalls,
     },
     deadlineEnvFor,
-    { pending: { 6: "Result intake adoption is deferred (AII-1622)" } },
   );
 
   it.each(VARIANTS.map(([label]) => label))("AII-1046: a GitHub Actions timeout never calls stopMachineRun (%s)", async (label) => {

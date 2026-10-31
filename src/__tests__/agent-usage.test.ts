@@ -446,6 +446,34 @@ describe("recorded usage", () => {
     }
   });
 
+  it("stores snapshotless KG calls without trusting claimed configuration, leaving other legacy dispatches unchanged", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup, log } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"), log: () => import("../log.js"),
+    } });
+    log.appendLog({ dispatchId: "kg-legacy", issueId: "kg-refresh", phase: "kg-refresh" });
+    log.appendLog({ dispatchId: "other-legacy", issueId: "kg-refresh", phase: "implementation" });
+    const input = usage.toRecordedUsage({ attribution: claim("implementation"), invocations: [
+      { attribution: claim("implementation"), cacheReadTokens: 0, attempts: 2 },
+      { attribution: claim("review", { usage: null }) },
+    ], failureCode: "INVOCATION_TIMEOUT" });
+    expect(usage.recordUsage("kg-legacy", input)).toBe(0);
+    const rows = dedup.getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY rowid");
+    const before = rows.all("kg-legacy");
+    expect(before).toMatchObject([
+      { invocation_id: "inv-review", snapshot_id: null, config_revision_id: null, profile_id: "unconfigured", auth_mode: "unknown" },
+      { invocation_id: "inv-implementation", status: "timed_out", snapshot_id: null },
+    ]);
+    expect(JSON.parse((before[1] as { usage_json: string }).usage_json)).toMatchObject({ attempts: 2, cacheReadTokens: 0, attribution: "absent" });
+    expect(usage.recordUsage("kg-legacy", JSON.parse(JSON.stringify(input)))).toBe(0);
+    expect(rows.all("kg-legacy")).toEqual(before);
+    expect(usage.recordUsage("other-legacy", input)).toBe(1);
+    expect(rows.all("other-legacy")).toEqual([]);
+    expect(dedup.getDb().prepare("SELECT * FROM run_agent_config_snapshots").all()).toEqual([]);
+    expect(dedup.getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get("kg-legacy"))
+      .toEqual({ invocations_complete: 1 });
+  });
+
   it("marks only whole lists complete, allowing empty lists without a snapshot", async () => {
     const { testDb } = await import("./helpers/test-db.js");
     const { modules: { usage, dedup } } = await testDb({ modules: {
