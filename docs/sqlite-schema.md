@@ -83,6 +83,10 @@ columns such as `notified_at` and `machine_nonce` do not move `changed_at`.
 7 days old (`FINISHED_JOB_RETENTION_MS`), even above `MAX_LOG_ENTRIES`. The table can therefore
 hold more than 500 rows. The older guards (active machine nonce, review-fix attempts) also still apply.
 
+`dispatch_log.callback_lifecycle_completed_at` is nullable callback bookkeeping. It records
+completion of owned callback lifecycle handling before the Restate forward, independently
+of job closure, and does not move `changed_at`.
+
 ## 3. Rollback
 
 Nothing undoes a schema change. If you deploy older code over a newer database:

@@ -1,9 +1,10 @@
+import { ownedRunReportFingerprint } from "../restate/owned-run-report-fingerprint.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { RecordedUsage } from "../agent-usage.js";
 import type * as DispatchAdmissionModule from "../dispatch-admission.js";
 import type * as ClientModule from "../restate/implementation-run-client.js";
 import { createImplementationRunWorkflow, type ImplementationRunInput } from "../restate/implementation-run-workflow.js";
-import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
+import { fakeFetch, hangUntilAborted, type FetchCall, type ReplyInit } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
 const INGRESS = "http://restate.test";
@@ -61,10 +62,18 @@ describe("ImplementationRun report sender", () => {
     expect(ingress.calls[0].body).toBe("");
   });
 
+  it("refuses an unverifiable cached acknowledgement for usage", async () => {
+    const ingress = fakeFetch({ "POST /ImplementationRun/d-1/report": [{ status: 200, json: { status: "accepted" } }] });
+    const sender = client.createImplementationRunIngressClient(INGRESS, { fetchImpl: ingress.fetch });
+    expect(await sender.report("d-1", {
+      usage: { records: [], attribution: null, pushedCommits: null, listWhole: false, timedOut: false },
+    })).toEqual({ status: "unavailable" });
+  });
+
   it("forwards supplied usage through the SDK as the report body", async () => {
     const dispatchId = "d-usage";
     plantImplementationDispatch(dispatchId, { kind: "restate", attemptId: "attempt-1" });
-    const ingress = fakeFetch({ [`POST /ImplementationRun/${dispatchId}/report`]: [{ status: 200, json: { status: "accepted" } }] });
+    const ingress = fakeFetch({ [`POST /ImplementationRun/${dispatchId}/report`]: [({ body }: FetchCall): ReplyInit => ({ status: 200, json: { status: "accepted", fingerprint: ownedRunReportFingerprint(JSON.parse(body)) } })] });
     const hook = client.createImplementationAdmissionTerminationHook({
       ingress: client.createImplementationRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
       legacy: vi.fn(async () => {}),
@@ -114,7 +123,7 @@ describe("ImplementationRun report sender", () => {
       legacy: vi.fn(async () => {}),
     });
 
-    await expect(hook("d-down")).resolves.toBeUndefined();
+    await expect(hook("d-down")).resolves.toEqual({ status: "unavailable" });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0][0])).toContain("d-down");
   });

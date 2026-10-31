@@ -16,6 +16,7 @@
  * asynchronously. kg-refresh has one owner, so none of the pilot's admission/selector
  * machinery is needed here — see `docs/adr/032-a-fully-migrated-run-kind-coordinates-through-a-virtual-object.md`.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import { isDeepStrictEqual } from "node:util";
 import { recordUsage, type RecordedUsage } from "../agent-usage.js";
 import type { SourceResult } from "../kg-source-results.js";
@@ -1233,19 +1234,20 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
   }
 
   // Producer: handleRunnerResult in src/runner-callback.ts (the verify-only runner callback).
-  async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate" }> {
+  async function report(ctx: WorkflowSharedContext, raw: unknown): Promise<{ status: "accepted" | "duplicate"; fingerprint?: string }> {
     const body = raw as KgRefreshReportBody;
     await requireStarted(ctx);
     if (await ctx.get<boolean>("completed")) {
       // Retried callbacks remain duplicates, including reordered JSON object keys.
       const existing = await ctx.promise<KgRefreshReportBody>("report").peek();
-      if (existing !== undefined && isDeepStrictEqual(existing, body)) return { status: "duplicate" };
+      if (existing !== undefined && isDeepStrictEqual(existing, body)) return { status: "duplicate", fingerprint: ownedRunReportFingerprint(body) };
       throw new restate.TerminalError("kg-refresh report received after run completed", { errorCode: 409 });
     }
     // Only original runs dispatch a runner; resumed runs consume the held report instead.
     const dispatchId = (await ctx.get<string>("triggerId"))!;
     try {
-      return await acceptOwnedRunReport(ctx, "report", body, (value) => value.usage && recordUsage(dispatchId, value.usage));
+      const result = await acceptOwnedRunReport(ctx, "report", body, (value) => value.usage && recordUsage(dispatchId, value.usage));
+      return { ...result, fingerprint: ownedRunReportFingerprint(body) };
     } catch (err) {
       // Preserve the KG callback's existing conflict diagnostic; intake owns the decision.
       if (err instanceof restate.TerminalError && err.code === 409 && err.message === "conflicting owned-run report") {

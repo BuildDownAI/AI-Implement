@@ -1148,13 +1148,13 @@ describe("KgRefresh durable workflow", () => {
     await eventually(() => scenarios.get(key)!.dispatchCalls === 1, Boolean, { label: "dispatch" });
     const id = appendLog({ dispatchId: key, issueId: "kg-refresh", phase: "kg-refresh" });
     const body = { ...STALE_REPORT, usage: reportedUsage(key) };
-    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toEqual({ status: "accepted" });
+    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toMatchObject({ status: "accepted" });
     const rows = storedRows(key);
     expect(rows).toHaveLength(2);
     expect(rows).toMatchObject([{ snapshot_id: null, config_revision_id: null }, { snapshot_id: null, config_revision_id: null }]);
     expect(getDb().prepare("SELECT 1 FROM run_agent_config_snapshots WHERE dispatch_id = ?").get(key)).toBeUndefined();
     await done;
-    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toEqual({ status: "duplicate" });
+    expect(await callWorkflow(url, "KgRefresh", key, "report", body)).toMatchObject({ status: "duplicate" });
     await expect(callWorkflow(url, "KgRefresh", key, "report", { ...body, usage: reportedUsage(key, 99) })).rejects.toThrow(/409/);
     expect(storedRows(key)).toEqual(rows);
     // Job-log effects are faked in this fixture; mirror production closing its dispatch row.
@@ -1187,11 +1187,11 @@ describe("KgRefresh durable workflow", () => {
 
       const first = await post(SUCCESS_REPORT, "w2-key-1");
       expect(first.ok).toBe(true);
-      expect(await first.json()).toEqual({ status: "accepted" });
+      expect(await first.json()).toMatchObject({ status: "accepted" });
 
       const duplicate = await post(SUCCESS_REPORT, "w2-key-1");
       expect(duplicate.ok).toBe(true);
-      expect(await duplicate.json()).toEqual({ status: "accepted" });
+      expect(await duplicate.json()).toMatchObject({ status: "accepted" });
 
       const conflicting = await post(GENERIC_FAILURE_REPORT, "w2-key-2");
       expect(conflicting.status).toBe(409);

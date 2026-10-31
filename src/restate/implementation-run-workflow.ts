@@ -12,6 +12,7 @@
  * The step names and duties are in `docs/implementation-lifecycle.md`.
  * No production path calls it yet; AII-1557 supplies the real deps and registers it.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
@@ -420,8 +421,9 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     await requireStarted(ctx);
     // Producer: handleRunnerResult in src/runner-callback.ts, through the termination hook AII-1557 adds.
     // The promise resolves with a body: awaitOwnedRun reads `undefined` as "not resolved".
-    return acceptOwnedRunReport(ctx, "report", { ok: true, ...(body?.usage ? { usage: body.usage } : {}) },
+    const result = await acceptOwnedRunReport(ctx, "report", { ok: true, ...(body?.usage ? { usage: body.usage } : {}) },
       (value) => value.usage && recordUsage(ctx.key, value.usage));
+    return { ...result, fingerprint: ownedRunReportFingerprint(body ?? {}) };
   }
 
   async function status(ctx: WorkflowSharedContext): Promise<ImplementationRunStatusResult> {

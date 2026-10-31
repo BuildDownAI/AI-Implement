@@ -104,7 +104,7 @@ export function createReviewFixIngressClient(
  * and never set `result_conflict_at`. Keying on the body keeps an identical retry on the
  * cached acknowledgement while a different body reaches the handler's conflict path.
  */
-export function reviewFixResultForwardKey(result: ReviewFixResultMetadataV1): string {
+export function reviewFixResultForwardKey(result: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }): string {
   return `${result.attemptId}.result.${createHash("sha256").update(JSON.stringify(result)).digest("hex")}`;
 }
 

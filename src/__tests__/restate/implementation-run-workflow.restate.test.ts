@@ -259,7 +259,7 @@ describe("ImplementationRun durable workflow", () => {
     await waitForStep(w.read, "wait");
     const response = await fetch(`${baseUrl(slow, label)}/ImplementationRun/${w.dispatchId}/report`, { method: "POST" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: "accepted" });
+    expect(await response.json()).toMatchObject({ status: "accepted" });
     w.sc.status = "ended";
     await w.done;
   });

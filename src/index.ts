@@ -4141,7 +4141,7 @@ export function sweepLegacyKgRefreshRows(): number {
   return rows.length;
 }
 
-async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
+async function onReviewFixResult(result: ReviewFixResultMetadataV1 & { usage?: import("./agent-usage.js").RecordedUsage }): Promise<ResultIntakeOutcome> {
   // Verify-only (AII-1185): the callback forwards the validated result to
   // ReviewFixAttempt.result, whose `store-result` step is the sole SQLite writer.
   // Restate unreachable throws, which the route answers 503 with nothing written;

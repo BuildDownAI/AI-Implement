@@ -1,6 +1,9 @@
+import type { PlanningIngressResult } from "./restate/planning-run-client.js";
 import type { SourceResult } from "./kg-source-results.js";
 import {
   claimJobRunId,
+  hasCompletedCallbackLifecycle,
+  markCallbackLifecycleCompleted,
   getJobByDispatchId,
   markJobFailureCommented,
   stampJobApproved,
@@ -50,8 +53,7 @@ import {
 import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 import { sanitizeFindingDispositions, type FindingDisposition } from "./pipeline/finding-dispositions.js";
-import { toRecordedUsage, recordUsage } from "./agent-usage.js";
-import { acceptedReviewFixDispatchId } from "./review-fix-attempt-store.js";
+import { toRecordedUsage, recordUsage, type RecordedUsage } from "./agent-usage.js";
 import { sanitizeAttribution, type InvocationAttributionV1, type InvocationRecordV1 } from "./pipeline/types.js";
 import { isCycleSummary, stripCycleAttribution, sanitizeCycleSummaries, type CycleSummary, type CycleDisposition } from "./pipeline/cycle-summary.js";
 import { lateExternalReviewWorkflowKey, type LateExternalReviewInput, type LateExternalReviewState } from "./restate/late-external-review.js";
@@ -228,7 +230,7 @@ export interface HandleRunnerResultInput {
    * `handleRunnerResult`'s reviewFix branch, which returns directly. An absent
    * seam fails closed: a pilot result cannot be acknowledged without storage.
    */
-  onReviewFixResult?: (result: ReviewFixResultMetadataV1) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
+  onReviewFixResult?: (result: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }) => ResultIntakeOutcome | Promise<ResultIntakeOutcome>;
   /**
    * Ingress client for the `KgRefresh` workflow. The kg-refresh result branch is
    * verify-only and hands the report here (AII-899). Absent → 503 so the runner retries.
@@ -248,15 +250,15 @@ export interface HandleRunnerResultInput {
    * the stale-admission sweep. Absent in tests that don't need it — the reservation
    * then simply stays held, matching pre-fast-path behavior.
    */
-  checkPlanningAdmissionTermination?: (dispatchId: string) => Promise<void>;
+  checkPlanningAdmissionTermination?: (dispatchId: string, usage?: RecordedUsage) => Promise<void | PlanningIngressResult>;
   /**
    * Sends `report` to the `ImplementationRun` workflow of a Restate-owned implementation attempt (AII-1557),
    * after the outcome branch has written the job row and made its ticket moves. The hook itself tells a
    * Restate-owned reservation from a Legacy one; a Legacy dispatch gets no `report`. The callback never
    * releases the reservation either way: the workflow confirms the run ended first. An error it throws is
-   * logged and does not change the response.
+   * logged and returns 503 for owned results so the runner can retry.
    */
-  checkImplementationAdmissionTermination?: (dispatchId: string) => Promise<void>;
+  checkImplementationAdmissionTermination?: (dispatchId: string, usage?: RecordedUsage) => Promise<void | PlanningIngressResult>;
   /**
    * Starts the `LateExternalReview` workflow (AII-1227) for a failed implementation or gap-analysis
    * result that ended `external_review_pending`. The hook itself decides whether Restate is ready;
@@ -571,27 +573,6 @@ function recordOneCycleSummary(attemptId: string, summary: CycleSummary): Review
     });
 }
 
-/** Best-effort diagnostics only: accepted result identity and frozen configuration remain authoritative. */
-function recordManagedResultAttribution(
-  result: ReviewFixResultMetadataV1,
-  body: { attribution?: unknown; invocations?: unknown; invocationsDropped?: unknown; pushedCommits?: unknown; failure?: unknown; failureCode?: unknown },
-): void {
-  if (body.attribution == null && body.invocations == null && body.pushedCommits == null) return;
-  try {
-    let attribution: InvocationAttributionV1 | undefined;
-    if (body.attribution != null) {
-      attribution = sanitizeAttribution(body.attribution) ?? undefined;
-      if (!attribution) console.warn("[runner-callback] Dropped 1 invalid managed attribution record(s)");
-    }
-    const usage = toRecordedUsage({ ...body, attribution });
-    const dispatchId = acceptedReviewFixDispatchId(result);
-    if (!dispatchId) return;
-    recordUsage(dispatchId, usage);
-  } catch {
-    console.warn("[runner-callback] Could not persist 1 managed attribution record (count only)");
-  }
-}
-
 function recordCycleSummaries(attemptId: string, summaries: readonly CycleSummary[]): void {
   for (const summary of summaries) {
     const outcome = recordOneCycleSummary(attemptId, summary);
@@ -716,7 +697,44 @@ export function describeTrackerWriteError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export async function handleRunnerResult(
+/**
+ * Preserve callback-owned lifecycle outcomes, then deliver owned accounting through
+ * the workflow intake. Persisted lifecycle completion skips effects on retry; the reusable
+ * credential and workflow idempotency still allow the report to be delivered.
+ */
+export async function handleRunnerResult(input: HandleRunnerResultInput): Promise<HandleRunnerResultOutput> {
+  if (input.body?.reviewFix !== undefined) return handleRunnerResultInternal(input);
+  const bearer = parseBearerToken(input.authorization);
+  const verified = bearer ? verifyRunToken(bearer, input.secret, "result", { consume: false }) : null;
+  const owned = verified?.ok && (input.body?.phase === "planning" || input.body?.phase === "implementation" || input.body?.phase === "gap-analysis")
+    && readAdmission(verified.claims.dispatchId)?.lifecycleOwner.kind === "restate";
+  if (!owned || !verified?.ok) return handleRunnerResultInternal(input);
+  const hook = input.body.phase === "planning"
+    ? input.checkPlanningAdmissionTermination : input.checkImplementationAdmissionTermination;
+  if (!hook) {
+    console.warn(`[runner-callback] forward failed kind=${input.body.phase} dispatch=${verified.claims.dispatchId}`);
+    return bad(503, "owned_result_intake_unavailable");
+  }
+  const result = await handleRunnerResultInternal({
+    ...input,
+    checkPlanningAdmissionTermination: undefined,
+    checkImplementationAdmissionTermination: undefined,
+  });
+  if (result.status >= 300) return result;
+  // Persist before the fallible forward: workflow closure may still be pending.
+  markCallbackLifecycleCompleted(verified.claims.dispatchId);
+  try {
+    const forwarded = await hook(verified.claims.dispatchId, toRecordedUsage(input.body));
+    if (forwarded?.status === "conflict") return bad(409, "conflicting_report");
+    if (!forwarded || forwarded.status !== "accepted") throw new Error("report unavailable");
+    return result;
+  } catch {
+    console.warn(`[runner-callback] forward failed kind=${input.body.phase} dispatch=${verified.claims.dispatchId}`);
+    return bad(503, "owned_result_intake_unavailable");
+  }
+}
+
+async function handleRunnerResultInternal(
   input: HandleRunnerResultInput,
 ): Promise<HandleRunnerResultOutput> {
   const bearerToken = parseBearerToken(input.authorization);
@@ -791,11 +809,15 @@ export async function handleRunnerResult(
       return bad(401, reason);
     }
 
-    if (!input.onReviewFixResult) return bad(503, "reviewfix_result_intake_unavailable");
+    if (!input.onReviewFixResult) {
+      console.warn(`[runner-callback] forward failed kind=review-fix dispatch=${authenticated.claims.dispatchId}`);
+      return bad(503, "reviewfix_result_intake_unavailable");
+    }
     let outcome: ResultIntakeOutcome;
     try {
-      outcome = await input.onReviewFixResult(validated.value);
+      outcome = await input.onReviewFixResult({ ...validated.value, usage: toRecordedUsage(body) });
     } catch (e) {
+      console.warn(`[runner-callback] forward failed kind=review-fix dispatch=${authenticated.claims.dispatchId}`);
       if (e instanceof ReviewFixIntakeUnavailableError) return bad(503, "reviewfix_result_intake_unavailable");
       throw e;
     }
@@ -804,7 +826,6 @@ export async function handleRunnerResult(
     // its attached cycles unwritten. A byte-identical duplicate may repair only
     // that evidence; nothing else here is ever replayed.
     if (outcome.status === "duplicate" && outcome.attemptId === validated.value.attemptId) {
-      recordManagedResultAttribution(validated.value, body);
       const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
       if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
       recordCycleSummaries(outcome.attemptId, valid);
@@ -813,8 +834,6 @@ export async function handleRunnerResult(
     if (outcome.status !== "stored") {
       return reviewFixResultIntakeResponse(outcome);
     }
-
-    recordManagedResultAttribution(validated.value, body);
 
     const { valid, dropped } = sanitizeCycleSummaries(body.cycleSummaries);
     if (dropped > 0) console.warn(`[runner-callback] Dropped ${dropped} invalid cycle summary record(s)`);
@@ -838,7 +857,10 @@ export async function handleRunnerResult(
     }
     if (kgVerified.claims.phase !== "kg-refresh") return bad(400, "phase_mismatch");
     const dispatchId = kgVerified.claims.dispatchId;
-    if (!input.kgRefreshClient) return bad(503, "kg_refresh_unavailable");
+    if (!input.kgRefreshClient) {
+      console.warn(`[runner-callback] forward failed kind=kg-refresh dispatch=${dispatchId}`);
+      return bad(503, "kg_refresh_unavailable");
+    }
     const reported = await input.kgRefreshClient.report(
       dispatchId,
       {
@@ -860,7 +882,10 @@ export async function handleRunnerResult(
       },
       { idempotencyKey: dispatchId },
     );
-    if (reported.status === "unavailable") return bad(503, "kg_refresh_unavailable");
+    if (reported.status === "unavailable") {
+      console.warn(`[runner-callback] forward failed kind=kg-refresh dispatch=${dispatchId}`);
+      return bad(503, "kg_refresh_unavailable");
+    }
     if (reported.status === "not-found") return noRefreshInFlight(dispatchId);
     if (reported.status === "conflict") return bad(409, "conflicting_report");
     return { status: 200, body: { acknowledged: true } };
@@ -896,7 +921,7 @@ export async function handleRunnerResult(
     return bad(400, "missing_prUrl");
   }
 
-  // Note: token is consumed atomically here BEFORE any provider call. If
+  // Legacy consumes atomically before provider calls; owned results stay check-only. If
   // postComment or a status verb fails downstream, the comments may be lost
   // (orchestrator surfaces the error in warnings[] but the runner has no
   // retry path — its token is gone). This is intentional, best-effort
@@ -904,7 +929,8 @@ export async function handleRunnerResult(
   // user-side retries, which we don't want to encourage. Operators monitor
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
-  const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
+  const owned = readAdmission(preflight.claims.dispatchId)?.lifecycleOwner.kind === "restate";
+  const verified = owned ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     console.warn(
       `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
@@ -922,7 +948,7 @@ export async function handleRunnerResult(
   const { claims, mappingTeamKey } = verified;
 
   // Shape-validated, but a malformed record is dropped rather than rejected: the
-  // token above is already consumed, and postRunnerResult never retries, so
+  // Legacy token above is already consumed, so
   // failing the whole callback here would discard the comments, the tracker
   // transition, and remediation over a field the orchestrator only ever displays.
   // A newer runner reporting a FailureCategory this orchestrator doesn't yet know
@@ -959,7 +985,7 @@ export async function handleRunnerResult(
   // Job accounting (AII-1562): every invocation plus the pushed SHAs. A body without the lists (older
   // runner) stores just the single attribution above; malformed entries are dropped, never fatal.
   const accounting = toRecordedUsage({ ...body, attribution: input.body.attribution });
-  if (accounting.attribution || accounting.records.length > 0 || accounting.pushedCommits || accounting.listWhole) {
+  if (!owned && (accounting.attribution || accounting.records.length > 0 || accounting.pushedCommits || accounting.listWhole)) {
     try {
       recordUsage(claims.dispatchId, accounting);
     } catch {
@@ -992,6 +1018,11 @@ export async function handleRunnerResult(
   }
 
 
+  const priorJob = owned ? getJobByDispatchId(claims.dispatchId) : null;
+  if (owned && (hasCompletedCallbackLifecycle(claims.dispatchId) ||
+    (priorJob && !["dispatched", "running"].includes(priorJob.status)))) {
+    return { status: 200, body: { acknowledged: true } };
+  }
   const provider = await input.resolveProvider(mappingTeamKey);
   if (!provider) {
     console.warn(
