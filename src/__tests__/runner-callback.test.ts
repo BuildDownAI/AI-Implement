@@ -5775,7 +5775,9 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
     expect(rows()).toHaveLength(0);
     await c.store.releaseOwner(c.attemptId, "finalized");
-    expect((await c.deliver()).status).toBe(401);
+    // This store-only seam has no transport idempotency cache: authentication
+    // succeeds after release, then the store rejects the stale result.
+    expect(await c.deliver()).toMatchObject({ status: 410, body: { outcome: "stale" } });
     expect(rows()).toHaveLength(0);
   });
 

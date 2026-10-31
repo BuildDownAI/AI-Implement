@@ -56,11 +56,11 @@ Harder: an adapter must supply fault injection, and the caller must write each e
 
 `acceptOwnedRunReport(ctx, "report", value, onAccept?)` accepts plain JSON without secrets. It compares recursively sorted object keys (array order matters): the first value is accepted, an equal value is a duplicate, and a different value throws 409, including after the owning run completes. Resolved `null` is a value. The optional callback runs in bounded `record-usage` before resolution; exhausted failures propagate without resolving. Completed steps replay from the journal, including a crash before resolution. As with other kit effects, an unfinished step may retry, so the callback must be idempotent. A reserved companion promise (`owned-run-report-owner:<promiseName>`) atomically elects one reporting invocation before any callback runs. Concurrent reports attach to that invocation before comparing the resolved value, so equal reports are duplicates and different reports conflict without recording usage again. If attaching proves the owner definitively failed, contenders advance to the next numbered companion promise and elect a new owner atomically. A later report can therefore recover an unresolved result after exhausted storage attempts; a crash or suspension retains the current owner and its journal.
 
-Scenario 6 checks accepted, duplicate, conflict and one callback on every harness variant. Consumers register it through `options.pending` until adoption.
+Scenario 6 checks accepted, duplicate, conflict and one callback on every harness variant. All four runner workflows execute it under every harness variant; none leaves scenario 6 pending.
 
 ## Status after adoption
 
-The original kit adopters are: `PlanningRun` (AII-1064, AII-1065, AII-1068) and `KgRefresh` (AII-1066). `PlanningRun` runs scenarios 1–5. `KgRefresh` runs scenario 1 only. Four scenarios do not apply to it:
+The original kit adopters are: `PlanningRun` (AII-1064, AII-1065, AII-1068) and `KgRefresh` (AII-1066). `PlanningRun` runs scenarios 1–6. `KgRefresh` runs scenarios 1 and 6. Four scenarios do not apply to it:
 
 * **Scenario 2** (a crash after the launch adopts the run): the `dispatch` step already looks the run up by title before it dispatches.
 * **Scenario 3** (a normal end runs `cleanup`, `outcome`, then the release): a normal end runs the rail gates, and `KgRefresh` has no `cleanup` step.
@@ -69,4 +69,8 @@ The original kit adopters are: `PlanningRun` (AII-1064, AII-1065, AII-1068) and 
 
 The AII-1058 gaps are closed in `PlanningRun`. The table above lists each fenced Legacy function by call site in [restate.md](../restate.md#the-owned-run-lifecycle-kit).
 
-`ImplementationRun` also uses the lifecycle kit and scenarios 1–5. `ReviewFixAttempt` uses `readOwnedRunStatus` and adopts result intake in its shared `result` handler with a scenario-6 contract adapter; scenarios 1–5 wait for AII-1627. Its optional usage is stored through `recordUsage` for the accepted attempt’s dispatch id before the report promise resolves; the `run` journal is unchanged. Production callers still omit `usage` until AII-1631. PlanningRun adopts the result intake in its shared `report` handler and executes scenario 6. Its optional usage is stored through `recordUsage` before the report promise resolves; the `run` journal is unchanged. The termination hook can forward usage, but callback producers still omit it. Scenario 6 remains pending for ImplementationRun and KgRefresh. The kit fixture executes all six scenarios.
+`ImplementationRun` also uses the lifecycle kit and scenarios 1–6. `ReviewFixAttempt` uses `readOwnedRunStatus` and runs scenario 6; scenarios 1–5 wait for AII-1627. All four workflows call `acceptOwnedRunReport` from their shared `report` handler (`result` for `ReviewFixAttempt`). Optional usage is stored through `recordUsage` for the dispatch id in `record-usage` before the report promise resolves. Only shared handlers changed; the `run` journals are unchanged, so live runs can replay without a drain. The kit fixture executes all six scenarios.
+
+The authenticated runner callback checks a Restate-owned run's token without consuming it and forwards sanitized usage with a dispatch-scoped idempotency key. It does not write usage itself. Runner result posts use one bounded retry policy: deadline plus grace, or eight attempts. AI-Implement records model usage; the control plane calculates costs from its own price table, and the `list_job_accounting` contract is unchanged.
+
+Review-fix retains its existing `<attemptId>.result.<body hash>` forwarding key so changed results reach conflict detection; identical retries reuse the cached acknowledgement, including after admission release. Other owned-run report clients use the dispatch id.

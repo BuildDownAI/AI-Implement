@@ -41,13 +41,15 @@ and handler types that the typed clients use are in `src/restate/kg-refresh-type
 
 | Run kind | Lifecycle kit use | Contract suite | Result intake |
 |---|---|---|---|
-| `PlanningRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–5; 6 pending | deferred |
-| `ImplementationRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–5; 6 pending | deferred |
-| `KgRefresh` | bounded read | scenario 1; 6 pending | deferred |
-| `ReviewFixAttempt` | status read | adapter deferred | deferred |
+| `PlanningRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–6, every variant | shared `report` handler |
+| `ImplementationRun` | reserve, status/bounded read, cleanup, outcome | scenarios 1–6, every variant | shared `report` handler |
+| `KgRefresh` | bounded read | [scenarios 1 and 6](../src/__tests__/restate/kg-refresh-workflow.restate.test.ts), every variant | shared `report` handler |
+| `ReviewFixAttempt` | status read | scenario 6, every variant; 1–5 deferred to AII-1627 | shared `result` handler |
 | Test fixture | lifecycle and `acceptOwnedRunReport` (`record-usage`) | scenarios 1–6, every variant | exercised |
 
-The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__tests__/restate/owned-run-contract.ts`. Result intake has no production callers yet (ADR 036).
+The kit is `src/restate/owned-run-lifecycle.ts`; the shared suite is `src/__tests__/restate/owned-run-contract.ts`. All four runner workflows call `acceptOwnedRunReport` from their shared result handler, recording usage in `record-usage` before resolving the report promise (ADR 036). The authenticated callback checks the token without consuming it and forwards sanitized usage with a dispatch-scoped idempotency key; it does not write usage for Restate-owned runs. KgRefresh excludes scenarios 2–5 for the lifecycle reasons documented in ADR 036.
+
+Review-fix retains its existing `<attemptId>.result.<body hash>` forwarding key so changed results reach conflict detection; identical retries reuse the cached acknowledgement, including after admission release. Other owned-run report clients use the dispatch id.
 
 ## 2. Feature matrix
 

@@ -212,6 +212,17 @@ describe("runner result to workflow accounting", () => {
         expect(getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId)).toEqual(beforeConflict);
         calls[0].attribution.usage.tokensIn = 10;
         expect((await post()).status).toBe(200);
+        if (kind === "review-fix") {
+          const beforeRelease = getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId);
+          expect(beforeRelease).toHaveLength(2);
+          expect(await store.releaseOwner(dispatchId, "finalized")).toEqual({ status: "released" });
+          expect(read(dispatchId)?.releasedAt).toEqual(expect.any(Number));
+          // Keep the production forwarding key: a retry after release may be
+          // answered by transport idempotency without re-entering the handler.
+          const retried = await post();
+          expect(retried.ok, await retried.text()).toBe(true);
+          expect(getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId)).toEqual(beforeRelease);
+        }
         const rows = getDb().prepare("SELECT invocation_id FROM model_invocation_attribution WHERE dispatch_id = ?").all(dispatchId);
         expect(rows).toHaveLength(2);
         // Lifecycle work is parked above; project a finished job before querying
