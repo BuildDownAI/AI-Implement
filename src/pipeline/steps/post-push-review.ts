@@ -1,3 +1,4 @@
+import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -2782,6 +2783,8 @@ ${externalFindingsFixBlock}
 
       const add = gitSpawn(["add", "-A"]);
       if (add.exitCode !== 0) throw new Error(`git add failed: ${resultMessage(add)}`);
+
+      removeScratchFromIndex(inputs.workspaceDir, gitSpawn);
 
       const status = gitSpawn(["status", "--porcelain"]);
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);
