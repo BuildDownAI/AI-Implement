@@ -1,3 +1,4 @@
+import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, openOrFindPullRequest, PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
@@ -112,6 +113,10 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       "git checkout",
     );
 
+    if (hasWorkingTreeChanges(workspaceDir, githubToken)) {
+      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+    }
+    removeScratchFromIndex(workspaceDir);
     const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
     // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
     // we always take the standard add→commit path regardless of prior commits.
@@ -147,8 +152,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 
     let commitSha: string | null;
     if (hasWTChanges) {
-      // Standard path: stage all changes → sensitive-file guard → commit.
-      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+      // Standard path: changes are staged and scratch removed before change detection.
       // --diff-filter=d excludes staged deletions: removing an accidentally-committed
       // secret (e.g. deleting a .env) is exactly what the guard wants to allow.
       const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only", "--diff-filter=d"], {

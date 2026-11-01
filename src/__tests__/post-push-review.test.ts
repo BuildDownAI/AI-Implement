@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
+import { prepareScratchExclusion } from "../pipeline/scratch-exclude.js";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import type { LLMExecutor, PipelineContextData } from "../pipeline/types.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
@@ -7422,5 +7423,54 @@ describe("credential refresh before a fix-pass push, by execution mode", () => {
     expect(JSON.parse(orchestrator.calls[0]!.body)).toEqual({ nonce: "machine-nonce", owner: "acme" });
     expect(events).toEqual(["vend", `push HEAD:refs/heads/ai-implement/aii-200-x to ${originWith("ghs_fresh_token")}`]);
     expect(process.env.GH_TOKEN).toBe("ghs_fresh_token");
+  });
+});
+
+describe("scratch index guard in fix passes", () => {
+  it.each(["code", "scratch-only", "removal-failure"])("handles force-staged scratch: %s", async (mode) => {
+    const realGit = (args: string[]) => {
+      const r = spawnSync("git", args, { cwd: workspaceDir, encoding: "utf8" });
+      if (r.status !== 0) throw new Error(r.stderr);
+      return { stdout: r.stdout, exitCode: 0 };
+    };
+    realGit(["init", "-q"]);
+    realGit(["config", "user.name", "Test"]);
+    realGit(["config", "user.email", "test@example.com"]);
+    fs.writeFileSync(path.join(workspaceDir, "code.ts"), "before");
+    realGit(["add", "-A"]);
+    realGit(["commit", "-qm", "base"]);
+    const before = realGit(["rev-parse", "HEAD"]).stdout;
+    prepareScratchExclusion(workspaceDir);
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "push") return { stdout: "", exitCode: 0 };
+      if (args[0] === "rm" && mode === "removal-failure") return { stdout: "", stderr: "index locked", exitCode: 1 };
+      return realGit(args);
+    });
+    let calls = 0;
+    const invoke = vi.fn(async () => {
+      if (++calls === 2) {
+        fs.mkdirSync(path.join(workspaceDir, "ai-output"), { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, DISPOSITIONS_FILE), "[]");
+        realGit(["add", "-f", DISPOSITIONS_FILE]);
+        if (mode === "code") fs.writeFileSync(path.join(workspaceDir, "code.ts"), "after");
+      }
+      return structuredReviewResult({ approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "fix" }], feedback: "fix", score: 4, progress_delta: 0 });
+    });
+    const run = runReview(makeCtx(invoke), {
+      prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [], gitSpawn,
+      ghSpawn: (args) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 }),
+    }, { report: async () => undefined });
+    if (mode === "removal-failure") await expect(run).rejects.toThrow(/index locked/);
+    else {
+      const out = await run;
+      if (mode === "scratch-only") expect(out.terminationReason).toBe("no_changes");
+    }
+    if (mode === "code") {
+      expect(realGit(["show", "HEAD:code.ts"]).stdout).toBe("after");
+      expect(realGit(["ls-tree", "-r", "--name-only", "HEAD"]).stdout).not.toContain("ai-output/");
+    } else {
+      expect(realGit(["rev-parse", "HEAD"]).stdout).toBe(before);
+      expect(gitSpawn.mock.calls.some(([args]) => args[0] === "commit" || args[0] === "push")).toBe(false);
+    }
   });
 });
