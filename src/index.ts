@@ -96,7 +96,7 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, seedRunnerImageAllowedPrefixesFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerReviewPublication, createReviewPublicationIngressClient, handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "./runner-tokens.js";
@@ -4012,6 +4012,7 @@ function restateReady(): boolean {
   const restate = getRestateStatus();
   return restate.sidecar.state === "ready" && restate.registration.state === "registered";
 }
+const reviewPublicationIngress = createReviewPublicationIngressClient();
 const lateExternalReviewIngress = createLateExternalReviewIngressClient();
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: lateExternalReviewIngress,
@@ -4584,6 +4585,37 @@ function startServer(
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Publish a post-push review through the durable publication object.
+    if (url === "/runner/review-publication" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(await readBody(req));
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleRunnerReviewPublication({
+          authorization: req.headers.authorization, secret: config.runnerTokenSecret,
+          body: parsed, ingress: reviewPublicationIngress, restateReady,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "restate-unavailable" }));
         }
       });
       return;

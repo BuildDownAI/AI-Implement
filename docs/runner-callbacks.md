@@ -28,6 +28,19 @@ sequenceDiagram
 
 **A 2xx from `/runner/result` means the callback was recorded.** A result that cannot be recorded answers a coded 4xx, which the runner logs as `POST failed`: `409 mapping_not_found` (the token's mapping key resolves to no mapping; the body names the key) and, for planning, `404 job_not_found` (no job row for the dispatch; checked before any comment is posted). Either answer follows token consumption, so a retry gets `already_consumed`. A duplicate callback for an already closed row stays 200. `mintRunToken` refuses an empty mapping key, so no token is minted that could hit this.
 
+## Post-push review publication
+
+`POST /runner/review-publication` accepts `{ prNumber, headSha, iteration, body, comments }`
+with a reusable `progress` bearer. It resolves the repository from the token's dispatch
+run record, ignoring repository fields in the request; no PR URL on the run is required.
+Missing or invalid credentials return 401, and a missing run or repository returns 403.
+The route calls `PostPushReviewPublication.publish` through Restate ingress with object
+key `<owner>/<repo>#<prNumber>` and idempotency key
+`<owner>/<repo>#<prNumber>:<headSha>:<iteration>`. Only publication fields enter Restate;
+the bearer and headers stay at the callback boundary. A successful call returns the
+object's result as 200. Sidecar or registration unreadiness and ingress failures return
+503 with `error: "restate-unavailable"`. The runner caller is added separately.
+
 ## Credentials
 
 | Name | Audience | Minted | Carried by | Read by | Verified by | Consumed |
