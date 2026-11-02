@@ -8,6 +8,9 @@ import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
 import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
+import * as githubAuth from "../../github-app-auth.js";
+import { githubImagePublished } from "../../restate/self-deploy.js";
+import { fakeFetch } from "../helpers/fake-fetch.js";
 import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
 
 describe("SelfDeploy durable phase machine", () => {
@@ -168,15 +171,43 @@ describe("SelfDeploy durable phase machine", () => {
     expect(f.deps.getDeployPolicy).toHaveBeenCalledOnce();
     expect(f.deps.flyctl).toHaveBeenCalledWith(expect.objectContaining({ target: expect.objectContaining({ repo: "fork-owner/AI-Implement" }) }), expect.arrayContaining(["SOURCE_REPO=fork-owner/AI-Implement", `SOURCE_COMMIT=${watchedHead}`, `SOURCE_BRANCH=${branch}`]), "secret-fly", expect.any(AbortSignal));
   });
+  it.each(VARIANTS.flatMap(([variant]) => (["testing", "main"] as const).map(branch => [variant, branch] as const)))("checks publication for the resolved watched repo and full commit (%s, %s)", async (label, branch) => {
+    f = deployFixture(); const env = envs.get(label)!;
+    const commit = "fedcba9876543210fedcba9876543210fedcba98";
+    f.deps.getDeployPolicy = vi.fn(() => ({ watchedRepo: "fork-owner/AI-Implement", watchedRef: "testing" }));
+    f.state.head = commit;
+    const image = `registry.fly.io/builddown-orchestrator-image:${branch}-fedcba9`;
+    expect(await call<SelfDeployStartResult>(env, "start", { branch, requestedBy: "owner" })).toMatchObject({ commit, image, alreadyActive: false });
+    expect(f.deps.imagePublished).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ owner: "fork-owner", repo: "AI-Implement" }), commit);
+    expect((await read(env))?.target).toEqual({ repo: "fork-owner/AI-Implement", branch, commit, image, source: "published" });
+    await call(env, "cancel", { requestedBy: "owner" });
+  });
+  it.each(VARIANTS)("refuses success in an unrelated status context without hold or Fly (%s)", async label => {
+    f = deployFixture(); const env = envs.get(label)!;
+    const previous = await read(env);
+    const mint = vi.spyOn(githubAuth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
+    const github = fakeFetch({ "GET /repos/owner/repo/commits/abcdef0123456789/statuses": { json: [{ context: "ci", state: "success" }] } });
+    const realFetch = globalThis.fetch;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => String(input).startsWith("https://api.github.com/") ? github.fetch(input, init) : realFetch(input, init));
+    f.deps.imagePublished = vi.fn((target, commit) => githubImagePublished("app", "key", target, commit));
+    try {
+      expect(await start(env)).toEqual({ reason: "image-not-published" });
+      expect(github.calls).toHaveLength(1);
+      expect(await read(env)).toEqual(previous);
+      expect(f.deps.setHold).not.toHaveBeenCalled();
+      for (const flyCall of Object.values(f.deps.fly)) expect(flyCall).not.toHaveBeenCalled();
+      expect(f.deps.flyctl).not.toHaveBeenCalled();
+    } finally { fetchSpy.mockRestore(); mint.mockRestore(); }
+  });
   it.each(VARIANTS)("refuses missing images/auth, unknown head and missing configuration without hold or Fly (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
     const warnings = vi.spyOn(console, "warn");
     const previous = await read(env);
-    for (const status of [404, 401, 403]) {
+    for (const status of [null, "pending", "failure", "401", "403"]) {
       f.state.status = status;
       expect(await start(env)).toEqual({ reason: "image-not-published" });
     }
-    for (const status of [401, 403]) expect(warnings.mock.calls.flat().join("\n")).toContain(`image-not-published HTTP ${status}`);
+    for (const status of [401, 403]) expect(warnings.mock.calls.flat().join("\n")).toContain(`image check unauthorized HTTP ${status}`);
     warnings.mockRestore();
     f.state.head = null;
     expect(await start(env)).toEqual({ reason: "head-unknown" });
@@ -241,7 +272,7 @@ describe("SelfDeploy durable phase machine", () => {
     f = deployFixture(); const env = envs.get(label)!;
     f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
     await start(env); await terminal(env, f, "succeeded");
-    expect(f.deps.registryHead).not.toHaveBeenCalled();
+    expect(f.deps.imagePublished).not.toHaveBeenCalled();
     expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), expect.arrayContaining(["--build-only", "--push", "--image-label", "deploy-abcdef0", "kg_token=secret-kg", `SOURCE_COMMIT=${COMMIT}`, "SOURCE_REPO=owner/repo", "SOURCE_BRANCH=testing"]), "secret-fly", expect.any(AbortSignal));
   });
   it.each(VARIANTS)("exhausts non-HTTP build failures and releases the hold (%s)", async label => {

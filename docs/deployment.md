@@ -69,7 +69,7 @@ curl -X POST https://<app-name>.fly.dev/api/deploy -H "Authorization: Bearer <se
 | Response | Meaning |
 |---|---|
 | `202 {"deployId","commit","image","alreadyActive"}` | Accepted. The deploy has started, not finished. A call while one is active returns the active deploy's id with `alreadyActive: true`. |
-| `409 image-not-published` | The image for that commit is not in the registry yet (see "The image rule"). |
+| `409 image-not-published` | The commit has no successful image publication status (see "The image rule"). |
 | `503 head-unknown` | The watched branch's HEAD could not be read. |
 | `400 unsupported-branch` | The watched ref is not `testing` or `main`, the two with published image channels. |
 | `501` | This orchestrator is not configured to deploy itself. |
@@ -85,7 +85,7 @@ curl -X POST https://<app-name>.fly.dev/api/deploy -H "Authorization: Bearer <se
 | `verifying` | The new process reports its `AI_IMPLEMENT_SOURCE_COMMIT`; five polls without a match end `failed` / `verify-timeout`. |
 | `succeeded`, `failed`, `cancelled` | Terminal. The hold is released and the outcome is recorded. |
 
-**The image rule.** Without `KG_SOURCE_REPO` the deploy applies the published image `registry.fly.io/<FLY_IMAGE_APP or builddown-orchestrator-image>:<branch>-<sha7>`, and refuses with `image-not-published` when the registry has no manifest for it. With `KG_SOURCE_REPO` set it builds `registry.fly.io/<app>:deploy-<sha7>` from the source tarball with the KG build secret, then applies that.
+**The image rule.** Without `KG_SOURCE_REPO` the deploy applies the published image `registry.fly.io/<FLY_IMAGE_APP or builddown-orchestrator-image>:<branch>-<sha7>`, and refuses with `image-not-published` unless the latest GitHub commit status with context `orchestrator-image/published` is `success`. Whoever publishes the image — the [AII-1602](https://linear.app/eudoxus/issue/AII-1602/publish-an-orchestrator-image-for-each-push-to-testing-and-main-and) workflow or the manual `bd-image-push` script — must set this status on the commit after pushing the image. The check uses a repository-scoped GitHub App installation token with `statuses: read`; tenants need no access to the shared registry. A 401/403 refuses deployment and logs `[self-deploy] image check unauthorized HTTP <status>`. With `KG_SOURCE_REPO` set it builds `registry.fly.io/<app>:deploy-<sha7>` from the source tarball with the KG build secret, then applies that.
 
 **Outcome.** The object's terminal record is written to `deploy_last_outcome` and announced on the notice webhook (failures and cancellations; a success is announced by the new process's boot notice). `succeeded` is `deployed-ok`, `failed` is `deploy-failed` and `cancelled` is `deploy-cancelled`, the latter two with the reason code in `detail`. `/admin#deployments`, `get_deploy_posture` (`lastOutcome`) and `GET /api/deployment-status` (`lastDeployOutcome`, plus `selfDeploy` and `applyFlyTomlAllowed`) read it. Log lines read `[self-deploy] <deployId> <phase> <reason>`; the `draining` line includes the target repository after the phase. Boot no longer guesses an outcome, so the old `deployed-not-serving` signal (sidecar missing or failing its probe) is no longer written; sidecar health is reported by `GET /` and `get_kg_status`.
 

@@ -1,10 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import os from "node:os";
 import { readFileSync } from "node:fs";
 import type * as DeployModule from "../deploy.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 
 let deploy: typeof DeployModule;
+
+afterEach(() => vi.restoreAllMocks());
 
 
 beforeEach(async () => {
@@ -200,11 +202,44 @@ describe("self-deploy drain exclusion", () => {
     expect(JSON.parse(fake.calls[0].body).query).toContain("id != 'inv-123'");
   });
 
-  it("checks published manifests with HEAD and returns auth failures without guessing", async () => {
-    const { publishedImageManifestHead } = await import("../restate/self-deploy.js");
-    const fake = fakeFetch({ "HEAD /v2/images/manifests/main-abcdef0": { status: 403 } });
-    expect(await publishedImageManifestHead("registry.fly.io/images:main-abcdef0", "deploy-token", fake.fetch)).toBe(403);
-    expect(fake.calls[0].headers.get("authorization")).toBe("Bearer deploy-token");
+  it.each([null, "pending", "failure", "success"])("checks the exact GitHub publication context (%s)", async state => {
+    const auth = await import("../github-app-auth.js");
+    const mint = vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
+    const mod = await import("../restate/self-deploy.js");
+    const statuses = [{ context: "unrelated", state: "success" }, ...(state ? [{ context: "orchestrator-image/published", state }] : [])];
+    const fake = fakeFetch({ "GET /repos/watched/source/commits/full-commit/statuses": { json: statuses } }).install();
+    expect(await mod.githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit")).toBe(state === "success");
+    expect(mint).toHaveBeenCalledWith("app", "key", "watched", { permissions: { statuses: "read" }, repositories: ["source"] });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].headers.get("authorization")).toBe("Bearer installation-token");
+    expect("publishedImageManifestHead" in mod).toBe(false);
+    expect(readFileSync(new URL("../restate/self-deploy.ts", import.meta.url), "utf8")).not.toContain("registryHead");
+  });
+
+  it("paginates and uses the latest publication status", async () => {
+    const auth = await import("../github-app-auth.js");
+    vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: "installation-token", authMode: "installation" });
+    const { githubImagePublished } = await import("../restate/self-deploy.js");
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(Response.json(Array.from({ length: 100 }, () => ({ context: "ci", state: "success" }))))
+      .mockResolvedValueOnce(Response.json([{ context: "orchestrator-image/published", state: "pending" }, { context: "orchestrator-image/published", state: "success" }]));
+    expect(await githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit")).toBe(false);
+    expect(fetchSpy.mock.calls[1][0]).toContain("page=2");
+  });
+
+  it("requires an installation token and propagates permission failures", async () => {
+    const auth = await import("../github-app-auth.js");
+    const mint = vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: null, authMode: "public" });
+    const { githubImagePublished } = await import("../restate/self-deploy.js");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const check = () => githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit");
+    expect(await check()).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    mint.mockRejectedValueOnce(Object.assign(new Error("forbidden"), { status: 403 }));
+    await expect(check()).rejects.toMatchObject({ status: 403 });
+    mint.mockResolvedValue({ token: "installation-token", authMode: "installation" });
+    fetchSpy.mockResolvedValue(new Response("", { status: 401 }));
+    await expect(check()).rejects.toMatchObject({ status: 401 });
   });
 });
 
