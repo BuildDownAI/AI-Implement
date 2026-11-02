@@ -53,6 +53,8 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Boot the image with its real entrypoint
+        env:
+          EXPECTED_COMMIT: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           GITHUB_APP_PRIVATE_KEY=$(openssl genrsa 2048 2>/dev/null)
@@ -78,8 +80,9 @@ jobs:
               exit 1
             fi
             if body=$(curl -sf http://localhost:8080/ 2>/dev/null) \
-              && printf '%s' "$body" | jq -e '
-                .status == "ok"
+              && printf '%s' "$body" | jq -e --arg commit "$EXPECTED_COMMIT" '
+                .sourceCommit == $commit
+                and .status == "ok"
                 and .restate.sidecar.state == "ready"
                 and .restate.registration.state == "registered"' >/dev/null; then
               ok=1
@@ -92,7 +95,7 @@ jobs:
           printf '%s\n' "$body" | jq . || printf '%s\n' "$body"
 
           if [ "$ok" != "1" ]; then
-            echo "FAIL: health check did not report ok + restate ready + registered within 120 s"
+            echo "FAIL: health check did not report the expected commit + ok + restate ready + registered within 120 s"
             echo "--- Container log ---"
             docker logs orchestrator-ci 2>&1 || true
             exit 1
@@ -103,7 +106,7 @@ jobs:
             docker logs orchestrator-ci 2>&1 || true
             exit 1
           fi
-          echo "PASS: status ok, restate sidecar ready, registration registered, container running"
+          echo "PASS: source commit matches, status ok, restate sidecar ready, registration registered, container running"
 
           # Sidecar-less mode must be reported, not hidden. With no
           # KG_SOURCE_REPO the sidecar never starts and is never probed, so the

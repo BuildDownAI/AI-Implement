@@ -4213,6 +4213,7 @@ function startServer(
       const { pollCount: polls, lastPollStartedAt, lastPollFinishedAt } = getPollStats();
       res.end(JSON.stringify({
         status: "ok",
+        sourceCommit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
         polls,
         kgDegraded: isKgDegraded(),
         ...sidecarHealthFields(),
