@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DeployHoldModule from "../deploy-hold.js";
 import { testDb } from "./helpers/test-db.js";
@@ -48,7 +49,7 @@ describe("deploy hold", () => {
     expect((await bareHold()).isDeployHeld()).toBe(false);
   });
 
-  it("survives a process boundary — the boot clear releases it, a restart alone does not", async () => {
+  it("survives a process boundary — a restart alone does not release it", async () => {
     hold.setDeployHold();
 
     // A new process against the same volume: fresh modules, same sqlite file.
@@ -57,6 +58,16 @@ describe("deploy hold", () => {
     expect(hold2.isDeployHeld()).toBe(true);
     expect(hold2.clearDeployHold()).toBe(true);
     expect(hold2.isDeployHeld()).toBe(false);
+  });
+
+  it("is left set by boot: main() clears it nowhere but, SelfDeploy's hold dependency", () => {
+    // A boot that clears the hold during a drain re-opens dispatch in the middle of a deploy.
+    const main = readFileSync("src/index.ts", "utf8");
+    const mainBody = main.slice(main.indexOf("async function main("));
+    const calls = mainBody.split("\n").filter((line) => line.includes("clearDeployHold("));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("setHold");
+    expect(mainBody).not.toContain("holdWasSet");
   });
 });
 

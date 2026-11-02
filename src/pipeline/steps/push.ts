@@ -1,6 +1,8 @@
+import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, openOrFindPullRequest, PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
+import { recordPushedCommits } from "../job-accounting.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
@@ -80,6 +82,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       // so a push would sweep their in-progress work into the commit. Changes are
       // left in the mount for inspection with `git diff`; shipping them is the
       // user's call. Skip push and PR creation.
+      recordPushedCommits([]);
       return { prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false };
     }
 
@@ -110,12 +113,17 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       "git checkout",
     );
 
+    if (hasWorkingTreeChanges(workspaceDir, githubToken)) {
+      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+    }
+    removeScratchFromIndex(workspaceDir);
     const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
     // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
     // we always take the standard add→commit path regardless of prior commits.
     const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseRef, githubToken);
 
     if (!hasWTChanges && !agentCommitted) {
+      recordPushedCommits([]);
       if (existingPrNumber) {
         return {
           prUrl: null,
@@ -144,8 +152,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 
     let commitSha: string | null;
     if (hasWTChanges) {
-      // Standard path: stage all changes → sensitive-file guard → commit.
-      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+      // Standard path: changes are staged and scratch removed before change detection.
       // --diff-filter=d excludes staged deletions: removing an accidentally-committed
       // secret (e.g. deleting a .env) is exactly what the guard wants to allow.
       const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only", "--diff-filter=d"], {
@@ -523,6 +530,11 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       }
       attempt++;
     }
+
+    // The push landed: report the SHAs this job published, oldest first (AII-1562). baseRef is the
+    // clone-time commit, or on a gap-fill the PR branch tip the run started from.
+    const pushedShas = listPushedCommits(workspaceDir, baseRef);
+    if (pushedShas) recordPushedCommits(pushedShas);
 
     if (existingPrNumber) {
       return {
@@ -948,6 +960,16 @@ function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boole
     throw new Error(`git status failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
   return result.stdout.toString().trim().length > 0;
+}
+
+/** `git rev-list --reverse <baseRef>..HEAD`; null when git cannot answer (the list is then unknown, not empty). */
+function listPushedCommits(workspaceDir: string, baseRef: string): string[] | null {
+  const result = spawnSync("git", ["rev-list", "--reverse", `${baseRef}..HEAD`], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) return null;
+  return result.stdout.toString().split("\n").map((l) => l.trim()).filter(Boolean);
 }
 
 function resolveCommitSha(workspaceDir: string): string | null {

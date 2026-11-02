@@ -25,7 +25,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, defaultFetchSignal, fetchRepoTarball, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -36,20 +36,23 @@ import type { TicketIssue } from "./providers/types.js";
 import { logSkipReasons, rememberCandidates, mappingForProvider, fetchProviderSnapshots, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
 import type { KgRefreshOutcomeNotification } from "./notify.js";
-import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
+import { isKgDegraded, onSelfDeployOutcome, postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
-import { clearDeployHold, getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
+import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
-import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
+import { canSelfDeploy, createRestateDrainProbes, readKgSourceRepo, parseKgSourceRepo, runSelfDeployFlyctl } from "./deploy.js";
+import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, githubImagePublished, type SelfDeployClient } from "./restate/self-deploy.js";
+import { getInFlightWork } from "./in-flight-work.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import { finalizeImplementation } from "./implementation-finalize.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
+import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
+import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
 import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken } from "./github-app-auth.js";
+import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
@@ -83,7 +86,7 @@ import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
-import { getMachine, listMachines, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
+import { getMachine, listMachines, updateMachine, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
@@ -102,7 +105,7 @@ import { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import { createReviewFixAdminFacade } from "./review-fix-admin-facade.js";
 import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "./review-fix-worker.js";
 import { listActiveRestateReviewFixPrs, queueReviewFixCancellationForClosedPr } from "./review-fix-close.js";
-import { createReviewFixIngressClient, reviewFixResultForwardKey, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
+import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "./restate/review-fix-client.js";
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -454,6 +457,16 @@ async function getTargetRepoToken(
 /** True once the KG composition (and so the `PipelineSchedule` service) is bound at boot. */
 let kgScheduleBound = false;
 
+/** Tracker kind and issue URL for a review-fix job row; a lookup failure never blocks the row. */
+async function reviewFixAccounting(
+  registry: ProviderRegistry,
+  mapping: RepoMapping,
+  fix: { issueId: string; issueIdentifier?: string | null },
+): Promise<TrackerAccounting> {
+  const provider = await registry.forMapping(mapping).catch(() => null);
+  return trackerAccounting(mapping, provider, { id: fix.issueId, identifier: fix.issueIdentifier });
+}
+
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
   if (!cycle) {
@@ -493,11 +506,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
     // Act on what the refresh above found.
     try {
-      // A factory over config with no state of its own, so building one per tick is
-      // free and behaves identically to the server's — the hold that actually
-      // serializes deploys lives in SQLite, not in this closure.
       const resolvedConfig = { ...config, selfDeployTarget: resolvedPollTarget };
-      const startDeploy = makeStartDeploy({ ...resolvedConfig, onBuildFailure: onDeployBuildFailure });
       const availability = getAvailability();
       const head = availability?.headCommit ?? null;
 
@@ -511,24 +520,26 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       });
 
       if (action !== "none" && head) {
-        // Recorded before acting, not after. A successful self-deploy kills this
-        // process inside the await below, so a write afterwards would never land and
-        // every boot would retry the same commit forever.
+        // Recorded before acting, not after: it bounds the automatic attempt, which a
+        // failing deploy must not repeat every cycle. A new push re-arms it.
         setLastActedCommit(head);
 
         if (action === "deploy") {
           console.log(`[deploy] Auto-deploying ${head.slice(0, 7)} — dispatch pauses now`);
-          const result = await startDeploy?.();
-          if (result && !result.started) {
-            console.warn(`[deploy] Auto-deploy did not start: ${result.reason}`);
-          }
-          // The starter resolves HEAD itself, one round trip after the cached read
-          // above. A push landing in that window means the commit recorded as acted on
-          // is not the commit being deployed — so correct it to what actually went out,
-          // or a later poll would retry the commit that really failed.
-          if (result?.started && result.commit !== head) {
-            console.log(`[deploy] head moved during the trigger: deploying ${result.commit.slice(0, 7)}`);
-            setLastActedCommit(result.commit);
+          const branch = resolvedPollTarget.branch;
+          if (branch !== "testing" && branch !== "main") {
+            console.warn(`[deploy] Auto-deploy skipped: watched ref '${branch}' has no published image channel`);
+          } else {
+            const result = await selfDeployClient.start({ branch, requestedBy: "auto-deploy" });
+            if ("reason" in result) {
+              console.warn(`[deploy] Auto-deploy did not start: ${result.reason}`);
+            } else if (!result.alreadyActive && result.commit !== head) {
+              // The object resolves HEAD itself, one round trip after the cached read above. A push
+              // landing in that window means the commit recorded as acted on is not the commit being
+              // deployed, so correct it to what actually went out.
+              console.log(`[deploy] head moved during the trigger: deploying ${result.commit.slice(0, 7)}`);
+              setLastActedCommit(result.commit);
+            }
           }
         } else {
           await postAvailableNotice(config, head);
@@ -1009,6 +1020,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         const provider = await registry.forMapping(mapping);
         await provider.postComment(issueId, body);
       },
+      trackerAccounting: async (mapping, issue) => trackerAccounting(mapping, await registry.forMapping(mapping), issue),
       onDispatchFailure: surfaceDispatchFailure,
       flySessionsToken: config.flySessionsToken,
       flySessionsApp: config.flySessionsApp,
@@ -1289,6 +1301,8 @@ export async function dispatchGitHubActions(
     sessionImage: runnerImage ?? null,
     contract,
     groupingParent: isGroupingParentDispatch(issue),
+    trackerKind: mapping.ticketingProvider ?? null,
+    issueUrl: provider.issueUrl(issue),
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -1560,6 +1574,8 @@ interface SessionBackendResult {
   executionMode: "fly-machines" | "local-docker";
   statusComment: { machineName: string; logsUrl?: string } | null;
   dispatchedLogLine?: string;
+  machineSize?: MachineSize;
+  computeStartedAt?: number;
 }
 
 /**
@@ -1781,6 +1797,10 @@ export async function dispatchSession(
       sessionImage: result.sessionImage,
       phase: opts.phase,
       groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
+      trackerKind: mapping.ticketingProvider ?? null,
+      issueUrl: provider.issueUrl(issue),
+      machineSize: result.machineSize ?? null,
+      computeStartedAt: result.computeStartedAt ?? null,
     });
 
     if (!opts.shadow) {
@@ -2241,6 +2261,7 @@ export async function confirmAdmissionTerminated(
 
     try {
       const status = await getWorkflowRunStatus(token, owner, repo, runId);
+      if (status) recordGhaRunCompleted(runId, status);
       return status?.status === "completed";
     } catch (err) {
       console.error(`[admission] Failed to check GHA run status for dispatch=${candidate.dispatchId}:`, err);
@@ -2481,6 +2502,7 @@ async function monitorGitHubActionsJob(
     return;
   }
   if (!isMonitorRunIdStillCurrent(job)) return;
+  recordGhaRunCompleted(job.runId, runStatus);
 
   // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
   const watchdog = githubActionsWatchdogDecision({
@@ -3628,7 +3650,9 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           sessionImage: config.localRunnerImage,
           machineNonce: container.machineNonce,
           machineId: container.containerId,
+          computeStartedAt: Date.now(),
           phase: "gap-analysis",
+          ...(await reviewFixAccounting(registry, mapping, fix)),
         });
         updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
         if (dispatchId) {
@@ -3796,6 +3820,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             runnerMode: "default",
             contract: reviewFixContract,
             phase: "gap-analysis",
+            ...(await reviewFixAccounting(registry, mapping, fix)),
           });
           updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
           recordReviewFixDispatch({ queueId: fix.id, dispatchId, repo: fix.repo,
@@ -3817,6 +3842,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
                 workflowFile: mapping.workflowFile,
                 contract: reviewFixContract,
                 phase: "gap-analysis",
+                ...(await reviewFixAccounting(registry, mapping, fix)),
               },
             );
           } catch (err) {
@@ -3843,6 +3869,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
         runnerMode: "default",
         contract: reviewFixContract,
         phase: "gap-analysis",
+        ...(await reviewFixAccounting(registry, mapping, fix)),
       });
       updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
       if (dispatchId) {
@@ -3886,10 +3913,6 @@ function readBodyLimited(req: http.IncomingMessage, maxBytes: number): Promise<s
     req.on("end", () => resolve(bytes > maxBytes ? null : Buffer.concat(chunks).toString()));
     req.on("error", reject);
   });
-}
-
-function onDeployBuildFailure(commit: string, err: unknown): void {
-  recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
 }
 
 async function handleKgRefreshOutcome(
@@ -3979,6 +4002,7 @@ async function handleKgRefreshOutcome(
 
 const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
+const selfDeployClient = createSelfDeployIngressClient();
 const trackerExportClient = createTrackerExportIngressClient();
 // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
 function restateReady(): boolean {
@@ -4112,12 +4136,12 @@ export function sweepLegacyKgRefreshRows(): number {
   return rows.length;
 }
 
-async function onReviewFixResult(result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> {
+async function onReviewFixResult(result: ReviewFixResultMetadataV1 & { usage?: import("./agent-usage.js").RecordedUsage }, opts: { idempotencyKey: string }): Promise<ResultIntakeOutcome> {
   // Verify-only (AII-1185): the callback forwards the validated result to
   // ReviewFixAttempt.result, whose `store-result` step is the sole SQLite writer.
   // Restate unreachable throws, which the route answers 503 with nothing written;
   // the runner retries the same body under the same key.
-  const out = await reviewFixIngressClient.result(result.attemptId, result, { idempotencyKey: reviewFixResultForwardKey(result) });
+  const out = await reviewFixIngressClient.result(result.attemptId, result, opts);
   const outcome = reviewFixResultIntakeFromForward(result.attemptId, out);
   if (!outcome) throw new ReviewFixIntakeUnavailableError();
   return outcome;
@@ -4158,7 +4182,6 @@ function startServer(
   memoryProvider: MemoryProvider | null,
   memoryProviderDiagnostic: string | null,
 ): http.Server {
-  const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
   const kgRefreshAdminDeps = config.kgSourceRepo ? makeKgRefreshAdminDeps(config.kgSourceRepo, kgRefreshIngressClient) : undefined;
   const reviewFixAttempts = createReviewFixAdminFacade(reviewFixAttemptStore, new GithubReviewFixWorker({
     credentials: createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey),
@@ -4188,6 +4211,7 @@ function startServer(
       const { pollCount: polls, lastPollStartedAt, lastPollFinishedAt } = getPollStats();
       res.end(JSON.stringify({
         status: "ok",
+        sourceCommit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
         polls,
         kgDegraded: isKgDegraded(),
         ...sidecarHealthFields(),
@@ -4840,7 +4864,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -4892,7 +4916,7 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
-  /** Runs after a registration that took effect (never after `declined-conflict`); must not throw. */
+  /** Runs after any non-conflict registration outcome, including `unreachable`; must not throw. */
   onRegistered?: () => Promise<void>;
 }
 
@@ -4926,7 +4950,45 @@ export function createBootReconciliation(
   };
 }
 
+/** Recover legacy/crashed deploys only after this boot has successfully registered with Restate. */
+export async function releaseUnownedDeployHoldAtBoot(
+  client: Pick<SelfDeployClient, "releaseUnownedHold"> = selfDeployClient,
+): Promise<void> {
+  if (!isDeployHeld()) return;
+  try {
+    const { released } = await client.releaseUnownedHold();
+    if (released) console.log("[self-deploy] released an unowned deploy hold at boot");
+  } catch (err) {
+    console.error("[self-deploy] keeping deploy hold at boot: hold ownership could not be checked:", err);
+  }
+}
+
+/** Production registration hook; only successful registration may recover the hold. */
+export async function onRestateRegistered(deps: {
+  releaseHold?: () => Promise<void>;
+  sweep: () => void;
+  scrub: () => Promise<void>;
+  seed: () => Promise<void>;
+  refresh: () => Promise<void>;
+  reconcile: () => Promise<void>;
+}): Promise<void> {
+  if (getRestateStatus().registration.state === "registered") {
+    await (deps.releaseHold ?? releaseUnownedDeployHoldAtBoot)();
+  }
+  deps.sweep();
+  await deps.scrub();
+  await deps.seed();
+  await deps.refresh();
+  await deps.reconcile();
+}
+
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
+/** Adapt transient apply diagnostics to the notice without changing the durable record. */
+export function createSelfDeployOutcomeHandler(config: Parameters<typeof onSelfDeployOutcome>[0]) {
+  return (record: import("./restate/self-deploy.js").SelfDeployRecord, detail?: string) =>
+    onSelfDeployOutcome(config, detail ? { ...record, reason: `${record.reason}: ${detail}` } : record);
+}
+
 const RESTATE_REGISTRATION_RETRY_MS = 60_000;
 
 /**
@@ -5049,11 +5111,8 @@ async function main(): Promise<void> {
     console.error("[kg-refresh] boot sweep failed; continuing boot:", err);
   }
 
-  // A process that died mid-deploy must not leave dispatch paused forever.
-  const holdWasSet = clearDeployHold();
-  if (holdWasSet) {
-    console.warn("[main] Cleared a hold left by the previous deployment process, resuming paused dispatches...");
-  }
+  // The deploy hold is deliberately not cleared here: a boot during a drain would re-open dispatch
+  // in the middle of a deploy. After registration we check SelfDeploy ownership (docs/deployment.md).
 
   // Start sidecar before loadConfig() so KG_SIDECAR_URL and KG_EMBEDDINGS_DEGRADED are
   // in process.env when loadConfig() reads them. Failure is non-fatal (logged, /mcp degraded).
@@ -5080,11 +5139,9 @@ async function main(): Promise<void> {
   // below — have no per-request dependency injection; sharing this instance means they
   // negotiate the same MCP session rather than a second, independent one.
   setKgMemoryProvider(memoryProvider);
-  let sidecarProbeError: string | null = null;
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
     if (health.lastError) {
-      sidecarProbeError = health.lastError;
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
       console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);
@@ -5142,6 +5199,7 @@ async function main(): Promise<void> {
       getWorkflowRunStatus: async (runId) => {
         const run = await getWorkflowRunStatus(await kgWorkflowToken(), kgSlug.owner, kgSlug.repo, runId);
         if (!run) throw new Error(`workflow run ${runId} status unavailable`);
+        recordGhaRunCompleted(runId, run);
         return { status: run.status, conclusion: run.conclusion };
       },
       findRunByTitle: createKgFindRunByTitle({ owner: kgSlug.owner, repo: kgSlug.repo, getToken: kgWorkflowToken }),
@@ -5191,20 +5249,50 @@ async function main(): Promise<void> {
   }).services;
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
   const trackerExportServices = createProductionTrackerExportServices().services;
+  const selfDeployServices = [selfDeployRecovery, createSelfDeploy({
+    config: () => ({
+      flyDeployToken: config.flyDeployToken ?? undefined,
+      flyOrchestratorApp: config.flyOrchestratorApp ?? undefined,
+      selfDeployTarget: config.selfDeployTarget,
+      imageApp: process.env.FLY_IMAGE_APP || undefined,
+      kgSourceRepo: config.kgSourceRepo,
+    }),
+    head: async (target, branch) => {
+      const { token } = await mintSourceTokenOrJwt(config.githubAppId, config.githubAppPrivateKey, target.owner, { permissions: { contents: "read" }, repositories: [target.repo] });
+      return getRefSha(token, target.owner, target.repo, branch);
+    },
+    getDeployPolicy,
+    imagePublished: (target, commit) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, target, commit),
+    fly: { listMachines, getMachine, updateMachine },
+    flyctl: async (record, args, token, signal) => {
+      const [owner, repo] = record.target.repo.split("/");
+      await runSelfDeployFlyctl({ owner, repo, commit: record.target.commit, githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, args, flyDeployToken: token, signal });
+    },
+    kgToken: async () => {
+      const kg = parseKgSourceRepo(config.kgSourceRepo);
+      return (await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, kg.owner, { permissions: { contents: "read" }, repositories: [kg.repo] })).token;
+    },
+    getInFlightWork,
+    drainProbes: createRestateDrainProbes,
+    setHold: async (held) => { if (held) setDeployHold(); else clearDeployHold(); },
+    sourceCommit: () => process.env.AI_IMPLEMENT_SOURCE_COMMIT || undefined,
+    // Only the notification/outcome copy carries diagnostic text; the durable record stays stable.
+    onOutcome: createSelfDeployOutcomeHandler(config),
+  })];
   const bootReconciliation = createBootReconciliation(
     () => startupReconciliation(config, registry),
     () => getRunnerBackendSource(),
   );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
-    onRegistered: async () => {
-      sweepOnRegistered(config);
-      await scrubOperatorLegacyTokens();
-      await seedRunnerBackends();
-      await refreshRunnerBackendCache();
-      await bootReconciliation.onRegistered();
-    },
+    onRegistered: () => onRestateRegistered({
+      sweep: () => sweepOnRegistered(config),
+      scrub: async () => { await scrubOperatorLegacyTokens(); },
+      seed: seedRunnerBackends,
+      refresh: refreshRunnerBackendCache,
+      reconcile: () => bootReconciliation.onRegistered(),
+    }),
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.
@@ -5253,12 +5341,10 @@ async function main(): Promise<void> {
   const server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic);
 
   // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
-  // Every write postBootNotice makes — LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY and
-  // DEPLOY_OUTCOME_KEY — happens synchronously before its first await, so nothing is lost
-  // if the webhook never answers. Keep it that way: a write moved below an await here stops
-  // persisting silently and misclassifies every later boot. The sidecar probe above has
-  // already resolved by this point, so the recorded outcome reflects it rather than racing it.
-  void postBootNotice(config, { holdWasSet, sidecarProbeError });
+  // Every write postBootNotice makes — LAST_IMAGE_REF_KEY and LAST_SHUTDOWN_AT_KEY — happens
+  // synchronously before its first await, so nothing is lost if the webhook never answers. Keep it
+  // that way: a write moved below an await here stops persisting silently and misclassifies every later boot.
+  void postBootNotice(config);
 
   // Reconcile machines from any previous run before starting the poll loop
   await refreshRunnerBackendCache();

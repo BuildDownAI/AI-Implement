@@ -15,7 +15,7 @@ import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { settleLaunch } from "../managed-dispatch-auth.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
-import { createMachine } from "../fly-machines.js";
+import { createMachine, buildSessionMachineConfig } from "../fly-machines.js";
 import { startLocalRunnerContainer } from "../local-docker.js";
 
 vi.mock("../github.js", async (importOriginal) => {
@@ -190,8 +190,19 @@ describe("implementation session launches", () => {
     expect(result).toEqual({
       machineId: "m-1", sessionImage: "default-img", executionMode: "fly-machines",
       statusComment: { machineName: "machine-one", logsUrl: "https://fly.io/apps/fly-app/machines/m-1" },
+      machineSize: undefined, computeStartedAt: expect.any(Number),
     });
     expectNoToken(result);
+  });
+
+  it("fly: the result holds the guest the built config requested (4 CPU, 8192 MB)", async () => {
+    vi.mocked(buildSessionMachineConfig).mockImplementationOnce(() => ({
+      config: { guest: { cpu_kind: "shared", cpus: 4, memory_mb: 8192 } },
+    }) as never);
+    vi.mocked(createMachine).mockResolvedValue({ id: "m-4", name: "machine-four" } as never);
+    const result = await launchImplementationFlySession({ ...args, mapping: { ...mapping, machineCpus: 4, machineMemoryMb: 8192 }, shadow: false });
+    expect(result.machineSize).toEqual({ cpuKind: "shared", cpus: 4, memoryMb: 8192 });
+    expect(vi.mocked(buildSessionMachineConfig).mock.calls[0][0]).toMatchObject({ cpus: 4, memoryMb: 8192 });
   });
 
   it("fly shadow: posts no status comment", async () => {

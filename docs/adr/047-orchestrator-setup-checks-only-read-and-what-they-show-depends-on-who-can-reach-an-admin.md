@@ -1,4 +1,4 @@
-# 046. Orchestrator setup checks only read, and what they show depends on who can reach an admin
+# 047. Orchestrator setup checks only read, and what they show depends on who can reach an admin
 
 **Status:** Accepted. The result contract and the orchestrator's own checks land with [AII-1532](https://linear.app/eudoxus/issue/AII-1532); the surfaces in decisions 2 and 3 land with later children of [AII-1531](https://linear.app/eudoxus/issue/AII-1531).
 **Date:** 2026-10-23

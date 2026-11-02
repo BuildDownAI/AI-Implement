@@ -356,7 +356,11 @@ export function verifyPreparedReviewFixToken(
       SELECT expires_at FROM runner_tokens WHERE dispatch_id = ? AND audience = ?
     `).get(claims.dispatchId, claims.audience) as { expires_at: number } | undefined;
     if (!row || claims.exp !== row.expires_at) return { ok: false, reason: "wrong_scope", claims };
-    if (!hasPreparedAdmissionAuthority(attempt)) {
+    // Result delivery can retry after the workflow releases its admission.
+    // Keep every scope and explicit revocation check; release alone ends
+    // publication/progress authority, not an unexpired result credential.
+    const authority = expectedAudience === "result" ? { ...attempt, released_at: null } : attempt;
+    if (!hasPreparedAdmissionAuthority(authority)) {
       return { ok: false, reason: "revoked", claims };
     }
     if (options.publicationExecution) {

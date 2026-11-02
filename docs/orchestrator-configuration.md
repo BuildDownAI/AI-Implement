@@ -4,7 +4,7 @@ How an orchestrator decides the effective value of each setting. `.env.example` 
 
 ## The orchestrator's setup checks
 
-The `orchestrator` group of setup checks (`ORCHESTRATOR_CONFIG_CHECKS`, `src/setup-checks/orchestrator-config.ts`) tests for each fault this page describes and names its fix. Each id below links to the section that explains the value it reads. A check only reads, and where the orchestrator decides something from a value with a function of its own (a parse, a precedence, which sign-in providers to keep), the check calls that function, so it reports what the orchestrator does rather than a second reading of the variable. `admin.allowlist` goes further than boot's warning: it also fails an empty list, which admits nobody. The decision to build them this way is [ADR 046](adr/046-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md).
+The `orchestrator` group of setup checks (`ORCHESTRATOR_CONFIG_CHECKS`, `src/setup-checks/orchestrator-config.ts`) tests for each fault this page describes and names its fix. Each id below links to the section that explains the value it reads. A check only reads, and where the orchestrator decides something from a value with a function of its own (a parse, a precedence, which sign-in providers to keep), the check calls that function, so it reports what the orchestrator does rather than a second reading of the variable. `admin.allowlist` goes further than boot's warning: it also fails an empty list, which admits nobody. The decision to build them this way is [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md).
 
 | Id | Reports |
 |---|---|

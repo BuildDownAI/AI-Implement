@@ -162,6 +162,41 @@ describe("kg-refresh callback is verify-only and reports to the KgRefresh workfl
     );
   });
 
+  it.each(["success", "failure"] as const)("forwards sanitized usage on %s and identical retries", async (outcome) => {
+    const { token, dispatchId } = mint();
+    const c = client();
+    const attribution = {
+      version: 1, invocationId: "kg-inv-1", stage: "implementation", snapshotId: "kg-snapshot",
+      agent: "codex", provider: "openai", model: "gpt-5", profileId: "kg-profile",
+      authMode: "openai-api-key", limit: null, outcome: "success",
+      usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5, costStatus: "reported" },
+    };
+    const record = { attribution, cacheReadTokens: 0, cacheCreationTokens: 0, attempts: 1 };
+    const body = {
+      phase: "kg-refresh", outcome, comments: [], attribution, invocations: [record],
+      failureCode: outcome === "failure" ? "INVOCATION_TIMEOUT" : undefined,
+    } as never;
+    for (let i = 0; i < 2; i++) expect((await run(token, c, body)).status).toBe(200);
+    expect(c.report).toHaveBeenCalledTimes(2);
+    expect(c.report).toHaveBeenNthCalledWith(1, dispatchId, expect.objectContaining({
+      usage: { attribution, records: [record], pushedCommits: null, listWhole: true, timedOut: outcome === "failure" },
+    }), { idempotencyKey: dispatchId });
+    expect(c.report.mock.calls[0]).toEqual(c.report.mock.calls[1]);
+    expect(consumedAt(dispatchId)).toBeNull();
+  });
+
+  it("drops malformed usage diagnostics while delivering the KG result", async () => {
+    const { token, dispatchId } = mint();
+    const c = client();
+    expect((await run(token, c, {
+      phase: "kg-refresh", outcome: "success", comments: [],
+      attribution: { version: 99 }, invocations: [{}],
+    } as never)).status).toBe(200);
+    expect(c.report).toHaveBeenCalledWith(dispatchId, expect.objectContaining({
+      usage: { attribution: null, records: [], pushedCommits: null, listWhole: false, timedOut: false },
+    }), { idempotencyKey: dispatchId });
+  });
+
   it("refuses bad signature, wrong audience, and unknown rows with 401 and never calls the client", async () => {
     const c = client();
     const { token } = mint();

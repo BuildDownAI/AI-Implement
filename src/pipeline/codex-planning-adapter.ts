@@ -427,6 +427,7 @@ function runSession(input: CodexTransportRunInput, policy: CodexProtocolPolicy):
     let lastMessage: string | null = null;
     let tokensIn: number | null = null;
     let tokensOut: number | null = null;
+    let cacheReadTokens: number | null = null;
     let unsafe = false;
     let calls = 0;
     const trace: string[] = [];
@@ -438,7 +439,7 @@ function runSession(input: CodexTransportRunInput, policy: CodexProtocolPolicy):
       if (tokenExpired) {
         outcome = { ...outcome, tokenExpired: true };
         const t = outcome.result.telemetry;
-        if (t && (tokensIn !== null || tokensOut !== null)) outcome.result = { ...outcome.result, tokensUsed: (tokensIn ?? 0) + (tokensOut ?? 0), telemetry: { ...t, tokensIn, tokensOut } };
+        if (t && (tokensIn !== null || tokensOut !== null || cacheReadTokens !== null)) outcome.result = { ...outcome.result, tokensUsed: (tokensIn ?? 0) + (tokensOut ?? 0), telemetry: { ...t, tokensIn, tokensOut, cacheReadTokens, cacheCreationTokens: null } };
       }
       io.stdout.off("data", onData);
       io.stdout.off("end", onEnd);
@@ -615,6 +616,7 @@ function runSession(input: CodexTransportRunInput, policy: CodexProtocolPolicy):
         if (!total || used === null || generated === null) return fail("malformed_message", true);
         tokensIn = used;
         tokensOut = generated;
+        cacheReadTokens = count(total.cachedInputTokens);
         return;
       }
       const turn = params.turn as Record<string, unknown>;
@@ -636,6 +638,8 @@ function runSession(input: CodexTransportRunInput, policy: CodexProtocolPolicy):
         costUsd: null,
         tokensIn,
         tokensOut,
+        cacheReadTokens,
+        cacheCreationTokens: null,
         toolTrace: [...trace],
       };
       let structured: Record<string, unknown> | undefined;

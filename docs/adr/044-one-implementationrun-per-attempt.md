@@ -12,7 +12,7 @@ An implementation run that gets stuck is retried: the stuck watchdog clears the 
 
 One `ImplementationRun` (`src/restate/implementation-run-workflow.ts`) owns exactly one implementation attempt: one dispatch id, one reservation, one runner. At its deadline it stops the run and calls the existing bounded stuck cleanup through the `finishJob` dep (`remediateStuckJob` with `ownerCall`). The poll loop starts the next attempt as a new `ImplementationRun`. After three attempts (`STUCK_JOB_MAX_ATTEMPTS`) the "Stuck — Needs Human" path runs, as today.
 
-`report` carries no payload. The runner callback keeps writing the outcome to SQLite, and the finish step (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row to learn what the callback already did. Every ticket move goes through `finalizeImplementation` (`src/implementation-finalize.ts`).
+`report` carries optional model usage but no job outcome. The runner callback keeps writing the outcome to SQLite, and the finish step (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row to learn what the callback already did. Every ticket move goes through `finalizeImplementation` (`src/implementation-finalize.ts`).
 
 ## Consequences
 

@@ -12,7 +12,6 @@ import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
 import type * as ReviewFixAttemptStoreModule from "../review-fix-attempt-store.js";
-import type * as ReviewFixAdminFacadeModule from "../review-fix-admin-facade.js";
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
@@ -27,7 +26,7 @@ import type {
   ReviewFixResultMetadataV1,
   ResultIntakeOutcome,
 } from "../review-fix-contract.js";
-import { makeAppendLogEntry, makeIssue, makeReviewFixResult } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeIssue, makeMapping, makeReviewFixResult } from "./helpers/builders.js";
 import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -80,13 +79,12 @@ let reviewFixQueue: typeof ReviewFixQueueModule;
 let commentGapfillQueue: typeof CommentGapfillQueueModule;
 let reviewFixEvidence: typeof ReviewFixEvidenceModule;
 let reviewFixAttemptStore: typeof ReviewFixAttemptStoreModule;
-let reviewFixAdminFacade: typeof ReviewFixAdminFacadeModule;
 
 beforeEach(async () => {
   ({
     dedup, log, dispatchAdmission, runnerTokens, runnerCallback, stepLog, dispatchBreaker, jiraClient,
     reviewStore, reviewFixQueue, commentGapfillQueue, reviewFixEvidence,
-    reviewFixAttemptStore, reviewFixAdminFacade,
+    reviewFixAttemptStore,
   } = (await testDb({
     modules: {
       dedup: () => import("../dedup.js"),
@@ -102,7 +100,6 @@ beforeEach(async () => {
       commentGapfillQueue: () => import("../comment-gapfill-queue.js"),
       reviewFixEvidence: () => import("../review-fix-evidence.js"),
       reviewFixAttemptStore: () => import("../review-fix-attempt-store.js"),
-      reviewFixAdminFacade: () => import("../review-fix-admin-facade.js"),
     },
   })).modules);
 });
@@ -680,7 +677,7 @@ describe("handleRunnerResult — planning", () => {
 
     it("calls checkPlanningAdmissionTermination and, for a Restate-owned dispatch, writes the failed row it keeps", async () => {
       const { token, dispatchId } = seedPlanningRun({ kind: "restate", attemptId: "x" });
-      const checkPlanningAdmissionTermination = vi.fn(async () => {});
+      const checkPlanningAdmissionTermination = vi.fn(async () => ({ status: "accepted" as const }));
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
         body: { phase: "planning", outcome: "failure", failureReason: "boom", failureCode: "PLAN_BOOM", comments: [] },
@@ -689,7 +686,7 @@ describe("handleRunnerResult — planning", () => {
         checkPlanningAdmissionTermination,
       });
       expect(res.status).toBe(200);
-      expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
+      expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId, expect.any(Object));
       expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", conclusion: "PLAN_BOOM" });
       // The backend may still be running: the reservation stays held for the workflow to release.
       expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
@@ -709,7 +706,7 @@ describe("handleRunnerResult — planning", () => {
       expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("failed");
     });
 
-    it("does not fail the callback when the hook throws", async () => {
+    it("returns a retryable failure when the hook throws", async () => {
       const { token } = seedPlanningRun({ kind: "restate", attemptId: "x" });
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
@@ -718,7 +715,7 @@ describe("handleRunnerResult — planning", () => {
         resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
         checkPlanningAdmissionTermination: async () => { throw new Error("network"); },
       });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(503);
     });
   });
 
@@ -1491,6 +1488,22 @@ describe("handleRunnerResult — implementation", () => {
       dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(at, rowId);
     }
 
+    it("the sweep submits a row's stored head, and no headSha key for a row with none (AII-1596)", async () => {
+      const withHead = pendingRow("i-sweep-head");
+      const noHead = pendingRow("i-sweep-nohead");
+      const head = "0123456789abcdef0123456789abcdef01234567";
+      log.setLateReviewHeadSha(withHead.rowId, head);
+      await setCompleted(withHead.rowId, NOW - HOUR);
+      await setCompleted(noHead.rowId, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      const inputs = (submit.mock.calls as unknown as Record<string, unknown>[][]).map((c) => c[0]!);
+      const h = inputs.find((i) => i.rowId === withHead.rowId)!;
+      const n = inputs.find((i) => i.rowId === noHead.rowId)!;
+      expect(h.headSha).toBe(head);
+      expect(Object.keys(n).includes("headSha")).toBe(false);
+    });
+
     it("a not-ready callback leaves the row pending; the next ready tick submits once, a second submits nothing", async () => {
       const { rowId, dispatchId } = pendingRow("i-sweep");
       await setCompleted(rowId, NOW - HOUR);
@@ -1517,6 +1530,16 @@ describe("handleRunnerResult — implementation", () => {
       });
       await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
       expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-submits a pending review-fix attempt's stored head with gapFill and attemptId (AII-1596)", async () => {
+      const head = "c".repeat(40);
+      log.recordPendingLateReview({ workflowKey: "d-att3-att-3", dispatchId: "d-att3", prUrl: "https://github.com/o/r/pull/7", attemptId: "att-3", headSha: head }, NOW - HOUR);
+      const submit = vi.fn(async () => {});
+      await runnerCallback.resubmitPendingGapFillReviews({ ready: () => true, submit, now: NOW });
+      expect(submit).toHaveBeenCalledWith({
+        dispatchId: "d-att3", owner: "o", repo: "r", prNumber: 7, prUrl: "https://github.com/o/r/pull/7", gapFill: true, attemptId: "att-3", headSha: head,
+      });
     });
 
     it("keeps a pending review-fix attempt when the hook reports the submit did not settle (AII-1307)", async () => {
@@ -2350,7 +2373,7 @@ describe("handleRunnerProgress", () => {
 
     it("passes a validated step to the client", async () => {
       const { token, dispatchId } = kgToken();
-      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" as const })) };
       const res = await runnerCallback.handleRunnerProgress({
         authorization: `Bearer ${token}`,
         body: { step: kgStep() },
@@ -2363,7 +2386,7 @@ describe("handleRunnerProgress", () => {
 
     it("calls the client with no step for a bare heartbeat", async () => {
       const { token, dispatchId } = kgToken();
-      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" as const })) };
       const res = await runnerCallback.handleRunnerProgress({
         authorization: `Bearer ${token}`,
         body: {},
@@ -2376,7 +2399,7 @@ describe("handleRunnerProgress", () => {
 
     it("answers 400 invalid_step_id for a malformed step", async () => {
       const { token } = kgToken();
-      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" as const })) };
       const res = await runnerCallback.handleRunnerProgress({
         authorization: `Bearer ${token}`,
         body: { step: { id: 1 } } as never,
@@ -2409,7 +2432,7 @@ describe("handleRunnerProgress", () => {
     ]) it(`contract: KgRefresh.progress — a real TokenStepReporter step post is accepted by the real handler (${shape})`, async () => {
       vi.stubEnv("GITHUB_RUN_ID", runId);
       const { token, dispatchId } = kgToken();
-      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" })) };
+      const kgRefreshClient = { progress: vi.fn(async () => ({ status: "accepted" as const })) };
       const responses: Array<{ status: number }> = [];
       const urls: string[] = [];
       const bodies: Array<Record<string, unknown>> = [];
@@ -2658,6 +2681,69 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(hook).toHaveBeenCalledWith({
       dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true, rowId: expect.any(Number),
     });
+  });
+
+  it.each([
+    ["restate", "restate", true],
+    ["legacy", "legacy", false],
+    ["a body with no externalReviewPending", "restate", false],
+  ] as const)("a gap-analysis success submits with the pushed headSha only for a restate mapping and a reported head: %s (AII-1484)", async (name, lifecycle, withHead) => {
+    const config = await import("../config.js");
+    config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", reviewFixLifecycle: lifecycle }));
+    const pushed = "0123456789abcdef0123456789abcdef01234567";
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: `i-head-${name}`, mappingTeamKey: "ENG", phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    const jobId = log.appendLog(makeAppendLogEntry({ issueId: `i-head-${name}`, issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(async () => {});
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], ...(name.startsWith("a body") ? {} : { externalReviewPending: { headSha: pushed } }) },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      submitLateExternalReview: hook as never,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(hook).toHaveBeenCalledWith({
+      dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true, rowId: jobId,
+      ...(withHead ? { headSha: pushed } : {}),
+    });
+    expect(Object.keys((hook.mock.calls as unknown[][])[0]![0] as object).includes("headSha")).toBe(withHead);
+    expect(log.getJobById(jobId)?.lateReviewHeadSha).toBe(withHead ? pushed : null);
+  });
+
+  it.each([
+    ["throws", (async () => { throw new Error("boom"); }) as () => Promise<unknown>],
+    ["rejects", () => Promise.reject(new Error("rejected")) as Promise<unknown>],
+    ["returns false", (async () => false) as () => Promise<unknown>],
+  ] as const)("keeps the stored restate head when the submit %s (AII-1596)", async (name, impl) => {
+    const config = await import("../config.js");
+    config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", reviewFixLifecycle: "restate" }));
+    const pushed = "fedcba9876543210fedcba9876543210fedcba98";
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: `i-head-fail-${name}`, mappingTeamKey: "ENG", phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    const jobId = log.appendLog(makeAppendLogEntry({ issueId: `i-head-fail-${name}`, issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(impl);
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], externalReviewPending: { headSha: pushed } },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+      submitLateExternalReview: hook as never,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(log.getJobById(jobId)?.lateReviewHeadSha).toBe(pushed);
   });
 
   it("still returns 200 and writes no mark when the LateExternalReview submit throws or is absent (AII-1291)", async () => {
@@ -4637,7 +4723,7 @@ describe("handleRunnerResult — reviewFix pilot marker (AII-777)", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(onReviewFixResult).toHaveBeenCalledWith(validReviewFix);
+    expect(onReviewFixResult).toHaveBeenCalledWith({ ...validReviewFix, usage: expect.any(Object) }, { idempotencyKey: validReviewFix.attemptId });
     expect(fake.getPhase("i")).toBeUndefined();
     expect(fake.recordedCalls()).toEqual([]);
     expect(stampApprovedSpy).not.toHaveBeenCalled();
@@ -5604,9 +5690,14 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     if (attribution && typeof attribution === "object" && (attribution as { snapshotId?: string }).snapshotId === "snap-1") {
       attribution = { ...(attribution as object), snapshotId: `snap-${dispatchId}` };
     }
+    const extra = { ...(opts.extra ?? {}) };
+    if (Array.isArray(extra.invocations)) {
+      extra.invocations = extra.invocations.map((r: { attribution: { snapshotId?: string } }) =>
+        r.attribution?.snapshotId === "snap-1" ? { ...r, attribution: { ...r.attribution, snapshotId: `snap-${dispatchId}` } } : r);
+    }
     return runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
-      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", attribution: attribution as never, ...(opts.extra ?? {}) },
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", attribution: attribution as never, ...extra },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
     });
@@ -5620,39 +5711,27 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     await store.bindExecution(attemptId, { githubRunId: 555, githubRunAttempt: 1 }, Date.now());
     const marker = makeReviewFixResult({ attemptId, repository: "acme/widgets", deadlineAt: DEADLINE_AT });
     const fake = new FakeProvider({ recordCalls: true });
+    const forwarded: unknown[] = [];
     const deliver = (attribution: unknown = claim({ snapshotId: "snap-managed-attr", usage: {
       availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable",
-    } }), result = marker, bearer = token) => runnerCallback.handleRunnerResult({
+    } }), result = marker, bearer = token, extra: Record<string, unknown> = {}) => runnerCallback.handleRunnerResult({
       authorization: `Bearer ${bearer}`, secret: SECRET,
-      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result, attribution: attribution as never },
+      body: { phase: "gap-analysis", outcome: "success", comments: [], reviewFix: result, attribution: attribution as never, ...extra },
       resolveProvider: makeResolve(fake),
-      onReviewFixResult: (value) => store.recordResult(value.attemptId, value, Date.now()),
+      onReviewFixResult: ({ usage, ...value }) => { forwarded.push(usage); return store.recordResult(value.attemptId, value, Date.now()); },
     });
-    return { attemptId, store, marker, deliver, fake };
+    return { attemptId, store, marker, deliver, fake, forwarded };
   }
 
-  it("retains managed attribution through real accepted intake and admin detail without a legacy job", async () => {
+  it("forwards managed usage on accepted and duplicate results without callback accounting writes", async () => {
     const c = await managedResult();
+    const consume = vi.spyOn(runnerTokens, "verifyAndConsumeRunToken");
     expect(await c.deliver()).toMatchObject({ status: 200, body: { outcome: "stored" } });
-    expect(log.getJobByDispatchId(c.attemptId)).toBeNull();
-    expect(rows()).toHaveLength(1);
-    expect(rows()[0]).toMatchObject({dispatch_id: c.attemptId, snapshot_id: "snap-managed-attr", model: "m-implementation", profile_id: "p-implementation"});
-    const facade = reviewFixAdminFacade.createReviewFixAdminFacade(c.store, {reconcile: async () => ({status: "unknown"})}, {cancel: async () => ({status: "accepted"})});
-    expect(await facade.getAttempt(c.attemptId, {role: "admin", email: "operator@example.com"})).toMatchObject({status: "ok", attempt: {
-      attribution: {snapshotId: "snap-managed-attr", invocationId: "inv-1", agent: "codex", model: "m-implementation", profileId: "p-implementation",
-        usage: {tokensIn: 100, tokensOut: 10, costUsd: null, costStatus: "unavailable"}},
-    }});
-    expect(await facade.getAttempt(c.attemptId, {role: "user", email: "user@example.com"})).toEqual({status: "not_found"});
-    expect(c.fake.recordedCalls()).toEqual([]);
-  });
-
-  it("repairs missing managed attribution on duplicate delivery without duplicating spend or legacy effects", async () => {
-    const c = await managedResult();
-    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "stored"}});
-    dedup.getDb().prepare("DELETE FROM model_invocation_attribution").run();
-    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
-    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
-    expect(rows()).toHaveLength(1);
+    expect(await c.deliver()).toMatchObject({ status: 200, body: { outcome: "duplicate" } });
+    expect(c.forwarded).toHaveLength(2);
+    expect(c.forwarded[0]).toMatchObject({ attribution: { invocationId: "inv-1" } });
+    expect(rows()).toHaveLength(0);
+    expect(consume).not.toHaveBeenCalled();
     expect(c.fake.recordedCalls()).toEqual([]);
   });
 
@@ -5696,23 +5775,10 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "duplicate"}});
     expect(rows()).toHaveLength(0);
     await c.store.releaseOwner(c.attemptId, "finalized");
-    expect((await c.deliver()).status).toBe(401);
+    // This store-only seam has no transport idempotency cache: authentication
+    // succeeds after release, then the store rejects the stale result.
+    expect(await c.deliver()).toMatchObject({ status: 410, body: { outcome: "stale" } });
     expect(rows()).toHaveLength(0);
-  });
-
-  it("keeps accepted managed delivery when diagnostic storage fails, without logging its error text", async () => {
-    const c = await managedResult();
-    const db = dedup.getDb();
-    const prepare = db.prepare.bind(db);
-    vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
-      if (sql.includes("INSERT OR IGNORE INTO model_invocation_attribution")) throw new Error(PLANTED);
-      return prepare(sql);
-    }) as never);
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    expect(await c.deliver()).toMatchObject({status: 200, body: {outcome: "stored"}});
-    expect((await c.store.getAcceptedResult(c.attemptId))?.result).toEqual(c.marker);
-    expect(warn).toHaveBeenCalledWith("[runner-callback] Could not persist 1 managed attribution record (count only)");
-    expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
   });
 
   const rows = () => dedup.getDb().prepare("SELECT * FROM model_invocation_attribution").all() as Array<Record<string, string | number | null>>;
@@ -5774,6 +5840,131 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
     expect(rows()).toHaveLength(1);
   });
 
+  describe("job accounting lists (AII-1562)", () => {
+    const SHA_A = "a".repeat(40);
+    const SHA_B = "b".repeat(40);
+    const record = (id: string, stageName: string, over: Record<string, unknown> = {}, rec: Record<string, unknown> = {}) => ({
+      attribution: claim({ invocationId: id, stage: stageName, ...over }),
+      cacheReadTokens: 7,
+      cacheCreationTokens: 3,
+      attempts: 1,
+      ...rec,
+    });
+    const threePass = () => [
+      record("impl-1", "implementation"),
+      record("review-1", "review"),
+      record("impl-2", "implementation", {}, { attempts: 2 }),
+      record("review-2", "review"),
+      record("impl-3", "implementation"),
+    ];
+    const usageOf = (id: string) => JSON.parse(rows().find((r) => r.invocation_id === id)!.usage_json as string);
+
+    it("stores every invocation with cache tokens and attempts, and keeps the legacy read on the implement row", async () => {
+      const res = await deliver(claim({ invocationId: "impl-3" }), { extra: { invocations: threePass(), pushedCommits: [SHA_A, SHA_B] } });
+      expect(res.status).toBe(200);
+      expect(rows().map((r) => r.invocation_id)).toEqual(["impl-1", "review-1", "impl-2", "review-2", "impl-3"]);
+      expect(usageOf("impl-2")).toMatchObject({ cacheReadTokens: 7, cacheCreationTokens: 3, attempts: 2 });
+      expect(usageOf("impl-1")).toMatchObject({ cacheReadTokens: 7, cacheCreationTokens: 3, attempts: 1 });
+      expect(log.getJobByDispatchId("disp-attr")!.attribution).toMatchObject({ invocationId: "impl-3", stage: "implementation" });
+    });
+
+    it("stores nothing twice when the same body is delivered again", async () => {
+      const extra = { invocations: threePass(), pushedCommits: [SHA_A, SHA_B] };
+      await deliver(claim({ invocationId: "impl-3" }), { extra });
+      dedup.getDb().prepare("DELETE FROM runner_tokens").run();
+      await deliver(claim({ invocationId: "impl-3" }), { extra });
+      expect(rows()).toHaveLength(5);
+      expect(log.getPushedCommits("disp-attr")).toEqual([SHA_A, SHA_B]);
+    });
+
+    it("stores an invocation without usage as unavailable with null cost, never zero", async () => {
+      await deliver(undefined, { extra: { invocations: [record("no-usage", "review", { usage: null, outcome: "error" }, { cacheReadTokens: null, cacheCreationTokens: null })] } });
+      expect(usageOf("no-usage")).toMatchObject({ availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+    });
+
+    it("keeps pushed SHAs in order, an empty list as empty, and an absent field as unknown", async () => {
+      await deliver(undefined, { dispatchId: "d-two", extra: { pushedCommits: [SHA_B, SHA_A] } });
+      await deliver(undefined, { dispatchId: "d-none", extra: { pushedCommits: [] } });
+      await deliver(undefined, { dispatchId: "d-old" });
+      expect(log.getPushedCommits("d-two")).toEqual([SHA_B, SHA_A]);
+      expect(log.getPushedCommits("d-none")).toEqual([]);
+      expect(log.getPushedCommits("d-old")).toBeNull();
+    });
+
+    it("drops malformed and snapshot-mismatched entries by count without failing the callback", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const res = await deliver(undefined, {
+        extra: {
+          invocations: [
+            record("ok-1", "implementation"),
+            { attribution: { ...claim(), apiKey: PLANTED }, cacheReadTokens: 0, cacheCreationTokens: 0, attempts: 1 },
+            record("bad-attempts", "implementation", {}, { attempts: 0 }),
+            record("other-snap", "implementation", { snapshotId: "other-snap" }),
+          ],
+          pushedCommits: ["not-a-sha"],
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(rows().map((r) => r.invocation_id)).toEqual(["ok-1"]);
+      expect(log.getPushedCommits("disp-attr")).toBeNull();
+      expect(warn.mock.calls.join(" ")).not.toContain(PLANTED);
+    });
+
+    describe("invocations_complete (AII-1566)", () => {
+      const complete = (id = "disp-attr") =>
+        (dedup.getDb().prepare("SELECT invocations_complete AS c FROM dispatch_job_report WHERE dispatch_id = ?").get(id) as { c: number } | undefined)?.c ?? 0;
+
+      it("is set when the whole list was stored", async () => {
+        await deliver(claim({ invocationId: "impl-3" }), { extra: { invocations: threePass() } });
+        expect(complete()).toBe(1);
+        // Still set after a repeated delivery.
+        dedup.getDb().prepare("DELETE FROM runner_tokens").run();
+        await deliver(claim({ invocationId: "impl-3" }), { extra: { invocations: threePass() } });
+        expect(complete()).toBe(1);
+      });
+
+      it("stays unset without an invocations list, with a legacy attribution alone, or with pushedCommits alone", async () => {
+        await deliver(claim());
+        await deliver(undefined, { dispatchId: "d-sha", extra: { pushedCommits: [SHA_A] } });
+        expect(complete()).toBe(0);
+        expect(complete("d-sha")).toBe(0);
+        expect(log.getPushedCommits("d-sha")).toEqual([SHA_A]);
+      });
+
+      it("stays unset when an entry was dropped as malformed", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        await deliver(undefined, { extra: { invocations: [record("ok-1", "implementation"), record("bad", "implementation", {}, { attempts: 0 })] } });
+        expect(complete()).toBe(0);
+      });
+
+      it("stays unset when an entry did not match the snapshot", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        await deliver(undefined, { extra: { invocations: [record("ok-1", "implementation"), record("other", "implementation", { snapshotId: "other-snap" })] } });
+        expect(complete()).toBe(0);
+      });
+
+      it("stays unset when the runner reports it dropped records, and is set for a whole list without the key", async () => {
+        await deliver(undefined, { extra: { invocations: [record("ok-1", "implementation")], invocationsDropped: 3 } });
+        expect(complete()).toBe(0);
+        await deliver(undefined, { dispatchId: "d-whole", extra: { invocations: [record("ok-2", "implementation")] } });
+        expect(complete("d-whole")).toBe(1);
+      });
+
+      it("stays unset when the list is past the cap", async () => {
+        vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        const many = Array.from({ length: 201 }, (_, i) => record(`inv-${i}`, "implementation"));
+        await deliver(undefined, { extra: { invocations: many } });
+        expect(complete()).toBe(0);
+      });
+    });
+
+    it("stores a body with only the legacy attribution as one row", async () => {
+      await deliver(claim());
+      expect(rows()).toHaveLength(1);
+      expect(usageOf("inv-1")).toMatchObject({ cacheReadTokens: null, cacheCreationTokens: null, attempts: 1 });
+    });
+  });
+
   it("keeps legacy dispatches (no snapshot) readable with no row and no inferred cost", async () => {
     const res = await deliver(claim(), { snapshot: false });
     expect(res.status).toBe(200);
@@ -5783,7 +5974,7 @@ describe("handleRunnerResult — attribution persistence (AII-971)", () => {
 
   it("still completes the terminal callback when persistence throws, without echoing payload", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    dedup.getDb().exec("DROP TABLE model_invocation_attribution");
+    dedup.getDb().exec("CREATE TRIGGER boom BEFORE INSERT ON model_invocation_attribution BEGIN SELECT RAISE(ABORT, 'boom'); END");
     const res = await deliver(claim({ model: "m-implementation" }));
     expect(res.status).toBe(200);
     expect(warn.mock.calls.map((c) => c.join(" ")).join("\n")).toContain("Could not persist 1 attribution record");
@@ -5846,7 +6037,7 @@ describe("handleRunnerResult — implementation report hook (AII-1557)", () => {
     const { res, report, legacy, dispatchId } = await run("restate", body);
     expect(res.status).toBe(200);
     expect(report).toHaveBeenCalledTimes(1);
-    expect(report).toHaveBeenCalledWith(dispatchId);
+    expect(report).toHaveBeenCalledWith(dispatchId, { usage: expect.any(Object) }, { idempotencyKey: dispatchId });
     expect(legacy).not.toHaveBeenCalled();
     expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
   });
@@ -5858,8 +6049,98 @@ describe("handleRunnerResult — implementation report hook (AII-1557)", () => {
     expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
   });
 
-  it("does not fail the callback when the hook throws", async () => {
+  it("returns a retryable failure when the hook throws", async () => {
     const throwing = await run("restate", { outcome: "success", prUrl: "https://github.com/o/r/pull/7" }, true);
-    expect(throwing.res.status).toBe(200);
+    expect(throwing.res.status).toBe(503);
+  });
+});
+
+describe("owned result accounting boundary", () => {
+  it.each(["planning", "implementation", "review-fix", "kg-refresh"] as const)(
+    "%s forwards usage without consuming a token or writing accounting",
+    async (kind) => {
+      const dispatchId = "boundary-attempt";
+      const phase = kind === "review-fix" ? "implementation" : kind;
+      let token: string;
+      let reviewFix: ReturnType<typeof makeReviewFixResult> | undefined;
+      if (kind === "review-fix") {
+        token = preparedResultToken(dispatchId);
+        reviewFix = makeReviewFixResult({ attemptId: dispatchId, repository: "acme/widgets", deadlineAt: DEADLINE_AT });
+      } else {
+        token = runnerTokens.mintRunToken({
+          dispatchId, phase, issueId: "i", mappingTeamKey: "ENG", ttlSeconds: 3600, secret: SECRET,
+        }).token;
+        dispatchAdmission.acquire({
+          dispatchId, mappingKey: "ENG", scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+          kind: phase, backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 1,
+        });
+      }
+      log.appendLog({ issueId: "i", repo: "o/r", dispatchId, phase });
+      const accounting = await import("../agent-usage.js");
+      const record = vi.spyOn(accounting, "recordUsage");
+      const consume = vi.spyOn(runnerTokens, "verifyAndConsumeRunToken");
+      const report = vi.fn(async () => ({ status: "accepted" as const }));
+      const review = vi.fn(async (result: ReviewFixResultMetadataV1): Promise<ResultIntakeOutcome> => ({ status: "stored", result }));
+      const result = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`, secret: SECRET,
+        body: { phase, outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1", reviewFix, invocations: [] },
+        resolveProvider: makeResolve(new FakeProvider()),
+        checkPlanningAdmissionTermination: report,
+        checkImplementationAdmissionTermination: report,
+        onReviewFixResult: review,
+        kgRefreshClient: { report } as never,
+      });
+      expect(result.status).toBe(200);
+      expect(record).not.toHaveBeenCalled();
+      expect(consume).not.toHaveBeenCalled();
+      if (kind === "review-fix") expect(review).toHaveBeenCalledWith(expect.objectContaining({ usage: expect.objectContaining({ listWhole: true }) }), { idempotencyKey: "boundary-attempt" });
+      else expect(report).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["success", "failure"] as const)("does not repeat implementation %s lifecycle work before workflow closure", async (outcome) => {
+    const dispatchId = "implementation-replay";
+    const { token } = runnerTokens.mintRunToken({
+      dispatchId, phase: "implementation", issueId: "i", mappingTeamKey: "ENG", ttlSeconds: 3600, secret: SECRET,
+    });
+    dispatchAdmission.acquire({
+      dispatchId, mappingKey: "ENG", scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 1,
+    });
+    log.appendLog({ issueId: "i", repo: "o/r", dispatchId, phase: "implementation", status: "running" });
+    const provider = new FakeProvider({ recordCalls: true });
+    const report = vi.fn()
+      .mockRejectedValueOnce(new Error("Restate unavailable"))
+      .mockResolvedValue({ status: "accepted" });
+    const input: Parameters<typeof runnerCallback.handleRunnerResult>[0] = {
+      authorization: `Bearer ${token}`, secret: SECRET,
+      body: { phase: "implementation", outcome, noWork: outcome === "success", comments: [{ body: "result" }], prUrl: "https://github.com/o/r/pull/1" },
+      resolveProvider: makeResolve(provider), checkImplementationAdmissionTermination: report,
+    };
+    expect((await runnerCallback.handleRunnerResult(input)).status).toBe(503);
+    expect(log.getJobByDispatchId(dispatchId)?.status).toBe("running");
+    const effects = provider.recordedCalls().length;
+    expect(effects).toBeGreaterThan(0);
+    expect((await runnerCallback.handleRunnerResult(input)).status).toBe(200);
+    expect((await runnerCallback.handleRunnerResult(input)).status).toBe(200);
+    expect(provider.recordedCalls()).toHaveLength(effects);
+    expect(report).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps legacy consumption and direct accounting", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      phase: "planning", issueId: "i", mappingTeamKey: "ENG", ttlSeconds: 3600, secret: SECRET,
+    });
+    log.appendLog({ issueId: "i", repo: "o/r", dispatchId, phase: "planning" });
+    const record = vi.spyOn(await import("../agent-usage.js"), "recordUsage");
+    const consume = vi.spyOn(runnerTokens, "verifyAndConsumeRunToken");
+    expect((await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`, secret: SECRET,
+      body: { phase: "planning", outcome: "success", comments: [], invocations: [] },
+      resolveProvider: makeResolve(new FakeProvider()),
+    })).status).toBe(200);
+    expect(consume).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ listWhole: true }));
+    expect(runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false }).ok).toBe(false);
   });
 });

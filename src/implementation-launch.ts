@@ -28,7 +28,8 @@ import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { recordDispatchFailure } from "./dispatch-breaker.js";
 import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
-import { createMachine, buildSessionMachineConfig, listAppSecrets } from "./fly-machines.js";
+import { createMachine, buildSessionMachineConfig, listAppSecrets, guestSize } from "./fly-machines.js";
+import type { MachineSize } from "./log.js";
 import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
 import {
@@ -250,6 +251,7 @@ export async function launchImplementationRun(args: LaunchImplementationRunArgs)
         workflowFile: mapping.workflowFile,
         contract,
         issueUrl: provider.issueUrl(issue),
+        trackerKind: mapping.ticketingProvider,
         issueState: issue.nativeStatus,
         phase: "implementation",
       },
@@ -317,6 +319,9 @@ export interface ImplementationSessionResult {
   executionMode: "fly-machines" | "local-docker";
   statusComment: { machineName: string; logsUrl?: string } | null;
   dispatchedLogLine?: string;
+  /** The guest the launch requested (Fly only) and when the compute started, for the job row. */
+  machineSize?: MachineSize;
+  computeStartedAt: number;
 }
 
 /** The Fly Machines implementation launch, moved out of `dispatchFlyMachine`. */
@@ -431,6 +436,8 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
     machineId: machine.id,
     sessionImage: resolvedImage,
     executionMode: "fly-machines",
+    machineSize: guestSize(machineConfig),
+    computeStartedAt: Date.now(),
     statusComment: shadow ? null : { machineName: machine.name, logsUrl: machineLogsUrl },
   };
 }
@@ -507,6 +514,7 @@ export async function launchImplementationLocalSession(args: LaunchImplementatio
     machineId: container.containerId,
     sessionImage: config.localRunnerImage,
     executionMode: "local-docker",
+    computeStartedAt: Date.now(),
     statusComment: {
       machineName: container.containerName || container.containerId.slice(0, 12),
     },

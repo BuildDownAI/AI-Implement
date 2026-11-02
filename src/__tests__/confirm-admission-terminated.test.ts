@@ -35,6 +35,8 @@ vi.mock("../log.js", () => ({
   getJobByDispatchId: vi.fn(),
   getClaimedRunIds: vi.fn().mockReturnValue(new Set()),
   attachJobRunIdIfMissing: vi.fn().mockReturnValue(true),
+  recordGhaRunCompleted: vi.fn(),
+  stampComputeStopped: vi.fn(),
 }));
 
 vi.mock("../config.js", () => ({

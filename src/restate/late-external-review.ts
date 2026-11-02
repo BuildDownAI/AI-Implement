@@ -16,19 +16,21 @@ import { z } from "zod";
 import type { AppConfig } from "../index.js";
 import { parse as parseYaml } from "yaml";
 import { parseReviewCheckNamesConfig } from "../pipeline/steps/install.js";
-import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
+import { defaultFetchSignal, parseLinkNext, getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, getJobById, recordLateReviewEnding, stampJobApproved } from "../log.js";
-import { listOpenReviewFindings } from "../review-ledger-store.js";
+import { getReviewFindingsByKeys, listOpenReviewFindings, stableReviewFindingKey } from "../review-ledger-store.js";
 import { getMappings } from "../config.js";
 import { classifyReviewIssueComment, type ReviewLedgerOptions } from "../pipeline/review-ledger.js";
-import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES } from "../review-process.js";
+import { isReviewCheckRun, resolveReviewProcess, REVIEW_PROCESSES, type ReviewVerdictInput } from "../review-process.js";
 import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 /** How often the PR is read. */
 export const LATE_EXTERNAL_REVIEW_INTERVAL_MS = 60 * 1000;
+/** A gap-fill that names its pushed head waits up to this long for the PR to show that head before it ends `superseded`. At least one tick interval. */
+export const LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS = 2 * 60 * 1000;
 /** How long the workflow keeps looking before it ends `timed-out`. */
 export const LATE_EXTERNAL_REVIEW_DEADLINE_MS = 30 * 60 * 1000;
 /** A gap-fill head with no review check run at all, older than this, has no reviewer; the check counts as passed. Applies only when no earlier commit of the PR had a review run (AII-1302). */
@@ -41,13 +43,14 @@ export function lateExternalHeldMarker(key: string): string {
   return `<!-- ai-implement late-external-held key=${key} -->`;
 }
 
-/** Why Claude's newest review of the head blocks it. */
-export type HeldReason = "incomplete" | "unreadable" | "changes_requested" | "changes_requested-empty";
+/** Why the external review of the head blocks it. */
+export type HeldReason = "incomplete" | "unreadable" | "changes_requested" | "changes_requested-empty" | "review-failed";
 
 const HELD_ACTIONS: Record<HeldReason | "ledger" | "timed-out" | "generic", string> = {
-  incomplete: "Claude's review of this commit did not finish. Re-run the Claude review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
-  unreadable: "Claude's review of this commit could not be read. Re-run the Claude review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
-  "changes_requested-empty": "Claude requested changes but listed no finding, so no fix run starts. Read the review, then post `/ai-implement <what to change>`; or merge by hand.",
+  incomplete: "The external review of this commit did not finish. Re-run the external review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
+  unreadable: "The external review of this commit could not be read. Re-run the external review on this commit (re-run its check, or push a commit); when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
+  "changes_requested-empty": "The external review requested changes but listed no finding, so no fix run starts. Read the review, then post `/ai-implement <what to change>`; or merge by hand.",
+  "review-failed": "The Codex review of this commit failed (for example a usage limit). Re-run it with an `@codex review` comment; when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
   changes_requested: "A blocking finding is open. If a review-fix run starts, do nothing; if none starts, post `/ai-implement <what to change>`.",
   ledger: "A blocking finding is open. If a review-fix run starts, do nothing; if none starts, post `/ai-implement <what to change>`.",
   "timed-out": "The external review did not finish within 30 minutes. When it approves, post `/ai-implement verify only, make no code change`; or merge by hand.",
@@ -65,9 +68,9 @@ export const lateExternalReviewInputSchema = z.object({
   repo: z.string().min(1),
   prNumber: z.number().int().positive(),
   prUrl: z.string().min(1),
-  /** Required unless `gapFill`, which reads the PR head in its first journaled step. */
+  /** Required unless `gapFill`, which reads the PR head in its first journaled step. A gap-fill may name the head it pushed (Restate lifecycle); the workflow then waits up to `LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS` for the PR to show it. */
   headSha: z.string().min(1).optional(),
-  /** A gap-fill run (AII-1291): the head is whatever the PR holds when the workflow starts, and a head with no review check run for 5 min has no reviewer. */
+  /** A gap-fill run (AII-1291): with no `headSha` the head is whatever the PR holds when the workflow starts, and a head with no review check run for 5 min has no reviewer. */
   gapFill: z.boolean().optional(),
   /** Repository-fix review process: follow the PR's head past the reviewed commit instead of ending `superseded`. Optional so an in-flight workflow still parses. */
   followHead: z.boolean().optional(),
@@ -129,6 +132,7 @@ export interface LateExternalReviewDependencies {
   /** Test seams; production leaves them unset. */
   intervalMs?: number;
   deadlineMs?: number;
+  headGraceMs?: number;
 }
 
 /** Decodes the `read-head` journal entry. A bare SHA string was journaled before AII-1302; it reads as "reviewer expected" (fail closed, no grace). */
@@ -140,6 +144,7 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
   const retentionMs = deps.retentionMs ?? restateRetentionMs();
   const intervalMs = deps.intervalMs ?? LATE_EXTERNAL_REVIEW_INTERVAL_MS;
   const deadlineMs = deps.deadlineMs ?? LATE_EXTERNAL_REVIEW_DEADLINE_MS;
+  const headGraceMs = deps.headGraceMs ?? LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS;
 
   async function run(ctx: WorkflowContext, input: LateExternalReviewInput): Promise<LateExternalReviewResult> {
     if (!input?.dispatchId || lateExternalReviewWorkflowKey(input) !== ctx.key) {
@@ -202,12 +207,32 @@ export function createLateExternalReviewWorkflow(deps: LateExternalReviewDepende
       }, { maxRetryAttempts: 5 });
       ({ headSha, reviewerExpected } = decodeReadHead(read));
     }
+    // A gap-fill that names its pushed head: no head read, but the reviewer decision (AII-1302) is journaled for that head.
+    // Reachable only for `gapFill && headSha && !followHead`, so every other input keeps its `ctx.run` sequence.
+    const namesHead = !!input.gapFill && !!input.headSha && !input.followHead;
+    if (namesHead && deps.readReviewerExpected) {
+      reviewerExpected = await ctx.run("reviewer-expected", () => deps.readReviewerExpected!({ ...input, headSha: headSha! }), { maxRetryAttempts: 5 });
+    }
+    let headSeen = false;
     const tickInput = { ...input, headSha, ...(reviewerExpected === undefined ? {} : { reviewerExpected }) };
     let approvedHeadSha = headSha;
     for (let i = 0; ; i++) {
       const tick = await ctx.run(`read-${i}`, () => deps.readTick(tickInput), { maxRetryAttempts: 5 });
       // Follow mode: the head moving is the expected result of the repository's auto-fix, so only a close ends it.
-      if (!tick.open || (!input.followHead && tick.headSha !== headSha)) return finish("superseded");
+      if (namesHead) {
+        if (!tick.open) return finish("superseded");
+        if (tick.headSha === headSha) {
+          // The first sighting counts only inside the grace; a read that lands after it never approves.
+          if (!headSeen && await ctx.date.now() - startedAt >= headGraceMs) return finish("superseded");
+          headSeen = true;
+        } else if (headSeen) return finish("superseded");
+        else {
+          // The PR does not show the pushed head yet: keep polling until the grace passes.
+          if (await ctx.date.now() - startedAt >= headGraceMs) return finish("superseded");
+          await ctx.sleep(intervalMs);
+          continue;
+        }
+      } else if (!tick.open || (!input.followHead && tick.headSha !== headSha)) return finish("superseded");
       if (tick.checks === "failure") return finish("external-failed");
       // A finding last seen before the head was committed was not reported by a review of this head
       // (a fix pass may have fixed it); one seen at or after the commit time blocks.
@@ -298,10 +323,93 @@ async function newestReviewRejectsHead(token: string, input: { owner: string; re
     if (at < headCommittedAtMs) return undefined;
     if (classified.findingsUnavailable) return "unreadable";
     if (classified.verdict === "incomplete") return "incomplete";
-    if (classified.verdict === "changes_requested") return classified.findings.length === 0 ? "changes_requested-empty" : "changes_requested";
+    if (classified.verdict === "changes_requested") {
+      if (classified.findings.length === 0) return "changes_requested-empty";
+      // ADR 028: a finding the fix pass deferred does not gate the merge. Fail closed: every listed finding
+      // needs a ledger row and every row must be `deferred`; a missing row means the deferral was never recorded.
+      const keys = [...new Set(classified.findings.map((f) => stableReviewFindingKey(f)))];
+      const rows = getReviewFindingsByKeys(`${input.owner}/${input.repo}`, input.prNumber, keys);
+      const byKey = new Map(rows.map((r) => [r.findingKey, r.status]));
+      return keys.every((k) => byKey.get(k) === "deferred") ? undefined : "changes_requested";
+    }
     return undefined;
   }
   return undefined;
+}
+
+/** Read every inline page strictly: a partial list could hide a blocking badge. */
+async function readInlineComments(token: string, input: { owner: string; repo: string; prNumber: number }): Promise<ReviewVerdictInput["inlineComments"]> {
+  const comments: ReviewVerdictInput["inlineComments"] = [];
+  let url: string | null = `https://api.github.com/repos/${input.owner}/${input.repo}/pulls/${input.prNumber}/comments?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+      signal: defaultFetchSignal(),
+    });
+    if (!res.ok) throw new Error(`late-external-review: inline comments unreadable (HTTP ${res.status})`);
+    const data = await res.json() as Array<{ user?: { login?: string; type?: string } | null; body?: string; commit_id?: string; path?: string; line?: number | null; html_url?: string }>;
+    comments.push(...data.map((c) => ({
+      authorLogin: c.user?.login ?? "", authorType: c.user?.type ?? "", body: c.body ?? "",
+      ...(c.commit_id ? { commitId: c.commit_id } : {}),
+      ...(c.path ? { path: c.path } : {}),
+      ...(c.line != null ? { line: c.line } : {}),
+      ...(c.html_url ? { url: c.html_url } : {}),
+    })));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return comments;
+}
+
+/** Strict thread snapshot: incomplete pages must never release a blocking finding. */
+async function readCommentThreadState(token: string, input: { owner: string; repo: string; prNumber: number }): Promise<Map<string, boolean>> {
+  const states = new Map<string, boolean>();
+  const cursors = new Set<string>();
+  let after: string | null = null;
+  for (;;) {
+    const res = await fetch("https://api.github.com/graphql", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: `query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
+            reviewThreads(first: 100, after: $after) {
+              nodes { isResolved isOutdated comments(first: 100) { nodes { url } pageInfo { hasNextPage } } }
+              pageInfo { hasNextPage endCursor }
+            }
+          } }
+        }`,
+        variables: { owner: input.owner, repo: input.repo, number: input.prNumber, after },
+      }),
+      signal: defaultFetchSignal(),
+    });
+    const unreadable = () => new Error("late-external-review: review threads unreadable or incomplete");
+    if (!res.ok) throw unreadable();
+    const data = await res.json() as {
+      errors?: unknown[];
+      data?: { repository?: { pullRequest?: { reviewThreads?: {
+        nodes?: Array<{ isResolved?: boolean; isOutdated?: boolean; comments?: {
+          nodes?: Array<{ url?: string }>; pageInfo?: { hasNextPage?: boolean };
+        } }>;
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+      } } } };
+    };
+    const threads = data?.data?.repository?.pullRequest?.reviewThreads;
+    if (data.errors?.length || !Array.isArray(threads?.nodes)
+      || typeof threads.pageInfo?.hasNextPage !== "boolean") throw unreadable();
+    for (const thread of threads.nodes) {
+      if (!thread || typeof thread.isResolved !== "boolean" || typeof thread.isOutdated !== "boolean"
+        || !Array.isArray(thread.comments?.nodes) || thread.comments.pageInfo?.hasNextPage !== false) throw unreadable();
+      for (const comment of thread.comments.nodes) {
+        if (!comment || typeof comment.url !== "string" || !comment.url) throw unreadable();
+        states.set(comment.url, !thread.isResolved && !thread.isOutdated);
+      }
+    }
+    if (!threads.pageInfo.hasNextPage) return states;
+    const cursor = threads.pageInfo.endCursor;
+    if (!cursor || cursors.has(cursor)) throw unreadable();
+    cursors.add(cursor);
+    after = cursor;
+  }
 }
 
 /** Production deps. A fresh installation token per call; it is never journaled. */
@@ -314,6 +422,8 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       return pr.headSha;
     },
     async readReviewerExpected(input) {
+      const { process } = reviewLedgerOptionsFor(input.owner, input.repo);
+      if (process.checkPairs.length === 0) return true;
       const t = await token(input.owner);
       const commits = await listPullRequestCommits(t, input.owner, input.repo, input.prNumber);
       const earlier = commits.filter((sha) => sha !== input.headSha).slice(-20).reverse();
@@ -336,8 +446,31 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       let checks = await getCombinedChecksState(t, input.owner, input.repo, pr.headSha);
       // Throws on an unreadable commit, so the step retries rather than reading "no findings".
       const headCommittedAtMs = await getCommitTime(t, input.owner, input.repo, pr.headSha);
+      const { process } = reviewLedgerOptionsFor(input.owner, input.repo);
+      const commentVerdict = process.checkPairs.length === 0;
+      let rejected: HeldReason | undefined;
+      if (commentVerdict) {
+        const comments = await listPrComments(t, input.owner, input.repo, input.prNumber, { strict: true });
+        const inlineComments = await readInlineComments(t, input);
+        const threads = process.id === "codex-code-review" ? await readCommentThreadState(t, input) : undefined;
+        if (threads) {
+          for (const comment of inlineComments) {
+            if (comment.url) comment.threadOpen = threads.get(comment.url);
+          }
+        }
+        const { verdict } = process.readVerdict({
+          headSha: pr.headSha, checkRuns: [], inlineComments, inlineCommentThreadsRead: threads !== undefined, blocks: [],
+          issueComments: comments.map((c) => ({
+            body: c.body, authorLogin: c.user?.login ?? "", authorType: c.user?.type ?? "",
+            updatedAt: c.updatedAt ?? c.createdAt,
+          })),
+        });
+        if (verdict === "incomplete" && checks === "success") checks = "pending";
+        if (verdict === "changes_requested") rejected = "changes_requested";
+        if (verdict === "no-real-verdict") rejected = "review-failed";
+      }
       const lateGapFill = input.gapFill === true && !input.followHead;
-      if ((input.followHead || input.gapFill) && checks === "success") {
+      if (!commentVerdict && (input.followHead || input.gapFill) && checks === "success") {
         const names = lateGapFill ? await readReviewCheckNames(t, input.owner, input.repo) : [];
         // A head pushed a moment ago has no check runs yet, which reads as "success". Its own review must
         // have completed with `success` before the head can count as clean (a skipped run is not a review).
@@ -355,7 +488,7 @@ export function createProductionLateExternalReviewDependencies(config: Pick<AppC
       // A late head (initial run or gap-fill) is never judged in-run, and the ledger has no verdict: read Claude's
       // own (AII-1303). The tick reports it as a blocking finding seen now, which the workflow ends `findings` on.
       // The read throws when the comment list is unreadable, so the step retries rather than reading "no review".
-      const rejected = input.followHead ? undefined : await newestReviewRejectsHead(t, input, headCommittedAtMs);
+      if (!commentVerdict && !input.followHead) rejected = await newestReviewRejectsHead(t, input, headCommittedAtMs);
       if (rejected) blockingLastSeenAtMs.push(Date.now());
       const heldBy = rejected ?? (blockingLastSeenAtMs.some((seen) => seen >= headCommittedAtMs) ? "ledger" as const : undefined);
       return { open, headSha: pr.headSha, checks, headCommittedAtMs, blockingLastSeenAtMs, ...(heldBy ? { heldBy } : {}) };

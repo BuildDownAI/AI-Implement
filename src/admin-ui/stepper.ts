@@ -331,9 +331,18 @@ export const stepperHtml = `
             <select class="select" id="np-review-process">
               <option value="ai-implement">AI-Implement</option>
               <option value="claude-code-review">Claude Code Review</option>
+              <option value="codex-code-review">Codex Code Review</option>
               <option value="claude-code-review-repository-fix">Claude Code Review, repository auto-fix</option>
             </select>
-            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.</div>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Codex Code Review requires the Restate lifecycle and reads the hosted Codex verdict for the PR head.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Review fix lifecycle</label>
+            <select class="select" id="np-review-fix-lifecycle">
+              <option value="legacy">Legacy</option>
+              <option value="restate">Restate</option>
+            </select>
+            <div class="field-hint">Codex Code Review requires Restate. P0 and P1 findings start an AI-Implement fix; P2 findings are advisory.</div>
           </div>
           <div class="field">
             <label class="field-label">Trusted Review Authors <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
@@ -514,7 +523,7 @@ export const stepperScript = `
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
     maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, prDispatchBudget: null, maxJobMinutes: null,
-    reviewProcess: 'ai-implement', trustedReviewAuthors: null,
+    reviewProcess: 'ai-implement', reviewFixLifecycle: 'legacy', trustedReviewAuthors: null,
     secrets: [],
   };
   let jiraFieldsLoaded = false;
@@ -554,6 +563,7 @@ export const stepperScript = `
     data.maxIterations = null;
     data.prDispatchBudget = null;
     data.reviewProcess = 'ai-implement';
+    data.reviewFixLifecycle = 'legacy';
     data.trustedReviewAuthors = null;
     data.maxJobMinutes = null;
     data.secrets = [];
@@ -564,6 +574,8 @@ export const stepperScript = `
     if (depScopeEl) depScopeEl.value = '';
     const reviewProcessEl = document.getElementById('np-review-process');
     if (reviewProcessEl) reviewProcessEl.value = 'ai-implement';
+    const lifecycleEl = document.getElementById('np-review-fix-lifecycle');
+    if (lifecycleEl) lifecycleEl.value = 'legacy';
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
@@ -957,6 +969,8 @@ export const stepperScript = `
       data.prDispatchBudget = optionalCap('np-prDispatchBudget');
       const rpEl = document.getElementById('np-review-process');
       if (rpEl) data.reviewProcess = rpEl.value;
+      const lifecycleEl = document.getElementById('np-review-fix-lifecycle');
+      if (lifecycleEl) data.reviewFixLifecycle = lifecycleEl.value;
       const taEl = document.getElementById('np-trusted-review-authors');
       const authors = taEl ? taEl.value.split('\\n').map(function (x) { return x.trim(); }).filter(Boolean) : [];
       data.trustedReviewAuthors = authors.length ? authors : null;
@@ -1022,6 +1036,10 @@ export const stepperScript = `
         return false;
       }
     } else if (n === 6) {
+      if (data.reviewProcess === 'codex-code-review' && data.reviewFixLifecycle !== 'restate') {
+        showError('Codex Code Review requires the Restate review fix lifecycle.');
+        return false;
+      }
       if (!Number.isInteger(data.maxInProgressAiIssues) || data.maxInProgressAiIssues < 1) {
         showError('Max parallel AI issues must be a positive integer.');
         return false;
@@ -1118,7 +1136,7 @@ export const stepperScript = `
       + ' &middot; PR budget ' + capText(data.prDispatchBudget)
       + ' &middot; timeout ' + capText(data.maxJobMinutes, ' min'));
 
-    set('reviewProcess', window.esc(data.reviewProcess));
+    set('reviewProcess', window.esc(data.reviewProcess) + ' (' + window.esc(data.reviewFixLifecycle) + ')');
     set('trustedReviewAuthors', data.trustedReviewAuthors
       ? data.trustedReviewAuthors.map(function (l) { return window.esc(l); }).join(', ')
       : '&mdash;');
@@ -1461,6 +1479,7 @@ export const stepperScript = `
       maxIterations: data.maxIterations,
       prDispatchBudget: data.prDispatchBudget,
       reviewProcess: data.reviewProcess,
+      reviewFixLifecycle: data.reviewFixLifecycle,
       trustedReviewAuthors: data.trustedReviewAuthors,
       maxJobMinutes: data.maxJobMinutes,
       skillsRepo: data.skillsRepo || null,

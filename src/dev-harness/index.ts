@@ -208,19 +208,6 @@ function snapshotFromLocalConfig(
   };
 }
 
-function verifyLocalSubscriptionRepoTrust(repository: string): void {
-  const result = spawnSync("gh", ["repo", "view", repository, "--json", "visibility", "-q", ".visibility"], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const visibility = result.status === 0 ? result.stdout.toString().trim().toUpperCase() : "";
-  if (visibility !== "PRIVATE" && visibility !== "INTERNAL") {
-    throw new Error(
-      "Local subscription configured runs require an independently verified private/internal GitHub repository; " +
-      `could not verify ${repository} with gh repo view.`,
-    );
-  }
-}
-
 function hasSubscriptionReference(references: readonly LocalCredentialReference[]): boolean {
   return references.some((r) => r.kind === "session");
 }
@@ -352,7 +339,6 @@ async function prepareLocalConfiguredAuth(input: {
       if (input.projectKey !== input.actualRepository || input.repositories.some((repo) => repo !== input.actualRepository)) {
         throw new Error("Local subscription configured runs require task repo, config projectKey, and actual workspace origin to match");
       }
-      verifyLocalSubscriptionRepoTrust(input.actualRepository);
     }
     for (const reference of references) {
       if (reference.kind === "session") leases.push(await ownership.acquire(reference));

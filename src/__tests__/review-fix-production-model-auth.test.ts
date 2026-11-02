@@ -65,7 +65,7 @@ describe("review-fix admission and model authentication", () => {
   it.each([
     ["credential_unauthorized", "configuration_error"], ["unsupported_combination", "configuration_error"],
     ["resolution_failed", "configuration_error"], ["runner_incompatible", "configuration_error"],
-    ["resolution_unavailable", "defer"], ["delivery_unreadable", "defer"], ["repository_visibility_unknown", "defer"], ["credential_unavailable", "defer"],
+    ["resolution_unavailable", "defer"], ["delivery_unreadable", "defer"], ["credential_unavailable", "defer"],
   ])("maps readiness code %s to %s", async (code, verdict) => {
     getMappings.mockReturnValue({ k: mapping });
     isManagedProject.mockReturnValue(true);

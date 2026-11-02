@@ -1,0 +1,17 @@
+{
+  "request": {
+    "args": {
+      "includeUnsettled": "yes"
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "400 {\"code\":400,\"message\":\"Failed to deserialize input: [\\n  {\\n    \\\"expected\\\": \\\"boolean\\\",\\n    \\\"code\\\": \\\"invalid_type\\\",\\n    \\\"path\\\": [\\n      \\\"args\\\",\\n      \\\"includeUnsettled\\\"\\n    ],\\n    \\\"message\\\": \\\"Invalid input: expected boolean, received string\\\"\\n  }\\n]\",\"source\":\"invocation\"}"
+      }
+    ],
+    "isError": true
+  }
+}

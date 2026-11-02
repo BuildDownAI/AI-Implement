@@ -115,8 +115,7 @@ beforeEach(async () => {
       sessionStore,
       resolveProtectedSecret: () => null,
       getProfileRevision: (id, revision) => ({
-        profileId: id, identity: "id", revision, agent: "codex", provider: "openai", authMode: "codex-subscription",
-        allowedProjectKeys: ["proj"], status: "active",
+        profileId: id, identity: "id", revision, agent: "codex", provider: "openai", authMode: "codex-subscription", status: "active",
       }),
       lookupReference: () => "model-account:cdx1",
     },

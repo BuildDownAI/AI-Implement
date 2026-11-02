@@ -396,7 +396,6 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
     try {
       resolution = resolveModelCredential(
         {
-          projectKey: auth.grant.projectKey,
           profileId: binding.profileId,
           revision: binding.profileRevision,
           provider: selection.provider,
@@ -469,7 +468,6 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
     try {
       status = getCredentialStatus(
         {
-          projectKey: auth.grant.projectKey,
           profileId: binding.profileId,
           revision: binding.profileRevision,
           provider: selection.provider,
@@ -482,7 +480,7 @@ export function createModelAuthHandlers(deps: ModelAuthHandlerDeps): ModelAuthHa
       return fail("persistence_failed");
     }
     if (status.provider === undefined) return fail("unauthorized");
-    if (!status.projectPermitted || !status.matchesRequest) return fail("unauthorized");
+    if (!status.matchesRequest) return fail("unauthorized");
 
     const ownerFailure = verifyOwner(auth, binding, "checkpoint");
     if (ownerFailure) return fail(ownerFailure);

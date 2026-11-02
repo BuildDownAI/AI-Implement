@@ -235,6 +235,10 @@ After each run the object sends itself a delayed `refresh` carrying `scheduledFo
 
 The production probe returns `null` and sends nothing when `isKgUnavailable()` is false, so a `check` queued after a recovery is a no-op. `checkKgSidecarHealth()` is the poll-loop caller, under the same `kgScheduleBound` guard as `checkPipelineSchedules`: one one-way `POST KgSidecarHealth/sidecar/check/send` per cycle while the sidecar is unavailable. It makes no call during a deploy hold or unless the sidecar is `ready` and registration is `registered`, and a failed call logs one line and never throws.
 
+## A self-deploy never keeps an invocation open across its own restart
+
+`SelfDeploy` (`src/restate/self-deploy.ts`, [ADR 046](adr/046-self-deploy-is-a-restate-object-that-never-spans-its-own-restart.md)) replaces the machine that runs this orchestrator's Restate server, so the rule is the same as the KG hold's: no invocation stays open across the restart. The drain (`queryNonCompletedInvocations`) and the boot registration both count every invocation that is not `completed` and not `scheduled`. A `ctx.sleep` inside one deploy workflow would keep it open and block both. So each step (`start`, `checkDrain`, `apply`, `verify`) is a short handler that hands over with a delayed send, and only a `scheduled` call exists between steps. `apply` schedules `verify` before it changes the image and returns before Fly stops the machine; `verify` runs on the new code. Do not add `ctx.sleep` or a long-running call to this object.
+
 ## Pipeline schedules
 
 `PipelineSchedule` (`src/restate/pipeline-schedule.ts`, AII-1431, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or-fired-state-checked-by-the-poll-loop.md)) is a Virtual Object, one per scheduled pipeline, that fires the pipeline once a day at a local time. Restate 1.7.10 has no native cron, and a delayed self-send brings back cancel-and-re-arm, so a schedule is a state: each day has one occurrence, and `lastFiredOccurrence` records whether it fired. The poll loop is the tick. KG refresh is the first consumer (AII-1432; `docs/issueless-runs.md` § Reserve and dispatch).
@@ -363,6 +367,14 @@ A `declined-conflict` outcome is not treated as final: `createRestateRegistratio
 
 Both `postDeployment()` calls inside `register()` — the initial no-force attempt and the forced retry after a `META0004` conflict — carry `signal: AbortSignal.timeout(10_000)` (AII-728). A hung admin API answers the same `{ outcome: "unreachable" }` a connection failure already produces; `main()`'s unconditional `await registerRestateEndpoint()` therefore cannot block boot indefinitely on a sidecar that accepted the TCP connection but never answered.
 
+### SelfDeploy object (AII-1609; no production callers yet)
+
+`createSelfDeploy` (`src/restate/self-deploy.ts`) defines an app-keyed Virtual Object. It stores the deploy target and phase under `deploy`, holds dispatch during drain, and advances through short `checkDrain`, `apply` and `verify` invocations using delayed sends. It never sleeps: a sleeping deploy invocation would block its own drain and boot registration. The quiet probe excludes only its own invocation ID through the optional argument to `createRestateDrainProbes` / `queryNonCompletedInvocations`; registration supplies no exclusion. Send headers carry the deploy ID so a cancelled deploy's outstanding timer cannot advance a later deploy.
+
+Apply schedules verification before changing the image. Its retried effect lists and rereads machines before replacing each full config with only `image` changed; an already accepted image update is skipped after a crash. Published images require a registry manifest HEAD. KG builds reuse `deployArgs` with build-only/push flags. Apply allows three effect attempts; exhaustion ends the deploy with `apply-failed` and clears the hold. Each flyctl call has a ten-minute deadline and receives an abort signal that its executor must honor. The apply handler uses 65-minute inactivity and 70-minute abort timeouts to accommodate three attempts containing a build and optional detached deploy. The optional injected fly.toml setting uses detached deploy only without `FLY_IMAGE_APP`, because control-plane-created machines retain their control-plane-owned config. Verification reads the running process's source commit, and terminal transitions clear the hold and invoke the journaled `record outcome` effect.
+
+All effects, configuration/credential access, and clock limits are injected. Credentials are read inside effects and never returned to the journal. It is registered at boot, keyed by `FLY_APP_NAME`, and is the only self-deploy path: the admin routes and the auto-deploy loop call it through the ingress, boot no longer clears the hold, and `onOutcome` records the outcome (see [deployment.md](deployment.md)). `options.applyFlyToml` lives in its state. Restate tests exercise both replay variants, disk-backed server/endpoint restarts and delayed-send journal snapshots (`self-deploy*.restate.test.ts`).
+
 ### All Restate ports bind loopback — check the fabric port too
 
 The orchestrator, the server, the admin API, and the SDK endpoint are same-machine peers, so ingress (8081), admin (9070), the SDK endpoint (9080), and the node/fabric port (5122) all bind `127.0.0.1` (§ "Ports and paths"). The fabric port defaults to `0.0.0.0:5122` upstream and was the one listener not on loopback until `RESTATE_BIND_ADDRESS` pinned it; on Fly an all-interfaces port is reachable over the private network. The local image boot check exists to catch a bind that regresses to `0.0.0.0`. On macOS, a long checkout path trips the 104-byte unix-socket limit (`RT0004`); set `RESTATE_DATA_DIR` to a short path.
@@ -426,12 +438,14 @@ A run kind's services live in `src/restate/<kind>-workflow.ts` and `src/restate/
 
 ### Journal projections
 
+For runner results, [ADR 046](adr/046-an-owned-run-takes-its-result-through-one-kit-intake.md) defines the check-only credential and workflow-owned accounting handoff. Legacy callbacks retain direct accounting until their dispatch paths are removed.
+
 A run kind writes its SQLite row from the journal. The rule: a value is a journaled step result unless it is a credential. Four steps, in this order:
 
 1. **`resolve` journals the record.** It computes the row's values (issue id, phase, repo, backend) from config and the environment and does no I/O to the store. Its result is the record.
-2. **A `record-*` step projects a journaled value.** It writes the journaled record or result to the store and reads nothing else, so it is idempotent on the dispatch id and a replay repeats it harmlessly. `reserve` projects the `resolve` record; `record-dispatch-N` projects the dispatch result (machine id, logs URL, run id); `record-reconcile-N` projects a run a reconcile read found. A read (`reconcile-N`, `watch-N`) writes nothing.
+2. **A `record-*` step projects a journaled value.** It writes the journaled record or result to the store and reads nothing else, so it is idempotent on the dispatch id and a replay repeats it harmlessly. `reserve` projects the `resolve` record; `record-dispatch-N` projects the dispatch result (machine id, logs URL, run id); `record-reconcile-N` projects a run a reconcile read found. `record-usage` projects sanitized model invocations from the accepted report through the kit intake. A read (`reconcile-N`, `watch-N`) writes nothing.
 3. **A credential is produced and written inside one step and never returned.** A run token (`mintRunTokens` inside `dispatch-N`) or a machine nonce (derived from the token secret, the dispatch id, and the attempt in `nonce-N`) is not a step result, because a step result is journaled. The step that hands it to a backend derives it again inside its own function. Derivation, not a stored random value, lets a later step get the same credential from journaled inputs.
-4. **Step names.** `resolve`, `reserve`, `envelope`, `nonce-N`, `dispatch-N`, `record-dispatch-N`, `record-reconcile-N`, `close-row`, `persist`, with `-N` for an attempt-scoped step (`N` is the attempt, or the reconcile index for `record-reconcile-N`). `close-row` and `persist` project the terminal outcome the workflow derived from journaled results. `envelope` journals the run's `RunConfigV1`, built by a pure builder with no token, and every dispatch retry sends that same envelope.
+4. **Step names.** `resolve`, `reserve`, `envelope`, `nonce-N`, `dispatch-N`, `record-dispatch-N`, `record-reconcile-N`, `record-usage`, `close-row`, `persist`, with `-N` for an attempt-scoped step (`N` is the attempt, or the reconcile index for `record-reconcile-N`). `close-row` and `persist` project the terminal outcome the workflow derived from journaled results. `envelope` journals the run's `RunConfigV1`, built by a pure builder with no token, and every dispatch retry sends that same envelope.
 
 The kg-refresh workflow is the worked example (`src/restate/kg-refresh-workflow.ts`); [restate-testing.md](restate-testing.md) § "Testing a journal projection (two tiers)" is the matching test recipe.
 
@@ -547,7 +561,7 @@ The failure branch of the planning callback also calls the termination hook, so 
 
 - **One workflow per attempt** ([ADR 044](adr/044-one-implementationrun-per-attempt.md)). At its deadline it stops the run and calls the bounded stuck cleanup; the next poll starts a new attempt under a new dispatch id.
 - **The deadline is the job timeout** ([ADR 045](adr/045-implementationrun-deadline-from-the-job-timeout.md)): `input.maxJobMinutes`, normalized by the caller at dispatch, plus the 10-minute stop margin after the stop. The bootstrap deadline is 10 minutes.
-- **`report` has no payload.** The callback writes the outcome to SQLite; `finish-job` (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row and does what the callback did not, through `finalizeImplementation`. The sender is `src/restate/implementation-run-client.ts`.
+- **`report` carries optional model usage.** The callback writes the outcome to SQLite; `finish-job` (`finishImplementationJob`, `src/restate/implementation-run-finish.ts`) reads the `dispatch_log` row and does what the callback did not, through `finalizeImplementation`. The sender is `src/restate/implementation-run-client.ts`.
 
 ### Handlers
 

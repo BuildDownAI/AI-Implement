@@ -25,6 +25,7 @@ import {
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
   read as readDispatchAdmission,
@@ -46,7 +47,8 @@ import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
-import { getDeployPosture } from "../deploy-posture.js";
+import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
+import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
   setRunnerModeAction,
   pauseProjectAction,
@@ -63,6 +65,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
+  grants: z.array(z.literal("deploy")).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -82,6 +85,8 @@ interface ToolOptions<I extends z.ZodType> {
   description: string;
   input: I;
   role: AccessRole;
+  /** Alternate authority, accepted only by tools that explicitly request it. */
+  grant?: "deploy";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -118,8 +123,8 @@ export function auditActor(caller: { email: string | null; kind: string }, fallb
  * Wraps `restate.handlers.handler` with a zod input/output serde and the discovery
  * metadata (`mcp.type`, `mcp.role`) tools-client.ts's discoverTools() reads back. The
  * wire input is `{ caller, args }` — the credential never travels with the request
- * (the ingress journals bodies), only the already-verified `Caller`. A caller whose role
- * doesn't satisfy `role` (equal, or admin) is refused before `handler` runs. A handler
+ * (the ingress journals bodies), only the already-verified `Caller`. A caller must satisfy
+ * `role` (equal, or admin) or hold the explicitly requested grant before `handler` runs. A handler
  * that throws is caught here and returned as an `isError` result rather than rethrown —
  * Restate retries a thrown non-terminal error indefinitely, which would turn a bug or a
  * transient failure into a hanging `tools/call` instead of the error result `/mcp` expects.
@@ -164,7 +169,7 @@ export function tool<I extends z.ZodType>(
           `[mcp] write tool=${name} actor=${actor} role=${input.caller.role ?? "null"} result=${result} kind=${input.caller.kind}${detail}`,
         );
       };
-      if (!roleAllows(input.caller.role, opts.role)) {
+      if (!roleAllows(input.caller.role, opts.role) && !(opts.grant && input.caller.grants.includes(opts.grant))) {
         audit("forbidden");
         return {
           isError: true,
@@ -293,7 +298,7 @@ export const listProjects = tool(
 );
 
 export const GET_PROJECT_BINDING_DESCRIPTION =
-  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the resolved review process (reviewProcess: ai-implement or claude-code-review), the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
+  "Returns the binding a skill needs for its own project: team key, repo, default branch, tracker kind, the resolved review process (reviewProcess: ai-implement, claude-code-review, claude-code-review-repository-fix, or codex-code-review), the effective pickup label (the live ADR 022 settings value, not a hardcoded default), and the knowledge-graph binding (present, orchestratorUrl, sourceRepo, baseRepo, searchTool). Pass `repo` (owner/repo) or `team` to select one project, returned as a single object; omit both to list every mapping as an array. Never includes extraEnv or a token.";
 
 export const getProjectBinding = tool(
   {
@@ -621,17 +626,62 @@ export const getFleetReportTool = tool(
   },
 );
 
+/** What `get_deploy_posture` serves: the posture plus the SelfDeploy record (null when none or unreadable). */
+type DeployPostureReport = DeployPosture & { selfDeploy: SelfDeployRecord | null };
+
 export const GET_DEPLOY_POSTURE_DESCRIPTION =
-  "Returns the current deploy posture: whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.";
+  "Returns the current deploy posture: selfDeploy (the SelfDeploy record: deployId, phase, target, requestedBy, times, reason; null when none or unreadable), whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.";
+
+export const GetDeployPostureArgsSchema = z.object({});
 
 export const getDeployPostureTool = tool(
-  { description: GET_DEPLOY_POSTURE_DESCRIPTION, input: z.object({}), role: "user" },
-  async (): Promise<ToolResponse> => {
+  { description: GET_DEPLOY_POSTURE_DESCRIPTION, input: GetDeployPostureArgsSchema, role: "user" },
+  async (ctx): Promise<ToolResponse> => {
     // No defaultImage passed: getDeployPosture's own fallback re-derives it from
     // process.env the same way config.sessionImage was computed at boot (AII-711) — a
     // Restate handler has no per-request injection the way handleMcpRequest did.
-    const result = await getDeployPosture({});
+    const posture = await getDeployPosture({});
+    // Additive: an unreadable SelfDeploy object must not take the whole posture down, so it reads as null.
+    let selfDeploy: SelfDeployRecord | null = null;
+    try {
+      selfDeploy = (await ctx.objectClient(SelfDeploy, selfDeployKey()).status()).deploy;
+    } catch (err) {
+      if (restate.internal.isSuspendedError(err)) throw err;
+    }
+    const result: DeployPostureReport = { ...posture, selfDeploy };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const START_DEPLOY_DESCRIPTION =
+  "Start a self-deploy of this orchestrator to the published build of the head of `branch` (testing | main) (admin role, or the control plane's deploy-scoped token). Args: branch, requestedBy (1..200 characters). Returns { deployId, commit, image, alreadyActive }. Shared SelfDeploy.status is read first: during draining, applying or verifying, returns the active deploy immediately with alreadyActive true without calling SelfDeploy.start. Otherwise calls SelfDeploy.start, which retains its alreadyActive race check. A refusal is one fixed code as the error text: image-not-published, head-unknown or not-configured. Progress is get_deploy_posture's selfDeploy record.";
+
+/** The SelfDeploy object key: the same fallback as createSelfDeployIngressClient, so the tool and the admin routes address one object. */
+const selfDeployKey = (): string => process.env.FLY_APP_NAME ?? "orchestrator";
+
+export const StartDeployArgsSchema = z.object({ branch: z.enum(["testing", "main"]), requestedBy: z.string().min(1).max(200) }).strict();
+
+export const startDeployTool = tool(
+  {
+    description: START_DEPLOY_DESCRIPTION,
+    input: StartDeployArgsSchema,
+    role: "admin",
+    grant: "deploy",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `branch=${input.args.branch}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const client = ctx.objectClient(SelfDeploy, selfDeployKey());
+    // Shared status stays available while exclusive apply holds the object.
+    const { deploy } = await client.status();
+    if (isActiveSelfDeploy(deploy)) {
+      const result = { deployId: deploy.deployId, commit: deploy.target.commit, image: deploy.target.image, alreadyActive: true };
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
+    const result = await client.start(input.args);
+    if ("reason" in result) return toolError(result.reason);
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
   },
 );
 
@@ -640,6 +690,7 @@ export const GET_KG_STATUS_DESCRIPTION =
 
 // Type-only client handles: the real definitions are built with dependencies at boot
 // (createProductionKgRefreshServices); a client needs only the service name and handler types.
+const SelfDeploy: SelfDeployDefinition = { name: "SelfDeploy" } as SelfDeployDefinition;
 const KgRepo: KgRepoDefinition = { name: "KgRepo" } as KgRepoDefinition;
 const KgRefresh: KgRefreshDefinition = { name: "KgRefresh" } as KgRefreshDefinition;
 
@@ -948,6 +999,27 @@ export const getReviewFixActivityTool = tool(
       reviewFixCaller(input),
     );
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const LIST_JOB_ACCOUNTING_DESCRIPTION =
+  "Returns one page of finished-job accounting records, oldest change first: dispatch id, phase, status, conclusion, lifecycle owner, times, changedAt, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). A job that changes after it was served (a second terminal write, a late review conclusion, a late invocation row) is served again with a newer changedAt: the newest copy of a job replaces older ones. usage is reported only when the runner's invocation list arrived whole, partial when some invocation rows exist without that, unknown when none exist. Args: optional cursor { changedAt, dispatchId }, optional pageSize 1..200 (default 100), optional includeUnsettled (boolean; also serves jobs that changed in the last 10 minutes — only for a caller about to lose the orchestrator; such records may still change and are replaced by changedAt). Returns records, nextCursor, oldestRetainedCompletedAt (information only) and prunedThrough ({ changedAt, dispatchId } of the newest finished job pruned, or null). Without includeUnsettled a record is returned 10 minutes after its last change. Read.";
+
+export const listJobAccountingTool = tool(
+  {
+    description: LIST_JOB_ACCOUNTING_DESCRIPTION,
+    input: JobAccountingArgsSchema,
+    role: "user",
+    operation: "read",
+  },
+  async (_ctx, input): Promise<ToolResponse> => {
+    const page = listJobAccounting({
+      cursor: input.args.cursor,
+      pageSize: input.args.pageSize,
+      includeUnsettled: input.args.includeUnsettled,
+    });
+    // Compact, to keep the page small. A full page can still pass the consumer's 2 MiB limit; it halves the page size.
+    return { content: [{ type: "text", text: JSON.stringify(page) }] };
   },
 );
 
@@ -1390,8 +1462,8 @@ export const addProjectArgsSchema = z.object({
   trustedReviewAuthors: z.array(z.string()).nullable().optional().describe(
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
-  reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix"]).nullable().optional().describe(
-    "The project's review process. Omit to keep the stored value; pass null or \"ai-implement\" for the default. It applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.",
+  reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix", "codex-code-review"]).nullable().optional().describe(
+    "The project's review process. codex-code-review requires the Restate lifecycle. Omit to keep the stored value; pass null or \"ai-implement\" for the default. Claude and AI-Implement apply to every project; Codex Code Review is Restate-only.",
   ),
 });
 
@@ -1535,6 +1607,7 @@ export const orchestratorTools = restate.service({
     get_kg_status: getKgStatusTool,
     get_review_fix_attempt: getReviewFixAttemptTool,
     get_review_fix_activity: getReviewFixActivityTool,
+    list_job_accounting: listJobAccountingTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,
@@ -1552,6 +1625,7 @@ export const orchestratorTools = restate.service({
     set_pipeline_schedule: setPipelineScheduleTool,
     get_pipeline_schedule: getPipelineScheduleTool,
     pause_project: pauseProjectTool,
+    start_deploy: startDeployTool,
     add_project: addProjectTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,

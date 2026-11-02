@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
+import { prepareScratchExclusion } from "../pipeline/scratch-exclude.js";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import type { LLMExecutor, PipelineContextData } from "../pipeline/types.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
@@ -4148,11 +4149,110 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(false);
-    expect(out.terminationReason).toBe("invalid_review");
+    expect(out.terminationReason).toBe("external_review_pending");
     expect(invoke).toHaveBeenCalledTimes(1);
     const reviewComment = ghComments.find((c) => c.includes("invalid-external-review"));
     expect(reviewComment).toContain("external review verdict was unavailable or incomplete");
-    expect(reviewComment).toContain("Manual review required");
+    expect(reviewComment).toContain("the late external review now decides");
+    expect(reviewComment).not.toContain("Manual review required");
+    expect(out.reviewedHeadSha).toBeDefined();
+  });
+
+  it("does not hand a blocking verdict to the late gate under another review process (AII-1589)", async () => {
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 };
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([{
+            user: { login: "claude[bot]", type: "Bot" },
+            body: ["```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings: [] }), "```"].join("\n"),
+            html_url: "https://example.com/verdict",
+          }]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") ghComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const out = await runReview(
+      makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProcess: "claude-code-review" } as never,
+      { report: vi.fn(async () => undefined) },
+    );
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).not.toBe("external_review_pending");
+    expect(out).not.toHaveProperty("reviewedHeadSha");
+    expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
+  });
+
+  describe("hand-off state table (AII-1589)", () => {
+    const blockingComment = {
+      user: { login: "github-actions[bot]", type: "Bot" },
+      created_at: "2026-10-06T15:00:00Z",
+      updated_at: "2026-10-06T15:00:00Z",
+      body: ["```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings: [] }), "```"].join("\n"),
+      html_url: "https://example.com/verdict",
+    };
+    const unreadableComment = {
+      user: { login: "github-actions[bot]", type: "Bot" },
+      created_at: "2026-10-06T15:05:00Z",
+      updated_at: "2026-10-06T15:05:00Z",
+      body: "**Claude finished the review**\n\n### Code Review\n\nAll four acceptance criteria are satisfied and the implementation is correct end-to-end.",
+      html_url: "https://example.com/unreadable",
+    };
+
+    async function runTable(opts: { comments: unknown[]; conclusion?: string; process?: string }) {
+      const ghComments: string[] = [];
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        if (args[0] === "pr" && args[1] === "comment") {
+          ghComments.push(args[args.indexOf("--body") + 1]);
+          return { stdout: "", exitCode: 0 };
+        }
+        if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+          return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+        }
+        if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+          return { stdout: JSON.stringify({ check_runs: [opts.process ? { name: "Claude Code Review", app: { slug: "claude" }, status: "completed", conclusion: opts.conclusion ?? "success" } : { name: "claude-review", status: "completed", conclusion: opts.conclusion ?? "success" }] }), exitCode: 0 };
+        }
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) return { stdout: "[]", exitCode: 0 };
+        if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+          return { stdout: JSON.stringify(opts.comments), exitCode: 0 };
+        }
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }), exitCode: 0 };
+      });
+      const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
+      const out = await runReview(
+        makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {}, ...(opts.process ? { reviewProcess: opts.process } : {}) } as never,
+        { report: vi.fn(async () => undefined) },
+      );
+      return { out, ghComments };
+    }
+
+    function expectInvalidReview(out: { approved: boolean; terminationReason: string }, ghComments: string[]) {
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("invalid_review");
+      expect(out).not.toHaveProperty("reviewedHeadSha");
+      expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
+    }
+
+    it("ai-implement: a blocking verdict plus unreadable findings ends invalid_review", async () => {
+      const { out, ghComments } = await runTable({ comments: [blockingComment, unreadableComment] });
+      expectInvalidReview(out, ghComments);
+    });
+
+    it("another process: a no-verdict check ends invalid_review", async () => {
+      const { out, ghComments } = await runTable({ comments: [], conclusion: "skipped", process: "claude-code-review" });
+      expectInvalidReview(out, ghComments);
+    });
+
+    it("another process: unreadable findings end invalid_review", async () => {
+      const { out, ghComments } = await runTable({ comments: [unreadableComment], process: "claude-code-review" });
+      expectInvalidReview(out, ghComments);
+    });
   });
 
   it("does not include minor external findings in the approval comment when there are none", async () => {
@@ -5076,6 +5176,7 @@ describe("postPushReviewStep", () => {
     expect(checkProbes).toBeGreaterThanOrEqual(2);
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("invalid_review");
+    expect(out).not.toHaveProperty("reviewedHeadSha");
   });
 
   describe("a review check that finished without a verdict (AII-1103)", () => {
@@ -5129,12 +5230,19 @@ describe("postPushReviewStep", () => {
     function expectVerdictUnavailableEnding(out: { approved: boolean; terminationReason: string; finalFeedback: string }, ghComments: string[]) {
       expect(out.approved).toBe(false);
       expect(out.terminationReason).toBe("invalid_review");
+      expect(out).not.toHaveProperty("reviewedHeadSha");
       expect(out.finalFeedback).toContain("finished without a verdict");
       const comment = ghComments.find((c) => c.includes("invalid-external-review"));
-      expect(comment).toContain("Manual review required; external review verdict unavailable.");
+      expect(comment).toContain("Not auto-approving.");
+      expect(comment).not.toContain("late external review");
       expect(comment).not.toContain("could not be parsed");
       expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
     }
+
+    it("ends invalid_review with no reviewedHeadSha when the review check finished skipped (AII-1589)", async () => {
+      const { out, ghComments } = await runGate({ conclusion: "skipped", comments: [] });
+      expectVerdictUnavailableEnding(out, ghComments);
+    });
 
     it("takes the verdict-unavailable ending when the failed run left only its error comment", async () => {
       const { out, ghComments } = await runGate({ conclusion: "failure", comments: [failedRunComment] });
@@ -5417,10 +5525,11 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("invalid_review");
+    expect(out).not.toHaveProperty("reviewedHeadSha");
     expect(invoke).toHaveBeenCalledTimes(1);
     const approvalComment = ghComments.find((c) => c.includes("invalid-external-review"));
     expect(approvalComment).toBeDefined();
-    expect(approvalComment).toContain("Manual review required");
+    expect(approvalComment).not.toContain("late external review");
     expect(approvalComment).toContain("findings could not be parsed");
     expect(approvalComment).not.toContain("External review findings are blocking");
   });
@@ -6441,6 +6550,7 @@ Minor issue worth addressing.
     // Still gating on iteration 2: internal review is clean, so approval hinges entirely on
     // whether the finding still gates. It does, so the run stops on the review cap instead.
     expect(out.approved).toBe(false);
+    expect(out.terminationReason).not.toBe("external_review_pending");
     expect(invokePrompt(invoke, 1)).toContain(findingKey);
   });
 
@@ -6771,7 +6881,7 @@ describe("postPushReviewStep review process gate", () => {
   });
   const thread = (body: string, oid = SHA) => ({
     isResolved: false, isOutdated: false, path: "a.ts", line: 3,
-    comments: { nodes: [{ body, url: "https://x/1", commit: { oid }, author: { login: "claude" } }] },
+    comments: { pageInfo: { hasNextPage: false }, nodes: [{ body, url: "https://x/1", commit: { oid }, author: { login: "claude" } }] },
   });
 
   function fixture(opts: { runs: Run[]; inlineComments?: unknown[]; threads?: unknown[]; issueComments?: unknown[] }) {
@@ -6827,6 +6937,92 @@ describe("postPushReviewStep review process gate", () => {
       warn.mockRestore();
     }
   }
+
+  it.each(["silence", "running", "failed", "completed"])("Codex gates on %s without a check run", async (status) => {
+    const issueComments = status === "silence" ? [] : [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"${status}","has_unresolved_findings":false}} -->`,
+    }];
+    const { out } = await run(fixture({ runs: [], issueComments }), { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(status === "completed");
+  });
+
+  it.each([0, 1])("Codex unresolved P%s head findings block approval and start a fix", async (priority) => {
+    const body = `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-orange?style=flat)</sub></sub>  Fix the head bug**`;
+    const comment = inline(body);
+    comment.user.login = "chatgpt-codex-connector[bot]";
+    const f = fixture({ runs: [], inlineComments: [comment], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":true}} -->`,
+    }] });
+    const { out, invoke } = await run(f, { reviewProcess: "codex-code-review", maxIterations: 2 });
+    expect(out.approved).toBe(false);
+    expect(f.posted.join("\n")).toContain("starting fix pass");
+    expect(invoke).toHaveBeenCalled();
+    expect(JSON.stringify(invoke.mock.calls)).toContain("Fix the head bug");
+  });
+
+  it.each(["resolved", "outdated", "open", "failed"] as const)("Codex P1 thread %s controls the gate", async (state) => {
+    const body = "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Fix bug**";
+    const comment = inline(body, "older");
+    comment.user.login = "chatgpt-codex-connector[bot]";
+    const t = thread(body, "older");
+    t.comments.nodes[0]!.author.login = "chatgpt-codex-connector";
+    t.isResolved = state === "resolved";
+    t.isOutdated = state === "outdated";
+    const f = fixture({ runs: [], inlineComments: [comment], threads: [t], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":true}} -->`,
+    }] });
+    if (state === "failed") {
+      const base = f.ghSpawn.getMockImplementation()!;
+      f.ghSpawn.mockImplementation((args: string[]) => args[1] === "graphql" ? { stdout: "", exitCode: 1 } : base(args));
+    }
+    const { out } = await run(f, { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(state === "resolved" || state === "outdated");
+  });
+
+  it.each([
+    { nodes: [] },
+    { nodes: [], pageInfo: {} },
+    { nodes: [], pageInfo: { hasNextPage: false }, errors: true },
+  ])("Codex incomplete empty thread snapshot retains unresolved hold: %j", async (snapshot) => {
+    const f = fixture({ runs: [], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":true}} -->`,
+    }] });
+    const base = f.ghSpawn.getMockImplementation()!;
+    f.ghSpawn.mockImplementation((args: string[]) => args[1] === "graphql" ? {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        ...("errors" in snapshot ? { errors: [{ message: "Partial response" }] } : {}),
+        data: { repository: { pullRequest: { reviewThreads: snapshot } } },
+      }),
+    } : base(args));
+    const { out } = await run(f, { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(false);
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])("Codex P2 threads stay advisory with unresolved=%s, human reply=%s and do not start an in-run fix", async (unresolved, reply) => {
+    const body = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Advisory**";
+    const t = thread(body);
+    t.comments.nodes[0]!.author.login = "chatgpt-codex-connector";
+    if (reply) {
+      Object.assign(t, { originatingComment: { nodes: [t.comments.nodes[0]] } });
+      t.comments.nodes = [{ ...t.comments.nodes[0]!, body: "Can we revisit this later?", author: { login: "human-reviewer" } }];
+    }
+    const comment = inline(body);
+    comment.user.login = "chatgpt-codex-connector[bot]";
+    const f = fixture({ runs: [], threads: [t], inlineComments: [comment], issueComments: [{
+      user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+      body: `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${SHA}","status":"completed","has_unresolved_findings":${unresolved}}} -->`,
+    }] });
+    const { out, invoke, logs } = await run(f, { reviewProcess: "codex-code-review" });
+    expect(out.approved).toBe(true);
+    expect(logs).toContain("[post-push-review] Review ledger findings: gating=0 advisory=1");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(f.posted.join("\n")).not.toContain("starting fix pass");
+  });
 
   const actions = (conclusion: string | null): Run => ({ name: "review", app: "github-actions", conclusion });
 
@@ -6939,7 +7135,7 @@ describe("postPushReviewStep review process gate", () => {
     const urlInline = (body: string, id: number) => ({ ...inline(body), html_url: `https://x/pull/42#discussion_r${id}` });
     const urlThread = (urls: string[], state: { isResolved?: boolean; isOutdated?: boolean }, body = "x") => ({
       isResolved: false, isOutdated: false, path: "a.ts", line: 3, ...state,
-      comments: { nodes: urls.map((url) => ({ body, url, commit: { oid: SHA }, author: { login: "claude" } })) },
+      comments: { pageInfo: { hasNextPage: false }, nodes: urls.map((url) => ({ body, url, commit: { oid: SHA }, author: { login: "claude" } })) },
     });
     const u = (id: number) => `https://x/pull/42#discussion_r${id}`;
 
@@ -7227,5 +7423,54 @@ describe("credential refresh before a fix-pass push, by execution mode", () => {
     expect(JSON.parse(orchestrator.calls[0]!.body)).toEqual({ nonce: "machine-nonce", owner: "acme" });
     expect(events).toEqual(["vend", `push HEAD:refs/heads/ai-implement/aii-200-x to ${originWith("ghs_fresh_token")}`]);
     expect(process.env.GH_TOKEN).toBe("ghs_fresh_token");
+  });
+});
+
+describe("scratch index guard in fix passes", () => {
+  it.each(["code", "scratch-only", "removal-failure"])("handles force-staged scratch: %s", async (mode) => {
+    const realGit = (args: string[]) => {
+      const r = spawnSync("git", args, { cwd: workspaceDir, encoding: "utf8" });
+      if (r.status !== 0) throw new Error(r.stderr);
+      return { stdout: r.stdout, exitCode: 0 };
+    };
+    realGit(["init", "-q"]);
+    realGit(["config", "user.name", "Test"]);
+    realGit(["config", "user.email", "test@example.com"]);
+    fs.writeFileSync(path.join(workspaceDir, "code.ts"), "before");
+    realGit(["add", "-A"]);
+    realGit(["commit", "-qm", "base"]);
+    const before = realGit(["rev-parse", "HEAD"]).stdout;
+    prepareScratchExclusion(workspaceDir);
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "push") return { stdout: "", exitCode: 0 };
+      if (args[0] === "rm" && mode === "removal-failure") return { stdout: "", stderr: "index locked", exitCode: 1 };
+      return realGit(args);
+    });
+    let calls = 0;
+    const invoke = vi.fn(async () => {
+      if (++calls === 2) {
+        fs.mkdirSync(path.join(workspaceDir, "ai-output"), { recursive: true });
+        fs.writeFileSync(path.join(workspaceDir, DISPOSITIONS_FILE), "[]");
+        realGit(["add", "-f", DISPOSITIONS_FILE]);
+        if (mode === "code") fs.writeFileSync(path.join(workspaceDir, "code.ts"), "after");
+      }
+      return structuredReviewResult({ approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "fix" }], feedback: "fix", score: 4, progress_delta: 0 });
+    });
+    const run = runReview(makeCtx(invoke), {
+      prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [], gitSpawn,
+      ghSpawn: (args) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 }),
+    }, { report: async () => undefined });
+    if (mode === "removal-failure") await expect(run).rejects.toThrow(/index locked/);
+    else {
+      const out = await run;
+      if (mode === "scratch-only") expect(out.terminationReason).toBe("no_changes");
+    }
+    if (mode === "code") {
+      expect(realGit(["show", "HEAD:code.ts"]).stdout).toBe("after");
+      expect(realGit(["ls-tree", "-r", "--name-only", "HEAD"]).stdout).not.toContain("ai-output/");
+    } else {
+      expect(realGit(["rev-parse", "HEAD"]).stdout).toBe(before);
+      expect(gitSpawn.mock.calls.some(([args]) => args[0] === "commit" || args[0] === "push")).toBe(false);
+    }
   });
 });

@@ -26,6 +26,7 @@ import { listOpenReviewFindings, type StoredReviewFinding } from "../review-ledg
 import type { ReviewLedgerSeverity } from "../pipeline/review-ledger.js";
 import {
   createProductionLateExternalReviewDependencies,
+  heldCommentBody,
   LATE_EXTERNAL_APPROVAL_MARKER,
   type LateExternalReviewInput,
 } from "../restate/late-external-review.js";
@@ -46,6 +47,14 @@ const finding = (severity: ReviewLedgerSeverity, lastSeenAt = 0): StoredReviewFi
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+it("held actions name the external review and explain Codex failure recovery", () => {
+  for (const reason of ["incomplete", "unreadable", "changes_requested-empty"] as const) {
+    expect(heldCommentBody("k", "sha", reason)).toContain("external review");
+    expect(heldCommentBody("k", "sha", reason)).not.toContain("Claude");
+  }
+  expect(heldCommentBody("k", "sha", "review-failed")).toContain("The Codex review of this commit failed (for example a usage limit). Re-run it with an `@codex review` comment; when it approves, post `/ai-implement verify only, make no code change`; or merge by hand.");
 });
 
 describe("readTick", () => {

@@ -5,12 +5,10 @@ import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { clearDeployHold, isDeployHeld, setDeployHold } from "./deploy-hold.js";
-import { getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
-import { fetchRepoTarball, getRefSha } from "./github.js";
-import { getInFlightWork, type InFlightWork } from "./in-flight-work.js";
+import { mintSourceTokenOrJwt } from "./github-app-auth.js";
+import { fetchRepoTarball } from "./github.js";
 import { getDb } from "./dedup.js";
-import { RestateDrainCoordinator, type RestateDrainProbes } from "./restate/drain.js";
+import type { RestateDrainProbes } from "./restate/drain.js";
 import { queryNonCompletedInvocations, restateBindAddress } from "./restate/endpoint.js";
 import { RESTATE_ADMIN_BASE_URL } from "./restate/server.js";
 import type { SelfDeployTarget } from "./deploy-availability.js";
@@ -22,22 +20,6 @@ export interface DeployArgsInput {
   sourceCommit: string;
   sourceRepo: string;
   sourceBranch: string;
-}
-
-export interface RunDeployInput {
-  app: string;
-  flyDeployToken: string;
-  owner: string;
-  repo: string;
-  branch: string;
-  /** The commit to deploy — resolved by the caller, not the branch tip. */
-  commit: string;
-  githubAppId: string;
-  githubAppPrivateKey: string;
-  kgSourceRepo: string | null;
-  pollIntervalMs: number;
-  /** Deterministic probe override for tests; production probes read Restate and SQLite. */
-  restateDrainProbes?: RestateDrainProbes;
 }
 
 const execFile = promisify(nodeExecFile);
@@ -97,15 +79,9 @@ export function readKgSourceRepo(
   }
 }
 
-const DEPLOY_TIMEOUT_MS = 20 * 60 * 1000;
-// A runner job is force-terminated 60 minutes after its dispatch,
-// so with new dispatches paused the in-flight set always drains.
-// this bounds a monitor that has itself stopped working, not the normal case.
-const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
-
 /** Restate invocation state is independent of dispatch_log and reservations. All
  * four probes must prove zero before a replacement can begin. */
-export function createRestateDrainProbes(): RestateDrainProbes {
+export function createRestateDrainProbes(excludeInvocationId?: string): RestateDrainProbes {
   const { host, port } = restateBindAddress();
   const endpointUri = `http://${host}:${port}`;
   const count = (sql: string): number => {
@@ -113,7 +89,7 @@ export function createRestateDrainProbes(): RestateDrainProbes {
     return row.n;
   };
   return {
-    oldDeploymentInvocations: () => queryNonCompletedInvocations(fetch, RESTATE_ADMIN_BASE_URL, endpointUri),
+    oldDeploymentInvocations: () => queryNonCompletedInvocations(fetch, RESTATE_ADMIN_BASE_URL, endpointUri, excludeInvocationId),
     unresolvedLaunches: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
       JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
       WHERE d.released_at IS NULL AND a.state = 'launch_intent' AND a.github_run_id IS NULL`),
@@ -125,132 +101,6 @@ export function createRestateDrainProbes(): RestateDrainProbes {
 }
 
 /**
- * Builds and releases a new version of this orchestrator.
-*
-* On success this never returns: the release replaces the machine, so the process is
-* SIGINTed inside the flyctl await and no catch or finally runs. The hold is
-* therefore released at boot, not here. Only a failure — which happens before the
-* machine is touched — comes back to this function.
-*/
-export async function runDeploy(input: RunDeployInput): Promise<void> {
-  const { app, flyDeployToken, owner, repo, branch, commit, githubAppId, githubAppPrivateKey, kgSourceRepo, pollIntervalMs } = input;
-
-  const endpointDrain = new RestateDrainCoordinator(input.restateDrainProbes ?? createRestateDrainProbes());
-  setDeployHold();
-  endpointDrain.begin();
-  try {
-    // Setting the hold above is what makes this terminate: new dispatches have stopped,
-    // so the in-flight set only shrinks from here.
-    await waitForQuiet(DRAIN_TIMEOUT_MS, drainPollMs(pollIntervalMs), endpointDrain);
-
-    // Mint and fetch the source before downloading flyctl: auth failures and
-    // inaccessible repos surface here with an actionable message, not after 100 MB of I/O.
-    const { token: sourceToken, authMode: sourceAuthMode } = await mintSourceTokenOrJwt(
-      githubAppId, githubAppPrivateKey, owner,
-      { permissions: { contents: "read" }, repositories: [repo] },
-    );
-    let tarball: Buffer;
-    try {
-      tarball = await fetchRepoTarball(sourceToken, owner, repo, commit);
-    } catch (err) {
-      if (sourceAuthMode === "public") {
-        // Public (unauthenticated) path means the App is not installed on the owner.
-        // A public repo would have succeeded; failure here means the repo is private.
-        throw new Error(
-          `Source repo '${owner}/${repo}' is not accessible. It may be private and the GitHub App is not installed on '${owner}'. Install the App on that org, or add the repository to the existing installation.`,
-        );
-      }
-      throw err;
-    }
-
-    const scratch = await deployScratch();
-    const flyctl = await resolveFlyctl(scratch);
-    const context = await extractSource(tarball, scratch);
-
-    let kgToken: string | null = null;
-    if (kgSourceRepo) {
-      const kgSource = parseKgSourceRepo(kgSourceRepo);
-      const kg = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, kgSource.owner, {
-        permissions: { contents: "read" },
-        repositories: [kgSource.repo],
-      });
-      kgToken = kg.token;
-    }
-
-    console.log(`[deploy] deploying ${owner}/${repo}@${commit.slice(0, 7)} to ${app}`);
-    await runFlyctl(
-      flyctl,
-      deployArgs({
-        app,
-        kgToken,
-        kgSourceRepo,
-        sourceCommit: commit,
-        sourceRepo: `${owner}/${repo}`,
-        sourceBranch: branch,
-      }),
-      {
-        cwd: context,
-        // A deliberate allowlist, not process.env: the orchestrator's environment
-        // holds every credential it has, and none of them belong in a build.
-        env: { PATH: process.env.PATH ?? "", HOME: scratch, FLY_API_TOKEN: flyDeployToken },
-        timeoutMs: DEPLOY_TIMEOUT_MS,
-      },
-    );
-    
-    // Reached only when the release did not replace its own process: a different app, or a local run.
-    // A self-deploy is SIGINTed inside the await above and relies on the
-    // boot clear instead — which is why this cannot be a finally.
-    console.log(`[deploy] ${app} released; this process was not replaced`);
-    endpointDrain.abort();
-    clearDeployHold();
-  } catch (err) {
-    endpointDrain.abort();
-    clearDeployHold();
-    throw err;
-  }
-}
-
-/** Holds until nothing is executing. Logs only when the blocking set changes. */
-export async function waitForQuiet(
-  timeoutMs: number,
-  pollMs: number,
-  endpointDrain?: RestateDrainCoordinator,
-  getBlocking: () => InFlightWork[] = getInFlightWork,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let reported = "";
-
-  for (;;) {
-    const blocking = getBlocking();
-    const endpoint = endpointDrain ? await endpointDrain.status() : null;
-    if (blocking.length === 0 && (!endpoint || endpoint.state === "drained")) return;
-
-    const summary = [
-      ...blocking.map((w) => `${w.count} ${w.kind}`),
-      ...(endpoint && endpoint.state !== "drained" ? [`old endpoint ${endpoint.state}`] : []),
-    ].join(", ");
-    if (summary !== reported) {
-      console.log(`[deploy] waiting for work to drain — ${summary}`);
-      reported = summary;
-    }
-
-    if (Date.now() >= deadline) {
-      throw new Error(`[deploy] work did not drain within ${Math.round(timeoutMs / 60000)}m — ${summary}`);
-    }
-    await sleep(pollMs);
-  }
-}
-
-/**
- * How often to re-check the in-flight set. The set is mutated by the poll loop, so
- * checking faster than it runs observes nothing new; half an interval bounds how long
- * a drain sits on stale state. The floor protects a very short configured interval.
- */
-export function drainPollMs(pollIntervalMs: number): number {
-  return Math.max(5_000, Math.floor(pollIntervalMs / 2));
-}
-
-/**
  * Runs flyctl, keeping a bounded tail of its output and logging it only on failure.
 *
 * spawn rather than execFile (the shape local-docker uses) because a --no-cache build
@@ -259,10 +109,10 @@ export function drainPollMs(pollIntervalMs: number): number {
 function runFlyctl(
   binary: string,
   args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+  opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(binary, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"], signal: opts.signal });
     
     // Chunks with a running total, not string concat: re-slicing a 64 KB string on
     // every chunk would allocate hundreds of megabytes across one build.
@@ -386,14 +236,6 @@ export async function extractSource(tarball: Buffer, dir: string): Promise<strin
   return context;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export type DeployStart =
-  | { started: true; commit: string }
-  | { started: false; reason: "deploy-in-progress" | "head-unknown" };
-
 /**
  * The configuration a deploy needs. Narrow by design: AppConfig satisfies it
  * structurally, so this module never imports the orchestrator's config type.
@@ -402,86 +244,65 @@ export interface StartDeployConfig {
   flyDeployToken: string | null;
   flyOrchestratorApp: string | null;
   selfDeployTarget: SelfDeployTarget | null;
-  pollIntervalMs: number;
-  githubAppId: string;
-  githubAppPrivateKey: string;
-  kgSourceRepo: string | null;
-  /** Called when the build or release step fails, so the caller can record the outcome. */
-  onBuildFailure?: (commit: string, err: unknown) => void;
-  restateDrainProbes?: RestateDrainProbes;
-}
-
-/** `StartDeployConfig` with every optional deploy prerequisite proven present. */
-type SelfDeployReady = StartDeployConfig & {
-  flyDeployToken: string;
-  flyOrchestratorApp: string;
-  selfDeployTarget: SelfDeployTarget;
-};
-
-/**
- * Builds the trigger's entry point, or undefined when this orchestrator cannot deploy
- * itself — which is what lets the route answer 501 rather than failing partway.
- */
-export function makeStartDeploy(
-  config: StartDeployConfig,
-): ((targetOverride?: SelfDeployTarget) => Promise<DeployStart>) | undefined {
-  if (!canSelfDeploy(config)) return undefined;
-
-  const fallbackTarget = config.selfDeployTarget;
-  const app = config.flyOrchestratorApp;
-  const flyDeployToken = config.flyDeployToken;
-
-  return async (targetOverride?: SelfDeployTarget) => {
-    const target = targetOverride ?? fallbackTarget;
-    // Claim before any await: the check and the set have to be atomic. With the awaits
-    // below sitting between them, two triggers arriving together would both pass the
-    // check, and the loser's cleanup would clear the hold out from under the winner.
-    if (isDeployHeld()) return { started: false, reason: "deploy-in-progress" };
-    setDeployHold();
-
-    try {
-      const { token: sourceToken } = await mintSourceTokenOrJwt(
-        config.githubAppId, config.githubAppPrivateKey, target.owner,
-        { permissions: { contents: "read" }, repositories: [target.repo] },
-      );
-      const head = await getRefSha(sourceToken, target.owner, target.repo, target.branch);
-      if (!head) {
-        clearDeployHold();
-        return { started: false, reason: "head-unknown" };
-      }
-
-      void runDeploy({
-        app,
-        flyDeployToken,
-        owner: target.owner,
-        repo: target.repo,
-        branch: target.branch,
-        commit: head,
-        pollIntervalMs: config.pollIntervalMs,
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
-        kgSourceRepo: config.kgSourceRepo,
-        restateDrainProbes: config.restateDrainProbes,
-      }).catch((err) => {
-        console.error("[deploy] failed:", err);
-        config.onBuildFailure?.(head, err);
-      });
-
-      return { started: true, commit: head };
-    } catch (err) {
-      // mintSourceTokenOrJwt handles the 404-not-installed case internally via the public
-      // (unauthenticated) fallback; only genuine failures (non-404 auth errors, network
-      // errors) reach here. Clear the hold so dispatch resumes rather than stalling.
-      clearDeployHold();
-      throw err;
-    }
-  };
 }
 
 /**
  * Whether this orchestrator can deploy itself: a token with deploy rights, an app to
  * deploy, and build stamps naming what to build. KG is optional — null means sidecar-less.
  */
-export function canSelfDeploy(config: StartDeployConfig): config is SelfDeployReady {
+export function canSelfDeploy(config: StartDeployConfig): config is StartDeployConfig & { flyDeployToken: string; flyOrchestratorApp: string; selfDeployTarget: SelfDeployTarget } {
   return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget);
+}
+
+const FLYCTL_TIMEOUT_MS = 20 * 60 * 1000;
+
+export interface FlyctlRunInput {
+  owner: string;
+  repo: string;
+  /** The commit the build context is extracted from — never the branch tip. */
+  commit: string;
+  githubAppId: string;
+  githubAppPrivateKey: string;
+  args: string[];
+  flyDeployToken: string;
+  signal: AbortSignal;
+}
+
+/**
+ * Runs flyctl against the source tarball at `commit`. The `SelfDeploy` object's `flyctl` dependency:
+ * the object owns the deadline and aborts `signal`, which kills the subprocess. Never logs argv, which
+ * can carry the KG build secret.
+ */
+export async function runSelfDeployFlyctl(input: FlyctlRunInput): Promise<void> {
+  const { owner, repo, commit } = input;
+  // Mint and fetch the source before downloading flyctl: auth failures and
+  // inaccessible repos surface here with an actionable message, not after 100 MB of I/O.
+  const { token: sourceToken, authMode } = await mintSourceTokenOrJwt(
+    input.githubAppId, input.githubAppPrivateKey, owner,
+    { permissions: { contents: "read" }, repositories: [repo] },
+  );
+  let tarball: Buffer;
+  try {
+    tarball = await fetchRepoTarball(sourceToken, owner, repo, commit);
+  } catch (err) {
+    if (authMode === "public") {
+      // Public (unauthenticated) path means the App is not installed on the owner.
+      throw new Error(
+        `Source repo '${owner}/${repo}' is not accessible. It may be private and the GitHub App is not installed on '${owner}'. Install the App on that org, or add the repository to the existing installation.`,
+      );
+    }
+    throw err;
+  }
+  const scratch = await deployScratch();
+  const flyctl = await resolveFlyctl(scratch);
+  const context = await extractSource(tarball, scratch);
+  console.log(`[deploy] running flyctl for ${owner}/${repo}@${commit.slice(0, 7)}`);
+  await runFlyctl(flyctl, input.args, {
+    cwd: context,
+    // A deliberate allowlist, not process.env: the orchestrator's environment
+    // holds every credential it has, and none of them belong in a build.
+    env: { PATH: process.env.PATH ?? "", HOME: scratch, FLY_API_TOKEN: input.flyDeployToken },
+    timeoutMs: FLYCTL_TIMEOUT_MS,
+    signal: input.signal,
+  });
 }

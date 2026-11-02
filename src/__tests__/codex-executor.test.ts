@@ -701,7 +701,13 @@ describe("protocol driver seam (AII-1001)", () => {
     expect(log[0].args).toEqual([
       "app-server", "--strict-config",
       "-c", 'model="gpt-synthetic"',
-      "-c", 'model_provider="openai"',
+      "-c", 'model_provider="openai_api_key"',
+      "-c", 'model_providers.openai_api_key.name="OpenAI API key"',
+      "-c", 'model_providers.openai_api_key.base_url="https://api.openai.com/v1"',
+      "-c", 'model_providers.openai_api_key.env_key="CODEX_API_KEY"',
+      "-c", 'model_providers.openai_api_key.wire_api="responses"',
+      "-c", "model_providers.openai_api_key.requires_openai_auth=false",
+      "-c", "model_providers.openai_api_key.supports_websockets=false",
       "-c", 'approval_policy="never"',
       "-c", 'sandbox_mode="read-only"',
       "-c", "features.shell_tool=false",
@@ -1311,6 +1317,76 @@ describe("ChatGPT plan provider", () => {
     expect(seen!.config).not.toContain("openai_base_url");
     expect(seen!.input.modelProvider).toBe("chatgpt_plan");
     expect(readFileSync(join(selected, "auth.json"), "utf8")).toBe(original);
+  });
+
+  describe("app-server: API-key provider", () => {
+    const keyAuth = (env: Record<string, string>): Pick<ModelAuthClient, "invoke"> => ({
+      invoke: async (_id, cb) => cb({ env: { PATH: "/usr/bin", ...env }, strippedKeys: [] }),
+    });
+    const runAppServer = async (env: Record<string, string>) => {
+      const log: Spawned[] = [];
+      let seen: { files: string[]; config: string; input: CodexTransportRunInput } | undefined;
+      const executor = new CodexExecutor(workspace, {
+        auth: keyAuth(env),
+        profileId: "p1",
+        allowRepositoryWrites: true,
+        protocolDriver: {
+          run: async (input) => {
+            const home = log[0].env.CODEX_HOME;
+            seen = { files: readdirSync(home).sort(), config: readFileSync(join(home, "config.toml"), "utf8"), input };
+            return okDriver();
+          },
+        },
+        spawnImpl: makeSpawn([{ hang: true, dieOn: ["SIGTERM"] }], log),
+        sleepImpl: async () => {},
+        termWaitMs: 30,
+        killWaitMs: 30,
+      });
+      await executor.invoke(base);
+      return { args: log[0].args, seen: seen! };
+    };
+    type Parsed = { model_provider?: string; model_providers?: Record<string, Record<string, unknown>> };
+
+    it("selects a provider that reads CODEX_API_KEY, in both the view and the argv", async () => {
+      const { args, seen } = await runAppServer({ CODEX_API_KEY: SYNTHETIC_KEY });
+      const parsed = parseToml(seen.config) as Parsed;
+      expect(parsed.model_provider).toBe("openai_api_key");
+      expect(parsed.model_providers?.openai_api_key).toMatchObject({
+        base_url: "https://api.openai.com/v1",
+        env_key: "CODEX_API_KEY",
+        wire_api: "responses",
+        requires_openai_auth: false,
+        supports_websockets: false,
+      });
+      expect(args).toContain('model_provider="openai_api_key"');
+      expect(args).toContain('model_providers.openai_api_key.env_key="CODEX_API_KEY"');
+      expect(args).toContain('model_providers.openai_api_key.base_url="https://api.openai.com/v1"');
+      expect(args).not.toContain('model_provider="openai"');
+      expect(args).toContain(`shell_environment_policy.exclude=${JSON.stringify(CODEX_SHELL_ENV_EXCLUDE)}`);
+      expect(seen.files).toEqual(["config.toml"]);
+      expect(seen.input.modelProvider).toBe("openai_api_key");
+      expect(seen.config).not.toContain(SYNTHETIC_KEY);
+      expect(args.join(" ")).not.toContain(SYNTHETIC_KEY);
+    });
+
+    it("carries the OPENAI_BASE_URL redirect as the provider's base_url", async () => {
+      const url = "http://127.0.0.1:4010/v1";
+      const { args, seen } = await runAppServer({ CODEX_API_KEY: SYNTHETIC_KEY, OPENAI_BASE_URL: url });
+      const parsed = parseToml(seen.config) as Parsed;
+      expect(parsed.model_providers?.openai_api_key?.base_url).toBe(url);
+      expect(args).toContain(`model_providers.openai_api_key.base_url=${JSON.stringify(url)}`);
+      expect(seen.config).not.toContain("openai_base_url");
+    });
+
+    it("still rejects a non-allowed OPENAI_BASE_URL", async () => {
+      await expect(runAppServer({ CODEX_API_KEY: SYNTHETIC_KEY, OPENAI_BASE_URL: "https://evil.example/v1" })).rejects.toThrow(/OPENAI_BASE_URL/);
+    });
+
+    it("keeps the built-in provider when the env carries no API key", async () => {
+      const { args, seen } = await runAppServer({ CODEX_HOME: selected });
+      expect(args).toContain('model_provider="openai"');
+      expect(seen.config).not.toContain("openai_api_key");
+    });
   });
 
   it("exec: leaves the sessions directory in place while a child may still be alive", async () => {

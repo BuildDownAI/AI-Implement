@@ -500,6 +500,8 @@ describe("prepared review-fix credentials", () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     seedPreparedPilotAttempt(now + 60_000);
     const minted = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET });
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET });
     const row = dedup.getDb().prepare(
       "SELECT expires_at FROM runner_tokens WHERE dispatch_id = ? AND audience = 'progress'",
     ).get(PILOT_ATTEMPT) as { expires_at: number };
@@ -508,10 +510,14 @@ describe("prepared review-fix credentials", () => {
     expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
       .toMatchObject({ ok: false, reason: "expired" });
 
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result"))
+      .toMatchObject({ ok: false, reason: "expired" });
     clock.mockReturnValue(now);
     dedup.getDb().prepare("UPDATE review_fix_attempts SET authority_revoked_at = ? WHERE attempt_id = ?")
       .run(now, PILOT_ATTEMPT);
     expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result"))
       .toMatchObject({ ok: false, reason: "revoked" });
     expect(() => runnerTokens.mintPreparedReviewFixToken({ attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET }))
       .toThrow(/no current authority/);
@@ -522,6 +528,9 @@ describe("prepared review-fix credentials", () => {
       .run(now, PILOT_ATTEMPT);
     expect(runnerTokens.verifyPreparedReviewFixToken(minted.token, SECRET, "progress"))
       .toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication"))
+      .toMatchObject({ ok: false, reason: "revoked" });
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result").ok).toBe(true);
   });
 
   it("allows a credential retry during delivery grace but no first issuance after the deadline", () => {

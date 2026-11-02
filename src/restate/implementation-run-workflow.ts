@@ -7,17 +7,19 @@
  *
  * Built the same way as `createPlanningRunWorkflow` (`src/restate/planning-run-workflow.ts`).
  * Differences: the total deadline comes from the project's job timeout (ADR 045), `report` carries
- * no payload so `finishJob` always runs and reads the `dispatch_log` row itself, and a stuck
+ * optional model usage while `finishJob` always runs and reads the `dispatch_log` row itself, and a stuck
  * attempt is not retried here: the poll loop starts the next attempt as a new workflow (ADR 044).
  * The step names and duties are in `docs/implementation-lifecycle.md`.
  * No production path calls it yet; AII-1557 supplies the real deps and registers it.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
+import { recordUsage, type RecordedUsage } from "../agent-usage.js";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
-import { cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "./owned-run-lifecycle.js";
+import { acceptOwnedRunReport, type OwnedRunReportResult, cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 import { restateRetentionMs } from "./retention.js";
 
@@ -93,7 +95,7 @@ export interface ImplementationRunDependencies {
   /** Stops the exact run or machine. */
   stop(input: ImplementationRunInput, jobId: string): Promise<boolean>;
   /** Finishes the job of this dispatch through the shared finalizer (`finishImplementationJob`). It reads the
-   *  `dispatch_log` row, because `report` carries no payload and the callback may have made the ticket transition already. */
+   *  `dispatch_log` row, because `report` carries no job outcome and the callback may have made the ticket transition already. */
   finishJob(dispatchId: string, outcome: ImplementationFinishOutcome): ImplementationFinishResult | void | Promise<ImplementationFinishResult | void>;
   /** Removes the machine (`destroyMachineRecorded`) or container of the exact run after it ended; a 404 counts as done,
    *  and GitHub Actions is a no-op. Safe to run twice. */
@@ -415,12 +417,13 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     }
   }
 
-  async function report(ctx: WorkflowSharedContext): Promise<void> {
+  async function report(ctx: WorkflowSharedContext, body?: { usage?: RecordedUsage }): Promise<OwnedRunReportResult> {
     await requireStarted(ctx);
     // Producer: handleRunnerResult in src/runner-callback.ts, through the termination hook AII-1557 adds.
     // The promise resolves with a body: awaitOwnedRun reads `undefined` as "not resolved".
-    const promise = ctx.promise<{ ok: true }>("report");
-    if ((await promise.peek()) === undefined) await promise.resolve({ ok: true });
+    const result = await acceptOwnedRunReport(ctx, "report", { ok: true, ...(body?.usage ? { usage: body.usage } : {}) },
+      (value) => value.usage && recordUsage(ctx.key, value.usage));
+    return { ...result, fingerprint: ownedRunReportFingerprint(body ?? {}) };
   }
 
   async function status(ctx: WorkflowSharedContext): Promise<ImplementationRunStatusResult> {
@@ -439,7 +442,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         input: serde.zod(implementationRunInputSchema),
         journalRetention: retentionMs,
       }, run),
-      report: restate.handlers.workflow.shared({
+      report: restate.handlers.workflow.shared<OwnedRunReportResult, { usage?: RecordedUsage }>({
         journalRetention: retentionMs,
         idempotencyRetention: retentionMs,
       }, report),

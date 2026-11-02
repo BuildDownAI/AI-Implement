@@ -272,11 +272,6 @@ export async function loadLocalSessionBootstrap(input: {
   const configured: ConfiguredRunOptions = {
     agentConfig: input.snapshot,
     localCredentialPort: port,
-    repositories: bootstrap.trustedRepositories,
-    repoTrust: async (repository) =>
-      bootstrap.trustedRepositories.includes(repository)
-        ? { visibility: "private", trustedForSubscription: true }
-        : { visibility: "unknown", trustedForSubscription: false },
     ...(bootstrap.syntheticProvider ? { syntheticProvider: bootstrap.syntheticProvider } : {}),
     ...(bootstrap.authRoot ? { modelAuthRoot: bootstrap.authRoot } : {}),
   };

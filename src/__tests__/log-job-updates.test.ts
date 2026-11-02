@@ -427,3 +427,35 @@ describe("late_review_pending outbox (AII-1362)", () => {
     expect(rows()).toEqual([]);
   });
 });
+
+describe("late_review_pending head upgrade (AII-1596)", () => {
+  const head = (k: string) => log.getPendingLateReviews(0).find((r) => r.workflowKey === k)?.headSha;
+
+  it("fills a headless row from a repeat record and keeps an existing head", () => {
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u" }, 100);
+    expect(head("h")).toBeNull();
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u", headSha: "a".repeat(40) }, 200);
+    expect(head("h")).toBe("a".repeat(40));
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u", headSha: "b".repeat(40) }, 300);
+    expect(head("h")).toBe("a".repeat(40));
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u" }, 400);
+    expect(head("h")).toBe("a".repeat(40));
+  });
+});
+
+describe("prune keeps recently finished rows (AII-1564)", () => {
+  it("keeps a finished row younger than 7 days beyond 500 rows and prunes an older one", () => {
+    const db = dedup.getDb();
+    const recent = log.appendLog({ issueId: "recent", dispatchId: "recent" });
+    const old = log.appendLog({ issueId: "old", dispatchId: "old" });
+    const now = Date.now();
+    db.prepare("UPDATE dispatch_log SET completed_at = ?, status = 'completed' WHERE id = ?").run(now - 24 * 3600_000, recent);
+    db.prepare("UPDATE dispatch_log SET completed_at = ?, status = 'completed' WHERE id = ?").run(now - 8 * 24 * 3600_000, old);
+    // The trigger stamps the wall clock on the writes above; pin the change times afterwards.
+    db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(now - 24 * 3600_000, recent);
+    db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(now - 8 * 24 * 3600_000, old);
+    for (let i = 0; i < 510; i++) log.appendLog({ issueId: `n${i}` });
+    expect(log.getJobById(recent)).not.toBeNull();
+    expect(log.getJobById(old)).toBeNull();
+  });
+});

@@ -457,6 +457,30 @@ describe("local session bootstrap consumption", () => {
     };
   }
 
+  it("round-trips the host bootstrap with trustedRepositories for older runner images", async () => {
+    const snapshot = makeSnapshot("openai-api-key");
+    const bridge = await startLocalAuthBridge({
+      snapshotId: snapshot.snapshotId,
+      projectKey: "owner/repo",
+      credentialPort: { load: vi.fn() },
+      ownership: { releaseUnused: vi.fn(), release: vi.fn() } as never,
+      leases: [],
+      references: [{ profileId: "p-impl", authMode: "openai-api-key", kind: "api-key", canonicalPath: "/tmp/profile.key" }],
+      trustedRepositories: ["owner/repo"],
+    });
+    try {
+      vi.mocked(readFile).mockResolvedValue(JSON.stringify(bridge.bootstrap));
+      const parsed = await validateLocalSessionBootstrap("/tmp/local-auth/bootstrap.json", snapshot, {
+        [LOCAL_AUTH_BOOTSTRAP_ENV]: "/tmp/local-auth/bootstrap.json",
+        AI_IMPLEMENT_HOST_UID: String(typeof process.getuid === "function" ? process.getuid() : 501),
+      });
+      expect(parsed.trustedRepositories).toEqual(["owner/repo"]);
+      expect(parsed).toEqual(bridge.bootstrap);
+    } finally {
+      await bridge.close();
+    }
+  });
+
   it("validates private bootstrap metadata, consumes the pointer, and withdraws the file", async () => {
     const path = "/tmp/local-auth/bootstrap.json";
     vi.mocked(readFile).mockResolvedValue(JSON.stringify(bootstrap()));
@@ -467,7 +491,6 @@ describe("local session bootstrap consumption", () => {
 
     const result = await loadLocalSessionBootstrap({ env, snapshot: makeSnapshot("openai-api-key"), workspaceDir: "/workspace" });
 
-    expect(result.configured.repositories).toEqual(["owner/repo"]);
     expect(result.configured.localCredentialPort).toBeDefined();
     expect(env[LOCAL_AUTH_BOOTSTRAP_ENV]).toBeUndefined();
     expect(unlink).toHaveBeenCalledWith(path);

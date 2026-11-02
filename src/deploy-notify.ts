@@ -20,28 +20,21 @@ export interface DeployNotifyConfig {
   kgSidecarUrl: string | null;
 }
 
+/** The terminal SelfDeploy record, as far as this module reads it. Structural so this file never imports src/restate/. */
+export interface DeployRecordLike {
+  deployId: string;
+  phase: string;
+  target: { commit: string };
+  finishedAt: number | null;
+  reason: string | null;
+}
+
 export interface DeployOutcome {
-  kind: "deployed-ok" | "deployed-not-serving" | "build-failed";
+  kind: "deployed-ok" | "deployed-not-serving" | "build-failed" | "deploy-failed" | "deploy-cancelled";
   /** null when the image was not stamped with AI_IMPLEMENT_SOURCE_COMMIT at build time */
   commit: string | null;
   timestamp: number;
   detail?: string;
-}
-
-export interface DeployOutcomeInput {
-  holdWasSet: boolean;
-  prevImageRef: string | null;
-  currentImageRef: string;
-  /** Absent means the sidecar never came up — see decideDeployOutcome. */
-  kgSidecarUrl: string | null;
-  /**
-   * The sidecar liveness probe's `lastError` (AII-648) when `kgSidecarUrl` is set — null
-   * means the probe succeeded. Required rather than optional so a caller cannot silently
-   * report deployed-ok by omitting it.
-   */
-  sidecarProbeError: string | null;
-  commit: string | null;
-  now: number;
 }
 
 const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
@@ -83,32 +76,12 @@ export function decideBootNotification(input: BootStateInput): BootDecision | nu
   return lastShutdownAt != null ? { kind: "restarted", downtimeMs } : null;
 }
 
-/**
- * Whether this boot is the far side of a self-deploy, and whether that release serves.
- *
- * docker-entrypoint.sh exports KG_SIDECAR_URL only after the sidecar answers its readiness
- * check, so an absent value here is the sidecar-less signal. An unauthenticated probe of /mcp
- * cannot substitute for either check: its 401 gate sits above the sidecar check, so an
- * unauthenticated caller sees 401 either way. What settles it is the in-process liveness probe
- * (AII-648, `SidecarMemoryProvider.probe()`) run against the sidecar right after boot — its
- * result arrives here as `sidecarProbeError`, and the deploy record is written after that
- * probe resolves, not before.
- */
-export function decideDeployOutcome(input: DeployOutcomeInput): DeployOutcome | null {
-  const { holdWasSet, prevImageRef, currentImageRef, kgSidecarUrl, sidecarProbeError, commit, now } = input;
-
-  // No hold means no deploy was in flight. A null or unchanged ref means this process
-  // was not replaced by one — a fresh volume, or a restart on the same version.
-  if (!holdWasSet) return null;
-  if (prevImageRef === null || prevImageRef === currentImageRef) return null;
-
-  if (!kgSidecarUrl) {
-    return { kind: "deployed-not-serving", commit, timestamp: now, detail: "KG sidecar did not start" };
-  }
-  if (sidecarProbeError) {
-    return { kind: "deployed-not-serving", commit, timestamp: now, detail: `KG sidecar liveness probe failed: ${sidecarProbeError}` };
-  }
-  return { kind: "deployed-ok", commit, timestamp: now };
+/** Maps a terminal SelfDeploy record to the stored outcome; `detail` carries the reason code. */
+export function outcomeFromDeployRecord(record: DeployRecordLike): DeployOutcome {
+  const base = { commit: record.target.commit, timestamp: record.finishedAt ?? Date.now() };
+  if (record.phase === "succeeded") return { kind: "deployed-ok", ...base };
+  if (record.phase === "cancelled") return { kind: "deploy-cancelled", ...base };
+  return { kind: "deploy-failed", ...base, ...(record.reason ? { detail: record.reason } : {}) };
 }
 
 /** Present only inside a Fly Machine, so it doubles as the "this is a real deployment" gate. */
@@ -173,7 +146,6 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
 
 export async function postBootNotice(
   config: DeployNotifyConfig,
-  opts: { holdWasSet?: boolean; sidecarProbeError?: string | null } = {},
 ): Promise<void> {
   const imageRef = flyImageRef();
   if (!imageRef) return;
@@ -187,16 +159,6 @@ export async function postBootNotice(
     now: Date.now(),
   });
 
-  const outcome = decideDeployOutcome({
-    holdWasSet: opts.holdWasSet ?? false,
-    prevImageRef,
-    currentImageRef: imageRef,
-    kgSidecarUrl: config.kgSidecarUrl,
-    sidecarProbeError: opts.sidecarProbeError ?? null,
-    commit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
-    now: Date.now(),
-  });
-
   // State advances even when nothing is posted, and even when the webhook is unset — otherwise
   // a run with notifications disabled would leave a stale ref and mis-classify the next boot.
   // Every write here stays above this function's first await: it is called fire-and-forget,
@@ -207,7 +169,6 @@ export async function postBootNotice(
   } catch (err) {
     console.error("[deploy-notify] failed to persist deploy state:", err);
   }
-  if (outcome) recordDeployOutcome(outcome);
 
   if (!decision || !config.notifyWebhookUrl) return;
   try {
@@ -235,5 +196,29 @@ export async function postAvailableNotice(config: DeployNotifyConfig, commit: st
     });
   } catch (err) {
     console.error("[deploy-notify] availability notice failed:", err);
+  }
+}
+
+/**
+ * The SelfDeploy object's `onOutcome`: stores the outcome and announces an unsuccessful end. Runs in
+ * whichever process finishes the deploy (the new one, after a successful verify), so it reads only
+ * SQLite and env. It never throws — the object retries a throwing effect, which would repeat the notice.
+ */
+export async function onSelfDeployOutcome(config: DeployNotifyConfig, record: DeployRecordLike): Promise<void> {
+  const outcome = outcomeFromDeployRecord(record);
+  recordDeployOutcome(outcome);
+  console.log(`[self-deploy] ${record.deployId} outcome ${outcome.kind}${outcome.detail ? ` ${outcome.detail}` : ""}`);
+  if (record.phase === "succeeded" || !config.notifyWebhookUrl) return;
+  try {
+    await notifyDeploy(config.notifyType, config.notifyWebhookUrl, {
+      kind: outcome.kind === "deploy-cancelled" ? "deploy-cancelled" : "deploy-failed",
+      appName: process.env.FLY_APP_NAME || "orchestrator",
+      region: process.env.FLY_REGION || null,
+      imageRef: null,
+      commit: record.target.commit,
+      detail: outcome.detail ?? null,
+    });
+  } catch (err) {
+    console.error("[deploy-notify] deploy outcome notice failed:", err);
   }
 }

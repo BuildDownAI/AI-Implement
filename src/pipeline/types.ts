@@ -399,6 +399,75 @@ export function sanitizeAttribution(value: unknown): InvocationAttributionV1 | n
   };
 }
 
+/** Upper bounds for the per-job accounting lists a runner result may carry. */
+export const INVOCATION_RECORDS_MAX = 200;
+export const PUSHED_COMMITS_MAX = 1000;
+
+/**
+ * One model invocation of a job as the runner reports it in the result's `invocations` list:
+ * the attribution plus the usage details {@link AttributionUsage} does not carry. A separate type so
+ * `sanitizeAttribution`'s strict key list never widens (an older orchestrator would otherwise drop the
+ * single `attribution` of a newer runner).
+ */
+export interface InvocationRecordV1 {
+  attribution: InvocationAttributionV1;
+  cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
+  /** Spawn attempts the executor made for this invocation; 1 when it did not report. */
+  attempts: number;
+}
+
+const INVOCATION_RECORD_KEYS = ["attribution", "cacheReadTokens", "cacheCreationTokens", "attempts"];
+
+/**
+ * Projects an untrusted `invocations` value to valid records, in order. Malformed entries (and everything
+ * past {@link INVOCATION_RECORDS_MAX}) are counted in `dropped`, never echoed. A non-array yields none.
+ */
+export function sanitizeInvocationRecords(value: unknown): { valid: InvocationRecordV1[]; dropped: number } {
+  if (!Array.isArray(value)) return { valid: [], dropped: value === undefined || value === null ? 0 : 1 };
+  const valid: InvocationRecordV1[] = [];
+  let dropped = 0;
+  for (const entry of value) {
+    if (valid.length >= INVOCATION_RECORDS_MAX) {
+      dropped++;
+      continue;
+    }
+    if (!attrRecord(entry) || !onlyKeys(entry, INVOCATION_RECORD_KEYS)) {
+      dropped++;
+      continue;
+    }
+    const attribution = sanitizeAttribution(entry.attribution);
+    const cacheRead = entry.cacheReadTokens ?? null;
+    const cacheCreation = entry.cacheCreationTokens ?? null;
+    const attempts = entry.attempts ?? 1;
+    if (
+      !attribution ||
+      !nullableCount(cacheRead) ||
+      !nullableCount(cacheCreation) ||
+      typeof attempts !== "number" ||
+      !Number.isSafeInteger(attempts) ||
+      attempts < 1
+    ) {
+      dropped++;
+      continue;
+    }
+    valid.push({ attribution, cacheReadTokens: cacheRead, cacheCreationTokens: cacheCreation, attempts });
+  }
+  return { valid, dropped };
+}
+
+const COMMIT_SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Validates a `pushedCommits` list (oldest first). Returns `null` when absent or malformed (including
+ * over {@link PUSHED_COMMITS_MAX}); `[]` is a valid, meaningful "nothing was pushed".
+ */
+export function sanitizePushedCommits(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > PUSHED_COMMITS_MAX) return null;
+  if (!value.every((v): v is string => typeof v === "string" && COMMIT_SHA_RE.test(v))) return null;
+  return [...value];
+}
+
 export interface RunTelemetry {
   outcome: "success" | "max_turns" | "error" | "unknown";
   numTurns: number | null;

@@ -223,6 +223,8 @@ describe("launchPlanningRun", () => {
     const count = dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_log").get() as { n: number };
     expect(count.n).toBe(1);
     expect(log.getJobByDispatchId("dispatch-launch-1")).not.toBeNull();
+    expect(dedup.getDb().prepare("SELECT tracker_kind, issue_url FROM dispatch_log WHERE dispatch_id = 'dispatch-launch-1'").get())
+      .toEqual({ tracker_kind: mapping.ticketingProvider, issue_url: provider.issueUrl(issue) });
     expect(provider.markPlanningStarted).toHaveBeenCalledWith(issue.id, issue.scopeKey);
   });
 

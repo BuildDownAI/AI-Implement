@@ -1,0 +1,17 @@
+{
+  "request": {
+    "args": {
+      "branch": "testing",
+      "requestedBy": "control-plane"
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"deployId\":\"5d1f1c58-6a52-4d3e-9a0e-0c1b7d8f2e41\",\"commit\":\"0123456789abcdef0123456789abcdef01234567\",\"image\":\"registry.fly.io/builddown-orchestrator-image:testing-0123456\",\"alreadyActive\":false}"
+      }
+    ]
+  }
+}

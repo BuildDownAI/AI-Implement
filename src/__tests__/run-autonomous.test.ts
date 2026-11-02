@@ -1752,6 +1752,62 @@ describe("runAutonomous", () => {
     });
   });
 
+  it("a gap-analysis success that pushed reports the push commit as externalReviewPending.headSha (AII-1484)", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: "b".repeat(40) })) }],
+    ]);
+    await runAutonomous({
+      workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+    });
+    expect(resultBody(fake)).toMatchObject({ outcome: "success", externalReviewPending: { headSha: "b".repeat(40) } });
+  });
+
+  it("a gap-analysis success with no push commit, and an implementation success, send no externalReviewPending (AII-1484)", async () => {
+    for (const [phase, commitSha] of [["gap-analysis", null], ["implementation", "b".repeat(40)]] as const) {
+      vi.stubEnv("PR_NUMBER", "42");
+      vi.stubEnv("RUNNER_PHASE", phase);
+      vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      const fake = fakeFetch({ [RESULT]: resultAccepted });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha })) }],
+      ]);
+      await runAutonomous({
+        workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+      });
+      expect(resultBody(fake)).not.toHaveProperty("externalReviewPending");
+    }
+  });
+
+  it("a gap-analysis failure that pushed sends no externalReviewPending (AII-1484)", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })) }],
+      ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: "b".repeat(40) })) }],
+    ]);
+    await runAutonomous({
+      workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch, ghSpawn: noReviewThreads,
+    });
+    expect(resultBody(fake)).toMatchObject({ outcome: "failure" });
+    expect(resultBody(fake)).not.toHaveProperty("externalReviewPending");
+  });
+
   it("uses RUNNER_PHASE instead of inferring callback phase from PR_NUMBER", async () => {
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_PHASE", "implementation");
@@ -4058,7 +4114,6 @@ describe("runAutonomousLocally", () => {
   });
 });
 
-
 describe("configured (opted-in) autonomous runs", () => {
   let workspaceDir: string;
   const snap = makeSnapshot();
@@ -4114,7 +4169,6 @@ describe("configured (opted-in) autonomous runs", () => {
       pipeline: l.pipeline, runner: l.runner,
       configured: {
         agentConfig: snap, modelAuthClient: localClient, localCredentialPort: { load: vi.fn() },
-        repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private", trustedForSubscription: true }),
       },
     });
     expect(managed.exitCode).toBe(0);
@@ -4397,37 +4451,12 @@ describe("configured (opted-in) autonomous runs", () => {
     });
   }
 
-  it("local: rejects a public repository or an untrusted subscription workspace before work", async () => {
-    const client = fakeClient();
-    const injected = makeExecutor();
-    for (const trust of [
-      { visibility: "public", trustedForSubscription: true },
-      { visibility: "private", trustedForSubscription: false },
-    ] as const) {
-      const l = capture();
-      await expect(
-        runAutonomousLocally({
-          workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", llmExecutor: injected,
-          pipeline: l.pipeline, runner: l.runner,
-          configured: {
-            agentConfig: makeSnapshot("codex-subscription"), modelAuthClient: client, localCredentialPort: { load: vi.fn() },
-            repositories: ["acme/app"], repoTrust: async () => trust,
-          },
-        }),
-      ).rejects.toThrow(/repository_untrusted/);
-      expect(l.seen.ctx).toBeUndefined();
-    }
-    expect(injected.invoke).not.toHaveBeenCalled();
-    expect(client.checkout).not.toHaveBeenCalled();
-  });
-
   it("local: cleans up on setup-hook failure and on a thrown pipeline", async () => {
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nsetup: exit 3\n---\nDo it.\n");
     const client = fakeClient();
     const l = capture();
     const configured = {
       agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() },
-      repositories: ["acme/app"], repoTrust: async () => ({ visibility: "private" as const, trustedForSubscription: true }),
     };
     const r = await runAutonomousLocally({ workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline: l.pipeline, runner: l.runner, configured });
     expect(r.terminationReason).toBe("setup_failed");

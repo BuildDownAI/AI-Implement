@@ -47,9 +47,8 @@ import {
   type ModelAuthClient,
   type ModelAuthTransport,
 } from "./model-auth-client.js";
-import { EXECUTION_POLICY_ENV, MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, isSubscriptionAuthMode, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
+import { EXECUTION_POLICY_ENV, MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
 import { STAGE_NAMES } from "./agent-config.js";
-import { repoTrustRejection, type RepoTrust } from "./repo-trust.js";
 import { AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
 import { CodexRecoveryRequiredError } from "./pipeline/codex-executor.js";
 import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
@@ -73,6 +72,7 @@ import {
 import { buildPublicationCycleSummary, readCycleSummaries } from "./pipeline/cycle-summary.js";
 import type { GhSpawn } from "./pipeline/review-ledger.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
+import { resetJobAccounting } from "./pipeline/job-accounting.js";
 
 /**
  * Runner-activity wiring for one autonomous run (AII-798). `sink` is handed to the
@@ -796,7 +796,6 @@ export type ConfiguredRunFailure =
   | "bootstrap_context_missing"
   | "grant_bindings_mismatch"
   | "transport_unconfigured"
-  | "repository_untrusted"
   | "execution_policy_invalid";
 
 /** Fixed-message rejection of an opted-in run; never carries input, grant or credential text. */
@@ -815,19 +814,15 @@ export { MODEL_AUTH_ENV };
 export interface ConfiguredRunOptions {
   /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */
   agentConfig?: ResolvedAgentSnapshotV1;
-  /** Local runs: protected credential source (trusted private testing). */
+  /** Local runs: protected credential source. */
   localCredentialPort?: LocalCredentialPort;
-  /** Injected client seam. Never bypasses snapshot, bootstrap or trust validation. */
+  /** Injected client seam. Never bypasses snapshot or bootstrap validation. */
   modelAuthClient?: ModelAuthClient;
   modelAuthTransport?: ModelAuthTransport;
   /** Trusted dispatch context; defaults to the launcher's AI_IMPLEMENT_MODEL_AUTH_* values. */
   expectedBootstrap?: ExpectedBootstrapContext;
   /** Parent directory for private credential directories (defaults to the OS temp dir). */
   modelAuthRoot?: string;
-  /** Repositories the run executes against, for the trust check (managed runs default to the target repo). */
-  repositories?: readonly string[];
-  /** Actual visibility/trust of one repository, judged by the dispatch-preparation rule. */
-  repoTrust?: (repository: string) => Promise<RepoTrust>;
   /** Local synthetic OpenAI-compatible provider for real-image manual tests. */
   syntheticProvider?: ConfiguredSyntheticProviderOptions;
   now?: () => number;
@@ -1010,8 +1005,6 @@ export async function prepareConfiguredRun(input: {
   env: NodeJS.ProcessEnv;
   snapshot?: ResolvedAgentSnapshotV1;
   workspaceDir: string;
-  /** Repositories for the trust check when `options.repositories` is not set. */
-  repositories?: readonly string[];
   options?: ConfiguredRunOptions;
 }): Promise<ConfiguredRun | undefined> {
   const { env, options = {} } = input;
@@ -1059,25 +1052,6 @@ export async function prepareConfiguredRun(input: {
   }
 
   const implementationFullAccess = resolveImplementationFullAccess(env, grant ? expectedContext : undefined);
-
-  // Visibility/trust: the same decision dispatch preparation makes. A local subscription run has no
-  // grant vouching for a prior dispatch check, so it fails closed without an explicit trust source.
-  const subscription = STAGE_NAMES.some((s) => isSubscriptionAuthMode(snapshot.profiles[s].authMode));
-  if (options.repoTrust) {
-    const repositories = [...new Set(options.repositories ?? input.repositories ?? [])];
-    if (repositories.length === 0) throw new ConfiguredRunError("repository_untrusted");
-    for (const repository of repositories) {
-      let trust: RepoTrust | undefined;
-      try {
-        trust = await options.repoTrust(repository);
-      } catch {
-        trust = undefined;
-      }
-      if (repoTrustRejection(trust)) throw new ConfiguredRunError("repository_untrusted");
-    }
-  } else if (port && subscription) {
-    throw new ConfiguredRunError("repository_untrusted");
-  }
 
   let client: ModelAuthClient;
   if (injected) {
@@ -1216,6 +1190,8 @@ function buildConfiguredRun(
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
+  // A runner process reports one job; drop any invocations or SHAs a previous run in this process collected.
+  resetJobAccounting();
   // Move the one-use publication bearer out of the inherited environment
   // before hooks, package installs, repository scripts, or model subprocesses
   // can run. Runner-owned publication steps retrieve it from private memory.
@@ -1262,7 +1238,6 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     env: process.env,
     snapshot: agentConfig,
     workspaceDir,
-    repositories: [`${githubOwner}/${githubRepo}`],
     options: opts.configured,
   });
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
@@ -1563,6 +1538,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         prUrl,
         referenceRepoResults,
         findingDispositions,
+        ...(runnerPhase === "gap-analysis" && outputCommit ? { externalReviewPending: { headSha: outputCommit } } : {}),
         callbackUrl,
         retryPolicy,
         fetchImpl: opts.fetchImpl,

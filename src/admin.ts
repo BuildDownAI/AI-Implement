@@ -43,7 +43,6 @@ import {
   type RunnerMode,
 } from "./runner-mode.js";
 import {
-  ALL_PROJECTS_KEY,
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
   STAGE_SELECTION_FIELDS,
@@ -78,7 +77,7 @@ import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminG
 import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
-import type { DeployStart } from "./deploy.js";
+import type { SelfDeployClient } from "./restate/self-deploy.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
@@ -546,8 +545,8 @@ export interface RetentionDeps {
 
 export interface AdminDeps {
   retention?: RetentionDeps;
-  /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
-  startDeploy?: (targetOverride?: SelfDeployTarget) => Promise<DeployStart>;
+  /** The `SelfDeploy` object's ingress client. Absent when the orchestrator is not configured to deploy itself. */
+  selfDeploy?: SelfDeployClient;
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
@@ -850,7 +849,7 @@ export function handleAdminRequest(
         if (caller) return handleToolCall(req, res, caller, "control-plane", toolName, deps);
         const gate = authorizeApiRequest(req, res, url, method);
         if (!gate) return;
-        return handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role }, gate.identity?.email ?? "session", toolName, deps);
+        return handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }, gate.identity?.email ?? "session", toolName, deps);
       })
       .catch((err) => {
         console.error("[admin] tool call failed:", err);
@@ -875,13 +874,18 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/deploy" && method === "POST") {
-      handleDeployTrigger(res, deps);
+      runAsync(res, handleDeployTrigger(res, deps, gate.identity?.email ?? "access-code"));
+      return true;
+    }
+
+    if (url === "/api/deploy-cancel" && method === "POST") {
+      runAsync(res, handleDeployCancel(res, deps, gate.identity?.email ?? "access-code"));
       return true;
     }
 
     const toolCallMatch = TOOL_CALL_ROUTE.exec(url);
     if (toolCallMatch && method === "POST") {
-      handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role }, gate.identity?.email ?? "session", decodeURIComponent(toolCallMatch[1]), deps);
+      handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }, gate.identity?.email ?? "session", decodeURIComponent(toolCallMatch[1]), deps);
       return true;
     }
 
@@ -1039,32 +1043,12 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/deployment-status" && method === "GET") {
-      const availability = getAvailability();
-      const policy = getDeployPolicy();
-      const target = resolveDeployTarget(deps.selfDeployTarget ?? null, policy);
-      json(res, 200, {
-        configured: !!deps.startDeploy,
-        available: availability?.available ?? null,
-        held: isDeployHeld(),
-        deployStartedAt: getDeployStartedAt(),
-        inFlight: getInFlightWork(),
-        checkedAt: availability?.checkedAt ?? null,
-        runningCommit: availability?.runningCommit ?? null,
-        headCommit: availability?.headCommit ?? null,
-        isDowngrade: availability?.isDowngrade ?? null,
-        repo: target ? `${target.owner}/${target.repo}` : null,
-        branch: target?.branch ?? null,
-        ...policy,
-        // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
-        notifyConfigured: Boolean(config.notifyWebhookUrl),
-        lastActedCommit: getLastActedCommit(),
-        lastDeployOutcome: getDeployOutcome(),
-      });
+      runAsync(res, handleDeploymentStatus(res, deps, config));
       return true;
     }
 
     if (url === "/api/deploy-policy" && method === "POST") {
-      handleSetDeployPolicy(req, res);
+      handleSetDeployPolicy(req, res, deps);
       return true;
     }
 
@@ -2227,23 +2211,88 @@ function handleSyncWorkflows(
 async function handleDeployTrigger(
   res: http.ServerResponse,
   deps: AdminDeps,
+  requestedBy: string,
 ): Promise<void> {
-  if (!deps.startDeploy) {
+  if (!deps.selfDeploy) {
     json(res, 501, { error: "Self-deploy is not configured" });
     return;
   }
   try {
-    const resolvedTarget = resolveDeployTarget(deps.selfDeployTarget ?? null, getDeployPolicy());
-    const result = await deps.startDeploy(resolvedTarget ?? undefined);
-    if (!result.started) {
-      json(res, result.reason === "deploy-in-progress" ? 409 : 503, { error: result.reason });
+    const target = resolveDeployTarget(deps.selfDeployTarget ?? null, getDeployPolicy());
+    // SelfDeploy builds its image tag from the branch, and only these two have published images.
+    if (target?.branch !== "testing" && target?.branch !== "main") {
+      json(res, 400, { error: "unsupported-branch" });
       return;
     }
-    json(res, 202, { deploying: result.commit });
+    const result = await deps.selfDeploy.start({ branch: target.branch, requestedBy });
+    if ("reason" in result) {
+      if (result.reason === "head-unknown") json(res, 503, { error: result.reason });
+      else if (result.reason === "image-not-published") json(res, 409, { error: result.reason });
+      else json(res, 501, { error: result.reason });
+      return;
+    }
+    json(res, 202, { deployId: result.deployId, commit: result.commit, image: result.image, alreadyActive: result.alreadyActive });
   } catch (err) {
     console.error("[admin] deploy trigger failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
+}
+
+async function handleDeployCancel(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+  requestedBy: string,
+): Promise<void> {
+  if (!deps.selfDeploy) {
+    json(res, 501, { error: "Self-deploy is not configured" });
+    return;
+  }
+  try {
+    json(res, 200, await deps.selfDeploy.cancel({ requestedBy }));
+  } catch (err) {
+    console.error("[admin] deploy cancel failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+async function handleDeploymentStatus(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+  config: AdminConfig,
+): Promise<void> {
+  const availability = getAvailability();
+  const policy = getDeployPolicy();
+  const target = resolveDeployTarget(deps.selfDeployTarget ?? null, policy);
+  // A Restate fault must not take the whole page down: the rest of the status is local.
+  let selfDeploy: unknown = null;
+  if (deps.selfDeploy) {
+    try {
+      selfDeploy = await deps.selfDeploy.status();
+    } catch (err) {
+      console.error("[admin] self-deploy status failed:", err);
+    }
+  }
+  json(res, 200, {
+    configured: !!deps.selfDeploy,
+    available: availability?.available ?? null,
+    held: isDeployHeld(),
+    deployStartedAt: getDeployStartedAt(),
+    inFlight: getInFlightWork(),
+    checkedAt: availability?.checkedAt ?? null,
+    runningCommit: availability?.runningCommit ?? null,
+    headCommit: availability?.headCommit ?? null,
+    isDowngrade: availability?.isDowngrade ?? null,
+    repo: target ? `${target.owner}/${target.repo}` : null,
+    branch: target?.branch ?? null,
+    ...policy,
+    // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
+    notifyConfigured: Boolean(config.notifyWebhookUrl),
+    lastActedCommit: getLastActedCommit(),
+    lastDeployOutcome: getDeployOutcome(),
+    selfDeploy,
+    // FLY_IMAGE_APP set means the control plane owns this machine's config, so fly.toml must not be applied.
+    applyFlyTomlAllowed: !process.env.FLY_IMAGE_APP,
+  });
 }
 
 /** Every tool name is snake_case ASCII (src/restate/tools.ts's `tool()` registrations). */
@@ -2596,9 +2645,10 @@ async function handleSetRetention(
 async function handleSetDeployPolicy(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  deps: AdminDeps,
 ): Promise<void> {
   try {
-    const body = JSON.parse(await readBody(req)) as Partial<Record<keyof DeployPolicy, unknown>>;
+    const body = JSON.parse(await readBody(req)) as Partial<Record<keyof DeployPolicy | "applyFlyToml", unknown>>;
     const patch: Partial<DeployPolicy> = {};
     for (const key of ["autoDeploy", "notifyAvailable"] as const) {
       if (body[key] === undefined) continue;
@@ -2617,6 +2667,24 @@ async function handleSetDeployPolicy(
         return;
       }
       patch[key] = body[key] as string | null;
+    }
+    const applyFlyToml = (body as Record<string, unknown>).applyFlyToml;
+    if (applyFlyToml !== undefined && typeof applyFlyToml !== "boolean") {
+      json(res, 400, { error: "applyFlyToml must be a boolean" });
+      return;
+    }
+    // The option lives in the SelfDeploy object, not SQLite: two stores for one setting would drift.
+    // Set it first so a refusal leaves the rest of the policy unchanged.
+    if (applyFlyToml !== undefined) {
+      if (!deps.selfDeploy) {
+        json(res, 501, { error: "Self-deploy is not configured" });
+        return;
+      }
+      const result = await deps.selfDeploy.setOptions({ applyFlyToml });
+      if (!result.ok) {
+        json(res, 409, { error: result.reason });
+        return;
+      }
     }
     setDeployPolicy(patch);
     json(res, 200, getDeployPolicy());
@@ -2965,7 +3033,7 @@ async function handlePostSettings(
       json(res, 503, { error: "restate-unavailable" });
       return;
     }
-    const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
+    const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] };
     let result: Awaited<ReturnType<NonNullable<AdminDeps["callTool"]>>>;
     try {
       result = await deps.callTool("set_runner_backend", { backend: "fly-machines", patch: flyPatch }, caller);
@@ -3566,7 +3634,7 @@ export async function upsertMappingAction(
     }
   }
 
-  // No enablement check: the process and its trusted authors apply to every project; only the forward to `ReviewFixPR.feedback` needs the Restate lifecycle.
+  // Validate the effective saved pair, including updates that omit either field.
   let reviewProcess: ReviewProcessId | null;
   if (body.reviewProcess === undefined) {
     reviewProcess = existingMapping?.reviewProcess ?? null;
@@ -3575,7 +3643,10 @@ export async function upsertMappingAction(
   } else if (isReviewProcessId(body.reviewProcess)) {
     reviewProcess = body.reviewProcess;
   } else {
-    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", or "claude-code-review-repository-fix"` } };
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"` } };
+  }
+  if (reviewProcess === "codex-code-review" && reviewFixLifecycle !== "restate") {
+    return { status: 400, body: { error: 'reviewProcess "codex-code-review" requires reviewFixLifecycle "restate"' } };
   }
 
   const mapping: RepoMapping = {
@@ -3910,7 +3981,7 @@ interface AccountStatusView {
   sessionRecovery?: { state: string; recoveryRequired: boolean } | null;
 }
 
-function accountStatus(profile: AccountProfileProjection, deps: AdminDeps, projectKey?: string): AccountStatusView {
+function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): AccountStatusView {
   const view: AccountStatusView = { readiness: "unknown", failureCode: null };
   if (profile.authMode === "claude-subscription") {
     const snap = deps.agentConfig?.sessionSnapshot?.(profile.profileId);
@@ -3918,15 +3989,10 @@ function accountStatus(profile: AccountProfileProjection, deps: AdminDeps, proje
     return view;
   }
   if (!deps.agentConfig) return view;
-  // A "*" grant has no project of its own to probe: use the first mapped team key instead.
-  const probe = projectKey ?? (profile.allowedProjectKeys.includes(ALL_PROJECTS_KEY)
-    ? Object.keys(getMappings()).sort()[0]
-    : profile.allowedProjectKeys[0]);
-  if (!probe) return view; // credential status is project-scoped; an unpermitted profile has nothing to probe
   let status;
   try {
     status = getCredentialStatus(
-      { projectKey: probe, profileId: profile.profileId, revision: profile.revision, provider: profile.provider, authMode: profile.authMode },
+      { profileId: profile.profileId, revision: profile.revision, provider: profile.provider, authMode: profile.authMode },
       deps.agentConfig.credentials,
     );
   } catch {
@@ -3951,7 +4017,6 @@ function handleListModelAccounts(res: http.ServerResponse, deps: AdminDeps): voi
     agent: p.agent,
     provider: p.provider,
     authMode: p.authMode,
-    allowedProjectKeys: p.allowedProjectKeys,
     profileStatus: p.status,
     account: accountStatus(p, deps),
     ...credentialView(p),
@@ -4115,7 +4180,6 @@ async function handleModelAccountCredential(
         agent: head.agent as never,
         provider: head.provider as never,
         authMode: head.authMode as never,
-        allowedProjectKeys: head.allowedProjectKeys,
         status: head.status as never,
         metadata: { credentialRef: ref },
       });
@@ -4131,7 +4195,7 @@ async function handleModelAccountCredential(
   json(res, 200, { ref, result: "set" });
 }
 
-const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "allowedProjectKeys", "credentialRef", "status"] as const;
+const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "credentialRef", "status"] as const;
 
 function accountWriteView(p: AccountProfileProjection, deps: AdminDeps): Record<string, unknown> {
   const { status, ...rest } = p;
@@ -4155,7 +4219,6 @@ async function handleCreateModelAccount(req: http.IncomingMessage, res: http.Ser
     json(res, 409, { error: "account profile already exists; PATCH it to append a revision" });
     return;
   }
-  if (body.allowedProjectKeys === undefined) body.allowedProjectKeys = [];
   if (body.status !== undefined && body.status !== "active") {
     json(res, 400, { error: "a new account profile must be created active" });
     return;
@@ -4181,7 +4244,6 @@ async function handlePatchModelAccount(req: http.IncomingMessage, res: http.Serv
     agent: head.agent,
     provider: head.provider,
     authMode: head.authMode,
-    allowedProjectKeys: head.allowedProjectKeys,
     status: head.status,
   };
   const currentRef = lookupCredentialReference(profileId, head.revision);
@@ -4189,15 +4251,6 @@ async function handlePatchModelAccount(req: http.IncomingMessage, res: http.Serv
   for (const [k, v] of Object.entries(body)) {
     if (k === "credentialRef" && v === null) delete merged.credentialRef;
     else merged[k] = v;
-  }
-  // A disabled or archived profile never gains a project grant: grants are only ever removed or kept.
-  const nextStatus = merged.status;
-  if (nextStatus !== "active" && Array.isArray(merged.allowedProjectKeys)) {
-    const added = (merged.allowedProjectKeys as unknown[]).filter((k) => typeof k === "string" && !head.allowedProjectKeys.includes(k));
-    if (added.length > 0) {
-      json(res, 409, { error: "a disabled or archived account profile cannot receive new project grants", code: "profile_not_active" });
-      return;
-    }
   }
   saveAccountWrite(res, deps, profileId, head.revision + 1, merged, 200);
 }
@@ -4218,7 +4271,6 @@ function saveAccountWrite(
       agent: fields.agent as never,
       provider: fields.provider as never,
       authMode: fields.authMode as never,
-      allowedProjectKeys: fields.allowedProjectKeys as string[],
       status: fields.status as never,
       metadata: fields.credentialRef === undefined ? {} : { credentialRef: fields.credentialRef as string },
     });
@@ -4343,7 +4395,6 @@ async function optInRefusal(projectKey: string, candidate: StageAgentConfigurati
           backend,
           workflowRepository: `${mapping.owner}/${mapping.repo}`,
           workflowFile: mapping.workflowFile,
-          repositories: [`${mapping.owner}/${mapping.repo}`],
         },
         candidate,
       );
@@ -4483,7 +4534,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
   try {
     projection = resolveProjectStageConfig(projectKey);
   } catch (err) {
-    // Resolver messages are fixed text (disabled, unpermitted or incompatible profile); none carries a credential.
+    // Resolver messages are fixed text (disabled or incompatible profile); none carries a credential.
     json(res, 200, {
       ...base,
       mode: "configured",
@@ -4505,7 +4556,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
       values: resolution.stages[stage],
       sources: resolution.sources[stage],
       profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },
-      account: projectionProfile ? accountStatus({ ...projectionProfile, revision: profile.revision }, deps, projectKey) : { readiness: "unknown", failureCode: "profile_not_found" },
+      account: projectionProfile ? accountStatus({ ...projectionProfile, revision: profile.revision }, deps) : { readiness: "unknown", failureCode: "profile_not_found" },
     };
   }
   json(res, 200, { ...base, mode: "configured", resolved: true, stages, configRevisions: projection.configReferences });

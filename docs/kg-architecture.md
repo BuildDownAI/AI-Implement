@@ -23,7 +23,7 @@ consequences follow, and every one of them has surprised somebody.
 
 ### A data refresh is a code deploy
 
-Updating the graph means building a new image and replacing the machine. `runDeploy` takes a deploy
+Updating the graph means building a new image and replacing the machine. The `SelfDeploy` object takes a deploy
 hold first, so **dispatch stops**, then waits for in-flight work to drain — up to 75 minutes, after
 which the deploy fails rather than interrupting a run. A KG refresh during a busy period therefore
 either waits or fails.
@@ -706,7 +706,7 @@ a route only through `handleAdminRequest` → `AdminDeps` → `index.ts`, and an
 else would mean a new public surface and a new credential. The design is therefore a budget,
 not an absence — `index.ts` gains exactly **one config field, one supervisor construction, one
 `main()` lifecycle hook, and one `AdminDeps` entry**. All logic lives in injected-dependency
-modules (`src/kg-sidecar.ts`, `src/kg-refresh.ts`), built in the `makeStartDeploy` shape from
+modules (`src/kg-sidecar.ts`, `src/kg-refresh.ts`), built as injected-dependency factories from
 the start. No new top-level function, no new route branch.
 
 ### Invariants the refresh must hold

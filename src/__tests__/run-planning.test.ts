@@ -3,6 +3,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { collectedInvocations, collectedPushedCommits, recordInvocation, recordPushedCommits } from "../pipeline/job-accounting.js";
 import { runPlanning, runPlanningLocally } from "../run-planning.js";
 import { encodeRunConfig, encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
 import { fakeFetch, type FakeFetch, type FetchCall } from "./helpers/fake-fetch.js";
@@ -122,6 +123,20 @@ describe("runPlanning", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(JSON.parse(orchestrator.calls[0].body)).toMatchObject({ phase: "planning", outcome: "failure" });
+  });
+
+  it("starts with no invocations or pushed SHAs left by an earlier run in the process (AII-1566)", async () => {
+    recordInvocation({ attribution: { invocationId: "stale" } as never, cacheReadTokens: null, cacheCreationTokens: null, attempts: 1 });
+    recordPushedCommits(["a".repeat(40)]);
+    let seen: { invocations: number; shas: readonly string[] | null } | null = null;
+    await runPlanning({
+      workspaceDir: ws,
+      executor: () => {
+        seen = { invocations: collectedInvocations().length, shas: collectedPushedCommits() };
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(seen).toEqual({ invocations: 0, shas: null });
   });
 
   it("uses built-in prompt when PLANNING.md is absent", async () => {
@@ -726,7 +741,7 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
             expect(env.CODEX_API_KEY).toBe(S_OPENAI);
             expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBeUndefined();
             expect(dump).not.toContain(S_CHATGPT);
-            expect(driverInputs[0].modelProvider).toBeUndefined();
+            expect(driverInputs[0].modelProvider).toBe("openai_api_key");
           }
           expect(env.OPENAI_API_KEY).toBeUndefined();
           expect(dump).not.toContain(S_AMBIENT);
@@ -1061,8 +1076,6 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
   // ---- Local entrypoint ----
 
   const localBase = () => ({ workspaceDir: ws, issueIdentifier: "L-1", issueTitle: "T", issueDescription: "D", executor: legacy });
-  // The snapshot's review profile is a subscription, so a local run needs an explicit trust source for the target repo.
-  const localTrust = { repositories: ["o/r"], repoTrust: async () => ({ visibility: "private" as const, trustedForSubscription: true }) };
   const apiPort = () => ({
     load: vi.fn(async ({ profileId, authMode }: { profileId: string; authMode: string }) => ({ kind: "api-key" as const, apiKey: S_API, profileId, authMode })),
   });
@@ -1074,7 +1087,7 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
       ...localBase(),
       model: "opts-model",
       agentConfig: snapshotFor("codex"),
-      configured: { localCredentialPort: apiPort() as never, modelAuthClient: client, createCodex: codex.createCodex, ...localTrust },
+      configured: { localCredentialPort: apiPort() as never, modelAuthClient: client, createCodex: codex.createCodex },
     });
     expect(r.diagnostics).toBe("");
     expect(r).toMatchObject({ exitCode: 0, planFound: true });
@@ -1091,7 +1104,7 @@ describe("configured planning (shared prepareConfiguredRun + selected stage exec
       ...localBase(),
       agentConfig: snapshotFor("claude"),
       spawnImpl: impl,
-      configured: { localCredentialPort: port as never, modelAuthRoot: authRoot, ...localTrust },
+      configured: { localCredentialPort: port as never, modelAuthRoot: authRoot },
     });
     expect(r.diagnostics).toBe("");
     expect(r).toMatchObject({ exitCode: 0, planFound: true });

@@ -24,6 +24,8 @@ vi.mock("../log.js", () => ({
   suppressStaleNotifications: vi.fn().mockReturnValue(0),
   updateJobRunId: vi.fn(),
   updateJobStatus: vi.fn(),
+  stampComputeStopped: vi.fn(),
+  recordGhaRunCompleted: vi.fn(),
 }));
 vi.mock("../dedup.js", () => ({ markDispatched: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ recordDispatchFailure: vi.fn().mockReturnValue({ tripped: false, failures: 1 }) }));
@@ -151,7 +153,8 @@ describe("production deps", () => {
   const SENTINELS = ["secret-gh-token", "RUN-TOKEN", "PROGRESS-TOKEN", "PUBLICATION-TOKEN", "SESSION-TOKEN", "MACHINE-NONCE"];
   const issue = { id: "i-1", identifier: "ENG-1", title: "T", scopeKey: "ENG", nativeStatus: "Todo" };
   const provider = {
-    findByKey: vi.fn(), clearWorkingState: vi.fn().mockResolvedValue(true), markImplementationFailed: vi.fn().mockResolvedValue(true),
+    findByKey: vi.fn(), issueUrl: vi.fn((i: { identifier: string }) => `https://tracker.test/issue/${i.identifier}`),
+    clearWorkingState: vi.fn().mockResolvedValue(true), markImplementationFailed: vi.fn().mockResolvedValue(true),
   };
   const prepared = { ghToken: "secret-gh-token", runnerImage: "img", contract: "envelope", dispatchInputs: { run_token: "RUN-TOKEN" } };
 
@@ -237,6 +240,25 @@ describe("production deps", () => {
       expect(input.postDispatch).toHaveBeenCalledWith(input.config, provider, expect.anything(), MAPPING, "secret-gh-token", 7, "github-actions");
       expect(vi.mocked(input.prepareImplementationLaunch).mock.calls[0][0]).toMatchObject({ baseBranch: "feat", dispatchId: "d-1" });
       expect(vi.mocked(input.launchImplementationRun).mock.calls[0][0].onRejected).toBeUndefined();
+    });
+
+    it.each(BACKENDS)("%s: the row carries tracker kind and issue URL", async (backend) => {
+      const { d } = compose();
+      await d.launch({ ...INPUT, backend });
+      expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({
+        trackerKind: MAPPING.ticketingProvider, issueUrl: "https://tracker.test/issue/ENG-1",
+      }));
+    });
+
+    it("fly: the row carries the launched guest size and compute start", async () => {
+      const size = { cpuKind: "shared", cpus: 4, memoryMb: 8192 };
+      const { d } = compose({
+        launchImplementationFlySession: vi.fn().mockResolvedValue({
+          machineId: "m-1", sessionImage: "img", executionMode: "fly-machines", statusComment: null, machineSize: size, computeStartedAt: 1234,
+        }) as never,
+      });
+      await d.launch({ ...INPUT, backend: "fly-machines" });
+      expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ machineSize: size, computeStartedAt: 1234 }));
     });
 
     it.each(["fly-machines", "local-docker"] as const)("%s: records the row with the machine id and nonce", async (backend) => {

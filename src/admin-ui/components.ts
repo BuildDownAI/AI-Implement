@@ -281,7 +281,7 @@ export const componentsCss = `
   margin-top: 2px;
 }
 .card-body { padding: 16px 18px; }
-.card-body.tight { padding: 0; }
+.card-body.tight { padding: 0; overflow-x: auto; }
 
 /* A card that IS the control — a real <button>, so focus and Enter/Space come with the element. */
 .card-action {

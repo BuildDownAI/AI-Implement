@@ -101,6 +101,7 @@ export type QueryNonCompletedInvocations = (
   fetchImpl: typeof fetch,
   adminBaseUrl: string,
   uri: string,
+  excludeInvocationId?: string,
 ) => Promise<number | null>;
 
 /** For testing: override the admin API base URL, the fetch implementation, and the drain check. */
@@ -193,6 +194,7 @@ export async function queryNonCompletedInvocations(
   fetchImpl: typeof fetch,
   adminBaseUrl: string,
   uri: string,
+  excludeInvocationId?: string,
 ): Promise<number | null> {
   try {
     const normalized = uri.replace(/\/+$/, "");
@@ -202,7 +204,8 @@ export async function queryNonCompletedInvocations(
     const rows = await runIntrospectionQuery(
       fetchImpl,
       adminBaseUrl,
-      "SELECT COUNT(*) AS count FROM sys_invocation WHERE status != 'completed' AND status != 'scheduled' AND (" +
+      (excludeInvocationId ? `SELECT COUNT(*) AS count FROM sys_invocation WHERE id != '${sqlQuote(excludeInvocationId)}' AND ` : "SELECT COUNT(*) AS count FROM sys_invocation WHERE ") +
+      "status != 'completed' AND status != 'scheduled' AND (" +
         `pinned_deployment_id IN ${oldDeployments} OR ` +
         `last_attempt_deployment_id IN ${oldDeployments} OR ` +
         "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +

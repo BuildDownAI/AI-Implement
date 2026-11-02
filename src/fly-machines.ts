@@ -758,6 +758,12 @@ export interface SessionMachineInput {
   protectedModelBootstrap?: ProtectedModelBootstrapInput;
 }
 
+/** The guest a built machine config requests, in the shape the job row stores. */
+export function guestSize(built: CreateMachineOpts): { cpuKind: string; cpus: number; memoryMb: number } | undefined {
+  const guest = built.config.guest;
+  return guest ? { cpuKind: guest.cpu_kind, cpus: guest.cpus, memoryMb: guest.memory_mb } : undefined;
+}
+
 export function buildSessionMachineConfig(input: SessionMachineInput): CreateMachineOpts {
   const protectedBootstrap = input.protectedModelBootstrap;
   const verifiedSecretsVersion = protectedBootstrap ? validateProtectedInput(input, protectedBootstrap) : undefined;

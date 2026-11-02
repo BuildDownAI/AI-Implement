@@ -1,6 +1,6 @@
 /**
  * Verifies the short-lived token the BuildDown control plane presents on `POST /api/tools/<name>`
- * and maps it to the read-only `service` caller (AII-1514).
+ * and maps it to the `service` caller with explicit grants (AII-1514).
  *
  * Verify-then-map, like `verifyMcpToken` (src/mcp-oauth.ts): any failure is `null` and the caller
  * answers 401. Active only when `BUILDDOWN_OIDC_ISSUER` (https) and `OAUTH_REDIRECT_BASE_URL` are
@@ -13,6 +13,7 @@ import { recordAuthEvent, type AuthEventCause } from "./mcp-auth-events.js";
 import { serviceCaller, type Caller } from "./mcp-identity.js";
 
 export const CONTROL_PLANE_SCOPE = "orchestrator:read";
+export const CONTROL_PLANE_DEPLOY_SCOPE = "orchestrator:deploy";
 const CLOCK_TOLERANCE_SECONDS = 60;
 const DISCOVERY_TIMEOUT_MS = 5000;
 
@@ -84,9 +85,9 @@ function refuse(cause: AuthEventCause, started: number): null {
   return null;
 }
 
-function hasScope(payload: JWTPayload): boolean {
+function hasScope(payload: JWTPayload, required: string): boolean {
   const scope = payload.scope;
-  return typeof scope === "string" && scope.split(" ").includes(CONTROL_PLANE_SCOPE);
+  return typeof scope === "string" && scope.split(" ").includes(required);
 }
 
 export async function verifyControlPlaneToken(authorizationHeader: string | undefined): Promise<Caller | null> {
@@ -113,8 +114,9 @@ export async function verifyControlPlaneToken(authorizationHeader: string | unde
       clockTolerance: CLOCK_TOLERANCE_SECONDS,
       requiredClaims: ["exp"],
     });
-    if (!hasScope(payload)) return refuse("invalid", started);
-    return serviceCaller();
+    const deploy = hasScope(payload, CONTROL_PLANE_DEPLOY_SCOPE);
+    if (!hasScope(payload, CONTROL_PLANE_SCOPE) && !deploy) return refuse("invalid", started);
+    return serviceCaller({ grants: deploy ? ["deploy"] : [] });
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
     return refuse(code === "ERR_JWT_EXPIRED" ? "expired" : "invalid", started);
