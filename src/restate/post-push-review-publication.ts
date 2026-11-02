@@ -10,13 +10,13 @@ const lookupSchema = z.object({
   headSha: z.string().regex(/^[a-f0-9]{40}$/),
   iteration: z.number().int().nonnegative(),
 });
-const inputSchema = z.object({
+export const reviewPublicationInputSchema = z.object({
   owner: z.string().regex(/^[\w.-]+$/), repo: z.string().regex(/^[\w.-]+$/),
   prNumber: z.number().int().positive(), headSha: z.string().regex(/^[a-f0-9]{40}$/),
   iteration: z.number().int().nonnegative(), body: z.string(),
   comments: z.array(z.object({ path: z.string().min(1).max(1024), line: z.number().int().positive(), side: z.enum(["LEFT", "RIGHT"]), body: z.string().min(1) })).max(MAX_PUBLICATION_COMMENTS),
 });
-export type PostPushReviewPublicationInput = z.infer<typeof inputSchema>;
+export type PostPushReviewPublicationInput = z.infer<typeof reviewPublicationInputSchema>;
 type Review = { id: number; html_url: string; body: string | null };
 type Comment = { id: number; path: string; line: number | null; original_line?: number | null };
 export type PostPushReviewPublicationResult = { status: "stale-head" } | {
@@ -51,7 +51,7 @@ function invalidPosition(error: unknown): boolean {
 export function createPostPushReviewPublication(deps: PostPushReviewPublicationDependencies) {
   return restate.object({ name: "PostPushReviewPublication", handlers: {
     publish: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, raw: PostPushReviewPublicationInput): Promise<PostPushReviewPublicationResult> => {
-      const parsed = inputSchema.safeParse(raw);
+      const parsed = reviewPublicationInputSchema.safeParse(raw);
       if (!parsed.success || Buffer.byteLength(JSON.stringify(raw), "utf8") > MAX_PUBLICATION_BYTES) throw new restate.TerminalError("Invalid or oversized review publication", { errorCode: 400 });
       const input = parsed.data;
       if (ctx.key !== `${input.owner}/${input.repo}#${input.prNumber}`) throw new restate.TerminalError("Publication key mismatch", { errorCode: 400 });

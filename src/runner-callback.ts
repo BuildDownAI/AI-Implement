@@ -1,3 +1,4 @@
+import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { RESTATE_INGRESS_BASE_URL } from "./restate/server.js";
 import type { createPostPushReviewPublication, PostPushReviewPublicationInput, PostPushReviewPublicationResult } from "./restate/post-push-review-publication.js";
@@ -1608,7 +1609,7 @@ export function createReviewPublicationIngressClient(
 export async function handleRunnerReviewPublication(input: {
   authorization: string | undefined;
   secret: string;
-  body: Omit<PostPushReviewPublicationInput, "owner" | "repo">;
+  body: unknown;
   ingress: ReviewPublicationIngressClient;
   restateReady: () => boolean;
 }): Promise<HandleRunnerResultOutput> {
@@ -1620,13 +1621,16 @@ export async function handleRunnerReviewPublication(input: {
   if (!repository) return bad(403, "repository_not_found");
   const [owner, repo] = repository.split("/");
   if (!owner || !repo) return bad(403, "repository_not_found");
+  const fields = reviewPublicationInputSchema.omit({ owner: true, repo: true }).safeParse(input.body);
+  if (!fields.success) return bad(400, "invalid_review_publication");
+  // Zod strips unknown fields at both levels, keeping credentials out of durable input.
+  const publication = reviewPublicationInputSchema.safeParse({ ...fields.data, owner, repo });
+  if (!publication.success || Buffer.byteLength(JSON.stringify(publication.data), "utf8") > MAX_PUBLICATION_BYTES) {
+    return bad(400, "invalid_review_publication");
+  }
   if (!input.restateReady()) return bad(503, "restate-unavailable");
   try {
-    const { prNumber, headSha, iteration, body, comments } = input.body;
-    // Construct the durable input explicitly: authentication and extra request fields stay here.
-    const result = await input.ingress.publish({ owner, repo, prNumber, headSha, iteration, body,
-      comments: comments.map(({ path, line, side, body }) => ({ path, line, side, body })),
-    });
+    const result = await input.ingress.publish(publication.data);
     return { status: 200, body: result };
   } catch {
     return bad(503, "restate-unavailable");

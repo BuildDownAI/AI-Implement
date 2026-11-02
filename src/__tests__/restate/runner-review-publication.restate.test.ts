@@ -6,7 +6,7 @@ import { getDb } from "../../dedup.js";
 import { appendLog, initLogTable } from "../../log.js";
 import { mintRunToken, verifyRunToken } from "../../runner-tokens.js";
 import { createReviewPublicationIngressClient, handleRunnerReviewPublication } from "../../runner-callback.js";
-import { createPostPushReviewPublication, type PostPushReviewPublicationInput } from "../../restate/post-push-review-publication.js";
+import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, type PostPushReviewPublicationInput } from "../../restate/post-push-review-publication.js";
 import { VARIANTS, journalEntries, journalText, queryInvocations, startVariants, stopAll, type RestateEnvironment } from "./harness.js";
 
 const secret = "review-publication-test-secret";
@@ -89,6 +89,30 @@ describe("runner review publication", () => {
       expect((await request(bearer)).status).toBe(503);
       fail = false;
       expect(await invocations()).toHaveLength(0);
+      const beforeForwarded = forwarded.length;
+      const malformed = [
+        null, [], {},
+        ...["prNumber", "headSha", "iteration", "body", "comments"].map((field) =>
+          Object.fromEntries(Object.entries(body).filter(([key]) => key !== field))),
+        ...[undefined, null, {}, "comments", [null]].map((comments) => ({ ...body, comments })),
+        ...[0, -1, 1.5, "42"].map((prNumber) => ({ ...body, prNumber })),
+        ...[null, "bad", "A".repeat(40)].map((headSha) => ({ ...body, headSha })),
+        ...[-1, 0.5, "0"].map((iteration) => ({ ...body, iteration })),
+        { ...body, body: null },
+        { ...body, body: "é".repeat(MAX_PUBLICATION_BYTES / 2) },
+        { ...body, comments: Array.from({ length: 101 }, () => body.comments[0]) },
+        ...[{ line: 0 }, { line: -1 }, { line: 1.5 }, { line: "2" },
+          { path: "" }, { path: "a".repeat(1025) }, { side: "right" }, { body: "" },
+        ].map((comment) => ({ ...body, comments: [{ ...body.comments[0], ...comment }] })),
+      ];
+      for (const invalid of malformed) {
+        const response = await request(bearer, invalid);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: "invalid_review_publication" });
+      }
+      expect(forwarded).toHaveLength(beforeForwarded);
+      expect(await invocations()).toHaveLength(0);
+      // These corrected fields use the same PR/head/iteration as the rejected requests.
       const beforePosts = posts.length;
       const data = { ...body, authorization: bearer, comments: body.comments.map((comment) => ({ ...comment, authorization: bearer })) };
       const first = await request(bearer, data);

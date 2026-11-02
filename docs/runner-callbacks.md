@@ -33,7 +33,9 @@ sequenceDiagram
 `POST /runner/review-publication` accepts `{ prNumber, headSha, iteration, body, comments }`
 with a reusable `progress` bearer. It resolves the repository from the token's dispatch
 run record, ignoring repository fields in the request; no PR URL on the run is required.
-Missing or invalid credentials return 401, and a missing run or repository returns 403.
+Invalid publication fields or a publication exceeding 48,000 UTF-8 bytes return 400 before ingress;
+HTTP bodies exceeding 49,024 bytes return 413. Missing or invalid credentials return 401,
+and a missing run or repository returns 403.
 The route calls `PostPushReviewPublication.publish` through Restate ingress with object
 key `<owner>/<repo>#<prNumber>` and idempotency key
 `<owner>/<repo>#<prNumber>:<headSha>:<iteration>`. Only publication fields enter Restate;
@@ -46,7 +48,7 @@ object's result as 200. Sidecar or registration unreadiness and ingress failures
 | Name | Audience | Minted | Carried by | Read by | Verified by | Consumed |
 |---|---|---|---|---|---|---|
 | `RUN_TOKEN` | `result` | `mintLaunchTokens` at dispatch (`src/runner-tokens.ts`) | GHA: `inputs.run_token` into the step env in `workflows/claude-implement.yml`, `claude-plan.yml`. Fly: machine env in `buildSessionMachineConfig` (`src/fly-machines.ts`). Local: container env (`src/local-docker.ts`) | `postRunnerResult` (`src/runner-result.ts`) | `POST /runner/result` with `verifyRunToken(…, "result", { consume: true })`. The kg-refresh phase verifies with `{ consume: false }` instead and hands the report to the `KgRefresh` workflow's `report` handler with the dispatch id as idempotency key | Yes, on first use; **not** for kg-refresh, which is verify-only (a duplicate is absorbed by the workflow, a conflicting body refused) |
-| `RUN_PROGRESS_TOKEN` | `progress` | `mintLaunchTokens` at dispatch, for every run kind on every backend (`LAUNCH_TOKEN_AUDIENCES`, `src/runner-tokens.ts`) | Same three carriers | `src/run-autonomous.ts`, `src/run-planning.ts`, `src/pipeline/kg-refresh-run.ts`, `src/pipeline/steps/dependency-auth.ts`, `reference-repos.ts`, `kg-tracker-data.ts` | `POST /runner/progress`, `GET /runner/planning-context`, `POST /api/runner/dependency-token`, `reference-token`, `kg-tracker-data`, all with `{ consume: false }` | No |
+| `RUN_PROGRESS_TOKEN` | `progress` | `mintLaunchTokens` at dispatch, for every run kind on every backend (`LAUNCH_TOKEN_AUDIENCES`, `src/runner-tokens.ts`) | Same three carriers | `src/run-autonomous.ts`, `src/run-planning.ts`, `src/pipeline/kg-refresh-run.ts`, `src/pipeline/steps/dependency-auth.ts`, `reference-repos.ts`, `kg-tracker-data.ts` | `POST /runner/progress`, `POST /runner/review-publication`, `GET /runner/planning-context`, `POST /api/runner/dependency-token`, `reference-token`, `kg-tracker-data`, all with `{ consume: false }` | No |
 | `RUN_PUBLICATION_TOKEN` | `publication` | `mintLaunchTokens` with a repository claim, for every run kind except planning, on every backend (`LAUNCH_TOKEN_AUDIENCES`). On GitHub Actions it is sent only when the workflow supports `run_publication_token` | Same three carriers | The push path exchanges it | `POST /api/runner/publication-token` returns a repository write credential; Legacy claims before mint, pilot verifies attempt authority and claims after mint | Yes after a successful exchange; a failed Legacy mint releases only its matching claim, while a failed pilot mint leaves the claim unused |
 | `RUNNER_CALLBACK_URL` | none, an address | Envelope `runnerCallbackUrl` or a plain env var | Same carriers | `postRunnerResult` fallback and the progress posters | none | No |
 
