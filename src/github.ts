@@ -265,7 +265,7 @@ function ghHeaders(token: string): Record<string, string> {
 
 // Unauthenticated reads (token: null) are limited to 60 req/hour per IP by GitHub.
 // Use only for public source-repo reads where no App installation covers the owner.
-function srcHeaders(token: string | null): Record<string, string> {
+export function srcHeaders(token: string | null): Record<string, string> {
   if (token === null) return { ...GH_HEADERS };
   return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
 }
