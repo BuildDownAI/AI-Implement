@@ -1,3 +1,4 @@
+import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../restate/post-push-review-publication.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -172,6 +173,69 @@ describe("postPushReviewStep", () => {
       comments: [{ path: "src/a.ts", line: 1, side: "RIGHT", body: expect.stringContaining("<!-- ai-implement review-finding:v1 -->") }] });
     expect(JSON.parse(call.body).body).toContain("Outside the diff.");
     expect(comments.join("\n")).toContain(REVIEW_LINK);
+  });
+
+  it.each(["external", "moved-head", "unreadable-head", "overflow", "oversized"])("bounds publication and preserves evidence: %s", async (scenario) => {
+    const warn = vi.spyOn(console, "warn");
+    const statusComments: string[] = [];
+    let diffRead = false;
+    const fullReport = scenario === "oversized" ? 'Evidence "\\\n😀'.repeat(9000) + "REPORT END" : "Complete reviewer evidence";
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42") {
+        if (scenario === "unreadable-head") return { stdout: "", exitCode: 1 };
+        return { stdout: JSON.stringify({ state: "open", head: { sha: diffRead ? "b".repeat(40) : PR_HEAD_SHA } }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") {
+        diffRead = true;
+        return { stdout: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new", exitCode: 0 };
+      }
+      if (scenario === "external" && args[0] === "api" && args[1] === "graphql") {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [{ id: "RT_1", isResolved: false, isOutdated: false, path: "src/a.ts", line: 1,
+            comments: { nodes: [{ body: "External finding", author: { login: "reviewer" }, url: "https://example.com/thread" }] } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } } }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") statusComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const findings = Array.from({ length: scenario === "overflow" ? MAX_PUBLICATION_COMMENTS + 1 : 1 }, (_, i) => ({
+      severity: "minor", body: `Internal finding ${i}.`, path: "src/a.ts", line: 1,
+    }));
+    if (scenario === "overflow") findings.push({ severity: "minor", body: "Unmapped evidence.", path: "other.ts", line: 2 });
+    await runReview(makeCtx(vi.fn(async () => structuredReviewResult({ approved: false, findings, summary: fullReport }))), {
+      prNumber: "42", workspaceDir, maxIterations: 1, reviewProviders: scenario === "external" ? undefined : [], ghSpawn,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
+    }, { report: vi.fn(async () => undefined) });
+    if (scenario === "unreadable-head") {
+      expect(warn).toHaveBeenCalledWith("[post-push-review] Review publication fallback: head unreadable");
+      warn.mockRestore();
+      expect(publicationFetch.calls).toHaveLength(0);
+      expect(statusComments.join("\n")).toContain(fullReport);
+      return;
+    }
+    warn.mockRestore();
+    expect(publicationFetch.calls).toHaveLength(1);
+    const serialized = publicationFetch.calls[0].body;
+    const request = JSON.parse(serialized);
+    expect(request.headSha).toBe(PR_HEAD_SHA);
+    if (scenario === "external") {
+      expect(request.comments).toHaveLength(1);
+      expect(request.comments[0].body).toContain("Internal finding");
+      expect(request.body).toContain("External finding");
+    }
+    if (scenario === "overflow") {
+      expect(request.comments).toHaveLength(MAX_PUBLICATION_COMMENTS);
+      expect(request.body.split("### Findings outside the diff")[1]).toContain("Internal finding 100.");
+      expect(request.body.split("### Findings outside the diff")[1]).toContain("Unmapped evidence.");
+    }
+    if (scenario === "oversized") {
+      expect(request.comments).toEqual([]);
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(MAX_PUBLICATION_BYTES);
+      expect(request.body).toContain("The full report is in the status comment");
+      expect(statusComments.join("\n")).toContain(fullReport);
+    }
   });
 
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {

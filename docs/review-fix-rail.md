@@ -200,9 +200,14 @@ explicitly. These reports appear in the GitHub review and are saved in each
 reviewer step's outputs. The runner sends each report with its reviewed head SHA and iteration to the authenticated
 `POST <callbackUrl>/runner/review-publication` route using the progress token.
 The `PostPushReviewPublication` Restate object posts the GitHub COMMENT review
-with inline comments mapped to lines in that pass’s diff. Each inline finding
+with only `ai-implement-internal` findings eligible for inline comments mapped
+to lines in that pass’s diff; external findings remain in the review body. Each inline finding
 carries `<!-- ai-implement review-finding:v1 -->`; findings outside the diff
-are appended to the review body. The runner does not post GitHub reviews directly.
+are appended to the review body. At most 100 inline comments are sent; excess
+comments join “Findings outside the diff” in the body. If the serialized UTF-8
+request still exceeds 48,000 bytes, the runner sends no inline comments and
+shortens the body to fit, with a note pointing to the full report retained in
+the status comment. The runner does not post GitHub reviews directly.
 The final status comment links to the returned review URL instead
 of repeating the checklist. If review publication fails or returns no usable
 link (including a stale head, HTTP error, network failure, or absent callback
