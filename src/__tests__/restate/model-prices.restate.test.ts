@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { fakeFetch, type Reply, type FakeFetch } from "../helpers/fake-fetch.js";
@@ -7,8 +8,15 @@ import {
   queryInvocations, cancelInvocation, setObjectState, startVariants, stopAll, type RestateEnvironment,
 } from "./harness.js";
 
-// These cases need no fabricated producer responses. Recorded success/503 cases
-// must be added when authentic Control-Plane recordings become available.
+const recordings = Object.fromEntries(["several-models", "empty", "unavailable"].map(name => [
+  name, JSON.parse(readFileSync(new URL(`../fixtures/contracts/model-prices/${name}.json`, import.meta.url), "utf8")) as {
+    response: { status: number; body: { prices?: ModelPricesCurrent["prices"]; error?: string } };
+  },
+]));
+function recordedReply(name: string): Reply {
+  const { status, body } = recordings[name]!.response;
+  return { status, json: body };
+}
 describe("ModelPrices configuration and failure scheduling", () => {
   let environments: Map<string, RestateEnvironment>;
   let issuer: string | undefined;
@@ -55,7 +63,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
 
       for (const [name, response, code] of [
         ["network", () => { throw new Error(SENTINEL); }, "network"],
-        ["HTTP", { status: 503, text: SENTINEL }, "http"],
+        ["HTTP", recordedReply("unavailable"), "http"],
         ["JSON", { text: SENTINEL }, "invalid-body"],
         ["schema", { json: { prices: SENTINEL } }, "invalid-body"],
       ] as const) {
@@ -79,6 +87,28 @@ describe("ModelPrices configuration and failure scheduling", () => {
           expect(JSON.stringify(await state.json())).not.toContain(SENTINEL);
         });
       }
+
+      it("replays producer success, unavailability, recovery, and empty prices", async () => {
+        issuer = "https://auth.example";
+        const key = randomUUID();
+        reply = recordedReply("several-models");
+        await refresh(key, { reason: "requested" });
+        const successful = await current(key);
+        expect(successful).toEqual({
+          prices: recordings["several-models"]!.response.body.prices,
+          fetchedAt: expect.any(Number), lastError: null,
+        });
+        reply = recordedReply("unavailable");
+        await refresh(key, { reason: "requested" });
+        expect(await current(key)).toEqual({ ...successful, lastError: "http" });
+        reply = recordedReply("several-models");
+        await refresh(key, { reason: "requested" });
+        expect(await current(key)).toEqual({ ...successful, fetchedAt: expect.any(Number) });
+        reply = recordedReply("empty");
+        await refresh(key, { reason: "requested" });
+        expect(await current(key)).toEqual({ prices: [], fetchedAt: expect.any(Number), lastError: null });
+        expect(endpoint.calls).toHaveLength(4);
+      });
 
       it("delivers a delayed refresh after a failed read", async () => {
         issuer = "https://auth.example";

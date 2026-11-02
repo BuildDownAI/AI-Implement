@@ -648,12 +648,12 @@ The Restate tests run both replay variants, check fixed failure codes and journa
 sanitization, and inject a short interval to exercise actual delayed retry delivery.
 The production interval remains six hours.
 
-Contract synchronization (pending producer repository access for AII-1654): pin
-a Control-Plane commit, then copy `docs/contracts/model-prices/several-models.json`,
-`empty.json`, `unavailable.json`, and `response.schema.json` byte for byte into
-`src/__tests__/fixtures/contracts/model-prices/`. Record that commit and each
-file's SHA-256 in `contracts.lock.json`; never edit the copied files. Replay the
-producer exchanges in both Restate harness variants and verify hashes in a unit
-test. The current wire-shape validator is provisional until checked against the
-producer schema; these producer copies and replay/integrity tests remain required
-before AII-1654 is complete.
+Contract synchronization uses a hand copy from the pinned Control-Plane commit
+`545a6c4`, because the runner cannot read the private `BuildDownAI/Control-Plane`
+repository. Copy `docs/contracts/model-prices/several-models.json`, `empty.json`,
+`unavailable.json`, and `response.schema.json` byte for byte into
+`src/__tests__/fixtures/contracts/model-prices/`. Verify the supplied SHA-256 hashes
+before writing the copies, and record the commit and hashes in `contracts.lock.json`.
+Never edit the copied files. The contract test checks all four hashes and validates
+recorded successful bodies against both the producer schema and the consumer
+validator. Both Restate harness variants replay the producer exchanges.

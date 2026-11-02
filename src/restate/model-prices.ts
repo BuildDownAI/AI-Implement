@@ -8,19 +8,18 @@ import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 export const MODEL_PRICES_REFRESH_INTERVAL_MS = 6 * 60 * 60_000;
 const STATE_KEY = "state";
 
-// The documented wire shape. Producer-schema parity must be verified against the
-// authentic Control-Plane schema before this issue is complete.
+// Matches the pinned Control-Plane response.schema.json; contract tests check parity.
 const rate = z.string().regex(/^\d+(?:\.\d+)?$/);
 const priceSchema = z.object({
   model: z.string(),
   version: z.string(),
-  effectiveFrom: z.string().nullable(),
+  effectiveFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/).nullable(),
   inputUsd: rate,
   outputUsd: rate,
   cacheReadUsd: rate,
   cacheWriteUsd: rate,
 }).strict();
-const responseSchema = z.object({ prices: z.array(priceSchema) }).strict();
+export const modelPricesResponseSchema = z.object({ prices: z.array(priceSchema) }).strict();
 export type ModelPrice = z.infer<typeof priceSchema>;
 export type ModelPricesError = "not-configured" | "network" | "http" | "invalid-body";
 export interface ModelPricesCurrent {
@@ -70,7 +69,7 @@ export function createModelPrices(deps: ModelPricesDeps) {
         });
         if (!response.ok) return { error: "http" };
         try {
-          const parsed = responseSchema.safeParse(await response.json());
+          const parsed = modelPricesResponseSchema.safeParse(await response.json());
           return parsed.success ? { prices: parsed.data.prices, error: null } : { error: "invalid-body" };
         } catch { return { error: "invalid-body" }; }
       } catch { return { error: "network" }; }
