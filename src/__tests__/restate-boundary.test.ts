@@ -17,22 +17,13 @@ function gitGrepFiles(pattern: string, paths: string[]): string[] {
   }
 }
 
-// AII-1655 explicitly shares the publication limits with the runner. Permit only
-// the two constants; all other Restate imports remain subject to the boundary.
-function withoutPublicationLimits(content: string): string {
-  return content.replace(
-    /^import \{ MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS \} from "\.\.\/\.\.\/restate\/post-push-review-publication\.js";$/m,
-    "",
-  );
-}
-
 describe("dependency direction: the main pipeline never reaches into Restate (AII-687)", () => {
   it("no file under src/pipeline/, workflows/, or src/github.ts imports @restatedev/* or src/restate/", () => {
     // Matches "restate/" rather than "src/restate/" literally: a relative import from
     // src/pipeline/ (e.g. "../restate/tools.js") never spells the "src/" prefix, so the
     // literal string from the issue's operator-run command would miss a real violation.
     const hits = gitGrepFiles("@restatedev\\|restate/", ["src/pipeline/", "workflows/", "src/github.ts"]);
-    expect(hits.filter((file) => /@restatedev|restate\//.test(withoutPublicationLimits(readFileSync(file, "utf8"))))).toEqual([]);
+    expect(hits).toEqual([]);
   });
 });
 
@@ -92,7 +83,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
     for (const file of allTsFiles) {
       if (file.startsWith("src/restate/")) continue;
       const content = readFileSync(file, "utf8");
-      const restateImports = extractImportSpecifiers(withoutPublicationLimits(content)).filter((i) => isRestateSpecifier(i.source));
+      const restateImports = extractImportSpecifiers(content).filter((i) => isRestateSpecifier(i.source));
       if (restateImports.length === 0) continue;
       if (!ALLOWLIST.has(file)) violations.push(file);
     }

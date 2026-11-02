@@ -1,4 +1,4 @@
-import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../restate/post-push-review-publication.js";
+import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../pipeline/review-publication-limits.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -175,14 +175,14 @@ describe("postPushReviewStep", () => {
     expect(comments.join("\n")).toContain(REVIEW_LINK);
   });
 
-  it.each(["external", "moved-head", "unreadable-head", "overflow", "oversized"])("bounds publication and preserves evidence: %s", async (scenario) => {
+  it.each(["external", "moved-head", "unreadable-head", "unreadable-head-oversized", "overflow", "oversized"])("bounds publication and preserves evidence: %s", async (scenario) => {
     const warn = vi.spyOn(console, "warn");
     const statusComments: string[] = [];
     let diffRead = false;
-    const fullReport = scenario === "oversized" ? 'Evidence "\\\n😀'.repeat(9000) + "REPORT END" : "Complete reviewer evidence";
+    const fullReport = scenario.endsWith("oversized") ? 'Evidence "\\\n😀'.repeat(9000) + "REPORT END" : "Complete reviewer evidence";
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42") {
-        if (scenario === "unreadable-head") return { stdout: "", exitCode: 1 };
+        if (scenario.startsWith("unreadable-head")) return { stdout: "", exitCode: 1 };
         return { stdout: JSON.stringify({ state: "open", head: { sha: diffRead ? "b".repeat(40) : PR_HEAD_SHA } }), exitCode: 0 };
       }
       if (args[0] === "pr" && args[1] === "diff") {
@@ -196,7 +196,11 @@ describe("postPushReviewStep", () => {
           pageInfo: { hasNextPage: false, endCursor: null },
         } } } } }), exitCode: 0 };
       }
-      if (args[0] === "pr" && args[1] === "comment") statusComments.push(args[args.indexOf("--body") + 1]);
+      if (args[0] === "pr" && args[1] === "comment") {
+        const body = args[args.indexOf("--body") + 1];
+        if (body.length > 65_536) return { stdout: "", stderr: "body too long", exitCode: 1 };
+        statusComments.push(body);
+      }
       return { stdout: "", exitCode: 0 };
     });
     const findings = Array.from({ length: scenario === "overflow" ? MAX_PUBLICATION_COMMENTS + 1 : 1 }, (_, i) => ({
@@ -208,11 +212,11 @@ describe("postPushReviewStep", () => {
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
     }, { report: vi.fn(async () => undefined) });
-    if (scenario === "unreadable-head") {
+    if (scenario.startsWith("unreadable-head")) {
       expect(warn).toHaveBeenCalledWith("[post-push-review] Review publication fallback: head unreadable");
       warn.mockRestore();
       expect(publicationFetch.calls).toHaveLength(0);
-      expect(statusComments.join("\n")).toContain(fullReport);
+      expect(statusComments.map((body) => body.replace(/^<!--[^\n]*continuation:\d+ -->\n/, "")).join("")).toContain(fullReport);
       return;
     }
     warn.mockRestore();
@@ -228,13 +232,16 @@ describe("postPushReviewStep", () => {
     if (scenario === "overflow") {
       expect(request.comments).toHaveLength(MAX_PUBLICATION_COMMENTS);
       expect(request.body.split("### Findings outside the diff")[1]).toContain("Internal finding 100.");
+      expect(request.body).toContain("inline comment limit exceeded");
       expect(request.body.split("### Findings outside the diff")[1]).toContain("Unmapped evidence.");
     }
     if (scenario === "oversized") {
       expect(request.comments).toEqual([]);
+      expect(statusComments.length).toBeGreaterThan(1);
+      expect(statusComments.every((body) => body.length <= 65_536)).toBe(true);
       expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(MAX_PUBLICATION_BYTES);
       expect(request.body).toContain("The full report is in the status comment");
-      expect(statusComments.join("\n")).toContain(fullReport);
+      expect(statusComments.map((body) => body.replace(/^<!--[^\n]*continuation:\d+ -->\n/, "")).join("")).toContain(fullReport);
     }
   });
 

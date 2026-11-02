@@ -1,4 +1,4 @@
-import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../../restate/post-push-review-publication.js";
+import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../review-publication-limits.js";
 import { buildInlineReviewComments, inlineCommentBody } from "../review-inline-comments.js";
 import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
@@ -1090,6 +1090,22 @@ function assertPrWritable(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
 
 function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
   assertPrWritable(ghSpawn, prNumber);
+  // Leave room for continuation markers, and never split a UTF-16 surrogate pair.
+  const chunkSize = 65_000;
+  if (body.length > 65_536) {
+    let offset = 0;
+    let part = 0;
+    while (offset < body.length) {
+      let end = Math.min(offset + chunkSize, body.length);
+      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1])) end--;
+      const partMarker = marker && part > 0 ? marker.replace("-->", `continuation:${part} -->`) : marker;
+      const prefix = part > 0 && partMarker ? `${partMarker}\n` : "";
+      postPrComment(ghSpawn, prNumber, prefix + body.slice(offset, end), partMarker);
+      offset = end;
+      part++;
+    }
+    return;
+  }
   if (marker) {
     const list = ghSpawn([
       "api",
@@ -1145,7 +1161,7 @@ async function submitPrReview(
   const overflow = publication.inline.comments.slice(MAX_PUBLICATION_COMMENTS);
   const outside = [
     ...publication.inline.unmapped.map(inlineCommentBody),
-    ...overflow.map((comment) => `### ${comment.path}:${comment.line} (${comment.side})\n\n${comment.body}`),
+    ...overflow.map((comment) => `### ${comment.path}:${comment.line} (${comment.side}; inline comment limit exceeded)\n\n${comment.body}`),
   ];
   const request = {
     owner: publication.owner, repo: publication.repo, prNumber: Number(prNumber),

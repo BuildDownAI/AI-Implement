@@ -1454,16 +1454,11 @@ describe("feedback-loop core isolation (AII-626)", () => {
       return entry.name.endsWith(".ts") ? [path] : [];
     });
 
-  it("pipeline imports no Restate code except the shared publication limits", () => {
+  it("pipeline imports no Restate code", () => {
     const importRe = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g;
     const offenders: string[] = [];
     for (const file of sources(pipelineDir)) {
-      // The runner shares the publication wire limits with the callback validator (AII-1655).
-      // Permit only this exact constants import, keeping all other Restate dependencies forbidden.
-      const source = readFileSync(file, "utf-8").replace(
-        /^import \{ MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS \} from "\.\.\/\.\.\/restate\/post-push-review-publication\.js";$/m,
-        "",
-      );
+      const source = readFileSync(file, "utf-8");
       for (const match of source.matchAll(importRe)) {
         if (match[1].startsWith("@restatedev/") || /(^|\/)restate\//.test(match[1])) offenders.push(`${file}: ${match[1]}`);
       }

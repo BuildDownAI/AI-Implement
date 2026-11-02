@@ -204,10 +204,12 @@ with only `ai-implement-internal` findings eligible for inline comments mapped
 to lines in that pass’s diff; external findings remain in the review body. Each inline finding
 carries `<!-- ai-implement review-finding:v1 -->`; findings outside the diff
 are appended to the review body. At most 100 inline comments are sent; excess
-comments join “Findings outside the diff” in the body. If the serialized UTF-8
+comments join “Findings outside the diff” in the body, labeled as exceeding
+the inline comment limit. If the serialized UTF-8
 request still exceeds 48,000 bytes, the runner sends no inline comments and
 shortens the body to fit, with a note pointing to the full report retained in
-the status comment. The runner does not post GitHub reviews directly.
+the status comment, split into ordered comments of at most 65,536 characters
+when needed. The runner does not post GitHub reviews directly.
 The final status comment links to the returned review URL instead
 of repeating the checklist. If review publication fails or returns no usable
 link (including a stale head, HTTP error, network failure, or absent callback
