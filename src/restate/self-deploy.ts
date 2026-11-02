@@ -54,7 +54,7 @@ export interface SelfDeployDeps {
   setHold(held: boolean): Promise<void>;
   /** Read this process's AI_IMPLEMENT_SOURCE_COMMIT inside the verify effect. */
   sourceCommit(): string | undefined;
-  onOutcome(record: SelfDeployRecord): Promise<void>;
+  onOutcome(record: SelfDeployRecord, detail?: string): Promise<void>;
   limits?: { drainTimeoutMs?: number; drainPollMs?: number; verifyInitialMs?: number; verifyPollMs?: number; flyctlTimeoutMs?: number };
 }
 export interface SelfDeployOptions { applyFlyToml: boolean }
@@ -99,11 +99,11 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   function current(ctx: restate.ObjectContext, record: SelfDeployRecord | null, phase: SelfDeployPhase): record is SelfDeployRecord {
     return record?.phase === phase && ctx.request().headers.get("self-deploy-id") === record.deployId;
   }
-  async function finish(ctx: restate.ObjectContext, record: SelfDeployRecord, phase: "succeeded" | "failed" | "cancelled", reason: SelfDeployRecord["reason"] = null) {
+  async function finish(ctx: restate.ObjectContext, record: SelfDeployRecord, phase: "succeeded" | "failed" | "cancelled", reason: SelfDeployRecord["reason"] = null, detail?: string) {
     const next = { ...record, phase, reason, finishedAt: await ctx.date.now() };
     write(ctx, next);
     await ctx.run("clear hold", () => deps.setHold(false));
-    await ctx.run("record outcome", () => deps.onOutcome(next));
+    await ctx.run("record outcome", () => deps.onOutcome(next, detail));
   }
   async function start(ctx: restate.ObjectContext, input: z.infer<typeof startSchema>): Promise<SelfDeployStartResult> {
     const existing = await read(ctx);
@@ -164,37 +164,68 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
     });
     // Outside the retried effect so a partially applied multi-machine update logs this only once.
     if (policy === "refused") ctx.console.warn("[self-deploy] apply fly.toml refused: control plane owns machine config");
-    let accepted: boolean;
+    // Keep old boolean journal results readable. New failures journal only sanitized detail.
+    let result: boolean | { detail: string };
     try {
-      accepted = await ctx.run("apply image", async () => {
+      result = await ctx.run<boolean | { detail: string }>("apply image", async () => {
         const config = deps.config();
         const token = config.flyDeployToken!;
-        try {
-          // Reread inside the same retried effect: an accepted update may have killed this process.
-          const machines = await deps.fly.listMachines(token, ctx.key);
-          const fresh = await Promise.all(machines.map(m => deps.fly.getMachine(token, ctx.key, m.id)));
-          if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
-          if (record.target.source === "built") {
-            const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: record.target.repo, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken: await deps.kgToken() });
-            await flyctl(record, [...args, "--build-only", "--push", "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
+        const secrets = [token];
+        let built = false;
+        for (let attempt = 0; ; attempt++) {
+          let operation = "listMachines";
+          try {
+            // An accepted update may have killed this process. Always reread machine config.
+            const machines = await deps.fly.listMachines(token, ctx.key);
+            operation = "getMachine";
+            const fresh = [];
+            for (const machine of machines) fresh.push(await deps.fly.getMachine(token, ctx.key, machine.id));
+            if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
+            if (record.target.source === "built" && !built) {
+              operation = "build";
+              const kgToken = await deps.kgToken();
+              secrets.push(kgToken);
+              const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: record.target.repo, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken });
+              await flyctl(record, [...args, "--build-only", "--push", "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
+              built = true;
+            }
+            if (policy === "toml") {
+              operation = "flyctl deploy";
+              await flyctl(record, ["deploy", "--image", record.target.image, "--detach", "--app", ctx.key], token);
+            } else for (const machine of fresh) {
+              operation = "updateMachine";
+              if (machine.config.image !== record.target.image) await deps.fly.updateMachine(token, ctx.key, machine.id, { ...machine.config, image: record.target.image });
+            }
+            return true;
+          } catch (error) {
+            const raw = error instanceof Error ? error.message : "Unknown error";
+            const status = (error as { status?: number } | null)?.status ?? (Number(raw.match(/(?:\(|\bHTTP\s+)([45]\d\d)\b/i)?.[1]) || undefined);
+            // Keep flyctl diagnostics, but drop command/argv suffixes (including build secrets).
+            let message = raw.replace(/(?:\bcommand\b|\bargv\b|(?<![\w/])flyctl\b(?! (?:exited\b|failed to start:|download failed:|timed out\b|deadline exceeded\b|digest mismatch:))|--)[\s\S]*/i, "[command redacted]")
+              // Remove queries on relative paths as well as absolute URLs.
+              .replace(/(?:https?:\/\/|\/)[^\s"'<>]*\?[^\s"'<>]*/gi, "[URL redacted]")
+              .replace(/["']?[\w-]*(?:token|authorization|password|secret)[\w-]*["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,}]+)/gi, "[credential redacted]")
+              .replace(/https?:\/\/[^\s]+/gi, "[URL redacted]")
+              .replace(/(?:bearer\s+|(?:token|authorization|password|secret)[\w-]*[\s=:]+)\S+/gi, "[credential redacted]");
+            for (const secret of secrets) if (secret) message = message.split(secret).join("[redacted]");
+            message = message.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 200);
+            const detail = `${operation} HTTP ${status ?? "unknown"} ${message}`;
+            ctx.console.warn(`[self-deploy] ${record.deployId} apply error ${detail}`);
+            const machinesApi = ["listMachines", "getMachine", "updateMachine"].includes(operation);
+            const fixed = status !== undefined && status >= 400 && status < 500
+              && !(machinesApi && (status === 409 || status === 429));
+            if (fixed || attempt === 2) return { detail };
+            await new Promise(resolve => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1_000)));
           }
-          if (policy === "toml") await flyctl(record, ["deploy", "--image", record.target.image, "--detach", "--app", ctx.key], token);
-          else for (const machine of fresh) {
-            if (machine.config.image !== record.target.image) await deps.fly.updateMachine(token, ctx.key, machine.id, { ...machine.config, image: record.target.image });
-          }
-          return true;
-        } catch (error) {
-          const status = (error as { status?: number }).status;
-          if ((status && status >= 400 && status < 500) || (error instanceof Error && /\(4\d\d\)/.test(error.message))) return false;
-          throw error;
         }
       }, { maxRetryAttempts: 3, initialRetryInterval: 100, maxRetryInterval: 1_000 });
     } catch (error) {
-      // A bounded run journals exhaustion as TerminalError. Never swallow replay suspension.
+      // Older apply effects journaled retry exhaustion as TerminalError. Replay must
+      // still finish and release the hold; suspension and other errors must escape.
       if (!(error instanceof restate.TerminalError)) throw error;
-      accepted = false;
+      result = false;
     }
-    if (!accepted) await finish(ctx, record, "failed", "apply-failed");
+    if (result !== true) await finish(ctx, record, "failed", "apply-failed", typeof result === "object" ? result.detail : undefined);
     else write(ctx, { ...record, phase: "verifying" });
   }
   async function verify(ctx: restate.ObjectContext, input: { attempt: number }) {
