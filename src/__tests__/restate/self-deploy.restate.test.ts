@@ -182,6 +182,15 @@ describe("SelfDeploy durable phase machine", () => {
     expect((await read(env))?.target).toEqual({ repo: "fork-owner/AI-Implement", branch, commit, image, source: "published" });
     await call(env, "cancel", { requestedBy: "owner" });
   });
+  it("reads successful public image publication without an Authorization header", async () => {
+    const mint = vi.spyOn(githubAuth, "mintSourceTokenOrJwt").mockResolvedValue({ token: null, authMode: "public" });
+    const github = fakeFetch({ "GET /repos/owner/repo/commits/abcdef0123456789/statuses": { json: [{ context: "orchestrator-image/published", state: "success" }] } }).install();
+    try {
+      expect(await githubImagePublished("app", "key", { owner: "owner", repo: "repo" }, "abcdef0123456789")).toBe(true);
+      expect(github.calls).toHaveLength(1);
+      expect(github.calls[0].headers.has("authorization")).toBe(false);
+    } finally { mint.mockRestore(); }
+  });
   it.each(VARIANTS)("refuses success in an unrelated status context without hold or Fly (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
     const previous = await read(env);

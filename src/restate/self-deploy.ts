@@ -10,8 +10,8 @@ import type { Machine, MachineConfig } from "../fly-machines.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 import { RestateDrainCoordinator, type RestateDrainProbes } from "./drain.js";
 
-import { githubAppHeaders, mintSourceTokenOrJwt } from "../github-app-auth.js";
-import { defaultFetchSignal } from "../github.js";
+import { mintSourceTokenOrJwt } from "../github-app-auth.js";
+import { defaultFetchSignal, srcHeaders } from "../github.js";
 
 const INGRESS_TIMEOUT_MS = 15_000;
 
@@ -258,10 +258,9 @@ export async function githubImagePublished(appId: string, privateKey: string, ta
   const { token } = await mintSourceTokenOrJwt(appId, privateKey, target.owner, {
     permissions: { statuses: "read" }, repositories: [target.repo],
   });
-  if (!token) return false;
   for (let page = 1; ; page++) {
     const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/commits/${encodeURIComponent(commit)}/statuses?per_page=100&page=${page}`, {
-      headers: githubAppHeaders(token), signal: defaultFetchSignal(),
+      headers: srcHeaders(token), signal: defaultFetchSignal(),
     });
     if (!response.ok) {
       if (response.status === 404) return false;

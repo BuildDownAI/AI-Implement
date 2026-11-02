@@ -227,14 +227,14 @@ describe("self-deploy drain exclusion", () => {
     expect(fetchSpy.mock.calls[1][0]).toContain("page=2");
   });
 
-  it("requires an installation token and propagates permission failures", async () => {
+  it("reads public statuses and propagates permission failures", async () => {
     const auth = await import("../github-app-auth.js");
     const mint = vi.spyOn(auth, "mintSourceTokenOrJwt").mockResolvedValue({ token: null, authMode: "public" });
     const { githubImagePublished } = await import("../restate/self-deploy.js");
-    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json([{ context: "orchestrator-image/published", state: "success" }]));
     const check = () => githubImagePublished("app", "key", { owner: "watched", repo: "source" }, "full-commit");
-    expect(await check()).toBe(false);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await check()).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledOnce();
     mint.mockRejectedValueOnce(Object.assign(new Error("forbidden"), { status: 403 }));
     await expect(check()).rejects.toMatchObject({ status: 403 });
     mint.mockResolvedValue({ token: "installation-token", authMode: "installation" });
