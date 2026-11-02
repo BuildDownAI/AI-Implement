@@ -52,7 +52,7 @@ its webhook must point at the orchestrator's `/api/github/webhook` with the
 
 ## Deploy paths
 
-Every path below ships the orchestrator **and** the knowledge graph as one image: a data refresh is a code deploy, and a code deploy re-materializes the graph from the KG repository's default branch. [kg-architecture.md](kg-architecture.md#the-monolith) covers what that couples.
+Deployments with `KG_SOURCE_REPO` ship the orchestrator **and** the knowledge graph as one image: a data refresh is a code deploy, and a code deploy re-materializes the graph from the KG repository's default branch. Shared published images omit the knowledge graph. [kg-architecture.md](kg-architecture.md#the-monolith) covers what that couples.
 
 Three ways an orchestrator gets deployed, in descending order of how often they are actually used.
 
@@ -87,7 +87,18 @@ curl -X POST https://<app-name>.fly.dev/api/deploy -H "Authorization: Bearer <se
 
 **The image rule.** Without `KG_SOURCE_REPO` the deploy applies the published image `registry.fly.io/<FLY_IMAGE_APP or builddown-orchestrator-image>:<branch>-<sha7>`, and refuses with `image-not-published` unless the latest GitHub commit status with context `orchestrator-image/published` is `success`. Whoever publishes the image — the [AII-1602](https://linear.app/eudoxus/issue/AII-1602/publish-an-orchestrator-image-for-each-push-to-testing-and-main-and) workflow or the manual `bd-image-push` script — must set this status on the commit after pushing the image. The check uses a repository-scoped GitHub App installation token with `statuses: read`; tenants need no access to the shared registry. A 401/403 refuses deployment and logs `[self-deploy] image check unauthorized HTTP <status>`. With `KG_SOURCE_REPO` set it builds `registry.fly.io/<app>:deploy-<sha7>` from the source tarball with the KG build secret, then applies that.
 
-**Publisher prerequisite.** Before relying on this path for a target commit, verify that its image publisher has pushed the image and set `orchestrator-image/published` to `success`. The repository’s current `orchestrator-image.yml` is a pull-request build/boot gate; it does not publish images or set this status. Publisher implementation is tracked separately in AII-1602. Until a publisher sets the status, even an existing registry image is refused with `image-not-published`.
+**Publishing shared images.** `.github/workflows/publish-orchestrator-image.yml` builds and pushes on every push to `testing` and `main`, including docs-only changes. Manual `workflow_dispatch` selects one of those branches and publishes its current head, independently of the workflow ref. The tag is `<branch>-<sha7>` (for example, `registry.fly.io/builddown-orchestrator-image:testing-abcdef0`). Checkout, tag, full `SOURCE_COMMIT`, `SOURCE_REPO` and `SOURCE_BRANCH` stamps, publication status and notification all describe the same commit. No `KG_SOURCE_REPO` is passed: this shared image has no knowledge graph. The job summary shows the image reference. The existing `orchestrator-image.yml` remains the PR build/boot gate.
+
+Configure these repository Actions secrets:
+
+- `FLY_IMAGE_PUSH_TOKEN` (required): a Fly deploy token scoped only to `builddown-orchestrator-image`. Missing credentials fail with an explicit error. The installed token `gha-publish-orchestrator-image` expires 2027-11-02; rotate it before expiry.
+- `CONTROL_PLANE_OPS_TOKEN` (optional): a control plane ops token with `orchestrator:update` scope. When absent, notification is skipped. Set it when CON-81 deploys.
+
+After a successful push, the workflow uses `GITHUB_TOKEN` with `statuses: write` to set `orchestrator-image/published` to `success` on the published commit, with the image reference as its description. Build/push failure sets no status and sends no notification. Runs are serialized per branch and newer runs cancel older builds; post-push bookkeeping uses `always()` so cancellation after a successful push still records the publication and notifies the control plane.
+
+The final step, when the ops secret is present, sends `POST https://auth.builddown.ai/api/ops/auto-update` with bearer authorization and `{ "branch": "<branch>", "commit": "<full sha>", "image": "<image reference>" }`. It prints the HTTP status and response body and records the status in the job summary. A 404 warns while the route is unavailable; other non-2xx responses and transport errors fail the step. Notification failure leaves the image and successful publication status in place.
+
+To verify a published image operationally, run `fly machine update <machine> -a <scratch-app> --image <image reference>` and check `GET /` for healthy boot. The current health response does not expose the source commit; inspect `AI_IMPLEMENT_SOURCE_COMMIT` inside the machine to verify the build stamp.
 
 **Outcome.** The object's terminal record is written to `deploy_last_outcome` and announced on the notice webhook (failures and cancellations; a success is announced by the new process's boot notice). `succeeded` is `deployed-ok`, `failed` is `deploy-failed` and `cancelled` is `deploy-cancelled`, the latter two with the reason code in `detail`. `/admin#deployments`, `get_deploy_posture` (`lastOutcome`) and `GET /api/deployment-status` (`lastDeployOutcome`, plus `selfDeploy` and `applyFlyTomlAllowed`) read it. Log lines read `[self-deploy] <deployId> <phase> <reason>`; the `draining` line includes the target repository after the phase. Boot no longer guesses an outcome, so the old `deployed-not-serving` signal (sidecar missing or failing its probe) is no longer written; sidecar health is reported by `GET /` and `get_kg_status`.
 

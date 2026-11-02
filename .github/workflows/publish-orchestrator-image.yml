@@ -1,0 +1,119 @@
+name: Publish orchestrator image
+
+on:
+  push:
+    branches: [testing, main]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to publish (its current head)
+        type: choice
+        required: true
+        default: testing
+        options: [testing, main]
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: publish-orchestrator-image-${{ inputs.branch || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_BRANCH: ${{ inputs.branch || github.ref_name }}
+      CONTROL_PLANE_OPS_TOKEN: ${{ secrets.CONTROL_PLANE_OPS_TOKEN }}
+    steps:
+      - name: Require Fly image push token
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_IMAGE_PUSH_TOKEN }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo '::error::FLY_IMAGE_PUSH_TOKEN is required: configure a deploy token scoped to builddown-orchestrator-image.'
+            exit 1
+          fi
+          case "$SOURCE_BRANCH" in
+            testing|main) ;;
+            *) echo '::error::Only testing and main can be published.'; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          # Pushes publish the event commit; dispatch resolves the selected head once.
+          ref: ${{ github.event_name == 'push' && github.sha || inputs.branch }}
+          persist-credentials: false
+
+      - name: Resolve image metadata
+        id: meta
+        run: |
+          commit=$(git rev-parse HEAD)
+          tag="${SOURCE_BRANCH}-${commit:0:7}"
+          {
+            echo "commit=$commit"
+            echo "tag=$tag"
+            echo "image=registry.fly.io/builddown-orchestrator-image:$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Build and push shared image
+        id: push
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_IMAGE_PUSH_TOKEN }}
+          SOURCE_COMMIT: ${{ steps.meta.outputs.commit }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          flyctl deploy --build-only --push --remote-only --no-cache \
+            --image-label "$IMAGE_TAG" -a builddown-orchestrator-image \
+            --build-arg "SOURCE_COMMIT=$SOURCE_COMMIT" \
+            --build-arg "SOURCE_REPO=$GITHUB_REPOSITORY" \
+            --build-arg "SOURCE_BRANCH=$SOURCE_BRANCH"
+
+      - name: Record published image
+        # always() lets publication bookkeeping finish when a newer run cancels us.
+        if: ${{ always() && steps.push.outcome == 'success' }}
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ steps.meta.outputs.commit }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          echo "Published image: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$SOURCE_COMMIT" \
+            -f state=success \
+            -f context=orchestrator-image/published \
+            -f "description=$IMAGE" \
+            -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Notify control plane
+        if: ${{ always() && steps.published.outcome == 'success' && env.CONTROL_PLANE_OPS_TOKEN != '' }}
+        env:
+          SOURCE_COMMIT: ${{ steps.meta.outputs.commit }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          body=$(jq -n --arg branch "$SOURCE_BRANCH" --arg commit "$SOURCE_COMMIT" \
+            --arg image "$IMAGE" '{branch: $branch, commit: $commit, image: $image}')
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
+          if ! status=$(curl --silent --show-error --connect-timeout 15 --max-time 120 \
+            --output "$response_file" --write-out '%{http_code}' \
+            --request POST https://auth.builddown.ai/api/ops/auto-update \
+            --header "Authorization: Bearer $CONTROL_PLANE_OPS_TOKEN" \
+            --header 'Content-Type: application/json' --data "$body"); then
+            echo "Control plane HTTP status: ${status:-000}"
+            cat "$response_file"
+            echo '::error::Control plane notification transport failed; the image remains published.'
+            exit 1
+          fi
+          echo "Control plane HTTP status: $status"
+          cat "$response_file"
+          echo
+          echo "Control plane auto-update: HTTP $status" >> "$GITHUB_STEP_SUMMARY"
+          case "$status" in
+            2??) ;;
+            404) echo '::warning::Control plane auto-update route is not deployed yet; the image remains published.' ;;
+            *) echo "::error::Control plane auto-update failed with HTTP $status; the image remains published."; exit 1 ;;
+          esac
