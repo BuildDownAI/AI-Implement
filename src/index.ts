@@ -178,6 +178,7 @@ import { checkKgSidecarHealth } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
+import { createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
@@ -5246,6 +5247,7 @@ async function main(): Promise<void> {
     remediateStuckJob,
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
   }).services;
+  const postPushReviewPublication = createPostPushReviewPublication(createProductionPostPushReviewPublicationDependencies(config));
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
   const trackerExportServices = createProductionTrackerExportServices().services;
   const selfDeployServices = [selfDeployRecovery, createSelfDeploy({
@@ -5282,7 +5284,7 @@ async function main(): Promise<void> {
     () => getRunnerBackendSource(),
   );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: () => onRestateRegistered({
       sweep: () => sweepOnRegistered(config),
