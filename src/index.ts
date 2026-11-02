@@ -96,7 +96,7 @@ import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, seedRunnerImageAllowedPrefixesFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerReviewPublication, createReviewPublicationIngressClient, handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "./runner-tokens.js";
@@ -178,7 +178,7 @@ import { checkKgSidecarHealth } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
-import { createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
+import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
@@ -4012,6 +4012,7 @@ function restateReady(): boolean {
   const restate = getRestateStatus();
   return restate.sidecar.state === "ready" && restate.registration.state === "registered";
 }
+const reviewPublicationIngress = createReviewPublicationIngressClient();
 const lateExternalReviewIngress = createLateExternalReviewIngressClient();
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: lateExternalReviewIngress,
@@ -4584,6 +4585,43 @@ function startServer(
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Publish a post-push review through the durable publication object.
+    if (url === "/runner/review-publication" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const body = await readBodyLimited(req, MAX_PUBLICATION_BYTES + 1024);
+        if (body === null) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Review publication too large" }));
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleRunnerReviewPublication({
+          authorization: req.headers.authorization, secret: config.runnerTokenSecret,
+          body: parsed, ingress: reviewPublicationIngress, restateReady,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "restate-unavailable" }));
         }
       });
       return;

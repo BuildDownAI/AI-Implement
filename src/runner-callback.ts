@@ -1,3 +1,7 @@
+import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
+import * as restateClients from "@restatedev/restate-sdk-clients";
+import { RESTATE_INGRESS_BASE_URL } from "./restate/server.js";
+import type { createPostPushReviewPublication, PostPushReviewPublicationInput, PostPushReviewPublicationResult } from "./restate/post-push-review-publication.js";
 import type { PlanningIngressResult } from "./restate/planning-run-client.js";
 import type { SourceResult } from "./kg-source-results.js";
 import {
@@ -1577,6 +1581,59 @@ function activityIntakeResponse(outcome: ActivityIntakeOutcome): HandleRunnerRes
           retryable: false,
         },
       };
+  }
+}
+
+export interface ReviewPublicationIngressClient {
+  publish(input: PostPushReviewPublicationInput): Promise<PostPushReviewPublicationResult>;
+}
+
+export function createReviewPublicationIngressClient(
+  baseUrl = RESTATE_INGRESS_BASE_URL,
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+): ReviewPublicationIngressClient {
+  const ingress = restateClients.connect({ url: baseUrl, ...(opts.fetchImpl ? { fetch: opts.fetchImpl } : {}) });
+  return {
+    async publish(input) {
+      const key = `${input.owner}/${input.repo}#${input.prNumber}`;
+      return ingress.objectClient<ReturnType<typeof createPostPushReviewPublication>>(
+        { name: "PostPushReviewPublication" }, key,
+      ).publish(input, restateClients.rpc.opts({
+        timeout: opts.timeoutMs ?? 10_000,
+        idempotencyKey: `${key}:${input.headSha}:${input.iteration}`,
+      }));
+    },
+  };
+}
+
+export async function handleRunnerReviewPublication(input: {
+  authorization: string | undefined;
+  secret: string;
+  body: unknown;
+  ingress: ReviewPublicationIngressClient;
+  restateReady: () => boolean;
+}): Promise<HandleRunnerResultOutput> {
+  const token = parseBearerToken(input.authorization);
+  if (!token) return bad(401, "missing_bearer");
+  const verified = verifyRunToken(token, input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+  const repository = getJobByDispatchId(verified.claims.dispatchId)?.repo;
+  if (!repository) return bad(403, "repository_not_found");
+  const [owner, repo] = repository.split("/");
+  if (!owner || !repo) return bad(403, "repository_not_found");
+  const fields = reviewPublicationInputSchema.omit({ owner: true, repo: true }).safeParse(input.body);
+  if (!fields.success) return bad(400, "invalid_review_publication");
+  // Zod strips unknown fields at both levels, keeping credentials out of durable input.
+  const publication = reviewPublicationInputSchema.safeParse({ ...fields.data, owner, repo });
+  if (!publication.success || Buffer.byteLength(JSON.stringify(publication.data), "utf8") > MAX_PUBLICATION_BYTES) {
+    return bad(400, "invalid_review_publication");
+  }
+  if (!input.restateReady()) return bad(503, "restate-unavailable");
+  try {
+    const result = await input.ingress.publish(publication.data);
+    return { status: 200, body: result };
+  } catch {
+    return bad(503, "restate-unavailable");
   }
 }
 
