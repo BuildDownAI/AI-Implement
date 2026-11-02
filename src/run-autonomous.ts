@@ -1353,6 +1353,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       groupingParent,
       retryPolicy,
       callbackUrl: callbackUrl ?? undefined,
+      progressToken: progressToken ?? undefined,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,

@@ -1,3 +1,4 @@
+import { buildInlineReviewComments, inlineCommentBody } from "../review-inline-comments.js";
 import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -231,21 +232,6 @@ function llmResultMessage(result: { stdout?: string; stderr?: string; exitCode: 
 function compactErrorMessage(message: string): string {
   const compact = message.replace(/\s+/g, " ").trim();
   return compact.length > 1200 ? `${compact.slice(0, 1200)}...` : compact;
-}
-
-function compactLogValue(text: string | undefined, maxLength = 1200): string {
-  const compact = (text ?? "").replace(/\s+/g, " ").trim();
-  if (compact.length <= maxLength) return compact;
-  return `${compact.slice(0, maxLength - 3).trim()}...`;
-}
-
-function resultDiagnostics(result: SpawnResult): string {
-  const parts = [`exit=${result.exitCode}`];
-  const stderr = compactLogValue(result.stderr);
-  const stdout = compactLogValue(result.stdout);
-  if (stderr) parts.push(`stderr=${stderr}`);
-  if (stdout) parts.push(`stdout=${stdout}`);
-  return parts.join(" ");
 }
 
 function compactForComment(text: string, maxLength = 260): string {
@@ -1019,56 +1005,6 @@ function stringProp(record: Record<string, unknown> | null, key: string): string
   return typeof value === "string" ? value : "";
 }
 
-function shortSha(sha: string): string {
-  return sha ? sha.slice(0, 7) : "";
-}
-
-function formatRefSha(ref: string, sha: string): string {
-  const short = shortSha(sha);
-  if (ref && short) return `${ref}@${short}`;
-  return ref || short;
-}
-
-function summarizePrDiagnostics(stdout: string): string {
-  try {
-    const pr = asRecord(JSON.parse(stdout));
-    if (!pr) return compactLogValue(stdout);
-
-    const user = recordProp(pr, "user");
-    const head = recordProp(pr, "head");
-    const headUser = recordProp(head, "user");
-    const headRepo = recordProp(head, "repo");
-    const base = recordProp(pr, "base");
-    const baseRepo = recordProp(base, "repo");
-    const mergeable = pr.mergeable;
-    const draft = pr.draft;
-    const parts = [
-      stringProp(pr, "html_url") ? `url=${stringProp(pr, "html_url")}` : "",
-      stringProp(pr, "state") ? `state=${stringProp(pr, "state")}` : "",
-      typeof draft === "boolean" ? `draft=${draft}` : "",
-      stringProp(user, "login") ? `author=${stringProp(user, "login")}` : "",
-      formatRefSha(stringProp(head, "ref"), stringProp(head, "sha")) ? `head=${formatRefSha(stringProp(head, "ref"), stringProp(head, "sha"))}` : "",
-      stringProp(headRepo, "full_name") ? `headRepo=${stringProp(headRepo, "full_name")}` : "",
-      stringProp(headUser, "login") ? `headOwner=${stringProp(headUser, "login")}` : "",
-      formatRefSha(stringProp(base, "ref"), stringProp(base, "sha")) ? `base=${formatRefSha(stringProp(base, "ref"), stringProp(base, "sha"))}` : "",
-      stringProp(baseRepo, "full_name") ? `baseRepo=${stringProp(baseRepo, "full_name")}` : "",
-      typeof mergeable === "boolean" || mergeable === null ? `mergeable=${String(mergeable)}` : "",
-    ].filter(Boolean);
-    return parts.length > 0 ? parts.join(" ") : compactLogValue(stdout);
-  } catch {
-    return compactLogValue(stdout);
-  }
-}
-
-function logReviewFailureDiagnostics(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
-  const prDetails = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
-  if (prDetails.exitCode === 0) {
-    console.warn(`[post-push-review] Native review PR context: ${summarizePrDiagnostics(prDetails.stdout)}`);
-  } else {
-    console.warn(`[post-push-review] Failed to fetch native review PR context: ${resultDiagnostics(prDetails)}`);
-  }
-}
-
 function parseFixSummary(stdout: string): FixSummary | null {
   const parsed = extractFirstJsonObject(stdout);
   if (!parsed) return null;
@@ -1192,41 +1128,39 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
   }
 }
 
-function submitPrReview(
+async function submitPrReview(
   ghSpawn: (args: string[]) => SpawnResult,
   prNumber: string,
   body: string,
-): string | undefined {
+  publication: { callbackUrl?: string; progressToken?: string; owner: string; repo: string; headSha: string; iteration: number; inline: ReturnType<typeof buildInlineReviewComments> },
+): Promise<string | undefined> {
   assertPrWritable(ghSpawn, prNumber);
-  // The reviewing identity is the same GitHub App installation that authored
-  // the PR, and GitHub rejects APPROVE/REQUEST_CHANGES on your own PR (422).
-  // COMMENT is the only review event allowed on a self-authored PR; the
-  // verdict itself is carried by the review body and the sticky PR comment.
-  const event = "COMMENT";
-  const endpoint = `repos/:owner/:repo/pulls/${prNumber}/reviews`;
-  const result = ghSpawn([
-    "api",
-    endpoint,
-    "-X",
-    "POST",
-    "-f",
-    `event=${event}`,
-    "-f",
-    `body=${body}`,
-  ]);
-  if (result.exitCode !== 0) {
-    console.warn(`[post-push-review] Failed to submit ${event} review for PR #${prNumber}: ${resultDiagnostics(result)}`);
-    console.warn(`[post-push-review] Native review request: endpoint=${endpoint} event=${event} bodyChars=${body.length} bodyPreview=${compactLogValue(body, 260)}`);
-    logReviewFailureDiagnostics(ghSpawn, prNumber);
+  const fallback = (reason: string): undefined => {
+    console.warn(`[post-push-review] Review publication fallback: ${reason}`);
     return undefined;
-  }
+  };
+  if (!publication.callbackUrl || !publication.progressToken) return fallback("missing callback URL or progress token");
   try {
-    const url = new URL(stringProp(asRecord(JSON.parse(result.stdout)), "html_url"));
-    if (url.protocol === "https:" || url.protocol === "http:") {
-      return url.href.replace(/[<>\s()]/g, encodeURIComponent);
-    }
-  } catch { /* Keep the full status report when the review response has no usable link. */ }
-  return undefined;
+    const response = await fetch(`${publication.callbackUrl.replace(/\/$/, "")}/runner/review-publication`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${publication.progressToken}`, "content-type": "application/json" },
+      signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify({
+        owner: publication.owner, repo: publication.repo, prNumber: Number(prNumber),
+        headSha: publication.headSha, iteration: publication.iteration,
+        body: body + (publication.inline.unmapped.length ? `\n\n### Findings outside the diff\n\n${publication.inline.unmapped.map(inlineCommentBody).join("\n\n")}` : ""),
+        comments: publication.inline.comments,
+      }),
+    });
+    if (response.status !== 200) return fallback(`HTTP ${response.status}`);
+    const result = asRecord(await response.json());
+    if (result?.status !== "posted") return fallback(result?.status === "stale-head" ? "stale-head" : "unexpected publication status");
+    const url = new URL(stringProp(result, "reviewUrl"));
+    if (url.protocol !== "https:" && url.protocol !== "http:") return fallback("invalid review URL");
+    return url.href.replace(/[<>\s()]/g, encodeURIComponent);
+  } catch {
+    return fallback("network error or invalid publication response");
+  }
 }
 
 function reviewReportForComment(reviewUrl: string | undefined, feedback: string): string {
@@ -2143,6 +2077,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       // Probe before the LLM call: a merge/close between iterations exits immediately rather than burning a full reviewer turn.
       assertPrWritable(ghSpawn, prNumber);
 
+      const publicationHeadSha = resolvePrHeadSha(ghSpawn, prNumber) ?? "";
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
 
@@ -2356,6 +2291,13 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           && (finding.source === "github-review" || finding.source === "github-review-thread")) return false;
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
       };
+      // Every publication branch exits this pass; no (head, iteration) is posted twice.
+      const inline = buildInlineReviewComments(reviewLedger, diffRes.stdout);
+      const publishReview = (spawn: typeof ghSpawn, number: string, body: string) => submitPrReview(spawn, number, body, {
+        callbackUrl: context.data.callbackUrl, progressToken: context.data.progressToken,
+        owner: context.data.githubOwner ?? "", repo: context.data.githubRepo ?? "",
+        headSha: publicationHeadSha, iteration, inline,
+      });
       const gatingReviewFindings = reviewLedger.filter(findingGates);
       const advisoryReviewFindings = reviewLedger.filter((finding) => !findingGates(finding));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
@@ -2431,7 +2373,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           : terminationReason === "provider_unavailable" ? "provider-unavailable"
           : terminationReason === "invalid_review" ? "review-invalid" : "review-failed";
         const marker = `<!-- ai-implement post-push iter=${iteration} ${markerReason} -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review did not complete for every required reviewer. Manual review required.${blockingIssuesBlock(issues)}${internalReviewSummaryBlock(feedback)}`,
@@ -2469,7 +2411,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
             logs_url: null,
           });
           const marker = `<!-- ai-implement post-push iter=${iteration} repository-fix -->`;
-          const reviewUrl = submitPrReview(
+          const reviewUrl = await publishReview(
             ghSpawn,
             prNumber,
             `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed. Claude's review found blocking issues, which the repository's auto-fix handles. Not approving until the auto-fix commit has a clean review.${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2485,7 +2427,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         // Both reviews block: two fixers must never run at once, so a person decides.
         terminationReason = "iterations_exhausted";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement's review and Claude's review both found blocking issues. Manual review required.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2515,7 +2457,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} external-pending -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review did not complete within the wait budget. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2553,7 +2495,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. The late external review now decides.${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2582,7 +2524,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2621,7 +2563,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (approved) {
         terminationReason = "approved";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        const reviewUrl = submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.${internalReviewSummaryBlock(verdict.feedback)}`);
+        const reviewUrl = await publishReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.${internalReviewSummaryBlock(verdict.feedback)}`);
         postPrComment(
           ghSpawn,
           prNumber,
@@ -2634,7 +2576,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (iteration >= maxIterations) {
         terminationReason = "iterations_exhausted";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
@@ -2819,7 +2761,7 @@ ${externalFindingsFixBlock}
         }
         terminationReason = "no_changes";
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
-        const reviewUrl = submitPrReview(
+        const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
