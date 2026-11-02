@@ -1090,14 +1090,23 @@ function assertPrWritable(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
 
 function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
   assertPrWritable(ghSpawn, prNumber);
-  // Leave room for continuation markers, and never split a UTF-16 surrogate pair.
-  const chunkSize = 65_000;
-  if (body.length > 65_536) {
+  // Bound both GitHub character counts and command argument bytes (including body=).
+  // Reserve space for continuation markers below Linux’s per-argument limit.
+  const chunkSize = 63_000;
+  if (body.length > 65_536 || Buffer.byteLength(body, "utf8") > 64_000) {
     let offset = 0;
     let part = 0;
     while (offset < body.length) {
-      let end = Math.min(offset + chunkSize, body.length);
-      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1])) end--;
+      let end = offset;
+      let bytes = 0;
+      while (end < body.length) {
+        const codePoint = body.codePointAt(end)!;
+        const width = codePoint > 0xFFFF ? 2 : 1;
+        const byteWidth = Buffer.byteLength(body.slice(end, end + width), "utf8");
+        if (bytes + byteWidth > chunkSize || end + width - offset > chunkSize) break;
+        bytes += byteWidth;
+        end += width;
+      }
       const partMarker = marker && part > 0 ? marker.replace("-->", `continuation:${part} -->`) : marker;
       const prefix = part > 0 && partMarker ? `${partMarker}\n` : "";
       postPrComment(ghSpawn, prNumber, prefix + body.slice(offset, end), partMarker);

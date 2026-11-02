@@ -175,11 +175,11 @@ describe("postPushReviewStep", () => {
     expect(comments.join("\n")).toContain(REVIEW_LINK);
   });
 
-  it.each(["external", "moved-head", "unreadable-head", "unreadable-head-oversized", "overflow", "oversized"])("bounds publication and preserves evidence: %s", async (scenario) => {
+  it.each(["external", "moved-head", "unreadable-head", "unreadable-head-oversized", "overflow", "oversized", "multilingual-oversized", "multilingual-byte-only-oversized", "multilingual-update-oversized"])("bounds publication and preserves evidence: %s", async (scenario) => {
     const warn = vi.spyOn(console, "warn");
     const statusComments: string[] = [];
     let diffRead = false;
-    const fullReport = scenario.endsWith("oversized") ? 'Evidence "\\\n😀'.repeat(9000) + "REPORT END" : "Complete reviewer evidence";
+    const fullReport = scenario.startsWith("multilingual") ? "漢字😀".repeat(scenario === "multilingual-byte-only-oversized" ? 14000 : 20000) + "REPORT END" : scenario.endsWith("oversized") ? 'Evidence "\\\n😀'.repeat(9000) + "REPORT END" : "Complete reviewer evidence";
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42") {
         if (scenario.startsWith("unreadable-head")) return { stdout: "", exitCode: 1 };
@@ -196,8 +196,19 @@ describe("postPushReviewStep", () => {
           pageInfo: { hasNextPage: false, endCursor: null },
         } } } } }), exitCode: 0 };
       }
-      if (args[0] === "pr" && args[1] === "comment") {
-        const body = args[args.indexOf("--body") + 1];
+      // Model Linux's per-argument limit for both --body and PATCH body=.
+      if (args.some((arg) => Buffer.byteLength(arg, "utf8") >= 131_072)) {
+        return { stdout: "", stderr: "E2BIG", exitCode: 1 };
+      }
+      if (scenario === "multilingual-update-oversized" && args.includes("--slurp")) {
+        return { stdout: JSON.stringify([Array.from({ length: 20 }, (_, part) => ({
+          id: part + 1,
+          body: part === 0 ? "<!-- ai-implement post-push iter=1 -->" : `<!-- ai-implement post-push iter=1 continuation:${part} -->`,
+        }))]), exitCode: 0 };
+      }
+      if ((args[0] === "pr" && args[1] === "comment") || args.includes("PATCH")) {
+        const body = args.includes("PATCH") ? args.find((arg) => arg.startsWith("body="))!.slice(5)
+          : args[args.indexOf("--body") + 1];
         if (body.length > 65_536) return { stdout: "", stderr: "body too long", exitCode: 1 };
         statusComments.push(body);
       }
@@ -235,10 +246,14 @@ describe("postPushReviewStep", () => {
       expect(request.body).toContain("inline comment limit exceeded");
       expect(request.body.split("### Findings outside the diff")[1]).toContain("Unmapped evidence.");
     }
-    if (scenario === "oversized") {
+    if (scenario.endsWith("oversized")) {
       expect(request.comments).toEqual([]);
       expect(statusComments.length).toBeGreaterThan(1);
-      expect(statusComments.every((body) => body.length <= 65_536)).toBe(true);
+      expect(statusComments.every((body) => body.length <= 65_536 && Buffer.byteLength(body, "utf8") <= 64_000)).toBe(true);
+      if (scenario === "multilingual-update-oversized") {
+        expect(ghSpawn.mock.calls.filter(([args]) => args.includes("PATCH"))).toHaveLength(statusComments.filter((body) => body.includes("<!-- ai-implement post-push iter=1")).length);
+        expect(ghSpawn.mock.calls.some(([args]) => args[0] === "pr" && args[1] === "comment" && args.some((arg) => arg.includes("<!-- ai-implement post-push iter=1")))).toBe(false);
+      }
       expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(MAX_PUBLICATION_BYTES);
       expect(request.body).toContain("The full report is in the status comment");
       expect(statusComments.map((body) => body.replace(/^<!--[^\n]*continuation:\d+ -->\n/, "")).join("")).toContain(fullReport);

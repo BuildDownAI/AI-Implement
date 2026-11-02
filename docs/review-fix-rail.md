@@ -208,7 +208,7 @@ comments join “Findings outside the diff” in the body, labeled as exceeding
 the inline comment limit. If the serialized UTF-8
 request still exceeds 48,000 bytes, the runner sends no inline comments and
 shortens the body to fit, with a note pointing to the full report retained in
-the status comment, split into ordered comments of at most 65,536 characters
+the status comment, split into ordered comments of at most 65,536 characters and 64,000 UTF-8 bytes
 when needed. The runner does not post GitHub reviews directly.
 The final status comment links to the returned review URL instead
 of repeating the checklist. If review publication fails or returns no usable
