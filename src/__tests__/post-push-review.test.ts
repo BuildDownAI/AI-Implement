@@ -25,15 +25,17 @@ const GITHUB_ACTIONS_RUN = { githubOwner: "acme", githubRepo: "app", githubToken
 
 function makeCtx(invoke: LLMExecutor["invoke"], overrides: Partial<PipelineContextData> = {}) {
   return makeContext(
-    { issueIdentifier: "AII-200", issueTitle: "X", model: "claude-sonnet-4-6", ...GITHUB_ACTIONS_RUN, ...overrides },
+    { issueIdentifier: "AII-200", issueTitle: "X", model: "claude-sonnet-4-6", ...GITHUB_ACTIONS_RUN, callbackUrl: "https://orchestrator.test/", progressToken: "progress-test-token", ...overrides },
     { invoke },
   );
 }
 
 // Each run writes its cycle summaries and other output under ai-output/ in the workspace.
 let workspaceDir: string;
+let publicationFetch: ReturnType<typeof fakeFetch>;
 beforeEach(() => {
   workspaceDir = testDir("post-push-review");
+  publicationFetch = fakeFetch({ "POST /runner/review-publication": { json: { status: "posted", reviewUrl: "https://github.com/acme/app/pull/42#pullrequestreview-80" } } }).install();
 });
 
 function structuredReviewResult(structuredOutput: unknown, stdout = "ignored final text") {
@@ -52,16 +54,13 @@ const PR_HEAD_SHA = "4a8f2c1e9b7d3a5f6c0e2b4d8a1f3c5e7b9d0a2c";
 
 /**
  * GitHub's answer, through `gh api`, to a request a test's fake answers with an empty success, which `gh api` never
- * prints for these routes: the PR with its head, no check runs on that head, and the review a POST creates.
+ * prints for these routes: the PR with its head and no check runs on that head.
  */
 function githubReply(args: string[]): string | undefined {
   if (args[0] !== "api") return undefined;
   const path = args.find((arg) => arg.startsWith("repos/")) ?? "";
   const pull = /^repos\/:owner\/:repo\/pulls\/(\d+)(\/reviews)?$/.exec(path);
   if (pull && !pull[2]) return JSON.stringify({ number: Number(pull[1]), state: "open", head: { ref: "ai-implement/aii-200-x", sha: PR_HEAD_SHA } });
-  if (pull && args.includes("POST")) {
-    return JSON.stringify({ id: 80, state: "COMMENTED", html_url: `https://github.com/acme/app/pull/${pull[1]}#pullrequestreview-80` });
-  }
   if (/\/commits\/[^/]+\/check-runs/.test(path)) {
     const page = { total_count: 0, check_runs: [] };
     return JSON.stringify(args.includes("--slurp") ? [page] : page);
@@ -84,6 +83,7 @@ function runReview(...[ctx, inputs, reporter]: Parameters<typeof postPushReviewS
       ...inputs,
       ...(ghSpawn && {
         ghSpawn: (args: string[]) => {
+          if (args[0] === "api" && args.includes("POST") && args.some(arg => /\/reviews$/.test(arg))) throw new Error("Runner must not publish GitHub reviews");
           const result = ghSpawn(args);
           const reply = result.exitCode === 0 && result.stdout.trim() === "" ? githubReply(args) : undefined;
           return reply === undefined ? result : { ...result, stdout: reply };
@@ -94,16 +94,12 @@ function runReview(...[ctx, inputs, reporter]: Parameters<typeof postPushReviewS
   );
 }
 
-// The comment links to the review GitHub created for the report (githubReply's POST answer).
+// The comment links to the review returned by the publication callback.
 const REVIEW_LINK = "[Full reviewer report](https://github.com/acme/app/pull/42#pullrequestreview-80)";
 
 /** The body of the last review the step submitted, which carries the full reviewer report the comment links to. */
-function submittedReview(ghSpawn: ReturnType<typeof vi.fn>): string {
-  const post = (ghSpawn.mock.calls as string[][][])
-    .map(([args]) => args)
-    .filter((args) => args.includes("POST") && args.some((arg) => /\/pulls\/\d+\/reviews$/.test(arg)))
-    .at(-1);
-  return post?.find((arg) => arg.startsWith("body="))?.slice("body=".length) ?? "";
+function submittedReview(_ghSpawn: ReturnType<typeof vi.fn>): string {
+  return JSON.parse(publicationFetch.calls.at(-1)?.body ?? "{}").body ?? "";
 }
 
 // The telemetry the executor reports when the CLI ended before writing its result event, as on a provider failure.
@@ -153,6 +149,31 @@ function reviewerMap(definitions: ReviewerDefinition[]): ReadonlyMap<string, Rev
 }
 
 describe("postPushReviewStep", () => {
+  it("publishes authenticated inline findings and retains unmapped findings in the body", async () => {
+    const comments: string[] = [];
+    const gh = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [
+      { severity: "blocking", body: "Mapped bug. Fix the new line.", path: "src/a.ts", line: 1 },
+      { severity: "minor", body: "Outside the diff.", path: "src/other.ts", line: 99 },
+    ], summary: "Review evidence" }));
+    await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, reviewProviders: [], ghSpawn: gh,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
+    }, { report: vi.fn(async () => undefined) });
+    expect(publicationFetch.calls).toHaveLength(1);
+    const call = publicationFetch.calls[0];
+    expect(call.url.href).toBe("https://orchestrator.test/runner/review-publication");
+    expect(call.headers.get("authorization")).toBe("Bearer progress-test-token");
+    expect(JSON.parse(call.body)).toMatchObject({ prNumber: 42, headSha: PR_HEAD_SHA, iteration: 1,
+      comments: [{ path: "src/a.ts", line: 1, side: "RIGHT", body: expect.stringContaining("<!-- ai-implement review-finding:v1 -->") }] });
+    expect(JSON.parse(call.body).body).toContain("Outside the diff.");
+    expect(comments.join("\n")).toContain(REVIEW_LINK);
+  });
+
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" };
     const ghComments: string[] = [];
@@ -197,70 +218,33 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(reviewCalls[0]).toContain("event=COMMENT");
-    const bodyArg = reviewCalls[0].find((arg) => arg.startsWith("body="));
+    expect(publicationFetch.calls).toHaveLength(1);
+    const bodyArg = submittedReview(ghSpawn);
     expect(bodyArg).toContain("<!-- ai-implement native-review -->");
     expect(bodyArg).toContain("AI-Implement post-push review approved this PR.");
   });
 
-  it("logs native review response details and PR context when submission fails", async () => {
+  it.each(["503", "network", "stale-head", "no-callback", "no-token", "invalid-url", "401"])("keeps the full status report on %s publication fallback", async (failure) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const reviewerOutput = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" };
+    const fake = fakeFetch({ "POST /runner/review-publication": () => {
+      if (failure === "network") throw new Error("secret network details");
+      return { status: failure === "503" ? 503 : failure === "401" ? 401 : 200, json: { status: failure === "stale-head" ? "stale-head" : "posted", reviewUrl: "invalid" } };
+    } }).install();
+    const comments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
-        return {
-          stdout: JSON.stringify({ message: "Can not approve your own pull request" }),
-          stderr: "gh: Unprocessable Entity (HTTP 422)",
-          exitCode: 1,
-        };
-      }
-      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) {
-        return {
-          stdout: JSON.stringify({
-            html_url: "https://github.com/acme/app/pull/42",
-            state: "open",
-            draft: false,
-            user: { login: "ai-implement[bot]" },
-            head: {
-              ref: "ai-implement/aii-200-x",
-              sha: "abc1234567890",
-              user: { login: "ai-implement[bot]" },
-              repo: { full_name: "acme/app" },
-            },
-            base: {
-              ref: "main",
-              sha: "def9876543210",
-              repo: { full_name: "acme/app" },
-            },
-            mergeable: true,
-          }),
-          exitCode: 0,
-        };
-      }
+      if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
       return { stdout: "", exitCode: 0 };
     });
-    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(reviewerOutput))));
-    let warnings = "";
-
-    try {
-      await runReview(
-        ctx,
-        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
-        { report: vi.fn(async () => undefined) },
-      );
-      warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
-    } finally {
-      warn.mockRestore();
-    }
-
-    expect(warnings).toContain("stderr=gh: Unprocessable Entity (HTTP 422)");
-    expect(warnings).toContain("stdout={\"message\":\"Can not approve your own pull request\"}");
-    expect(warnings).toContain("event=COMMENT");
-    expect(warnings).toContain("bodyChars=");
-    expect(warnings).toContain("author=ai-implement[bot]");
-    expect(warnings).toContain("head=ai-implement/aii-200-x@abc1234");
-    expect(warnings).toContain("base=main@def9876");
+    await runReview(makeCtx(vi.fn(async () => structuredReviewResult({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "Complete reviewer evidence" })), {
+      ...(failure === "no-callback" ? { callbackUrl: undefined } : {}),
+      ...(failure === "no-token" ? { progressToken: undefined } : {}),
+    }), { prNumber: "42", workspaceDir, maxIterations: 1, reviewProviders: [], ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) }, { report: vi.fn(async () => undefined) });
+    expect(comments.join("\n")).toContain("Complete reviewer evidence");
+    expect(comments.join("\n")).not.toContain("Full reviewer report");
+    expect(fake.calls).toHaveLength(failure === "no-callback" || failure === "no-token" ? 0 : 1);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes("Review publication fallback"))).toHaveLength(1);
+    warn.mockRestore();
   });
 
   it("submits a native COMMENT review when blockers remain", async () => {
@@ -288,8 +272,8 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(reviewCalls[0]).toContain("event=COMMENT");
-    expect(reviewCalls[0].find((arg) => arg.startsWith("body="))).toContain("Fix validation");
+    expect(publicationFetch.calls).toHaveLength(1);
+    expect(submittedReview(ghSpawn)).toContain("Fix validation");
   });
 
   it("loops to cap then posts ⚠️ comment", async () => {
@@ -591,6 +575,7 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(false);
     expect(out.iterations).toBe(3);
+    expect(publicationFetch.calls.map(call => JSON.parse(call.body).iteration)).toEqual([3]);
     expect(gitPushCalls.length).toBe(2);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 1/2"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 2/2"))).toBe(true);
@@ -4381,9 +4366,7 @@ describe("postPushReviewStep", () => {
       "post-push-review/code-review-review-1",
     ]);
     expect(reviewCalls.some((call) => call.some((arg) => arg.includes("approved this PR")))).toBe(false);
-    const submittedReviewBody = reviewCalls
-      .find((call) => call.includes("-X") && call.includes("POST"))
-      ?.find((arg) => arg.startsWith("body="));
+    const submittedReviewBody = submittedReview(ghSpawn);
     expect(submittedReviewBody).toContain("<!-- ai-implement native-review -->");
     expect(submittedReviewBody).toContain("AI-Implement internal review passed");
     expect(submittedReviewBody).toContain("gap-analysis: approved");
@@ -4751,7 +4734,7 @@ describe("postPushReviewStep", () => {
     // without ever reaching the check-runs endpoint. Folding "" into the null retry path would
     // spin to the timeout instead, and probes would still be 0 — so assert the head read too.
     expect(f.probes()).toBe(0);
-    expect(f.ghSpawn.mock.calls.filter((c) => (c[0] as string[]).some((a) => a === "repos/:owner/:repo/pulls/42")).length).toBe(1);
+    expect(f.ghSpawn.mock.calls.filter((c) => (c[0] as string[]).some((a) => a === "repos/:owner/:repo/pulls/42")).length).toBe(2);
   });
 
   it("warns once per condition per wait, and does not carry that state between waits", async () => {
@@ -6249,6 +6232,7 @@ describe("independent incomplete reviewer results", () => {
     expect(invoke.mock.calls[0][0].prompt).toContain("Reserve your final turn");
     expect(out.approved).toBe(!gates);
     if (gates) expect(out.terminationReason).toBe(({ turns: "reviewer_turns_exhausted", invalid: "invalid_review", provider: "provider_unavailable", throws: "review_failed" })[kind]);
+    reviews.push(...publicationFetch.calls.map(call => JSON.parse(call.body).body));
     expect(reviews).toHaveLength(1);
     expect(reviews[0]).toContain("code-review: approved");
     expect(reviews[0]).toContain("Checked error handling in src/api.ts.");
@@ -6285,6 +6269,7 @@ describe("independent incomplete reviewer results", () => {
     }, { report: vi.fn(async () => undefined) });
     expect(out.approved).toBe(false);
     expect(invoke).toHaveBeenCalledTimes(2);
+    reviews.push(...publicationFetch.calls.map(call => JSON.parse(call.body).body));
     expect(reviews[0]).toContain("Null response crashes src/api.ts.");
     expect(reviews[0]).toContain("No usable partial structured review evidence");
   });
@@ -7244,7 +7229,7 @@ describe("postPushReviewStep review process gate", () => {
     await run(f);
     const urls = f.ghSpawn.mock.calls.map(([args]) => args.find((x) => x.startsWith("repos/:owner/:repo/")) ?? "");
     // From the first check-runs read (the poll) through the post-wait findings reads, up to the unrelated reviews-API read after the CI gate.
-    const span = urls.slice(urls.findIndex((u) => u.includes("/check-runs")), urls.findIndex((u) => u === "repos/:owner/:repo/pulls/42/reviews"));
+    const span = urls.slice(urls.findIndex((u) => u.includes("/check-runs")), urls.reduce((last, url, index) => url.includes("/check-runs") ? index + 1 : last, 0));
     expect(span.filter((u) => u.includes("/issues/42/comments"))).toHaveLength(1);
   });
 
@@ -7392,7 +7377,7 @@ describe("credential refresh before a fix-pass push, by execution mode", () => {
     });
     const ghSpawn = vi.fn((args: string[]) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 }));
     await runReview(
-      makeCtx(vi.fn(async () => structuredReviewResult(notApproved)), overrides),
+      makeCtx(vi.fn(async () => structuredReviewResult(notApproved)), { callbackUrl: undefined, ...overrides }),
       { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn },
       { report: vi.fn(async () => undefined) },
     );

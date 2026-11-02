@@ -197,9 +197,17 @@ and concrete evidence. Gap analysis maps acceptance criteria to implementation;
 code review describes relevant behavior, risks, and validation. Reading a test
 is distinguished from running it, and checks that were not performed are named
 explicitly. These reports appear in the GitHub review and are saved in each
-reviewer step's outputs. The final status comment links to that review instead
+reviewer step's outputs. The runner sends each report with its reviewed head SHA and iteration to the authenticated
+`POST <callbackUrl>/runner/review-publication` route using the progress token.
+The `PostPushReviewPublication` Restate object posts the GitHub COMMENT review
+with inline comments mapped to lines in that pass’s diff. Each inline finding
+carries `<!-- ai-implement review-finding:v1 -->`; findings outside the diff
+are appended to the review body. The runner does not post GitHub reviews directly.
+The final status comment links to the returned review URL instead
 of repeating the checklist. If review publication fails or returns no usable
-link, the status comment retains the full report.
+link (including a stale head, HTTP error, network failure, or absent callback
+credentials), the status comment retains the full report. The runner logs one
+fallback diagnostic per attempted publication.
 
 Built-in reviewers must return both report fields; a checklist embedded in the
 summary does not satisfy the structured contract. The report fields remain
