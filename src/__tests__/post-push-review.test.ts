@@ -1,3 +1,4 @@
+import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../pipeline/review-publication-limits.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -172,6 +173,91 @@ describe("postPushReviewStep", () => {
       comments: [{ path: "src/a.ts", line: 1, side: "RIGHT", body: expect.stringContaining("<!-- ai-implement review-finding:v1 -->") }] });
     expect(JSON.parse(call.body).body).toContain("Outside the diff.");
     expect(comments.join("\n")).toContain(REVIEW_LINK);
+  });
+
+  it.each(["external", "moved-head", "unreadable-head", "unreadable-head-oversized", "overflow", "oversized", "multilingual-oversized", "multilingual-byte-only-oversized", "multilingual-update-oversized"])("bounds publication and preserves evidence: %s", async (scenario) => {
+    const warn = vi.spyOn(console, "warn");
+    const statusComments: string[] = [];
+    let diffRead = false;
+    const fullReport = scenario.startsWith("multilingual") ? "漢字😀".repeat(scenario === "multilingual-byte-only-oversized" ? 14000 : 20000) + "REPORT END" : scenario.endsWith("oversized") ? 'Evidence "\\\n😀'.repeat(9000) + "REPORT END" : "Complete reviewer evidence";
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42") {
+        if (scenario.startsWith("unreadable-head")) return { stdout: "", exitCode: 1 };
+        return { stdout: JSON.stringify({ state: "open", head: { sha: diffRead ? "b".repeat(40) : PR_HEAD_SHA } }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") {
+        diffRead = true;
+        return { stdout: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new", exitCode: 0 };
+      }
+      if (scenario === "external" && args[0] === "api" && args[1] === "graphql") {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [{ id: "RT_1", isResolved: false, isOutdated: false, path: "src/a.ts", line: 1,
+            comments: { nodes: [{ body: "External finding", author: { login: "reviewer" }, url: "https://example.com/thread" }] } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } } }), exitCode: 0 };
+      }
+      // Model Linux's per-argument limit for both --body and PATCH body=.
+      if (args.some((arg) => Buffer.byteLength(arg, "utf8") >= 131_072)) {
+        return { stdout: "", stderr: "E2BIG", exitCode: 1 };
+      }
+      if (scenario === "multilingual-update-oversized" && args.includes("--slurp")) {
+        return { stdout: JSON.stringify([Array.from({ length: 20 }, (_, part) => ({
+          id: part + 1,
+          body: part === 0 ? "<!-- ai-implement post-push iter=1 -->" : `<!-- ai-implement post-push iter=1 continuation:${part} -->`,
+        }))]), exitCode: 0 };
+      }
+      if ((args[0] === "pr" && args[1] === "comment") || args.includes("PATCH")) {
+        const body = args.includes("PATCH") ? args.find((arg) => arg.startsWith("body="))!.slice(5)
+          : args[args.indexOf("--body") + 1];
+        if (body.length > 65_536) return { stdout: "", stderr: "body too long", exitCode: 1 };
+        statusComments.push(body);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const findings = Array.from({ length: scenario === "overflow" ? MAX_PUBLICATION_COMMENTS + 1 : 1 }, (_, i) => ({
+      severity: "minor", body: `Internal finding ${i}.`, path: "src/a.ts", line: 1,
+    }));
+    if (scenario === "overflow") findings.push({ severity: "minor", body: "Unmapped evidence.", path: "other.ts", line: 2 });
+    await runReview(makeCtx(vi.fn(async () => structuredReviewResult({ approved: false, findings, summary: fullReport }))), {
+      prNumber: "42", workspaceDir, maxIterations: 1, reviewProviders: scenario === "external" ? undefined : [], ghSpawn,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
+    }, { report: vi.fn(async () => undefined) });
+    if (scenario.startsWith("unreadable-head")) {
+      expect(warn).toHaveBeenCalledWith("[post-push-review] Review publication fallback: head unreadable");
+      warn.mockRestore();
+      expect(publicationFetch.calls).toHaveLength(0);
+      expect(statusComments.map((body) => body.replace(/^<!--[^\n]*continuation:\d+ -->\n/, "")).join("")).toContain(fullReport);
+      return;
+    }
+    warn.mockRestore();
+    expect(publicationFetch.calls).toHaveLength(1);
+    const serialized = publicationFetch.calls[0].body;
+    const request = JSON.parse(serialized);
+    expect(request.headSha).toBe(PR_HEAD_SHA);
+    if (scenario === "external") {
+      expect(request.comments).toHaveLength(1);
+      expect(request.comments[0].body).toContain("Internal finding");
+      expect(request.body).toContain("External finding");
+    }
+    if (scenario === "overflow") {
+      expect(request.comments).toHaveLength(MAX_PUBLICATION_COMMENTS);
+      expect(request.body.split("### Findings outside the diff")[1]).toContain("Internal finding 100.");
+      expect(request.body).toContain("inline comment limit exceeded");
+      expect(request.body.split("### Findings outside the diff")[1]).toContain("Unmapped evidence.");
+    }
+    if (scenario.endsWith("oversized")) {
+      expect(request.comments).toEqual([]);
+      expect(statusComments.length).toBeGreaterThan(1);
+      expect(statusComments.every((body) => body.length <= 65_536 && Buffer.byteLength(body, "utf8") <= 64_000)).toBe(true);
+      if (scenario === "multilingual-update-oversized") {
+        expect(ghSpawn.mock.calls.filter(([args]) => args.includes("PATCH"))).toHaveLength(statusComments.filter((body) => body.includes("<!-- ai-implement post-push iter=1")).length);
+        expect(ghSpawn.mock.calls.some(([args]) => args[0] === "pr" && args[1] === "comment" && args.some((arg) => arg.includes("<!-- ai-implement post-push iter=1")))).toBe(false);
+      }
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(MAX_PUBLICATION_BYTES);
+      expect(request.body).toContain("The full report is in the status comment");
+      expect(statusComments.map((body) => body.replace(/^<!--[^\n]*continuation:\d+ -->\n/, "")).join("")).toContain(fullReport);
+    }
   });
 
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {

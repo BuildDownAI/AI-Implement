@@ -4,8 +4,8 @@ import type { AppConfig } from "../index.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
 
-export const MAX_PUBLICATION_BYTES = 48_000;
-export const MAX_PUBLICATION_COMMENTS = 100;
+import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../pipeline/review-publication-limits.js";
+export { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../pipeline/review-publication-limits.js";
 const lookupSchema = z.object({
   headSha: z.string().regex(/^[a-f0-9]{40}$/),
   iteration: z.number().int().nonnegative(),

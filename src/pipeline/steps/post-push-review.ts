@@ -1,3 +1,4 @@
+import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../review-publication-limits.js";
 import { buildInlineReviewComments, inlineCommentBody } from "../review-inline-comments.js";
 import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
@@ -1089,6 +1090,31 @@ function assertPrWritable(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
 
 function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
   assertPrWritable(ghSpawn, prNumber);
+  // Bound both GitHub character counts and command argument bytes (including body=).
+  // Reserve space for continuation markers below Linux’s per-argument limit.
+  const chunkSize = 63_000;
+  if (body.length > 65_536 || Buffer.byteLength(body, "utf8") > 64_000) {
+    let offset = 0;
+    let part = 0;
+    while (offset < body.length) {
+      let end = offset;
+      let bytes = 0;
+      while (end < body.length) {
+        const codePoint = body.codePointAt(end)!;
+        const width = codePoint > 0xFFFF ? 2 : 1;
+        const byteWidth = Buffer.byteLength(body.slice(end, end + width), "utf8");
+        if (bytes + byteWidth > chunkSize || end + width - offset > chunkSize) break;
+        bytes += byteWidth;
+        end += width;
+      }
+      const partMarker = marker && part > 0 ? marker.replace("-->", `continuation:${part} -->`) : marker;
+      const prefix = part > 0 && partMarker ? `${partMarker}\n` : "";
+      postPrComment(ghSpawn, prNumber, prefix + body.slice(offset, end), partMarker);
+      offset = end;
+      part++;
+    }
+    return;
+  }
   if (marker) {
     const list = ghSpawn([
       "api",
@@ -1132,39 +1158,63 @@ async function submitPrReview(
   ghSpawn: (args: string[]) => SpawnResult,
   prNumber: string,
   body: string,
-  publication: { callbackUrl?: string; progressToken?: string; owner: string; repo: string; headSha: string; iteration: number; inline: ReturnType<typeof buildInlineReviewComments> },
-): Promise<string | undefined> {
+  publication: { callbackUrl?: string; progressToken?: string; owner: string; repo: string; headSha: string | null; iteration: number; inline: ReturnType<typeof buildInlineReviewComments> },
+): Promise<{ url: string; truncated: boolean } | undefined> {
   assertPrWritable(ghSpawn, prNumber);
   const fallback = (reason: string): undefined => {
     console.warn(`[post-push-review] Review publication fallback: ${reason}`);
     return undefined;
   };
+  if (!publication.headSha) return fallback("head unreadable");
   if (!publication.callbackUrl || !publication.progressToken) return fallback("missing callback URL or progress token");
+  const overflow = publication.inline.comments.slice(MAX_PUBLICATION_COMMENTS);
+  const outside = [
+    ...publication.inline.unmapped.map(inlineCommentBody),
+    ...overflow.map((comment) => `### ${comment.path}:${comment.line} (${comment.side}; inline comment limit exceeded)\n\n${comment.body}`),
+  ];
+  const request = {
+    owner: publication.owner, repo: publication.repo, prNumber: Number(prNumber),
+    headSha: publication.headSha, iteration: publication.iteration,
+    body: body + (outside.length ? `\n\n### Findings outside the diff\n\n${outside.join("\n\n")}` : ""),
+    comments: publication.inline.comments.slice(0, MAX_PUBLICATION_COMMENTS),
+  };
+  const truncated = Buffer.byteLength(JSON.stringify(request), "utf8") > MAX_PUBLICATION_BYTES;
+  if (truncated) {
+    request.comments = [];
+    const fullBody = request.body;
+    const note = "\n\nReport shortened to fit publication limits. The full report is in the status comment.";
+    // Budget the complete serialized request, including JSON escapes and UTF-8 bytes.
+    let low = 0;
+    let high = fullBody.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      request.body = fullBody.slice(0, middle) + note;
+      if (Buffer.byteLength(JSON.stringify(request), "utf8") <= MAX_PUBLICATION_BYTES) low = middle;
+      else high = middle - 1;
+    }
+    request.body = fullBody.slice(0, low) + note;
+  }
   try {
     const response = await fetch(`${publication.callbackUrl.replace(/\/$/, "")}/runner/review-publication`, {
       method: "POST",
       headers: { authorization: `Bearer ${publication.progressToken}`, "content-type": "application/json" },
       signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({
-        owner: publication.owner, repo: publication.repo, prNumber: Number(prNumber),
-        headSha: publication.headSha, iteration: publication.iteration,
-        body: body + (publication.inline.unmapped.length ? `\n\n### Findings outside the diff\n\n${publication.inline.unmapped.map(inlineCommentBody).join("\n\n")}` : ""),
-        comments: publication.inline.comments,
-      }),
+      body: JSON.stringify(request),
     });
     if (response.status !== 200) return fallback(`HTTP ${response.status}`);
     const result = asRecord(await response.json());
     if (result?.status !== "posted") return fallback(result?.status === "stale-head" ? "stale-head" : "unexpected publication status");
     const url = new URL(stringProp(result, "reviewUrl"));
     if (url.protocol !== "https:" && url.protocol !== "http:") return fallback("invalid review URL");
-    return url.href.replace(/[<>\s()]/g, encodeURIComponent);
+    return { url: url.href.replace(/[<>\s()]/g, encodeURIComponent), truncated };
   } catch {
     return fallback("network error or invalid publication response");
   }
 }
 
-function reviewReportForComment(reviewUrl: string | undefined, feedback: string): string {
-  return reviewUrl ? `[Full reviewer report](${reviewUrl})` : feedback;
+function reviewReportForComment(review: { url: string; truncated: boolean } | undefined, feedback: string): string {
+  if (!review) return feedback;
+  return review.truncated ? `[Shortened reviewer report](${review.url})\n\n${feedback}` : `[Full reviewer report](${review.url})`;
 }
 
 function failedReviewOutputs(feedback: string) {
@@ -2077,7 +2127,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       // Probe before the LLM call: a merge/close between iterations exits immediately rather than burning a full reviewer turn.
       assertPrWritable(ghSpawn, prNumber);
 
-      const publicationHeadSha = resolvePrHeadSha(ghSpawn, prNumber) ?? "";
+      const publicationHeadSha = resolvePrHeadSha(ghSpawn, prNumber);
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
 
@@ -2292,7 +2342,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
       };
       // Every publication branch exits this pass; no (head, iteration) is posted twice.
-      const inline = buildInlineReviewComments(reviewLedger, diffRes.stdout);
+      const inline = buildInlineReviewComments(reviewLedger.filter((finding) => finding.source === "ai-implement-internal"), diffRes.stdout);
       const publishReview = (spawn: typeof ghSpawn, number: string, body: string) => submitPrReview(spawn, number, body, {
         callbackUrl: context.data.callbackUrl, progressToken: context.data.progressToken,
         owner: context.data.githubOwner ?? "", repo: context.data.githubRepo ?? "",
