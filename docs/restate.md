@@ -625,3 +625,30 @@ Reading a run's journal in the Restate UI works once the AII-1287 scrub row exis
 The link is hidden for a `user` session. The Journal page and the drawer's "Restate journal" section are gone.
 
 For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.
+
+## PostPushReviewPublication
+
+`PostPushReviewPublication` is a virtual object keyed by `<owner>/<repo>#<prNumber>`.
+Its exclusive `publish` handler accepts the pushed head SHA, post-push review pass
+`iteration`, body, and inline comments. The shared `get({ headSha, iteration })`
+returns the saved result or `null`. State keys are `<headSha>:<iteration>`; results
+contain review ID/URL, inline comment IDs and locations, and `inlineFallback`, or
+`stale-head`. There is no caller yet.
+
+Inputs are limited to 48,000 UTF-8 JSON bytes and 100 inline comments. This leaves
+room under GitHub's review body limit for fallback formatting and markers. Invalid
+inputs and mismatched object keys fail terminally before GitHub is called.
+
+One `publish-review` step obtains an installation token, checks the current PR
+head, searches paginated reviews for the head/pass marker, and posts a COMMENT
+review pinned to that head if absent. Position validation failures (422) cause
+one submission without inline comments, with their text appended to the body.
+The native review body prefix is preserved and the publication marker is last.
+A separate fallback marker allows retries to recover `inlineFallback`; paginated
+review comments recover comment IDs even after a crash following publication.
+The step retries up to five times, reconciling before each submission.
+
+The token exists only inside that step: it is never returned, stored in object
+state, passed to another handler, or included in errors. Dependency exceptions
+are replaced with a fixed message before reaching Restate's journal. Only plain
+publication results cross the step boundary.
