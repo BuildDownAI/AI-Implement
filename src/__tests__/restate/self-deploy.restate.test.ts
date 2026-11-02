@@ -7,7 +7,7 @@ import * as restate from "@restatedev/restate-sdk";
 import { queryNonCompletedInvocations } from "../../restate/endpoint.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
-import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
+import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startRetryEnabled, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
 import * as githubAuth from "../../github-app-auth.js";
 import { githubImagePublished } from "../../restate/self-deploy.js";
 import { fakeFetch } from "../helpers/fake-fetch.js";
@@ -359,6 +359,86 @@ describe("SelfDeploy durable phase machine", () => {
       }
     }
   });
+  it.each(VARIANTS)("preserves production flyctl failure diagnostics (%s)", async label => {
+    const env = envs.get(label)!;
+    for (const [message, status] of [
+      ["[deploy] flyctl exited 1", "unknown"],
+      ["[deploy] flyctl failed to start: spawn /tmp/flyctl ENOENT", "unknown"],
+      ["[deploy] flyctl timed out after 10m", "unknown"],
+      ["SelfDeploy flyctl deadline exceeded", "unknown"],
+      ["[deploy] flyctl download failed: HTTP 404", "404"],
+    ]) {
+      f = deployFixture(); f.state.work = false; f.config.kgSourceRepo = "owner/kg";
+      vi.mocked(f.deps.flyctl).mockRejectedValue(new Error(`${message} command: flyctl deploy --build-secret kg_token=secret-kg`));
+      const log = vi.spyOn(console, "warn");
+      try {
+        await start(env); const record = await terminal(env, f, "failed", "apply-failed");
+        const detail = `build HTTP ${status} ${message} [command redacted]`;
+        expect(f.deps.onOutcome).toHaveBeenCalledWith(record, detail);
+        expect(log.mock.calls.flat()).toContain(`[self-deploy] ${record!.deployId} apply error ${detail}`);
+        expect(f.deps.flyctl).toHaveBeenCalledTimes(status === "404" ? 1 : 3);
+      } finally { log.mockRestore(); }
+    }
+  });
+  it("replays legacy exhausted apply effects and clears the hold", async () => {
+    const fixture = deployFixture(); fixture.state.work = false;
+    const interrupted = gate("legacy exhausted apply");
+    let attempts = 0;
+    // Reproduce the old effect's retry-exhausted journal, then interrupt before finish.
+    const current = createSelfDeploy(fixture.deps);
+    const legacy = restate.object({ name: "SelfDeploy", handlers: {
+      verify: restate.handlers.object.exclusive({ ingressPrivate: true }, async () => {}),
+      status: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) => ({
+        deploy: await ctx.get<SelfDeployRecord>("deploy"), options: { applyFlyToml: false },
+      })),
+      apply: restate.handlers.object.exclusive({ ingressPrivate: true }, async (ctx: restate.ObjectContext) => {
+        const record = (await ctx.get<SelfDeployRecord>("deploy"))!;
+        ctx.objectSendClient(current, ctx.key).verify({ attempt: 1 }, restate.rpc.sendOpts({
+          delay: fixture.deps.limits!.verifyInitialMs!, headers: { "self-deploy-id": record.deployId },
+        }));
+        await ctx.get("options");
+        await ctx.run("apply policy", () => "image");
+        try {
+          await ctx.run("apply image", async () => { attempts++; throw new Error("legacy build failed"); },
+            { maxRetryAttempts: 3, initialRetryInterval: 100, maxRetryInterval: 1_000 });
+        } catch (error) {
+          if (!(error instanceof restate.TerminalError)) throw error;
+          await interrupted.wait();
+        }
+      }),
+    } });
+    const driver = restate.service({ name: "LegacyApplyDriver", handlers: {
+      invoke: async (ctx: restate.Context) => {
+        await ctx.objectClient(current, "test-app").apply(restate.rpc.opts({ headers: { "self-deploy-id": "legacy" } }));
+      },
+    } });
+    const env = await startRetryEnabled([legacy, driver]);
+    let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+    try {
+      fixture.state.held = true;
+      await setObjectState(env.adminAPIBaseUrl(), "SelfDeploy", "test-app", "deploy", {
+        deployId: "legacy", phase: "applying", target: { repo: "owner/repo", branch: "testing", commit: COMMIT, image: "image", source: "published" },
+        requestedBy: "owner", startedAt: 1, finishedAt: null, reason: null,
+      } satisfies SelfDeployRecord);
+      const invocation = callService(env.baseUrl(), "LegacyApplyDriver", "invoke", {});
+      void invocation.catch(() => undefined);
+      await interrupted.reached();
+      expect(attempts).toBe(3);
+      expect(fixture.state.held).toBe(true);
+      replacement = await replaceEndpoint(env, [current, driver]);
+      await env.startedRestateServer.restart();
+      const record = await phase(env, "failed");
+      await eventually(() => fixture.state.outcomes.length, n => n === 1);
+      expect(record?.reason).toBe("apply-failed");
+      expect(fixture.deps.onOutcome).toHaveBeenCalledWith(record, undefined);
+      expect(attempts).toBe(3);
+      expect(fixture.deps.fly.listMachines).not.toHaveBeenCalled();
+      expect(fixture.deps.setHold).toHaveBeenLastCalledWith(false);
+      expect(fixture.deps.onOutcome).toHaveBeenCalledOnce();
+    } finally {
+      interrupted.release(); replacement?.close(); await env.stop();
+    }
+  }, 60_000);
   it.each(VARIANTS)("releases hold after exhausting Machines rate limits (%s)", async label => {
     f = deployFixture(); f.state.work = false; f.config.kgSourceRepo = "owner/kg";
     vi.mocked(f.deps.fly.updateMachine).mockRejectedValue(Object.assign(new Error("rate limited"), { status: 429 }));
