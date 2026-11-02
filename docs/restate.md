@@ -633,7 +633,8 @@ Its exclusive `publish` handler accepts the pushed head SHA, post-push review pa
 `iteration`, body, and inline comments. The shared `get({ headSha, iteration })`
 returns the saved result or `null`. State keys are `<headSha>:<iteration>`; results
 contain review ID/URL, inline comment IDs and locations, and `inlineFallback`, or
-`stale-head`. There is no caller yet.
+`stale-head`.
+The runner’s `submitPrReview` in `src/pipeline/steps/post-push-review.ts` calls `POST <callbackUrl>/runner/review-publication`; see [In-run: the post-push-review step](review-fix-rail.md#in-run-the-post-push-review-step).
 
 Inputs are limited to 48,000 UTF-8 JSON bytes and 100 inline comments. This leaves
 room under GitHub's review body limit for fallback formatting and markers. Invalid

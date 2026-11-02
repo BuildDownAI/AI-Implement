@@ -1192,6 +1192,9 @@ async function submitPrReview(
       if (Buffer.byteLength(JSON.stringify(request), "utf8") <= MAX_PUBLICATION_BYTES) low = middle;
       else high = middle - 1;
     }
+    // Keep the cut between code points rather than splitting a UTF-16 surrogate pair.
+    if (low > 0 && fullBody.charCodeAt(low - 1) >= 0xd800 && fullBody.charCodeAt(low - 1) <= 0xdbff
+      && fullBody.charCodeAt(low) >= 0xdc00 && fullBody.charCodeAt(low) <= 0xdfff) low -= 1;
     request.body = fullBody.slice(0, low) + note;
   }
   try {

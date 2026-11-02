@@ -1,8 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createPostPushReviewPublication, MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS, publicationMarker, type PostPushReviewPublicationDependencies, type PostPushReviewPublicationInput, type PostPushReviewPublicationResult } from "../../restate/post-push-review-publication.js";
 import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER } from "../../pipeline/review-ledger.js";
 import { callObject, callService, journalEntries, journalText, queryInvocations, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
+
+import { postPushReviewStep } from "../../pipeline/steps/post-push-review.js";
+import { createReviewPublicationIngressClient, handleRunnerReviewPublication } from "../../runner-callback.js";
+import { mintRunToken } from "../../runner-tokens.js";
+import { appendLog, initLogTable } from "../../log.js";
+import { makeContext } from "../helpers/builders.js";
+import { testDir } from "../helpers/test-dir.js";
 
 const TOKEN = "SENTINEL-PUBLICATION-INSTALLATION-TOKEN";
 const SHA = "a".repeat(40);
@@ -61,6 +68,74 @@ describe("PostPushReviewPublication", () => {
       expect(state.rows.length).toBeGreaterThan(0);
       expect(JSON.stringify(state)).not.toContain(TOKEN);
     }
+    for (const outcome of ["inline", "fallback", "failure"] as const) it(`publishes mixed runner findings through the callback (${outcome})`, async () => {
+      const { input, s, get } = setup({ fallback: outcome === "fallback", unrelated: outcome === "failure" });
+      initLogTable();
+      const dispatchId = randomUUID();
+      const secret = "mixed-findings-secret";
+      appendLog({ dispatchId, issueId: dispatchId, teamKey: "ENG", phase: "implementation", repo: `o/${input.repo}` });
+      const { token } = mintRunToken({ dispatchId, issueId: dispatchId, mappingTeamKey: "ENG", phase: "implementation", audience: "progress", ttlSeconds: 3600, secret });
+      const callbackUrl = "https://runner-callback.test";
+      const realFetch = globalThis.fetch;
+      const callbackResults: unknown[] = [];
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        if (String(url) !== `${callbackUrl}/runner/review-publication`) return realFetch(url, init);
+        const result = await handleRunnerReviewPublication({
+          authorization: new Headers(init?.headers).get("authorization") ?? undefined,
+          secret, body: JSON.parse(String(init?.body)), restateReady: () => true,
+          ingress: createReviewPublicationIngressClient(env().baseUrl(), { fetchImpl: realFetch }),
+        });
+        callbackResults.push(result);
+        return new Response(JSON.stringify(result.body), { status: result.status });
+      });
+      const statusComments: string[] = [];
+      const fullReport = "Complete mixed-finding reviewer evidence. REPORT END";
+      const findings = [
+        { severity: "blocking", body: "Mapped bug. Fix the new line.", path: "src/a.ts", line: 3 },
+        { severity: "minor", body: "Unmapped bug. Preserve this evidence.", path: "src/other.ts", line: 99 },
+      ];
+      try {
+        await postPushReviewStep.run(makeContext({
+          githubOwner: "o", githubRepo: input.repo, githubToken: "dispatch-token", nonce: "", orchestratorUrl: "",
+          callbackUrl, progressToken: token,
+        }, { invoke: async () => ({ stdout: "", exitCode: 0, tokensUsed: 1,
+          structuredOutput: { approved: false, findings, summary: fullReport }, terminalStatus: { subtype: "success", isError: false },
+        }) }), {
+          prNumber: "1", workspaceDir: testDir("mixed-publication"), pushedSha: SHA, maxIterations: 1, reviewProviders: [],
+          reviewers: [{ id: "code-review", gates: true }],
+          trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: { type: "object" } }]]),
+          gitSpawn: () => ({ stdout: "", exitCode: 0 }),
+          ghSpawn: (args) => {
+            if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -3 +3 @@\n-old\n+new", exitCode: 0 };
+            if (args[0] === "pr" && args[1] === "comment") statusComments.push(args[args.indexOf("--body") + 1]!);
+            if (args.includes("POST") && args.some((arg) => /\/reviews$/.test(arg))) throw new Error("Runner review write forbidden");
+            if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/1") return { stdout: JSON.stringify({ state: "open", head: { sha: SHA } }), exitCode: 0 };
+            return { stdout: "", exitCode: 0 };
+          },
+        }, { report: async () => undefined });
+      } finally { fetchSpy.mockRestore(); }
+      expect(callbackResults).toHaveLength(1);
+      expect(s.attempts[0]!.comments).toEqual([{ path: "src/a.ts", line: 3, side: "RIGHT", body: expect.stringContaining(findings[0]!.body.split(". ")[0]!) }]);
+      expect(s.attempts[0]!.body.split("### Findings outside the diff")[1]).toContain("Unmapped bug.");
+      expect(s.attempts[0]!.body).toContain(fullReport);
+      if (outcome === "failure") {
+        expect(callbackResults[0]).toMatchObject({ status: 503 });
+        expect(await get()).toBeNull();
+        for (const evidence of [fullReport, "Mapped bug.", "Unmapped bug."]) expect(statusComments.join("\n")).toContain(evidence);
+      } else {
+        const result = await get();
+        expect(callbackResults[0]).toMatchObject({ status: 200, body: result });
+        expect(result).toMatchObject({ status: "posted", reviewId: 12, inlineFallback: outcome === "fallback",
+          comments: outcome === "inline" ? [{ path: "src/a.ts", line: 3, commentId: 100 }] : [] });
+        const published = s.reviews[0]!.body;
+        for (const evidence of [fullReport, "Unmapped bug."]) expect(published).toContain(evidence);
+        if (outcome === "fallback") {
+          expect(s.attempts).toHaveLength(2);
+          expect(s.attempts[1]!.comments).toEqual([]);
+          expect(published).toContain("Mapped bug.");
+        }
+      }
+    });
     it("posts inline IDs, caches per pass, and deduplicates an invocation retry", async () => {
       const { input, s, key, publish, get } = setup();
       const headers = { "idempotency-key": randomUUID() };

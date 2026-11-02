@@ -46,7 +46,8 @@ key `<owner>/<repo>#<prNumber>` and idempotency key
 the bearer and headers stay at the callback boundary. A successful call returns the
 object's result as 200. Sidecar or registration unreadiness and ingress failures return
 503 with `error: "restate-unavailable"`. Unexpected route errors are logged and return
-500 with `error: "Internal server error"`. The runner caller is added separately.
+500 with `error: "Internal server error"`.
+The runner’s `submitPrReview` in `src/pipeline/steps/post-push-review.ts` calls `POST <callbackUrl>/runner/review-publication`; see [In-run: the post-push-review step](review-fix-rail.md#in-run-the-post-push-review-step).
 
 ## Credentials
 

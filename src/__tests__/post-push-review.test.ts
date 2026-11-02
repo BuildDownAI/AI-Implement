@@ -256,6 +256,7 @@ describe("postPushReviewStep", () => {
       }
       expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(MAX_PUBLICATION_BYTES);
       expect(request.body).toContain("The full report is in the status comment");
+      expect(request.body).not.toMatch(/[\uFFFD\uD800-\uDFFF]/u);
       expect(statusComments.map((body) => body.replace(/^<!--[^\n]*continuation:\d+ -->\n/, "")).join("")).toContain(fullReport);
     }
   });
