@@ -94,11 +94,11 @@ Configure these repository Actions secrets:
 - `FLY_IMAGE_PUSH_TOKEN` (required): a Fly deploy token scoped only to `builddown-orchestrator-image`. Missing credentials fail with an explicit error. The installed token `gha-publish-orchestrator-image` expires 2027-11-02; rotate it before expiry.
 - `CONTROL_PLANE_OPS_TOKEN` (optional): a control plane ops token with `orchestrator:update` scope. When absent, notification is skipped. Set it when CON-81 deploys.
 
-After a successful push, the workflow uses `GITHUB_TOKEN` with `statuses: write` to set `orchestrator-image/published` to `success` on the published commit, with the image reference as its description. Build/push failure sets no status and sends no notification. Runs are serialized per branch and newer runs cancel older builds; post-push bookkeeping uses `always()` so cancellation after a successful push still records the publication and notifies the control plane.
+After a successful push, the workflow uses `GITHUB_TOKEN` with `statuses: write` to set `orchestrator-image/published` to `success` on the published commit, with the image reference as its description. Build/push failure sets no status and sends no notification. Newer runs cancel superseded Docker validation builds per branch. After validation, a separate publication job rebuilds remotely with Fly and serializes publication per branch without cancelling an active publisher. Its job-level `always()` condition protects the entire remote build/push, status update and notification, including the interval before flyctl reports push success. Dispatch publishes the exact commit resolved by validation.
 
 The final step, when the ops secret is present, sends `POST https://auth.builddown.ai/api/ops/auto-update` with bearer authorization and `{ "branch": "<branch>", "commit": "<full sha>", "image": "<image reference>" }`. It prints the HTTP status and response body and records the status in the job summary. A 404 warns while the route is unavailable; other non-2xx responses and transport errors fail the step. Notification failure leaves the image and successful publication status in place.
 
-To verify a published image operationally, run `fly machine update <machine> -a <scratch-app> --image <image reference>` and check `GET /` for healthy boot. The current health response does not expose the source commit; inspect `AI_IMPLEMENT_SOURCE_COMMIT` inside the machine to verify the build stamp.
+To verify a published image operationally, run `fly machine update <machine> -a <scratch-app> --image <image reference>` and verify the full pushed commit through `GET /`: `curl -fsS https://<scratch-app>.fly.dev/ | jq -e --arg commit "<full pushed sha>" '.status == "ok" and .sourceCommit == $commit'`. The `sourceCommit` field exposes `AI_IMPLEMENT_SOURCE_COMMIT` (or `null` for unstamped builds).
 
 **Outcome.** The object's terminal record is written to `deploy_last_outcome` and announced on the notice webhook (failures and cancellations; a success is announced by the new process's boot notice). `succeeded` is `deployed-ok`, `failed` is `deploy-failed` and `cancelled` is `deploy-cancelled`, the latter two with the reason code in `detail`. `/admin#deployments`, `get_deploy_posture` (`lastOutcome`) and `GET /api/deployment-status` (`lastDeployOutcome`, plus `selfDeploy` and `applyFlyTomlAllowed`) read it. Log lines read `[self-deploy] <deployId> <phase> <reason>`; the `draining` line includes the target repository after the phase. Boot no longer guesses an outcome, so the old `deployed-not-serving` signal (sidecar missing or failing its probe) is no longer written; sidecar health is reported by `GET /` and `get_kg_status`.
 
@@ -344,6 +344,7 @@ To repair a degraded image, re-deploy with `--no-cache` and a working `--build-s
 | Field | Meaning |
 |---|---|
 | `status` | Always `"ok"` |
+| `sourceCommit` | Full `AI_IMPLEMENT_SOURCE_COMMIT` build stamp, or `null` when unset |
 | `polls` | Poll cycles since boot |
 | `lastPollStartedAt`, `lastPollFinishedAt` | ISO times, or `null` before the first poll |
 | `kgDegraded` | Embeddings missing; search is lexical only |

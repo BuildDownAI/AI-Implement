@@ -16,12 +16,34 @@ permissions:
   contents: read
   statuses: write
 
-concurrency:
-  group: publish-orchestrator-image-${{ inputs.branch || github.ref_name }}
-  cancel-in-progress: true
-
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: orchestrator-image-build-${{ inputs.branch || github.ref_name }}
+      cancel-in-progress: true
+    outputs:
+      commit: ${{ steps.meta.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.sha || inputs.branch }}
+          persist-credentials: false
+      - name: Resolve source commit
+        id: meta
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # Validate without publishing; superseded builds can safely be cancelled.
+      - name: Validate image build
+        run: docker build --no-cache --tag orchestrator-validation .
+
   publish:
+    needs: build
+    # GitHub re-evaluates job conditions on cancellation. Keep the entire remote
+    # build/push and its bookkeeping alive once this job starts.
+    if: ${{ always() && needs.build.result == 'success' }}
+    concurrency:
+      group: orchestrator-image-publish-${{ inputs.branch || github.ref_name }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     env:
       SOURCE_BRANCH: ${{ inputs.branch || github.ref_name }}
@@ -43,7 +65,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Pushes publish the event commit; dispatch resolves the selected head once.
-          ref: ${{ github.event_name == 'push' && github.sha || inputs.branch }}
+          ref: ${{ needs.build.outputs.commit }}
           persist-credentials: false
 
       - name: Resolve image metadata
@@ -73,7 +95,7 @@ jobs:
             --build-arg "SOURCE_BRANCH=$SOURCE_BRANCH"
 
       - name: Record published image
-        # always() lets publication bookkeeping finish when a newer run cancels us.
+        # The job and bookkeeping both remain eligible during cancellation.
         if: ${{ always() && steps.push.outcome == 'success' }}
         id: published
         env:
