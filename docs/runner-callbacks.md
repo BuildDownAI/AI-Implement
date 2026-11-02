@@ -31,7 +31,11 @@ sequenceDiagram
 ## Post-push review publication
 
 `POST /runner/review-publication` accepts `{ prNumber, headSha, iteration, body, comments }`
-with a reusable `progress` bearer. It resolves the repository from the token's dispatch
+with a reusable `progress` bearer from an `implementation` or `gap-analysis` run.
+Other phases return 403 `phase_not_allowed` before run lookup or any Restate call.
+Only these two phases perform post-push reviews and already hold publication tokens;
+planning never pushes and has no publication token, while `kg-refresh` does not run
+post-push reviews. It resolves the repository from the token's dispatch
 run record, ignoring repository fields in the request; no PR URL on the run is required.
 Invalid publication fields or a publication exceeding 48,000 UTF-8 bytes return 400 before ingress;
 HTTP bodies exceeding 49,024 bytes return 413. Missing or invalid credentials return 401,
@@ -41,7 +45,8 @@ key `<owner>/<repo>#<prNumber>` and idempotency key
 `<owner>/<repo>#<prNumber>:<headSha>:<iteration>`. Only publication fields enter Restate;
 the bearer and headers stay at the callback boundary. A successful call returns the
 object's result as 200. Sidecar or registration unreadiness and ingress failures return
-503 with `error: "restate-unavailable"`. The runner caller is added separately.
+503 with `error: "restate-unavailable"`. Unexpected route errors are logged and return
+500 with `error: "Internal server error"`. The runner caller is added separately.
 
 ## Credentials
 

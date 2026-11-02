@@ -4180,6 +4180,51 @@ function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
   return { status: "accepted", attemptId: batch.attemptId };
 }
 
+/** HTTP boundary shared by the production route and route-level tests. */
+export function handleReviewPublicationRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  deps: {
+    secret: string | null | undefined;
+    ingress: Parameters<typeof handleRunnerReviewPublication>[0]["ingress"];
+    restateReady: () => boolean;
+  },
+): void {
+  (async () => {
+    if (!deps.secret) {
+      res.writeHead(501, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Runner callback not configured" }));
+      return;
+    }
+    const body = await readBodyLimited(req, MAX_PUBLICATION_BYTES + 1024);
+    if (body === null) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Review publication too large" }));
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+      return;
+    }
+    const result = await handleRunnerReviewPublication({
+      authorization: req.headers.authorization, secret: deps.secret,
+      body: parsed, ingress: deps.ingress, restateReady: deps.restateReady,
+    });
+    res.writeHead(result.status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result.body));
+  })().catch((err) => {
+    console.error("[runner-review-publication] Unhandled error:", err);
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal server error" }));
+    }
+  });
+}
+
 function startServer(
   config: AppConfig,
   registry: ProviderRegistry,
@@ -4592,38 +4637,7 @@ function startServer(
 
     // Publish a post-push review through the durable publication object.
     if (url === "/runner/review-publication" && req.method === "POST") {
-      (async () => {
-        if (!config.runnerTokenSecret) {
-          res.writeHead(501, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Runner callback not configured" }));
-          return;
-        }
-        const body = await readBodyLimited(req, MAX_PUBLICATION_BYTES + 1024);
-        if (body === null) {
-          res.writeHead(413, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Review publication too large" }));
-          return;
-        }
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(body);
-        } catch {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Invalid JSON" }));
-          return;
-        }
-        const result = await handleRunnerReviewPublication({
-          authorization: req.headers.authorization, secret: config.runnerTokenSecret,
-          body: parsed, ingress: reviewPublicationIngress, restateReady,
-        });
-        res.writeHead(result.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result.body));
-      })().catch(() => {
-        if (!res.headersSent) {
-          res.writeHead(503, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "restate-unavailable" }));
-        }
-      });
+      handleReviewPublicationRequest(req, res, { secret: config.runnerTokenSecret, ingress: reviewPublicationIngress, restateReady });
       return;
     }
 
