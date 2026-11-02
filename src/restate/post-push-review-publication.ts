@@ -6,6 +6,10 @@ import { defaultFetchSignal } from "../github.js";
 
 export const MAX_PUBLICATION_BYTES = 48_000;
 export const MAX_PUBLICATION_COMMENTS = 100;
+const lookupSchema = z.object({
+  headSha: z.string().regex(/^[a-f0-9]{40}$/),
+  iteration: z.number().int().nonnegative(),
+});
 const inputSchema = z.object({
   owner: z.string().regex(/^[\w.-]+$/), repo: z.string().regex(/^[\w.-]+$/),
   prNumber: z.number().int().positive(), headSha: z.string().regex(/^[a-f0-9]{40}$/),
@@ -80,8 +84,10 @@ export function createPostPushReviewPublication(deps: PostPushReviewPublicationD
       ctx.set(key, result);
       return result;
     }),
-    get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext, input: { headSha: string; iteration: number }): Promise<PostPushReviewPublicationResult | null> => {
-      if (!/^[a-f0-9]{40}$/.test(input.headSha) || !Number.isSafeInteger(input.iteration) || input.iteration < 0) throw new restate.TerminalError("Invalid publication lookup", { errorCode: 400 });
+    get: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext, raw: z.infer<typeof lookupSchema>): Promise<PostPushReviewPublicationResult | null> => {
+      const parsed = lookupSchema.safeParse(raw);
+      if (!parsed.success) throw new restate.TerminalError("Invalid publication lookup", { errorCode: 400 });
+      const input = parsed.data;
       return ctx.get<PostPushReviewPublicationResult>(`${input.headSha}:${input.iteration}`);
     }),
   } });

@@ -122,6 +122,13 @@ describe("PostPushReviewPublication", () => {
       await expect(publish({ ...input, owner: "different" })).rejects.toThrow(/400/);
       expect(s.mints).toBe(0);
     });
+    it("terminally rejects malformed lookups before GitHub", async () => {
+      const { key, s } = setup();
+      for (const input of [null, [], "lookup", {}, { headSha: null, iteration: 1 }, { headSha: SHA, iteration: -1 }, { headSha: SHA, iteration: 1.5 }, { headSha: SHA, iteration: "1" }, { headSha: SHA, iteration: Number.MAX_SAFE_INTEGER + 1 }]) {
+        await expect(callObject(env().baseUrl(), "PostPushReviewPublication", key, "get", input)).rejects.toThrow(/400.*Invalid publication lookup/);
+      }
+      expect(s.mints).toBe(0);
+    });
     it("accepts payload and comment count boundaries", async () => {
       const { input, s, publish } = setup();
       input.comments = Array.from({ length: MAX_PUBLICATION_COMMENTS }, () => input.comments[0]!);
