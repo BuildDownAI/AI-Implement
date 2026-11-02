@@ -1,7 +1,8 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { handleReviewPublicationRequest } from "../../index.js";
 import { getDb } from "../../dedup.js";
 import { appendLog, initLogTable } from "../../log.js";
 import { mintRunToken, verifyRunToken } from "../../runner-tokens.js";
@@ -58,10 +59,10 @@ describe("runner review publication", () => {
     await new Promise<void>((resolve) => server?.close(() => resolve()));
     await stopAll(environments);
   });
-  function token(options: { repo?: string; missingRun?: boolean; audience?: "progress" | "result"; ttlSeconds?: number } = {}) {
+  function token(options: { repo?: string; missingRun?: boolean; audience?: "progress" | "result"; ttlSeconds?: number; phase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh" } = {}) {
     const dispatchId = randomUUID();
-    if (!options.missingRun) appendLog({ dispatchId, issueId: dispatchId, teamKey: "ENG", phase: "implementation", repo: options.repo ?? "o/r" });
-    return mintRunToken({ dispatchId, issueId: dispatchId, mappingTeamKey: "ENG", phase: "implementation", audience: options.audience ?? "progress", ttlSeconds: options.ttlSeconds ?? 3600, secret }).token;
+    if (!options.missingRun) appendLog({ dispatchId, issueId: dispatchId, teamKey: "ENG", phase: options.phase ?? "implementation", repo: options.repo ?? "o/r" });
+    return mintRunToken({ dispatchId, issueId: dispatchId, mappingTeamKey: "ENG", phase: options.phase ?? "implementation", audience: options.audience ?? "progress", ttlSeconds: options.ttlSeconds ?? 3600, secret }).token;
   }
   async function request(bearer?: string, data: unknown = body) {
     return fetch(url, { method: "POST", headers: { "content-type": "application/json", ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) }, body: JSON.stringify(data) });
@@ -75,6 +76,16 @@ describe("runner review publication", () => {
         expect((await request(bearer)).status).toBe(401);
       }
       for (const bearer of [token({ missingRun: true }), token({ repo: "" })]) expect((await request(bearer)).status).toBe(403);
+      expect(await invocations()).toHaveLength(0);
+      const beforeRejected = forwarded.length;
+      for (const phase of ["planning", "kg-refresh"] as const) {
+        for (const missingRun of [false, true]) {
+          const rejected = await request(token({ phase, missingRun }));
+          expect(rejected.status).toBe(403);
+          expect(await rejected.json()).toEqual({ error: "phase_not_allowed" });
+        }
+      }
+      expect(forwarded).toHaveLength(beforeRejected);
       expect(await invocations()).toHaveLength(0);
       const bearer = token();
       ready = false;
@@ -131,12 +142,41 @@ describe("runner review publication", () => {
       const journal = journalText(await journalEntries(env.adminAPIBaseUrl(), String(rows[0].id)));
       expect(journal).not.toContain(bearer);
       expect(journal).not.toContain("authorization");
-      for (const sent of forwarded) {
+      for (const sent of forwarded.slice(beforeForwarded)) {
         expect(sent.input).not.toContain(bearer);
         expect(sent.input).not.toContain("authorization");
         expect(sent.key).toBe(`o/r#42:${headSha}:0`);
         expect(decodeURIComponent(sent.url)).toContain("PostPushReviewPublication/o/r#42/publish");
       }
+      const gapBearer = token({ phase: "gap-analysis" });
+      const gapResult = await request(gapBearer, { ...body, iteration: 1 });
+      expect(gapResult.status).toBe(200);
+      expect(await gapResult.json()).toMatchObject({ status: "posted" });
+      expect(posts.length - beforePosts).toBe(2);
+      expect(await invocations()).toHaveLength(2);
+      expect(verifyRunToken(gapBearer, secret, "progress", { consume: false }).ok).toBe(true);
     });
   }
+  it("logs an unexpected route rejection once and returns 500", async () => {
+    const error = new Error("unexpected readiness failure");
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const routeServer = createServer((req, res) => {
+      handleReviewPublicationRequest(req, res, {
+        secret, ingress: { publish: async () => { throw new Error("must not publish"); } },
+        restateReady: () => { throw error; },
+      });
+    });
+    try {
+      await new Promise<void>((resolve) => routeServer.listen(0, "127.0.0.1", resolve));
+      const response = await fetch(`http://127.0.0.1:${(routeServer.address() as AddressInfo).port}/runner/review-publication`, {
+        method: "POST", headers: { authorization: `Bearer ${token()}` }, body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ error: "Internal server error" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[runner-review-publication] Unhandled error:", error);
+    } finally {
+      log.mockRestore();
+      await new Promise<void>((resolve) => routeServer.close(() => resolve()));
+    }
+  });
 });

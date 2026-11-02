@@ -1617,6 +1617,9 @@ export async function handleRunnerReviewPublication(input: {
   if (!token) return bad(401, "missing_bearer");
   const verified = verifyRunToken(token, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
+  if (verified.claims.phase !== "implementation" && verified.claims.phase !== "gap-analysis") {
+    return bad(403, "phase_not_allowed");
+  }
   const repository = getJobByDispatchId(verified.claims.dispatchId)?.repo;
   if (!repository) return bad(403, "repository_not_found");
   const [owner, repo] = repository.split("/");
