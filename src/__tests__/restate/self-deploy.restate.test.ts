@@ -1,4 +1,4 @@
-import { createRestateRegistrationGate, onRestateRegistered, releaseUnownedDeployHoldAtBoot } from "../../index.js";
+import { createSelfDeployOutcomeHandler, createRestateRegistrationGate, onRestateRegistered, releaseUnownedDeployHoldAtBoot } from "../../index.js";
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "../../deploy-hold.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { callToolAsSystem } from "../../restate/tools-client.js";
@@ -11,6 +11,7 @@ import { callObject, callService, killInvocation, gate, eventually, queryInvocat
 import * as githubAuth from "../../github-app-auth.js";
 import { githubImagePublished } from "../../restate/self-deploy.js";
 import { fakeFetch } from "../helpers/fake-fetch.js";
+import * as notify from "../../notify.js";
 import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
 
 describe("SelfDeploy durable phase machine", () => {
@@ -30,7 +31,7 @@ describe("SelfDeploy durable phase machine", () => {
     expect(record).toMatchObject({ phase: expected, reason, finishedAt: expect.any(Number) });
     expect(record!.finishedAt!).toBeGreaterThanOrEqual(record!.startedAt);
     expect(fixture.state.outcomes.filter(r => r.deployId === record!.deployId)).toEqual([record]);
-    expect(fixture.deps.onOutcome).toHaveBeenCalledWith(record);
+    expect(fixture.deps.onOutcome).toHaveBeenCalledWith(record, reason === "apply-failed" ? expect.any(String) : undefined);
     return record;
   };
   const phase = (env: RestateEnvironment, value: string) => eventually(() => read(env), r => r?.phase === value, { label: value });
@@ -283,6 +284,88 @@ describe("SelfDeploy durable phase machine", () => {
     await start(env); await terminal(env, f, "succeeded");
     expect(f.deps.imagePublished).not.toHaveBeenCalled();
     expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), expect.arrayContaining(["--build-only", "--push", "--image-label", "deploy-abcdef0", "kg_token=secret-kg", `SOURCE_COMMIT=${COMMIT}`, "SOURCE_REPO=owner/repo", "SOURCE_BRANCH=testing"]), "secret-fly", expect.any(AbortSignal));
+  });
+  it.each(VARIANTS)("retries Machines conflicts and rate limits without rebuilding (%s)", async label => {
+    const env = envs.get(label)!;
+    for (const status of [409, 429]) {
+      f = deployFixture(); f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
+      const update = async (_token: string, _app: string, _id: string, config: typeof f.machine.config) => { f.machine.config = structuredClone(config); };
+      vi.mocked(f.deps.fly.updateMachine)
+        .mockRejectedValueOnce(Object.assign(new Error("lease busy"), { status }))
+        .mockRejectedValueOnce(Object.assign(new Error("lease busy"), { status }))
+        .mockImplementationOnce(update);
+      await start(env); await phase(env, "verifying");
+      expect(f.deps.fly.updateMachine).toHaveBeenCalledTimes(3);
+      expect(f.deps.flyctl).toHaveBeenCalledOnce();
+      await terminal(env, f, "succeeded");
+    }
+  });
+  it.each(VARIANTS)("logs sanitized fixed failures and passes durable notice detail (%s)", async label => {
+    const env = envs.get(label)!;
+    for (const status of [400, 401, 403, 404, 422]) {
+      f = deployFixture(); f.state.work = false;
+      const error = new Error(`invalid config (${status}) secret-fly {"token":"other-secret"} /machines?access_token=query-secret https://fly.test/?token=hidden\nargv flyctl --token hidden`);
+      // Exercise the structured API status as well as older message-only errors.
+      vi.mocked(f.deps.fly.updateMachine).mockRejectedValue(status === 422 ? Object.assign(error, { status }) : error);
+      const log = vi.spyOn(console, "warn");
+      try {
+        await start(env); const record = await terminal(env, f, "failed", "apply-failed");
+        expect(f.deps.fly.updateMachine).toHaveBeenCalledOnce();
+        const detail = vi.mocked(f.deps.onOutcome).mock.calls[0][1]!;
+        expect(detail).toContain(`updateMachine HTTP ${status}`);
+        expect(detail).not.toMatch(/secret-fly|other-secret|query-secret|access_token|hidden|https:|\n|--token/);
+        expect(log.mock.calls.flat().filter(line => String(line).includes(` ${record!.deployId} apply error `)))
+          .toEqual([`[self-deploy] ${record!.deployId} apply error ${detail}`]);
+        expect(f.state.held).toBe(false);
+      } finally { log.mockRestore(); }
+    }
+  });
+  it.each(VARIANTS)("attributes every apply operation and forwards sanitized notice detail (%s)", async label => {
+    const env = envs.get(label)!;
+    for (const operation of ["listMachines", "getMachine", "build", "flyctl deploy"] as const) {
+      f = deployFixture(); f.state.work = false;
+      const raw = 'invalid (422) {"password":"quoted-secret"} /machines?key=query-secret Bearer bearer-secret --token argv-secret';
+      const error = new Error(operation === "build" ? "x".repeat(250) : raw);
+      if (operation === "build") f.config.kgSourceRepo = "owner/kg";
+      if (operation === "flyctl deploy") await setOptions(env, true);
+      if (operation === "listMachines" || operation === "getMachine") vi.mocked(f.deps.fly[operation]).mockRejectedValue(error);
+      else vi.mocked(f.deps.flyctl).mockRejectedValue(error);
+      const outcome = createSelfDeployOutcomeHandler({ notifyType: "slack", notifyWebhookUrl: "https://notice.test", kgSidecarUrl: "" });
+      const original = f.deps.onOutcome;
+      f.deps.onOutcome = vi.fn(async (record, detail) => {
+        await original(record, detail);
+        await outcome(record, detail);
+      });
+      const notice = vi.spyOn(notify, "notifyDeploy").mockResolvedValue(undefined);
+      const log = vi.spyOn(console, "warn");
+      try {
+        await start(env);
+        const record = await terminal(env, f, "failed", "apply-failed");
+        const detail = vi.mocked(f.deps.onOutcome).mock.calls[0][1]!;
+        const prefix = `${operation} HTTP ${operation === "build" ? "unknown" : "422"} `;
+        expect(detail.startsWith(prefix)).toBe(true);
+        if (operation === "build") expect(detail.slice(prefix.length)).toHaveLength(200);
+        expect(detail.slice(prefix.length).length).toBeLessThanOrEqual(200);
+        expect(detail).not.toMatch(/quoted-secret|query-secret|bearer-secret|argv-secret|\?|--token/);
+        const lines = log.mock.calls.flat().filter(line => String(line).includes(` ${record!.deployId} apply error `));
+        expect(lines).toEqual(Array(operation === "build" ? 3 : 1).fill(`[self-deploy] ${record!.deployId} apply error ${detail}`));
+        expect(notice).toHaveBeenCalledWith("slack", "https://notice.test", expect.objectContaining({
+          kind: "deploy-failed", detail: `apply-failed: ${detail}`,
+        }));
+        expect(record!.reason).toBe("apply-failed");
+      } finally {
+        notice.mockRestore(); log.mockRestore();
+        if (operation === "flyctl deploy") await setOptions(env, false);
+      }
+    }
+  });
+  it.each(VARIANTS)("releases hold after exhausting Machines rate limits (%s)", async label => {
+    f = deployFixture(); f.state.work = false; f.config.kgSourceRepo = "owner/kg";
+    vi.mocked(f.deps.fly.updateMachine).mockRejectedValue(Object.assign(new Error("rate limited"), { status: 429 }));
+    await start(envs.get(label)!); await terminal(envs.get(label)!, f, "failed", "apply-failed");
+    expect(f.deps.fly.updateMachine).toHaveBeenCalledTimes(3);
+    expect(f.deps.flyctl).toHaveBeenCalledOnce();
+    expect(f.state.held).toBe(false);
   });
   it.each(VARIANTS)("exhausts non-HTTP build failures and releases the hold (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
