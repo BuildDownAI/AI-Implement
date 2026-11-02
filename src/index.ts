@@ -5038,6 +5038,12 @@ export async function onRestateRegistered(deps: {
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
+/** Adapt transient apply diagnostics to the notice without changing the durable record. */
+export function createSelfDeployOutcomeHandler(config: Parameters<typeof onSelfDeployOutcome>[0]) {
+  return (record: import("./restate/self-deploy.js").SelfDeployRecord, detail?: string) =>
+    onSelfDeployOutcome(config, detail ? { ...record, reason: `${record.reason}: ${detail}` } : record);
+}
+
 const RESTATE_REGISTRATION_RETRY_MS = 60_000;
 
 /**
@@ -5330,7 +5336,8 @@ async function main(): Promise<void> {
     drainProbes: createRestateDrainProbes,
     setHold: async (held) => { if (held) setDeployHold(); else clearDeployHold(); },
     sourceCommit: () => process.env.AI_IMPLEMENT_SOURCE_COMMIT || undefined,
-    onOutcome: (record) => onSelfDeployOutcome(config, record),
+    // Only the notification/outcome copy carries diagnostic text; the durable record stays stable.
+    onOutcome: createSelfDeployOutcomeHandler(config),
   })];
   const bootReconciliation = createBootReconciliation(
     () => startupReconciliation(config, registry),
