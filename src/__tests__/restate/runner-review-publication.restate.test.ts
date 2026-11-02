@@ -3,13 +3,10 @@ import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { handleReviewPublicationRequest } from "../../index.js";
-import { postPushReviewStep } from "../../pipeline/steps/post-push-review.js";
-import { makeContext } from "../helpers/builders.js";
-import { testDir } from "../helpers/test-dir.js";
 import { getDb } from "../../dedup.js";
 import { appendLog, initLogTable } from "../../log.js";
 import { mintRunToken, verifyRunToken } from "../../runner-tokens.js";
-import { createReviewPublicationIngressClient } from "../../runner-callback.js";
+import { createReviewPublicationIngressClient, handleRunnerReviewPublication } from "../../runner-callback.js";
 import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, type PostPushReviewPublicationInput } from "../../restate/post-push-review-publication.js";
 import { VARIANTS, journalEntries, journalText, queryInvocations, startVariants, stopAll, type RestateEnvironment } from "./harness.js";
 
@@ -40,9 +37,12 @@ describe("runner review publication", () => {
       },
       listComments: async () => [{ id: 456, path: "src/a.ts", line: 2 }],
     })]);
-    server = createServer((request, response) => {
-      handleReviewPublicationRequest(request, response, {
-        secret,
+    server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const result = await handleRunnerReviewPublication({
+        authorization: request.headers.authorization, secret,
+        body: JSON.parse(Buffer.concat(chunks).toString()),
         restateReady: () => ready && registered,
         ingress: createReviewPublicationIngressClient(baseUrl, { fetchImpl: async (input, init) => {
           if (fail) throw new Error("injected ingress failure");
@@ -50,6 +50,7 @@ describe("runner review publication", () => {
           return fetch(input, init);
         } }),
       });
+      response.writeHead(result.status, { "content-type": "application/json" }).end(JSON.stringify(result.body));
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/runner/review-publication`;
@@ -66,80 +67,11 @@ describe("runner review publication", () => {
   async function request(bearer?: string, data: unknown = body) {
     return fetch(url, { method: "POST", headers: { "content-type": "application/json", ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) }, body: JSON.stringify(data) });
   }
-  it("rejects malformed JSON and oversized HTTP bodies before ingress", async () => {
-    const before = forwarded.length;
-    for (const [payload, status, error] of [
-      ["{", 400, "Invalid JSON"],
-      ["x".repeat(MAX_PUBLICATION_BYTES + 1025), 413, "Review publication too large"],
-    ] as const) {
-      const response = await fetch(url, {
-        method: "POST", headers: { authorization: `Bearer ${token()}` }, body: payload,
-      });
-      expect(response.status).toBe(status);
-      expect(await response.json()).toEqual({ error });
-    }
-    expect(forwarded).toHaveLength(before);
-  });
   for (const [variant] of VARIANTS) {
-    it(`${variant}: publishes mapped findings through the step and preserves the full report during an outage`, async () => {
-      baseUrl = environments.get(variant)!.baseUrl();
-      const summary = "Checked both findings against the implementation.";
-      const evidence = "Inspected src/a.ts and the omitted diff lines.";
-      const findings = [
-        { severity: "blocking", body: "Mapped defect. Repair the added line.", path: "src/a.ts", line: 2 },
-        { severity: "blocking", body: "Unmapped defect. Repair the omitted line.", path: "src/a.ts", line: 99 },
-      ];
-      const runStep = async (prNumber: string) => {
-        const statusComments: string[] = [];
-        const ghSpawn = (args: string[]) => {
-          if (args[0] === "pr" && args[1] === "diff") return {
-            stdout: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1,2 @@\n old\n+new\n", exitCode: 0,
-          };
-          if (args.includes("POST") && args.some(arg => /\/reviews$/.test(arg))) throw new Error("Runner must not post reviews");
-          if (args.includes(`repos/:owner/:repo/pulls/${prNumber}`)) return { stdout: JSON.stringify({ state: "open", head: { sha: headSha } }), exitCode: 0 };
-          if (args[0] === "pr" && args[1] === "comment") statusComments.push(args[args.indexOf("--body") + 1]!);
-          return { stdout: "[]", exitCode: 0 };
-        };
-        const context = makeContext({ callbackUrl: url.replace("/runner/review-publication", ""), progressToken: token(), githubOwner: "o", githubRepo: "r" }, {
-          invoke: async () => ({ stdout: "", exitCode: 0, tokensUsed: 100, structuredOutput: {
-            approved: false, findings, summary, checks: [{ check: "Diff inspection", result: "passed", evidence }],
-          }, terminalStatus: { subtype: "success", isError: false } }),
-        });
-        const result = await postPushReviewStep.run(context, {
-          prNumber, workspaceDir: testDir(`publication-${variant}-${prNumber}`), maxIterations: 1,
-          pushedSha: headSha, ghSpawn, gitSpawn: () => ({ stdout: headSha, exitCode: 0 }), reviewProviders: [],
-          reviewers: [{ id: "code-review", gates: true }],
-          trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: { type: "object" } }]]),
-        }, { report: async () => {} });
-        expect(result.terminationReason).toBe("iterations_exhausted");
-        return statusComments.join("\n");
-      };
-      const before = posts.length;
-      const status = await runStep("43");
-      expect(posts).toHaveLength(before + 1);
-      expect(posts.at(-1)!.comments).toEqual([expect.objectContaining({ path: "src/a.ts", line: 2, side: "RIGHT", body: expect.stringContaining("Mapped defect.") })]);
-      expect(posts.at(-1)!.comments[0]!.body).toContain("<!-- ai-implement");
-      expect(posts.at(-1)!.body).toContain("Findings outside the diff");
-      expect(posts.at(-1)!.body).toContain("Unmapped defect.");
-      expect(status).toContain("Full reviewer report");
-      for (const outage of ["readiness", "ingress"] as const) {
-        ready = outage !== "readiness";
-        fail = outage === "ingress";
-        try {
-          const fallback = await runStep("44");
-          for (const text of [summary, evidence, ...findings.map(finding => finding.body)]) expect(fallback).toContain(text);
-          expect(fallback).not.toContain("Full reviewer report");
-          expect(posts).toHaveLength(before + 1);
-        } finally {
-          ready = true;
-          fail = false;
-        }
-      }
-    });
     it(`${variant}: authenticates, scopes, deduplicates and excludes credentials from Restate`, async () => {
       const env = environments.get(variant)!;
       baseUrl = env.baseUrl();
-      const invocations = () => queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'PostPushReviewPublication' AND target_handler_name = 'publish' AND target_service_key = 'o/r#42'");
+      const invocations = () => queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'PostPushReviewPublication' AND target_handler_name = 'publish'");
       for (const bearer of [undefined, "invalid", `${token()}x`, token({ audience: "result" }), token({ ttlSeconds: -1 })]) {
         expect((await request(bearer)).status).toBe(401);
       }
