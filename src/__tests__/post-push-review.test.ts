@@ -174,6 +174,61 @@ describe("postPushReviewStep", () => {
     expect(comments.join("\n")).toContain(REVIEW_LINK);
   });
 
+  it.each(["mixed", "moved-head", "unreadable-head", "101-findings", "oversized"])("bounds publication and binds the reviewed head: %s", async (scenario) => {
+    let diffRead = false;
+    const statusComments: string[] = [];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const gh = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") {
+        diffRead = true;
+        return { stdout: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) {
+        if (scenario === "unreadable-head") return { stdout: "", exitCode: 1 };
+        return { stdout: JSON.stringify({ state: "open", head: { sha: diffRead ? "new-head" : PR_HEAD_SHA } }), exitCode: 0 };
+      }
+      if (scenario === "mixed" && args.includes("graphql")) {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [{ isResolved: false, isOutdated: false, path: "src/a.ts", line: 1, comments: { nodes: [{ body: "External finding.", author: { login: "claude[bot]" }, url: "https://example.com/external" }] } }], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") statusComments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const summary = scenario === "oversized" ? "Full evidence 🧪\n".repeat(6000) : "Review evidence";
+    const findings = Array.from({ length: scenario === "101-findings" ? 101 : 1 }, (_, i) => ({ severity: "blocking", body: `Internal finding ${i}. Fix it.`, path: "src/a.ts", line: 1 }));
+    await runReview(makeCtx(vi.fn(async () => structuredReviewResult({ approved: false, findings, summary }))), {
+      prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: gh,
+      ...(scenario === "mixed" ? {} : { reviewProviders: [] }),
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
+    }, { report: vi.fn(async () => undefined) });
+    if (scenario === "unreadable-head") {
+      expect(publicationFetch.calls).toHaveLength(0);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("head unreadable"));
+      expect(statusComments.join("\n")).toContain(summary);
+    } else {
+      expect(publicationFetch.calls).toHaveLength(1);
+      const request = JSON.parse(publicationFetch.calls[0].body);
+      expect(request.headSha).toBe(PR_HEAD_SHA);
+      if (scenario === "mixed") {
+        expect(request.comments).toHaveLength(1);
+        expect(request.comments[0].body).toContain("Internal finding");
+        expect(request.body).toContain("External finding");
+      }
+      if (scenario === "101-findings") {
+        expect(request.comments).toHaveLength(100);
+        expect(request.body).toContain("### Findings outside the diff");
+        expect(request.body).toContain("Internal finding 100");
+      }
+      if (scenario === "oversized") {
+        expect(Buffer.byteLength(publicationFetch.calls[0].body, "utf8")).toBeLessThanOrEqual(48_000);
+        expect(request.comments).toEqual([]);
+        expect(request.body).toContain("full report is in the status comment");
+        expect(statusComments.join("\n")).toContain(summary);
+      }
+    }
+    warn.mockRestore();
+  });
+
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" };
     const ghComments: string[] = [];

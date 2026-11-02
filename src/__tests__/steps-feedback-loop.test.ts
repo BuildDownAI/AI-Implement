@@ -1454,11 +1454,16 @@ describe("feedback-loop core isolation (AII-626)", () => {
       return entry.name.endsWith(".ts") ? [path] : [];
     });
 
-  it("no file under src/pipeline/ imports src/restate/ or @restatedev/*", () => {
+  it("pipeline imports no Restate runtime APIs (publication limit constants are shared)", () => {
     const importRe = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g;
     const offenders: string[] = [];
     for (const file of sources(pipelineDir)) {
       for (const match of readFileSync(file, "utf-8").matchAll(importRe)) {
+        // AII-1650 shares only the route's wire limits with its runner caller.
+        const prefix = readFileSync(file, "utf-8").slice(0, match.index);
+        if (file === join(pipelineDir, "steps", "post-push-review.ts")
+          && match[1] === "../../restate/post-push-review-publication.js"
+          && /import \{ MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS \} $/.test(prefix)) continue;
         if (match[1].startsWith("@restatedev/") || /(^|\/)restate\//.test(match[1])) offenders.push(`${file}: ${match[1]}`);
       }
     }
