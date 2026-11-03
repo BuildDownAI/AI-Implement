@@ -26,7 +26,10 @@ export const FAILURE_CATEGORIES: readonly FailureCategory[] = [
   "unknown",
 ];
 
+export interface ModelFallback { stage: "planning" | "implementation" | "review"; from: string; to: string }
+
 export interface FailureRecord {
+  modelFallback?: ModelFallback;
   category: FailureCategory;
   /** Open-ended machine code, UPPER_SNAKE, e.g. PROVIDER_OVERLOADED, GIT_LEASE_REJECTED. */
   code: string;
