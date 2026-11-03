@@ -5,7 +5,7 @@ import { fakeFetch, type Reply, type Routes, type FakeFetch } from "../helpers/f
 import { createModelPrices, MODEL_PRICES_REFRESH_INTERVAL_MS, type ModelPricesCurrent } from "../../restate/model-prices.js";
 import {
   VARIANTS, callObject, eventually, gate, attachInvocation, journalEntries, journalText,
-  queryInvocations, cancelInvocation, setObjectState, startVariants, stopAll, type RestateEnvironment,
+  queryInvocations, cancelInvocationIfLive, setObjectState, startVariants, stopAll, type RestateEnvironment,
 } from "./harness.js";
 
 const recordings = Object.fromEntries(["several-models", "empty", "unavailable"].map(name => [
@@ -154,7 +154,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
           issuers.set(key, undefined);
           for (const row of await invocations(key)) {
             if (row.status !== "completed" && row.status !== "cancelled") {
-              await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+              await cancelInvocationIfLive(env().adminAPIBaseUrl(), String(row.id));
             }
           }
         }
@@ -195,7 +195,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
             issuers.set(key, undefined);
             await eventually(async () => {
               const live = (await invocations(key)).filter(row => row.status !== "completed" && row.status !== "cancelled");
-              for (const row of live) await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+              for (const row of live) await cancelInvocationIfLive(env().adminAPIBaseUrl(), String(row.id));
               return live;
             }, rows => rows.length === 0, {
               label: `ModelPrices invocations of ${key} did not settle`, timeoutMs: 10_000,
@@ -217,7 +217,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
           issuers.set(key, undefined);
           await eventually(async () => {
             const live = (await invocations(key)).filter(row => row.status !== "completed" && row.status !== "cancelled");
-            for (const row of live) await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+            for (const row of live) await cancelInvocationIfLive(env().adminAPIBaseUrl(), String(row.id));
             return live;
           }, rows => rows.length === 0, {
             label: `ModelPrices invocations of ${key} did not settle`, timeoutMs: 10_000,
