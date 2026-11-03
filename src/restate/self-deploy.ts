@@ -197,6 +197,19 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             }
             return true;
           } catch (error) {
+            const builtDeployFailed = record.target.source === "built" && operation === "flyctl deploy";
+            if (builtDeployFailed) {
+              // The release may have stopped this process after accepting the deploy.
+              // Reconcile once, but never start another remote build in this effect.
+              try {
+                const machines = await deps.fly.listMachines(token, ctx.key);
+                const fresh = [];
+                for (const machine of machines) fresh.push(await deps.fly.getMachine(token, ctx.key, machine.id));
+                if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
+              } catch {
+                // Preserve the original deploy failure if reconciliation is unavailable.
+              }
+            }
             const raw = error instanceof Error ? error.message : "Unknown error";
             const status = (error as { status?: number } | null)?.status ?? (Number(raw.match(/(?:\(|\bHTTP\s+)([45]\d\d)\b/i)?.[1]) || undefined);
             // Keep flyctl diagnostics, but drop command/argv suffixes (including build secrets).
@@ -213,7 +226,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             const machinesApi = ["listMachines", "getMachine", "updateMachine"].includes(operation);
             const fixed = status !== undefined && status >= 400 && status < 500
               && !(machinesApi && (status === 409 || status === 429));
-            if (fixed || attempt === 2) return { detail };
+            if (builtDeployFailed || fixed || attempt === 2) return { detail };
             await new Promise(resolve => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1_000)));
           }
         }

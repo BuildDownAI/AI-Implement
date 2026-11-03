@@ -360,7 +360,7 @@ describe("SelfDeploy durable phase machine", () => {
         expect(detail.slice(prefix.length).length).toBeLessThanOrEqual(200);
         expect(detail).not.toMatch(/quoted-secret|query-secret|bearer-secret|argv-secret|\?|--token/);
         const lines = log.mock.calls.flat().filter(line => String(line).includes(` ${record!.deployId} apply error `));
-        expect(lines).toEqual(Array(operation === "built flyctl deploy" ? 3 : 1).fill(`[self-deploy] ${record!.deployId} apply error ${detail}`));
+        expect(lines).toEqual([`[self-deploy] ${record!.deployId} apply error ${detail}`]);
         expect(notice).toHaveBeenCalledWith("slack", "https://notice.test", expect.objectContaining({
           kind: "deploy-failed", detail: `apply-failed: ${detail}`,
         }));
@@ -389,7 +389,7 @@ describe("SelfDeploy durable phase machine", () => {
         expect(detail).not.toMatch(/secret-fly|secret-kg/);
         expect(f.deps.onOutcome).toHaveBeenCalledWith(record, detail);
         expect(log.mock.calls.flat()).toContain(`[self-deploy] ${record!.deployId} apply error ${detail}`);
-        expect(f.deps.flyctl).toHaveBeenCalledTimes(status === "404" ? 1 : 3);
+        expect(f.deps.flyctl).toHaveBeenCalledOnce();
       } finally { log.mockRestore(); }
     }
   });
@@ -460,12 +460,26 @@ describe("SelfDeploy durable phase machine", () => {
     expect(f.deps.flyctl).not.toHaveBeenCalled();
     expect(f.state.held).toBe(false);
   });
-  it.each(VARIANTS)("exhausts non-HTTP build failures and releases the hold (%s)", async label => {
+  it.each(VARIANTS)("recovers a rejected built deploy when machines already run the target (%s)", async label => {
+    f = deployFixture(); const env = envs.get(label)!;
+    f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
+    vi.mocked(f.deps.flyctl).mockImplementation(async record => {
+      f.machine.config.image = record.target.image;
+      throw new Error("release stopped this process");
+    });
+    await start(env); await phase(env, "verifying");
+    expect(f.deps.flyctl).toHaveBeenCalledOnce();
+    expect(f.deps.fly.listMachines).toHaveBeenCalledTimes(2);
+    expect(f.deps.fly.getMachine).toHaveBeenCalledTimes(2);
+    expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
+    await terminal(env, f, "succeeded");
+  });
+  it.each(VARIANTS)("fails after one built deploy attempt and releases the hold (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!;
     f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
     vi.mocked(f.deps.flyctl).mockRejectedValue(new Error("target commit does not compile"));
     await start(env); await terminal(env, f, "failed", "apply-failed");
-    expect(f.deps.flyctl).toHaveBeenCalledTimes(3);
+    expect(f.deps.flyctl).toHaveBeenCalledOnce();
     expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
     expect(f.state.held).toBe(false);
     // The exclusive lock is released, so another request can be handled.
@@ -483,7 +497,7 @@ describe("SelfDeploy durable phase machine", () => {
     try { for (const env of local.values()) {
       signals.length = 0;
       await start(env); await terminal(env, fixture, "failed", "apply-failed");
-      expect(signals).toHaveLength(3);
+      expect(signals).toHaveLength(1);
       expect(signals.every(signal => signal.aborted)).toBe(true);
       expect(fixture.state.held).toBe(false);
     } } finally { await stopAll(local); }
