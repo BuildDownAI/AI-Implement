@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   encodeRunConfig,
@@ -972,5 +973,26 @@ describe("private credentials namespace (AII-981)", () => {
     const decoded = JSON.parse(Buffer.from(encodeRunConfig(long), "base64").toString());
     expect(decoded.issue.description.length).toBeLessThan(200_000);
     expect(decoded).not.toHaveProperty("extra");
+  });
+});
+
+
+describe("public model prices envelope", () => {
+  const prices = JSON.parse(readFileSync(new URL("./fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+  it("projects only public prices in builders and encode/decode", () => {
+    const copy = { prices: prices.map((p: object) => ({ ...p, secret: "drop" })), fetchedAt: 123, lastError: "drop", credential: "drop" };
+    const input = { issue: full.issue, mapping: makeMapping(), baseBranch: "testing", retryPolicy: DEFAULT_RETRY_POLICY, modelPrices: copy };
+    for (const built of [buildImplRunConfig(input), buildRunConfig({ ...input, runnerPhase: "implementation" })]) {
+      expect(built.modelPrices).toEqual({ prices, fetchedAt: 123 });
+      expect(decodeRunConfig(encodeRunConfig({ ...built, modelPrices: copy })).modelPrices).toEqual({ prices, fetchedAt: 123 });
+      expect(diagnosticProjection({ ...built, modelPrices: copy }).modelPrices).toEqual({ prices, fetchedAt: 123 });
+    }
+  });
+  it("omits missing and empty copies", () => {
+    for (const modelPrices of [undefined, { prices: [], fetchedAt: null }]) {
+      const built = buildRunConfig({ issue: full.issue, mapping: makeMapping(), runnerPhase: "implementation", retryPolicy: null, modelPrices });
+      expect(built).not.toHaveProperty("modelPrices");
+      expect(decodeRunConfig(encodeRunConfig(built))).not.toHaveProperty("modelPrices");
+    }
   });
 });

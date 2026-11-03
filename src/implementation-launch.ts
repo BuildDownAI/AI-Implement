@@ -60,6 +60,7 @@ async function getTargetRepoToken(
 }
 
 export interface PrepareImplementationLaunchArgs {
+  modelPrices?: RunConfigV1["modelPrices"];
   config: AppConfig;
   issue: TicketIssue;
   mapping: RepoMapping;
@@ -135,6 +136,7 @@ export async function prepareImplementationLaunch(args: PrepareImplementationLau
 
     const dispatchInputs = contract === "envelope"
       ? buildEnvelopeDispatchInputs(mapping, issue, {
+          modelPrices: args.modelPrices,
           runnerPhase: "implementation",
           baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
           runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -298,6 +300,7 @@ export interface ImplementationSessionInput {
 }
 
 export interface LaunchImplementationSessionArgs {
+  modelPrices?: RunConfigV1["modelPrices"];
   config: AppConfig;
   issue: TicketIssue;
   mapping: RepoMapping;
@@ -360,6 +363,7 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
   }
 
   const implRunConfig: RunConfigV1 = buildImplRunConfig({
+    modelPrices: args.modelPrices,
     issue,
     mapping,
     baseBranch,
@@ -456,6 +460,7 @@ export async function launchImplementationLocalSession(args: LaunchImplementatio
   const protectedLaunch = managedAuth.kind === "launch" ? managedAuth : null;
 
   const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
+    modelPrices: args.modelPrices,
     issue,
     mapping,
     baseBranch,

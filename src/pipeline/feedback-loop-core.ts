@@ -71,6 +71,7 @@ export interface PassStat extends Record<string, unknown> {
   implementTurns: number | null;
   implementOutcome: string;   // RunTelemetry outcome or "unknown"
   costUsd: number | null;
+  reviewTelemetry?: RunTelemetry;
   reviewCostUsd: number | null; // null when review never ran, or ran without telemetry, on this pass
   reviewApproved: boolean | null; // null when review never ran on this pass
   tokensIn?: number | null;
@@ -524,6 +525,7 @@ export async function runFeedbackLoop(
         reviewIssues = [...reviewOutputs.issues];
         pass.reviewApproved = reviewOutputs.approved;
         pass.reviewAttempts = reviewAttemptsTotal;
+        pass.reviewTelemetry = reviewOutputs.telemetry;
         pass.reviewCostUsd = reviewOutputs.telemetry?.costUsd ?? null;
         if (approved) terminationReason = "approved";
         effects.writeCycleSummary({
@@ -585,6 +587,7 @@ export async function runFeedbackLoop(
         }
 
         approved = false;
+        pass.reviewTelemetry = reviewErrTelemetry;
         pass.reviewCostUsd = reviewErrTelemetry?.costUsd ?? null;
         pass.reviewAttempts = reviewAttemptsTotal;
         reviewStageFailed = true;

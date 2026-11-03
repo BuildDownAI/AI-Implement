@@ -1,3 +1,4 @@
+import type { ModelPriceRates } from "./model-price-estimate.js";
 import type { ReferenceRepo } from "./reference-repos.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import type { RepoMapping, ReviewerSelection } from "./config.js";
@@ -47,6 +48,18 @@ export interface ResolvedAgentSnapshotV1 {
   profiles: ConfiguredStageResolution["profiles"];
 }
 
+export interface RunModelPrices {
+  prices: (ModelPriceRates & { version: string; effectiveFrom: string | null })[];
+  fetchedAt: number | null;
+}
+
+/** Project public fields explicitly at the runner trust boundary. */
+export function copyModelPrices(value: RunModelPrices | undefined): RunModelPrices | undefined {
+  if (!value?.prices?.length) return undefined;
+  return { prices: value.prices.map(({ model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd }) =>
+    ({ model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd })), fetchedAt: value.fetchedAt };
+}
+
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
  * workflow_dispatch input (`run_config`) on GHA and as the
@@ -58,6 +71,7 @@ export interface ResolvedAgentSnapshotV1 {
  * `encodeRunConfig`, `decodeRunConfig`, `pickKnownKeys` or `diagnosticProjection`.
  */
 export interface RunConfigV1 {
+  modelPrices?: RunModelPrices;
   v: 1;
   issue: { id: string; identifier: string; title: string; description: string };
   prNumber?: string;
@@ -442,6 +456,7 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 }
 
 export interface ImplRunConfigInput {
+  modelPrices?: RunModelPrices;
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
   baseBranch: string;
@@ -462,6 +477,7 @@ export interface ImplRunConfigInput {
 export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
   const { issue, mapping, baseBranch, runnerCallbackUrl, groupingParent, retryPolicy, agentConfig } = input;
   return buildRunConfig({
+    modelPrices: input.modelPrices,
     runnerPhase: "implementation",
     issue,
     mapping,
@@ -474,6 +490,7 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
 }
 
 export interface RunConfigBuildInput {
+  modelPrices?: RunModelPrices;
   runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
@@ -502,7 +519,9 @@ export interface RunConfigBuildInput {
  */
 export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
   const { issue, mapping } = input;
+  const modelPrices = copyModelPrices(input.modelPrices);
   return {
+    ...(modelPrices ? { modelPrices } : {}),
     v: 1,
     issue: {
       id: issue.id,
@@ -601,6 +620,8 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
     kgDryRun, kgSourceRef, referenceRepos,
     reviewers, reviewProcess, trustedReviewAuthors, retryPolicy, reviewFix, agentConfig } = cfg;
   const out: RunConfigV1 = { v, issue };
+  const prices = copyModelPrices(cfg.modelPrices);
+  if (prices) out.modelPrices = prices;
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
   if (runnerPhase !== undefined) out.runnerPhase = runnerPhase;
