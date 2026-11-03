@@ -109,7 +109,7 @@ import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
@@ -5407,7 +5407,9 @@ async function main(): Promise<void> {
   // Every write postBootNotice makes — LAST_IMAGE_REF_KEY and LAST_SHUTDOWN_AT_KEY — happens
   // synchronously before its first await, so nothing is lost if the webhook never answers. Keep it
   // that way: a write moved below an await here stops persisting silently and misclassifies every later boot.
-  void postBootNotice(config);
+  void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
+    ? { probe: remainingMs => probeWithTimeout(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
+    : undefined);
 
   // Reconcile machines from any previous run before starting the poll loop
   await refreshRunnerBackendCache();

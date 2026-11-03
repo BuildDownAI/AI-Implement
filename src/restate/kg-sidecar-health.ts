@@ -2,10 +2,11 @@
  * `KgSidecarHealth` — a Virtual Object, one key (`sidecar`), that re-probes the KG sidecar while it is
  * marked unavailable (AII-1527). The poll loop is the tick (`checkKgSidecarHealth`): each cycle sends
  * one `check`. The exclusive handler queues a second `check` behind the first, so two probes from this
- * object never run at once, and the probe result is in the invocation's journal. No object state.
+ * object never run at once, and the probe result is in the invocation's journal. Recovery sends are journaled in a named step.
  */
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext } from "@restatedev/restate-sdk";
+import { clearKgRecoveryNotice, hasKgRecoveryNotice, postKgRecoveryNotice } from "../deploy-notify.js";
 import { isDeployHeld } from "../deploy-hold.js";
 import type { SidecarHealth } from "../kg-provider.js";
 import { SidecarMemoryProvider, getKgMemoryProvider, isKgUnavailable, probeWithTimeout } from "../kg-provider.js";
@@ -15,6 +16,8 @@ import { getRestateStatus } from "./status.js";
 export interface KgSidecarHealthDeps {
   /** A plain function (no ctx). Resolves `null` when there is nothing to probe. */
   probe(): Promise<SidecarHealth | null>;
+  notifyRecovery?: () => Promise<void>;
+  clearRecovery?: () => void;
 }
 
 export const KG_SIDECAR_HEALTH_KEY = "sidecar";
@@ -24,7 +27,25 @@ export function createKgSidecarHealth(deps: KgSidecarHealthDeps) {
     name: "KgSidecarHealth",
     handlers: {
       check: restate.handlers.object.exclusive(
-        async (ctx: ObjectContext): Promise<SidecarHealth | null> => ctx.run("probe", () => deps.probe()),
+        async (ctx: ObjectContext): Promise<SidecarHealth | null> => {
+          const health = await ctx.run("probe", () => deps.probe());
+          if (health && !health.lastError) {
+            try {
+              await ctx.run("notify-recovery", () => (deps.notifyRecovery ?? postKgRecoveryNotice)(), {
+                maxRetryAttempts: 3,
+              });
+            } catch (err) {
+              // Only exhausted delivery failures may abandon the notice. Runtime
+              // suspension and invocation cancellation must unwind unchanged.
+              if (!(err instanceof restate.TerminalError) || err.code === 409) throw err;
+              await ctx.run("discard-recovery", () => {
+                (deps.clearRecovery ?? clearKgRecoveryNotice)();
+                console.warn(`[deploy-notify] KG recovery notice failed: ${err instanceof Error ? err.message : String(err)}`);
+              }, { maxRetryAttempts: 3 });
+            }
+          }
+          return health;
+        },
       ),
     },
   });
@@ -37,7 +58,7 @@ export type KgSidecarHealthDefinition = ReturnType<typeof createKgSidecarHealth>
  * marked unavailable, so a `check` queued behind a recovery is a no-op. `probeWithTimeout` never throws.
  */
 export async function probeKgSidecarIfUnavailable(): Promise<SidecarHealth | null> {
-  if (!isKgUnavailable()) return null;
+  if (!isKgUnavailable() && !hasKgRecoveryNotice()) return null;
   const provider = getKgMemoryProvider();
   if (!(provider instanceof SidecarMemoryProvider)) return null;
   return probeWithTimeout(provider);
@@ -68,7 +89,7 @@ export async function checkKgSidecarHealth(deps: CheckKgSidecarHealthDeps = {}):
       return restateStatus.sidecar.state === "ready" && restateStatus.registration.state === "registered";
     });
   if (!ready()) return;
-  if (!(deps.unavailable ?? isKgUnavailable)()) return;
+  if (!(deps.unavailable ?? (() => isKgUnavailable() || hasKgRecoveryNotice()))()) return;
   try {
     const response = await (deps.fetchImpl ?? fetch)(
       `${RESTATE_INGRESS_BASE_URL}/KgSidecarHealth/${KG_SIDECAR_HEALTH_KEY}/check/send`,
