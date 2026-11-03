@@ -1,11 +1,10 @@
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import * as restate from "@restatedev/restate-sdk";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { fakeFetch, type Reply, type Routes, type FakeFetch } from "../helpers/fake-fetch.js";
 import { createModelPrices, MODEL_PRICES_REFRESH_INTERVAL_MS, type ModelPricesCurrent } from "../../restate/model-prices.js";
 import {
-  VARIANTS, callObject, eventually, journalEntries, journalText,
+  VARIANTS, callObject, eventually, gate, attachInvocation, journalEntries, journalText,
   queryInvocations, cancelInvocation, setObjectState, startVariants, stopAll, type RestateEnvironment,
 } from "./harness.js";
 
@@ -26,7 +25,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
   let interval: number | undefined;
   let requestOptions: Map<string, RequestInit | undefined>;
   const routes: Routes = {};
-  const configurations = new Map<string, { issuer: string | undefined; interval: number | undefined }>();
+  const issuers = new Map<string, string | undefined>();
   const callsFor = (key: string) => endpoint.calls.filter(call => call.url.pathname === `/${key}/api/model-prices`);
   const SENTINEL = "PRIVATE-NETWORK-ERROR-SENTINEL";
   beforeEach(() => {
@@ -36,31 +35,14 @@ describe("ModelPrices configuration and failure scheduling", () => {
     endpoint = fakeFetch(routes);
   });
   beforeAll(async () => {
-    // Resolve configuration from the invocation's key, even when an old timer runs
-    // after beforeEach has installed the next test's fake endpoint.
-    const modelFor = (key: string) => {
-      const model = createModelPrices({
-        issuer: () => {
-          const value = configurations.get(key)?.issuer;
-          return value === "https://auth.example" ? `${value}/${key}` : value;
-        },
-        get refreshIntervalMs() { return configurations.get(key)?.interval; },
-        fetch: async (url, init) => {
-          requestOptions.set(String(url), init);
-          return endpoint.fetch(url, init);
-        },
-      });
-      // The SDK runtime exposes handlers on `object`; its definition type only
-      // carries the service name. Keep the cast local to this fixture adapter.
-      return (model as typeof model & { object: restate.VirtualObject<typeof model> }).object;
-    };
-    type RefreshInput = Parameters<ReturnType<typeof modelFor>["refresh"]>[1];
-    environments = await startVariants([restate.object({ name: "ModelPrices", handlers: {
-      refresh: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, input: RefreshInput) =>
-        modelFor(ctx.key).refresh(ctx, input)),
-      current: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) =>
-        modelFor(ctx.key).current(ctx)),
-    } })]);
+    environments = await startVariants([createModelPrices({
+      issuer: key => issuers.get(key),
+      get refreshIntervalMs() { return interval; },
+      fetch: async (url, init) => {
+        requestOptions.set(String(url), init);
+        return endpoint.fetch(url, init);
+      },
+    })]);
   }, 60_000);
   afterAll(async () => { await stopAll(environments); });
 
@@ -68,8 +50,10 @@ describe("ModelPrices configuration and failure scheduling", () => {
     describe(variant, () => {
       const env = () => environments.get(variant)!;
       const refresh = (key: string, body: unknown) => {
-        if (!configurations.has(key)) {
-          configurations.set(key, { issuer, interval });
+        if (!issuers.has(key)) {
+          // New timer invocations must resolve configuration by their own key,
+          // independently of whichever test is currently configuring the fixture.
+          issuers.set(key, issuer === "https://auth.example" ? `${issuer}/${key}` : issuer);
           routes[`GET /${key}/api/model-prices`] = call => typeof reply === "function" ? reply(call) : reply;
         }
         return callObject<number | null>(env().baseUrl(), "ModelPrices", key, "refresh", body);
@@ -137,6 +121,89 @@ describe("ModelPrices configuration and failure scheduling", () => {
         expect(callsFor(key)).toHaveLength(4);
       });
 
+      it("completes a refresh replay after its issuer changes", async () => {
+        issuer = "https://auth.example";
+        const key = randomUUID();
+        const reading = gate("model prices fetch before issuer change");
+        reply = async () => {
+          await reading.wait();
+          return { json: { prices: [] } };
+        };
+        const original = refresh(key, { reason: "requested" });
+        // Restart can disconnect the original ingress request; attach to the same
+        // durable invocation below instead of issuing another refresh.
+        void original.catch(() => undefined);
+        try {
+          await reading.reached();
+          const rows = await invocations(key);
+          const invocation = rows.find(row => row.target_handler_name === "refresh")!;
+          issuers.set(key, undefined);
+          await env().startedRestateServer.restart();
+          reading.release();
+          const completed = await eventually(() => invocations(key), rows => rows.some(row =>
+            row.id === invocation.id && row.status === "completed"), {
+            label: `refresh replay of ${key} completes without RT0016`,
+          });
+          expect(completed.find(row => row.id === invocation.id)?.last_failure_error_code).not.toBe("RT0016");
+          await attachInvocation(env().baseUrl(), String(invocation.id));
+          expect(callsFor(key).length).toBeGreaterThanOrEqual(1);
+          issuers.set(key, `https://auth.example/${key}`);
+          expect(await current(key)).toEqual({ prices: [], fetchedAt: expect.any(Number), lastError: null });
+        } finally {
+          reading.release();
+          issuers.set(key, undefined);
+          for (const row of await invocations(key)) {
+            if (row.status !== "completed" && row.status !== "cancelled") {
+              await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+            }
+          }
+        }
+      });
+
+      it("attributes an old timer to its key after the next key starts", async () => {
+        issuer = "https://auth.example";
+        interval = 500;
+        const oldKey = randomUUID();
+        const nextKey = randomUUID();
+        const oldTimer = gate("old-key timer fetch held until next key starts");
+        reply = async call => {
+          if (call.url.pathname === `/${oldKey}/api/model-prices` && callsFor(oldKey).length >= 2) {
+            await oldTimer.wait();
+          }
+          return { json: { prices: [] } };
+        };
+        try {
+          await refresh(oldKey, { reason: "boot" });
+          // Deliberately delay cancellation and hold the delivered timer while
+          // the next key starts, without requiring either request to beat a clock.
+          await oldTimer.reached();
+          interval = undefined;
+          await refresh(nextKey, { reason: "boot" });
+          oldTimer.release();
+          await eventually(() => invocations(oldKey), rows => rows.filter(row =>
+            row.target_handler_name === "refresh" && row.status === "completed").length >= 2, {
+            label: "old-key timer completed during the next key", timeoutMs: 10_000,
+          });
+          await eventually(() => callsFor(oldKey).length, count => count >= 2, {
+            label: "old-key timer attributed to its key", timeoutMs: 10_000,
+          });
+          expect(callsFor(nextKey)).toHaveLength(1);
+          expect(callsFor(oldKey).every(call => call.url.pathname === `/${oldKey}/api/model-prices`)).toBe(true);
+        } finally {
+          oldTimer.release();
+          for (const key of [oldKey, nextKey]) {
+            issuers.set(key, undefined);
+            await eventually(async () => {
+              const live = (await invocations(key)).filter(row => row.status !== "completed" && row.status !== "cancelled");
+              for (const row of live) await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+              return live;
+            }, rows => rows.length === 0, {
+              label: `ModelPrices invocations of ${key} did not settle`, timeoutMs: 10_000,
+            });
+          }
+        }
+      });
+
       it("delivers a delayed refresh after a failed read", async () => {
         issuer = "https://auth.example";
         interval = 100;
@@ -147,7 +214,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
             label: "durable model price retry delivery", timeoutMs: 10_000,
           });
         } finally {
-          configurations.get(key)!.issuer = undefined;
+          issuers.set(key, undefined);
           await eventually(async () => {
             const live = (await invocations(key)).filter(row => row.status !== "completed" && row.status !== "cancelled");
             for (const row of live) await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
@@ -190,8 +257,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
         // Inspect every completed invocation: stale and boot no-ops must never send.
         for (const row of staleRows.filter(row => row.status === "completed")) {
           const entries = await journalEntries(env().adminAPIBaseUrl(), String(row.id));
-          const text = journalText(entries);
-          if (!text.includes("read model prices")) {
+          if (!entries.some(entry => entry.name === "read model prices")) {
             expect(entries.some(entry => entry.entry_type === "Command: OneWayCall")).toBe(false);
           }
         }
