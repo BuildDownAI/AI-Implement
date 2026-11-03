@@ -415,7 +415,24 @@ describe("control-plane estimates", () => {
     const md = stats([pass], { modelPrices });
     // 700000 * input + 100000 * cache-write + 100000 * output = 2.736419752...
     expect(md).toContain("~$2.74 (estimated)");
-    expect(md.match(/Estimated with control-plane prices from 1793310000000; not the charged cost\./g)).toHaveLength(1);
+    expect(md.match(/Estimated with control-plane prices/g)).toHaveLength(1);
+  });
+  it("formats the price timestamp as ISO 8601 UTC", () => {
+    const md = stats([pass], { modelPrices: { ...modelPrices, fetchedAt: 1793671094000 } });
+    expect(md.split("\n").filter(line => line.startsWith("Estimated with"))).toEqual([
+      "Estimated with control-plane prices from 2026-11-03T01:58:14.000Z; not the charged cost.",
+    ]);
+  });
+  it("omits the timestamp when the price fetch time is null", () => {
+    const md = stats([pass], { modelPrices: { ...modelPrices, fetchedAt: null } });
+    expect(md.split("\n").filter(line => line.startsWith("Estimated with"))).toEqual([
+      "Estimated with control-plane prices; not the charged cost.",
+    ]);
+  });
+  it("renders stats without throwing when the price timestamp exceeds the Date range", () => {
+    const render = () => stats([pass], { modelPrices: { ...modelPrices, fetchedAt: 8640000000000001 } });
+    expect(render).not.toThrow();
+    expect(render()).toBe(stats([pass]));
   });
   it("adds the review's own estimate to the reported implement cost", () => {
     expect(stats([{ ...pass, costUsd: 7, reviewApproved: true, reviewTelemetry }], { modelPrices })).toContain("~$12.47 (estimated)");

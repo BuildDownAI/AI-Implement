@@ -59,7 +59,8 @@ export interface RunModelPrices {
 export function copyModelPrices(value: unknown): RunModelPrices | undefined {
   if (!isRec(value) || !Array.isArray(value.prices) || value.prices.length === 0) return undefined;
   if (value.fetchedAt !== null && (typeof value.fetchedAt !== "number"
-    || !Number.isSafeInteger(value.fetchedAt) || value.fetchedAt < 0)) return undefined;
+    || !Number.isSafeInteger(value.fetchedAt) || value.fetchedAt < 0
+    || !Number.isFinite(new Date(value.fetchedAt).getTime()))) return undefined;
   const prices: RunModelPrices["prices"] = [];
   for (const price of value.prices) {
     if (!isRec(price)) return undefined;

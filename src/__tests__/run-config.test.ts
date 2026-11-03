@@ -994,7 +994,7 @@ describe("public model prices envelope", () => {
     const malformed: unknown[] = [null, "invalid", [], {},
       { ...valid, prices: "invalid" }, { ...valid, prices: {} },
       { ...valid, prices: [null] }, { ...valid, prices: [42] },
-      ...[undefined, "123", -1, 1.5, {}].map(fetchedAt => ({ ...valid, fetchedAt })),
+      ...[undefined, "123", -1, 1.5, {}, 8640000000000001, Number.MAX_SAFE_INTEGER].map(fetchedAt => ({ ...valid, fetchedAt })),
       ...["model", "version", "effectiveFrom"].flatMap(field =>
         [undefined, 42, {}].map(value => ({ ...valid, prices: [{ ...prices[0], [field]: value }] }))),
       { ...valid, prices: [{ ...prices[0], effectiveFrom: "invalid" }] },
@@ -1012,7 +1012,7 @@ describe("public model prices envelope", () => {
     for (const fetchedAt of [Infinity, NaN]) {
       expect(copyModelPrices({ ...valid, fetchedAt })).toBeUndefined();
     }
-    for (const fetchedAt of [null, 0, 123]) {
+    for (const fetchedAt of [null, 0, 123, 8640000000000000]) {
       const encoded = Buffer.from(JSON.stringify({ ...full, modelPrices: { ...valid, fetchedAt } })).toString("base64");
       expect(decodeRunConfig(encoded).modelPrices).toEqual({ ...valid, fetchedAt });
     }

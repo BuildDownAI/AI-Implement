@@ -229,7 +229,7 @@ export function formatRunStats(s: RunStats): string {
     STATS_TABLE_DIVIDER,
     passRows,
     ...(s.modelPrices && s.passes.some(p => formatPassCost(p, s.modelPrices).includes("(estimated)"))
-      ? ["", `Estimated with control-plane prices from ${s.modelPrices.fetchedAt}; not the charged cost.`] : []),
+      ? ["", `Estimated with control-plane prices${s.modelPrices.fetchedAt === null ? "" : ` from ${new Date(s.modelPrices.fetchedAt).toISOString()}`}; not the charged cost.`] : []),
     "",
     `**Total cost:** ${totalCost}`,
   ];
