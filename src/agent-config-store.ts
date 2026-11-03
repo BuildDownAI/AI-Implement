@@ -1,5 +1,5 @@
 // src/agent-config-store.ts
-// SQLite operations for account profiles, project permissions, orchestrator defaults,
+// SQLite operations for account profiles, orchestrator defaults,
 // project stage overrides and explicit opt-in (AII-943). Tables are created by dedup.ts (AII-940);
 // stage-configuration semantics come from agent-config.ts (AII-941).
 import { randomUUID } from "node:crypto";
@@ -23,11 +23,7 @@ import {
 /** scope_key of the single orchestrator-wide defaults row series. */
 export const ORCHESTRATOR_SCOPE_KEY = "default";
 
-/** Synthetic project key used to validate orchestrator defaults, which are not tied to a project. */
-const DEFAULTS_PROBE_PROJECT = "\u0000defaults-probe";
-
 export type AccountProfileStatus = "active" | "disabled" | "archived";
-export type PermissionStatus = "allowed" | "disabled";
 
 const AGENTS: readonly StageAgent[] = ["claude", "codex"];
 const PROVIDERS: readonly ModelProvider[] = ["anthropic", "bedrock", "openai"];
@@ -51,7 +47,6 @@ export interface AccountProfileProjection {
   agent: StageAgent;
   provider: ModelProvider;
   authMode: AccountAuthMode;
-  allowedProjectKeys: string[];
   status: AccountProfileStatus;
 }
 
@@ -67,8 +62,6 @@ export interface SaveAccountProfileRevisionInput {
   agent: StageAgent;
   provider: ModelProvider;
   authMode: AccountAuthMode;
-  /** Explicit list; empty authorizes no project. Listed keys are allowed, previously granted others are disabled. */
-  allowedProjectKeys: readonly string[];
   metadata?: AccountProfileMetadata;
   /** Defaults to the current head status (or `active` for a new profile). */
   status?: AccountProfileStatus;
@@ -164,8 +157,6 @@ function validateProfileInput(input: SaveAccountProfileRevisionInput): void {
   if (!AUTH_COMBINATIONS[input.agent][input.provider]?.includes(input.authMode)) {
     throw new Error("profile agent/provider/authentication combination is unsupported");
   }
-  if (!Array.isArray(input.allowedProjectKeys)) throw new Error("allowedProjectKeys is required");
-  for (const key of input.allowedProjectKeys) assertNonEmptyString(key, "allowed project key");
   if (input.status !== undefined && !["active", "disabled", "archived"].includes(input.status)) {
     throw new Error("profile status is unsupported");
   }
@@ -218,16 +209,7 @@ interface RevisionRow {
   display_name: string;
 }
 
-function allowedKeys(db: Database.Database, profileId: string): string[] {
-  const rows = db
-    .prepare(
-      "SELECT project_key FROM model_account_profile_project_permissions WHERE profile_id = ? AND status = 'allowed' ORDER BY project_key",
-    )
-    .all(profileId) as { project_key: string }[];
-  return rows.map((r) => r.project_key);
-}
-
-function project(db: Database.Database, rev: RevisionRow, status: AccountProfileStatus): AccountProfileProjection {
+function project(rev: RevisionRow, status: AccountProfileStatus): AccountProfileProjection {
   return {
     profileId: rev.profile_id,
     identity: rev.display_name,
@@ -235,7 +217,6 @@ function project(db: Database.Database, rev: RevisionRow, status: AccountProfile
     agent: rev.agent,
     provider: rev.provider,
     authMode: rev.auth_mode,
-    allowedProjectKeys: allowedKeys(db, rev.profile_id),
     status,
   };
 }
@@ -257,7 +238,7 @@ function getRevisionRow(db: Database.Database, profileId: string, revision: numb
 
 // --- profiles ---
 
-/** Appends an immutable revision, moves the head, and replaces the permission set — all in one transaction. */
+/** Appends an immutable revision, and moves the head in one transaction. */
 export function saveAccountProfileRevision(input: SaveAccountProfileRevisionInput): AccountProfileProjection {
   validateProfileInput(input);
   const db = getDb();
@@ -296,51 +277,13 @@ export function saveAccountProfileRevision(input: SaveAccountProfileRevisionInpu
           "INSERT INTO model_account_profiles (profile_id, current_profile_revision, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
         ).run(input.profileId, input.revision, status, now, now);
       }
-      replacePermissions(db, input.profileId, new Set(input.allowedProjectKeys), now);
       const rev = getRevisionRow(db, input.profileId, input.revision)!;
-      return project(db, rev, status);
+      return project(rev, status);
     })
     .immediate();
 }
 
-function replacePermissions(db: Database.Database, profileId: string, allowed: Set<string>, now: number): void {
-  const existing = db
-    .prepare("SELECT project_key, permission_revision, status FROM model_account_profile_project_permissions WHERE profile_id = ?")
-    .all(profileId) as { project_key: string; permission_revision: number; status: PermissionStatus }[];
-  const byKey = new Map(existing.map((r) => [r.project_key, r]));
-  for (const key of allowed) {
-    const row = byKey.get(key);
-    if (!row) {
-      db.prepare(
-        `INSERT INTO model_account_profile_project_permissions
-           (profile_id, project_key, permission_revision, status, created_at, updated_at) VALUES (?, ?, 1, 'allowed', ?, ?)`,
-      ).run(profileId, key, now, now);
-    } else if (row.status !== "allowed") {
-      setPermission(db, profileId, key, row.permission_revision + 1, "allowed", now);
-    }
-  }
-  for (const row of existing) {
-    if (!allowed.has(row.project_key) && row.status === "allowed") {
-      setPermission(db, profileId, row.project_key, row.permission_revision + 1, "disabled", now);
-    }
-  }
-}
-
-function setPermission(
-  db: Database.Database,
-  profileId: string,
-  projectKey: string,
-  revision: number,
-  status: PermissionStatus,
-  now: number,
-): void {
-  db.prepare(
-    `UPDATE model_account_profile_project_permissions SET permission_revision = ?, status = ?, updated_at = ?
-     WHERE profile_id = ? AND project_key = ?`,
-  ).run(revision, status, now, profileId, projectKey);
-}
-
-/** Disables or archives the head. History and permissions are kept; works even when settings reference the profile. */
+/** Disables or archives the head. History is kept; works even when settings reference the profile. */
 export function retireAccountProfile(profileId: string, status: "disabled" | "archived" = "disabled"): AccountProfileProjection {
   if (status !== "disabled" && status !== "archived") throw new Error("retire status must be disabled or archived");
   const db = getDb();
@@ -349,7 +292,7 @@ export function retireAccountProfile(profileId: string, status: "disabled" | "ar
       const head = getHead(db, profileId);
       if (!head) throw new Error("account profile not found");
       db.prepare("UPDATE model_account_profiles SET status = ?, updated_at = ? WHERE profile_id = ?").run(status, Date.now(), profileId);
-      return project(db, getRevisionRow(db, profileId, head.current_profile_revision)!, status);
+      return project(getRevisionRow(db, profileId, head.current_profile_revision)!, status);
     })
     .immediate();
 }
@@ -359,15 +302,15 @@ export function getAccountProfile(profileId: string): AccountProfileProjection |
   const head = getHead(db, profileId);
   if (!head) return null;
   const rev = getRevisionRow(db, profileId, head.current_profile_revision);
-  return rev ? project(db, rev, head.status) : null;
+  return rev ? project(rev, head.status) : null;
 }
 
-/** A retained revision; status and project permissions reflect the current head, not the historical moment. */
+/** A retained revision; status reflects the current head, not the historical moment. */
 export function getAccountProfileRevision(profileId: string, revision: number): AccountProfileProjection | null {
   const db = getDb();
   const head = getHead(db, profileId);
   const rev = head ? getRevisionRow(db, profileId, revision) : undefined;
-  return head && rev ? project(db, rev, head.status) : null;
+  return head && rev ? project(rev, head.status) : null;
 }
 
 export function listAccountProfiles(): AccountProfileProjection[] {
@@ -424,8 +367,8 @@ function appendConfig(
   return toStored(latestConfigRow(db, scopeKind, scopeKey)!);
 }
 
-/** Current profile heads as resolver input; `disabled` reflects head status and permissions come from `allowed` rows. */
-function loadProfiles(db: Database.Database, probeProject?: string): AccountProfile[] {
+/** Current profile heads as resolver input; `disabled` reflects head status. */
+function loadProfiles(db: Database.Database): AccountProfile[] {
   const heads = db.prepare("SELECT profile_id, current_profile_revision, status FROM model_account_profiles").all() as HeadRow[];
   const profiles: AccountProfile[] = [];
   for (const head of heads) {
@@ -439,7 +382,6 @@ function loadProfiles(db: Database.Database, probeProject?: string): AccountProf
       provider: rev.provider,
       authMode: rev.auth_mode,
       disabled: head.status !== "active",
-      allowedProjectKeys: probeProject ? [probeProject] : allowedKeys(db, head.profile_id),
     });
   }
   return profiles;
@@ -455,10 +397,9 @@ function parseConfig(row: ConfigRow | undefined): StageAgentConfigurationV1 | nu
   return row ? (JSON.parse(row.config_json) as StageAgentConfigurationV1) : null;
 }
 
-/** Throws unless a configured project config resolves against the stored defaults, profiles and permissions. */
-function assertProjectResolves(db: Database.Database, projectKey: string, projectConfig: StageAgentConfigurationV1): void {
+/** Throws unless a configured project config resolves against the stored defaults, profiles. */
+function assertProjectResolves(db: Database.Database, projectConfig: StageAgentConfigurationV1): void {
   resolveStageAgentConfig({
-    projectKey,
     orchestratorDefaults: parseConfig(currentDefaults(db)) ?? LEGACY_CONFIG,
     projectConfig,
     accountProfiles: loadProfiles(db),
@@ -475,12 +416,11 @@ export function setOrchestratorDefaults(config: StageAgentConfigurationV1, creat
   return db
     .transaction(() => {
       if (config.mode === "configured") {
-        // Complete, compatible and enabled for every stage; permissions are checked per project.
+        // Complete, compatible and enabled for every stage.
         resolveStageAgentConfig({
-          projectKey: DEFAULTS_PROBE_PROJECT,
           orchestratorDefaults: config,
           projectConfig: { version: STAGE_AGENT_CONFIG_VERSION, mode: "configured" },
-          accountProfiles: loadProfiles(db, DEFAULTS_PROBE_PROJECT),
+          accountProfiles: loadProfiles(db),
         });
       }
       return appendConfig(db, "orchestrator", ORCHESTRATOR_SCOPE_KEY, config, createdBy);
@@ -505,13 +445,13 @@ function inputsFingerprint(db: Database.Database, projectKey: string): string {
   return JSON.stringify({
     defaults: currentDefaults(db)?.config_revision_id ?? null,
     project: latestConfigRow(db, "project", projectKey)?.config_revision_id ?? null,
-    profiles: loadProfiles(db).map((p) => [p.id, p.revision, p.disabled, [...(p.allowedProjectKeys ?? [])].sort()]),
+    profiles: loadProfiles(db).map((p) => [p.id, p.revision, p.disabled]),
   });
 }
 
 /**
  * Identity of everything a project's resolution reads: the defaults head, the project head, and every profile's head
- * revision, status and permissions. Read-only. Take it before inspecting a candidate and pass it back as
+ * revision and status. Read-only. Take it before inspecting a candidate and pass it back as
  * `expectedInputs` to `setProjectStageConfig`, which refuses the write if any of it moved.
  */
 export function readStageInputsFingerprint(projectKey: string): string {
@@ -521,7 +461,7 @@ export function readStageInputsFingerprint(projectKey: string): string {
 }
 
 /**
- * Resolves an uncommitted project config against the current defaults, profiles and permissions without writing
+ * Resolves an uncommitted project config against the current defaults, profiles without writing
  * anything. The project reference is a placeholder for the revision the candidate would become. Throws when it does not resolve.
  */
 export function resolveCandidateProjectStageConfig(
@@ -536,7 +476,6 @@ export function resolveCandidateProjectStageConfig(
     const projectRow = latestConfigRow(db, "project", projectKey);
     const defaultsRow = currentDefaults(db);
     const resolution = resolveStageAgentConfig({
-      projectKey,
       orchestratorDefaults: parseConfig(defaultsRow) ?? LEGACY_CONFIG,
       projectConfig: candidate,
       accountProfiles: loadProfiles(db),
@@ -568,7 +507,7 @@ export function setProjectStageConfig(
   return db
     .transaction(() => {
       if (expectedInputs !== undefined && inputsFingerprint(db, projectKey) !== expectedInputs) throw new StaleStageInputsError();
-      if (config.mode === "configured") assertProjectResolves(db, projectKey, config);
+      if (config.mode === "configured") assertProjectResolves(db, config);
       return appendConfig(db, "project", projectKey, config, createdBy);
     })
     .immediate();
@@ -598,7 +537,7 @@ export function clearProjectStageField(
         ...current,
         stages: { ...current.stages, [stage]: { ...current.stages?.[stage], [field]: null } },
       };
-      if (next.mode === "configured") assertProjectResolves(db, projectKey, next);
+      if (next.mode === "configured") assertProjectResolves(db, next);
       return appendConfig(db, "project", projectKey, next, createdBy);
     })
     .immediate();
@@ -619,7 +558,7 @@ export function setProjectOptIn(projectKey: string, optedIn: boolean, createdBy:
       const currentlyOptedIn = current?.mode === "configured";
       if (currentlyOptedIn === optedIn) return optedIn;
       const next: StageAgentConfigurationV1 = { ...(current ?? LEGACY_CONFIG), mode: optedIn ? "configured" : "legacy" };
-      if (optedIn) assertProjectResolves(db, projectKey, next);
+      if (optedIn) assertProjectResolves(db, next);
       appendConfig(db, "project", projectKey, next, createdBy);
       return optedIn;
     })
@@ -628,7 +567,7 @@ export function setProjectOptIn(projectKey: string, optedIn: boolean, createdBy:
 
 /**
  * Resolves a project's stage configuration from current heads. Legacy (no row or mode=legacy) resolves as such;
- * a disabled, archived, unpermitted or unknown profile throws.
+ * a disabled, archived, or unknown profile throws.
  */
 export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: number): ProjectStageResolution {
   assertNonEmptyProjectKey(projectKey);
@@ -637,7 +576,6 @@ export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: n
     const projectRow = latestConfigRow(db, "project", projectKey);
     const defaultsRow = currentDefaults(db);
     const resolution = resolveStageAgentConfig({
-      projectKey,
       orchestratorDefaults: parseConfig(defaultsRow) ?? LEGACY_CONFIG,
       projectConfig: parseConfig(projectRow),
       accountProfiles: loadProfiles(db),

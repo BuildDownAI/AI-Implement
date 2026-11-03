@@ -2,9 +2,11 @@
  * The sender side of `PlanningRun` (AII-1019): an ingress client for the `submit` and `report`
  * calls, and the termination hook that `handleRunnerResult` calls for a planning callback
  * (`checkPlanningAdmissionTermination`, `src/runner-callback.ts`). The hook is injected through
- * that existing input; `runner-callback.ts` itself does not change. Sibling of
+ * that input, including usage and the forwarding outcome. Sibling of
  * `createKgRefreshIngressClient` in `kg-refresh-production.ts`.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
+import type { RecordedUsage } from "../agent-usage.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { read as readAdmission, type DispatchAdmissionRecord } from "../dispatch-admission.js";
 import type { PlanningRunDefinition, PlanningRunInput } from "./planning-run-workflow.js";
@@ -20,7 +22,7 @@ export interface PlanningRunIngressClient {
   /** Starts the workflow keyed by `dispatchId`; the workflow key is the idempotency (Restate rejects an idempotency key on a workflow handler with HTTP 400). */
   submit(dispatchId: string, input: PlanningRunInput): Promise<PlanningIngressResult>;
   /** Resolves the workflow's `report` promise. */
-  report(dispatchId: string): Promise<PlanningIngressResult>;
+  report(dispatchId: string, body?: { usage?: RecordedUsage }, opts?: { idempotencyKey: string }): Promise<PlanningIngressResult>;
 }
 
 export interface PlanningRunIngressClientDeps {
@@ -39,9 +41,11 @@ export function createPlanningRunIngressClient(
   const timeout = deps.timeoutMs ?? INGRESS_TIMEOUT_MS;
   const workflow = (dispatchId: string) => ingress.workflowClient<PlanningRunDefinition>({ name: "PlanningRun" }, dispatchId);
 
-  async function invoke(call: () => PromiseLike<unknown>): Promise<PlanningIngressResult> {
+  async function invoke(call: () => PromiseLike<unknown>, body?: { usage?: RecordedUsage }): Promise<PlanningIngressResult> {
     try {
-      await call();
+      const result = await call() as { fingerprint?: string } | undefined;
+      if (body?.usage && !result?.fingerprint) return { status: "unavailable" };
+      if (result?.fingerprint && result.fingerprint !== ownedRunReportFingerprint(body ?? {})) return { status: "conflict" };
       return { status: "accepted" };
     } catch (err) {
       if (err instanceof restateClients.HttpCallError) {
@@ -55,7 +59,9 @@ export function createPlanningRunIngressClient(
   return {
     submit: (dispatchId, input) =>
       invoke(() => workflow(dispatchId).workflowSubmit(input, restateClients.rpc.sendOpts({ timeout }))),
-    report: (dispatchId) => invoke(() => workflow(dispatchId).report(restateClients.rpc.opts({ timeout }))),
+    // The SDK RemoveVoidArgument type cannot represent an optional JSON input. The handler
+    // accepts undefined at runtime; preserve it so existing callers send an empty HTTP body.
+    report: (dispatchId, body, opts) => invoke(() => workflow(dispatchId).report(body!, restateClients.rpc.opts({ timeout, ...(opts ? { idempotencyKey: opts.idempotencyKey } : {}) })), body),
   };
 }
 
@@ -70,22 +76,23 @@ export interface PlanningAdmissionTerminationHookDeps {
 /**
  * Has the signature of `checkPlanningAdmissionTermination`. A Restate-owned reservation gets a
  * `report` to its workflow (the workflow key is the dispatch id); anything else is Legacy-owned.
- * One attempt, no retry: the workflow still finds the end of the run on its own tick.
+ * Returns the ingress outcome to the callback so an unavailable report can be retried.
  */
 export function createPlanningAdmissionTerminationHook(
   deps: PlanningAdmissionTerminationHookDeps,
-): (dispatchId: string) => Promise<void> {
+): (dispatchId: string, usage?: RecordedUsage) => Promise<void | PlanningIngressResult> {
   const lookup = deps.readAdmission ?? readAdmission;
-  return async (dispatchId) => {
+  return async (dispatchId, usage) => {
     if (lookup(dispatchId)?.lifecycleOwner.kind !== "restate") {
       await deps.legacy(dispatchId);
       return;
     }
-    const result = await deps.ingress.report(dispatchId);
+    const result = await (usage ? deps.ingress.report(dispatchId, { usage }, { idempotencyKey: dispatchId }) : deps.ingress.report(dispatchId));
     if (result.status === "accepted") {
       console.log(`[planning-run] report sent dispatch=${dispatchId}`);
     } else {
       console.warn(`[planning-run] report not accepted dispatch=${dispatchId} status=${result.status}`);
     }
+    return result;
   };
 }

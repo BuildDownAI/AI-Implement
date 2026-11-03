@@ -1,5 +1,7 @@
 # Model account operations
 
+A ChatGPT plan profile works on public and private repositories. Claude subscription profiles are still refused for managed runs.
+
 Operator procedures for hosted model accounts. The command is `src/model-account-cli.ts`, run on the orchestrator
 machine as `node dist/model-account-cli.js <command> --profile <id>`.
 
@@ -14,15 +16,9 @@ On Models & providers an admin adds a profile with the form (`POST /api/model-ac
 | Agent | `claude` or `codex` |
 | Provider | `anthropic`, `openai` or `bedrock` |
 | Authentication | `anthropic-api-key`, `openai-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
-| Permitted projects | Which projects may use the profile (below) |
 
-- **Permitted projects.** Three cases, stored in `allowedProjectKeys`:
-  - **Blank in the form = every project.** The form sends `["*"]` (`mpAddAccount`, `src/admin-ui/pages/models-and-providers.ts`). `*` is `ALL_PROJECTS_KEY`, and `isProjectPermitted` (`src/agent-config.ts`) accepts a project when the list holds its key or `*`.
-  - **A comma-separated list of keys = only those projects.**
-  - **An emptied list = no project.** An empty list never widens to all projects: it matches neither the key nor `*`. It is how to revoke a profile, and only `PATCH` can set it on an existing profile. The form cannot send one, but a plain `POST` that omits `allowedProjectKeys` also stores `[]` (a revoked profile), so a blank field is form behaviour only. Scripts that call the API must send `["*"]` for every project.
-- **Readiness probe.** Credential readiness is project-scoped (`accountStatus`, `src/admin.ts`). A `*` profile is probed against a mapped project (no mappings, no probe), a listed profile against its first key. An empty list reads `unknown`, which is not a credential fault.
-- **Every stage needs a profile.** A project that opts into configured runs needs a usable, permitted profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown profile, or one the project may not use, throws. A project that wants Codex only for review must still give planning and implementation a profile.
-- **Editing permitted projects.** Use `PATCH /api/model-accounts/:id` with the full `allowedProjectKeys` list; there is no UI for it yet. A disabled or archived profile cannot gain new grants (409 `profile_not_active`); grants can only be removed or kept.
+- **Readiness.** Credential readiness comes from the profile's own credential status (`accountStatus`, `src/admin.ts`), whether or not any project uses it. Every active profile is usable by every project; disable or archive a profile to stop its use.
+- **Every stage needs a profile.** A project that opts into configured runs needs a usable profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown, disabled or archived profile, or one whose agent or provider does not match the stage, throws. A project that wants Codex only for review must still give planning and implementation a profile.
 
 ## ChatGPT plan accounts
 
@@ -99,7 +95,7 @@ sign in again on the laptop (step 1), then import again (step 2).
 `src/model-auth-runtime.ts` composes the dependencies a hosted (configured) run needs. Three facts matter to an operator:
 
 - **Protection key.** The Fly protection key is derived, not a new secret: HKDF-SHA256 over `RUNNER_TOKEN_SECRET`, salt `ai-implement`, info `ai-implement/model-auth-protection-key/v1`, 32 bytes (`deriveModelAuthProtectionKey`, `src/model-session-keys.ts`). The info label differs from the hosted session key's (`ai-implement/model-session-key/v1`), as ADR 009 requires, so the two keys are never equal. It travels base64url-encoded. With `RUNNER_TOKEN_SECRET` unset there is no key. Rotating the secret changes both keys.
-- **API-key and Bedrock profiles resolve from encrypted storage.** `src/model-protected-secrets.ts` stores each credential in `model_protected_secrets`, sealed with AES-256-GCM under a key derived by HKDF from `RUNNER_TOKEN_SECRET` (info `ai-implement/model-protected-secret-key/v1`, distinct from the session and protection labels) and bound to the exact `model-account:` reference as authenticated data. A permitted profile whose reference has a stored row prepares as `ready`. A missing key, row or reference, a malformed value, a bad tag, a changed `RUNNER_TOKEN_SECRET` or a swapped reference is unavailable: the profile prepares as `authentication-required`, with a fixed failure code and no value in errors. There is never an ambient fallback key. Rotating `RUNNER_TOKEN_SECRET` requires re-importing the credentials. Import and delete are described in [API credentials](#api-credentials).
+- **API-key and Bedrock profiles resolve from encrypted storage.** `src/model-protected-secrets.ts` stores each credential in `model_protected_secrets`, sealed with AES-256-GCM under a key derived by HKDF from `RUNNER_TOKEN_SECRET` (info `ai-implement/model-protected-secret-key/v1`, distinct from the session and protection labels) and bound to the exact `model-account:` reference as authenticated data. An active profile whose reference has a stored row prepares as `ready`. A missing key, row or reference, a malformed value, a bad tag, a changed `RUNNER_TOKEN_SECRET` or a swapped reference is unavailable: the profile prepares as `authentication-required`, with a fixed failure code and no value in errors. There is never an ambient fallback key. Rotating `RUNNER_TOKEN_SECRET` requires re-importing the credentials. Import and delete are described in [API credentials](#api-credentials).
 - **Scope of this slice.** Only `codex-subscription` and API-key profiles prepare. No `claude-subscription` account is reserved. A repo image override (`.ai-implement/image.yml`) is refused on Fly. No new environment variable is involved.
 
 ## API credentials
@@ -117,6 +113,33 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 - **Delete.** `node dist/model-account-cli.js secret-delete --ref model-account:team-key` removes the row and succeeds when none exists. Afterwards the profile prepares as `authentication-required`.
 - **Backup and restore.** Rows are sealed under a key derived from the current `RUNNER_TOKEN_SECRET` and bound to their reference. A restored database works only under the same secret, and a row copied to another reference fails authentication.
 - **Rotation.** Rotating `RUNNER_TOKEN_SECRET` orphans every stored credential. Re-import each one after the rotation.
+
+### API keys and Codex stages
+
+An `openai-api-key` profile works for every Codex stage, including review and planning, which run `codex app-server`. The invocation env carries the key as `CODEX_API_KEY`. `codex exec` reads that variable directly. The app-server path has no `auth.json`, and its built-in `openai` provider does not read the variable, so the executor selects a provider named `openai_api_key` whose `env_key` is `CODEX_API_KEY` (`base_url` is `OPENAI_BASE_URL` when the invocation sets an allowed one, else `https://api.openai.com/v1`). The provider is chosen the same way in the view's `config.toml`, the argv and the thread request. `CODEX_API_KEY` stays in the shell-environment exclusion list, so the Codex process has the key and the commands the model runs do not. A run without `CODEX_API_KEY` in its env keeps the built-in provider.
+
+## Check which profile a run used
+
+Open the run's GitHub Actions log (the `implement` or `plan` job, step `Run pipeline` or `Run planning`) and search for `[model-auth]`. `src/run-autonomous.ts` prints one line per credential checkout, checkpoint and finish:
+
+```
+[model-auth] {"operation":"checkout","profileId":"anthropic-aii","status":"ok"}
+[model-auth] {"operation":"checkout","stage":"review","profileId":"openai-codex","status":"ok"}
+[model-auth] {"operation":"finish","stage":"review","profileId":"openai-codex","status":"ok"}
+```
+
+Each line is one JSON object:
+
+- `operation` is `checkout`, `checkpoint` or `finish`.
+- `profileId` is the account profile the credential came from. Compare it with the profile you configured for the stage (see [Add an account profile](#add-an-account-profile)). The log shows the id, not the provider or identity behind it.
+- `status` is `ok` or `failed`. A `failed` line also carries a `category`.
+- `stage` names the stage the credential was for, and appears only when exactly one stage binding in the run's grant uses that profile (the `review` lines above). A profile bound to several stages prints no `stage`, because the line cannot say which of them it served (the `anthropic-aii` line above). A line without `stage` therefore does not mean the main stage: to find which stage it served, check the stage bindings of the run's grant for that `profileId`.
+
+`status: "ok"` on `checkout` means the credential reached the runner. It does not prove the provider accepted the key: a provider error, for example `401 Unauthorized`, appears later in the same log.
+
+`[model-auth] finish failed: <category>` means returning one profile's credential failed. `[model-auth] dispose failed: <category>` is logged after every credential was returned, when closing the run's model-auth client fails. They print a category, never a value.
+
+These lines appear only for hosted credentials, so an empty search does not mean no profile was used.
 
 ## Claude subscription accounts
 

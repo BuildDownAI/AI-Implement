@@ -91,6 +91,7 @@ export function makeJob(overrides: Partial<Job> = {}): Job {
     approved: false,
     failure: null,
     failureCommentedAt: null,
+    lateReviewHeadSha: null,
     ...overrides,
   };
 }

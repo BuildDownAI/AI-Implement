@@ -33,6 +33,30 @@ export const chatgptPlanProviderArgs = (): string[] => {
   ].flatMap((pair) => ["-c", pair]);
 };
 
+/** Provider id for an OpenAI API key on the app-server path, which reads the key from `CODEX_API_KEY` through `env_key`. */
+export const OPENAI_API_KEY_PROVIDER = "openai_api_key";
+
+const OPENAI_API_KEY_ENV = "CODEX_API_KEY";
+const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
+
+/** The seven `-c key=value` pairs that select the API-key provider, as flat argv. */
+export const openaiApiKeyProviderArgs = (baseUrl?: string): string[] => {
+  const t = `model_providers.${OPENAI_API_KEY_PROVIDER}`;
+  return [
+    `model_provider="${OPENAI_API_KEY_PROVIDER}"`,
+    `${t}.name="OpenAI API key"`,
+    `${t}.base_url=${JSON.stringify(baseUrl ?? OPENAI_DEFAULT_BASE_URL)}`,
+    `${t}.env_key=${JSON.stringify(OPENAI_API_KEY_ENV)}`,
+    `${t}.wire_api="responses"`,
+    `${t}.requires_openai_auth=false`,
+    `${t}.supports_websockets=false`,
+  ].flatMap((pair) => ["-c", pair]);
+};
+
+/** App-server only: a non-plan invocation whose selected env carries an API key needs the provider that reads it. */
+const usesApiKeyProvider = (provider: CodexProviderKind | undefined, env: Record<string, string>): boolean =>
+  provider !== "chatgpt-plan" && !!env[OPENAI_API_KEY_ENV];
+
 type CodexProviderKind = ModelInvocation["codexProvider"];
 
 /**
@@ -642,7 +666,7 @@ export class CodexExecutor implements LLMExecutor {
   }
 
   /** Trusted app-server argv. Nothing here is model- or repository-controlled; config comes only from argv. */
-  private buildAppServerArgs(params: InvokeParams, provider?: CodexProviderKind): string[] {
+  private buildAppServerArgs(params: InvokeParams, provider?: CodexProviderKind, apiKey = false, baseUrl?: string): string[] {
     // The pinned app-server accepts only --stdio/--strict-config/-c: no --ignore-* flags. Isolation comes
     // from the executor-owned trusted CODEX_HOME and empty cwd (see createAppServerView); --strict-config
     // only rejects unknown settings, it does not ignore configuration.
@@ -651,7 +675,11 @@ export class CodexExecutor implements LLMExecutor {
       "--strict-config",
       "-c",
       `model=${JSON.stringify(params.model)}`,
-      ...(provider === "chatgpt-plan" ? chatgptPlanProviderArgs() : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
+      ...(provider === "chatgpt-plan"
+        ? chatgptPlanProviderArgs()
+        : apiKey
+          ? openaiApiKeyProviderArgs(baseUrl)
+          : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
       "-c",
       'approval_policy="never"',
       "-c",
@@ -679,7 +707,7 @@ export class CodexExecutor implements LLMExecutor {
    * credential arrives as an env var), an empty HOME, and an empty protocol cwd. Nothing else from the selected home,
    * the user home or the repository is visible to the child's config/rules/MCP loaders.
    */
-  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string, provider?: CodexProviderKind, state?: InvocationState): AppServerView {
+  private createAppServerView(selectedHome: string | undefined, model: string, baseUrl?: string, provider?: CodexProviderKind, state?: InvocationState, apiKey = false): AppServerView {
     // A ChatGPT plan view outlives one attempt: its CODEX_HOME holds the thread that `thread/resume` reloads.
     const shared = provider === "chatgpt-plan" && !!state;
     const root = shared && state.sessionsDir ? state.sessionsDir : mkdtempSync(join(this.options.viewParentDir ?? tmpdir(), "codex-view-"));
@@ -688,7 +716,7 @@ export class CodexExecutor implements LLMExecutor {
     const cwd = join(root, "cwd");
     const userHome = join(root, "user-home");
     try {
-      return this.populateAppServerView({ root, home, cwd, userHome, shared }, selectedHome, model, baseUrl, provider);
+      return this.populateAppServerView({ root, home, cwd, userHome, shared }, selectedHome, model, baseUrl, provider, apiKey);
     } catch (err) {
       // No child exists yet, so removing a half-built view cannot race a live process. A shared root is the invocation's to remove.
       if (!shared) removeView(root);
@@ -702,6 +730,7 @@ export class CodexExecutor implements LLMExecutor {
     model: string,
     baseUrl?: string,
     provider?: CodexProviderKind,
+    apiKey = false,
   ): AppServerView {
     const plan = provider === "chatgpt-plan";
     mkdirSync(home, { mode: 0o700, recursive: true });
@@ -711,12 +740,12 @@ export class CodexExecutor implements LLMExecutor {
       join(home, "config.toml"),
       [
         `model = ${JSON.stringify(model)}`,
-        `model_provider = "${plan ? CHATGPT_PLAN_PROVIDER : CODEX_PROVIDER}"`,
+        `model_provider = "${plan ? CHATGPT_PLAN_PROVIDER : apiKey ? OPENAI_API_KEY_PROVIDER : CODEX_PROVIDER}"`,
         'approval_policy = "never"',
         'sandbox_mode = "read-only"',
         // The only sanctioned provider redirect: the SELECTED invoke env's OPENAI_BASE_URL (trusted, set by
         // the auth client or a synthetic test), never the selected home's or repository's config.
-        ...(baseUrl && !plan ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
+        ...(baseUrl && !plan && !apiKey ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
         ...(plan
           ? [
               "",
@@ -724,6 +753,18 @@ export class CodexExecutor implements LLMExecutor {
               'name = "ChatGPT plan"',
               'base_url = "https://api.openai.com/v1"',
               `env_key = ${JSON.stringify(CHATGPT_PLAN_ACCESS_TOKEN_ENV)}`,
+              'wire_api = "responses"',
+              "requires_openai_auth = false",
+              "supports_websockets = false",
+            ]
+          : []),
+        ...(apiKey
+          ? [
+              "",
+              `[model_providers.${OPENAI_API_KEY_PROVIDER}]`,
+              'name = "OpenAI API key"',
+              `base_url = ${JSON.stringify(baseUrl ?? OPENAI_DEFAULT_BASE_URL)}`,
+              `env_key = ${JSON.stringify(OPENAI_API_KEY_ENV)}`,
               'wire_api = "responses"',
               "requires_openai_auth = false",
               "supports_websockets = false",
@@ -780,8 +821,9 @@ export class CodexExecutor implements LLMExecutor {
         schemaPath = join(schemaDir, "output-schema.json");
         writeFileSync(schemaPath, JSON.stringify(params.jsonSchema), { mode: 0o600 });
       }
+      const apiKey = !!this.options.protocolDriver && usesApiKeyProvider(provider, selectedEnv);
       if (this.options.protocolDriver) {
-        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider, state);
+        view = this.createAppServerView(selectedEnv.CODEX_HOME, params.model, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider, state, apiKey);
         env = { ...selectedEnv, CODEX_HOME: view.home, HOME: view.userHome };
       } else if (provider === "chatgpt-plan") {
         // The plan token arrives as an env var, so there is no selected home: the executor owns one, and
@@ -789,7 +831,7 @@ export class CodexExecutor implements LLMExecutor {
         state.sessionsDir ??= mkdtempSync(join(tmpdir(), "codex-sessions-"));
         env = { ...selectedEnv, CODEX_HOME: state.sessionsDir };
       }
-      const args = this.options.protocolDriver ? this.buildAppServerArgs(params, provider) : this.buildArgs(params, schemaPath, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider, resumeThreadId);
+      const args = this.options.protocolDriver ? this.buildAppServerArgs(params, provider, apiKey, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL)) : this.buildArgs(params, schemaPath, validateSelectedOpenAIBaseUrl(selectedEnv.OPENAI_BASE_URL), provider, resumeThreadId);
       // Auth acquisition and view setup may have consumed the budget: never spawn with an expired timeout.
       if (deadlineAt !== null && this.now() >= deadlineAt) return expiredAttempt();
       const attempt = await this.spawnAndWait(params, args, env, view ?? undefined, selectedEnv.CODEX_HOME, deadlineAt, provider, resumeThreadId);
@@ -915,7 +957,11 @@ export class CodexExecutor implements LLMExecutor {
           io: { stdin: proc.stdin, stdout: proc.stdout, halt: haltController.signal },
           prompt: params.prompt,
           model: params.model,
-          ...(provider === "chatgpt-plan" ? { modelProvider: CHATGPT_PLAN_PROVIDER } : {}),
+          ...(provider === "chatgpt-plan"
+            ? { modelProvider: CHATGPT_PLAN_PROVIDER }
+            : usesApiKeyProvider(provider, env)
+              ? { modelProvider: OPENAI_API_KEY_PROVIDER }
+              : {}),
           ...(resumeThreadId ? { resumeThreadId } : {}),
           workspaceDir: this.workspaceDir,
           ...(view ? { protocolCwd: view.cwd } : {}),

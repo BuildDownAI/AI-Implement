@@ -8,6 +8,8 @@ import { read as readAdmission, release as releaseAdmission } from "./dispatch-a
 import { REVIEW_FIX_EVIDENCE_RETENTION_MS } from "./review-fix-evidence.js";
 
 const MAX_LOG_ENTRIES = 500;
+/** A finished dispatch_log row is never pruned for this long, so its accounting record can be pulled. */
+const FINISHED_JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type JobStatus =
   | "unknown"
@@ -70,6 +72,8 @@ export interface Job {
    *  🟡 one. Distinct from `failure`, which is persisted for every phase (including
    *  gap-analysis, which the callback never comments for and so never stamps this field). */
   failureCommentedAt: number | null;
+  /** Head the gap-fill pushed, stored only for a Restate-lifecycle row so the sweep re-submits it (AII-1596). */
+  lateReviewHeadSha: string | null;
   /** Bounded safe projection of the latest persisted invocation record for this dispatch
    *  (`model_invocation_attribution`, AII-971); legacy dispatches read `null` with no inferred cost.
    *  Optional so undeclared `Job` literals keep compiling. */
@@ -130,6 +134,80 @@ export function initLogTable(): void {
     db.exec("DELETE FROM attempt_review_pending");
   })();
   ensureLogColumns();
+  ensureAccountingTriggers();
+}
+
+/** Nullable per-job accounting columns, saved on the row when the job runs (the mapping can change later). */
+const ACCOUNTING_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["tracker_kind", "TEXT"],
+  ["issue_url", "TEXT"],
+  ["machine_cpu_kind", "TEXT"],
+  ["machine_cpus", "INTEGER"],
+  ["machine_memory_mb", "INTEGER"],
+  ["compute_started_at", "INTEGER"],
+  ["compute_stopped_at", "INTEGER"],
+  ["changed_at", "INTEGER"],
+];
+
+const CHANGED_NOW = "CAST(unixepoch('subsec') * 1000 AS INTEGER)";
+
+/**
+ * AII-1566: `changed_at` (epoch ms, set by SQLite) moves when a column a job accounting record shows is
+ * written, or when an invocation row or runner report arrives; bookkeeping columns (`notified_at`,
+ * `machine_nonce`, ...) do not move it. `changed_at` is deliberately absent from the `UPDATE OF` lists,
+ * so these triggers never re-fire themselves. Pruning a finished row raises the one-row high-water mark
+ * and drops the invocation and report rows the row owned.
+ */
+const DISPATCH_LOG_CHANGE_COLUMNS = [
+  "status", "conclusion", "completed_at", "pr_url", "issue_identifier", "issue_title", "tracker_kind", "issue_url",
+  "machine_cpu_kind", "machine_cpus", "machine_memory_mb", "compute_started_at", "compute_stopped_at",
+];
+
+function ensureAccountingTriggers(): void {
+  const db = getDb();
+  // Once: rows that existed before the column get their completion time. A later NULL stays NULL.
+  db.exec("UPDATE dispatch_log SET changed_at = completed_at WHERE changed_at IS NULL AND completed_at IS NOT NULL");
+  db.exec("UPDATE review_fix_attempts SET changed_at = completed_at WHERE changed_at IS NULL AND completed_at IS NOT NULL");
+  // Dropped and recreated so a database that has the unguarded form gets the guarded one at boot. The WHEN
+  // compares OLD and NEW per column: a write that stores the same values (a COALESCE that keeps its value, a
+  // repeated status) must not move `changed_at`, or a polled job never settles.
+  const when = DISPATCH_LOG_CHANGE_COLUMNS.map((c) => `OLD.${c} IS NOT NEW.${c}`).join(" OR ");
+  db.exec("DROP TRIGGER IF EXISTS trg_dispatch_log_changed_at");
+  db.exec(`CREATE TRIGGER trg_dispatch_log_changed_at
+    AFTER UPDATE OF ${DISPATCH_LOG_CHANGE_COLUMNS.join(", ")} ON dispatch_log
+    WHEN ${when}
+    BEGIN UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE id = NEW.id; END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_invocation_attribution_changed_at
+    AFTER INSERT ON model_invocation_attribution
+    BEGIN
+      UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+      UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+    END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_job_report_insert_changed_at
+    AFTER INSERT ON dispatch_job_report
+    BEGIN
+      UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+      UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+    END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_job_report_update_changed_at
+    AFTER UPDATE ON dispatch_job_report
+    WHEN OLD.pushed_shas_json IS NOT NEW.pushed_shas_json OR OLD.invocations_complete <> NEW.invocations_complete
+    BEGIN
+      UPDATE dispatch_log SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+      UPDATE review_fix_attempts SET changed_at = ${CHANGED_NOW} WHERE dispatch_id = NEW.dispatch_id;
+    END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_dispatch_log_pruned
+    AFTER DELETE ON dispatch_log
+    WHEN OLD.completed_at IS NOT NULL
+    BEGIN
+      INSERT INTO job_accounting_pruned (id, changed_at, jid)
+        VALUES (1, COALESCE(OLD.changed_at, OLD.completed_at), COALESCE(OLD.dispatch_id, 'log-' || OLD.id))
+        ON CONFLICT (id) DO UPDATE SET changed_at = excluded.changed_at, jid = excluded.jid
+        WHERE excluded.changed_at > job_accounting_pruned.changed_at
+          OR (excluded.changed_at = job_accounting_pruned.changed_at AND excluded.jid > job_accounting_pruned.jid);
+      DELETE FROM model_invocation_attribution WHERE dispatch_id = OLD.dispatch_id;
+      DELETE FROM dispatch_job_report WHERE dispatch_id = OLD.dispatch_id;
+    END`);
 }
 
 function ensureLogColumns(): void {
@@ -200,8 +278,17 @@ function ensureLogColumns(): void {
   if (!names.has("failure_json")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_json TEXT");
   }
+  if (!names.has("callback_lifecycle_completed_at")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN callback_lifecycle_completed_at INTEGER");
+  }
   if (!names.has("failure_commented_at")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_commented_at INTEGER");
+  }
+  if (!names.has("late_review_head_sha")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN late_review_head_sha TEXT");
+  }
+  for (const [column, type] of ACCOUNTING_COLUMNS) {
+    if (!names.has(column)) db.exec(`ALTER TABLE dispatch_log ADD COLUMN ${column} ${type}`);
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
@@ -238,6 +325,13 @@ export function appendLogIfAbsent(entry: Parameters<typeof appendLog>[0] & { dis
   return findLogIdByDispatchId(entry.dispatchId) ?? appendLog(entry);
 }
 
+/** The Fly guest a job was launched with. */
+export interface MachineSize {
+  cpuKind: string;
+  cpus: number;
+  memoryMb: number;
+}
+
 export function appendLog(entry: {
   issueId: string;
   issueIdentifier?: string;
@@ -263,12 +357,19 @@ export function appendLog(entry: {
   trigger?: string;
   /** True when this dispatch is a grouping parent's own closing-work run (AII-264 r5). */
   groupingParent?: boolean;
+  /** Ticketing provider kind of the mapping at dispatch time. */
+  trackerKind?: string | null;
+  issueUrl?: string | null;
+  /** Guest size actually requested from the backend; absent for GitHub Actions. */
+  machineSize?: MachineSize | null;
+  /** Epoch ms the compute started (Fly/local launch time). */
+  computeStartedAt?: number | null;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, admission_generation, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, admission_generation, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent, tracker_kind, issue_url, machine_cpu_kind, machine_cpus, machine_memory_mb, compute_started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -290,6 +391,12 @@ export function appendLog(entry: {
     entry.contract ?? null,
     entry.trigger ?? null,
     entry.groupingParent ? 1 : 0,
+    entry.trackerKind ?? null,
+    entry.issueUrl ?? null,
+    entry.machineSize?.cpuKind ?? null,
+    entry.machineSize?.cpus ?? null,
+    entry.machineSize?.memoryMb ?? null,
+    entry.computeStartedAt ?? null,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows, but never evict a row while
@@ -299,11 +406,15 @@ export function appendLog(entry: {
   // dispatch_id) that is still unresolved (review_fix_attempts.completed_at IS
   // NULL) or completed within the last 7 days (AII-795). A terminal attempt
   // stays exempt while reservation, result conflict, or execution
-  // identity is unresolved, matching review-fix-evidence's retention guard.
+  // identity is unresolved, matching review-fix-evidence's retention guard. A finished row
+  // (completed_at set) whose last change (changed_at, else completed_at) is younger than 7 days is also kept,
+  // so the control plane can pull its newest accounting record (AII-1564); that guard can hold the table
+  // above MAX_LOG_ENTRIES.
   db.prepare(
     `DELETE FROM dispatch_log
      WHERE machine_nonce IS NULL
        AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)
+       AND NOT (completed_at IS NOT NULL AND COALESCE(changed_at, completed_at) >= ?)
        AND (
          dispatch_id IS NULL
          OR NOT EXISTS (
@@ -317,7 +428,7 @@ export function appendLog(entry: {
              )
          )
        )`,
-  ).run(MAX_LOG_ENTRIES, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
+  ).run(MAX_LOG_ENTRIES, Date.now() - FINISHED_JOB_RETENTION_MS, Date.now() - REVIEW_FIX_EVIDENCE_RETENTION_MS);
 
   return Number(result.lastInsertRowid);
 }
@@ -600,6 +711,11 @@ export function stampJobApproved(jobId: number, prUrl: string): void {
     .run(prUrl, Date.now(), jobId);
 }
 
+/** Stores the head a Restate-lifecycle gap-fill pushed, for the late-review sweep to re-submit (AII-1596). */
+export function setLateReviewHeadSha(rowId: number, headSha: string): void {
+  getDb().prepare("UPDATE dispatch_log SET late_review_head_sha = ? WHERE id = ?").run(headSha, rowId);
+}
+
 /**
  * Writes how a LateExternalReview ended to the gap-fill row it was submitted for (AII-1524):
  * `conclusion = late_review_<ending>`, and `approved = 1` only for `approved`. Guarded on the row
@@ -687,7 +803,7 @@ export interface PendingLateReview {
 }
 
 /**
- * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key.
+ * Records a LateExternalReview submit that still needs to settle (AII-1362). Idempotent per workflow key; a repeat only fills a head the existing row lacks, never replaces one.
  * The caller computes `workflowKey` with `lateExternalReviewWorkflowKey` (importing it here would be circular).
  */
 export function recordPendingLateReview(
@@ -696,7 +812,8 @@ export function recordPendingLateReview(
 ): void {
   getDb()
     .prepare(
-      "INSERT OR IGNORE INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO late_review_pending (workflow_key, dispatch_id, pr_url, head_sha, attempt_id, created_at) VALUES (?, ?, ?, ?, ?, ?) " +
+        "ON CONFLICT(workflow_key) DO UPDATE SET head_sha = excluded.head_sha WHERE late_review_pending.head_sha IS NULL AND excluded.head_sha IS NOT NULL",
     )
     .run(input.workflowKey, input.dispatchId, input.prUrl, input.headSha ?? null, input.attemptId ?? null, now);
 }
@@ -938,6 +1055,7 @@ interface RawRow {
   approved: number | null;
   failure_json: string | null;
   failure_commented_at: number | null;
+  late_review_head_sha: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -971,6 +1089,7 @@ function mapRows(rows: RawRow[]): Job[] {
     approved: row.approved === 1,
     failure: parseFailureJson(row.failure_json),
     failureCommentedAt: row.failure_commented_at ?? null,
+    lateReviewHeadSha: row.late_review_head_sha ?? null,
     attribution: (row.dispatch_id && attributions.get(row.dispatch_id)) || null,
   }));
 }
@@ -1052,6 +1171,49 @@ export function getInvocationAttribution(dispatchId: string): InvocationAttribut
   return readAttributionsByDispatch([dispatchId]).get(dispatchId) ?? null;
 }
 
+/**
+ * Stores the SHAs a job pushed (oldest first; may be empty) on the dispatch's runner report. The first
+ * report wins, so a retried callback never rewrites them. Returns whether the SHAs were stored now.
+ */
+export function recordPushedCommits(dispatchId: string, shas: readonly string[], now: number = Date.now()): boolean {
+  const info = getDb()
+    .prepare(
+      `INSERT INTO dispatch_job_report (dispatch_id, pushed_shas_json, recorded_at) VALUES (?, ?, ?)
+       ON CONFLICT (dispatch_id) DO UPDATE SET pushed_shas_json = excluded.pushed_shas_json
+       WHERE dispatch_job_report.pushed_shas_json IS NULL`,
+    )
+    .run(dispatchId, JSON.stringify(shas), now);
+  return info.changes > 0;
+}
+
+/**
+ * Marks a dispatch's `invocations` list as having arrived whole: the result carried it, none was dropped,
+ * and every record was stored (AII-1566). Only ever sets the flag, so a retried callback cannot clear it.
+ */
+export function recordInvocationsComplete(dispatchId: string, now: number = Date.now()): void {
+  getDb()
+    .prepare(
+      `INSERT INTO dispatch_job_report (dispatch_id, invocations_complete, recorded_at) VALUES (?, 1, ?)
+       ON CONFLICT (dispatch_id) DO UPDATE SET invocations_complete = 1`,
+    )
+    .run(dispatchId, now);
+}
+
+/** The SHAs stored for a dispatch, in push order; `null` when the runner never reported them (distinct from `[]`). */
+export function getPushedCommits(dispatchId: string): string[] | null {
+  try {
+    const row = getDb().prepare(`SELECT pushed_shas_json FROM dispatch_job_report WHERE dispatch_id = ?`).get(dispatchId) as
+      | { pushed_shas_json: string | null }
+      | undefined;
+    if (!row || row.pushed_shas_json === null) return null;
+    const parsed: unknown = JSON.parse(row.pushed_shas_json);
+    return Array.isArray(parsed) && parsed.every((v) => typeof v === "string") ? (parsed as string[]) : null;
+  } catch (err) {
+    warnAttributionReadFailure(err);
+    return null;
+  }
+}
+
 const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
   success: "succeeded",
   max_turns: "failed",
@@ -1066,7 +1228,11 @@ const INVOCATION_STATUS: Record<InvocationUsageRow["outcome"], string> = {
  */
 export function recordInvocationAttribution(
   dispatchId: string,
-  row: InvocationUsageRow,
+  row: Omit<InvocationUsageRow, "snapshotId" | "configRevisions" | "authMode"> & {
+    authMode: InvocationUsageRow["authMode"] | "unknown";
+    snapshotId: string | null;
+    configRevisions: InvocationUsageRow["configRevisions"] | null;
+  },
   opts: { timedOut?: boolean; now?: number } = {},
 ): boolean {
   if (row.invocationId === null) return false;
@@ -1095,7 +1261,7 @@ export function recordInvocationAttribution(
     )
     .run(
       row.invocationId, dispatchId, row.stage, row.profileId, row.profileRevision, row.agent, row.provider,
-      row.model, row.authMode, row.configRevisions.project.configRevisionId, row.snapshotId, status, now, now,
+      row.model, row.authMode, row.configRevisions?.project.configRevisionId ?? null, row.snapshotId, status, now, now,
       JSON.stringify(usage),
     );
   return info.changes > 0;
@@ -1110,6 +1276,19 @@ export function parseFailureJson(raw: string | null): FailureRecord | null {
   } catch {
     return null;
   }
+}
+
+/** Callback lifecycle completion is independent of the owning workflow closing the job. */
+export function hasCompletedCallbackLifecycle(dispatchId: string): boolean {
+  return getDb().prepare(
+    "SELECT 1 FROM dispatch_log WHERE dispatch_id = ? AND callback_lifecycle_completed_at IS NOT NULL",
+  ).get(dispatchId) !== undefined;
+}
+
+export function markCallbackLifecycleCompleted(dispatchId: string): void {
+  getDb().prepare(
+    "UPDATE dispatch_log SET callback_lifecycle_completed_at = COALESCE(callback_lifecycle_completed_at, ?) WHERE dispatch_id = ?",
+  ).run(Date.now(), dispatchId);
 }
 
 /** Persists the structured terminal failure reported by the runner callback. */
@@ -1220,6 +1399,53 @@ export function setJobMachineId(jobId: number, machineId: string): void {
   getDb()
     .prepare("UPDATE dispatch_log SET machine_id = ? WHERE id = ?")
     .run(machineId, jobId);
+}
+
+/** Records the guest size and compute start of a job whose row already exists. */
+export function setJobCompute(jobId: number, size: MachineSize | null, startedAt: number): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_cpu_kind = ?, machine_cpus = ?, machine_memory_mb = ?, compute_started_at = COALESCE(compute_started_at, ?) WHERE id = ?")
+    .run(size?.cpuKind ?? null, size?.cpus ?? null, size?.memoryMb ?? null, startedAt, jobId);
+}
+
+/** Stamps the stop time on the newest open row of a machine or container. The first stop wins; `gone` (the
+ *  backend answered 404 / no such container) falls back to the row's `completed_at`. */
+export function recordComputeStoppedByMachine(machineId: string, opts: { gone?: boolean; at?: number } = {}): void {
+  const now = opts.at ?? Date.now();
+  getDb()
+    .prepare(
+      `UPDATE dispatch_log SET compute_stopped_at = ${opts.gone ? "COALESCE(completed_at, ?)" : "?"}
+       WHERE id = (SELECT id FROM dispatch_log WHERE machine_id = ? AND compute_stopped_at IS NULL ORDER BY dispatched_at DESC, id DESC LIMIT 1)`,
+    )
+    .run(now, machineId);
+}
+
+/** Best-effort accounting stamp: never throws into a destroy path. */
+export function stampComputeStopped(machineId: string, gone: boolean): void {
+  try {
+    recordComputeStoppedByMachine(machineId, { gone });
+  } catch (err) {
+    console.error(`[log] Failed to record compute stop for ${machineId}:`, err);
+  }
+}
+
+/** Records a GitHub Actions run's API start and end times (epoch ms) on the row holding that run id. First write wins. */
+function recordGhaComputeTimes(runId: number, startedAt: number | null, stoppedAt: number | null): void {
+  getDb()
+    .prepare(
+      "UPDATE dispatch_log SET compute_started_at = COALESCE(compute_started_at, ?), compute_stopped_at = COALESCE(compute_stopped_at, ?) WHERE run_id = ?",
+    )
+    .run(startedAt, stoppedAt, runId);
+}
+
+/** Writes a GitHub Actions run's API times onto the job row holding that run id, only once the run is `completed`. */
+export function recordGhaRunCompleted(runId: number, run: { status: string; run_started_at?: string | null; updated_at?: string | null }): void {
+  if (run.status !== "completed") return;
+  const ms = (iso?: string | null) => {
+    const t = iso ? Date.parse(iso) : NaN;
+    return Number.isNaN(t) ? null : t;
+  };
+  recordGhaComputeTimes(runId, ms(run.run_started_at), ms(run.updated_at));
 }
 
 /** Writes only the nonce, leaving machine_id and the rest of the row untouched. */

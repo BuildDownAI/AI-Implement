@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-23
-**References:** ADR 019, ADR 020, ADR 027, AII-285, Answer9 ANS-966 (external review scope creep ran the issue out of cycles)
+**References:** ADR 019, ADR 020, ADR 027, AII-285, AII-1582, AII-1583, AII-1087, AII-1347, Answer9 ANS-966 (external review scope creep ran the issue out of cycles)
 
 ## Context
 
@@ -57,3 +57,23 @@ the merge until someone fixed it.
   is enforced only by the prompt. A wrong deferral on a child PR reaches the feature branch, and a
   human sees it only at the top-of-tree review.
 - Follow-on: the `deferred` state is one piece of AII-285's findings-accounting loop.
+
+## Amendment (2026-10-28): deferral also applies at the verdict level
+
+Decision points 4 and 5 say a `deferred` finding does not gate the merge, but the verdict-level checks
+did not follow them. On PR #1328 (AII-1580) the fix pass deferred the only external finding. The head
+did not move, so the external `claude-review` did not run again and its `changes_requested` verdict
+stayed. The run ended `invalid_review` with no approval mark, and the PR waited for a human.
+
+- **Rule:** a `changes_requested` external verdict whose listed findings are all `deferred` in the
+  ledger does not hold the merge. An external verdict still counts only for its own PR head (AII-1087,
+  AII-1347); this amendment does not change that.
+- **Owner:** the Restate `LateExternalReview` workflow (`src/restate/late-external-review.ts`,
+  `newestReviewRejectsHead`) decides and writes the approval mark. When the internal review is clean
+  but the external verdict blocks, the in-run gate (`src/pipeline/steps/post-push-review.ts`) does not
+  approve; it hands the PR to `LateExternalReview` and waits.
+- **Fail closed:** every listed finding needs a ledger row (`getReviewFindingsByKeys`) and every row
+  must be `deferred`. A missing row means the deferral was never recorded, so the verdict still holds
+  the merge. So does a `changes_requested` verdict that lists no findings (`changes_requested-empty`).
+
+The alternatives rejected above still hold; none relied on the verdict-level behavior.

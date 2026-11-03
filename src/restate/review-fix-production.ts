@@ -67,7 +67,7 @@ export type ReviewFixAdmission = "admit" | "defer" | "configuration_error";
  * `resolution_failed` is deliberately not here: an unauthorized, disabled or missing profile surfaces as that code,
  * whereas `resolution_unavailable` is an operational fault (such as a locked database) reading the inputs. */
 const DEFERRED_READINESS_CODES: ReadonlySet<string> = new Set([
-  "delivery_unreadable", "repository_visibility_unknown", "credential_unavailable", "session_unavailable",
+  "delivery_unreadable", "credential_unavailable", "session_unavailable",
   "resolution_unavailable",
 ]);
 
@@ -116,7 +116,7 @@ async function decideAdmission(
   try {
     readiness = await inspectAgentReadiness({ dispatchId: `admission-readiness-${randomUUID()}`, projectKey: key,
       backend: "github-actions", workflowRepository: repository, workflowFile: mapping.workflowFile,
-      repositories: [repository] }, runtime.preparationDeps({ owner: mapping.owner, repo: mapping.repo, projectKey: key }));
+    }, runtime.preparationDeps({ owner: mapping.owner, repo: mapping.repo, projectKey: key }));
   } catch { return { verdict: "defer", reason: "readiness_unavailable" }; }
   if (readiness.status === "legacy") return { verdict: "configuration_error", reason: "no_stage_configuration" };
   if (readiness.status === "not-ready") {
@@ -198,7 +198,7 @@ function dispositionsFor(attempt: PreparedReviewFixAttempt, result: ReviewFixRes
 }
 
 /**
- * After a review-fix attempt's approval effect applied (AII-1307), asks `LateExternalReview` to review the
+ * For a succeeded review-fix attempt whose facts hold (AII-1307, AII-1414), asks `LateExternalReview` to review the
  * pushed head and write the PR's mark. The mark is never stamped here. Never throws: this runs inside the
  * journaled `apply-approval-once` step, and a retry would re-run the approval effect.
  */
@@ -206,6 +206,7 @@ export async function submitLateReviewForAttempt(
   scope: ScopedPrIdentity,
   attemptId: string,
   submit: ((input: LateExternalReviewInput) => Promise<boolean | void>) | undefined,
+  headSha?: string,
 ): Promise<void> {
   if (!submit) return;
   try {
@@ -224,8 +225,8 @@ export async function submitLateReviewForAttempt(
     }
     // Held for the poll sweep (resubmitPendingGapFillReviews) in case Restate is not ready and the hook only logs.
     const workflowKey = lateExternalReviewWorkflowKey({ dispatchId: row.dispatchId, attemptId });
-    recordPendingLateReview({ workflowKey, dispatchId: row.dispatchId, prUrl, attemptId });
-    const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId });
+    recordPendingLateReview({ workflowKey, dispatchId: row.dispatchId, prUrl, attemptId, ...(headSha ? { headSha } : {}) });
+    const settled = await submit({ dispatchId: row.dispatchId, owner, repo, prNumber: scope.prNumber, prUrl, gapFill: true, attemptId, ...(headSha ? { headSha } : {}) });
     // Accepted or already running: the workflow key is the idempotency, so the retry record is spent.
     if (settled !== false) clearPendingLateReview(workflowKey);
   } catch (err) {
@@ -258,14 +259,22 @@ export function createProductionFinalizer(deps: {
         return { status: "withheld", reason: "current attempt authority or accepted result changed" };
       }
       const head = await github.getPrHeadSha(input.scope) ?? "";
-      if (head !== input.result.outputCommit || !input.policyAllows
-        || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
+      // The attempt facts alone decide the late review: LateExternalReview waits for the pushed head's review check and
+      // CI, so the instant merge policy (false while CI runs on a fresh push) must not gate the submit.
+      const dispositionsComplete = input.dispositionsComplete ?? input.policyAllows;
+      if (head !== input.result.outputCommit || !dispositionsComplete) {
+        return { status: "withheld", reason: "current PR head or merge policy changed" };
+      }
+      // Submitted before the policy read: a transient GitHub error there must not block it. Never throws.
+      await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview, input.result.outputCommit);
+      if (!input.policyAllows || !await github.evaluateMergePolicy(input.scope, input.findingDispositions)) {
+        if (submitLateExternalReview) {
+          console.log(`[review-fix] Approval effect withheld for attempt ${input.attemptId} (merge policy not yet satisfied); late external review submitted`);
+        }
         return { status: "withheld", reason: "current PR head or merge policy changed" };
       }
       const current = { ...input, currentAuthority: true, currentPrHeadSha: head };
-      const applied = await baseFinalizer.applyApproval(current);
-      if (applied.status === "applied") await submitLateReviewForAttempt(input.scope, input.attemptId, submitLateExternalReview);
-      return applied;
+      return baseFinalizer.applyApproval(current);
     },
   };
 }
@@ -378,7 +387,7 @@ export function createProductionReviewFixServices(
         && findingDispositions.every((disposition) => required.has(disposition.findingKey));
       const currentPrHeadSha = await github.getPrHeadSha(prepared.scope) ?? "";
       const policyAllows = full && await github.evaluateMergePolicy(prepared.scope, findingDispositions);
-      return { currentPrHeadSha, findingDispositions, policyAllows };
+      return { currentPrHeadSha, findingDispositions, policyAllows, dispositionsComplete: full };
     },
   });
   return [pr, attempt];

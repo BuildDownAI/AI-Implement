@@ -24,7 +24,10 @@ import {
   type ReviewFixWorkerPort,
 } from "../review-fix-ports.js";
 import { awaitOwnedRun } from "./owned-run-wait.js";
-import { readOwnedRunStatus } from "./owned-run-lifecycle.js";
+import { recordUsage, type RecordedUsage } from "../agent-usage.js";
+import { acceptedReviewFixDispatchId } from "../review-fix-attempt-store.js";
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
+import { acceptOwnedRunReport, readOwnedRunStatus } from "./owned-run-lifecycle.js";
 import { reviewFixPRKey } from "./review-fix-pr.js";
 import { restateRetentionMs } from "./retention.js";
 
@@ -38,6 +41,8 @@ export interface ReviewFixApprovalEvidence {
   currentPrHeadSha: string;
   findingDispositions: readonly ReviewFixFindingDisposition[];
   policyAllows: boolean;
+  /** Every required finding has a disposition. Kept apart from `policyAllows`, which is false while CI runs. */
+  dispositionsComplete: boolean;
 }
 
 export interface ReviewFixAttemptDependencies {
@@ -279,6 +284,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
           currentPrHeadSha: evidence.currentPrHeadSha,
           findingDispositions: evidence.findingDispositions,
           policyAllows: evidence.policyAllows,
+          dispositionsComplete: evidence.dispositionsComplete,
         }));
         approval = effect.status === "applied" || effect.status === "already_applied" ? "applied" : "withheld";
       } else {
@@ -310,7 +316,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     return completion;
   }
 
-  async function result(ctx: WorkflowSharedContext, raw: unknown): Promise<ResultIntakeOutcome> {
+  async function result(ctx: WorkflowSharedContext, raw: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }): Promise<ResultIntakeOutcome & { fingerprint: string }> {
     const checked = validateReviewFixResultMetadata(raw);
     // Validator details can contain an attacker-supplied field value. Keep the
     // journal-visible error generic; authenticated callback logs can use a
@@ -320,6 +326,11 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     const receivedAt = await ctx.date.now();
     const outcome = await ctx.run("store-result", () => store.recordResult(attemptId, checked.value, receivedAt));
     if (outcome.status === "stored" || outcome.status === "duplicate") {
+      await acceptOwnedRunReport(ctx, "report", { ...(raw.usage ? { usage: raw.usage } : {}) }, (value) => {
+        if (!value.usage) return;
+        const dispatchId = acceptedReviewFixDispatchId(checked.value);
+        if (dispatchId) recordUsage(dispatchId, value.usage);
+      });
       // The runner callback forwards here over the ingress and writes nothing itself, so
       // `store-result` is the only writer of the accepted result. A first call stores; an
       // identical retry (a fresh key past the idempotency retention) returns `duplicate`
@@ -340,7 +351,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       // durable state beyond the alert itself, which is the only required signal.
       await alert(ctx, attemptId, `stale result rejected: ${outcome.reason}`, "alert-stale-result");
     }
-    return outcome;
+    return { ...outcome, fingerprint: ownedRunReportFingerprint(raw) };
   }
 
   async function cancel(ctx: WorkflowSharedContext, raw: { attemptId: string }): Promise<void> {

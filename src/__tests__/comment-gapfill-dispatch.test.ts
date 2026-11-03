@@ -340,6 +340,7 @@ describe("drainCommentGapfillQueue", () => {
 
     await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
       getMappings: () => ({ AII: mapping }),
+      trackerAccounting: async (m, i) => ({ trackerKind: m.ticketingProvider, issueUrl: `https://tracker.test/${i.id}` }),
     }));
 
     const logEntries = log.listLog({ limit: 10 });
@@ -347,6 +348,8 @@ describe("drainCommentGapfillQueue", () => {
     expect(commentEntry).toBeDefined();
     expect(commentEntry!.issueId).toBe("issue-2");
     expect(commentEntry!.repo).toBe("acme/billing");
+    expect(dedup.getDb().prepare("SELECT tracker_kind, issue_url FROM dispatch_log WHERE id = ?").get(commentEntry!.id))
+      .toEqual({ tracker_kind: mapping.ticketingProvider, issue_url: "https://tracker.test/issue-2" });
   });
 
   it("case (b): marks row failed and posts PR comment when no dispatch log entry exists for the PR", async () => {

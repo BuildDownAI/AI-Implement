@@ -216,16 +216,7 @@ NODE
 chmod 600 "$AGENT_CONFIG"
 ```
 
-Before running with subscription credentials, verify the target repository is
-private or internal with GitHub CLI. This check is separate from AI-Implement and
-does not require tracker or orchestrator access:
-
-```bash
-OWNER_REPO="$(jq -r .projectKey "$AGENT_CONFIG")"
-gh repo view "$OWNER_REPO" --json visibility
-```
-
-Then run the live smoke:
+Run the live smoke:
 
 ```bash
 AI_IMPLEMENT_DIR=/private/tmp/aii-939-manual-testing
@@ -288,7 +279,7 @@ acceptable for local development. Opted-out projects keep today's arguments and 
 
 1. Opt the project in with direct store writes: save the account profile revision and the orchestrator
    defaults with `src/agent-config-store.ts` (`saveAccountProfileRevision`, `setOrchestratorDefaults`), then
-   call `setProjectOptIn("<TEAM>", true)`. The target repository must be private.
+   call `setProjectOptIn("<TEAM>", true)`.
 2. Import a plan record for the profile with `src/model-account-cli.ts` (see the earlier sections).
 3. Run `npm run dev:local`. The container reaches the model-auth routes at
    `config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? http://host.docker.internal:<healthPort>`.

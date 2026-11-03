@@ -23,7 +23,7 @@ import { mintLaunchTokens, PLANNING_TTL_SECONDS } from "./runner-tokens.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import { postBranchComment } from "./base-branch.js";
 import { appendLog, countPriorDispatches } from "./log.js";
-import { createMachine, buildSessionMachineConfig, listAppSecrets } from "./fly-machines.js";
+import { createMachine, buildSessionMachineConfig, listAppSecrets, guestSize } from "./fly-machines.js";
 import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
 import { getModelAuthRuntime, type ModelAuthRuntime } from "./model-auth-runtime.js";
 import {
@@ -293,6 +293,7 @@ export async function launchPlanningRun(args: LaunchPlanningRunArgs): Promise<Pl
         workflowFile: mapping.planningWorkflowFile,
         contract: planningContract,
         issueUrl: provider.issueUrl(issue),
+        trackerKind: mapping.ticketingProvider,
         issueState: issue.nativeStatus,
         phase: "planning",
       },
@@ -332,6 +333,8 @@ export async function launchPlanningRun(args: LaunchPlanningRunArgs): Promise<Pl
     phase: "planning",
     sessionImage: runnerImage ?? null,
     contract: planningContract,
+    trackerKind: mapping.ticketingProvider ?? null,
+    issueUrl: provider.issueUrl(issue),
   });
 
   if (config.notifyWebhookUrl) {
@@ -568,6 +571,8 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           sessionImage: resolvedImage,
           ghToken: controlGhToken,
           executionMode: "fly-machines" as const,
+          machineSize: guestSize(machineConfig),
+          computeStartedAt: Date.now(),
           statusComment: { machineName: machine.name, logsUrl: machineLogsUrl },
         };
       } else {
@@ -628,6 +633,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           sessionImage: config.localRunnerImage,
           ghToken: controlGhToken,
           executionMode: "local-docker" as const,
+          computeStartedAt: Date.now(),
           statusComment: {
             machineName: container.containerName || container.containerId.slice(0, 12),
           },

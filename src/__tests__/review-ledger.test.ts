@@ -2058,7 +2058,7 @@ function isIssueCommentsRequest(args: string[]): boolean {
 }
 
 describe("collectExternalReviewFindingsFromGh review process options (AII-1181)", () => {
-  function spawnWithThreads(threads: Array<{ login: string; body: string }>, reviews: unknown[] = []): GhSpawn {
+  function spawnWithThreads(threads: Array<{ login: string; body: string; commit?: string; origin?: { body: string; author: { login: string }; commit: { oid: string } } }>, reviews: unknown[] = []): GhSpawn {
     return (args) => {
       if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: JSON.stringify(reviews) };
       if (isIssueCommentsRequest(args)) return { exitCode: 0, stdout: "[]" };
@@ -2074,7 +2074,8 @@ describe("collectExternalReviewFindingsFromGh review process options (AII-1181)"
                     isOutdated: false,
                     path: "src/x.ts",
                     line: i + 1,
-                    comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, author: { login: t.login } }] },
+                    originatingComment: t.origin ? { nodes: [t.origin] } : undefined,
+                    comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, commit: { oid: t.commit }, author: { login: t.login } }] },
                   })),
                 },
               },
@@ -2100,6 +2101,46 @@ describe("collectExternalReviewFindingsFromGh review process options (AII-1181)"
       ["untagged", "minor"],
       ["🟡 nit", "minor"],
     ]);
+  });
+
+  it.each([0, 1, 2])("preserves Codex P%s severity and reply context from the originating head finding", (priority) => {
+    const origin = {
+      body: `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-yellow?style=flat)</sub></sub> Original finding**`,
+      author: { login: "chatgpt-codex-connector" },
+      commit: { oid: "current-head" },
+    };
+    const spawn = spawnWithThreads([{ login: "human", body: "Please investigate", origin }]);
+    const result = collectExternalReviewFindingsFromGh(spawn, "42", {
+      process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head",
+    });
+    expect(result.findings).toEqual([expect.objectContaining({
+      severity: priority === 2 ? "minor" : "blocking",
+      body: `${origin.body}\n\nLatest reply:\nPlease investigate`,
+    })]);
+    origin.commit.oid = "old-head";
+    expect(collectExternalReviewFindingsFromGh(spawn, "42", {
+      process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head",
+    }).findings).toEqual([]);
+  });
+
+  it("retains Codex P2 as minor and P0/P1 as blocking, including the GraphQL login", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([0, 1, 2].map((p) => ({
+      login: "chatgpt-codex-connector",
+      body: `**<sub><sub>![P${p} Badge](https://img.shields.io/badge/P${p}-yellow?style=flat)</sub></sub>  Finding**`,
+    }))), "42", { process: resolveReviewProcess("codex-code-review"), extraAuthors: [] });
+    expect(result.findings.map((f) => f.severity)).toEqual(["blocking", "blocking", "minor"]);
+  });
+
+  it.each([
+    { login: "chatgpt-codex-connector", commit: "old-head", expected: [] },
+    { login: "untrusted-codex", commit: "current-head", expected: ["medium"] },
+  ])("does not collect blocking Codex findings from $login at $commit", ({ login, commit, expected }) => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{
+      login, commit,
+      body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Bug**",
+    }]), "42", { process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head" });
+    expect(result.findings.map((finding) => finding.severity)).toEqual(expected);
+    expect(result.findings.some((finding) => finding.severity === "blocking")).toBe(false);
   });
 
   it("stays medium for every thread with no options", () => {
@@ -2134,7 +2175,7 @@ describe("collectClosedReviewThreadCommentUrls", () => {
   const thread = (isResolved: boolean, isOutdated: boolean, urls: string[]) => ({
     isResolved,
     isOutdated,
-    comments: { nodes: urls.map((url) => ({ url })) },
+    comments: { pageInfo: { hasNextPage: false }, nodes: urls.map((url) => ({ url })) },
   });
 
   it("collects every comment URL on resolved or outdated threads and skips open ones", () => {
@@ -2149,6 +2190,26 @@ describe("collectClosedReviewThreadCommentUrls", () => {
         ? page([thread(true, false, ["p2"])])
         : page([thread(true, false, ["p1"])], true, "c1");
     expect(collectClosedReviewThreadCommentUrls(spawn, "42")).toEqual(new Set(["p1", "p2"]));
+  });
+
+  it.each([
+    { nodes: [] },
+    { nodes: [], pageInfo: { hasNextPage: null } },
+    { nodes: [null], pageInfo: { hasNextPage: false } },
+    { nodes: [{ isResolved: true, isOutdated: false, comments: { nodes: [] } }], pageInfo: { hasNextPage: false } },
+    { nodes: [{ isResolved: true, isOutdated: false, comments: { nodes: [], pageInfo: { hasNextPage: true } } }], pageInfo: { hasNextPage: false } },
+  ])("rejects incomplete thread snapshots: %j", (reviewThreads) => {
+    expect(collectClosedReviewThreadCommentUrls(() => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads } } } }),
+    }), "42")).toBeUndefined();
+  });
+
+  it("rejects partial GraphQL data and repeated pagination cursors", () => {
+    const partial = JSON.parse(page([]).stdout);
+    partial.errors = [{ message: "Partial data" }];
+    expect(collectClosedReviewThreadCommentUrls(() => ({ exitCode: 0, stdout: JSON.stringify(partial) }), "42")).toBeUndefined();
+    expect(collectClosedReviewThreadCommentUrls(() => page([], true, "same"), "42")).toBeUndefined();
   });
 
   it("returns undefined when the read fails, errors, or cannot page on", () => {

@@ -667,7 +667,6 @@ describe("resolveRunnerInputs", () => {
   });
 });
 
-
 describe("resolveRunnerInputs agentConfig", () => {
   it("carries the snapshot and never the grant", () => {
     const snap = makeSnapshot();
@@ -700,9 +699,8 @@ describe("hasConfiguredIntent", () => {
 
 describe("prepareConfiguredRun", () => {
   const snap = makeSnapshot();
-  const trusted = async () => ({ visibility: "private" as const, trustedForSubscription: true });
   const prepare = (env: Record<string, string>, options: ConfiguredRunOptions = {}, snapshot = snap) =>
-    prepareConfiguredRun({ env: env as NodeJS.ProcessEnv, snapshot, workspaceDir: "/tmp/ws-x", repositories: ["o/r"], options: { now: () => NOW, ...options } });
+    prepareConfiguredRun({ env: env as NodeJS.ProcessEnv, snapshot, workspaceDir: "/tmp/ws-x", options: { now: () => NOW, ...options } });
   const reason = async (p: Promise<unknown>) => {
     try {
       await p;
@@ -743,23 +741,6 @@ describe("prepareConfiguredRun", () => {
     expect(await reason(prepare(envelopeEnv(snap, makeGrant(snap)), { modelAuthClient: fakeClient() }, { ...snap, version: 2 } as never))).toBe("snapshot_incomplete");
   });
 
-  it("applies the dispatch-preparation visibility and trust decision", async () => {
-    const env = envelopeEnv(snap, makeGrant(snap));
-    const withTrust = (t: unknown) => prepare(env, { modelAuthClient: fakeClient(), repoTrust: async () => t as never });
-    expect(await reason(withTrust({ visibility: "public", trustedForSubscription: true }))).toBe("repository_untrusted");
-    expect(await reason(withTrust({ visibility: "private", trustedForSubscription: false }))).toBe("repository_untrusted");
-    expect(await reason(withTrust({ visibility: "mystery", trustedForSubscription: true }))).toBe("repository_untrusted");
-    expect(await reason(prepare(env, { modelAuthClient: fakeClient(), repoTrust: async () => { throw new Error("boom"); } }))).toBe("repository_untrusted");
-    expect(await reason(withTrust({ visibility: "internal", trustedForSubscription: true }))).toBe("no-error");
-  });
-
-  it("fails a local subscription run closed without a trust source", async () => {
-    const sub = makeSnapshot("codex-subscription");
-    const local = { localCredentialPort: { load: vi.fn() } };
-    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: sub, ...local, modelAuthClient: fakeClient() } }))).toBe("repository_untrusted");
-    expect(await reason(prepareConfiguredRun({ env: {}, workspaceDir: "/tmp/ws-x", options: { agentConfig: sub, ...local, modelAuthClient: fakeClient(), repositories: ["o/r"], repoTrust: trusted } }))).toBe("no-error");
-    expect(local.localCredentialPort.load).not.toHaveBeenCalled();
-  });
 
   it("accepts a local synthetic provider only for selected Codex/OpenAI profiles", async () => {
     const local = { localCredentialPort: { load: vi.fn() } };

@@ -801,26 +801,37 @@ function collectUnresolvedReviewThreads(
  */
 export function collectClosedReviewThreadCommentUrls(ghSpawn: GhSpawn, prNumber: string): Set<string> | undefined {
   const closed = new Set<string>();
+  const cursors = new Set<string>();
   let after: string | undefined;
 
   for (;;) {
     const result = safeGhSpawn(ghSpawn, buildReviewThreadsArgs(prNumber, after, closedThreadCommentsQuery));
     if (!result || result.exitCode !== 0) return undefined;
 
-    const reviewThreads = getReviewThreadsConnection(parseJson(result.stdout));
-    if (!reviewThreads) return undefined;
+    const payload = parseJson(result.stdout);
+    // GraphQL can return partial data alongside errors even with a successful exit.
+    if (!isRecord(payload) || (payload.errors !== undefined
+      && (!Array.isArray(payload.errors) || payload.errors.length > 0))) return undefined;
+    const reviewThreads = getReviewThreadsConnection(payload);
+    if (!reviewThreads || typeof reviewThreads.pageInfo?.hasNextPage !== "boolean") return undefined;
 
     for (const thread of reviewThreads.nodes) {
-      if (!isRecord(thread) || (thread.isResolved !== true && thread.isOutdated !== true)) continue;
-      for (const comment of getCommentNodes(thread) ?? []) {
-        if (isRecord(comment) && typeof comment.url === "string" && comment.url) closed.add(comment.url);
+      if (!isRecord(thread) || typeof thread.isResolved !== "boolean"
+        || typeof thread.isOutdated !== "boolean") return undefined;
+      const comments = getCommentNodes(thread);
+      if (!comments || !isRecord(thread.comments) || !isRecord(thread.comments.pageInfo)
+        || thread.comments.pageInfo.hasNextPage !== false) return undefined;
+      for (const comment of comments) {
+        if (!isRecord(comment) || typeof comment.url !== "string" || !comment.url) return undefined;
+        if (thread.isResolved || thread.isOutdated) closed.add(comment.url);
       }
     }
 
-    if (reviewThreads.pageInfo?.hasNextPage !== true) return closed;
-    if (typeof reviewThreads.pageInfo.endCursor !== "string" || !reviewThreads.pageInfo.endCursor) return undefined;
-
-    after = reviewThreads.pageInfo.endCursor;
+    if (!reviewThreads.pageInfo.hasNextPage) return closed;
+    const cursor = reviewThreads.pageInfo.endCursor;
+    if (typeof cursor !== "string" || !cursor || cursors.has(cursor)) return undefined;
+    cursors.add(cursor);
+    after = cursor;
   }
 }
 
@@ -881,29 +892,42 @@ function collectReviewThreadFindings(
     const comments = getCommentNodes(thread);
     const latestComment = comments?.at(-1);
     if (!isRecord(latestComment) || typeof latestComment.body !== "string") continue;
+    // Codex severity belongs to the originating finding, even after a human reply.
+    // Keep the latest-comment behavior for all other processes.
+    const originNodes = isRecord(thread.originatingComment) ? thread.originatingComment.nodes : undefined;
+    const origin = Array.isArray(originNodes) ? originNodes[0] : comments?.[0];
+    const findingComment = options.process.id === "codex-code-review"
+      && isRecord(origin) && isRecord(origin.author)
+      && typeof origin.author.login === "string"
+      && isTrustedReviewAuthor(origin.author.login, options.process, options.extraAuthors)
+      ? origin : latestComment;
+    if (typeof findingComment.body !== "string") continue;
     if (options.headSha) {
-      const commit = latestComment.commit;
+      const commit = findingComment.commit;
       const oid = isRecord(commit) && typeof commit.oid === "string" ? commit.oid : "";
       if (oid && oid !== options.headSha) continue;
     }
 
-    const body = latestComment.body.trim();
+    const findingBody = findingComment.body.trim();
+    const replyBody = latestComment.body.trim();
+    const body = findingComment !== latestComment && replyBody && replyBody !== findingBody
+      ? `${findingBody}\n\nLatest reply:\n${replyBody}` : findingBody;
     if (!body) continue;
 
     // An unresolved inline thread only blocks when its author's current verdict is
     // CHANGES_REQUESTED. Otherwise (approved, commented, or no formal review) it is a
     // non-blocking nit that should not override the reviewer's approval.
-    const author = latestComment.author;
+    const author = findingComment.author;
     const authorLogin = isRecord(author) && typeof author.login === "string" ? author.login : "";
     let severity: ReviewLedgerSeverity = "medium";
     if (authorLogin && blockingReviewerLogins.has(normalizeReviewerLogin(authorLogin))) {
       severity = "blocking";
     } else if (
-      options.process.claudeInlineMarkers
+      options.process.classifyInline
       && authorLogin
       && isTrustedReviewAuthor(authorLogin, options.process, options.extraAuthors)
     ) {
-      const marker = classifyClaudeInlineMarker(body);
+      const marker = options.process.classifyInline(findingBody);
       if (marker === null) continue;
       severity = marker === "blocking" ? "blocking" : "minor";
     }
@@ -1062,6 +1086,13 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           isOutdated
           path
           line
+          originatingComment: comments(first: 1) {
+            nodes {
+              body
+              commit { oid }
+              author { login }
+            }
+          }
           comments(last: 1) {
             nodes {
               body
@@ -1094,6 +1125,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           isResolved
           isOutdated
           comments(first: 100) {
+            pageInfo { hasNextPage }
             nodes {
               url
             }

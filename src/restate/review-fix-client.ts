@@ -5,8 +5,9 @@
  * (ADR 018 rule 6, ADR 031). Nothing is stored here; an `unavailable` outcome is the
  * caller's to retry or surface.
  */
+import { ownedRunReportFingerprint } from "./owned-run-report-fingerprint.js";
+import type { RecordedUsage } from "../agent-usage.js";
 import type { AttemptId, ResultIntakeOutcome, ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
-import { createHash } from "node:crypto";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import type { ReviewFixAttemptDefinition } from "./review-fix-attempt-types.js";
 import { reviewFixPRKey, type ReviewFixFeedbackEvent, type ReviewFixPRDefinition } from "./review-fix-pr.js";
@@ -26,10 +27,10 @@ export interface ReviewFixIngressClient {
   feedback(scope: ScopedPrIdentity, event: ReviewFixFeedbackEvent | undefined, opts: { idempotencyKey: string }): Promise<ReviewFixFacadeOutcome>;
   /**
    * Forwards the validated runner result to `ReviewFixAttempt.result` (AII-1185); `idempotencyKey` is
-   * `reviewFixResultForwardKey(result)`. `accepted` carries the handler's own outcome (`stored`, `duplicate`, `conflict`,
+   * the authenticated runner token's dispatch id. `accepted` carries the handler's own outcome (`stored`, `duplicate`, `conflict`,
    * `stale`); the transport-level `conflict` (409) and `not-found` (404) are separate. Never throws.
    */
-  result(attemptId: AttemptId, result: ReviewFixResultMetadataV1, opts: { idempotencyKey: string }): Promise<ReviewFixResultForwardOutcome>;
+  result(attemptId: AttemptId, result: ReviewFixResultMetadataV1 & { usage?: RecordedUsage }, opts: { idempotencyKey: string }): Promise<ReviewFixResultForwardOutcome>;
   /**
    * Forwards a cancellation to `ReviewFixAttempt.cancel` (AII-1186); `idempotencyKey` is `<attemptId>.closed` for a
    * closed PR and `<attemptId>.cancel` for an operator cancel. Any error resolves `unavailable`. Never throws.
@@ -69,11 +70,23 @@ export function createReviewFixIngressClient(
     },
     async result(attemptId, result, opts) {
       try {
-        const rpc = restateClients.rpc.opts<ReviewFixResultMetadataV1, ResultIntakeOutcome>({ timeout, idempotencyKey: opts.idempotencyKey });
+        const rpc = restateClients.rpc.opts<ReviewFixResultMetadataV1 & { usage?: RecordedUsage }, ResultIntakeOutcome & { fingerprint: string }>({ timeout, idempotencyKey: opts.idempotencyKey });
         const outcome = await ingress
           .workflowClient<ReviewFixAttemptDefinition>({ name: "ReviewFixAttempt" }, attemptId)
           .result(result, rpc);
-        return { status: "accepted", outcome: outcome as ResultIntakeOutcome };
+        // Ingress can return the first response for this dispatch even when the body changes.
+        if (!outcome.fingerprint) return { status: "unavailable" };
+        if (outcome.fingerprint !== ownedRunReportFingerprint(result)) {
+          // The dispatch key has already acknowledged another body. Bypass its cached
+          // response so the owner durably records the conflict and revokes authority.
+          // Await completion: transport failures must remain retryable by the runner.
+          await ingress
+            .workflowClient<ReviewFixAttemptDefinition>({ name: "ReviewFixAttempt" }, attemptId)
+            .result(result, restateClients.rpc.opts({ timeout }));
+          return { status: "conflict" };
+        }
+        const { fingerprint: _fingerprint, ...intake } = outcome;
+        return { status: "accepted", outcome: intake as ResultIntakeOutcome };
       } catch (err) {
         if (err instanceof restateClients.HttpCallError) {
           if (err.status === 409) return { status: "conflict" };
@@ -94,17 +107,6 @@ export function createReviewFixIngressClient(
       }
     },
   };
-}
-
-/**
- * Idempotency key for the callback's result forward: `<attemptId>.result.<sha256 of the body>`.
- * Restate answers a repeated key with the first response whatever the body, so a bare
- * `<attemptId>.result` would hide a conflicting second result behind the cached `stored`
- * and never set `result_conflict_at`. Keying on the body keeps an identical retry on the
- * cached acknowledgement while a different body reaches the handler's conflict path.
- */
-export function reviewFixResultForwardKey(result: ReviewFixResultMetadataV1): string {
-  return `${result.attemptId}.result.${createHash("sha256").update(JSON.stringify(result)).digest("hex")}`;
 }
 
 /**

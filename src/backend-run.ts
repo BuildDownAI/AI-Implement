@@ -3,6 +3,7 @@
 import type { AppConfig } from "./index.js";
 import { destroyMachine, getMachine, readMachineExit, stopMachine, type Machine, type MachineExit } from "./fly-machines.js";
 import { recordReaperAction } from "./dedup.js";
+import { stampComputeStopped } from "./log.js";
 import { DURABLE_RUNNER_PURPOSE_KEY, DURABLE_RUNNER_PURPOSE_VALUE } from "./durable-runner.js";
 import { inspectLocalContainer, stopLocalContainer } from "./local-docker.js";
 
@@ -100,7 +101,13 @@ export async function destroyMachineRecorded(
   }
   console.log(`[fly] destroying machine ${machineId} reason=${reason}`);
   record(`destroy:${reason}`);
-  await destroyMachine(token, app, machineId);
+  try {
+    await destroyMachine(token, app, machineId);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("404")) stampComputeStopped(machineId, true);
+    throw err;
+  }
+  stampComputeStopped(machineId, machine === null);
 }
 
 /** Stops the exact machine or container. `false` for a backend with no machine to stop. A Fly machine is
@@ -110,8 +117,11 @@ export async function stopBackendRun(config: FlyConfig, mode: string, id: string
     if (!config.flySessionsToken || !config.flySessionsApp) {
       throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured; cannot stop the machine");
     }
-    if (opts.keep) await stopMachine(config.flySessionsToken, config.flySessionsApp, id);
-    else await destroyMachineRecorded(config, id, "backend-stop");
+    if (opts.keep) {
+      await stopMachine(config.flySessionsToken, config.flySessionsApp, id);
+      // A kept machine is stopped, not destroyed: this is the end of this run's compute.
+      stampComputeStopped(id, false);
+    } else await destroyMachineRecorded(config, id, "backend-stop");
     return true;
   }
   if (mode === "local-docker") {

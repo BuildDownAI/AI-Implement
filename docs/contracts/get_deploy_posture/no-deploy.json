@@ -1,0 +1,14 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"autoDeploy\": false,\n  \"watchedRepo\": null,\n  \"watchedRef\": null,\n  \"runningCommit\": null,\n  \"headCommit\": null,\n  \"upToDate\": null,\n  \"deploy\": {\n    \"held\": false,\n    \"inFlight\": false,\n    \"lastOutcome\": null\n  },\n  \"runnerChannel\": {\n    \"image\": \"ghcr.io/builddownai/ai-implement-runner\",\n    \"channelTag\": null,\n    \"channelCommit\": null,\n    \"matchesHead\": null\n  },\n  \"mergeCost\": \"none\",\n  \"selfDeploy\": null\n}"
+      }
+    ]
+  }
+}

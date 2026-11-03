@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  ALL_PROJECTS_KEY,
-  isProjectPermitted,
   describeInvocationLimit,
   resolveStageAgentConfig,
   type AccountProfile,
@@ -44,7 +42,6 @@ const accountProfiles: AccountProfile[] = [
     agent: "claude",
     provider: "anthropic",
     authMode: "anthropic-api-key",
-    allowedProjectKeys: ["AII"],
   },
   {
     id: "claude-subscription",
@@ -53,7 +50,6 @@ const accountProfiles: AccountProfile[] = [
     agent: "claude",
     provider: "anthropic",
     authMode: "claude-subscription",
-    allowedProjectKeys: ["AII"],
   },
   {
     id: "claude-bedrock",
@@ -62,7 +58,6 @@ const accountProfiles: AccountProfile[] = [
     agent: "claude",
     provider: "bedrock",
     authMode: "bedrock",
-    allowedProjectKeys: ["AII"],
   },
   {
     id: "openai-api",
@@ -71,7 +66,6 @@ const accountProfiles: AccountProfile[] = [
     agent: "codex",
     provider: "openai",
     authMode: "openai-api-key",
-    allowedProjectKeys: ["AII"],
   },
   {
     id: "openai-subscription",
@@ -80,7 +74,6 @@ const accountProfiles: AccountProfile[] = [
     agent: "codex",
     provider: "openai",
     authMode: "codex-subscription",
-    allowedProjectKeys: ["AII"],
   },
 ];
 
@@ -106,7 +99,6 @@ describe("resolveStageAgentConfig", () => {
   it("returns explicit legacy mode when project configuration is absent or legacy", () => {
     expect(
       resolveStageAgentConfig({
-        projectKey: "AII",
         orchestratorDefaults,
         projectConfig: null,
         accountProfiles,
@@ -115,7 +107,6 @@ describe("resolveStageAgentConfig", () => {
 
     expect(
       resolveStageAgentConfig({
-        projectKey: "AII",
         orchestratorDefaults,
         projectConfig: { version: 1, mode: "legacy", stages: { implementation: { model: "" } } },
         accountProfiles,
@@ -124,7 +115,6 @@ describe("resolveStageAgentConfig", () => {
 
     expect(
       resolveStageAgentConfig({
-        projectKey: "AII",
         orchestratorDefaults: { ...orchestratorDefaults, version: 2 as 1 },
         projectConfig: { version: 1, mode: "legacy" },
         accountProfiles,
@@ -134,7 +124,6 @@ describe("resolveStageAgentConfig", () => {
 
   it("resolves defaults and lets a project override only the model", () => {
     const result = resolveStageAgentConfig({
-      projectKey: "AII",
       orchestratorDefaults,
       projectConfig: configuredProject({ implementation: { model: "gpt-5.6-codex" } }),
       accountProfiles,
@@ -160,7 +149,6 @@ describe("resolveStageAgentConfig", () => {
 
   it("treats a null override as cleared and restores inheritance", () => {
     const result = resolveStageAgentConfig({
-      projectKey: "AII",
       orchestratorDefaults,
       projectConfig: configuredProject({ implementation: { model: null } }),
       accountProfiles,
@@ -174,7 +162,6 @@ describe("resolveStageAgentConfig", () => {
 
   it("projects account metadata without credential or session fields", () => {
     const result = resolveStageAgentConfig({
-      projectKey: "AII",
       orchestratorDefaults,
       projectConfig: configuredProject({ implementation: { accountProfileId: "openai-secret-bearing" } }),
       accountProfiles: [
@@ -186,7 +173,6 @@ describe("resolveStageAgentConfig", () => {
           agent: "codex",
           provider: "openai",
           authMode: "openai-api-key",
-          allowedProjectKeys: ["AII"],
           apiKey: "sk-must-not-project",
         } as AccountProfile,
       ],
@@ -207,7 +193,6 @@ describe("resolveStageAgentConfig", () => {
 
   it("supports explicit Claude subscription profiles for configured stages", () => {
     const result = resolveStageAgentConfig({
-      projectKey: "AII",
       orchestratorDefaults,
       projectConfig: configuredProject({ planning: { accountProfileId: "claude-subscription" } }),
       accountProfiles,
@@ -237,7 +222,6 @@ describe("resolveStageAgentConfig", () => {
 
   it("bounds invocation time by the remaining job deadline", () => {
     const result = resolveStageAgentConfig({
-      projectKey: "AII",
       orchestratorDefaults,
       projectConfig: configuredProject(),
       accountProfiles,
@@ -254,7 +238,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults: { ...orchestratorDefaults, version: 2 as 1 },
           projectConfig: configuredProject(),
           accountProfiles,
@@ -265,7 +248,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: { version: 1, mode: "configured", stages: { bogus: {} } } as unknown as StageAgentConfigurationV1,
           accountProfiles,
@@ -276,7 +258,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject({ implementation: { temperature: 0 } as unknown as never }),
           accountProfiles,
@@ -289,7 +270,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults: {
             version: 1,
             mode: "configured",
@@ -307,7 +287,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject({ implementation: { invocationTimeoutMs: 0 } }),
           accountProfiles,
@@ -317,7 +296,6 @@ describe("resolveStageAgentConfig", () => {
 
     const err = captureError(() =>
       resolveStageAgentConfig({
-        projectKey: "AII",
         orchestratorDefaults,
         projectConfig: configuredProject({ implementation: { agent: "sk-secret-agent" as "codex" } }),
         accountProfiles,
@@ -331,7 +309,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject({ implementation: { provider: "anthropic" } }),
           accountProfiles,
@@ -342,7 +319,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject({ implementation: { accountProfileId: "claude-api" } }),
           accountProfiles,
@@ -355,7 +331,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject({ implementation: { accountProfileId: "missing" } }),
           accountProfiles,
@@ -366,7 +341,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject(),
           accountProfiles: accountProfiles.map((profile) =>
@@ -375,62 +349,12 @@ describe("resolveStageAgentConfig", () => {
         }),
       /disabled/,
     );
-
-    expectError(
-      () =>
-        resolveStageAgentConfig({
-          projectKey: "AII",
-          orchestratorDefaults,
-          projectConfig: configuredProject(),
-          accountProfiles: accountProfiles.map((profile) => {
-            if (profile.id !== "openai-api") return profile;
-            const { allowedProjectKeys, ...withoutPermissions } = profile;
-            void allowedProjectKeys;
-            return withoutPermissions as AccountProfile;
-          }),
-        }),
-      /permission metadata is required/,
-    );
-
-    expectError(
-      () =>
-        resolveStageAgentConfig({
-          projectKey: "OTHER",
-          orchestratorDefaults,
-          projectConfig: configuredProject(),
-          accountProfiles,
-        }),
-      /not authorized/,
-    );
-  });
-
-  it("honours a * grant as every project, and treats an empty list as none", () => {
-    const resolveWith = (keys: string[], over: Partial<AccountProfile> = {}, projectKey = "OTHER") =>
-      resolveStageAgentConfig({
-        projectKey,
-        orchestratorDefaults,
-        projectConfig: configuredProject(),
-        accountProfiles: accountProfiles.map((p) => ({ ...p, allowedProjectKeys: keys, ...(p.id === "openai-api" ? over : {}) })),
-      });
-    expect(ALL_PROJECTS_KEY).toBe("*");
-    expect(isProjectPermitted([], "P")).toBe(false);
-    expect(isProjectPermitted(["P"], "P")).toBe(true);
-    expect(isProjectPermitted(["Q"], "P")).toBe(false);
-    expect(isProjectPermitted(["*"], "P")).toBe(true);
-    expect(isProjectPermitted(["*", "Q"], "P")).toBe(true);
-    expect(() => resolveWith(["OTHER"])).not.toThrow();
-    expect(() => resolveWith(["*"])).not.toThrow();
-    expect(() => resolveWith(["*", "Q"])).not.toThrow();
-    expectError(() => resolveWith([]), /not authorized/);
-    expectError(() => resolveWith(["Q"]), /not authorized/);
-    expectError(() => resolveWith(["*"], { disabled: true }), /disabled/);
   });
 
   it("rejects malformed profile metadata and duplicate profile ids", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject(),
           accountProfiles: accountProfiles.map((profile) =>
@@ -443,7 +367,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject(),
           accountProfiles: accountProfiles.map((profile) =>
@@ -456,7 +379,6 @@ describe("resolveStageAgentConfig", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
-          projectKey: "AII",
           orchestratorDefaults,
           projectConfig: configuredProject(),
           accountProfiles: [...accountProfiles, { ...accountProfiles[0] }],
@@ -468,7 +390,6 @@ describe("resolveStageAgentConfig", () => {
   it("does not echo unknown field names when rejecting strict configuration objects", () => {
     const err = captureError(() =>
       resolveStageAgentConfig({
-        projectKey: "AII",
         orchestratorDefaults,
         projectConfig: configuredProject({ implementation: { "sk-secret-field": "x" } as unknown as never }),
         accountProfiles,

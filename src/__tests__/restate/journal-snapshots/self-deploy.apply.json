@@ -1,0 +1,34 @@
+[
+  {
+    "type": "Input",
+    "name": ""
+  },
+  {
+    "type": "GetEagerState",
+    "name": ""
+  },
+  {
+    "type": "OneWayCall",
+    "name": ""
+  },
+  {
+    "type": "GetEagerState",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "apply policy"
+  },
+  {
+    "type": "Run",
+    "name": "apply image"
+  },
+  {
+    "type": "SetState",
+    "name": ""
+  },
+  {
+    "type": "Output",
+    "name": ""
+  }
+]

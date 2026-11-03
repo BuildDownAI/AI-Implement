@@ -45,6 +45,23 @@ export const deploymentsHtml = `
 
     <div class="alert" id="deployments-outcome-alert" hidden></div>
 
+    <div class="card" id="deployments-active" hidden>
+      <div class="card-header"><h2 class="card-title">Deploy in progress <span class="badge neutral" id="deployments-active-badge">—</span></h2></div>
+      <div class="card-body">
+        <div id="deployments-active-details" class="kpi-trend" style="font-family: var(--font-mono)"></div>
+        <div style="margin-top: 8px">
+          <button class="btn btn-sm" id="deployments-cancel-btn" onclick="window.cancelDeploy()" hidden>Cancel deploy</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="deployments-last-result" hidden>
+      <div class="card-header"><h2 class="card-title">Last deploy result <span class="badge neutral" id="deployments-last-result-badge">—</span></h2></div>
+      <div class="card-body">
+        <div id="deployments-last-result-details" class="kpi-trend" style="font-family: var(--font-mono)"></div>
+      </div>
+    </div>
+
     <div class="card" id="deployments-policy" hidden>
       <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
       <div class="card-body">
@@ -73,6 +90,12 @@ export const deploymentsHtml = `
           <span>Deploy it automatically</span>
         </label>
         <div class="kpi-trend text-secondary" id="deployments-auto-hint" style="margin-left: 24px"></div>
+
+        <label class="checkbox-row" id="deployments-fly-toml-row">
+          <input type="checkbox" id="deployments-fly-toml" onchange="window.refreshPolicyDirty()">
+          <span>Apply fly.toml on deploy</span>
+        </label>
+        <div class="kpi-trend text-secondary" id="deployments-fly-toml-hint" style="margin-left: 24px"></div>
 
         <label class="checkbox-row" id="deployments-notify-row">
           <input type="checkbox" id="deployments-notify" onchange="window.refreshPolicyDirty()">
@@ -226,6 +249,49 @@ export const deploymentsScript = `
   // does not silently revert a checkbox someone has ticked but not yet saved.
   let savedPolicy = null;
   let stampedBranch = null;
+  // Whether a SelfDeploy is draining, applying or verifying; the Deploy button must stay
+  // disabled for exactly that long, including after triggerDeploy's finally block.
+  let deployActive = false;
+
+  function isActivePhase(phase) {
+    return phase === 'draining' || phase === 'applying' || phase === 'verifying';
+  }
+
+  function deployDetails(deploy) {
+    const t = deploy.target || {};
+    const parts = [];
+    if (t.branch) parts.push('branch ' + t.branch);
+    if (t.commit) parts.push('commit ' + short(t.commit));
+    if (t.image) parts.push('image ' + t.image);
+    return parts;
+  }
+
+  function renderSelfDeploy(deploy) {
+    const activeCard = document.getElementById('deployments-active');
+    const lastCard = document.getElementById('deployments-last-result');
+    const cancelBtn = document.getElementById('deployments-cancel-btn');
+    const phase = deploy ? deploy.phase : null;
+    deployActive = isActivePhase(phase);
+    activeCard.hidden = !deployActive;
+    cancelBtn.hidden = phase !== 'draining';
+    const isResult = phase === 'succeeded' || phase === 'failed' || phase === 'cancelled';
+    lastCard.hidden = !isResult;
+    document.getElementById('deployments-deploy-btn').disabled = deployActive;
+    if (deployActive) {
+      setBadge(document.getElementById('deployments-active-badge'), phase === 'draining' ? 'warn' : 'running', phase);
+      const parts = deployDetails(deploy);
+      if (deploy.requestedBy) parts.push('started by ' + deploy.requestedBy);
+      if (deploy.startedAt) parts.push('started ' + new Date(deploy.startedAt).toLocaleString());
+      document.getElementById('deployments-active-details').textContent = parts.join(' · ');
+    }
+    if (isResult) {
+      setBadge(document.getElementById('deployments-last-result-badge'), phase === 'succeeded' ? 'success' : phase === 'failed' ? 'fail' : 'neutral', phase);
+      const parts = deployDetails(deploy);
+      if (deploy.reason) parts.push('reason ' + deploy.reason);
+      if (deploy.finishedAt) parts.push('finished ' + new Date(deploy.finishedAt).toLocaleString());
+      document.getElementById('deployments-last-result-details').textContent = parts.join(' · ');
+    }
+  }
 
   function policyDirty() {
     if (!savedPolicy) return false;
@@ -236,7 +302,10 @@ export const deploymentsScript = `
     const notifyChanged = !notifyEl.disabled && notifyEl.checked !== savedPolicy.notifyAvailable;
     const watchedRepoChanged = document.getElementById('deployments-watched-repo').value !== (savedPolicy.watchedRepo || '');
     const watchedRefChanged = document.getElementById('deployments-watched-ref').value !== (savedPolicy.watchedRef || '');
-    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged || watchedRepoChanged || watchedRefChanged;
+    // Same rule as the announcement switch: a disabled control is not part of the form.
+    const flyEl = document.getElementById('deployments-fly-toml');
+    const flyChanged = !flyEl.disabled && flyEl.checked !== savedPolicy.applyFlyToml;
+    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged || flyChanged || watchedRepoChanged || watchedRefChanged;
   }
 
   function refreshPolicyDirty() {
@@ -391,8 +460,8 @@ export const deploymentsScript = `
     loadDeployments();
   }
 
-  async function loadDeployments() {
-    clearMessage();
+  async function loadDeployments(opts) {
+    if (!(opts && opts.keepMessage)) clearMessage();
     loadReservations();
 
     let data;
@@ -448,12 +517,20 @@ export const deploymentsScript = `
     const notifyEl = document.getElementById('deployments-notify');
     const watchedRepoEl = document.getElementById('deployments-watched-repo');
     const watchedRefEl = document.getElementById('deployments-watched-ref');
+    const flyEl = document.getElementById('deployments-fly-toml');
+
+    // Before the dirty check below, which ignores a disabled control. A Restate fault
+    // leaves selfDeploy null; the stored option is then unknown and reads as off.
+    const selfDeploy = data.selfDeploy || null;
+    const flyAllowed = data.applyFlyTomlAllowed !== false;
+    flyEl.disabled = !flyAllowed;
 
     // Computed against the *previous* server state, before it is replaced below — the
     // poll must not overwrite a checkbox that is ticked and not yet saved.
     if (!policyDirty()) {
       autoEl.checked = !!data.autoDeploy;
       notifyEl.checked = !!data.notifyAvailable;
+      flyEl.checked = flyAllowed && !!(selfDeploy && selfDeploy.options && selfDeploy.options.applyFlyToml);
       watchedRepoEl.value = data.watchedRepo || '';
       // Seed the ref selector with the saved value; the options are loaded on blur.
       const savedRef = data.watchedRef || '';
@@ -476,6 +553,7 @@ export const deploymentsScript = `
       notifyAvailable: !!data.notifyAvailable,
       watchedRepo: data.watchedRepo || '',
       watchedRef: data.watchedRef || '',
+      applyFlyToml: flyAllowed && !!(selfDeploy && selfDeploy.options && selfDeploy.options.applyFlyToml),
     };
     refreshPolicyDirty();
 
@@ -489,6 +567,15 @@ export const deploymentsScript = `
     const notifyRow = document.getElementById('deployments-notify-row');
     notifyRow.style.opacity = data.notifyConfigured ? '' : '0.5';
     notifyRow.style.cursor = data.notifyConfigured ? '' : 'not-allowed';
+
+    const flyRow = document.getElementById('deployments-fly-toml-row');
+    flyRow.style.opacity = flyAllowed ? '' : '0.5';
+    flyRow.style.cursor = flyAllowed ? '' : 'not-allowed';
+    document.getElementById('deployments-fly-toml-hint').textContent = flyAllowed
+      ? 'Off by default. On: a deploy also applies this repo\u2019s fly.toml to the machine.'
+      : 'The control plane created this machine and owns its config.';
+
+    renderSelfDeploy(selfDeploy && selfDeploy.deploy ? selfDeploy.deploy : null);
 
     document.getElementById('deployments-auto-hint').textContent = autoHint(data, available, held);
     document.getElementById('deployments-notify-hint').textContent = notifyHint(data);
@@ -543,6 +630,9 @@ export const deploymentsScript = `
         setBadge(outcomeBadge, 'success', 'Completed');
       } else if (outcome.kind === 'deployed-not-serving') {
         setBadge(outcomeBadge, 'warn', 'Degraded');
+      } else if (outcome.kind === 'deploy-cancelled') {
+        // Deliberate, so neither the red failure treatment nor a success.
+        setBadge(outcomeBadge, 'neutral', 'Cancelled');
       } else {
         setBadge(outcomeBadge, 'fail', 'Failed');
       }
@@ -562,19 +652,23 @@ export const deploymentsScript = `
     outcomeAlert.hidden = !troubled;
     if (troubled) {
       const degraded = outcome.kind === 'deployed-not-serving';
+      const cancelled = outcome.kind === 'deploy-cancelled';
       outcomeAlert.className = 'alert ' + (degraded ? 'warn' : 'fail');
+      // Cancelling is deliberate: the warn treatment, not the failure one.
+      if (cancelled) outcomeAlert.className = 'alert warn';
       const title = degraded
         ? 'Released, but the knowledge graph is not serving'
-        : 'Deploy did not release';
+        : cancelled ? 'Deploy cancelled' : 'Deploy did not release';
       const explain = degraded
         ? '/mcp answers 503 while every other route is healthy. Deploy now, below, rebuilds and releases the same commit.'
+        : cancelled ? 'The deploy was cancelled while draining. The running version is unchanged.'
         : 'The running version is unchanged, and the commit is still available to deploy.';
       // The record carries a one-line reason on purpose. flyctl's real output is a 64 KB
       // tail that is logged and never stored, because the KG token rides in its argv and a
       // stored copy would outlive a rotating log and be served on every status poll.
       // Naming where the output is beats reproducing it somewhere it should not be.
       outcomeAlert.innerHTML =
-        '<div class="alert-icon">' + (degraded ? '!' : '\\u00d7') + '</div>'
+        '<div class="alert-icon">' + (degraded || cancelled ? '!' : '\\u00d7') + '</div>'
         + '<div style="flex:1">'
         + '<div class="alert-title">' + window.esc(title) + '</div>'
         + '<div class="alert-desc">' + window.esc(explain) + '</div>'
@@ -643,9 +737,34 @@ export const deploymentsScript = `
     } finally {
       // finally, not the success path: returning early there left the button dead
       // whenever a fast failure cleared the hold before the next poll could hide it.
-      btn.disabled = false;
+      btn.disabled = deployActive;
       loadDeployments();
     }
+  }
+
+  async function cancelDeploy() {
+    clearMessage();
+    const btn = document.getElementById('deployments-cancel-btn');
+    btn.disabled = true;
+    try {
+      const res = await window.api('/api/deploy-cancel', { method: 'POST' });
+      if (!res.ok) {
+        let message = 'Unknown error';
+        try { const body = await res.json(); message = body.error || message; } catch (e) { /* ignore */ }
+        showMessage('error', 'Could not cancel the deploy — ' + message);
+      } else {
+        const body = await res.json().catch(function () { return {}; });
+        if (body && body.cancelled === false && body.reason === 'too-late') {
+          showMessage('warning', 'The deploy is past the drain and cannot be cancelled.');
+        }
+      }
+    } catch (err) {
+      showMessage('error', 'Could not cancel the deploy — ' + String(err));
+    } finally {
+      btn.disabled = false;
+    }
+    // keepMessage: a plain reload would erase the too-late notice just shown.
+    await loadDeployments({ keepMessage: true });
   }
 
   async function saveDeployPolicy() {
@@ -661,11 +780,15 @@ export const deploymentsScript = `
     const patch = { autoDeploy: document.getElementById('deployments-auto').checked };
     if (!notifyEl.disabled) patch.notifyAvailable = notifyEl.checked;
     // Send null to clear the override when the field is blank.
+    const flyEl = document.getElementById('deployments-fly-toml');
+    if (!flyEl.disabled) patch.applyFlyToml = flyEl.checked;
     patch.watchedRepo = watchedRepoEl.value.trim() || null;
     patch.watchedRef = watchedRefEl.value || null;
     try {
       const res = await window.api('/api/deploy-policy', { method: 'POST', body: JSON.stringify(patch) });
-      if (!res.ok && res.status !== 401) {
+      if (res.status === 409) {
+        showMessage('error', 'Could not save the deployment policy — the control plane owns this machine\u2019s config, so fly.toml cannot be applied.');
+      } else if (!res.ok && res.status !== 401) {
         showMessage('error', 'Could not save the deployment policy — the settings may not reflect what is stored.');
       }
     } catch (err) {
@@ -761,6 +884,7 @@ export const deploymentsScript = `
   window.loadDeployments = loadDeployments;
   window.releaseReservation = releaseReservation;
   window.triggerDeploy = triggerDeploy;
+  window.cancelDeploy = cancelDeploy;
   window.saveDeployPolicy = saveDeployPolicy;
   window.refreshPolicyDirty = refreshPolicyDirty;
   window.loadDeployRefs = loadDeployRefs;

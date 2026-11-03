@@ -16,7 +16,7 @@ vi.mock("../fly-machines.js", async (importOriginal) => ({
   fetchMachineLogs: vi.fn(),
 }));
 
-const USER: Caller = { kind: "human", email: "u@example.com", role: "user" };
+const USER: Caller = { kind: "human", email: "u@example.com", role: "user", grants: [] };
 const ctx = { request: () => ({ target: { handler: "x" } }) } as unknown as restate.Context;
 
 function machine(overrides: Partial<Machine> = {}): Machine {

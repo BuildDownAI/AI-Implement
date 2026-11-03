@@ -52,7 +52,7 @@ export const modelsAndProvidersHtml = `
         <div style="overflow-x:auto">
         <table class="tbl">
           <thead>
-            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Permitted projects</th><th>Profile</th><th>Readiness</th><th>Busy / recovery</th><th>API key</th></tr>
+            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Profile</th><th>Readiness</th><th>Busy / recovery</th><th>API key</th></tr>
           </thead>
           <tbody id="mp-account-rows"></tbody>
         </table>
@@ -68,14 +68,12 @@ export const modelsAndProvidersHtml = `
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-agent">Agent</label><select class="input" id="mp-new-agent"><option value="claude">claude</option><option value="codex">codex</option></select></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-provider">Provider</label><select class="input" id="mp-new-provider"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="bedrock">bedrock</option></select></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-authMode">Authentication</label><select class="input" id="mp-new-authMode"><option value="anthropic-api-key">anthropic-api-key</option><option value="openai-api-key">openai-api-key</option><option value="codex-subscription">codex-subscription</option><option value="claude-subscription">claude-subscription</option><option value="bedrock">bedrock</option></select></span>
-            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-allowedProjectKeys">Permitted projects</label><input class="input" id="mp-new-allowedProjectKeys" placeholder="Project keys, comma-separated. Leave blank for all projects." size="48"></span>
             <button class="btn btn-primary btn-sm" onclick="mpAddAccount()">Add account profile</button>
           </div>
         </div>
         <div class="text-tertiary" style="font-size:11.5px;padding:12px">
           <div><strong>Provisioning.</strong> Add a profile above and set an API key per profile; a key is encrypted on save and never shown again. Connect a ChatGPT plan from a laptop with a pairing code; other subscription sign-ins and Bedrock credentials are provisioned on the host.</div>
           <div>ChatGPT plan, <em>sign-in required</em> or <em>missing</em>: run <span class="mono">node dist/chatgpt-plan-login.js login</span>, or import an existing sign-in with <span class="mono">chatgpt-import</span>.</div>
-          <div>Readiness is checked against the profile's first permitted project; a profile for all projects is checked against a mapped project. A profile with no permitted project shows <em>unknown</em>; that is not a credential fault.</div>
         </div>
       </div>
     </div>
@@ -279,7 +277,6 @@ export const modelsAndProvidersScript = `(function () {
     emptyEl.classList.toggle('hidden', mpAccounts.length > 0);
     let html = '';
     for (const a of mpAccounts) {
-      const projects = (a.allowedProjectKeys || []).indexOf('*') !== -1 ? 'all projects' : (a.allowedProjectKeys || []).map(function (k) { return '<span class="mono">' + window.esc(k) + '</span>'; }).join(', ') || '<span class="text-tertiary">none</span>';
       const account = a.account || {};
       let readyCell;
       let recoveryCell = '<span class="text-tertiary">—</span>';
@@ -315,7 +312,6 @@ export const modelsAndProvidersScript = `(function () {
         '<td>' + window.esc(a.agent) + '</td>' +
         '<td>' + window.esc(a.provider) + '</td>' +
         '<td>' + window.esc(mpAuthLabel(a.authMode)) + '</td>' +
-        '<td>' + projects + '</td>' +
         '<td><span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span></td>' +
         '<td>' + readyCell + '</td>' +
         '<td>' + recoveryCell + '</td>' +
@@ -420,9 +416,7 @@ export const modelsAndProvidersScript = `(function () {
     if (!mpCanEdit()) return;
     mpAccountError('');
     const val = function (id) { return String(document.getElementById('mp-new-' + id).value || '').trim(); };
-    const keys = val('allowedProjectKeys').split(',').map(function (k) { return k.trim(); }).filter(Boolean);
-    if (!keys.length) keys.push('*');
-    const body = { profileId: val('profileId'), identity: val('identity'), agent: val('agent'), provider: val('provider'), authMode: val('authMode'), allowedProjectKeys: keys };
+    const body = { profileId: val('profileId'), identity: val('identity'), agent: val('agent'), provider: val('provider'), authMode: val('authMode') };
     try {
       const res = await window.api('/api/model-accounts', { method: 'POST', body: JSON.stringify(body) });
       if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to add account profile')); return; }
@@ -432,7 +426,6 @@ export const modelsAndProvidersScript = `(function () {
     }
     document.getElementById('mp-new-profileId').value = '';
     document.getElementById('mp-new-identity').value = '';
-    document.getElementById('mp-new-allowedProjectKeys').value = '';
     await loadStageConfig(false);
   }
 

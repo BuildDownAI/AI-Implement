@@ -1,3 +1,4 @@
+import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -752,6 +753,7 @@ function probeExternalReviewCheck(
   warnOnce: WarnOnce,
 ): ExternalReviewProbe {
   const { configuredCheckNames, process } = opts;
+  if (process.checkPairs.length === 0) return readProcessVerdict(ghSpawn, prNumber, headSha, [], opts);
   // --paginate --slurp, not a bare per_page=100: on a busy SHA the review check can fall
   // outside the first page, and a truncated page is indistinguishable from "no reviewer" —
   // which resolves to "absent" and fails OPEN. parseCheckRuns already accepts the array-of-
@@ -833,7 +835,10 @@ function readProcessVerdict(
   if (blocks === null) return { state: "unreadable" };
 
   let payload: unknown;
+  let issuePayload: unknown;
   try {
+    issuePayload = JSON.parse(issueComments.stdout);
+    if (!Array.isArray(issuePayload)) return { state: "unreadable" };
     payload = JSON.parse(commentsRes.stdout);
   } catch {
     return { state: "unreadable" };
@@ -859,14 +864,28 @@ function readProcessVerdict(
     }
   }
 
+  const closedUrls = opts.process.id === "codex-code-review"
+    ? collectClosedReviewThreadCommentUrls(ghSpawn, prNumber) : undefined;
+  if (closedUrls !== undefined) {
+    for (const comment of inlineComments) {
+      if (comment.url) comment.threadOpen = !closedUrls.has(comment.url);
+    }
+  }
+
   const verdict = opts.process.readVerdict({
     headSha,
     checkRuns: matchedRuns.map((run) => ({ ...run, conclusion: run.conclusion || null })),
     inlineComments,
+    inlineCommentThreadsRead: closedUrls !== undefined,
+    issueComments: (issuePayload as unknown[]).flat().map((item) => {
+      const c = asRecord(item);
+      const user = recordProp(c, "user");
+      return { authorLogin: stringProp(user, "login"), authorType: stringProp(user, "type"), body: stringProp(c, "body"), updatedAt: stringProp(c, "updated_at") || stringProp(c, "created_at") };
+    }),
     blocks,
   });
   if (verdict.verdict === "approve" || verdict.verdict === "changes_requested") return { state: "completed", verdict, issueComments };
-  if (verdict.verdict === "incomplete" && verdict.source !== "none") return { state: "running", verdict, issueComments };
+  if (verdict.verdict === "incomplete" && (verdict.source !== "none" || opts.process.checkPairs.length === 0)) return { state: "running", verdict, issueComments };
   return { state: "no-real-verdict", verdict, issueComments };
 }
 
@@ -2331,8 +2350,14 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const summaryBlockingGates = reviewProcess.summaryBlockingGates;
       const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
       const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
-      const gatingReviewFindings = reviewLedger.filter((finding) => isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
-      const advisoryReviewFindings = reviewLedger.filter((finding) => !isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict));
+      const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
+        // Codex P2/untagged comments are advisory even though other processes gate by source.
+        if (reviewProcess.id === "codex-code-review" && finding.severity === "minor"
+          && (finding.source === "github-review" || finding.source === "github-review-thread")) return false;
+        return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
+      };
+      const gatingReviewFindings = reviewLedger.filter(findingGates);
+      const advisoryReviewFindings = reviewLedger.filter((finding) => !findingGates(finding));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
       // An "invalid" disposition is not filtered — it stays gating so the next review decides.
@@ -2504,6 +2529,44 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
 
+      // Only a real, readable, blocking verdict goes to the late gate: LateExternalReview re-reads it from
+      // Claude's review comment (ai-implement process), and does not require an initial run's own review
+      // check to have succeeded, so a no-verdict or unreadable ending would otherwise earn the mark (AII-1589).
+      const handOffToLateReview = cleanInternalNoGatingFindings
+        && externalReviewVerdictBlocks
+        && !findingsUnavailable
+        && !externalReviewNoVerdict
+        && reviewProcess.id === "ai-implement";
+      if (handOffToLateReview) {
+        terminationReason = "external_review_pending";
+        reviewedHeadSha = externalReviewResult.headSha || undefined;
+        feedback = externalVerdictUnavailableFeedback({ noVerdict: false, verdictBlocks: true });
+        await reporter.report({
+          id: `post-push-review.${iteration}`,
+          type: "custom",
+          status: "passed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [], telemetry: reviewResult.telemetry, ...(reviewedHeadSha ? { reviewedHeadSha } : {}) },
+          logs_url: null,
+        });
+        const marker = `<!-- ai-implement post-push iter=${iteration} invalid-external-review -->`;
+        const reviewUrl = submitPrReview(
+          ghSpawn,
+          prNumber,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. The late external review now decides.${internalReviewSummaryBlock(verdict.feedback)}`,
+        );
+        postPrComment(
+          ghSpawn,
+          prNumber,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not approving here; the late external review now decides (a verdict whose findings are all deferred follow-ups does not hold the PR).${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}\n\n**Merge readiness:** Waiting for the late external review to decide.`,
+          marker,
+        );
+        break;
+      }
+
       if (cleanInternalNoGatingFindings && (findingsUnavailable || externalReviewVerdictBlocks || externalReviewNoVerdict)) {
         terminationReason = "invalid_review";
         feedback = externalVerdictUnavailableFeedback({ noVerdict: externalReviewNoVerdict, verdictBlocks: externalReviewVerdictBlocks });
@@ -2522,7 +2585,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         const reviewUrl = submitPrReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
@@ -2720,6 +2783,8 @@ ${externalFindingsFixBlock}
 
       const add = gitSpawn(["add", "-A"]);
       if (add.exitCode !== 0) throw new Error(`git add failed: ${resultMessage(add)}`);
+
+      removeScratchFromIndex(inputs.workspaceDir, gitSpawn);
 
       const status = gitSpawn(["status", "--porcelain"]);
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);

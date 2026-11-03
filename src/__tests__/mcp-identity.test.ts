@@ -5,13 +5,17 @@ import { handleMcpTokenRequest, setRefreshAuthority } from "../mcp-oauth.js";
 
 describe("systemCaller", () => {
   it("returns kind system, no email, and the admin role", () => {
-    expect(systemCaller()).toEqual({ kind: "system", email: null, role: "admin" });
+    expect(systemCaller()).toEqual({ kind: "system", email: null, role: "admin", grants: [] });
   });
 });
 
 describe("serviceCaller", () => {
+  it("keeps deploy authority separate from the service role", () => {
+    expect(serviceCaller({ grants: ["deploy"] })).toEqual({ kind: "service", email: null, role: "user", grants: ["deploy"] });
+  });
+
   it("returns kind service, no email, and the read-only user role", () => {
-    expect(serviceCaller()).toEqual({ kind: "service", email: null, role: "user" });
+    expect(serviceCaller()).toEqual({ kind: "service", email: null, role: "user", grants: [] });
   });
 });
 

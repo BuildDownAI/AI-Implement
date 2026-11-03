@@ -265,7 +265,7 @@ function ghHeaders(token: string): Record<string, string> {
 
 // Unauthenticated reads (token: null) are limited to 60 req/hour per IP by GitHub.
 // Use only for public source-repo reads where no App installation covers the owner.
-function srcHeaders(token: string | null): Record<string, string> {
+export function srcHeaders(token: string | null): Record<string, string> {
   if (token === null) return { ...GH_HEADERS };
   return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
 }
@@ -1018,6 +1018,9 @@ export interface WorkflowRunStatus {
   status: "queued" | "in_progress" | "completed" | string;
   conclusion: "success" | "failure" | "cancelled" | "timed_out" | string | null;
   html_url: string;
+  /** ISO timestamps from the API; `updated_at` can drift past the true end time. */
+  run_started_at?: string | null;
+  updated_at?: string | null;
 }
 
 /**
@@ -1037,12 +1040,16 @@ export async function getWorkflowRunStatus(
     status: string;
     conclusion: string | null;
     html_url: string;
+    run_started_at?: string | null;
+    updated_at?: string | null;
   };
 
   return {
     status: data.status,
     conclusion: data.conclusion,
     html_url: data.html_url,
+    run_started_at: data.run_started_at ?? null,
+    updated_at: data.updated_at ?? null,
   };
 }
 
@@ -1625,11 +1632,13 @@ export async function compareCommits(
 }
 
 /**
- * A file's text from the repository's default branch (no `ref`), or `null` when it does not exist.
+ * A file's text from `ref` when given, else from the repository's GitHub default branch (no `ref` sent), or
+ * `null` when it does not exist.
  * Any other failure throws, so a caller inside a retried step never reads "no file" from an outage.
  */
-export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string): Promise<string | null> {
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string, ref?: string): Promise<string | null> {
+  const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}${query}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`getDefaultBranchFileText ${path} failed: HTTP ${res.status}`);
   const body = (await res.json()) as { content?: string; encoding?: string; type?: string };

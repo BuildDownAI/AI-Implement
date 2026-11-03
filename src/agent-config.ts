@@ -23,7 +23,6 @@ export interface AccountProfile {
   provider: ModelProvider;
   authMode: AccountAuthMode;
   disabled?: boolean;
-  allowedProjectKeys?: readonly string[];
 }
 
 export interface StageSelection {
@@ -58,7 +57,6 @@ export interface ConfiguredStageResolution {
 export type StageConfigResolution = LegacyStageResolution | ConfiguredStageResolution;
 
 export interface ResolveStageAgentConfigInput {
-  projectKey: string;
   orchestratorDefaults: StageAgentConfigurationV1;
   projectConfig?: StageAgentConfigurationV1 | null;
   accountProfiles: readonly AccountProfile[];
@@ -154,23 +152,6 @@ function validateAgentProvider(stage: StageName, selection: StageSelection, prof
   throw new Error(`${stage} has unsupported Codex provider/authentication combination`);
 }
 
-/** A single entry of this key in a profile's permitted-projects list grants every project. An empty list still means no project. */
-export const ALL_PROJECTS_KEY = "*";
-
-export function isProjectPermitted(keys: readonly string[], projectKey: string): boolean {
-  return keys.includes(projectKey) || keys.includes(ALL_PROJECTS_KEY);
-}
-
-function assertProfileAuthorized(stage: StageName, selection: StageSelection, profile: AccountProfile, projectKey: string): void {
-  if (!Array.isArray(profile.allowedProjectKeys)) {
-    throw new Error(`${stage}.accountProfileId permission metadata is required`);
-  }
-  if (!isProjectPermitted(profile.allowedProjectKeys, projectKey)) {
-    throw new Error(`${stage}.accountProfileId is not authorized for this project`);
-  }
-  validateAgentProvider(stage, selection, profile);
-}
-
 function validateAccountProfile(profile: AccountProfile): void {
   if (!isRecord(profile)) throw new Error("account profile must be an object");
   if (typeof profile.id !== "string" || profile.id.trim() === "") {
@@ -199,14 +180,6 @@ function validateAccountProfile(profile: AccountProfile): void {
   }
   if (profile.disabled !== undefined && typeof profile.disabled !== "boolean") {
     throw new Error("account profile disabled flag must be a boolean");
-  }
-  if (!Array.isArray(profile.allowedProjectKeys)) {
-    throw new Error("account profile permission metadata is required");
-  }
-  for (const projectKey of profile.allowedProjectKeys) {
-    if (typeof projectKey !== "string" || projectKey.trim() === "") {
-      throw new Error("account profile permission metadata is malformed");
-    }
   }
 }
 
@@ -267,7 +240,7 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
     );
     const profile = profileById.get(resolved.selection.accountProfileId);
     if (!profile) throw new Error(`${stage}.accountProfileId does not reference a known profile`);
-    assertProfileAuthorized(stage, resolved.selection, profile, input.projectKey);
+    validateAgentProvider(stage, resolved.selection, profile);
     stages[stage] = resolved.selection;
     sources[stage] = resolved.sources;
     profiles[stage] = {

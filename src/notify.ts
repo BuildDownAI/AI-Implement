@@ -46,12 +46,13 @@ export interface CompletionNotification {
 }
 
 export interface DeployNotification {
-  kind: "shutdown" | "deployed" | "restarted" | "available";
+  kind: "shutdown" | "deployed" | "restarted" | "available" | "deploy-failed" | "deploy-cancelled";
   appName: string;
   region: string | null;
   imageRef: string | null; // Full FLY_IMAGE_REF, only the deployment-<id> tag is displayed.
   downtimeMs?: number | null; // Gap between the shutdown notice and the boot that answered it, when both were observed.
-  commit?: string | null; // Only the "available" kind — there is no image to reference yet.
+  detail?: string | null; // Only the "deploy-failed" kind: the reason code.
+  commit?: string | null; // The "available", "deploy-failed" and "deploy-cancelled" kinds — there is no image to reference yet.
   kgDegraded?: boolean; // True when embeddings were not built — /mcp serves lexical-only search.
   kgUnavailable?: boolean; // True when the last sidecar liveness probe failed (AII-648/650).
   sidecarError?: string | null; // The probe's lastError, shown alongside kgUnavailable.
@@ -100,6 +101,21 @@ const DEPLOY_EVENTS: Record<DeployNotification["kind"], {
     teamsIcon: "&#x2B06;",
     title: "Deployment available",
     summary: "Deploy from /admin#deployments when you are ready.",
+    broadcast: false,
+  },
+  // A success is announced by the "deployed" boot notice of the new process, so only the endings that boot never sees post here.
+  "deploy-failed": {
+    slackEmoji: ":x:",
+    teamsIcon: "&#x274C;",
+    title: "Orchestrator deploy failed",
+    summary: "The previous version keeps running and dispatch resumes.",
+    broadcast: true,
+  },
+  "deploy-cancelled": {
+    slackEmoji: ":no_entry_sign:",
+    teamsIcon: "&#x1F6AB;",
+    title: "Orchestrator deploy cancelled",
+    summary: "Dispatch resumes on the running version.",
     broadcast: false,
   },
 };
@@ -479,7 +495,7 @@ function imageTag(imageRef: string | null): string | null {
 // printing it would be ambiguous (two differing versions for same deploy, same version twice for a restart)
 function displayedVersion(n: DeployNotification): string | null {
   // An availability notice names the commit that is waiting; no image exists yet.
-  if (n.kind === "available") return n.commit ? n.commit.slice(0, 7) : null;
+  if (n.kind === "available" || n.kind === "deploy-failed" || n.kind === "deploy-cancelled") return n.commit ? n.commit.slice(0, 7) : null;
   return n.kind === "shutdown" ? null : imageTag(n.imageRef);
 }
 
@@ -492,6 +508,7 @@ async function notifyDeploySlack(webhookUrl: string, n: DeployNotification): Pro
   const version = displayedVersion(n);
   if (version) details.push(`Version: \`${version}\``);
   if (n.downtimeMs != null) details.push(`Down for ${formatDuration(n.downtimeMs)}`);
+  if (n.detail) details.push(`Reason: \`${n.detail}\``);
 
   let text = `${event.slackEmoji} ${mention}*${event.title}* — ${event.summary}\n${details.join(" · ")}`;
   if (n.kgDegraded) text += "\n⚠️ KG embeddings missing — /mcp is lexical-only";
@@ -529,6 +546,7 @@ async function notifyDeployTeams(webhookUrl: string, n: DeployNotification): Pro
   const version = displayedVersion(n);
   if (version) facts.push({ title: "Version", value: version });
   if (n.downtimeMs != null) facts.push({ title: "Down for", value: formatDuration(n.downtimeMs) });
+  if (n.detail) facts.push({ title: "Reason", value: n.detail });
 
   const cardBody: unknown[] = [
     { type: "TextBlock", text: `${event.teamsIcon} ${event.title}`, weight: "Bolder", size: "Medium" },

@@ -1,0 +1,16 @@
+{
+  "request": {
+    "args": {
+      "includeUnsettled": true
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"records\":[{\"dispatchId\":\"f1225385-f0bf-414e-8234-2b2d4b2bace0\",\"completedAt\":1700000001000,\"changedAt\":1700000001000,\"usage\":\"reported\",\"invocations\":[{\"stage\":\"implementation\",\"agent\":\"claude\",\"provider\":\"anthropic\",\"model\":\"claude-model\",\"status\":\"succeeded\",\"tokensIn\":1000,\"tokensOut\":100,\"cacheReadTokens\":null,\"cacheCreationTokens\":null,\"costUsd\":0.25,\"costStatus\":\"reported\",\"attempts\":1}],\"pushedShas\":[\"1111111111111111111111111111111111111111\"],\"phase\":\"implementation\",\"status\":\"completed\",\"conclusion\":\"success\",\"lifecycleOwner\":\"legacy\",\"dispatchedAt\":1699999401000,\"issue\":{\"identifier\":\"AII-job-old\",\"title\":\"Job job-old\",\"repo\":\"acme/widgets\",\"trackerKind\":\"linear\",\"url\":\"https://linear.app/acme/issue/AII-job-old\"},\"pr\":{\"url\":\"https://github.com/acme/widgets/pull/7\",\"number\":7},\"compute\":{\"backend\":\"fly-machines\",\"cpuKind\":null,\"cpus\":null,\"memoryMb\":null,\"startedAt\":1699999501000,\"stoppedAt\":1700000000000}},{\"dispatchId\":\"e2c3504d-efa9-42f6-846b-bf1123f464df\",\"completedAt\":1700009940000,\"changedAt\":1700009940000,\"usage\":\"reported\",\"invocations\":[{\"stage\":\"implementation\",\"agent\":\"claude\",\"provider\":\"anthropic\",\"model\":\"claude-model\",\"status\":\"succeeded\",\"tokensIn\":1000,\"tokensOut\":100,\"cacheReadTokens\":null,\"cacheCreationTokens\":null,\"costUsd\":0.25,\"costStatus\":\"reported\",\"attempts\":1}],\"pushedShas\":[\"2222222222222222222222222222222222222222\"],\"phase\":\"implementation\",\"status\":\"completed\",\"conclusion\":\"success\",\"lifecycleOwner\":\"legacy\",\"dispatchedAt\":1700009340000,\"issue\":{\"identifier\":\"AII-job-fresh\",\"title\":\"Job job-fresh\",\"repo\":\"acme/widgets\",\"trackerKind\":\"linear\",\"url\":\"https://linear.app/acme/issue/AII-job-fresh\"},\"pr\":{\"url\":\"https://github.com/acme/widgets/pull/9\",\"number\":9},\"compute\":{\"backend\":\"fly-machines\",\"cpuKind\":null,\"cpus\":null,\"memoryMb\":null,\"startedAt\":1700009440000,\"stoppedAt\":1700009939000}}],\"nextCursor\":null,\"oldestRetainedCompletedAt\":1700000001000,\"prunedThrough\":null}"
+      }
+    ]
+  }
+}

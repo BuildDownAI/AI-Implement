@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { projectsHtml, projectsScript } from "../pages/projects.js";
+import { componentsCss } from "../components.js";
 import type { RepoMapping } from "../../config.js";
 import { makeMapping } from "../../__tests__/helpers/builders.js";
 import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
@@ -45,6 +46,23 @@ async function save(win: { saveMappingDialog: () => Promise<void> }): Promise<vo
 function reviewerRows(doc: Document): HTMLElement[] {
   return Array.from(doc.querySelectorAll<HTMLElement>("#md-reviewer-list > div"));
 }
+
+describe("projects table containment", () => {
+  it("uses a shared horizontal scroll container for the table and its Edit action", async () => {
+    const tightBodyRule = /\.card-body\.tight\s*\{([^}]*)\}/.exec(componentsCss)?.[1] ?? "";
+    expect(tightBodyRule).toContain("overflow-x: auto");
+
+    const { win, doc } = mountProjects();
+    await win.loadMappings();
+    const table = doc.querySelector("#mappings-body")!.closest("table.tbl")!;
+    expect(table.parentElement?.matches(".card > .card-body.tight")).toBe(true);
+    const edit = Array.from(table.querySelectorAll("button")).find((button) => button.textContent === "Edit");
+    expect(edit).toBeDefined();
+    edit!.click();
+    expect(doc.querySelector<HTMLDialogElement>("#mapping-dialog")!.open).toBe(true);
+    expect(doc.querySelector<HTMLInputElement>("#md-team-key-orig")!.value).toBe("AII");
+  });
+});
 
 describe("projects page reviewer control", () => {
   it("declares the reviewer controls and uses escAttr for reviewer attribute contexts", () => {
@@ -459,7 +477,6 @@ describe("projects page agents tab", () => {
     agent: "codex",
     provider: "openai",
     authMode: "openai-api-key",
-    allowedProjectKeys: ["AII"],
     profileStatus: "active",
     account: { readiness: "ready", failureCode: null },
     ...overrides,
@@ -580,28 +597,26 @@ describe("projects page agents tab", () => {
     expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("positive whole number");
   });
 
-  it("treats a * grant as permitting any project in both the profile list and the stage select", async () => {
+  it("lists every active profile in both the profile list and the stage select", async () => {
     const m = mountAgents({
       accounts: [
-        account({ profileId: "acct-all", allowedProjectKeys: ["*"] }),
-        account({ profileId: "acct-other", allowedProjectKeys: ["OTHER"] }),
-        account({ profileId: "acct-none", allowedProjectKeys: [] }),
-        account({ profileId: "acct-off", allowedProjectKeys: ["*"], profileStatus: "inactive" }),
+        account({ profileId: "acct-a" }),
+        account({ profileId: "acct-b" }),
+        account({ profileId: "acct-off", profileStatus: "inactive" }),
       ],
     });
     await open(m);
     const listed = [...m.doc.querySelectorAll("[data-ag-profile]")].map((e) => e.getAttribute("data-ag-profile"));
-    expect(listed).toEqual(["acct-all"]);
+    expect(listed).toEqual(["acct-a", "acct-b"]);
     const options = [...m.doc.querySelectorAll('select[data-stage="review"][data-field="accountProfileId"] option')].map((o) => (o as HTMLOptionElement).value);
-    expect(options).toContain("acct-all");
-    for (const id of ["acct-other", "acct-none", "acct-off"]) expect(options).not.toContain(id);
+    expect(options).toEqual(expect.arrayContaining(["acct-a", "acct-b"]));
+    expect(options).not.toContain("acct-off");
   });
-  it("lists only active, permitted, compatible profiles and shows readiness and recovery", async () => {
+  it("lists only active, compatible profiles and shows readiness and recovery", async () => {
     const m = mountAgents({
       accounts: [
         account(),
         account({ profileId: "acct-off", profileStatus: "disabled" }),
-        account({ profileId: "acct-other", allowedProjectKeys: ["OTHER"] }),
         account({ profileId: "acct-claude", agent: "claude", provider: "anthropic", authMode: "claude-subscription", account: { readiness: "sign-in required", failureCode: "authentication_required", sessionRecovery: { state: "recovery_required", recoveryRequired: true } } }),
         account({ profileId: "acct-bad", identity: "<img src=x onerror=alert(1)>", account: { readiness: "missing", failureCode: "x" } }),
       ],
@@ -621,7 +636,7 @@ describe("projects page agents tab", () => {
   });
 
   it("blocks opt-in when a stage profile is not eligible", async () => {
-    const m = mountAgents({ accounts: [account({ allowedProjectKeys: ["OTHER"] })] });
+    const m = mountAgents({ accounts: [account({ profileStatus: "disabled" })] });
     await open(m);
     const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
     box.checked = true;

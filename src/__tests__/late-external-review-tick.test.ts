@@ -1,8 +1,10 @@
+import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { readFileSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "tok") }));
-vi.mock("../github.js", () => ({
+vi.mock("../github.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github.js")>()),
   getCombinedChecksState: vi.fn(),
   getCommitTime: vi.fn(),
   getPullRequestState: vi.fn(),
@@ -13,23 +15,163 @@ vi.mock("../github.js", () => ({
   postPrComment: vi.fn(),
 }));
 vi.mock("../config.js", () => ({ getMappings: vi.fn(() => ({})) }));
-vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() => []) }));
+vi.mock("../review-ledger-store.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../review-ledger-store.js")>()),
+  listOpenReviewFindings: vi.fn(() => []),
+  getReviewFindingsByKeys: vi.fn(() => []),
+}));
 
 import { getCombinedChecksState, getCommitTime, getDefaultBranchFileText, getPullRequestState, listCheckRuns, listPrComments, listPullRequestCommits } from "../github.js";
-import { listOpenReviewFindings } from "../review-ledger-store.js";
+import { getReviewFindingsByKeys, listOpenReviewFindings } from "../review-ledger-store.js";
+import { classifyReviewIssueComment } from "../pipeline/review-ledger.js";
+import { stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
 import { decodeReadHead, heldCommentBody, createProductionLateExternalReviewDependencies, LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS } from "../restate/late-external-review.js";
+import { getMappings } from "../config.js";
 import { headReviewedClean } from "../review-head-clean.js";
 
 const run = (status: string, conclusion: string | null) => ({ name: "Claude Code Review", appSlug: "claude", status, conclusion });
 const input = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", headSha: "a", followHead: true };
 
 beforeEach(() => {
+  vi.mocked(getMappings).mockReturnValue({});
   vi.mocked(getPullRequestState).mockResolvedValue({ state: "open", merged: false, headRef: "ai-implement/aii-5-x", headSha: "b" });
   vi.mocked(getCombinedChecksState).mockResolvedValue("success");
   vi.mocked(getCommitTime).mockResolvedValue(1000);
   vi.mocked(listOpenReviewFindings).mockReturnValue([]);
+  vi.mocked(getReviewFindingsByKeys).mockReset().mockReturnValue([]);
   vi.mocked(listPrComments).mockReset().mockResolvedValue([]);
   vi.mocked(getDefaultBranchFileText).mockReset().mockResolvedValue(null);
+});
+
+describe("Codex late review", () => {
+  const deps = () => createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
+  const state = (status: string, unresolved = false, sha = "b") => ({
+    id: 1,
+    body: `<!-- codex-review-state:v1 ${JSON.stringify({ code_review: { commit_sha: sha, status, has_unresolved_findings: unresolved } })} -->`,
+    user: { login: "chatgpt-codex-connector[bot]", type: "Bot" },
+    updatedAt: new Date(2000).toISOString(),
+  });
+  const threadPage = (nodes: unknown[] = [], hasNextPage = false, endCursor: string | null = null) => ({
+    json: { data: { repository: { pullRequest: { reviewThreads: { nodes, pageInfo: { hasNextPage, endCursor } } } } } },
+  });
+  const thread = (url: string, isResolved = false, isOutdated = false) => ({
+    isResolved, isOutdated, comments: { nodes: [{ url }], pageInfo: { hasNextPage: false } },
+  });
+  let inlineFetch: FakeFetch;
+  const inlinePath = "GET /repos/o/r/pulls/5/comments" as const;
+  beforeEach(() => {
+    inlineFetch = fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: { json: [] } }).install();
+    vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess: "codex-code-review" } } as never);
+    vi.mocked(listCheckRuns).mockReset().mockResolvedValue([]);
+  });
+  const badge = (p: number) => ({
+    user: { login: "chatgpt-codex-connector[bot]", type: "Bot" }, commit_id: "b",
+    body: `**<sub><sub>![P${p} Badge](https://img.shields.io/badge/P${p}-yellow?style=flat)</sub></sub> advice`,
+  });
+  it.each([1, 2])("maps P%s head badges into the shared verdict", async (priority) => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    inlineFetch = fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: { json: [
+      { ...badge(1), commit_id: "old" }, { ...badge(1), user: { login: "human", type: "User" } },
+      { ...badge(1), user: { login: "untrusted", type: "Bot" } }, badge(priority),
+    ] } }).install();
+    const tick = await deps().readTick({ ...input, headSha: "b", followHead: false });
+    expect(tick.checks).toBe("success");
+    expect(tick.heldBy).toBe(priority === 1 ? "changes_requested" : undefined);
+    expect(tick.blockingLastSeenAtMs).toHaveLength(priority === 1 ? 1 : 0);
+    expect(inlineFetch.calls[0]!.url.href).toBe("https://api.github.com/repos/o/r/pulls/5/comments?per_page=100");
+  });
+  it("reads later inline pages before approving and throws on an unreadable page", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    const firstPage = { json: [badge(2)],
+      headers: { link: '<https://api.github.com/repos/o/r/pulls/5/comments?page=2>; rel="next"' },
+    };
+    inlineFetch = fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: [firstPage, { json: [badge(1)] }] }).install();
+    expect((await deps().readTick({ ...input, headSha: "b", followHead: false })).heldBy).toBe("changes_requested");
+    expect(inlineFetch.calls[1]!.url.href).toBe("https://api.github.com/repos/o/r/pulls/5/comments?page=2");
+    fakeFetch({ "POST /graphql": threadPage(), [inlinePath]: [firstPage, { status: 503 }] }).install();
+    await expect(deps().readTick({ ...input, headSha: "b", followHead: false })).rejects.toThrow("inline comments unreadable");
+  });
+  it.each([
+    [true, false, "b", undefined], [false, true, "b", undefined],
+    [false, false, "b", "changes_requested"], [false, false, "old", "changes_requested"],
+  ] as const)("reads resolved=%s outdated=%s P1 on %s", async (resolved, outdated, commit_id, heldBy) => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    const f = fakeFetch({
+      [inlinePath]: { json: [{ ...badge(1), commit_id, html_url: "p1" }, { ...badge(2), html_url: "p2" }] },
+      "POST /graphql": [threadPage([thread("p1", resolved, outdated)], true, "next"), threadPage([thread("p2")])],
+    }).install();
+    expect((await deps().readTick({ ...input, headSha: "b" })).heldBy).toBe(heldBy);
+    const calls = f.calls.filter((c) => c.path === "/graphql");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer tok");
+    expect(JSON.parse(calls[1]!.body).variables.after).toBe("next");
+  });
+  it.each([
+    { status: 503 }, { json: { errors: [{ message: "denied" }] } }, { json: {} },
+    threadPage([], true), threadPage([{ ...thread("p1"), comments: { nodes: [], pageInfo: { hasNextPage: true } } }]),
+  ])("throws on failed or incomplete thread reads: %j", async (reply) => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed", true)]);
+    fakeFetch({ [inlinePath]: { json: [] }, "POST /graphql": reply }).install();
+    await expect(deps().readTick({ ...input, headSha: "b" })).rejects.toThrow("review threads unreadable");
+  });
+  it("expects the reviewer without check runs", async () => {
+    expect(await deps().readReviewerExpected!({ ...input, headSha: "b" })).toBe(true);
+    expect(listCheckRuns).not.toHaveBeenCalled();
+  });
+  for (const gapFill of [false, true]) {
+    it.each([
+      ["completed", false, "b", "success", undefined],
+      ["running", false, "b", "pending", undefined],
+      ["completed", false, "old", "pending", undefined],
+      ["completed", true, "b", "success", undefined],
+      ["failed", false, "b", "success", "review-failed"],
+      ["absent", false, "b", "pending", undefined],
+    ] as const)(`gapFill=${gapFill}: %s unresolved=%s head=%s`, async (status, unresolved, sha, checks, heldBy) => {
+      vi.mocked(listPrComments).mockResolvedValue(status === "absent" ? [] : [state(status, unresolved, sha)]);
+      const tick = await deps().readTick({ ...input, headSha: "b", followHead: false, gapFill, reviewerExpected: false });
+      expect(tick.checks).toBe(checks);
+      expect(tick.heldBy).toBe(heldBy);
+      expect(tick.blockingLastSeenAtMs.length).toBe(heldBy ? 1 : 0);
+      expect(listPrComments).toHaveBeenLastCalledWith("tok", "o", "r", 5, { strict: true });
+    });
+  }
+  it.each(["pending", "failure"] as const)("approval preserves %s CI", async (checks) => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed")]);
+    vi.mocked(getCombinedChecksState).mockResolvedValue(checks);
+    expect((await deps().readTick({ ...input, headSha: "b", followHead: false })).checks).toBe(checks);
+  });
+  it("preserves ledger holds and throws on unreadable comments", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([state("completed")]);
+    vi.mocked(listOpenReviewFindings).mockReturnValue([{ severity: "blocking", lastSeenAt: 2000 }] as never);
+    expect((await deps().readTick({ ...input, headSha: "b", followHead: false })).heldBy).toBe("ledger");
+    vi.mocked(listPrComments).mockRejectedValue(new Error("unreadable"));
+    await expect(deps().readTick({ ...input, headSha: "b", followHead: false })).rejects.toThrow("unreadable");
+  });
+});
+
+describe("shared Claude repository-fix review check pairs", () => {
+  it.each(["ai-implement", "claude-code-review", "claude-code-review-repository-fix"] as const)("%s counts the hosted Claude check on earlier commits and the head", async (reviewProcess) => {
+    vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess } } as never);
+    vi.mocked(listPullRequestCommits).mockResolvedValue(["earlier", "b"]);
+    vi.mocked(listCheckRuns).mockReset().mockResolvedValue([run("completed", "success")]);
+    const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
+    const tickInput = { ...input, headSha: "b", followHead: false, gapFill: true };
+    expect(await deps.readReviewerExpected!(tickInput)).toBe(true);
+    expect(listCheckRuns).toHaveBeenLastCalledWith("tok", "o", "r", "earlier");
+    const tick = await deps.readTick({ ...tickInput, reviewerExpected: true });
+    expect(tick.checks).toBe("success");
+    expect(listCheckRuns).toHaveBeenLastCalledWith("tok", "o", "r", "b");
+  });
+
+  it.each(["claude-code-review", "ai-implement"] as const)("%s uses the configured name and posting app", async (reviewProcess) => {
+    vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess } } as never);
+    vi.mocked(getDefaultBranchFileText).mockResolvedValue("reviewCheckNames: [custom-review]");
+    const deps = createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
+    const tickInput = { ...input, headSha: "b", followHead: false, gapFill: true, reviewerExpected: true };
+    vi.mocked(listCheckRuns).mockResolvedValue([{ name: "custom-review", appSlug: "github-actions", status: "completed", conclusion: "success" }]);
+    expect((await deps.readTick(tickInput)).checks).toBe("success");
+    vi.mocked(listCheckRuns).mockResolvedValue([{ name: "custom-review", appSlug: "untrusted", status: "completed", conclusion: "success" }]);
+    expect((await deps.readTick(tickInput)).checks).toBe("pending");
+  });
 });
 
 describe("headReviewedClean", () => {
@@ -56,6 +198,7 @@ describe("headReviewedClean", () => {
 });
 
 describe("readTick in follow mode", () => {
+  beforeEach(() => vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess: "claude-code-review" } } as never));
   it("reads a skipped review check on the new head as pending", async () => {
     vi.mocked(listCheckRuns).mockResolvedValue([run("completed", "skipped")]);
     const tick = await createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" }).readTick(input);
@@ -69,6 +212,7 @@ describe("readTick in follow mode", () => {
 });
 
 describe("readTick for a gap-fill (AII-1291)", () => {
+  beforeEach(() => vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess: "claude-code-review" } } as never));
   const gapInput = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", headSha: "b", gapFill: true };
   const tickOf = () => createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" }).readTick(gapInput);
   const other = { name: "ci", appSlug: "github-actions", status: "completed", conclusion: "success" };
@@ -116,6 +260,7 @@ describe("readTick for a gap-fill (AII-1291)", () => {
 });
 
 describe("readReviewerExpected (AII-1302)", () => {
+  beforeEach(() => vi.mocked(getMappings).mockReturnValue({ test: { owner: "o", repo: "r", reviewProcess: "claude-code-review" } } as never));
   const deps = () => createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" });
   const gapInput = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", gapFill: true, headSha: "h" };
   const other = { name: "ci", appSlug: "github-actions", status: "completed", conclusion: "success" };
@@ -303,5 +448,75 @@ describe("heldCommentBody (AII-1361)", () => {
     expect(body.split("\n").every((l) => !l.startsWith("/ai-implement"))).toBe(true);
     expect(body).not.toContain("/claude-review");
     expect(body).toContain("<!-- ai-implement late-external-held key=k -->");
+  });
+});
+
+describe("readTick heldBy for a deferred changes_requested verdict (AII-1583)", () => {
+  const COMMIT_MS = 1_700_000_000_000;
+  const gapInput = { dispatchId: "d", owner: "o", repo: "r", prNumber: 5, prUrl: "u", headSha: "b", gapFill: true };
+  const tickOf = (extra: Record<string, unknown> = {}) =>
+    createProductionLateExternalReviewDependencies({ githubAppId: "1", githubAppPrivateKey: "k" }).readTick({ ...gapInput, ...extra } as never);
+  const findings = [
+    { severity: "blocking", path: "src/a.ts", line: 3, body: "first problem" },
+    { severity: "blocking", path: "src/b.ts", line: 9, body: "second problem" },
+  ];
+  const comment = (verdict: string, list: unknown[] | "bad", atMs = COMMIT_MS + 1000) => {
+    const block = list === "bad" ? "{ not json" : JSON.stringify({ schema: "review-findings/v1", verdict, findings: list });
+    return { id: 1, body: "Review\n\n```json review-findings\n" + block + "\n```\n", user: { login: "claude[bot]", type: "Bot" }, createdAt: new Date(atMs).toISOString() };
+  };
+  // The keys the runner would store: from the same parse the workflow reads.
+  const keysOf = (c: ReturnType<typeof comment>) =>
+    classifyReviewIssueComment({ body: c.body, user: c.user }, undefined)!.findings.map((f) => stableReviewFindingKey(f));
+  const rows = (keys: string[], statuses: string[]) => keys.map((findingKey, i) => ({ findingKey, status: statuses[i] })) as never;
+
+  beforeEach(() => {
+    vi.mocked(getCommitTime).mockResolvedValue(COMMIT_MS);
+    vi.mocked(listCheckRuns).mockResolvedValue([run("completed", "success")]);
+  });
+
+  it("approve: not held, whatever the ledger holds", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("approve", findings)] as never);
+    expect(await tickOf()).not.toHaveProperty("heldBy");
+  });
+  it("changes_requested with no findings: changes_requested-empty", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", [])] as never);
+    expect((await tickOf()).heldBy).toBe("changes_requested-empty");
+  });
+  it("changes_requested with every finding recorded as deferred: not held", async () => {
+    const c = comment("changes_requested", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c), ["deferred", "deferred"]));
+    expect(await tickOf()).not.toHaveProperty("heldBy");
+    expect(getReviewFindingsByKeys).toHaveBeenCalledWith("o/r", 5, keysOf(c));
+  });
+  it("changes_requested with one key missing from the ledger: held", async () => {
+    const c = comment("changes_requested", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c).slice(0, 1), ["deferred"]));
+    expect((await tickOf()).heldBy).toBe("changes_requested");
+  });
+  it("changes_requested with no ledger rows at all: held", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", findings)] as never);
+    expect((await tickOf()).heldBy).toBe("changes_requested");
+  });
+  it.each(["open", "resolved"])("changes_requested with one %s row: held", async (status) => {
+    const c = comment("changes_requested", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c), ["deferred", status]));
+    expect((await tickOf()).heldBy).toBe("changes_requested");
+  });
+  it("incomplete: held even when the ledger holds deferred rows", async () => {
+    const c = comment("incomplete", findings);
+    vi.mocked(listPrComments).mockResolvedValue([c] as never);
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(rows(keysOf(c), ["deferred", "deferred"]));
+    expect((await tickOf()).heldBy).toBe("incomplete");
+  });
+  it("unreadable findings: held", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", "bad")] as never);
+    expect((await tickOf()).heldBy).toBe("unreadable");
+  });
+  it("a review older than the head's commit: not held", async () => {
+    vi.mocked(listPrComments).mockResolvedValue([comment("changes_requested", findings, COMMIT_MS - 1000)] as never);
+    expect(await tickOf()).not.toHaveProperty("heldBy");
   });
 });

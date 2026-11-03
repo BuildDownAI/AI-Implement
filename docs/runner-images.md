@@ -164,7 +164,7 @@ The tool takes no input. It returns:
 - `autoDeploy`, `held`, `runningCommit`, `headCommit`, `lastOutcome`, `watchedRepo`, `watchedRef` — from the same source as `GET /api/deployment-status`.
 - `upToDate` — `true` when `runningCommit === headCommit`, `null` when either is unknown.
 - `deploy.inFlight` — `true` when runner jobs are executing. It does not show whether a deploy is in progress.
-- `deploy.lastOutcome` — `"deployed-ok"`, `"deployed-not-serving"`, `"build-failed"`, or `null` when no deploy has completed.
+- `deploy.lastOutcome` — `"deployed-ok"`, `"deploy-failed"` (the reason is the outcome detail, e.g. `drain-timeout`), `"deploy-cancelled"`, or `null` when no deploy has completed. `"deployed-not-serving"` and `"build-failed"` are legacy kinds that nothing writes any more; a stored outcome from an older release may still carry one.
 - `runnerChannel.channelTag` — `"next"` for `testing`, `"latest"` for `main`, `null` for other branches. It comes from the watched ref, not from the configured image.
 - `runnerChannel.channelCommit` — read from the OCI labels of the channel image (`org.opencontainers.image.revision` or `AI_IMPLEMENT_SOURCE_COMMIT`) in `src/repo-image.ts`. `Dockerfile.session` has no `LABEL`, so this value is always null today.
 - `runnerChannel.matchesHead` — `true` when `channelCommit === headCommit`, `null` when `channelCommit` is null. It is always null today.

@@ -103,7 +103,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | KG sidecar, its OAuth flow, and the image build | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
 | MCP door, identity contract, tools service, entry points, roles | `src/restate/tools.ts`, `src/mcp.ts`, `src/mcp-oauth.ts`, `src/mcp-identity.ts` | [docs/mcp-server.md](docs/mcp-server.md), [ADR 025](docs/adr/025-mcp-tools-are-restate-handlers-and-the-operator-object-is-the-refresh-authority.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
-| Orchestrator configuration (what boot checks, which source wins) and the setup checks | `loadConfig` in `src/index.ts`, `src/setup-checks/` | [docs/orchestrator-configuration.md](docs/orchestrator-configuration.md), [ADR 046](docs/adr/046-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md) |
+| Orchestrator configuration (what boot checks, which source wins) and the setup checks | `loadConfig` in `src/index.ts`, `src/setup-checks/` | [docs/orchestrator-configuration.md](docs/orchestrator-configuration.md), [ADR 047](docs/adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | [docs/ticketing-providers.md](docs/ticketing-providers.md) |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
 | Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md), [docs/execution-backends.md](docs/execution-backends.md) |
@@ -194,7 +194,9 @@ Fixing a bug: write the failing test first, then the fix, in one pull request �
 
 ## Data layer
 
-One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 25 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 26 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+
+Schema changes run at boot and a trigger can block a column change — read [docs/sqlite-schema.md](docs/sqlite-schema.md) before changing a table or column.
 
 **Dedup has no TTL.** The `dispatched` table is a bare existence check with no retention logic: an entry clears only when something explicitly removes it — a failed or timed-out run, the reconcile loop reaching a terminal issue, or a manual delete. There is no time-based auto-retry. This is a recurring source of documentation errors claiming a 24-hour window; the only genuine 24-hour figure belongs to the reaper's summary statistic.
 
@@ -262,7 +264,7 @@ Editable per mapping; blank means the default.
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
 | PR Dispatch Budget | 4 | Gap-fill runs per PR per rolling 24 h; at the limit the PR is parked for a human |
 | Trusted Review Authors | none | Extra GitHub logins (additive to the built-ins) whose `approve` block can gate a merge |
-| Review process | `ai-implement` | Who reviews a PR and who fixes it (ADR 038): `ai-implement` or `claude-code-review`. Stored as NULL for the default. The process and its trusted authors apply to every project; only the forward to `ReviewFixPR.feedback` needs the Restate review-fix lifecycle. Set in the project drawer next to the lifecycle select; read by the webhook, the in-run gate, and `ReviewFixPR.check`. `claude-code-review` trusts `claude[bot]` and reads the verdict from the review check run and Claude's inline comments. Full reference: [docs/review-fix-rail.md](docs/review-fix-rail.md) |
+| Review process | `ai-implement` | Who reviews a PR and who fixes it (ADR 038): `ai-implement`, `claude-code-review`, `claude-code-review-repository-fix`, or `codex-code-review`. Codex requires Restate, trusts `chatgpt-codex-connector[bot]` (also the bare login), reads the head-specific state comment, and forwards only P0/P1; P2 stays minor. Stored as NULL for the default. The Claude and AI-Implement processes apply to every project; only their forward to `ReviewFixPR.feedback` needs the Restate review-fix lifecycle. Set in the project drawer next to the lifecycle select; read by the webhook, the in-run gate, and `ReviewFixPR.check`. `claude-code-review` trusts `claude[bot]` and reads the verdict from the review check run and Claude's inline comments. Full reference: [docs/review-fix-rail.md](docs/review-fix-rail.md) |
 
 **Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. On Fly, they are also excluded at the Fly boundary by default (process-level mode). **Extra Env** entries are passed through to the model process and are visible to the agent.
 

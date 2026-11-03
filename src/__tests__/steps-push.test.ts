@@ -8,6 +8,7 @@ import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { makeContext as makeBaseContext, makeFeedbackLoopOutputs } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
+import { collectedPushedCommits, resetJobAccounting } from "../pipeline/job-accounting.js";
 import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 vi.mock("node:child_process", () => ({
@@ -108,6 +109,7 @@ describe("pushStep", () => {
   beforeEach(() => {
     __resetPublicationCredentialForTests();
     vi.clearAllMocks();
+    resetJobAccounting();
   });
 
   afterEach(() => {
@@ -125,6 +127,60 @@ describe("pushStep", () => {
     expect(outputs.prNumber).toBe(7);
     expect(outputs.branchPushed).toBe(true);
     expect(outputs.commitSha).toBe("abc123");
+  });
+
+  describe("pushed commit accounting (AII-1562)", () => {
+    const SHA_1 = "1".repeat(40);
+    const SHA_2 = "2".repeat(40);
+
+    function mockRevList(revList: ReturnType<typeof spawnResult>, dirty = true) {
+      mockGitSuccess("abc123", dirty);
+      const base = vi.mocked(spawnSync).getMockImplementation()!;
+      vi.mocked(spawnSync).mockImplementation(((cmd: string, args: string[], opts: never) =>
+        args[0] === "rev-list" && args.includes("--reverse") ? revList : base(cmd, args, opts)) as never);
+    }
+
+    it("reports the SHAs in rev-list order after a successful push", async () => {
+      mockRevList(spawnResult(0, `${SHA_1}\n${SHA_2}\n`));
+      fakeFetch({ [CREATE_PR]: created(7) }).install();
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expect(spawnSync).toHaveBeenCalledWith("git", ["rev-list", "--reverse", "c0ffee00..HEAD"], expect.anything());
+      expect(collectedPushedCommits()).toEqual([SHA_1, SHA_2]);
+    });
+
+    it("leaves the list unknown when rev-list fails", async () => {
+      mockRevList(spawnResult(128, "", "fatal"));
+      fakeFetch({ [CREATE_PR]: created(7) }).install();
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expect(collectedPushedCommits()).toBeNull();
+    });
+
+    it("reports an empty list when the run changed nothing", async () => {
+      vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+        const gitArgs = args as string[];
+        if (gitArgs[0] === "rev-list") return spawnResult(0, "0\n"); // hasCommitsAheadOfBase: none
+        return spawnResult(0);
+      });
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()).catch(() => undefined);
+      expect(collectedPushedCommits()).toEqual([]);
+    });
+
+    it("reports an empty list in mounted mode, without touching git", async () => {
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expect(spawnSync).not.toHaveBeenCalled();
+      expect(collectedPushedCommits()).toEqual([]);
+    });
+
+    it("reports nothing when the push throws", async () => {
+      mockGitSuccess("abc123");
+      const base = vi.mocked(spawnSync).getMockImplementation()!;
+      vi.mocked(spawnSync).mockImplementation(((cmd: string, args: string[], opts: never) =>
+        args[0] === "push" ? spawnResult(1, "", "rejected") : base(cmd, args, opts)) as never);
+      fakeFetch({ [CREATE_PR]: created(7) }).install();
+      await expect(pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter())).rejects.toThrow();
+      expect(collectedPushedCommits()).toBeNull();
+    });
   });
 
   it("uses a freshly vended token for remote lookup, push, and PR creation", async () => {
