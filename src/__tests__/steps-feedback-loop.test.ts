@@ -1454,11 +1454,12 @@ describe("feedback-loop core isolation (AII-626)", () => {
       return entry.name.endsWith(".ts") ? [path] : [];
     });
 
-  it("no file under src/pipeline/ imports src/restate/ or @restatedev/*", () => {
+  it("pipeline imports no Restate code", () => {
     const importRe = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g;
     const offenders: string[] = [];
     for (const file of sources(pipelineDir)) {
-      for (const match of readFileSync(file, "utf-8").matchAll(importRe)) {
+      const source = readFileSync(file, "utf-8");
+      for (const match of source.matchAll(importRe)) {
         if (match[1].startsWith("@restatedev/") || /(^|\/)restate\//.test(match[1])) offenders.push(`${file}: ${match[1]}`);
       }
     }
