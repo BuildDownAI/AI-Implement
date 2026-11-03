@@ -2,7 +2,7 @@
 // and passes `fake.fetch` wherever a module takes `fetchImpl`, or calls `fake.install()` for code
 // that calls the global fetch. Every request is recorded, and a request the table does not expect
 // fails the test, even when the code under test catches the error. See README.md in this directory.
-import { onTestFinished } from "vitest";
+import { onTestFinished, vi } from "vitest";
 
 export type Method = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -45,6 +45,24 @@ export const hangUntilAborted: Reply = ({ signal }) =>
     if (signal.aborted) return reject(signal.reason);
     signal.addEventListener("abort", () => reject(signal.reason), { once: true });
   });
+
+/** Makes every `AbortSignal.timeout` abort right after the caller's synchronous code, with a `TimeoutError`, so a
+ *  test proves a bound without waiting it out. A duration other than `expectedMs` fails the test when it finishes,
+ *  not inside the call, where the code under test could catch it. Restored when the test finishes. */
+export function stubAbortTimeout(expectedMs: number) {
+  const unexpected: number[] = [];
+  const spy = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+    if (ms !== expectedMs) unexpected.push(ms);
+    const controller = new AbortController();
+    queueMicrotask(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")));
+    return controller.signal;
+  });
+  onTestFinished(() => {
+    spy.mockRestore();
+    if (unexpected.length > 0) throw new Error(`stubAbortTimeout: expected ${expectedMs} ms, the code asked for ${unexpected.join(", ")} ms`);
+  });
+  return spy;
+}
 
 export interface FakeFetch {
   fetch: typeof fetch;

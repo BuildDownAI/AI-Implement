@@ -111,7 +111,7 @@ import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fi
 import { handleMcpRequest } from "./mcp.js";
 import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
-import { withRequestErrorBoundary } from "./http-server.js";
+import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
 import {
   initMcpOAuthTables,
   handleMcpProtectedResourceMetadata,
@@ -329,7 +329,7 @@ function loadConfig(): AppConfig {
     oauthRedirectBaseUrl,
     pollIntervalMs: parsePollIntervalMs(process.env.POLL_INTERVAL_MS),
     pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
-    healthPort: parseInt(process.env.PORT || "8080", 10),
+    healthPort: parseHealthPort(process.env.PORT),
     get flySessionsToken() {
       return getFlySessionsConfig().token;
     },
