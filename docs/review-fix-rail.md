@@ -111,11 +111,11 @@ The internal automatic producers (`guardOpenPrBeforeImplementationDispatch` for 
 
 Severity is `blocking`, `medium`, or `minor`, and the rule for deciding it is the subtlest part of the rail.
 
-Merge gating is source-based, except that `review-contract` also reads severity and the contract verdict:
+Minor findings are advisory for every source and review process. For non-minor findings, merge gating retains the source rules below; `review-contract` also reads the contract verdict:
 
 | Source | Gates a merge? |
 |---|---|
-| `review-contract` | When `blocking`, or when the contract verdict is not `approve` (`reviewContractFindingGates`) |
+| `review-contract` | When `blocking`, or when `medium` and the contract verdict is not `approve` (`reviewContractFindingGates`) |
 | `github-review` | Yes |
 | `github-review-thread` | Yes, when collected from a reviewer whose latest formal verdict is `CHANGES_REQUESTED` |
 | `ai-implement-internal` | Yes |
@@ -123,7 +123,7 @@ Merge gating is source-based, except that `review-contract` also reads severity 
 
 **Summary headings.** A heading that starts with 🔴 is a `blocking` finding and one that starts with 🟡 is `minor`, in both summary parsers (the trusted `claude[bot]` heading scan and the `github-actions[bot]` "Claude finished" shape). The marker mapping is `classifyClaudeInlineMarker` (`src/review-process.ts`), checked before the word rules; 🟣 and untagged headings fall through to those rules. Under the `claude-code-review` and `claude-code-review-repository-fix` processes (the definition's `summaryBlockingGates`) a `blocking` `claude-review-summary` finding gates the in-run approval even without a reviewer selection (`isReviewLedgerFindingGating`'s `summaryBlockingGates`), so a green review check with no inline comments cannot approve past a 🔴 section; `minor` and `medium` summary findings stay advisory. The gate goes through the external-findings path, not `claudeCodeReviewVerdict`. The ledger and the late-review workflow see the same finding.
 
-A `review-contract` finding gates when it is `blocking`, or when the verdict is not `approve`; a `minor` finding under an `approve` verdict is advisory, so the run approves. Under `changes_requested` or `incomplete` a `minor` finding keeps its fix pass, so the run never ends `invalid_review` with an empty gating set (`reviewContractFindingGates`, `src/pipeline/review-ledger.ts`). A `blocking` `claude-review-summary` finding is advisory by default because it came from scraped prose. PR comments split those lists: gating findings stay under "Unresolved external review findings", while prose-only findings are shown under an advisory heading that says they do not block the merge.
+A `review-contract` finding gates when it is `blocking`, or when it is `medium` and the verdict is not `approve`. A `minor` finding is advisory even under `changes_requested` or `incomplete` (`reviewContractFindingGates`, `src/pipeline/review-ledger.ts`). A completed negative verdict whose own findings are exclusively minor is advisory; incomplete verdicts, empty negative verdicts, and aggregate blocking severity counts remain independent approval safeguards. A `blocking` `claude-review-summary` finding is advisory by default because it came from scraped prose. PR comments split those lists: gating findings stay under "Unresolved external review findings", while prose-only findings are shown under an advisory heading that says they do not block the merge.
 
 **A reviewer's latest formal verdict is authoritative.** Only reviewers whose most recent actionable review is `CHANGES_REQUESTED` contribute blocking findings. Unresolved inline threads authored by someone who has since approved are recorded as `medium` advisory context unless their reviewer still has a changes-requested verdict. Without that rule, a stale nit thread from an approving reviewer would keep the PR blocked forever.
 

@@ -7125,6 +7125,32 @@ describe("postPushReviewStep review process gate", () => {
     expect(logs.some((l) => l.includes("review process claude-code-review: verdict approve from check-and-comments"))).toBe(true);
   });
 
+  it.each(["claude-code-review", "claude-code-review-repository-fix"])("%s preserves aggregate blocking counts with a minor-only external ledger", async (reviewProcess) => {
+    const { out, logs } = await run(fixture({
+      runs: [{ name: "Claude Code Review", app: "claude", conclusion: "success", text: SEVERITY(1) }],
+      inlineComments: [inline("🟡 Naming nit")],
+      threads: [thread("🟡 Naming nit")],
+    }), { reviewProcess });
+    expect(logs).toContain("[post-push-review] Review ledger findings: gating=0 advisory=1");
+    expect(logs).toContain(`[post-push-review] review process ${reviewProcess}: verdict changes_requested from bughunter-severity`);
+    expect(out.approved).toBe(false);
+  });
+
+  it("preserves an empty negative contract verdict with an unrelated minor thread", async () => {
+    const { out, logs } = await run(fixture({
+      runs: [actions("success")],
+      threads: [thread("🟡 Naming nit")],
+      issueComments: [{
+        user: { login: "claude[bot]", type: "Bot" },
+        body: ["```json review-findings", JSON.stringify({
+          schema: "review-findings/v1", verdict: "changes_requested", findings: [],
+        }), "```"].join("\n"),
+      }],
+    }));
+    expect(logs).toContain("[post-push-review] Review ledger findings: gating=0 advisory=1");
+    expect(out.approved).toBe(false);
+  });
+
   it("approves: success with only 🟡 and untagged findings", async () => {
     const { out } = await run(fixture({ runs: [actions("success")], inlineComments: [inline("🟡 nit"), inline("plain remark")] }));
     expect(out.approved).toBe(true);

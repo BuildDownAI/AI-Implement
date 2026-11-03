@@ -2370,14 +2370,18 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         externalReviewPending && verdict.approved === true && issues.length === 0 ? [] : reportedGatingExternalFindings;
       const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
-      const minorOnlyExternalFindings = externalFindings.length > 0
-        && externalFindings.every((finding) => finding.severity === "minor");
+      const contractFindings = externalFindingsResult.findings.filter((finding) => finding.source === "review-contract");
+      const minorOnlyContractFindings = contractFindings.length > 0
+        && contractFindings.every((finding) => finding.severity === "minor");
+      const minorOnlyProcessFindings = processVerdict !== undefined && processVerdict.findings.length > 0
+        && processVerdict.findings.every((finding) => finding.severity === "minor");
       // Missing/incomplete verdicts remain independent safeguards. A completed negative
-      // verdict supported only by minor findings must not turn those findings into blockers.
+      // verdict must establish through its own findings that it is exclusively minor.
+      // Aggregate severity counts and empty negative verdicts remain blocking.
       const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
         && (externalFindingsResult.verdict === "incomplete"
-          || (externalFindingsResult.verdict === "changes_requested" && !minorOnlyExternalFindings)))
-        || (processVerdict?.verdict === "changes_requested" && !minorOnlyExternalFindings);
+          || (externalFindingsResult.verdict === "changes_requested" && !minorOnlyContractFindings)))
+        || (processVerdict?.verdict === "changes_requested" && !minorOnlyProcessFindings);
       console.log(
         `[post-push-review] Review ledger findings: gating=${gatingReviewFindings.length} advisory=${advisoryReviewFindings.length}`,
       );
