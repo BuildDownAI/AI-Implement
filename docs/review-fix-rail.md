@@ -210,7 +210,10 @@ request still exceeds 48,000 bytes, the runner sends no inline comments and
 shortens the body to fit, with a note pointing to the full report retained in
 the status comment, split into ordered comments of at most 65,536 characters and 64,000 UTF-8 bytes
 when needed. The runner does not post GitHub reviews directly.
-The final status comment links to the returned review URL instead
+Every pass with findings posts a review, including passes that start a fix.
+Publication completes before the fix starts, while the reviewed head is current.
+A no-file-changes exit reuses that pass’s publication without posting again.
+The status comment links to the returned review URL instead
 of repeating the checklist. If review publication fails or returns no usable
 link (including a stale head, HTTP error, network failure, or absent callback
 credentials), the status comment retains the full report. The runner logs one
