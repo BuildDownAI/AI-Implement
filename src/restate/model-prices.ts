@@ -35,7 +35,8 @@ const inputSchema = z.object({
 type RefreshInput = z.infer<typeof inputSchema>;
 
 export interface ModelPricesDeps {
-  issuer: () => string | undefined;
+  /** Resolve configuration for the invocation key, including newly delivered timers. */
+  issuer: (key: string) => string | undefined;
   fetch: typeof fetch;
   /** Shorter delays allow tests to exercise actual durable timer delivery. */
   refreshIntervalMs?: number;
@@ -54,7 +55,7 @@ const unconfigured = (): ModelPricesCurrent => ({ prices: [], fetchedAt: null, l
 
 export function createModelPrices(deps: ModelPricesDeps) {
   async function refresh(ctx: restate.ObjectContext, input: RefreshInput): Promise<number | null> {
-    const url = pricesUrl(deps.issuer());
+    const url = await ctx.run("read model prices configuration", () => pricesUrl(deps.issuer(ctx.key)));
     if (!url) return null;
     const previous = await ctx.get<State>(STATE_KEY);
     // Boot is an exclusive check-and-arm: repeated boots preserve the existing timer.
@@ -91,7 +92,8 @@ export function createModelPrices(deps: ModelPricesDeps) {
     return nextAt;
   }
   async function current(ctx: restate.ObjectSharedContext): Promise<ModelPricesCurrent> {
-    if (!pricesUrl(deps.issuer())) return unconfigured();
+    const url = await ctx.run("read model prices configuration", () => pricesUrl(deps.issuer(ctx.key)));
+    if (!url) return unconfigured();
     const state = await ctx.get<State>(STATE_KEY);
     return { prices: state?.prices ?? [], fetchedAt: state?.fetchedAt ?? null, lastError: state?.lastError ?? null };
   }
