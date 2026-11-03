@@ -112,7 +112,7 @@ describe("models page stage defaults", () => {
     const put = stub.calls.find((c) => c.method === "PUT")!;
     expect(put.url).toBe("/api/agent-defaults");
     expect(put.body.mode).toBe("configured");
-    expect(put.body.stages.planning).toEqual({ agent: "claude", provider: null, model: null, accountProfileId: null, invocationTimeoutMs: null });
+    expect(put.body.stages.planning).toEqual({ agent: "claude", provider: null, model: null, fallbackModel: null, accountProfileId: null, invocationTimeoutMs: null });
     expect(put.body.stages.review).toMatchObject({ agent: "codex", model: "m1", invocationTimeoutMs: 60000, provider: null });
     expect(put.body.stages.implementation.agent).toBeNull();
   });
@@ -135,6 +135,36 @@ describe("models page stage defaults", () => {
       expect(field("review", "model").value).toBe("typed-model");
     });
   }
+
+  it("loads and safely saves optional fallback models for every stage", async () => {
+    const stages = ["planning", "implementation", "review"];
+    const model = '"<img src=x onerror="alert(1)">';
+    const stub = await bootModels(true, { mode: "configured", stages: Object.fromEntries(stages.map(stage => [stage, { fallbackModel: model }])) });
+    for (const stage of stages) {
+      expect(field(stage, "fallbackModel").value).toBe(model);
+      expect(field(stage, "fallbackModel").parentElement!.textContent).toContain("Used for the rest of the run after this stage's model reports it is at capacity.");
+    }
+    expect(document.querySelector("#mp-stage-rows img")).toBeNull();
+    field("planning", "fallbackModel").value = "  backup  ";
+    field("implementation", "fallbackModel").value = "";
+    field("review", "fallbackModel").value = "   ";
+    await w.saveStageDefaults();
+    const saved = stub.calls.find(c => c.method === "PUT")!.body.stages;
+    expect(saved.planning.fallbackModel).toBe("backup");
+    expect(saved.implementation.fallbackModel).toBeNull();
+    expect(saved.review.fallbackModel).toBeNull();
+  });
+
+  it("retains a refused fallback and displays API validation as text", async () => {
+    const error = "fallbackModel must differ from model " + SENT;
+    await bootModels(true, undefined, undefined, { calls: [], put: { status: 400, body: { error } } });
+    field("review", "fallbackModel").value = SENT;
+    field("review", "fallbackModel").dispatchEvent(new Event("input", { bubbles: true }));
+    await w.saveStageDefaults();
+    expect(document.getElementById("mp-stage-error")!.textContent).toContain(error);
+    expect(field("review", "fallbackModel").value).toBe(SENT);
+    expect(document.querySelector("img")).toBeNull();
+  });
 
   it("rejects a non-positive limit client-side", async () => {
     const stub = await bootModels();
