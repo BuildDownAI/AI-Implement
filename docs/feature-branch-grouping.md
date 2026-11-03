@@ -22,8 +22,11 @@ A Linear issue tree maps onto a tree of git branches:
 - An **unlabelled child** gets no run. While it is open (neither Done nor Cancelled),
   the parent's closing-work run waits, and consequently so does the roll-up PR. The
   [AII-349](https://linear.app/eudoxus/issue/AII-349/grouping-cascade-parent-with-pre-done-children-finalized-during-parent)
-  guard in `src/providers/linear.ts` allows for operators still labelling children and logs
+  guard applies to both Linear and Jira, allowing for operators still labelling children.
+  Linear's guard in `src/providers/linear.ts` logs
   `Skipping <key>: <mode> grouping parent has undesignated non-terminal children`.
+  Jira applies the same guard via `classifyByChildren` in `src/providers/jira-hierarchy.ts`;
+  `src/providers/jira.ts` logs `[jira] Skipping <key>: grouping parent not ready (waiting-parent)`.
   File operator-only or later tasks outside the feature node (for example under the
   parent's own parent), or close them, before the last labelled child lands.
 - The tree is **recursive**: a child that is itself a feature node gets its own branch cut
@@ -101,7 +104,7 @@ children`). Only once **all** its labelled children reach a terminal state does 
 work dispatch — onto its own feature branch. "Terminal" means completed *or* cancelled, so
 a cancelled child doesn't block the parent forever.
 
-On Linear, unlabelled children must also be Done or Cancelled before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
+On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
 
 The internal gap-analysis and in-loop review grade a grouping parent's closing-work PR
 only against the requirements the parent keeps for itself. Child-owned requirements are
