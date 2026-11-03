@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { readFileSync } from "node:fs";
 import { BUILTIN_REVIEWER_VERDICT_SCHEMA, REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
+import type { ReviewerPromptInput } from "../pipeline/reviewers/registry.js";
 import { makeContext } from "./helpers/builders.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -17,7 +18,7 @@ const checks = [{
 }];
 const summary = "The requested animation change is implemented in the shared pulse setting.";
 
-async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { strictReport?: boolean; outputSchema?: Record<string, unknown>; reviewUrl?: string; reviewFailure?: boolean } = {}) {
+async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { groupingParent?: boolean; buildPrompt?: (input: ReviewerPromptInput) => string; strictReport?: boolean; outputSchema?: Record<string, unknown>; reviewUrl?: string; reviewFailure?: boolean } = {}) {
   const ghSpawn = vi.fn((args: string[]) => {
     if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
     if (args.includes("POST") && args.some(arg => /\/reviews$/.test(arg))) throw new Error("Runner must not publish GitHub reviews");
@@ -37,7 +38,7 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     status: options.reviewFailure ? 503 : 200,
     json: { status: "posted", reviewUrl: options.reviewUrl },
   } }).install();
-  const context = makeContext({ callbackUrl: "https://orchestrator.test", progressToken: "progress-token" }, { invoke });
+  const context = makeContext({ groupingParent: options.groupingParent, callbackUrl: "https://orchestrator.test", progressToken: "progress-token" }, { invoke });
   const report = vi.fn(async (_row: Record<string, any>) => {});
   const result = await postPushReviewStep.run(context, {
     prNumber: "42", workspaceDir: testDir("reviewer-reporting"), maxIterations, ghSpawn,
@@ -45,7 +46,7 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     reviewProviders: externalPending ? ["github-claude-code-review"] : [],
     sleep: async () => {}, reviewWaitPollMs: 1, reviewWaitTimeoutMs: 2,
     reviewers: [{ id: "code-review", gates: true }],
-    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: options.outputSchema ?? { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
+    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: options.buildPrompt ?? (() => "Review"), outputSchema: options.outputSchema ?? { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
   }, { report });
   const nativeBodies = publication.calls.map(call => JSON.parse(call.body).body as string);
   const comments = ghSpawn.mock.calls.filter(([args]) => args[0] === "pr" && args[1] === "comment")
@@ -54,6 +55,15 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
 }
 
 describe("reviewer evidence reports", () => {
+  it.each([undefined, false, true])("passes groupingParent to the selected reviewer (%s)", async groupingParent => {
+    const buildPrompt = vi.fn((_input: ReviewerPromptInput) => "Review");
+    const { result } = await runReview({ approved: true, findings: [] }, false, 1, { groupingParent, buildPrompt });
+    expect(result.approved).toBe(true);
+    expect(buildPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      issueIdentifier: expect.any(String), diff: "diff", groupingParent,
+    }));
+  });
+
   it("rejects the actual PR8 built-in response with its checklist embedded in summary", async () => {
     const malformed = JSON.parse(readFileSync(new URL("./fixtures/pr8-malformed-review-report.json", import.meta.url), "utf8"));
     const { result, nativeBodies } = await runReview(malformed, false, 1, { strictReport: true });

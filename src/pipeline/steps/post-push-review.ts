@@ -1722,6 +1722,7 @@ async function runSelectedInternalReviewers(params: {
         issueIdentifier: params.context.data.issueIdentifier,
         issueTitle: params.context.data.issueTitle,
         issueDescription: params.context.data.issueDescription,
+        groupingParent: params.context.data.groupingParent,
         prNumber: params.prNumber,
         diff: params.diff,
         previousFindings: params.previousFindings,

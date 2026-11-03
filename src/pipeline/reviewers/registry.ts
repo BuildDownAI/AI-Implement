@@ -43,6 +43,8 @@ export interface ReviewerPromptInput {
   issueIdentifier: string;
   issueTitle: string;
   issueDescription: string;
+  /** True for a grouping parent's own closing-work run. */
+  groupingParent?: boolean;
   prNumber: string;
   diff: string;
   /** Formatted findings from previous passes, for follow-up review context. */

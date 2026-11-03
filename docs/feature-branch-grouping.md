@@ -96,6 +96,14 @@ children`). Only once **all** its labelled children reach a terminal state does 
 work dispatch — onto its own feature branch. "Terminal" means completed *or* cancelled, so
 a cancelled child doesn't block the parent forever.
 
+The internal gap-analysis and in-loop review grade a grouping parent's closing-work PR
+only against the requirements the parent keeps for itself. Child-owned requirements are
+treated as delivered by the children into the base branch, even when the parent issue or
+planning acceptance bar lists them. Their absence from the closing-work diff is not a
+finding, and does not imply independent verification of the children's implementation or
+test execution. Missing parent-owned work still blocks approval. Reviews for other runs
+are unchanged.
+
 "Terminal" is read live from each labelled child's own tracker workflow state on every
 roll-up check for both providers, and on Linear's poll dispatch check, via
 `nonTerminalDesignatedChildren` in `src/feature-branch.ts` (Jira's poll dispatch check
