@@ -50,6 +50,33 @@ describe("classifyLlmResult", () => {
     expect(record.retryable).toBe(true);
   });
 
+  const PATH_WARNING = 'WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/codex-sessions-Ha1OPV"))';
+  const CAPACITY_ERROR = "Selected model is at capacity. Please try a different model.";
+
+  it.each([CAPACITY_ERROR, "Selected model is AT CAPACITY", "Please TRY A DIFFERENT MODEL"])(
+    "classifies terminal capacity error %s ahead of the PATH warning",
+    (errorMessage) => {
+      const record = classifyLlmResult(llmResult({ exitCode: 1, stderr: PATH_WARNING, errorMessage }), CTX);
+      expect(record).toMatchObject({
+        category: "transient", code: "PROVIDER_OVERLOADED", retryable: true, message: errorMessage,
+      });
+      expect(record.evidence.llmErrorMessage).toBe(errorMessage);
+    },
+  );
+
+  it("keeps an unrecognised non-zero exit without terminal error text as a crash", () => {
+    const record = classifyLlmResult(llmResult({ exitCode: 1, stderr: PATH_WARNING }), CTX);
+    expect(record).toMatchObject({ category: "crash", code: "PROCESS_EXIT_NONZERO", retryable: false });
+  });
+
+  it("keeps exit-0 terminal capacity errors structural", () => {
+    const record = classifyLlmResult(llmResult({
+      exitCode: 0, stderr: PATH_WARNING, errorMessage: CAPACITY_ERROR,
+      terminalStatus: { subtype: "error_during_execution", isError: true },
+    }), CTX);
+    expect(record).toMatchObject({ category: "invalid_output", code: "LLM_TERMINAL_ERROR", retryable: false });
+  });
+
   it("classifies a real 401 stderr as auth/PROVIDER_AUTH", () => {
     const record = classifyLlmResult(llmResult({ stderr: AUTH_STDERR, exitCode: 1 }), CTX);
     expect(record.category).toBe("auth");

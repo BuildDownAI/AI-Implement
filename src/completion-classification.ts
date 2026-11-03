@@ -78,9 +78,9 @@ export function neutralizeFences(text: string): string {
     .join("\n");
 }
 
-/** stderrTail, then stdoutTail, then the one-line message — whichever is first present. */
+/** Terminal error, then stderrTail, stdoutTail, or the one-line message — first present. */
 function evidenceExcerpt(failure: FailureRecord): string {
-  const text = failure.evidence.stderrTail || failure.evidence.stdoutTail || failure.message;
+  const text = failure.evidence.llmErrorMessage || failure.evidence.stderrTail || failure.evidence.stdoutTail || failure.message;
   return neutralizeFences(capChars(lastLines(text, EVIDENCE_MAX_LINES), EVIDENCE_MAX_CHARS));
 }
 

@@ -736,3 +736,32 @@ describe("renderClassification", () => {
     expect(md).not.toContain("troubleshooting");
   });
 });
+
+
+describe("classificationForFailure — terminal error evidence", () => {
+  const failure: FailureRecord = {
+    category: "transient", code: "PROVIDER_OVERLOADED", stage: "implement", attempt: 1,
+    retryable: true, message: "fallback message",
+    evidence: { stderrTail: "PATH-alias warning", stdoutTail: "model prose", truncated: false },
+  };
+
+  it("prefers the terminal error over stderr and stdout in the evidence block", () => {
+    const errorMessage = "Selected model is at capacity. Please try a different model.";
+    const result = classificationForFailure({
+      ...failure, evidence: { ...failure.evidence, llmErrorMessage: errorMessage },
+    });
+    expect(result.detail).toContain("```\n" + errorMessage + "\n```");
+    expect(result.detail).not.toContain("PATH-alias warning");
+  });
+
+  it.each([
+    [{ stderrTail: "stderr", stdoutTail: "stdout", truncated: false }, "stderr"],
+    [{ stdoutTail: "stdout", truncated: false }, "stdout"],
+    [{ truncated: false }, "fallback message"],
+  ] as const)("preserves the evidence fallback for %j", (evidence, expected) => {
+    const detail = classificationForFailure({ ...failure, evidence }).detail;
+    const baseline = classificationForFailure({ ...failure, evidence: { ...evidence, llmErrorMessage: "" } }).detail;
+    expect(detail).toBe(baseline);
+    expect(detail).toContain("```\n" + expected + "\n```");
+  });
+});
