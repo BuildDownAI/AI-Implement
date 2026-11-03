@@ -1,5 +1,6 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
@@ -3768,7 +3769,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               runPublicationToken,
               privateTransport: reviewFixCapabilities.supportsPrivateRunConfig === true,
               credentials: ghaFixCredentials,
-              ...(ghaFixDecision.kind === "launch" ? { agentConfig: ghaFixDecision.snapshot } : {}),
+              ...managedRunConfigFields(ghaFixDecision),
               runnerImage,
               retryPolicy: getRetryPolicy(),
             })

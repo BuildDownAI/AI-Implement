@@ -94,6 +94,7 @@ export function makeLaunchDecision(
     projectKey: bootstrap.projectKey,
     backend,
     snapshot,
+    fallbackModels: {},
     grant: toSafeGrantMetadata(bootstrap),
     takeBootstrap: vi.fn(() => {
       const taken = pending;

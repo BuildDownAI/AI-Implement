@@ -10,7 +10,7 @@
  * `JSON.stringify` and structured logging never see. Refusal text is fixed and built from `kind`, `category`
  * and `code` only.
  */
-import { STAGE_NAMES } from "./agent-config.js";
+import { STAGE_NAMES, type StageName } from "./agent-config.js";
 import { getProjectOptIn, resolveProjectStageConfig } from "./agent-config-store.js";
 import {
   loadStoredSnapshot,
@@ -20,7 +20,7 @@ import {
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import { parseExecutionPolicy, parseModelAuthContext, type ModelAuthGrantBootstrapV1, type SafeGrantMetadata } from "./model-auth-contract.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
-import type { ResolvedAgentSnapshotV1, RunCredentialsV1 } from "./run-config.js";
+import { copyModelFallbacks, type ResolvedAgentSnapshotV1, type RunCredentialsV1 } from "./run-config.js";
 
 export interface ManagedDispatchRequest {
   dispatchId: string;
@@ -41,6 +41,7 @@ export type ManagedDispatchDecision =
       readonly projectKey: string;
       readonly backend: DispatchAdmissionBackend;
       readonly snapshot: ResolvedAgentSnapshotV1;
+      readonly fallbackModels: Partial<Record<StageName, string>>;
       readonly grant: SafeGrantMetadata;
       readonly takeBootstrap: () => ModelAuthGrantBootstrapV1 | undefined;
     }
@@ -135,6 +136,7 @@ export async function prepareManagedDispatch(
         projectKey: req.projectKey,
         backend: req.backend,
         snapshot: result.snapshot,
+        fallbackModels: result.fallbackModels,
         grant: result.grant,
         takeBootstrap: result.takeBootstrap,
       };
@@ -242,4 +244,19 @@ export function ghaManagedCredentials(
 export function ghaLaunchOutcome(result: { success: boolean; outcome?: string }): "accepted" | "rejected" | "unknown" {
   if (result.success) return "accepted";
   return result.outcome === "rejected" ? "rejected" : "unknown";
+}
+
+/** Keep the snapshot and its companion model ids together on every managed transport. */
+export function managedRunConfigFields(
+  decision:
+    | { kind: "launch"; snapshot: ResolvedAgentSnapshotV1; fallbackModels?: Partial<Record<StageName, string>> }
+    | { kind: Exclude<ManagedDispatchDecision["kind"], "launch"> }
+    | null | undefined,
+): {
+  agentConfig?: ResolvedAgentSnapshotV1;
+  modelFallbacks?: Partial<Record<StageName, string>>;
+} {
+  if (decision?.kind !== "launch") return {};
+  const modelFallbacks = copyModelFallbacks(decision.fallbackModels);
+  return { agentConfig: decision.snapshot, ...(modelFallbacks ? { modelFallbacks } : {}) };
 }

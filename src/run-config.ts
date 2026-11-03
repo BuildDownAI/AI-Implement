@@ -79,6 +79,19 @@ export function copyModelPrices(value: unknown): RunModelPrices | undefined {
   return { prices, fetchedAt: value.fetchedAt };
 }
 
+/** Public model ids only; malformed optional maps never prevent a launch. */
+export function copyModelFallbacks(value: unknown): Partial<Record<StageName, string>> | undefined {
+  if (!isRec(value) || Object.keys(value).length === 0) return undefined;
+  const out: Partial<Record<StageName, string>> = {};
+  for (const [stage, model] of Object.entries(value)) {
+    // Same character contract as ATTRIBUTION_MODEL_RE, without attribution secret filtering.
+    if (!(STAGE_NAMES as readonly string[]).includes(stage)
+      || typeof model !== "string" || !/^[\x21-\x7e]{1,128}$/.test(model)) return undefined;
+    out[stage as StageName] = model;
+  }
+  return out;
+}
+
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
  * workflow_dispatch input (`run_config`) on GHA and as the
@@ -91,6 +104,7 @@ export function copyModelPrices(value: unknown): RunModelPrices | undefined {
  */
 export interface RunConfigV1 {
   modelPrices?: RunModelPrices;
+  modelFallbacks?: Partial<Record<StageName, string>>;
   v: 1;
   issue: { id: string; identifier: string; title: string; description: string };
   prNumber?: string;
@@ -476,6 +490,7 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 
 export interface ImplRunConfigInput {
   modelPrices?: RunModelPrices;
+  modelFallbacks?: Partial<Record<StageName, string>>;
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
   baseBranch: string;
@@ -497,6 +512,7 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
   const { issue, mapping, baseBranch, runnerCallbackUrl, groupingParent, retryPolicy, agentConfig } = input;
   return buildRunConfig({
     modelPrices: input.modelPrices,
+    modelFallbacks: input.modelFallbacks,
     runnerPhase: "implementation",
     issue,
     mapping,
@@ -510,6 +526,7 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
 
 export interface RunConfigBuildInput {
   modelPrices?: RunModelPrices;
+  modelFallbacks?: Partial<Record<StageName, string>>;
   runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
@@ -539,8 +556,10 @@ export interface RunConfigBuildInput {
 export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
   const { issue, mapping } = input;
   const modelPrices = copyModelPrices(input.modelPrices);
+  const modelFallbacks = copyModelFallbacks(input.modelFallbacks);
   return {
     ...(modelPrices ? { modelPrices } : {}),
+    ...(modelFallbacks ? { modelFallbacks } : {}),
     v: 1,
     issue: {
       id: issue.id,
@@ -641,6 +660,8 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const out: RunConfigV1 = { v, issue };
   const prices = copyModelPrices(cfg.modelPrices);
   if (prices) out.modelPrices = prices;
+  const fallbacks = copyModelFallbacks(cfg.modelFallbacks);
+  if (fallbacks) out.modelFallbacks = fallbacks;
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
   if (runnerPhase !== undefined) out.runnerPhase = runnerPhase;

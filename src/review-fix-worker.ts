@@ -64,6 +64,7 @@
  * PR that moved again after this read can only withhold approval, never grant a
  * false one.
  */
+import { managedRunConfigFields, type ManagedDispatchDecision } from "./managed-dispatch-auth.js";
 import { getInstallation } from "./github-app-auth.js";
 import {
   cancelWorkflowRun,
@@ -329,7 +330,7 @@ function buildLaunchInputs(
       deadlineAt: plan.deadlineAt,
     },
     retryPolicy,
-    agentConfig: managed?.snapshot,
+    ...managedRunConfigFields(managed ? { ...managed, kind: "launch" } : undefined),
   });
 
   // run_attempt_token stays the public correlation marker on both paths (run-name/reconcile need
@@ -459,6 +460,7 @@ export function reviewFixAttemptStoreScopeStore(source: ReviewFixWorkerAttemptSc
 /** Kept inside launch(), never returned through a journaled worker port. */
 export interface ManagedReviewFixLaunch {
   snapshot: ResolvedAgentSnapshotV1;
+  fallbackModels?: Extract<ManagedDispatchDecision, { kind: "launch" }>["fallbackModels"];
   credentials: RunCredentialsV1;
   settle(outcome: "accepted" | "rejected" | "unknown"): void;
 }
