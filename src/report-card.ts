@@ -1,3 +1,5 @@
+import { estimateCallCostUsd, type ModelPriceRates } from "./model-price-estimate.js";
+import { toInvocation } from "./job-accounting.js";
 import { getDb } from "./dedup.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 
@@ -21,7 +23,7 @@ export interface IssueReportCard {
   issue: string;
   repo: string | null;
   runs: RunEntry[];
-  totals: { dispatches: number; passes: number; costUsd: number | null };
+  totals: { dispatches: number; passes: number; costUsd: number | null; estimatedCostUsd: number | null; unpricedCalls: number };
   approved: boolean;
   planned: boolean;
   merged: boolean;
@@ -272,7 +274,7 @@ function restateRefForRow(d: DispatchRow): RunEntry["restate"] {
 
 // ---- getIssueReportCard ----
 
-export function getIssueReportCard(identifier: string): IssueReportCard | null {
+export function getIssueReportCard(identifier: string, prices: readonly ModelPriceRates[] = []): IssueReportCard | null {
   const db = getDb();
 
   const dispatches = db
@@ -285,6 +287,22 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
     .all(identifier) as DispatchRow[];
 
   if (dispatches.length === 0) return null;
+
+  let estimatedCostUsd: number | null = null;
+  let unpricedCalls = 0;
+  const calls = db.prepare(`
+    SELECT a.* FROM model_invocation_attribution a
+    WHERE a.dispatch_id IN (
+      SELECT dispatch_id FROM dispatch_log WHERE issue_identifier = ?
+    ) ORDER BY a.rowid
+  `).all(identifier) as Parameters<typeof toInvocation>[0][];
+  for (const row of calls) {
+    const call = toInvocation(row);
+    if (call.costStatus !== "unavailable") continue;
+    const estimate = estimateCallCostUsd(call, prices);
+    if (estimate === null) unpricedCalls++;
+    else estimatedCostUsd = (estimatedCostUsd ?? 0) + estimate;
+  }
 
   const repo = dispatches.find((d) => d.repo != null)?.repo ?? null;
 
@@ -376,7 +394,7 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
     issue: identifier,
     repo,
     runs,
-    totals: { dispatches: dispatches.length, passes: totalPasses, costUsd: totalCostUsd },
+    totals: { dispatches: dispatches.length, passes: totalPasses, costUsd: totalCostUsd, estimatedCostUsd, unpricedCalls },
     approved,
     planned,
     merged,

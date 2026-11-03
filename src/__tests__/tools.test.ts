@@ -106,6 +106,7 @@ interface RunCall {
 function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Context {
   return {
     request: () => ({ target: { handler: handlerName } }),
+    objectClient: () => ({ current: async () => ({ prices: [] }) }),
     run: async (name: unknown, action?: unknown, options?: unknown) => {
       // ctx.run(action) and ctx.run(name, action) are unused by any write handler here, but
       // the fake still handles the two-arg form defensively rather than assuming three.
@@ -1275,7 +1276,7 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
   it("get_issue_report_card passes `issue` through and returns the card verbatim", async () => {
     (getIssueReportCard as ReturnType<typeof vi.fn>).mockReturnValue({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5 });
     const result = await getIssueReportCardTool(fakeContext("get_issue_report_card"), { caller: system, args: { issue: "AII-1" } });
-    expect(getIssueReportCard).toHaveBeenCalledWith("AII-1");
+    expect(getIssueReportCard).toHaveBeenCalledWith("AII-1", []);
     expect(JSON.parse(result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5 });
   });
 
