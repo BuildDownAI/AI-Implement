@@ -672,6 +672,37 @@ describe("postPushReviewStep", () => {
       expect((invoke.mock.calls[1][0] as any).agentStage).toBe("implementation");
     });
 
+    describe("LLM failure detail precedence", () => {
+      const warning = 'WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp"';
+      const capacity = "Selected model is at capacity. Please try a different model.";
+
+      it.each([
+        { name: "model error", errorMessage: capacity, stderr: warning, stdout: "output", detail: `exit 1: ${capacity}` },
+        { name: "padded model error", errorMessage: `  ${capacity}  `, stderr: warning, stdout: "output", detail: `exit 1: ${capacity}` },
+        { name: "absent model error", stderr: "stderr detail", stdout: "output", detail: "exit 1: stderr detail" },
+        { name: "empty model error", errorMessage: "", stderr: "stderr detail", stdout: "output", detail: "exit 1: stderr detail" },
+        { name: "stdout fallback", stderr: "", stdout: "  output  ", detail: "exit 1: output" },
+        { name: "empty details", stderr: "", stdout: "", detail: "exit 1" },
+        { name: "whitespace model error", errorMessage: "   ", stderr: warning, stdout: "output", detail: "exit 1" },
+      ])("reports $name for review and fix failures", async ({ name: _name, detail, ...result }) => {
+        for (const stage of ["review", "fix"]) {
+          const comments: string[] = [];
+          const gh = vi.fn((args: string[]) => {
+            if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+            return ghSpawn(args);
+          });
+          const failed = { ...result, exitCode: 1, tokensUsed: 0 };
+          const invoke = vi.fn().mockResolvedValue(failed);
+          if (stage === "fix") invoke.mockResolvedValueOnce(structuredReviewResult(notApproved));
+          await runWith(makeCtx(invoke, { agentConfig: makeSnapshot() }), stage === "fix" ? 2 : 1, {}, gh);
+          const message = `${stage === "fix" ? "Fix-pass" : "Reviewer"} LLM failed (${detail})`;
+          const report = stage === "fix" ? comments.join("\n") : submittedReview(gh);
+          expect(report).toContain(message);
+          expect(report).not.toContain(warning);
+        }
+      });
+    });
+
     it("never approves when the reviewer times out", async () => {
       const invoke = vi.fn(async () => ({ stdout: "", exitCode: 1, tokensUsed: 0 }));
       const out: any = await run(makeCtx(invoke, { agentConfig: makeSnapshot() }), 1);

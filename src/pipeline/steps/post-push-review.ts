@@ -226,8 +226,8 @@ function resultMessage(result: SpawnResult): string {
   return (result.stderr || result.stdout || `exit ${result.exitCode}`).trim();
 }
 
-function llmResultMessage(result: { stdout?: string; stderr?: string; exitCode: number }): string {
-  const detail = (result.stderr || result.stdout || "").trim();
+function llmResultMessage(result: { stdout?: string; stderr?: string; errorMessage?: string; exitCode: number }): string {
+  const detail = (result.errorMessage || result.stderr || result.stdout || "").trim();
   return detail ? `exit ${result.exitCode}: ${detail}` : `exit ${result.exitCode}`;
 }
 
@@ -1812,7 +1812,8 @@ async function runSelectedInternalReviewers(params: {
     if (reviewStageClassified && reviewStageClassified.category === "transient") {
       const failure = { ...reviewStageClassified, stage: "post-push-review", code: "PROVIDER_UNAVAILABLE" as const, retryable: false };
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).`);
+      const modelErrorDetail = reviewResult.errorMessage?.trim() ? ` ${reviewFailureMessage(reviewResult)}` : "";
+      const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).${modelErrorDetail}`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "provider_unavailable";
       priorLlmFailure ||= reviewerGates(selection, provenance);
       await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
