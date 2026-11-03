@@ -126,6 +126,13 @@ value ([AII-609](https://linear.app/eudoxus/issue/AII-609)).
   queued for the next poll instead of silently dispatching it against the repository
   base branch.
 
+Linear refuses to dispatch a designated child when its repository mapping differs
+from any contiguous labelled ancestor's mapping, or any of these mappings is
+missing. Each refusal logs both issue identifiers and team-to-repository mappings.
+Different teams may share the same owner/repository. This fence applies to planning
+and implementation; it does not repair branches already orphaned by a cross-repository
+tree. Those require a manual merge.
+
 This resolution is the same in all execution modes — the resolved branch is passed to the
 runner as the `base_branch` workflow input (GitHub Actions) or as the runner's default
 branch (Fly machines / local Docker). The target repo's `claude-implement.yml` must accept

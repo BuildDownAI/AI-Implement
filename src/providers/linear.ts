@@ -8,13 +8,13 @@ import type {
   ProviderConfig,
   TrackerIssuePage,
 } from "./types.js";
-import type { RepoMapping } from "../config.js";
+import { getMappings, type RepoMapping } from "../config.js";
 import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 import { isLinearAuthConfigured, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
 import { parseIssueConfig } from "../issue-config.js";
-import { nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
+import { hasCompatibleFeatureMapping, nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
 import { DEFAULT_LINEAR_PICKUP_LABEL, getLinearPickupLabel } from "../orchestrator-settings.js";
 
 interface GraphQLResponse<T> {
@@ -35,6 +35,7 @@ function refreshPickupLabel(): void {
 /** A node in the ancestor chain: identifier + description + labels, with a nullable parent. */
 type AncestorNode = {
   identifier: string;
+  team: { key: string };
   description?: string | null;
   labels?: { nodes: Array<{ name: string }> };
   parent?: AncestorNode | null;
@@ -64,14 +65,15 @@ function childFeatureStates(
   }));
 }
 
-function labeledAncestorChain(parent: AncestorNode): FeatureBranchChainEntry[] {
-  const collected: FeatureBranchChainEntry[] = [];
+function labeledAncestorChain(parent: AncestorNode): Array<FeatureBranchChainEntry & { scopeKey: string }> {
+  const collected: Array<FeatureBranchChainEntry & { scopeKey: string }> = [];
   let node = parent;
   while (node) {
     const hasLabel = (node.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
     if (!hasLabel) break;
     collected.push({
       identifier: node.identifier,
+      scopeKey: node.team.key,
       mode: parseIssueConfig(node.description, node.identifier).config.featureBranch.mode,
     });
     node = node.parent ?? null;
@@ -237,22 +239,27 @@ export class LinearProvider implements TicketingProvider {
             parent {
               identifier
               description
+              team { key }
               labels { nodes { name } }
               parent {
                 identifier
                 description
+                team { key }
                 labels { nodes { name } }
                 parent {
                   identifier
                   description
+                  team { key }
                   labels { nodes { name } }
                   parent {
                     identifier
                     description
+                    team { key }
                     labels { nodes { name } }
                     parent {
                       identifier
                       description
+                      team { key }
                       labels { nodes { name } }
                     }
                   }
@@ -271,6 +278,7 @@ export class LinearProvider implements TicketingProvider {
     type LinearLabelNodes = { nodes: Array<{ name: string }> };
     type LinearAncestor = {
       identifier: string;
+      team: { key: string };
       description: string | null;
       labels: LinearLabelNodes;
       parent: LinearAncestor | null;
@@ -326,6 +334,7 @@ export class LinearProvider implements TicketingProvider {
     const readyForImplementation: AIImplementSnapshot["readyForImplementation"] = [];
     const parentsToFinalize: AIImplementSnapshot["parentsToFinalize"] = [];
 
+    let mappings: Record<string, RepoMapping> | undefined;
     for (const issue of allNodes) {
       const labelNames = new Set(issue.labels?.nodes?.map((l) => l.name) ?? []);
 
@@ -365,7 +374,11 @@ export class LinearProvider implements TicketingProvider {
       //     none AI-Implement yet)          its children were, so let it sit).
       const children = issue.children?.nodes ?? [];
       const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
-      const ancestorChain = labeledAncestorChain(issue.parent);
+      const ancestors = labeledAncestorChain(issue.parent);
+      if (ancestors.some((ancestor) => !hasCompatibleFeatureMapping(
+        { identifier: issue.identifier, scopeKey: issue.team.key }, ancestor, mappings ??= getMappings(),
+      ))) continue;
+      const ancestorChain = ancestors.map(({ identifier, mode }) => ({ identifier, mode }));
       const parsed = parseIssueConfig(issue.description, issue.identifier);
       const mode = parsed.config.featureBranch.mode;
 
