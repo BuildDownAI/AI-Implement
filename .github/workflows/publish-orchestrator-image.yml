@@ -15,6 +15,7 @@ on:
 permissions:
   contents: read
   statuses: write
+  id-token: write
 
 jobs:
   build:
@@ -47,7 +48,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SOURCE_BRANCH: ${{ inputs.branch || github.ref_name }}
-      CONTROL_PLANE_OPS_TOKEN: ${{ secrets.CONTROL_PLANE_OPS_TOKEN }}
     steps:
       - name: Require Fly image push token
         env:
@@ -111,11 +111,24 @@ jobs:
             -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       - name: Notify control plane
-        if: ${{ always() && steps.published.outcome == 'success' && env.CONTROL_PLANE_OPS_TOKEN != '' }}
+        if: ${{ always() && steps.published.outcome == 'success' }}
         env:
           SOURCE_COMMIT: ${{ steps.meta.outputs.commit }}
           IMAGE: ${{ steps.meta.outputs.image }}
         run: |
+          if ! identity_response=$(curl --silent --show-error --fail \
+            --connect-timeout 15 --max-time 120 \
+            --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fauth.builddown.ai"); then
+            echo '::error::GitHub identity token request failed; the image remains published.'
+            exit 1
+          fi
+          if ! identity_token=$(jq -er '.value | select(type == "string" and length > 0)' <<< "$identity_response"); then
+            echo '::error::GitHub identity token response is invalid; the image remains published.'
+            exit 1
+          fi
+          echo "::add-mask::$identity_token"
+          unset identity_response
           body=$(jq -n --arg branch "$SOURCE_BRANCH" --arg commit "$SOURCE_COMMIT" \
             --arg image "$IMAGE" '{branch: $branch, commit: $commit, image: $image}')
           response_file=$(mktemp)
@@ -123,7 +136,7 @@ jobs:
           if ! status=$(curl --silent --show-error --connect-timeout 15 --max-time 120 \
             --output "$response_file" --write-out '%{http_code}' \
             --request POST https://auth.builddown.ai/api/ops/auto-update \
-            --header "Authorization: Bearer $CONTROL_PLANE_OPS_TOKEN" \
+            --header "Authorization: Bearer $identity_token" \
             --header 'Content-Type: application/json' --data "$body"); then
             echo "Control plane HTTP status: ${status:-000}"
             cat "$response_file"
