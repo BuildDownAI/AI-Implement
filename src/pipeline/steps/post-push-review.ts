@@ -2347,7 +2347,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
       };
-      // Every publication branch exits this pass; no (head, iteration) is posted twice.
+      // Terminal branches exit this pass; the fix branch reuses its publication on no changes.
       const inline = buildInlineReviewComments(reviewLedger.filter((finding) => finding.source === "ai-implement-internal"), diffRes.stdout);
       const publishReview = (spawn: typeof ghSpawn, number: string, body: string) => submitPrReview(spawn, number, body, {
         callbackUrl: context.data.callbackUrl, progressToken: context.data.progressToken,
@@ -2655,11 +2655,17 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
 
+      // Publish against the reviewed head before the fix can push a new one.
+      const reviewUrl = await publishReview(
+        ghSpawn,
+        prNumber,
+        `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found issues; starting a fix pass.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}`,
+      );
       const feedbackMarker = `<!-- ai-implement post-push iter=${iteration} -->`;
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 
@@ -2826,11 +2832,7 @@ ${externalFindingsFixBlock}
         }
         terminationReason = "no_changes";
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
-        const reviewUrl = await publishReview(
-          ghSpawn,
-          prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
-        );
+        // Reuse the pre-fix attempt, including publication failures.
         postPrComment(
           ghSpawn,
           prNumber,
