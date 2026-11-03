@@ -1,5 +1,6 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -5021,6 +5022,7 @@ export async function releaseUnownedDeployHoldAtBoot(
 /** Production registration hook; only successful registration may recover the hold. */
 export async function onRestateRegistered(deps: {
   releaseHold?: () => Promise<void>;
+  armPrices?: () => Promise<void>;
   sweep: () => void;
   scrub: () => Promise<void>;
   seed: () => Promise<void>;
@@ -5029,6 +5031,7 @@ export async function onRestateRegistered(deps: {
 }): Promise<void> {
   if (getRestateStatus().registration.state === "registered") {
     await (deps.releaseHold ?? releaseUnownedDeployHoldAtBoot)();
+    await (deps.armPrices ?? armModelPricesSchedule)();
   }
   deps.sweep();
   await deps.scrub();

@@ -626,6 +626,38 @@ The link is hidden for a `user` session. The Journal page and the drawer's "Rest
 
 For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.
 
+### ModelPrices
+
+`ModelPrices/builddown` caches public USD-per-token model prices from
+`GET <BUILDDOWN_OIDC_ISSUER>/api/model-prices`. After endpoint registration, boot
+sends `refresh({ reason: "boot" })`. The exclusive handler preserves an existing
+armed timer, so restarts do not multiply the schedule. Every attempted read arms
+another refresh six hours later. Scheduled inputs carry `scheduledFor`; a timer
+superseded by a requested refresh does nothing.
+
+The shared `current` handler returns `{ prices, fetchedAt, lastError }`.
+`fetchedAt` is epoch milliseconds of the last successful read. Failures preserve
+the last good prices and timestamp and record only `network`, `http`, or
+`invalid-body`. A successful read clears the error, including when prices are
+empty. No response text or exception message leaves the bounded `ctx.run` step.
+Requests omit credentials, reject redirects, and have a 30-second fetch timeout.
+Missing or invalid HTTPS issuer configuration disables fetching and scheduling;
+`current` then returns empty prices, a null timestamp and `not-configured`.
+No MCP tool exposes this cache.
+The Restate tests run both replay variants, check fixed failure codes and journal/state
+sanitization, and inject a short interval to exercise actual delayed retry delivery.
+The production interval remains six hours.
+
+Contract synchronization uses a hand copy from the pinned Control-Plane commit
+`545a6c4`, because the runner cannot read the private `BuildDownAI/Control-Plane`
+repository. Copy `docs/contracts/model-prices/several-models.json`, `empty.json`,
+`unavailable.json`, and `response.schema.json` byte for byte into
+`src/__tests__/fixtures/contracts/model-prices/`. Verify the supplied SHA-256 hashes
+before writing the copies, and record the commit and hashes in `contracts.lock.json`.
+Never edit the copied files. The contract test checks all four hashes and validates
+recorded successful bodies against both the producer schema and the consumer
+validator. Both Restate harness variants replay the producer exchanges.
+
 ## PostPushReviewPublication
 
 `PostPushReviewPublication` is a virtual object keyed by `<owner>/<repo>#<prNumber>`.
