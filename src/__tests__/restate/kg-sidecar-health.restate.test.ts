@@ -1,13 +1,12 @@
 // Real Restate coverage for the KgSidecarHealth object (AII-1527), on both variants.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
-import * as restate from "@restatedev/restate-sdk";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { testDb } from "../helpers/test-db.js";
 import type { SidecarHealth } from "../../kg-provider.js";
 import { createKgSidecarHealth } from "../../restate/kg-sidecar-health.js";
 import type { RestateEnvironment } from "./harness.js";
-import { VARIANTS, callObject, eventually, gate, journalEntries, journaledRunResult, queryInvocations, settle, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, callObject, cancelInvocation, eventually, gate, journalEntries, journaledRunResult, queryInvocations, settle, startVariants, stopAll } from "./harness.js";
 
 const health = (lastError: string | null, checkedAt: number): SidecarHealth => ({
   reachable: lastError === null,
@@ -114,19 +113,29 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
     let pending = true;
     const clear = vi.fn(() => { pending = false; });
     nextProbe = async () => health(null, 9100);
-    nextNotify = async () => { throw new restate.TerminalError("cancelled", { errorCode: 409 }); };
+    const sending = gate("recovery send");
+    nextNotify = () => sending.wait();
     nextClear = clear;
-    onTestFinished(() => { nextNotify = async () => {}; nextClear = () => {}; });
-    const response = await fetch(`${env().baseUrl()}/KgSidecarHealth/sidecar/check`, { method: "POST", headers: { "idempotency-key": `cancel-recovery-${label}` } });
+    onTestFinished(() => { sending.release(); nextNotify = async () => {}; nextClear = () => {}; });
+    const responsePromise = fetch(`${env().baseUrl()}/KgSidecarHealth/sidecar/check`, {
+      method: "POST", headers: { "idempotency-key": `cancel-recovery-${label}` },
+    });
+    await sending.reached();
+    const rows = await eventually(
+      () => queryInvocations(env().adminAPIBaseUrl(), "target_service_name = 'KgSidecarHealth' AND target_handler_name = 'check' AND status != 'completed'"),
+      (found) => found.length === 1,
+      { label: "recovery send awaiting cancellation" },
+    );
+    const invocationId = String(rows[0].id);
+    await cancelInvocation(env().adminAPIBaseUrl(), invocationId);
+    sending.release();
+    const response = await responsePromise;
     expect(response.status).toBe(409);
     expect(pending).toBe(true);
     expect(clear).not.toHaveBeenCalled();
-    const rows = await queryInvocations(env().adminAPIBaseUrl(), "target_service_name = 'KgSidecarHealth' AND target_handler_name = 'check'");
-    const entries = await Promise.all(rows.map(row => journalEntries(env().adminAPIBaseUrl(), String(row.id))));
-    // Earlier tests may discard exhausted attempts; this invocation must not.
-    const cancelled = entries.filter(entry => JSON.stringify(entry).includes("cancelled"));
-    expect(cancelled.length).toBeGreaterThan(0);
-    expect(JSON.stringify(cancelled)).not.toContain("discard-recovery");
+    const entries = await journalEntries(env().adminAPIBaseUrl(), invocationId);
+    expect(JSON.stringify(entries)).toContain("notify-recovery");
+    expect(JSON.stringify(entries)).not.toContain("discard-recovery");
   });
 
   it("returns the probe result and journals it", async () => {
