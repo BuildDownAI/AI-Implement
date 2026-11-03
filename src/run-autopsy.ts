@@ -1,5 +1,5 @@
 import { estimateCallCostUsd } from "./model-price-estimate.js";
-import type { RunModelPrices } from "./run-config.js";
+import { copyModelPrices, type RunModelPrices } from "./run-config.js";
 import type { RunTelemetry } from "./pipeline/types.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -39,6 +39,7 @@ interface CostCell {
 }
 
 function passCostParts(p: StatsPass, prices?: RunModelPrices): CostCell {
+  prices = copyModelPrices(prices);
   const usage = p.attribution?.usage;
   let implement =
     p.costUsd ?? (usage?.costStatus === "reported" ? usage.costUsd : null);
@@ -215,6 +216,7 @@ export interface RunStats {
 
 /** Markdown stats posted to the ticket for approved runs via the ai-output/comments plumbing. */
 export function formatRunStats(s: RunStats): string {
+  s = { ...s, modelPrices: copyModelPrices(s.modelPrices) };
   const passRows = s.passes.map(p => formatPassRow(p, s.modelPrices)).join("\n");
   // Pattern anchor: report-card.ts's derivedStatsForJob — extraCostUsd is the same addition it makes
   // on top of the per-pass sum (BAC-27201). A missing component yields a partial/unavailable label.

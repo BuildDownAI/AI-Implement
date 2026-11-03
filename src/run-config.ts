@@ -53,11 +53,29 @@ export interface RunModelPrices {
   fetchedAt: number | null;
 }
 
-/** Project public fields explicitly at the runner trust boundary. */
-export function copyModelPrices(value: RunModelPrices | undefined): RunModelPrices | undefined {
-  if (!value?.prices?.length) return undefined;
-  return { prices: value.prices.map(({ model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd }) =>
-    ({ model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd })), fetchedAt: value.fetchedAt };
+/** Validate optional data and project public fields at the runner trust boundary.
+ * A malformed copy is omitted wholesale so prices cannot prevent a run from starting.
+ */
+export function copyModelPrices(value: unknown): RunModelPrices | undefined {
+  if (!isRec(value) || !Array.isArray(value.prices) || value.prices.length === 0) return undefined;
+  if (value.fetchedAt !== null && (typeof value.fetchedAt !== "number"
+    || !Number.isSafeInteger(value.fetchedAt) || value.fetchedAt < 0)) return undefined;
+  const prices: RunModelPrices["prices"] = [];
+  for (const price of value.prices) {
+    if (!isRec(price)) return undefined;
+    const { model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd } = price;
+    // Match the public control-plane decimal and effectiveFrom contracts without importing
+    // the Restate service (and its server dependencies) into the runner.
+    if (typeof model !== "string" || typeof version !== "string"
+      || (effectiveFrom !== null && (typeof effectiveFrom !== "string"
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(effectiveFrom)))
+      || typeof inputUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(inputUsd)
+      || typeof outputUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(outputUsd)
+      || typeof cacheReadUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(cacheReadUsd)
+      || typeof cacheWriteUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(cacheWriteUsd)) return undefined;
+    prices.push({ model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd });
+  }
+  return { prices, fetchedAt: value.fetchedAt };
 }
 
 /**

@@ -437,6 +437,21 @@ describe("control-plane estimates", () => {
     expect(stats([{ ...pass, reviewApproved: true }], { modelPrices })).not.toContain("estimated");
     expect(stats([pass], { modelPrices, extraCostUnreported: 1 })).toContain("**Total cost:** unavailable");
   });
+  it("keeps the stats comment unchanged when optional prices are malformed", () => {
+    const malformed: unknown[] = [null, { prices: "invalid", fetchedAt: null },
+      { ...modelPrices, prices: [null] }, { ...modelPrices, fetchedAt: "invalid" },
+      ...["inputUsd", "outputUsd", "cacheReadUsd", "cacheWriteUsd"].flatMap(field =>
+        [null, 42, {}, "invalid", "1e-6", "-1"].map(value => ({
+          ...modelPrices, prices: [{ ...prices.find((p: { model: string }) => p.model === "a-dated"), [field]: value }],
+        }))),
+    ];
+    for (const value of malformed) {
+      const modelPrices = value as Parameters<typeof formatRunStats>[0]["modelPrices"];
+      for (const passes of [[pass], [{ ...pass, costUsd: 7, reviewApproved: true, reviewTelemetry }]]) {
+        expect(stats(passes, { modelPrices })).toBe(stats(passes));
+      }
+    }
+  });
   it("preserves the complete legacy comment byte for byte without prices", () => {
     expect(stats([pass])).toBe([
       "## Run stats — AII-1", "",

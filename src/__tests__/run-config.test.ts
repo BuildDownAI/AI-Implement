@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
+  copyModelPrices,
   encodeRunConfig,
   decodeRunConfig,
   decodeTrustedRunConfig,
@@ -986,6 +987,34 @@ describe("public model prices envelope", () => {
       expect(built.modelPrices).toEqual({ prices, fetchedAt: 123 });
       expect(decodeRunConfig(encodeRunConfig({ ...built, modelPrices: copy })).modelPrices).toEqual({ prices, fetchedAt: 123 });
       expect(diagnosticProjection({ ...built, modelPrices: copy }).modelPrices).toEqual({ prices, fetchedAt: 123 });
+    }
+  });
+  it("drops malformed optional prices when decoding raw envelopes", () => {
+    const valid = { prices, fetchedAt: 123 };
+    const malformed: unknown[] = [null, "invalid", [], {},
+      { ...valid, prices: "invalid" }, { ...valid, prices: {} },
+      { ...valid, prices: [null] }, { ...valid, prices: [42] },
+      ...[undefined, "123", -1, 1.5, {}].map(fetchedAt => ({ ...valid, fetchedAt })),
+      ...["model", "version", "effectiveFrom"].flatMap(field =>
+        [undefined, 42, {}].map(value => ({ ...valid, prices: [{ ...prices[0], [field]: value }] }))),
+      { ...valid, prices: [{ ...prices[0], effectiveFrom: "invalid" }] },
+      ...["inputUsd", "outputUsd", "cacheReadUsd", "cacheWriteUsd"].flatMap(field =>
+        [undefined, null, 1, {}, "", "-1", "1e-6", "NaN", "Infinity", "1.2.3", " 1", ".5", "1."].map(value =>
+          ({ ...valid, prices: [prices[0], { ...prices[1], [field]: value }] }))),
+    ];
+    for (const modelPrices of malformed) {
+      // Encode raw JSON: encodeRunConfig itself sanitizes and would hide decode regressions.
+      const encoded = Buffer.from(JSON.stringify({ ...full, modelPrices })).toString("base64");
+      const decoded = decodeRunConfig(encoded);
+      expect(decoded.issue).toEqual(full.issue);
+      expect(decoded).not.toHaveProperty("modelPrices");
+    }
+    for (const fetchedAt of [Infinity, NaN]) {
+      expect(copyModelPrices({ ...valid, fetchedAt })).toBeUndefined();
+    }
+    for (const fetchedAt of [null, 0, 123]) {
+      const encoded = Buffer.from(JSON.stringify({ ...full, modelPrices: { ...valid, fetchedAt } })).toString("base64");
+      expect(decodeRunConfig(encoded).modelPrices).toEqual({ ...valid, fetchedAt });
     }
   });
   it("omits missing and empty copies", () => {
