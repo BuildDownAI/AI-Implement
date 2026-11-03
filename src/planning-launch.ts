@@ -2,6 +2,7 @@
  * workflow step can call it. `dispatchPlanning` owns admission: it reserves capacity before
  * `preparePlanningLaunch` and releases it based on what `launchPlanningRun` returns. Nothing
  * in this file acquires or releases a reservation. */
+import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import type { AppConfig, HeldReservation, DispatchSessionResult } from "./index.js";
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue, TicketingProvider } from "./providers/types.js";
@@ -197,7 +198,7 @@ async function buildPlanningLaunch(
         planningContext: planningContextInputs,
         privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
         credentials: trustedCredentials,
-        ...(managedDecision.kind === "launch" ? { agentConfig: managedDecision.snapshot } : {}),
+        ...managedRunConfigFields(managedDecision),
         // Planning has no retry loop, so nothing is stamped — but retryPolicy is
         // required on EnvelopeDispatchOpts, so every call site must say so explicitly.
         retryPolicy: null,
@@ -478,7 +479,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           planningContext: planningContextInputs,
           retryPolicy: null,
         }),
-        ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
+        ...managedRunConfigFields(protectedLaunch),
       };
 
       // Control-plane work keeps the installation-wide token; the runner boots with a

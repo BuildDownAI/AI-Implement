@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
@@ -607,7 +608,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
               commentInstruction: item.instruction || undefined,
               retryPolicy: getRetryPolicy(),
             }),
-            ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
+            ...managedRunConfigFields(protectedLaunch),
           };
 
           let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
@@ -794,7 +795,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                 runPublicationToken: ghaPublicationToken,
                 privateTransport: capabilities.supportsPrivateRunConfig === true,
                 credentials: trustedCredentials,
-                ...(ghaDecision.kind === "launch" ? { agentConfig: ghaDecision.snapshot } : {}),
+                ...managedRunConfigFields(ghaDecision),
                 runnerImage,
                 retryPolicy: getRetryPolicy(),
               })
