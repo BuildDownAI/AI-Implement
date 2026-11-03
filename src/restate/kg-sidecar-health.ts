@@ -37,7 +37,7 @@ export function createKgSidecarHealth(deps: KgSidecarHealthDeps) {
             } catch (err) {
               await ctx.run("discard-recovery", () => {
                 (deps.clearRecovery ?? clearKgRecoveryNotice)();
-                console.warn(`[kg-sidecar-health] recovery notice failed after 3 attempts: ${err instanceof Error ? err.message : String(err)}`);
+                console.warn(`[deploy-notify] KG recovery notice failed: ${err instanceof Error ? err.message : String(err)}`);
               }, { maxRetryAttempts: 3 });
             }
           }

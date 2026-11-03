@@ -88,11 +88,18 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
     });
     expect(deploy.hasKgRecoveryNotice()).toBe(true);
     failRecovery = true;
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(await check()).toEqual(health(null, 9000));
     expect(failedAttempts).toBe(3);
     expect(deploy.hasKgRecoveryNotice()).toBe(false);
+    const recoveryWarnings = () => warning.mock.calls.filter(([message]) =>
+      String(message).startsWith("[deploy-notify] KG recovery notice failed:"));
+    expect(recoveryWarnings()).toEqual([
+      ["[deploy-notify] KG recovery notice failed: Webhook notification failed: 503 — unavailable"],
+    ]);
     expect(await check()).toEqual(health(null, 9000));
     expect(failedAttempts).toBe(3);
+    expect(recoveryWarnings()).toHaveLength(1);
   });
 
   it("returns the probe result and journals it", async () => {
