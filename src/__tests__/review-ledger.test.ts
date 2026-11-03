@@ -2253,10 +2253,16 @@ describe("reviewContractFindingGates", () => {
   it.each([
     ["blocking", "approve", true],
     ["minor", "approve", false],
-    ["minor", "changes_requested", true],
-    ["minor", "incomplete", true],
-    ["minor", undefined, true],
+    ["minor", "changes_requested", false],
+    ["minor", "incomplete", false],
+    ["minor", undefined, false],
     ["blocking", "changes_requested", true],
+    ["blocking", "incomplete", true],
+    ["blocking", undefined, true],
+    ["medium", "approve", false],
+    ["medium", "changes_requested", true],
+    ["medium", "incomplete", true],
+    ["medium", undefined, true],
   ] as const)("%s finding under verdict %s gates=%s", (severity, verdict, expected) => {
     expect(reviewContractFindingGates({ severity }, verdict)).toBe(expected);
   });

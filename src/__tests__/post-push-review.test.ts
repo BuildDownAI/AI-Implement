@@ -1,3 +1,4 @@
+import { REVIEW_PROCESSES } from "../review-process.js";
 import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../pipeline/review-publication-limits.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
@@ -5,7 +6,7 @@ import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
 import { prepareScratchExclusion } from "../pipeline/scratch-exclude.js";
-import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { isReviewLedgerFindingGating, postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import type { LLMExecutor, PipelineContextData } from "../pipeline/types.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -833,6 +834,32 @@ describe("postPushReviewStep", () => {
     expect(calls[0][0].prompt).toContain("spec-coverage review only");
     expect(calls[1][0].prompt).toContain("complete merge-readiness review");
     expect(calls.map((call) => call[0].maxTurns)).toEqual([45, 45]);
+  });
+
+  it.each([
+    { approved: true, severities: ["minor"], expected: true },
+    { approved: false, severities: ["minor"], expected: true },
+    { approved: false, severities: ["blocking"], expected: false },
+    { approved: true, severities: ["medium"], expected: false },
+    { approved: false, severities: ["minor", "blocking"], expected: false },
+    { approved: false, severities: [], expected: false },
+  ] as const)("gating reviewer approval respects severity: %j", async ({ approved, severities, expected }) => {
+    const invoke = vi.fn(async () => structuredReviewResult({
+      approved, findings: severities.map((severity) => ({ severity, body: "Finding " + severity })),
+    }));
+    const report = vi.fn(async (_event: unknown) => undefined);
+    const out = await runReview(makeCtx(invoke), {
+      prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [],
+      ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "code-review", gates: true }],
+      trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
+    }, { report });
+    expect(out.approved).toBe(expected);
+    if (expected) expect(invoke).toHaveBeenCalledTimes(1);
+    for (const severity of severities) {
+      expect(JSON.stringify(report.mock.calls)).toContain('"severity":"' + severity + '"');
+    }
   });
 
   it("feeds selected gating reviewer findings into one fix ledger in gap-analysis-first order", async () => {
@@ -4083,7 +4110,7 @@ describe("postPushReviewStep", () => {
     expect(approvedComment).not.toContain("Unresolved external review findings");
   });
 
-  it("withholds approval and initiates a fix pass when the review contract has only minor findings under changes_requested", async () => {
+  it("approves without a fix pass when changes_requested contains only minor findings", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "lgtm", score: 9, progress_delta: 0 };
     const ghComments: string[] = [];
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -4124,16 +4151,10 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(false);
-    expect(invoke).toHaveBeenCalledTimes(2);
-    const fixPrompt = invokePrompt(invoke, 1);
-    expect(fixPrompt).toContain("Required external review findings");
-    expect(fixPrompt).toContain("Consider extracting this to a helper function");
-    expect(fixPrompt).toContain("Rename variable for clarity");
-    const reviewComment = ghComments.find((c) => c.includes("Reviewer found issues"));
-    expect(reviewComment).toContain("Unresolved external review findings:");
-    expect(reviewComment).toContain("Consider extracting this to a helper function");
-    expect(ghComments.some((c) => c.includes("**Merge readiness:** Ready to merge."))).toBe(false);
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(ghComments.join("\n")).toContain("Consider extracting this to a helper function");
+
   });
 
   it("withholds approval and initiates a fix pass when the review contract has blocking findings", async () => {
@@ -7544,5 +7565,31 @@ describe("scratch index guard in fix passes", () => {
       expect(realGit(["rev-parse", "HEAD"]).stdout).toBe(before);
       expect(gitSpawn.mock.calls.some(([args]) => args[0] === "commit" || args[0] === "push")).toBe(false);
     }
+  });
+});
+
+
+describe("uniform minor ledger gate", () => {
+  for (const process of Object.values(REVIEW_PROCESSES)) {
+    for (const source of ["github-review", "github-review-thread", "ai-implement-internal", "review-contract", "claude-review-summary"] as const) {
+      it.each(["minor", "blocking", "medium"] as const)(process.id + "/" + source + " severity %s", (severity) => {
+        const reviewers = [{ id: "claude-review-summary", gates: true }, { id: "code-review", gates: true }];
+        expect(isReviewLedgerFindingGating(
+          { source, severity, reviewerId: "code-review", reviewerProvenance: "trusted" },
+          reviewers, process.summaryBlockingGates, "changes_requested",
+        )).toBe(severity !== "minor");
+      });
+    }
+  }
+
+  it.each(["blocking", "medium", "minor"] as const)("preserves branch and unselected reviewer authority for %s", (severity) => {
+    expect(isReviewLedgerFindingGating(
+      { source: "ai-implement-internal", severity, reviewerId: "code-review", reviewerProvenance: "branch" },
+      [{ id: "code-review", gates: true }],
+    )).toBe(false);
+    expect(isReviewLedgerFindingGating(
+      { source: "ai-implement-internal", severity, reviewerId: "code-review" },
+      [{ id: "code-review", gates: false }],
+    )).toBe(false);
   });
 });

@@ -187,6 +187,7 @@ interface ReviewIssue {
   problem: string;
   requiredFix: string;
   rawText?: string;
+  severity?: ReviewLedgerFinding["severity"];
 }
 
 interface PostPushReviewLedgerFinding extends ReviewLedgerFinding {
@@ -355,7 +356,7 @@ function reviewFindingToIssue(finding: PostPushReviewLedgerFinding): ReviewIssue
   const location = finding.path
     ? `${finding.path}${typeof finding.line === "number" ? `:${finding.line}` : ""}: `
     : "";
-  return issueFromString(`${location}${finding.body}`);
+  return { ...issueFromString(`${location}${finding.body}`), severity: finding.severity };
 }
 
 function formatReviewFindingsAsIssueList(findings: PostPushReviewLedgerFinding[]): string {
@@ -436,6 +437,7 @@ export function isReviewLedgerFindingGating(
   summaryBlockingGates = false,
   contractVerdict?: ReviewFindingsVerdict,
 ): boolean {
+  if (finding.severity === "minor") return false;
   if (summaryBlockingGates && finding.source === "claude-review-summary" && finding.severity === "blocking") return true;
   if (finding.source === "review-contract") return reviewContractFindingGates(finding, contractVerdict);
   return isReviewLedgerSourceGating(finding.source, reviewers, finding.reviewerId, finding.reviewerProvenance);
@@ -455,7 +457,8 @@ function isReviewLedgerSourceGating(
 function reviewIssueToLedgerFinding(issue: ReviewIssue): PostPushReviewLedgerFinding {
   return {
     source: "ai-implement-internal",
-    severity: "blocking",
+    // Legacy issues and synthetic CI failures have no emitted severity and remain blocking.
+    severity: issue.severity ?? "blocking",
     body: postPushIssueText(issue),
     issue,
   };
@@ -1908,7 +1911,9 @@ async function runSelectedInternalReviewers(params: {
     const reviewerFindings = legacy ? [] : verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding, provenance));
     findings.push(...reviewerFindings);
     if (selection.gates && provenance !== "branch") {
-      approved = approved && verdict.approved && (legacy ? verdict.findings.length === 0 : reviewerFindings.length === 0);
+      // A minor-only negative verdict is advisory; an empty negative verdict still fails closed.
+      approved = approved && (verdict.approved || verdict.findings.length > 0)
+        && !verdict.findings.some((finding) => finding.severity !== "minor");
     }
     feedbackParts.push(legacy && reviewerFeedback ? reviewerFeedback : reviewerEvidenceReport(label, verdict));
     if (!legacy) {
@@ -2339,9 +2344,6 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
       const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
       const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
-        // Codex P2/untagged comments are advisory even though other processes gate by source.
-        if (reviewProcess.id === "codex-code-review" && finding.severity === "minor"
-          && (finding.source === "github-review" || finding.source === "github-review-thread")) return false;
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
       };
       // Every publication branch exits this pass; no (head, iteration) is posted twice.
@@ -2368,9 +2370,14 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         externalReviewPending && verdict.approved === true && issues.length === 0 ? [] : reportedGatingExternalFindings;
       const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
+      const minorOnlyExternalFindings = externalFindings.length > 0
+        && externalFindings.every((finding) => finding.severity === "minor");
+      // Missing/incomplete verdicts remain independent safeguards. A completed negative
+      // verdict supported only by minor findings must not turn those findings into blockers.
       const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
-        && (externalFindingsResult.verdict === "changes_requested" || externalFindingsResult.verdict === "incomplete"))
-        || processVerdict?.verdict === "changes_requested";
+        && (externalFindingsResult.verdict === "incomplete"
+          || (externalFindingsResult.verdict === "changes_requested" && !minorOnlyExternalFindings)))
+        || (processVerdict?.verdict === "changes_requested" && !minorOnlyExternalFindings);
       console.log(
         `[post-push-review] Review ledger findings: gating=${gatingReviewFindings.length} advisory=${advisoryReviewFindings.length}`,
       );
