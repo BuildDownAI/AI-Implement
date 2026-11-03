@@ -197,15 +197,26 @@ export async function postBootNotice(
   try {
     const payload = describe(decision.kind, imageRef, decision.downtimeMs);
     if (payload.kgUnavailable && warmup) {
+      let recordedHealth = sidecarHealthFields().sidecar;
       const end = Date.now() + (warmup.deadlineMs ?? CANARY_DEADLINE_MS);
       while (Date.now() < end) {
         await new Promise(resolve => setTimeout(resolve, Math.min(warmup.retryMs ?? CANARY_RETRY_MS, end - Date.now())));
         const remaining = end - Date.now();
         if (remaining <= 0) break;
         const health = await warmup.probe(remaining);
+        recordedHealth = sidecarHealthFields().sidecar;
         payload.kgUnavailable = !!health.lastError;
         payload.sidecarError = health.lastError;
         if (!payload.kgUnavailable) break;
+      }
+      // A background or previously timed-out probe may finish during the final sleep.
+      // Only replace the injected probe result if the shared record changed afterward:
+      // injected probes need not update process-wide health.
+      const latest = sidecarHealthFields();
+      if (Object.keys(recordedHealth).some(key =>
+        latest.sidecar[key as keyof SidecarHealth] !== recordedHealth[key as keyof SidecarHealth])) {
+        payload.kgUnavailable = latest.kgUnavailable;
+        payload.sidecarError = latest.sidecar.lastError;
       }
     }
     let delivered!: (ok: boolean) => void;

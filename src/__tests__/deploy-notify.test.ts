@@ -561,6 +561,25 @@ describe("boot KG warm-up", () => {
     expect(notify.notifyKgRecovery).toHaveBeenCalledOnce();
   });
 
+  it("uses recovery recorded by another probe during the final retry sleep", async () => {
+    const probe = vi.fn(async () => health("warm-up failed"));
+    const posted = deployNotify.postBootNotice(config, { probe, retryMs: 5, deadlineMs: 16 });
+    await vi.advanceTimersByTimeAsync(15);
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+
+    Object.assign(kgProvider.sidecarHealth, health(null));
+    await vi.advanceTimersByTimeAsync(1);
+    await posted;
+
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: false, sidecarError: null });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
+    await deployNotify.postKgRecoveryNotice();
+    expect(notify.notifyKgRecovery).not.toHaveBeenCalled();
+  });
+
   it("does not arm recovery after failed or suppressed delivery", async () => {
     vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("delivery failed"));
     await deployNotify.postBootNotice(config, { probe: async () => health("failed"), deadlineMs: 0 });
