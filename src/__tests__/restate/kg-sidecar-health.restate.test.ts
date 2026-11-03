@@ -1,7 +1,8 @@
 // Real Restate coverage for the KgSidecarHealth object (AII-1527), on both variants.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
+import { testDb } from "../helpers/test-db.js";
 import type { SidecarHealth } from "../../kg-provider.js";
 import { createKgSidecarHealth } from "../../restate/kg-sidecar-health.js";
 import type { RestateEnvironment } from "./harness.js";
@@ -15,10 +16,11 @@ const health = (lastError: string | null, checkedAt: number): SidecarHealth => (
 });
 
 let nextProbe: () => Promise<SidecarHealth | null> = async () => null;
+let nextNotify: () => Promise<void> = async () => {};
 let envs: Map<string, RestateEnvironment>;
 
 beforeAll(async () => {
-  envs = await startVariants([createKgSidecarHealth({ probe: () => nextProbe() })]);
+  envs = await startVariants([createKgSidecarHealth({ probe: () => nextProbe(), notifyRecovery: () => nextNotify() })]);
 }, 60_000);
 
 afterAll(async () => {
@@ -29,6 +31,50 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
   const env = () => envs.get(label)!;
   const check = () => callObject<SidecarHealth | null>(env().baseUrl(), "KgSidecarHealth", "sidecar", "check", undefined);
 
+  it("journals recovery once after a warning and stays silent without one", async () => {
+    const { modules: { deploy, dedup, kg } } = await testDb({ modules: {
+      deploy: () => import("../../deploy-notify.js"),
+      dedup: () => import("../../dedup.js"),
+      kg: () => import("../../kg-provider.js"),
+    } });
+    const messages: string[] = [];
+    const realFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      if (url === "https://notice.example.test") {
+        const payload = JSON.parse(String(init?.body));
+        messages.push(payload.text ?? payload.blocks[0].text.text);
+        return new Response("ok");
+      }
+      return realFetch(url, init);
+    });
+    onTestFinished(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); nextNotify = async () => {}; });
+    nextNotify = () => deploy.postKgRecoveryNotice();
+    nextProbe = async () => health(null, 9000);
+    await check();
+    expect(messages).toEqual([]);
+    vi.stubEnv("FLY_IMAGE_REF", "new-image");
+    dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("deploy_last_image_ref", "old-image");
+    Object.assign(kg.sidecarHealth, health("timed out", 8000));
+    await deploy.postBootNotice({ notifyType: "slack", notifyWebhookUrl: "https://notice.example.test", kgSidecarUrl: null }, {
+      probe: async () => health("timed out", 8000), deadlineMs: 0,
+    });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("⚠️ KG sidecar not serving — timed out");
+    expect(deploy.hasKgRecoveryNotice()).toBe(true);
+    messages.length = 0;
+    // The idempotency key re-attaches to the same invocation, including on alwaysReplay.
+    const send = () => fetch(`${env().baseUrl()}/KgSidecarHealth/sidecar/check`, {
+      method: "POST", headers: { "idempotency-key": `recovery-${label}` },
+    });
+    expect((await send()).ok).toBe(true);
+    expect((await send()).ok).toBe(true);
+    await check();
+    expect(messages).toEqual(["✅ KG sidecar serving again"]);
+    const rows = await queryInvocations(env().adminAPIBaseUrl(), "target_service_name = 'KgSidecarHealth' AND target_handler_name = 'check'");
+    const entries = await Promise.all(rows.map(row => journalEntries(env().adminAPIBaseUrl(), String(row.id))));
+    expect(JSON.stringify(entries)).toContain("notify-recovery");
+  });
+
   it("returns the probe result and journals it", async () => {
     const result = health(null, 1000);
     nextProbe = async () => result;
@@ -38,8 +84,8 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
       (r) => r.length > 0,
       { label: "check invocation" },
     );
-    const entries = await journalEntries(env().adminAPIBaseUrl(), String(rows[rows.length - 1].id));
-    expect(journaledRunResult(entries, "probe")).toEqual(result);
+    const entries = await Promise.all(rows.map(row => journalEntries(env().adminAPIBaseUrl(), String(row.id))));
+    expect(entries.map(entry => journaledRunResult(entry, "probe"))).toContainEqual(result);
   });
 
   it("probes again on each check after a repeated failure", async () => {

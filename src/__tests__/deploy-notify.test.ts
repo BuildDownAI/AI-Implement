@@ -7,7 +7,7 @@ import { testDb } from "./helpers/test-db.js";
 
 // The formatters are covered by notify.test.ts; here we only care that the right
 // payload reaches them, so the whole notify module is replaced by a spy.
-vi.mock("../notify.js", () => ({ notifyDeploy: vi.fn() }));
+vi.mock("../notify.js", () => ({ notifyDeploy: vi.fn(), notifyKgRecovery: vi.fn() }));
 
 const IMAGE_A = "registry.fly.io/orch:deployment-AAA";
 const IMAGE_B = "registry.fly.io/orch:deployment-BBB";
@@ -520,5 +520,52 @@ describe("recordDeployOutcome / getDeployOutcome", () => {
       .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
       .run(DEPLOY_OUTCOME_KEY, "not-json{");
     expect(deployNotify.getDeployOutcome()).toBeNull();
+  });
+});
+
+
+describe("boot KG warm-up", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    kgProvider.sidecarHealth.lastError = "KG sidecar request timed out after 10000ms";
+    kgProvider.sidecarHealth.checkedAt = Date.now();
+  });
+  afterEach(() => vi.useRealTimers());
+  const health = (lastError: string | null) => ({ reachable: !lastError, toolsListed: !lastError, lastError, checkedAt: Date.now() });
+
+  it("waits for a passing re-probe and omits the warning", async () => {
+    const probe = vi.fn(async () => health(null));
+    const posted = deployNotify.postBootNotice(config, { probe, retryMs: 5, deadlineMs: 20 });
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5);
+    await posted;
+    expect(probe).toHaveBeenCalledOnce();
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: false, sidecarError: null });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
+  });
+
+  it("posts the last failure at the deadline, then recovers only once", async () => {
+    let calls = 0;
+    const probe = vi.fn(async () => health(`failure ${++calls}`));
+    const posted = deployNotify.postBootNotice(config, { probe, retryMs: 5, deadlineMs: 16 });
+    await vi.advanceTimersByTimeAsync(16);
+    await posted;
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: true, sidecarError: "failure 3" });
+    await deployNotify.postKgRecoveryNotice();
+    await deployNotify.postKgRecoveryNotice();
+    expect(notify.notifyKgRecovery).toHaveBeenCalledOnce();
+  });
+
+  it("does not arm recovery after failed or suppressed delivery", async () => {
+    vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("delivery failed"));
+    await deployNotify.postBootNotice(config, { probe: async () => health("failed"), deadlineMs: 0 });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
+    await deployNotify.postBootNotice({ ...config, notifyWebhookUrl: null });
+    expect(deployNotify.hasKgRecoveryNotice()).toBe(false);
   });
 });

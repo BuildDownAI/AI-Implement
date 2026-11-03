@@ -845,3 +845,8 @@ export async function notifyText(webhookUrl: string, message: string): Promise<v
     throw new Error(`Webhook notification failed: ${res.status} — ${body}`);
   }
 }
+
+/** A recovery pairs only with a successfully posted sidecar warning. */
+export async function notifyKgRecovery(webhookUrl: string): Promise<void> {
+  await notifyText(webhookUrl, "✅ KG sidecar serving again");
+}

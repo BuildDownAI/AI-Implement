@@ -1,5 +1,7 @@
 import { getDb } from "./dedup.js";
-import { notifyDeploy, type DeployNotification } from "./notify.js";
+import { notifyKgRecovery, notifyDeploy, type DeployNotification } from "./notify.js";
+import { CANARY_DEADLINE_MS, CANARY_RETRY_MS } from "./kg-refresh.js";
+import type { SidecarHealth } from "./kg-provider.js";
 import { sidecarHealthFields } from "./kg-provider.js";
 
 export interface BootStateInput {
@@ -144,8 +146,29 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
   }
 }
 
+// Process-local, like sidecar health. Keep delivery ordering when a poll recovers during the send.
+let recoveryNotice: { delivered: Promise<boolean>; send: () => Promise<void> } | null = null;
+
+export function hasKgRecoveryNotice(): boolean {
+  return recoveryNotice !== null;
+}
+
+export async function postKgRecoveryNotice(): Promise<void> {
+  const pending = recoveryNotice;
+  if (!pending || !await pending.delivered) return;
+  await pending.send();
+  if (recoveryNotice === pending) recoveryNotice = null;
+}
+
+export interface BootWarmup {
+  probe: (remainingMs: number) => Promise<SidecarHealth>;
+  retryMs?: number;
+  deadlineMs?: number;
+}
+
 export async function postBootNotice(
   config: DeployNotifyConfig,
+  warmup?: BootWarmup,
 ): Promise<void> {
   const imageRef = flyImageRef();
   if (!imageRef) return;
@@ -172,7 +195,33 @@ export async function postBootNotice(
 
   if (!decision || !config.notifyWebhookUrl) return;
   try {
-    await notifyDeploy(config.notifyType, config.notifyWebhookUrl, describe(decision.kind, imageRef, decision.downtimeMs));
+    const payload = describe(decision.kind, imageRef, decision.downtimeMs);
+    if (payload.kgUnavailable && warmup) {
+      const end = Date.now() + (warmup.deadlineMs ?? CANARY_DEADLINE_MS);
+      while (Date.now() < end) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(warmup.retryMs ?? CANARY_RETRY_MS, end - Date.now())));
+        const remaining = end - Date.now();
+        if (remaining <= 0) break;
+        const health = await warmup.probe(remaining);
+        payload.kgUnavailable = !!health.lastError;
+        payload.sidecarError = health.lastError;
+        if (!payload.kgUnavailable) break;
+      }
+    }
+    let delivered!: (ok: boolean) => void;
+    const pending = payload.kgUnavailable ? {
+      delivered: new Promise<boolean>(resolve => { delivered = resolve; }),
+      send: () => notifyKgRecovery(config.notifyWebhookUrl!),
+    } : null;
+    recoveryNotice = pending;
+    try {
+      await notifyDeploy(config.notifyType, config.notifyWebhookUrl, payload);
+      delivered?.(true);
+    } catch (err) {
+      delivered?.(false);
+      if (recoveryNotice === pending) recoveryNotice = null;
+      throw err;
+    }
   } catch (err) {
     console.error("[deploy-notify] boot notice failed:", err);
   }

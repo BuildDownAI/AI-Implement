@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as deployNotify from "../deploy-notify.js";
 import http from "node:http";
 import { SidecarMemoryProvider, setKgMemoryProvider, sidecarHealth } from "../kg-provider.js";
 import { checkKgSidecarHealth, probeKgSidecarIfUnavailable } from "../restate/kg-sidecar-health.js";
@@ -15,6 +16,13 @@ describe("checkKgSidecarHealth", () => {
     const [url, init] = (fetchImpl.mock.calls as unknown as Array<[string, RequestInit]>)[0];
     expect(url).toMatch(/\/KgSidecarHealth\/sidecar\/check\/send$/);
     expect(init.method).toBe("POST");
+  });
+
+  it("still schedules recovery when another probe cleared the health flag", async () => {
+    vi.spyOn(deployNotify, "hasKgRecoveryNotice").mockReturnValue(true);
+    const fetchImpl = ok();
+    await checkKgSidecarHealth({ deployHeld: () => false, restateReady: () => true, fetchImpl });
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 
   it("makes no call when the sidecar is available", async () => {
