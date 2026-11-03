@@ -4,26 +4,9 @@ How an orchestrator decides the effective value of each setting. `.env.example` 
 
 ## The orchestrator's setup checks
 
-The `orchestrator` group of setup checks (`ORCHESTRATOR_CONFIG_CHECKS`, `src/setup-checks/orchestrator-config.ts`) tests for each fault this page describes and names its fix. Each id below links to the section that explains the value it reads. A check only reads, and where the orchestrator decides something from a value with a function of its own (a parse, a precedence, which sign-in providers to keep), the check calls that function, so it reports what the orchestrator does rather than a second reading of the variable. `admin.allowlist` goes further than boot's warning: it also fails an empty list, which admits nobody. The decision to build them this way is [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md).
+The `orchestrator` group of setup checks (`ORCHESTRATOR_CONFIG_CHECKS`, `src/setup-checks/orchestrator-config.ts`) tests for each fault this page describes and names its fix. A check only reads, and where the orchestrator decides something from a value with a function of its own (a parse, a precedence, which sign-in providers to keep), the check calls that function, so it reports what the orchestrator does rather than a second reading of the variable. `admin.allowlist` goes further than boot's warning: it also fails an empty list, which admits nobody. The decision to build them this way is [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md).
 
-| Id | Reports |
-|---|---|
-| [`env.github-app`](#boot-checks-presence-not-validity) | The App pair unset, or a key that does not parse |
-| [`env.admin-access-code`](#what-boot-warns-about) | The refused `.env.example` placeholder |
-| [`env.runner-mode`](#environment-overrides) | An unrecognized `RUNNER_MODE`, ignored |
-| [`env.poll-interval`](#numeric-tuning-values) | A set `POLL_INTERVAL_MS` that is not a whole number of milliseconds from 1 to 2147483647 |
-| [`env.breaker-threshold`](#numeric-tuning-values) | A `DISPATCH_BREAKER_THRESHOLD` that turns the breaker off |
-| [`settings.seeded`](#settings-rows-seeded-from-the-environment) | A seed-once variable that differs from its row, has no row, or is refused |
-| [`settings.env-override`](#environment-overrides) | `RUNNER_MODE` or `FLY_PROCESS_LEVEL_SECRETS` overriding a different saved value |
-| [`settings.allowlist-env`](#the-sign-in-allowlist) | `OAUTH_ALLOWED_*` made inert by a saved list |
-| [`volume.database`](#the-database-path) | The `/tmp` fallback, or on Fly a database off the volume |
-| [`restate`](#boot) | The sidecar not ready, or the endpoint not registered; see [restate.md](restate.md) |
-| [`callback.config`](#what-boot-warns-about) | No callback URL, set or derived, or no `RUNNER_TOKEN_SECRET` |
-| [`runner.fly-sessions`](#the-summary-main-logs) | Projects whose path resolves to Fly Machines without the sessions token or app |
-| [`admin.path`](#what-boot-warns-about) | No usable access code and no sign-in provider |
-| [`admin.providers`](#what-boot-warns-about) | A sign-in provider that boot drops, with the reason |
-| [`admin.redirect-url`](#what-boot-warns-about) | A sign-in provider without `OAUTH_REDIRECT_BASE_URL` |
-| [`admin.allowlist`](#the-sign-in-allowlist) | SSO as the only admin path with no admin address in the list; with BuildDown configured it passes, naming the organization role claim |
+The group's checks are listed in [setup-checks.md § orchestrator](setup-checks.md#orchestrator), each linked to the section of this page that explains the value it reads, beside how to run the checks and read their output.
 
 ## Boot
 

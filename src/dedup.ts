@@ -30,6 +30,13 @@ export function getDatabasePath(): DatabasePath {
 }
 
 let db: Database.Database | null = null;
+let readOnly = false;
+
+/** Opens the database read-only from here on, with no migrations, and never creates it: for a command run beside the orchestrator. */
+export function useReadOnlyDb(): void {
+  if (db) throw new Error("useReadOnlyDb() must run before the database is opened");
+  readOnly = true;
+}
 
 function ensureDispatchedColumns(): void {
   if (!db) return;
@@ -333,6 +340,14 @@ function createAgentConfigurationTables(): void {
 }
 
 export function getDb(): Database.Database {
+  if (!db && readOnly) {
+    // A read-only open never creates the file, so a wrong path throws here instead of creating an empty database there.
+    try {
+      db = new Database(DB_PATH.path, { readonly: true });
+    } catch (err) {
+      throw new Error(`Cannot open the database at ${DB_PATH.path} read-only (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
   if (!db) {
     db = new Database(DB_PATH.path);
     db.pragma("journal_mode = WAL");
