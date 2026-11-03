@@ -19,7 +19,7 @@ export function deployFixture() {
       getMachine: vi.fn(async () => structuredClone(machine)),
       updateMachine: vi.fn(async (_token, _app, _id, next) => { machine.config = structuredClone(next); }),
     },
-    flyctl: vi.fn(async () => undefined),
+    flyctl: vi.fn(async record => { machine.config.image = record.target.image; }),
     kgToken: async () => "secret-kg",
     getInFlightWork: () => state.work ? [{}] : [],
     drainProbes: vi.fn(() => ({ oldDeploymentInvocations: async () => 0, unresolvedLaunches: async () => 0, unresolvedTerminations: async () => 0, activeOwners: async () => 0 })),
