@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
+  copyModelPrices,
   encodeRunConfig,
   decodeRunConfig,
   decodeTrustedRunConfig,
@@ -972,5 +974,54 @@ describe("private credentials namespace (AII-981)", () => {
     const decoded = JSON.parse(Buffer.from(encodeRunConfig(long), "base64").toString());
     expect(decoded.issue.description.length).toBeLessThan(200_000);
     expect(decoded).not.toHaveProperty("extra");
+  });
+});
+
+
+describe("public model prices envelope", () => {
+  const prices = JSON.parse(readFileSync(new URL("./fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+  it("projects only public prices in builders and encode/decode", () => {
+    const copy = { prices: prices.map((p: object) => ({ ...p, secret: "drop" })), fetchedAt: 123, lastError: "drop", credential: "drop" };
+    const input = { issue: full.issue, mapping: makeMapping(), baseBranch: "testing", retryPolicy: DEFAULT_RETRY_POLICY, modelPrices: copy };
+    for (const built of [buildImplRunConfig(input), buildRunConfig({ ...input, runnerPhase: "implementation" })]) {
+      expect(built.modelPrices).toEqual({ prices, fetchedAt: 123 });
+      expect(decodeRunConfig(encodeRunConfig({ ...built, modelPrices: copy })).modelPrices).toEqual({ prices, fetchedAt: 123 });
+      expect(diagnosticProjection({ ...built, modelPrices: copy }).modelPrices).toEqual({ prices, fetchedAt: 123 });
+    }
+  });
+  it("drops malformed optional prices when decoding raw envelopes", () => {
+    const valid = { prices, fetchedAt: 123 };
+    const malformed: unknown[] = [null, "invalid", [], {},
+      { ...valid, prices: "invalid" }, { ...valid, prices: {} },
+      { ...valid, prices: [null] }, { ...valid, prices: [42] },
+      ...[undefined, "123", -1, 1.5, {}, 8640000000000001, Number.MAX_SAFE_INTEGER].map(fetchedAt => ({ ...valid, fetchedAt })),
+      ...["model", "version", "effectiveFrom"].flatMap(field =>
+        [undefined, 42, {}].map(value => ({ ...valid, prices: [{ ...prices[0], [field]: value }] }))),
+      { ...valid, prices: [{ ...prices[0], effectiveFrom: "invalid" }] },
+      ...["inputUsd", "outputUsd", "cacheReadUsd", "cacheWriteUsd"].flatMap(field =>
+        [undefined, null, 1, {}, "", "-1", "1e-6", "NaN", "Infinity", "1.2.3", " 1", ".5", "1."].map(value =>
+          ({ ...valid, prices: [prices[0], { ...prices[1], [field]: value }] }))),
+    ];
+    for (const modelPrices of malformed) {
+      // Encode raw JSON: encodeRunConfig itself sanitizes and would hide decode regressions.
+      const encoded = Buffer.from(JSON.stringify({ ...full, modelPrices })).toString("base64");
+      const decoded = decodeRunConfig(encoded);
+      expect(decoded.issue).toEqual(full.issue);
+      expect(decoded).not.toHaveProperty("modelPrices");
+    }
+    for (const fetchedAt of [Infinity, NaN]) {
+      expect(copyModelPrices({ ...valid, fetchedAt })).toBeUndefined();
+    }
+    for (const fetchedAt of [null, 0, 123, 8640000000000000]) {
+      const encoded = Buffer.from(JSON.stringify({ ...full, modelPrices: { ...valid, fetchedAt } })).toString("base64");
+      expect(decodeRunConfig(encoded).modelPrices).toEqual({ ...valid, fetchedAt });
+    }
+  });
+  it("omits missing and empty copies", () => {
+    for (const modelPrices of [undefined, { prices: [], fetchedAt: null }]) {
+      const built = buildRunConfig({ issue: full.issue, mapping: makeMapping(), runnerPhase: "implementation", retryPolicy: null, modelPrices });
+      expect(built).not.toHaveProperty("modelPrices");
+      expect(decodeRunConfig(encodeRunConfig(built))).not.toHaveProperty("modelPrices");
+    }
   });
 });

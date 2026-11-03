@@ -1,3 +1,6 @@
+import { estimateCallCostUsd } from "./model-price-estimate.js";
+import { copyModelPrices, type RunModelPrices } from "./run-config.js";
+import type { RunTelemetry } from "./pipeline/types.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_RETRY_POLICY } from "./pipeline/retry-backoff.js";
@@ -6,6 +9,9 @@ import { providerUnavailablePhrase, type FailureRecord } from "./pipeline/failur
 
 /** One pass as the stats/autopsy tables see it. `attribution` is the sanitized implement-invocation attribution. */
 export interface StatsPass {
+  reviewTelemetry?: RunTelemetry;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
   iteration: number;
   implementTurns: number | null;
   implementOutcome: string;
@@ -24,44 +30,72 @@ export const STATS_TABLE_HEADER = "| Pass | Implement outcome | Turns / limit | 
 export const STATS_TABLE_DIVIDER = "|---|---|---|---|---|---|---|";
 
 interface CostCell {
+  estimatedUsd?: number;
+  estimated?: boolean;
   /** Sum of the components that were reported. */
   known: number;
   anyKnown: boolean;
   anyMissing: boolean;
 }
 
-function passCostParts(p: StatsPass): CostCell {
+function passCostParts(p: StatsPass, prices?: RunModelPrices): CostCell {
+  prices = copyModelPrices(prices);
   const usage = p.attribution?.usage;
-  const implement =
+  let implement =
     p.costUsd ?? (usage?.costStatus === "reported" ? usage.costUsd : null);
   // A null review cost only counts as a missing component when a review actually ran.
   const reviewRan = p.reviewApproved != null;
-  const review = p.reviewCostUsd ?? null;
+  let review = p.reviewCostUsd ?? null;
+  const known = (implement ?? 0) + (review ?? 0);
+  const anyKnown = implement != null || review != null;
+  let estimated = false;
+  if (prices) {
+    const estimate = (telemetry: Pick<RunTelemetry, "tokensIn" | "tokensOut" | "cacheReadTokens" | "cacheCreationTokens" | "attribution"> | undefined) => {
+      const attribution = telemetry?.attribution;
+      if (!attribution) return null;
+      return estimateCallCostUsd({ model: attribution.model, tokensIn: telemetry?.tokensIn ?? attribution.usage?.tokensIn ?? null,
+        tokensOut: telemetry?.tokensOut ?? attribution.usage?.tokensOut ?? null,
+        cacheReadTokens: telemetry?.cacheReadTokens, cacheCreationTokens: telemetry?.cacheCreationTokens }, prices.prices);
+    };
+    if (implement == null) {
+      implement = estimate({ ...p, tokensIn: p.tokensIn ?? null, tokensOut: p.tokensOut ?? null });
+      estimated ||= implement != null;
+    }
+    if (reviewRan && review == null) {
+      review = estimate(p.reviewTelemetry);
+      estimated ||= review != null;
+    }
+  }
   return {
-    known: (implement ?? 0) + (review ?? 0),
-    anyKnown: implement != null || review != null,
+    estimated,
+    known,
+    anyKnown,
+    estimatedUsd: (implement ?? 0) + (review ?? 0) - known,
     anyMissing: implement == null || (reviewRan && review == null),
   };
 }
 
 function formatCostCell(c: CostCell): string {
+  if (c.estimated && !c.anyMissing) return `~$${(c.known + (c.estimatedUsd ?? 0)).toFixed(2)} (estimated)`;
   if (!c.anyKnown) return "unavailable";
   return c.anyMissing ? `≥ $${c.known.toFixed(2)} (partial)` : `$${c.known.toFixed(2)}`;
 }
 
 /** Per-pass cost: implement + in-loop review (BAC-27201), never a missing cost rendered as $0.00. */
-export function formatPassCost(p: StatsPass): string {
-  return formatCostCell(passCostParts(p));
+export function formatPassCost(p: StatsPass, prices?: RunModelPrices): string {
+  return formatCostCell(passCostParts(p, prices));
 }
 
 /**
  * Run total across passes plus the out-of-table extra (retry attempts, post-push review).
  * `extraCostUnreported` counts extra components that ran without a reported cost.
  */
-export function formatTotalCost(passes: StatsPass[], extraCostUsd?: number | null, extraCostUnreported = 0): string {
+export function formatTotalCost(passes: StatsPass[], extraCostUsd?: number | null, extraCostUnreported = 0, prices?: RunModelPrices): string {
   const total: CostCell = { known: 0, anyKnown: false, anyMissing: extraCostUnreported > 0 };
   for (const p of passes) {
-    const c = passCostParts(p);
+    const c = passCostParts(p, prices);
+    total.estimated ||= c.estimated;
+    total.estimatedUsd = (total.estimatedUsd ?? 0) + (c.estimatedUsd ?? 0);
     total.known += c.known;
     total.anyKnown ||= c.anyKnown;
     total.anyMissing ||= c.anyMissing;
@@ -96,10 +130,10 @@ export function formatTokensCell(p: StatsPass): string {
   return `in ${tin ?? "unavailable"} / out ${tout ?? "unavailable"}`;
 }
 
-export function formatPassRow(p: StatsPass): string {
+export function formatPassRow(p: StatsPass, prices?: RunModelPrices): string {
   const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
   const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
-  return `| ${p.iteration} | ${outcome} | ${formatTurnsCell(p)} | ${p.attempts ?? 1} | ${formatPassCost(p)} | ${formatTokensCell(p)} | ${review} |`;
+  return `| ${p.iteration} | ${outcome} | ${formatTurnsCell(p)} | ${p.attempts ?? 1} | ${formatPassCost(p, prices)} | ${formatTokensCell(p)} | ${review} |`;
 }
 
 export interface RunAutopsy {
@@ -120,7 +154,7 @@ export interface RunAutopsy {
 export function formatRunAutopsy(a: RunAutopsy): string {
   const reviewerTurnsExhausted = a.terminationReason === "reviewer_turns_exhausted";
   const providerUnavailable = a.terminationReason === "provider_unavailable";
-  const passRows = a.passes.map(formatPassRow).join("\n");
+  const passRows = a.passes.map(p => formatPassRow(p)).join("\n");
   const { stageLabel, codeState } = providerUnavailablePhrase(a.failure?.stage, Boolean(a.prUrl));
   return [
     `## 🔎 Run autopsy — ${a.issueIdentifier}`,
@@ -167,6 +201,7 @@ export function writeRunAutopsy(workspaceDir: string, a: RunAutopsy): void {
 }
 
 export interface RunStats {
+  modelPrices?: RunModelPrices;
   issueIdentifier: string;
   passes: StatsPass[];
   plannedFiles: string[];
@@ -181,10 +216,11 @@ export interface RunStats {
 
 /** Markdown stats posted to the ticket for approved runs via the ai-output/comments plumbing. */
 export function formatRunStats(s: RunStats): string {
-  const passRows = s.passes.map(formatPassRow).join("\n");
+  s = { ...s, modelPrices: copyModelPrices(s.modelPrices) };
+  const passRows = s.passes.map(p => formatPassRow(p, s.modelPrices)).join("\n");
   // Pattern anchor: report-card.ts's derivedStatsForJob — extraCostUsd is the same addition it makes
   // on top of the per-pass sum (BAC-27201). A missing component yields a partial/unavailable label.
-  const totalCost = formatTotalCost(s.passes, s.extraCostUsd, s.extraCostUnreported);
+  const totalCost = formatTotalCost(s.passes, s.extraCostUsd, s.extraCostUnreported, s.modelPrices);
 
   const lines: string[] = [
     `## Run stats — ${s.issueIdentifier}`,
@@ -192,6 +228,8 @@ export function formatRunStats(s: RunStats): string {
     STATS_TABLE_HEADER,
     STATS_TABLE_DIVIDER,
     passRows,
+    ...(s.modelPrices && s.passes.some(p => formatPassCost(p, s.modelPrices).includes("(estimated)"))
+      ? ["", `Estimated with control-plane prices${s.modelPrices.fetchedAt === null ? "" : ` from ${new Date(s.modelPrices.fetchedAt).toISOString()}`}; not the charged cost.`] : []),
     "",
     `**Total cost:** ${totalCost}`,
   ];

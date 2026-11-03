@@ -396,3 +396,86 @@ describe("formatRunStats — truthful cost, turns and tokens (AII-113)", () => {
     expect(md).toContain("| n/a (native turn count unavailable) |");
   });
 });
+
+
+describe("control-plane estimates", () => {
+  const prices = JSON.parse(readFileSync(new URL("./fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+  const modelPrices = { prices, fetchedAt: 1793310000000 };
+  const pass: StatsPass = {
+    iteration: 1, implementTurns: null, implementOutcome: "success", costUsd: null, reviewApproved: null,
+    attribution: attr("codex", { model: "a-dated" }),
+    tokensIn: 1000000, tokensOut: 100000, cacheReadTokens: 200000, cacheCreationTokens: 100000,
+  };
+  const reviewTelemetry = {
+    outcome: "success" as const, numTurns: null, durationMs: null, costUsd: null,
+    attribution: attr("codex", { model: "z-seed" }),
+    tokensIn: 2000000, tokensOut: 200000, cacheReadTokens: 400000, cacheCreationTokens: 200000,
+  };
+  it("estimates missing implement cost with cache tokens using the recording", () => {
+    const md = stats([pass], { modelPrices });
+    // 700000 * input + 100000 * cache-write + 100000 * output = 2.736419752...
+    expect(md).toContain("~$2.74 (estimated)");
+    expect(md.match(/Estimated with control-plane prices/g)).toHaveLength(1);
+  });
+  it("formats the price timestamp as ISO 8601 UTC", () => {
+    const md = stats([pass], { modelPrices: { ...modelPrices, fetchedAt: 1793671094000 } });
+    expect(md.split("\n").filter(line => line.startsWith("Estimated with"))).toEqual([
+      "Estimated with control-plane prices from 2026-11-03T01:58:14.000Z; not the charged cost.",
+    ]);
+  });
+  it("omits the timestamp when the price fetch time is null", () => {
+    const md = stats([pass], { modelPrices: { ...modelPrices, fetchedAt: null } });
+    expect(md.split("\n").filter(line => line.startsWith("Estimated with"))).toEqual([
+      "Estimated with control-plane prices; not the charged cost.",
+    ]);
+  });
+  it("renders stats without throwing when the price timestamp exceeds the Date range", () => {
+    const render = () => stats([pass], { modelPrices: { ...modelPrices, fetchedAt: 8640000000000001 } });
+    expect(render).not.toThrow();
+    expect(render()).toBe(stats([pass]));
+  });
+  it("adds the review's own estimate to the reported implement cost", () => {
+    expect(stats([{ ...pass, costUsd: 7, reviewApproved: true, reviewTelemetry }], { modelPrices })).toContain("~$12.47 (estimated)");
+  });
+  it("preserves reported costs including zero and attribution costs", () => {
+    for (const cost of [0, 4.25]) {
+      const md = stats([{ ...pass, costUsd: cost }], { modelPrices });
+      expect(md).toContain(`**Total cost:** $${cost.toFixed(2)}`);
+      expect(md).not.toContain("estimated");
+    }
+    const md = stats([{ ...pass, attribution: attr("codex", { model: "a-dated", usage: { tokensIn: 1, tokensOut: 1, costUsd: 9, costStatus: "reported", availability: "complete" } }) }], { modelPrices });
+    expect(md).toContain("**Total cost:** $9.00");
+    expect(md).not.toContain("estimated");
+  });
+  it("retains partial/unavailable for unknown models, missing tokens and missing extras", () => {
+    expect(stats([{ ...pass, tokensOut: null }], { modelPrices })).toContain("**Total cost:** unavailable");
+    expect(stats([{ ...pass, attribution: attr("codex") }], { modelPrices })).toContain("**Total cost:** unavailable");
+    expect(stats([{ ...pass, costUsd: 7, reviewApproved: true }], { modelPrices })).toContain("**Total cost:** ≥ $7.00 (partial)");
+    expect(stats([{ ...pass, reviewApproved: true }], { modelPrices })).not.toContain("estimated");
+    expect(stats([pass], { modelPrices, extraCostUnreported: 1 })).toContain("**Total cost:** unavailable");
+  });
+  it("keeps the stats comment unchanged when optional prices are malformed", () => {
+    const malformed: unknown[] = [null, { prices: "invalid", fetchedAt: null },
+      { ...modelPrices, prices: [null] }, { ...modelPrices, fetchedAt: "invalid" },
+      ...["inputUsd", "outputUsd", "cacheReadUsd", "cacheWriteUsd"].flatMap(field =>
+        [null, 42, {}, "invalid", "1e-6", "-1"].map(value => ({
+          ...modelPrices, prices: [{ ...prices.find((p: { model: string }) => p.model === "a-dated"), [field]: value }],
+        }))),
+    ];
+    for (const value of malformed) {
+      const modelPrices = value as Parameters<typeof formatRunStats>[0]["modelPrices"];
+      for (const passes of [[pass], [{ ...pass, costUsd: 7, reviewApproved: true, reviewTelemetry }]]) {
+        expect(stats(passes, { modelPrices })).toBe(stats(passes));
+      }
+    }
+  });
+  it("preserves the complete legacy comment byte for byte without prices", () => {
+    expect(stats([pass])).toBe([
+      "## Run stats — AII-1", "",
+      "| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |",
+      "|---|---|---|---|---|---|---|",
+      "| 1 | success | n/a (native turn count unavailable) | 1 | unavailable | in 1000000 / out 100000 | not run |",
+      "", "**Total cost:** unavailable",
+    ].join("\n"));
+  });
+});

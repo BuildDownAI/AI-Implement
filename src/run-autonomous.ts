@@ -1,3 +1,4 @@
+import type { RunModelPrices } from "./run-config.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -436,6 +437,7 @@ function writeShellEnvFile(dest: string, before: Record<string, string | undefin
 }
 
 export interface ResolvedRunnerInputs {
+  modelPrices?: RunModelPrices;
   issueId: string;
   issueIdentifier: string;
   issueTitle: string;
@@ -697,6 +699,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     retryPolicy: normalizeRetryPolicy(cfg.retryPolicy),
     reviewFix: cfg.reviewFix,
     agentConfig: cfg.agentConfig,
+    modelPrices: cfg.modelPrices,
   };
 }
 
@@ -1231,6 +1234,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     retryPolicy,
     reviewFix,
     agentConfig,
+    modelPrices,
   } = resolveRunnerInputs(process.env);
   // An opted-in run is validated here, before the branch, planning fetch, hooks, clone or any model work.
   // Injection (opts.llmExecutor) never bypasses this; absent a snapshot the run is exactly the legacy one.
@@ -1518,6 +1522,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         ? null
         : (fbExtraCostUsd ?? 0) + (postPushReviewCostUsd ?? 0);
       writeRunStats(workspaceDir, {
+        modelPrices,
         issueIdentifier,
         passes: statPasses,
         plannedFiles: prUrl ? (planningBlock?.files ?? []) : [],
