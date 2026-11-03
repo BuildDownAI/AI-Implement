@@ -274,8 +274,8 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   return restate.object({ name: "SelfDeploy", handlers: {
     start: restate.handlers.object.exclusive({ input: serde.zod(startSchema) }, start),
     checkDrain: restate.handlers.object.exclusive({ ingressPrivate: true }, checkDrain),
-    // A built deploy can take twenty minutes per attempt.
-    // Leave room for three attempts and retry delays before the server aborts the effect.
+    // A built deploy makes one flyctl attempt with a twenty-minute deadline per effect.
+    // Retain the handler limits independently of that deadline and the published-path retries.
     apply: restate.handlers.object.exclusive({ ingressPrivate: true, inactivityTimeout: 65 * 60_000, abortTimeout: 70 * 60_000 }, apply),
     verify: restate.handlers.object.exclusive({ ingressPrivate: true, input: serde.zod(z.object({ attempt: z.number().int().min(1).max(5) }).strict()) }, verify),
     cancel: restate.handlers.object.exclusive({ input: serde.zod(z.object({ requestedBy: requester }).strict()) }, cancel),
