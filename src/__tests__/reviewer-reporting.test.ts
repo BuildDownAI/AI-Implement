@@ -3,6 +3,7 @@ import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { readFileSync } from "node:fs";
 import { BUILTIN_REVIEWER_VERDICT_SCHEMA, REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
 import { makeContext } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
 
 const checks = [{
@@ -19,9 +20,7 @@ const summary = "The requested animation change is implemented in the shared pul
 async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { strictReport?: boolean; outputSchema?: Record<string, unknown>; reviewUrl?: string; reviewFailure?: boolean } = {}) {
   const ghSpawn = vi.fn((args: string[]) => {
     if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-    if (args.includes("repos/:owner/:repo/pulls/42/reviews") && args.includes("POST")) {
-      return { stdout: JSON.stringify({ html_url: options.reviewUrl }), exitCode: options.reviewFailure ? 1 : 0 };
-    }
+    if (args.includes("POST") && args.some(arg => /\/reviews$/.test(arg))) throw new Error("Runner must not publish GitHub reviews");
     if (args.includes("repos/:owner/:repo/pulls/42")) {
       return { stdout: JSON.stringify({ state: "open", head: { sha: "head123" } }), exitCode: 0 };
     }
@@ -34,7 +33,11 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     stdout: "", exitCode: 0, tokensUsed: 100, structuredOutput: verdict,
     terminalStatus: { subtype: "success", isError: false },
   }));
-  const context = makeContext({}, { invoke });
+  const publication = fakeFetch({ "POST /runner/review-publication": {
+    status: options.reviewFailure ? 503 : 200,
+    json: { status: "posted", reviewUrl: options.reviewUrl },
+  } }).install();
+  const context = makeContext({ callbackUrl: "https://orchestrator.test", progressToken: "progress-token" }, { invoke });
   const report = vi.fn(async (_row: Record<string, any>) => {});
   const result = await postPushReviewStep.run(context, {
     prNumber: "42", workspaceDir: testDir("reviewer-reporting"), maxIterations, ghSpawn,
@@ -44,8 +47,7 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     reviewers: [{ id: "code-review", gates: true }],
     trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: options.outputSchema ?? { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
   }, { report });
-  const nativeBodies = ghSpawn.mock.calls.filter(([args]) => args.includes("event=COMMENT"))
-    .map(([args]) => args.find(arg => arg.startsWith("body=")) || "");
+  const nativeBodies = publication.calls.map(call => JSON.parse(call.body).body as string);
   const comments = ghSpawn.mock.calls.filter(([args]) => args[0] === "pr" && args[1] === "comment")
     .map(([args]) => args[args.indexOf("--body") + 1]);
   return { result, report, nativeBodies, comments };

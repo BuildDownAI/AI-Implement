@@ -89,6 +89,8 @@ export interface PipelineContextData {
   hooks?: { setup?: string; verify?: string; teardown?: string };
   /** Autonomous runner: callback URL for runner result/progress posts (from runnerCallbackUrl / RUNNER_CALLBACK_URL). */
   callbackUrl?: string;
+  /** Bearer credential for authenticated runner callbacks. */
+  progressToken?: string;
   /** Autonomous runner: per-project dependency-repo read access scope (from run_config envelope). */
   dependencyTokenScope?: "installation";
   /** Autonomous runner: reference repositories to clone read-only into the workspace (from run_config envelope). */

@@ -657,3 +657,31 @@ before writing the copies, and record the commit and hashes in `contracts.lock.j
 Never edit the copied files. The contract test checks all four hashes and validates
 recorded successful bodies against both the producer schema and the consumer
 validator. Both Restate harness variants replay the producer exchanges.
+
+## PostPushReviewPublication
+
+`PostPushReviewPublication` is a virtual object keyed by `<owner>/<repo>#<prNumber>`.
+Its exclusive `publish` handler accepts the pushed head SHA, post-push review pass
+`iteration`, body, and inline comments. The shared `get({ headSha, iteration })`
+returns the saved result or `null`. State keys are `<headSha>:<iteration>`; results
+contain review ID/URL, inline comment IDs and locations, and `inlineFallback`, or
+`stale-head`.
+The runner’s `submitPrReview` in `src/pipeline/steps/post-push-review.ts` calls `POST <callbackUrl>/runner/review-publication`; see [In-run: the post-push-review step](review-fix-rail.md#in-run-the-post-push-review-step).
+
+Inputs are limited to 48,000 UTF-8 JSON bytes and 100 inline comments. This leaves
+room under GitHub's review body limit for fallback formatting and markers. Invalid
+inputs and mismatched object keys fail terminally before GitHub is called.
+
+One `publish-review` step obtains an installation token, checks the current PR
+head, searches paginated reviews for the head/pass marker, and posts a COMMENT
+review pinned to that head if absent. Position validation failures (422) cause
+one submission without inline comments, with their text appended to the body.
+The native review body prefix is preserved and the publication marker is last.
+A separate fallback marker allows retries to recover `inlineFallback`; paginated
+review comments recover comment IDs even after a crash following publication.
+The step retries up to five times, reconciling before each submission.
+
+The token exists only inside that step: it is never returned, stored in object
+state, passed to another handler, or included in errors. Dependency exceptions
+are replaced with a fixed message before reaching Restate's journal. Only plain
+publication results cross the step boundary.

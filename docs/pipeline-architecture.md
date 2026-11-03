@@ -12,6 +12,8 @@ The practical consequence: by the time any pipeline code runs, the target repo i
 
 ## The step contract
 
+`src/pipeline/review-inline-comments.ts` provides pure helpers for preparing reviewer findings for inline publication. `buildInlineReviewComments(findings, diff)` maps added and context lines on the new side of unified-diff hunks, using destination paths for renames, and returns other findings in `unmapped` for the caller's summary. It preserves finding order and duplicates. `inlineCommentBody` uses our severity badge, a bold first-sentence title (first line when there is no sentence-ending punctuation), the remaining text, and the final `<!-- ai-implement review-finding:v1 -->` marker. These helpers perform no publication; caller wiring is separate.
+
 A step is any module with a `run` method, defined in `src/pipeline/types.ts`:
 
 ```typescript
