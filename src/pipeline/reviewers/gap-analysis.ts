@@ -27,7 +27,9 @@ unless the review context includes that exact evidence. Do not put tool XML, a
 serialized checklist, or checks content in summary; checks must be top-level
 JSON array items.
 
-Issue description and acceptance criteria:
+${input.groupingParent === true ? `This is a grouping parent's closing-work run. The child issues delivered their own requirements into the base branch. Grade only the requirements that the parent keeps for itself, including when the issue description or acceptance bar also lists child requirements. Do not report a child requirement as missing solely because it is absent from this diff. Record child-owned requirements as delegated to the children, using result="not_applicable" in checks[] where available; do not claim their implementation or execution was independently verified. Missing parent-owned work remains a finding.
+
+` : ""}Issue description and acceptance criteria:
 ${input.issueDescription}
 
 Previous gap-analysis findings:

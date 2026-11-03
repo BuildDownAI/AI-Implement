@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   BUILTIN_REVIEWER_VERDICT_SCHEMA,
@@ -70,6 +71,23 @@ describe("built-in reviewers", () => {
 
     expect(gap?.maxTurns).toBeUndefined();
     expect(code?.maxTurns).toBeUndefined();
+  });
+
+  it("scopes grouping parent review to its own closing work", async () => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = gap!.buildPrompt({ ...input, groupingParent: true });
+    expect(prompt).toContain("The child issues delivered their own requirements into the base branch");
+    expect(prompt).toContain("Grade only the requirements that the parent keeps for itself");
+    expect(prompt).toContain("Do not report a child requirement as missing solely because it is absent from this diff");
+    expect(prompt).toContain('result="not_applicable"');
+    expect(prompt).toContain("Missing parent-owned work remains a finding");
+  });
+
+  it.each([undefined, false])("preserves the ordinary gap prompt (groupingParent: %s)", async groupingParent => {
+    const gap = await resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false });
+    const prompt = gap!.buildPrompt({ ...input, groupingParent });
+    // SHA-256 of the pre-change prompt for this fixture.
+    expect(createHash("sha256").update(prompt).digest("hex")).toBe("58ebc67b5390c314d31f3bec5f57c2fcdabe15f924635602898f1b21ededd1ac");
   });
 
   it("gap-analysis prompt is scoped to acceptance-criteria coverage", async () => {
