@@ -16,7 +16,7 @@ import { COMMIT, deployFixture as baseDeployFixture } from "./self-deploy-fixtur
 
 function deployFixture() {
   const fixture = baseDeployFixture();
-  return { ...fixture, deps: { ...fixture.deps, imageVisible: vi.fn(async () => true),
+  return { ...fixture, deps: { ...fixture.deps, imageVisible: vi.fn(async (): Promise<"visible" | "missing" | { unauthorized: 401 | 403 }> => "visible"),
     limits: { ...fixture.deps.limits, imagePollMs: 1, imageWaitMs: 40, manifestRetryMs: 1 } } };
 }
 
@@ -293,7 +293,7 @@ describe("SelfDeploy durable phase machine", () => {
   });
   it.each(VARIANTS)("waits for built image visibility before updating (%s)", async label => {
     f = deployFixture(); f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
-    f.deps.imageVisible.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    f.deps.imageVisible.mockResolvedValueOnce("missing").mockResolvedValueOnce("missing");
     const update = f.deps.fly.updateMachine;
     f.deps.fly.updateMachine = vi.fn(async (token, app, id, config) => {
       expect(f.deps.imageVisible).toHaveBeenCalledTimes(3);
@@ -304,9 +304,27 @@ describe("SelfDeploy durable phase machine", () => {
     expect(f.deps.flyctl).toHaveBeenCalledOnce();
     await terminal(envs.get(label)!, f, "succeeded");
   });
+  it.each(VARIANTS)("updates when registry visibility is unauthorized (%s)", async label => {
+    const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const status of [401, 403] as const) {
+        f = deployFixture(); f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
+        f.deps.imageVisible.mockResolvedValue({ unauthorized: status });
+        const result = await start(envs.get(label)!);
+        await phase(envs.get(label)!, "verifying");
+        expect(f.deps.imageVisible).toHaveBeenCalledOnce();
+        expect(f.deps.fly.updateMachine).toHaveBeenCalledOnce();
+        expect(f.deps.flyctl).toHaveBeenCalledOnce();
+        expect(warnings.mock.calls.flat().filter(line => String(line).includes(
+          `[self-deploy] ${"deployId" in result ? result.deployId : ""} image visibility check unauthorized HTTP ${status}`,
+        ))).toHaveLength(1);
+        await terminal(envs.get(label)!, f, "succeeded");
+      }
+    } finally { warnings.mockRestore(); }
+  });
   it.each(VARIANTS)("fails fixed when built image never appears (%s)", async label => {
     f = deployFixture(); f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
-    f.deps.imageVisible.mockResolvedValue(false);
+    f.deps.imageVisible.mockResolvedValue("missing");
     await start(envs.get(label)!); await terminal(envs.get(label)!, f, "failed", "apply-failed");
     expect(f.deps.onOutcome).toHaveBeenCalledWith(expect.anything(), expect.stringContaining("wait for image"));
     expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
@@ -707,15 +725,25 @@ describe("SelfDeploy durable phase machine", () => {
 });
 
 describe("Fly manifest visibility request", () => {
-  it("uses deploy-token Basic auth and requires HTTP 200", async () => {
+  it("rejects registry errors other than missing or unauthorized", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
     try {
-      for (const status of [200, 201, 404, 401]) {
+      for (const status of [201, 400, 429, 500]) {
         fetchMock.mockResolvedValueOnce(new Response(null, { status }));
-        expect(await flyImageVisible("registry.fly.io/test-app:deploy-abcdef0", "deploy-token", new AbortController().signal)).toBe(status === 200);
+        await expect(flyImageVisible("registry.fly.io/test-app:deploy-abcdef0", "deploy-token", new AbortController().signal))
+          .rejects.toMatchObject({ status });
+      }
+    } finally { fetchMock.mockRestore(); }
+  });
+  it("uses deploy-token Basic auth, accepts indexes, and classifies registry responses", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    try {
+      for (const status of [200, 404, 401, 403]) {
+        fetchMock.mockResolvedValueOnce(new Response(null, { status }));
+        expect(await flyImageVisible("registry.fly.io/test-app:deploy-abcdef0", "deploy-token", new AbortController().signal)).toEqual(status === 200 ? "visible" : status === 404 ? "missing" : { unauthorized: status });
         expect(fetchMock).toHaveBeenLastCalledWith("https://registry.fly.io/v2/test-app/manifests/deploy-abcdef0", {
           headers: {
-            Accept: "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json",
+            Accept: "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
             Authorization: `Basic ${Buffer.from("fly:deploy-token").toString("base64")}`,
           }, signal: expect.any(AbortSignal),
         });

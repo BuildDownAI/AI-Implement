@@ -33,6 +33,7 @@ export interface SelfDeployConfig {
   imageApp?: string;
   kgSourceRepo?: string | null;
 }
+export type ImageVisibility = "visible" | "missing" | { unauthorized: 401 | 403 };
 export interface SelfDeployDeps {
   /** Read credentials only inside effects; this value is never returned to the journal. */
   config(): SelfDeployConfig;
@@ -40,7 +41,7 @@ export interface SelfDeployDeps {
   head(target: { owner: string; repo: string }, branch: "testing" | "main"): Promise<string | null>;
   /** Publication marker read inside the target lookup effect. */
   imagePublished(target: { owner: string; repo: string }, commit: string): Promise<boolean>;
-  imageVisible?(image: string, token: string, signal: AbortSignal): Promise<boolean>;
+  imageVisible?(image: string, token: string, signal: AbortSignal): Promise<ImageVisibility>;
   fly: {
     listMachines(token: string, app: string): Promise<Machine[]>;
     getMachine(token: string, app: string, id: string): Promise<Machine>;
@@ -203,9 +204,15 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
                   (async () => {
                     while (!controller.signal.aborted) {
                       try {
-                        if (await (deps.imageVisible ?? flyImageVisible)(record.target.image, token, controller.signal)) return;
-                      } catch {
-                        // Registry/transport failures remain bounded by the visibility deadline.
+                        const visibility = await (deps.imageVisible ?? flyImageVisible)(record.target.image, token, controller.signal);
+                        if (visibility === "visible") return;
+                        if (typeof visibility === "object") {
+                          ctx.console.warn(`[self-deploy] ${record.deployId} image visibility check unauthorized HTTP ${visibility.unauthorized}`);
+                          return;
+                        }
+                      } catch (error) {
+                        if ((error as { status?: number } | null)?.status !== undefined) throw error;
+                        // Transport failures remain bounded by the visibility deadline.
                       }
                       if (!controller.signal.aborted) await new Promise(resolve => setTimeout(resolve, limits.imagePollMs));
                     }
@@ -353,16 +360,19 @@ export function createSelfDeployIngressClient(key: () => string = () => process.
 }
 
 /** Fly registry accepts the deploy token as the Basic auth password. */
-export async function flyImageVisible(image: string, token: string, signal: AbortSignal): Promise<boolean> {
+export async function flyImageVisible(image: string, token: string, signal: AbortSignal): Promise<ImageVisibility> {
   const match = /^registry\.fly\.io\/([^:]+):([^:]+)$/.exec(image);
   if (!match) throw new Error("Invalid Fly image reference");
   const response = await fetch(`https://registry.fly.io/v2/${match[1]}/manifests/${match[2]}`, {
     headers: {
-      Accept: "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json",
+      Accept: "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
       Authorization: `Basic ${Buffer.from(`fly:${token}`).toString("base64")}`,
     },
     signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
   });
   await response.body?.cancel();
-  return response.status === 200;
+  if (response.status === 200) return "visible";
+  if (response.status === 401 || response.status === 403) return { unauthorized: response.status };
+  if (response.status === 404) return "missing";
+  throw Object.assign(new Error(`Image visibility check HTTP ${response.status}`), { status: response.status });
 }
