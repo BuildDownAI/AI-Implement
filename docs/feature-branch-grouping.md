@@ -127,7 +127,7 @@ value ([AII-609](https://linear.app/eudoxus/issue/AII-609)).
   base branch.
 
 Linear refuses to dispatch a designated child when its repository mapping differs
-from the base-most contiguous labelled ancestor's mapping, or either mapping is
+from any contiguous labelled ancestor's mapping, or any of these mappings is
 missing. Each refusal logs both issue identifiers and team-to-repository mappings.
 Different teams may share the same owner/repository. This fence applies to planning
 and implementation; it does not repair branches already orphaned by a cross-repository

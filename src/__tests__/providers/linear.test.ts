@@ -213,6 +213,49 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     },
   );
 
+  it.each([
+    { planned: false, intermediate: "different" },
+    { planned: true, intermediate: "different" },
+    { planned: false, intermediate: "missing" },
+    { planned: true, intermediate: "missing" },
+    { planned: false, intermediate: "shared" },
+    { planned: true, intermediate: "shared" },
+  ])("checks intermediate ancestor mappings before dispatch (%j)", async ({ planned, intermediate }) => {
+    vi.mocked(mappingConfig.getMappings).mockReturnValue({
+      ENG: makeMapping(),
+      ...(intermediate === "missing" ? {} : {
+        OOL: makeMapping({ repo: intermediate === "different" ? "other-repo" : "test-repo" }),
+      }),
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    singlePage([issueNode({
+      identifier: "ENG-3",
+      labels: planned ? ["AI-Implement", "Plan-Complete"] : ["AI-Implement"],
+      parent: { identifier: "OOL-2", labels: ["AI-Implement"],
+        parent: { identifier: "ENG-1", labels: ["AI-Implement"] } },
+    })]);
+    const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+    if (intermediate === "shared") {
+      const queue = planned ? snap.readyForImplementation : snap.needsPlanning;
+      expect(queue.map((issue) => issue.identifier)).toEqual(["ENG-3"]);
+      expect(queue[0].featureBranchChain).toEqual([
+        { identifier: "ENG-1", mode: "feature" },
+        { identifier: "OOL-2", mode: "feature" },
+      ]);
+      expect(log).not.toHaveBeenCalled();
+    } else {
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+      expect(log).toHaveBeenCalledTimes(1);
+      const line = log.mock.calls[0][0];
+      for (const value of ["ENG-3", "OOL-2", "ENG", "OOL", "test-org/test-repo",
+        intermediate === "missing" ? "unmapped" : "test-org/other-repo"]) {
+        expect(line).toContain(value);
+      }
+    }
+    expect(snap.parentsToFinalize).toEqual([]);
+  });
+
   it("buckets issues by Plan-Complete label", async () => {
     singlePage([
       issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "Plan-Complete"] }),

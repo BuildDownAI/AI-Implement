@@ -375,9 +375,9 @@ export class LinearProvider implements TicketingProvider {
       const children = issue.children?.nodes ?? [];
       const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
       const ancestors = labeledAncestorChain(issue.parent);
-      if (!hasCompatibleFeatureMapping(
-        { identifier: issue.identifier, scopeKey: issue.team.key }, ancestors[0], ancestors.length > 0 ? (mappings ??= getMappings()) : {},
-      )) continue;
+      if (ancestors.some((ancestor) => !hasCompatibleFeatureMapping(
+        { identifier: issue.identifier, scopeKey: issue.team.key }, ancestor, mappings ??= getMappings(),
+      ))) continue;
       const ancestorChain = ancestors.map(({ identifier, mode }) => ({ identifier, mode }));
       const parsed = parseIssueConfig(issue.description, issue.identifier);
       const mode = parsed.config.featureBranch.mode;

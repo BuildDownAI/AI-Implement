@@ -48,24 +48,24 @@ export function nonTerminalDesignatedChildren(children: FeatureChildState[]): Fe
   return children.filter((c) => c.designated && !c.terminal);
 }
 
-/** Refuse grouped dispatch when its base-most ancestor will roll up in another repo.
+/** Refuse grouped dispatch when a grouping ancestor will roll up in another repo.
  * Missing mappings also fail closed; an ungrouped issue needs no such lookup. */
 export function hasCompatibleFeatureMapping(
   child: { identifier: string; scopeKey: string },
-  root: { identifier: string; scopeKey: string } | undefined,
+  ancestor: { identifier: string; scopeKey: string } | undefined,
   mappings: Record<string, RepoMapping>,
 ): boolean {
-  if (!root) return true;
+  if (!ancestor) return true;
   const childMapping = mappings[child.scopeKey];
-  const rootMapping = mappings[root.scopeKey];
-  if (childMapping && rootMapping &&
-      childMapping.owner === rootMapping.owner && childMapping.repo === rootMapping.repo) return true;
+  const ancestorMapping = mappings[ancestor.scopeKey];
+  if (childMapping && ancestorMapping &&
+      childMapping.owner === ancestorMapping.owner && childMapping.repo === ancestorMapping.repo) return true;
 
   const describe = (scopeKey: string, mapping: RepoMapping | undefined) =>
     `${scopeKey} → ${mapping ? `${mapping.owner}/${mapping.repo}` : "unmapped"}`;
   console.log(
     `[linear] Refusing to dispatch ${child.identifier} (${describe(child.scopeKey, childMapping)}): ` +
-    `grouping root ${root.identifier} (${describe(root.scopeKey, rootMapping)}) has a different or missing repository mapping`,
+    `grouping ancestor ${ancestor.identifier} (${describe(ancestor.scopeKey, ancestorMapping)}) has a different or missing repository mapping`,
   );
   return false;
 }
