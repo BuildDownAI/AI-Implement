@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   findOpenRollUpPr,
+  hasCompatibleFeatureMapping,
   nonTerminalDesignatedChildren,
   resolveBaseBranch,
   resolvePlanningBranch,
@@ -180,5 +181,39 @@ describe("findOpenRollUpPr (parent no-work churn guard)", () => {
     // empty chain
     const bare = makeIssue({ featureBranchChain: [] });
     expect(await findOpenRollUpPr({ ghToken: "t", issue: bare, mapping, finder: leafFinder })).toBeNull();
+  });
+});
+
+describe("hasCompatibleFeatureMapping", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const child = { identifier: "B-2", scopeKey: "B" };
+  const root = { identifier: "A-1", scopeKey: "A" };
+
+  it.each([{ owner: "other-org" }, { repo: "other-repo" }])("refuses differing mapping %j with one actionable log", (difference) => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const childMapping = makeMapping(difference);
+    expect(hasCompatibleFeatureMapping(child, root, { A: mapping, B: childMapping })).toBe(false);
+    expect(log).toHaveBeenCalledTimes(1);
+    const line = log.mock.calls[0][0];
+    for (const value of ["B-2", "A-1", "A", "B", "test-org/test-repo", `${childMapping.owner}/${childMapping.repo}`]) {
+      expect(line).toContain(value);
+    }
+  });
+
+  it("allows distinct teams mapped to the same repository", () => {
+    expect(hasCompatibleFeatureMapping(child, root, { A: mapping, B: makeMapping() })).toBe(true);
+  });
+
+  it("leaves ungrouped issues unaffected even without mappings", () => {
+    expect(hasCompatibleFeatureMapping(child, undefined, {})).toBe(true);
+  });
+
+  it.each(["A", "B"])("fails closed when mapping %s is missing", (missing) => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const mappings = { A: mapping, B: mapping };
+    delete mappings[missing as keyof typeof mappings];
+    expect(hasCompatibleFeatureMapping(child, root, mappings)).toBe(false);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls[0][0]).toContain("unmapped");
   });
 });

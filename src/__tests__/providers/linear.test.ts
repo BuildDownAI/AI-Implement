@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import * as mappingConfig from "../../config.js";
 import { LinearProvider } from "../../providers/linear.js";
 import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import {
@@ -131,6 +132,10 @@ describe("LinearProvider.fetchLifecycleStates", () => {
 });
 
 describe("LinearProvider.fetchAIImplementSnapshot", () => {
+  afterEach(() => vi.restoreAllMocks());
+  beforeEach(() => {
+    vi.spyOn(mappingConfig, "getMappings").mockReturnValue({ ENG: makeMapping(), OOL: makeMapping() });
+  });
   type Ancestor = { identifier: string; description?: string | null; labels?: string[]; parent?: Ancestor | null };
   type Child = { labels?: string[]; stateType?: string };
 
@@ -141,7 +146,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   }
   function ancestorNode(a: Ancestor | null | undefined): unknown {
     if (!a) return null;
-    return { identifier: a.identifier, description: a.description ?? null, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
+    return { identifier: a.identifier, team: { key: a.identifier.split("-")[0] }, description: a.description ?? null, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
   }
 
   // One issue as the snapshot query returns it. Linear derives an identifier from its team's key,
@@ -187,6 +192,26 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   function singlePage(nodes: ReturnType<typeof issueNode>[]) {
     return linear(data({ issues: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } }));
   }
+
+  it.each([{ labels: ["AI-Implement"] }, { labels: ["AI-Implement", "Plan-Complete"] }])(
+    "refuses cross-mapping nested children before either dispatch queue (%j)",
+    async ({ labels }) => {
+      vi.mocked(mappingConfig.getMappings).mockReturnValue({ ENG: makeMapping({ repo: "other-repo" }), OOL: makeMapping() });
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      singlePage([issueNode({
+        identifier: "ENG-3", labels,
+        parent: { identifier: "ENG-2", labels: ["AI-Implement"],
+          parent: { identifier: "OOL-1", labels: ["AI-Implement"] } },
+      })]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+      expect(snap.parentsToFinalize).toEqual([]);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0]).toContain("OOL-1");
+      expect(log.mock.calls[0][0]).toContain("ENG-3");
+    },
+  );
 
   it("buckets issues by Plan-Complete label", async () => {
     singlePage([
