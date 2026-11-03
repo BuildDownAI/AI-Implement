@@ -5,7 +5,7 @@ import { fakeFetch, type Reply, type Routes, type FakeFetch } from "../helpers/f
 import { createModelPrices, MODEL_PRICES_REFRESH_INTERVAL_MS, type ModelPricesCurrent } from "../../restate/model-prices.js";
 import {
   VARIANTS, callObject, eventually, gate, attachInvocation, journalEntries, journalText,
-  queryInvocations, cancelInvocation, cancelInvocationIfLive, setObjectState, startVariants, stopAll, type RestateEnvironment,
+  queryInvocations, cancelInvocationIfLive, setObjectState, startVariants, stopAll, type RestateEnvironment,
 } from "./harness.js";
 
 const recordings = Object.fromEntries(["several-models", "empty", "unavailable"].map(name => [
@@ -154,7 +154,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
           issuers.set(key, undefined);
           for (const row of await invocations(key)) {
             if (row.status !== "completed" && row.status !== "cancelled") {
-              await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+              await cancelInvocationIfLive(env().adminAPIBaseUrl(), String(row.id));
             }
           }
         }
