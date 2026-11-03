@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import * as restate from "@restatedev/restate-sdk";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { fakeFetch, type Reply, type FakeFetch } from "../helpers/fake-fetch.js";
+import { fakeFetch, type Reply, type Routes, type FakeFetch } from "../helpers/fake-fetch.js";
 import { createModelPrices, MODEL_PRICES_REFRESH_INTERVAL_MS, type ModelPricesCurrent } from "../../restate/model-prices.js";
 import {
   VARIANTS, callObject, eventually, journalEntries, journalText,
@@ -23,30 +24,56 @@ describe("ModelPrices configuration and failure scheduling", () => {
   let endpoint: FakeFetch;
   let reply: Reply;
   let interval: number | undefined;
-  let requestOptions: Array<RequestInit | undefined>;
+  let requestOptions: Map<string, RequestInit | undefined>;
+  const routes: Routes = {};
+  const configurations = new Map<string, { issuer: string | undefined; interval: number | undefined }>();
+  const callsFor = (key: string) => endpoint.calls.filter(call => call.url.pathname === `/${key}/api/model-prices`);
   const SENTINEL = "PRIVATE-NETWORK-ERROR-SENTINEL";
   beforeEach(() => {
-    requestOptions = [];
+    requestOptions = new Map();
     interval = undefined;
     reply = () => { throw new Error(SENTINEL); };
-    endpoint = fakeFetch({ "GET /api/model-prices": call => typeof reply === "function" ? reply(call) : reply });
+    endpoint = fakeFetch(routes);
   });
   beforeAll(async () => {
-    environments = await startVariants([createModelPrices({
-      issuer: () => issuer,
-      get refreshIntervalMs() { return interval; },
-      fetch: async (_url, init) => {
-        requestOptions.push(init);
-        return endpoint.fetch(_url, init);
-      },
-    })]);
+    // Resolve configuration from the invocation's key, even when an old timer runs
+    // after beforeEach has installed the next test's fake endpoint.
+    const modelFor = (key: string) => {
+      const model = createModelPrices({
+        issuer: () => {
+          const value = configurations.get(key)?.issuer;
+          return value === "https://auth.example" ? `${value}/${key}` : value;
+        },
+        get refreshIntervalMs() { return configurations.get(key)?.interval; },
+        fetch: async (url, init) => {
+          requestOptions.set(String(url), init);
+          return endpoint.fetch(url, init);
+        },
+      });
+      // The SDK runtime exposes handlers on `object`; its definition type only
+      // carries the service name. Keep the cast local to this fixture adapter.
+      return (model as typeof model & { object: restate.VirtualObject<typeof model> }).object;
+    };
+    type RefreshInput = Parameters<ReturnType<typeof modelFor>["refresh"]>[1];
+    environments = await startVariants([restate.object({ name: "ModelPrices", handlers: {
+      refresh: restate.handlers.object.exclusive(async (ctx: restate.ObjectContext, input: RefreshInput) =>
+        modelFor(ctx.key).refresh(ctx, input)),
+      current: restate.handlers.object.shared(async (ctx: restate.ObjectSharedContext) =>
+        modelFor(ctx.key).current(ctx)),
+    } })]);
   }, 60_000);
   afterAll(async () => { await stopAll(environments); });
 
   for (const [variant] of VARIANTS) {
     describe(variant, () => {
       const env = () => environments.get(variant)!;
-      const refresh = (key: string, body: unknown) => callObject<number | null>(env().baseUrl(), "ModelPrices", key, "refresh", body);
+      const refresh = (key: string, body: unknown) => {
+        if (!configurations.has(key)) {
+          configurations.set(key, { issuer, interval });
+          routes[`GET /${key}/api/model-prices`] = call => typeof reply === "function" ? reply(call) : reply;
+        }
+        return callObject<number | null>(env().baseUrl(), "ModelPrices", key, "refresh", body);
+      };
       const current = (key: string) => callObject<ModelPricesCurrent>(env().baseUrl(), "ModelPrices", key, "current", null);
       const invocations = (key: string) => queryInvocations(env().adminAPIBaseUrl(), `target_service_name = 'ModelPrices' AND target_service_key = '${key}'`);
 
@@ -56,7 +83,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
           const key = randomUUID();
           await refresh(key, { reason: "boot" });
           expect(await current(key)).toEqual({ prices: [], fetchedAt: null, lastError: "not-configured" });
-          expect(endpoint.calls.length).toBe(0);
+          expect(callsFor(key).length).toBe(0);
           expect((await invocations(key)).some(row => row.status === "scheduled")).toBe(false);
         });
       }
@@ -107,22 +134,27 @@ describe("ModelPrices configuration and failure scheduling", () => {
         reply = recordedReply("empty");
         await refresh(key, { reason: "requested" });
         expect(await current(key)).toEqual({ prices: [], fetchedAt: expect.any(Number), lastError: null });
-        expect(endpoint.calls).toHaveLength(4);
+        expect(callsFor(key)).toHaveLength(4);
       });
 
       it("delivers a delayed refresh after a failed read", async () => {
         issuer = "https://auth.example";
         interval = 100;
         const key = randomUUID();
-        await refresh(key, { reason: "boot" });
-        await eventually(() => endpoint.calls.length, count => count >= 2, {
-          label: "durable model price retry delivery", timeoutMs: 10_000,
-        });
-        // Disable subsequent deliveries before this test's dependency is replaced.
-        issuer = undefined;
-        const rows = await invocations(key);
-        for (const row of rows) {
-          if (row.status === "scheduled") await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+        try {
+          await refresh(key, { reason: "boot" });
+          await eventually(() => callsFor(key).length, count => count >= 2, {
+            label: "durable model price retry delivery", timeoutMs: 10_000,
+          });
+        } finally {
+          configurations.get(key)!.issuer = undefined;
+          await eventually(async () => {
+            const live = (await invocations(key)).filter(row => row.status !== "completed" && row.status !== "cancelled");
+            for (const row of live) await cancelInvocation(env().adminAPIBaseUrl(), String(row.id));
+            return live;
+          }, rows => rows.length === 0, {
+            label: `ModelPrices invocations of ${key} did not settle`, timeoutMs: 10_000,
+          });
         }
       });
 
@@ -134,13 +166,15 @@ describe("ModelPrices configuration and failure scheduling", () => {
         expect(firstTimer).toEqual(expect.any(Number));
         expect(await current(key)).toEqual({ prices: [], fetchedAt: null, lastError: "network" });
         const rows = await eventually(() => invocations(key), rows => rows.some(r => r.status === "scheduled"), { label: "six-hour model price timer" });
-        expect(endpoint.calls.length).toBe(1);
-        expect(requestOptions[0]?.credentials).toBe("omit");
-        expect(requestOptions[0]?.redirect).toBe("error");
-        expect(requestOptions[0]?.headers).toBeUndefined();
-        expect(endpoint.calls[0]?.url.toString()).toBe("https://auth.example/api/model-prices");
+        expect(callsFor(key).length).toBe(1);
+        const requestUrl = callsFor(key)[0]!.url.toString();
+        const options = requestOptions.get(requestUrl);
+        expect(options?.credentials).toBe("omit");
+        expect(options?.redirect).toBe("error");
+        expect(options?.headers).toBeUndefined();
+        expect(requestUrl).toBe(`https://auth.example/${key}/api/model-prices`);
         expect(await refresh(key, { reason: "boot" })).toBe(firstTimer);
-        expect(endpoint.calls.length).toBe(1);
+        expect(callsFor(key).length).toBe(1);
         const journals = await Promise.all(rows.map(async row => journalText(await journalEntries(env().adminAPIBaseUrl(), String(row.id)))));
         expect(journals.join("\n")).not.toContain(SENTINEL);
         const response = await fetch(`${env().adminAPIBaseUrl()}/query`, { // restate-test-allow: inspect cached state and its timer guard
@@ -151,7 +185,7 @@ describe("ModelPrices configuration and failure scheduling", () => {
         const stateText = JSON.stringify(await response.json());
         expect(stateText).not.toContain(SENTINEL);
         await refresh(key, { reason: "scheduled", scheduledFor: -1 });
-        expect(endpoint.calls.length).toBe(1);
+        expect(callsFor(key).length).toBe(1);
         const staleRows = await invocations(key);
         // Inspect every completed invocation: stale and boot no-ops must never send.
         for (const row of staleRows.filter(row => row.status === "completed")) {
@@ -162,10 +196,10 @@ describe("ModelPrices configuration and failure scheduling", () => {
           }
         }
         const secondTimer = await refresh(key, { reason: "scheduled", scheduledFor: firstTimer });
-        expect(endpoint.calls.length).toBe(2);
+        expect(callsFor(key).length).toBe(2);
         expect(secondTimer).not.toBe(firstTimer);
         await refresh(key, { reason: "scheduled", scheduledFor: firstTimer });
-        expect(endpoint.calls.length).toBe(2);
+        expect(callsFor(key).length).toBe(2);
         expect(await current(key)).toEqual({ prices: [], fetchedAt: null, lastError: "network" });
       });
     });
