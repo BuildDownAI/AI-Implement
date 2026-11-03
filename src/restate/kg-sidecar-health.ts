@@ -6,7 +6,7 @@
  */
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext } from "@restatedev/restate-sdk";
-import { hasKgRecoveryNotice, postKgRecoveryNotice } from "../deploy-notify.js";
+import { clearKgRecoveryNotice, hasKgRecoveryNotice, postKgRecoveryNotice } from "../deploy-notify.js";
 import { isDeployHeld } from "../deploy-hold.js";
 import type { SidecarHealth } from "../kg-provider.js";
 import { SidecarMemoryProvider, getKgMemoryProvider, isKgUnavailable, probeWithTimeout } from "../kg-provider.js";
@@ -17,6 +17,7 @@ export interface KgSidecarHealthDeps {
   /** A plain function (no ctx). Resolves `null` when there is nothing to probe. */
   probe(): Promise<SidecarHealth | null>;
   notifyRecovery?: () => Promise<void>;
+  clearRecovery?: () => void;
 }
 
 export const KG_SIDECAR_HEALTH_KEY = "sidecar";
@@ -29,7 +30,16 @@ export function createKgSidecarHealth(deps: KgSidecarHealthDeps) {
         async (ctx: ObjectContext): Promise<SidecarHealth | null> => {
           const health = await ctx.run("probe", () => deps.probe());
           if (health && !health.lastError) {
-            await ctx.run("notify-recovery", () => (deps.notifyRecovery ?? postKgRecoveryNotice)());
+            try {
+              await ctx.run("notify-recovery", () => (deps.notifyRecovery ?? postKgRecoveryNotice)(), {
+                maxRetryAttempts: 3,
+              });
+            } catch (err) {
+              await ctx.run("discard-recovery", () => {
+                (deps.clearRecovery ?? clearKgRecoveryNotice)();
+                console.warn(`[kg-sidecar-health] recovery notice failed after 3 attempts: ${err instanceof Error ? err.message : String(err)}`);
+              }, { maxRetryAttempts: 3 });
+            }
           }
           return health;
         },

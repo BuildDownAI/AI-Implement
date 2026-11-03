@@ -153,6 +153,11 @@ export function hasKgRecoveryNotice(): boolean {
   return recoveryNotice !== null;
 }
 
+/** Abandon a recovery notice after its journaled delivery attempts are exhausted. */
+export function clearKgRecoveryNotice(): void {
+  recoveryNotice = null;
+}
+
 export async function postKgRecoveryNotice(): Promise<void> {
   const pending = recoveryNotice;
   if (!pending || !await pending.delivered) return;

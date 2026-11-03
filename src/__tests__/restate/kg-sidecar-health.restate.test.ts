@@ -17,10 +17,11 @@ const health = (lastError: string | null, checkedAt: number): SidecarHealth => (
 
 let nextProbe: () => Promise<SidecarHealth | null> = async () => null;
 let nextNotify: () => Promise<void> = async () => {};
+let nextClear: () => void = () => {};
 let envs: Map<string, RestateEnvironment>;
 
 beforeAll(async () => {
-  envs = await startVariants([createKgSidecarHealth({ probe: () => nextProbe(), notifyRecovery: () => nextNotify() })]);
+  envs = await startVariants([createKgSidecarHealth({ probe: () => nextProbe(), notifyRecovery: () => nextNotify(), clearRecovery: () => nextClear() })]);
 }, 60_000);
 
 afterAll(async () => {
@@ -38,17 +39,24 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
       kg: () => import("../../kg-provider.js"),
     } });
     const messages: string[] = [];
+    let failRecovery = false;
+    let failedAttempts = 0;
     const realFetch = globalThis.fetch;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       if (url === "https://notice.example.test") {
         const payload = JSON.parse(String(init?.body));
+        if (failRecovery) {
+          failedAttempts++;
+          return new Response("unavailable", { status: 503 });
+        }
         messages.push(payload.text ?? payload.blocks[0].text.text);
         return new Response("ok");
       }
       return realFetch(url, init);
     });
-    onTestFinished(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); nextNotify = async () => {}; });
+    onTestFinished(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); nextNotify = async () => {}; nextClear = () => {}; });
     nextNotify = () => deploy.postKgRecoveryNotice();
+    nextClear = () => deploy.clearKgRecoveryNotice();
     nextProbe = async () => health(null, 9000);
     await check();
     expect(messages).toEqual([]);
@@ -73,6 +81,18 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
     const rows = await queryInvocations(env().adminAPIBaseUrl(), "target_service_name = 'KgSidecarHealth' AND target_handler_name = 'check'");
     const entries = await Promise.all(rows.map(row => journalEntries(env().adminAPIBaseUrl(), String(row.id))));
     expect(JSON.stringify(entries)).toContain("notify-recovery");
+    // A webhook outage must release this exclusive handler and abandon the notice.
+    dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("deploy_last_image_ref", "old-image");
+    await deploy.postBootNotice({ notifyType: "slack", notifyWebhookUrl: "https://notice.example.test", kgSidecarUrl: null }, {
+      probe: async () => health("timed out", 8000), deadlineMs: 0,
+    });
+    expect(deploy.hasKgRecoveryNotice()).toBe(true);
+    failRecovery = true;
+    expect(await check()).toEqual(health(null, 9000));
+    expect(failedAttempts).toBe(3);
+    expect(deploy.hasKgRecoveryNotice()).toBe(false);
+    expect(await check()).toEqual(health(null, 9000));
+    expect(failedAttempts).toBe(3);
   });
 
   it("returns the probe result and journals it", async () => {
