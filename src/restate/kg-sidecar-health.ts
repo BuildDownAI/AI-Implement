@@ -35,6 +35,9 @@ export function createKgSidecarHealth(deps: KgSidecarHealthDeps) {
                 maxRetryAttempts: 3,
               });
             } catch (err) {
+              // Only exhausted delivery failures may abandon the notice. Runtime
+              // suspension and invocation cancellation must unwind unchanged.
+              if (!(err instanceof restate.TerminalError) || err.code === 409) throw err;
               await ctx.run("discard-recovery", () => {
                 (deps.clearRecovery ?? clearKgRecoveryNotice)();
                 console.warn(`[deploy-notify] KG recovery notice failed: ${err instanceof Error ? err.message : String(err)}`);

@@ -147,7 +147,7 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
 }
 
 // Process-local, like sidecar health. Keep delivery ordering when a poll recovers during the send.
-let recoveryNotice: { delivered: Promise<boolean>; send: () => Promise<void> } | null = null;
+let recoveryNotice: { delivered: Promise<boolean>; send: (signal: AbortSignal) => Promise<void> } | null = null;
 
 export function hasKgRecoveryNotice(): boolean {
   return recoveryNotice !== null;
@@ -158,11 +158,28 @@ export function clearKgRecoveryNotice(): void {
   recoveryNotice = null;
 }
 
-export async function postKgRecoveryNotice(): Promise<void> {
+/** Bound both warning delivery ordering and the recovery HTTP request using the existing warm-up budget. */
+export async function postKgRecoveryNotice(deadlineMs = CANARY_DEADLINE_MS): Promise<void> {
   const pending = recoveryNotice;
-  if (!pending || !await pending.delivered) return;
-  await pending.send();
-  if (recoveryNotice === pending) recoveryNotice = null;
+  if (!pending) return;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error("KG recovery notice timed out");
+      reject(error);
+      controller.abort(error);
+    }, deadlineMs);
+  });
+  try {
+    // Race the ordering wait too: the original warning webhook may itself stall.
+    const delivered = await Promise.race([pending.delivered, deadline]);
+    if (!delivered) return;
+    await Promise.race([pending.send(controller.signal), deadline]);
+    if (recoveryNotice === pending) recoveryNotice = null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export interface BootWarmup {
@@ -227,7 +244,7 @@ export async function postBootNotice(
     let delivered!: (ok: boolean) => void;
     const pending = payload.kgUnavailable ? {
       delivered: new Promise<boolean>(resolve => { delivered = resolve; }),
-      send: () => notifyKgRecovery(config.notifyWebhookUrl!),
+      send: (signal: AbortSignal) => notifyKgRecovery(config.notifyWebhookUrl!, signal),
     } : null;
     recoveryNotice = pending;
     try {

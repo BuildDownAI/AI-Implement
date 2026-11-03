@@ -1,6 +1,7 @@
 // Real Restate coverage for the KgSidecarHealth object (AII-1527), on both variants.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
+import * as restate from "@restatedev/restate-sdk";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { testDb } from "../helpers/test-db.js";
 import type { SidecarHealth } from "../../kg-provider.js";
@@ -32,7 +33,7 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
   const env = () => envs.get(label)!;
   const check = () => callObject<SidecarHealth | null>(env().baseUrl(), "KgSidecarHealth", "sidecar", "check", undefined);
 
-  it("journals recovery once after a warning and stays silent without one", async () => {
+  it.each(["rejecting", "stalled"])("journals recovery once and releases the handler after a %s webhook fails", async (failureMode) => {
     const { modules: { deploy, dedup, kg } } = await testDb({ modules: {
       deploy: () => import("../../deploy-notify.js"),
       dedup: () => import("../../dedup.js"),
@@ -47,6 +48,11 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
         const payload = JSON.parse(String(init?.body));
         if (failRecovery) {
           failedAttempts++;
+          if (failureMode === "stalled") {
+            return new Promise<Response>((_resolve, reject) => {
+              init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+            });
+          }
           return new Response("unavailable", { status: 503 });
         }
         messages.push(payload.text ?? payload.blocks[0].text.text);
@@ -55,7 +61,7 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
       return realFetch(url, init);
     });
     onTestFinished(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); nextNotify = async () => {}; nextClear = () => {}; });
-    nextNotify = () => deploy.postKgRecoveryNotice();
+    nextNotify = () => deploy.postKgRecoveryNotice(100);
     nextClear = () => deploy.clearKgRecoveryNotice();
     nextProbe = async () => health(null, 9000);
     await check();
@@ -72,7 +78,7 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
     messages.length = 0;
     // The idempotency key re-attaches to the same invocation, including on alwaysReplay.
     const send = () => fetch(`${env().baseUrl()}/KgSidecarHealth/sidecar/check`, {
-      method: "POST", headers: { "idempotency-key": `recovery-${label}` },
+      method: "POST", headers: { "idempotency-key": `recovery-${label}-${failureMode}` },
     });
     expect((await send()).ok).toBe(true);
     expect((await send()).ok).toBe(true);
@@ -95,11 +101,32 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
     const recoveryWarnings = () => warning.mock.calls.filter(([message]) =>
       String(message).startsWith("[deploy-notify] KG recovery notice failed:"));
     expect(recoveryWarnings()).toEqual([
-      ["[deploy-notify] KG recovery notice failed: Webhook notification failed: 503 — unavailable"],
+      [failureMode === "stalled"
+        ? "[deploy-notify] KG recovery notice failed: KG recovery notice timed out"
+        : "[deploy-notify] KG recovery notice failed: Webhook notification failed: 503 — unavailable"],
     ]);
     expect(await check()).toEqual(health(null, 9000));
     expect(failedAttempts).toBe(3);
     expect(recoveryWarnings()).toHaveLength(1);
+  });
+
+  it("propagates recovery cancellation without discarding the pending notice", async () => {
+    let pending = true;
+    const clear = vi.fn(() => { pending = false; });
+    nextProbe = async () => health(null, 9100);
+    nextNotify = async () => { throw new restate.TerminalError("cancelled", { errorCode: 409 }); };
+    nextClear = clear;
+    onTestFinished(() => { nextNotify = async () => {}; nextClear = () => {}; });
+    const response = await fetch(`${env().baseUrl()}/KgSidecarHealth/sidecar/check`, { method: "POST", headers: { "idempotency-key": `cancel-recovery-${label}` } });
+    expect(response.status).toBe(409);
+    expect(pending).toBe(true);
+    expect(clear).not.toHaveBeenCalled();
+    const rows = await queryInvocations(env().adminAPIBaseUrl(), "target_service_name = 'KgSidecarHealth' AND target_handler_name = 'check'");
+    const entries = await Promise.all(rows.map(row => journalEntries(env().adminAPIBaseUrl(), String(row.id))));
+    // Earlier tests may discard exhausted attempts; this invocation must not.
+    const cancelled = entries.filter(entry => JSON.stringify(entry).includes("cancelled"));
+    expect(cancelled.length).toBeGreaterThan(0);
+    expect(JSON.stringify(cancelled)).not.toContain("discard-recovery");
   });
 
   it("returns the probe result and journals it", async () => {

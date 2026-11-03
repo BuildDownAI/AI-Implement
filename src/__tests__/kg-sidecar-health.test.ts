@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as deployNotify from "../deploy-notify.js";
+import { testDb } from "./helpers/test-db.js";
 import http from "node:http";
 import { SidecarMemoryProvider, setKgMemoryProvider, sidecarHealth } from "../kg-provider.js";
 import { checkKgSidecarHealth, probeKgSidecarIfUnavailable } from "../restate/kg-sidecar-health.js";
@@ -75,5 +76,44 @@ describe("probeKgSidecarIfUnavailable", () => {
   it("returns null without throwing when there is no sidecar provider", async () => {
     sidecarHealth.lastError = "boom";
     await expect(probeKgSidecarIfUnavailable()).resolves.toBeNull();
+  });
+});
+
+
+describe("KG recovery deadline", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  it.each(["warning", "recovery"])("bounds a stalled %s webhook and aborts a recovery send", async (stage) => {
+    const { modules: { deploy, dedup, kg } } = await testDb({ modules: {
+      deploy: () => import("../deploy-notify.js"),
+      dedup: () => import("../dedup.js"),
+      kg: () => import("../kg-provider.js"),
+    } });
+    vi.useFakeTimers();
+    vi.stubEnv("FLY_IMAGE_REF", "new-image");
+    dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run("deploy_last_image_ref", "old-image");
+    Object.assign(kg.sidecarHealth, { reachable: false, toolsListed: false, lastError: "timeout", checkedAt: 1 });
+    let recoverySignal: AbortSignal | null | undefined;
+    const send = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const recovery = String(init?.body).includes("serving again");
+      if (recovery) recoverySignal = init?.signal;
+      if (stage === "warning" || recovery) return new Promise<Response>(() => {});
+      return new Response("ok");
+    });
+    void deploy.postBootNotice({ notifyType: "slack", notifyWebhookUrl: "https://notice.example.test", kgSidecarUrl: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(deploy.hasKgRecoveryNotice()).toBe(true);
+    const result = expect(deploy.postKgRecoveryNotice(25)).rejects.toThrow("KG recovery notice timed out");
+    await vi.advanceTimersByTimeAsync(25);
+    await result;
+    expect(send).toHaveBeenCalledTimes(stage === "warning" ? 1 : 2);
+    if (stage === "recovery") expect(recoverySignal?.aborted).toBe(true);
+    // The Restate handler owns abandonment after bounded retries.
+    expect(deploy.hasKgRecoveryNotice()).toBe(true);
+    deploy.clearKgRecoveryNotice();
   });
 });
