@@ -407,3 +407,18 @@ The runner compares the grant against trusted launcher values (`AI_IMPLEMENT_MOD
 Validation is strict (`parseModelAuthContext`, mirrored in the workflow `jq`): known fields only, version 1, bounded ids, backend `gha`, no userinfo/query/fragment, and a real HTTPS authority (port 1-65535, IPv4-shaped hosts must be four octets of at most 255; `isValidModelAuthUrl` in TypeScript, the same checks in `jq`). A GHA envelope that carries `modelAuthGrant` must also carry `modelAuthContext`: the bootstrap step fails with the fixed error, emits nothing and the Run step never starts. Envelopes with no grant (Legacy callback-only) are unaffected. The bootstrap step masks the values and emits them as step outputs; only the Run step maps them to the env vars above, never `$GITHUB_ENV`, and `process-env.ts` strips the `AI_IMPLEMENT_MODEL_AUTH_` prefix from hook and model children. The context is encoded only by `encodeTrustedRunConfig`; the generic encoder and diagnostic projections omit it. Writers: implementation, planning, manual gap-fill and legacy review-fix.
 
 `credentials.executionPolicy` (AII-1437) travels in the same protected namespace, beside `modelAuthContext`, as `{version: 1, implementationSandbox: "ephemeral-full-access", dispatchId, projectKey, backend: "gha", ephemeralRunnerAsserted: true}` (`parseExecutionPolicy`, mirrored in the workflow `jq`). It is valid only with a `modelAuthContext` carrying the same dispatch id, project key and backend, and only the implementation workflow (capability `github-hosted-execution-policy-v2`) accepts it; `claude-plan.yml` rejects the key. The generic encoder, generic decoder and `diagnosticProjection` never emit or return it (diagnostics list the field name only). See [execution-backends.md](execution-backends.md#ephemeral-full-access-for-codex-implementation-aii-1437).
+
+### Stored fallback models
+
+Configured stage defaults and project overrides accept an optional `fallbackModel`
+(non-empty string or `null`). A non-null project value wins; null restores
+inheritance. A fallback must differ from the resolved primary model and shares the
+stage's account profile. The resolved admin route includes `values.fallbackModel`
+and `sources.fallbackModel` (null when absent).
+
+Preparation freezes these values in `resolved_config_json.fallbackModels` alongside
+the stages and profiles, and returns them separately on its ready result. Retries
+reuse the dispatch's stored values; old rows have no fallbacks. The five-field
+snapshot selections and source maps are unchanged. Runner delivery and use of the
+fallback are separate work. Before reverting to code that predates this field,
+clear fallback models from every stored configuration.

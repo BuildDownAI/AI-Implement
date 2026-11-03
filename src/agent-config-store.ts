@@ -8,7 +8,8 @@ import { getDb } from "./dedup.js";
 import {
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
-  STAGE_SELECTION_FIELDS,
+  STORED_STAGE_SELECTION_FIELDS,
+  validateFallbackModel,
   resolveStageAgentConfig,
   type AccountAuthMode,
   type AccountProfile,
@@ -17,7 +18,7 @@ import {
   type StageAgentConfigurationV1,
   type StageConfigResolution,
   type StageName,
-  type StageSelectionField,
+  type StoredStageSelectionField,
 } from "./agent-config.js";
 
 /** scope_key of the single orchestrator-wide defaults row series. */
@@ -186,7 +187,8 @@ function assertConfigShape(config: StageAgentConfigurationV1, name: string): voi
   for (const [stage, patch] of Object.entries(config.stages)) {
     if (!(STAGE_NAMES as readonly string[]).includes(stage)) throw new Error(`${name}.stages contains unknown key(s)`);
     if (typeof patch !== "object" || patch === null || Array.isArray(patch)) throw new Error(`${name}.stages.${stage} must be an object`);
-    if (Object.keys(patch).some((f) => !(STAGE_SELECTION_FIELDS as readonly string[]).includes(f))) {
+    validateFallbackModel(patch.fallbackModel, stage);
+    if (Object.keys(patch).some((f) => !(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(f))) {
       throw new Error(`${name}.stages.${stage} contains unknown key(s)`);
     }
   }
@@ -522,12 +524,12 @@ export function getProjectStageConfig(projectKey: string): StoredStageConfig | n
 export function clearProjectStageField(
   projectKey: string,
   stage: StageName,
-  field: StageSelectionField,
+  field: StoredStageSelectionField,
   createdBy: string | null = null,
 ): StoredStageConfig {
   assertNonEmptyProjectKey(projectKey);
   if (!(STAGE_NAMES as readonly string[]).includes(stage)) throw new Error("unknown stage");
-  if (!(STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) throw new Error("unknown stage field");
+  if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) throw new Error("unknown stage field");
   const db = getDb();
   return db
     .transaction(() => {

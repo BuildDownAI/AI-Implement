@@ -166,6 +166,7 @@ export type AgentRunPreparation =
       readonly status: "ready";
       readonly dispatchId: string;
       readonly snapshot: ResolvedAgentSnapshotV1;
+      readonly fallbackModels: Partial<Record<StageName, string>>;
       readonly grant: SafeGrantMetadata;
       readonly reservations: readonly ReservedProfile[];
       /** False on the call that minted the grant, true on every repeat. */
@@ -231,9 +232,15 @@ export function loadStoredSnapshot(dispatchId: string): ResolvedAgentSnapshotV1 
   return row ? snapshotFromRow(row) : null;
 }
 
+type FallbackModels = Partial<Record<StageName, string>>;
+
+function fallbackModelsFromRow(row: SnapshotRow): FallbackModels {
+  return JSON.parse(row.resolved_config_json).fallbackModels ?? {};
+}
+
 type Resolved =
   | { readonly kind: "legacy" }
-  | { readonly kind: "snapshot"; readonly snapshot: ResolvedAgentSnapshotV1; readonly stored: boolean }
+  | { readonly kind: "snapshot"; readonly snapshot: ResolvedAgentSnapshotV1; readonly stored: boolean; readonly fallbackModels: FallbackModels }
   | { readonly kind: "error"; readonly code: ConfigurationErrorCode };
 
 /** A database fault (locked, busy, I/O) is operational uncertainty, not a verdict on the stored selection. */
@@ -268,7 +275,7 @@ function resolveCurrent(request: AgentRunRequest, candidate?: StageAgentConfigur
       sources: resolution.sources,
       profiles: resolution.profiles,
     });
-    return { kind: "snapshot", snapshot, stored: false };
+    return { kind: "snapshot", snapshot, stored: false, fallbackModels: resolution.fallbackModels };
   } catch {
     return { kind: "error", code: "snapshot_invalid" };
   }
@@ -280,14 +287,14 @@ function resolveForRequest(request: AgentRunRequest): Resolved {
   if (row) {
     if (row.project_key !== request.projectKey) return { kind: "error", code: "project_mismatch" };
     const snapshot = snapshotFromRow(row);
-    return snapshot ? { kind: "snapshot", snapshot, stored: true } : { kind: "error", code: "snapshot_invalid" };
+    return snapshot ? { kind: "snapshot", snapshot, stored: true, fallbackModels: fallbackModelsFromRow(row) } : { kind: "error", code: "snapshot_invalid" };
   }
   if (!getProjectOptIn(request.projectKey)) return { kind: "legacy" };
   return resolveCurrent(request);
 }
 
 /** Persists the snapshot keyed by dispatch id; a concurrent writer's row wins and is what is returned. */
-function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapshotV1): Resolved {
+function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapshotV1, fallbackModels: FallbackModels): Resolved {
   const db = getDb();
   db.prepare(
     `INSERT OR IGNORE INTO run_agent_config_snapshots
@@ -297,14 +304,14 @@ function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapsh
     snapshot.snapshotId,
     request.dispatchId,
     request.projectKey,
-    JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles }),
+    JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles, ...(Object.keys(fallbackModels).length ? { fallbackModels } : {}) }),
     JSON.stringify(snapshot.sources),
     JSON.stringify(snapshot.configRevisions),
     Date.now(),
   );
   const row = readSnapshotRow(request.dispatchId);
   const stored = row ? snapshotFromRow(row) : null;
-  return stored ? { kind: "snapshot", snapshot: stored, stored: true } : { kind: "error", code: "snapshot_invalid" };
+  return stored ? { kind: "snapshot", snapshot: stored, stored: true, fallbackModels: fallbackModelsFromRow(row!) } : { kind: "error", code: "snapshot_invalid" };
 }
 
 // --- checks shared by preparation and inspection ---
@@ -564,7 +571,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
   let resolved: Resolved;
   try {
     resolved = resolveForRequest(request);
-    if (resolved.kind === "snapshot" && !resolved.stored) resolved = persistSnapshot(request, resolved.snapshot);
+    if (resolved.kind === "snapshot" && !resolved.stored) resolved = persistSnapshot(request, resolved.snapshot, resolved.fallbackModels);
   } catch (err) {
     return { status: "configuration-error", code: resolutionFailure(err) };
   }
@@ -641,7 +648,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
     if (row.revoked_at !== null) return { status: "recovery-required", code: "grant_revoked" };
     if (row.expires_at <= now()) return { status: "recovery-required", code: "grant_expired" };
     if (!sameBindings(existing.bindings, bindings)) return { status: "recovery-required", code: "grant_mismatch" };
-    return ready(request, snapshot, reservations, true, {
+    return ready(request, snapshot, resolved.fallbackModels, reservations, true, {
       version: 1,
       audience: MODEL_AUTH_AUDIENCE,
       grantId: row.grant_id,
@@ -669,12 +676,13 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
     if (!releaseAll(deps.ownership, request.dispatchId, reservations)) return { status: "recovery-required", code: "release_failed" };
     return { status: "configuration-error", code: "invalid_request" };
   }
-  return ready(request, snapshot, reservations, false, toSafeGrantMetadata(minted.grant), minted.grant);
+  return ready(request, snapshot, resolved.fallbackModels, reservations, false, toSafeGrantMetadata(minted.grant), minted.grant);
 }
 
 function ready(
   request: AgentRunRequest,
   snapshot: ResolvedAgentSnapshotV1,
+  fallbackModels: FallbackModels,
   reservations: readonly ReservedProfile[],
   reused: boolean,
   grant: SafeGrantMetadata,
@@ -683,6 +691,7 @@ function ready(
   let pending = bootstrap;
   return {
     status: "ready",
+    fallbackModels,
     dispatchId: request.dispatchId,
     snapshot,
     grant,
