@@ -9,10 +9,16 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, type SelfDeployRecord, type SelfDeployStartResult, type SelfDeployStatus, type SelfDeploySetOptionsResult } from "../../restate/self-deploy.js";
 import { callObject, callService, killInvocation, gate, eventually, queryInvocations, replaceEndpoint, setObjectState, startRetryEnabled, startVariants, stopAll, VARIANTS, type RestateEnvironment } from "./harness.js";
 import * as githubAuth from "../../github-app-auth.js";
-import { githubImagePublished } from "../../restate/self-deploy.js";
+import { flyImageVisible, githubImagePublished } from "../../restate/self-deploy.js";
 import { fakeFetch } from "../helpers/fake-fetch.js";
 import * as notify from "../../notify.js";
-import { COMMIT, deployFixture } from "./self-deploy-fixture.js";
+import { COMMIT, deployFixture as baseDeployFixture } from "./self-deploy-fixture.js";
+
+function deployFixture() {
+  const fixture = baseDeployFixture();
+  return { ...fixture, deps: { ...fixture.deps, imageVisible: vi.fn(async () => true),
+    limits: { ...fixture.deps.limits, imagePollMs: 1, imageWaitMs: 40, manifestRetryMs: 1 } } };
+}
 
 describe("SelfDeploy durable phase machine", () => {
   let f = deployFixture();
@@ -284,6 +290,40 @@ describe("SelfDeploy durable phase machine", () => {
     await start(env); await terminal(env, f, "succeeded");
     expect(f.deps.imagePublished).not.toHaveBeenCalled();
     expect(f.deps.flyctl).toHaveBeenCalledWith(expect.anything(), expect.arrayContaining(["--build-only", "--push", "--image-label", "deploy-abcdef0", "kg_token=secret-kg", `SOURCE_COMMIT=${COMMIT}`, "SOURCE_REPO=owner/repo", "SOURCE_BRANCH=testing"]), "secret-fly", expect.any(AbortSignal));
+  });
+  it.each(VARIANTS)("waits for built image visibility before updating (%s)", async label => {
+    f = deployFixture(); f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
+    f.deps.imageVisible.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    const update = f.deps.fly.updateMachine;
+    f.deps.fly.updateMachine = vi.fn(async (token, app, id, config) => {
+      expect(f.deps.imageVisible).toHaveBeenCalledTimes(3);
+      await update(token, app, id, config);
+    });
+    await start(envs.get(label)!); await phase(envs.get(label)!, "verifying");
+    expect(f.deps.fly.updateMachine).toHaveBeenCalledOnce();
+    expect(f.deps.flyctl).toHaveBeenCalledOnce();
+    await terminal(envs.get(label)!, f, "succeeded");
+  });
+  it.each(VARIANTS)("fails fixed when built image never appears (%s)", async label => {
+    f = deployFixture(); f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
+    f.deps.imageVisible.mockResolvedValue(false);
+    await start(envs.get(label)!); await terminal(envs.get(label)!, f, "failed", "apply-failed");
+    expect(f.deps.onOutcome).toHaveBeenCalledWith(expect.anything(), expect.stringContaining("wait for image"));
+    expect(f.deps.fly.updateMachine).not.toHaveBeenCalled();
+    expect(f.deps.flyctl).toHaveBeenCalledOnce();
+  });
+  it.each(VARIANTS)("retries manifest 400 without rebuilding and bounds exhaustion (%s)", async label => {
+    for (const exhausted of [false, true]) {
+      f = deployFixture(); f.config.kgSourceRepo = "owner/kg"; f.state.work = false;
+      const error = Object.assign(new Error("failed to get manifest: not found"), { status: 400 });
+      if (exhausted) vi.mocked(f.deps.fly.updateMachine).mockRejectedValue(error);
+      else vi.mocked(f.deps.fly.updateMachine).mockRejectedValueOnce(error);
+      await start(envs.get(label)!);
+      if (exhausted) await terminal(envs.get(label)!, f, "failed", "apply-failed");
+      else { await phase(envs.get(label)!, "verifying"); await terminal(envs.get(label)!, f, "succeeded"); }
+      expect(f.deps.fly.updateMachine).toHaveBeenCalledTimes(exhausted ? 3 : 2);
+      expect(f.deps.flyctl).toHaveBeenCalledOnce();
+    }
   });
   it.each(VARIANTS)("retries Machines conflicts and rate limits without rebuilding (%s)", async label => {
     const env = envs.get(label)!;
@@ -664,4 +704,22 @@ describe("SelfDeploy durable phase machine", () => {
       expect(fixture.state.held).toBe(false);
     } finally { replacement?.close(); await stopAll(local); }
   }, 120_000);
+});
+
+describe("Fly manifest visibility request", () => {
+  it("uses deploy-token Basic auth and requires HTTP 200", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    try {
+      for (const status of [200, 201, 404, 401]) {
+        fetchMock.mockResolvedValueOnce(new Response(null, { status }));
+        expect(await flyImageVisible("registry.fly.io/test-app:deploy-abcdef0", "deploy-token", new AbortController().signal)).toBe(status === 200);
+        expect(fetchMock).toHaveBeenLastCalledWith("https://registry.fly.io/v2/test-app/manifests/deploy-abcdef0", {
+          headers: {
+            Accept: "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json",
+            Authorization: `Basic ${Buffer.from("fly:deploy-token").toString("base64")}`,
+          }, signal: expect.any(AbortSignal),
+        });
+      }
+    } finally { fetchMock.mockRestore(); }
+  });
 });

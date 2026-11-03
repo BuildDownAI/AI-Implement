@@ -42,7 +42,7 @@ import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfD
 import { clearDeployHold, getDeployStartedAt, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, createRestateDrainProbes, readKgSourceRepo, parseKgSourceRepo, runSelfDeployFlyctl } from "./deploy.js";
-import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, githubImagePublished, type SelfDeployClient } from "./restate/self-deploy.js";
+import { selfDeployRecovery, createSelfDeploy, createSelfDeployIngressClient, githubImagePublished, flyImageVisible, type SelfDeployClient } from "./restate/self-deploy.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import { finalizeImplementation } from "./implementation-finalize.js";
@@ -5272,6 +5272,7 @@ async function main(): Promise<void> {
     },
     getDeployPolicy,
     imagePublished: (target, commit) => githubImagePublished(config.githubAppId, config.githubAppPrivateKey, target, commit),
+    imageVisible: flyImageVisible,
     fly: { listMachines, getMachine, updateMachine },
     flyctl: async (record, args, token, signal) => {
       const [owner, repo] = record.target.repo.split("/");
