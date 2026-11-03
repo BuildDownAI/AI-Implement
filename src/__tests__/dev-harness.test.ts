@@ -88,6 +88,8 @@ function configuredResolution() {
   const profile = { id: "sub-a", identity: "local", revision: 1, agent: "codex" as const, provider: "openai" as const, authMode: "codex-subscription" as const };
   return {
     mode: "configured" as const,
+    fallbackModels: {},
+    fallbackModelSources: {},
     stages: { planning: stage, implementation: stage, review: stage },
     sources: { planning: sources, implementation: sources, review: sources },
     profiles: { planning: profile, implementation: profile, review: profile },
@@ -100,6 +102,8 @@ function configuredResolutionForProfile(profileId: string) {
   const profile = { id: profileId, identity: "local", revision: 1, agent: "codex" as const, provider: "openai" as const, authMode: "codex-subscription" as const };
   return {
     mode: "configured" as const,
+    fallbackModels: {},
+    fallbackModelSources: {},
     stages: { planning: stage, implementation: stage, review: stage },
     sources: { planning: sources, implementation: sources, review: sources },
     profiles: { planning: profile, implementation: profile, review: profile },
