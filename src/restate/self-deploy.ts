@@ -33,7 +33,6 @@ export interface SelfDeployConfig {
   imageApp?: string;
   kgSourceRepo?: string | null;
 }
-export type ImageVisibility = "visible" | "missing" | { unauthorized: 401 | 403 };
 export interface SelfDeployDeps {
   /** Read credentials only inside effects; this value is never returned to the journal. */
   config(): SelfDeployConfig;
@@ -41,7 +40,6 @@ export interface SelfDeployDeps {
   head(target: { owner: string; repo: string }, branch: "testing" | "main"): Promise<string | null>;
   /** Publication marker read inside the target lookup effect. */
   imagePublished(target: { owner: string; repo: string }, commit: string): Promise<boolean>;
-  imageVisible?(image: string, token: string, signal: AbortSignal): Promise<ImageVisibility>;
   fly: {
     listMachines(token: string, app: string): Promise<Machine[]>;
     getMachine(token: string, app: string, id: string): Promise<Machine>;
@@ -57,7 +55,7 @@ export interface SelfDeployDeps {
   /** Read this process's AI_IMPLEMENT_SOURCE_COMMIT inside the verify effect. */
   sourceCommit(): string | undefined;
   onOutcome(record: SelfDeployRecord, detail?: string): Promise<void>;
-  limits?: { drainTimeoutMs?: number; drainPollMs?: number; verifyInitialMs?: number; verifyPollMs?: number; flyctlTimeoutMs?: number; imagePollMs?: number; imageWaitMs?: number; manifestRetryMs?: number };
+  limits?: { drainTimeoutMs?: number; drainPollMs?: number; verifyInitialMs?: number; verifyPollMs?: number; flyctlTimeoutMs?: number };
 }
 export interface SelfDeployOptions { applyFlyToml: boolean }
 export interface SelfDeployStatus { deploy: SelfDeployRecord | null; options: SelfDeployOptions }
@@ -72,7 +70,7 @@ const read = (ctx: restate.ObjectSharedContext) => ctx.get<SelfDeployRecord>("de
 const readOptions = async (ctx: restate.ObjectSharedContext): Promise<SelfDeployOptions> => ({ ...DEFAULT_OPTIONS, ...await ctx.get<SelfDeployOptions>("options") });
 
 export function createSelfDeploy(deps: SelfDeployDeps) {
-  const limits = { drainTimeoutMs: 75 * 60_000, drainPollMs: 30_000, verifyInitialMs: 180_000, verifyPollMs: 60_000, flyctlTimeoutMs: 10 * 60_000, imagePollMs: 5_000, imageWaitMs: 120_000, manifestRetryMs: 5_000, ...deps.limits };
+  const limits = { drainTimeoutMs: 75 * 60_000, drainPollMs: 30_000, verifyInitialMs: 180_000, verifyPollMs: 60_000, flyctlTimeoutMs: 10 * 60_000, ...deps.limits };
   // Bound each CLI call independently; the injected executor must also stop its subprocess.
   async function flyctl(record: SelfDeployRecord, args: string[], token: string) {
     const controller = new AbortController();
@@ -83,7 +81,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
           timer = setTimeout(() => {
             controller.abort();
             reject(new Error("SelfDeploy flyctl deadline exceeded"));
-          }, limits.flyctlTimeoutMs);
+          }, deps.limits?.flyctlTimeoutMs ?? (record.target.source === "built" ? 20 * 60_000 : limits.flyctlTimeoutMs));
         }),
         deps.flyctl(record, args, token, controller.signal),
       ]);
@@ -173,7 +171,6 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
         const config = deps.config();
         const token = config.flyDeployToken!;
         const secrets = [token];
-        let built = false;
         for (let attempt = 0; ; attempt++) {
           let operation = "listMachines";
           try {
@@ -183,42 +180,13 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             const fresh = [];
             for (const machine of machines) fresh.push(await deps.fly.getMachine(token, ctx.key, machine.id));
             if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
-            if (record.target.source === "built" && !built) {
-              operation = "build";
+            if (record.target.source === "built") {
+              operation = "flyctl deploy";
               const kgToken = await deps.kgToken();
               secrets.push(kgToken);
               const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: record.target.repo, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken });
-              await flyctl(record, [...args, "--build-only", "--push", "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
-              built = true;
-              operation = "wait for image";
-              const controller = new AbortController();
-              let timer: ReturnType<typeof setTimeout> | undefined;
-              try {
-                await Promise.race([
-                  new Promise<never>((_resolve, reject) => {
-                    timer = setTimeout(() => {
-                      controller.abort();
-                      reject(new Error("Image manifest did not become visible before deadline"));
-                    }, limits.imageWaitMs);
-                  }),
-                  (async () => {
-                    while (!controller.signal.aborted) {
-                      try {
-                        const visibility = await (deps.imageVisible ?? flyImageVisible)(record.target.image, token, controller.signal);
-                        if (visibility === "visible") return;
-                        if (typeof visibility === "object") {
-                          ctx.console.warn(`[self-deploy] ${record.deployId} image visibility check unauthorized HTTP ${visibility.unauthorized}`);
-                          return;
-                        }
-                      } catch (error) {
-                        if ((error as { status?: number } | null)?.status !== undefined) throw error;
-                        // Transport failures remain bounded by the visibility deadline.
-                      }
-                      if (!controller.signal.aborted) await new Promise(resolve => setTimeout(resolve, limits.imagePollMs));
-                    }
-                  })(),
-                ]);
-              } finally { clearTimeout(timer); }
+              await flyctl(record, [...args, "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
+              return true;
             }
             if (policy === "toml") {
               operation = "flyctl deploy";
@@ -229,6 +197,19 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             }
             return true;
           } catch (error) {
+            const builtDeployFailed = record.target.source === "built" && operation === "flyctl deploy";
+            if (builtDeployFailed) {
+              // The release may have stopped this process after accepting the deploy.
+              // Reconcile once, but never start another remote build in this effect.
+              try {
+                const machines = await deps.fly.listMachines(token, ctx.key);
+                const fresh = [];
+                for (const machine of machines) fresh.push(await deps.fly.getMachine(token, ctx.key, machine.id));
+                if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
+              } catch {
+                // Preserve the original deploy failure if reconciliation is unavailable.
+              }
+            }
             const raw = error instanceof Error ? error.message : "Unknown error";
             const status = (error as { status?: number } | null)?.status ?? (Number(raw.match(/(?:\(|\bHTTP\s+)([45]\d\d)\b/i)?.[1]) || undefined);
             // Keep flyctl diagnostics, but drop command/argv suffixes (including build secrets).
@@ -243,11 +224,10 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             const detail = `${operation} HTTP ${status ?? "unknown"} ${message}`;
             ctx.console.warn(`[self-deploy] ${record.deployId} apply error ${detail}`);
             const machinesApi = ["listMachines", "getMachine", "updateMachine"].includes(operation);
-            const manifestLag = operation === "updateMachine" && status === 400 && /failed to get manifest/i.test(raw);
             const fixed = status !== undefined && status >= 400 && status < 500
-              && !manifestLag && !(machinesApi && (status === 409 || status === 429));
-            if (operation === "wait for image" || fixed || attempt === 2) return { detail };
-            await new Promise(resolve => setTimeout(resolve, manifestLag ? limits.manifestRetryMs * 2 ** attempt : Math.min(100 * 2 ** attempt, 1_000)));
+              && !(machinesApi && (status === 409 || status === 429));
+            if (builtDeployFailed || fixed || attempt === 2) return { detail };
+            await new Promise(resolve => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1_000)));
           }
         }
       }, { maxRetryAttempts: 3, initialRetryInterval: 100, maxRetryInterval: 1_000 });
@@ -294,8 +274,8 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   return restate.object({ name: "SelfDeploy", handlers: {
     start: restate.handlers.object.exclusive({ input: serde.zod(startSchema) }, start),
     checkDrain: restate.handlers.object.exclusive({ ingressPrivate: true }, checkDrain),
-    // A KG build and optional detached deploy can each take ten minutes per attempt.
-    // Leave room for three attempts and retry delays before the server aborts the effect.
+    // A built deploy makes one flyctl attempt with a twenty-minute deadline per effect.
+    // Retain the handler limits independently of that deadline and the published-path retries.
     apply: restate.handlers.object.exclusive({ ingressPrivate: true, inactivityTimeout: 65 * 60_000, abortTimeout: 70 * 60_000 }, apply),
     verify: restate.handlers.object.exclusive({ ingressPrivate: true, input: serde.zod(z.object({ attempt: z.number().int().min(1).max(5) }).strict()) }, verify),
     cancel: restate.handlers.object.exclusive({ input: serde.zod(z.object({ requestedBy: requester }).strict()) }, cancel),
@@ -357,22 +337,4 @@ export function createSelfDeployIngressClient(key: () => string = () => process.
     status: async () => await obj().status(),
     setOptions: async (input) => await obj().setOptions(input),
   };
-}
-
-/** Fly registry accepts the deploy token as the Basic auth password. */
-export async function flyImageVisible(image: string, token: string, signal: AbortSignal): Promise<ImageVisibility> {
-  const match = /^registry\.fly\.io\/([^:]+):([^:]+)$/.exec(image);
-  if (!match) throw new Error("Invalid Fly image reference");
-  const response = await fetch(`https://registry.fly.io/v2/${match[1]}/manifests/${match[2]}`, {
-    headers: {
-      Accept: "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
-      Authorization: `Basic ${Buffer.from(`fly:${token}`).toString("base64")}`,
-    },
-    signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
-  });
-  await response.body?.cancel();
-  if (response.status === 200) return "visible";
-  if (response.status === 401 || response.status === 403) return { unauthorized: response.status };
-  if (response.status === 404) return "missing";
-  throw Object.assign(new Error(`Image visibility check HTTP ${response.status}`), { status: response.status });
 }

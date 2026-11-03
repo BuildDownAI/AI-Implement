@@ -56,11 +56,12 @@ The value is a GitHub repo identifier, not a URL; see `docs/kg-sidecar.md`.
 
 ## Standing rules
 
-Three operator rules apply to every plan, issue, ADR, review, and change. **Full reference: [docs/standing-rules.md](docs/standing-rules.md).**
+Four operator rules apply to every plan, issue, ADR, review, and change. **Full reference: [docs/standing-rules.md](docs/standing-rules.md).**
 
 1. Verify each claim in code, or by an experiment against the pinned version, before you present it. A theory is not a finding.
 2. Prefer the design that needs no new GitHub or GitHub Actions right: runner image or orchestrator first, then a `run_config` field, then a template change, then an App permission last.
 3. As Restate use grows, re-check an ADR's rule and its rejection reasons before you rely on them; amend the ADR when a reason no longer holds.
+4. When you move working behavior into Restate or behind a new caller, wrap the proven mechanism as it is (same command, same arguments). Change the mechanism only as a separate, explicit decision by the operator. Every merge into `testing` redeploys the testing orchestrator, so group multi-issue orchestrator changes in a feature branch.
 
 A tool the BuildDown control plane calls is a cross-repo contract: arguments arrive only inside `args`, its paging and `null` rules are documented, and its request and response are recorded from the real handler in `docs/contracts/<tool>/` for the control plane's tests. See `docs/mcp-server.md` § "Tools the control plane calls".
 
