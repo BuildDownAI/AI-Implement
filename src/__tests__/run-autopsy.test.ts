@@ -504,6 +504,29 @@ describe("control-plane estimates", () => {
       }
     }
   });
+  it.each(["implementation", "review"] as const)("escapes every pipe in %s model and fallback cells", stage => {
+    const plain: StatsPass = {
+      ...pass,
+      attribution: attr("codex", { model: "current-model-id" }),
+      implementFallbackFrom: "original-model-id",
+      reviewApproved: true,
+      reviewTelemetry: { ...reviewTelemetry, attribution: attr("codex", { model: "current-model-id" }) },
+      reviewFallbackFrom: "original-model-id",
+    };
+    const piped: StatsPass = stage === "implementation"
+      ? { ...plain, attribution: attr("codex", { model: "current|model|id" }), implementFallbackFrom: "original|model|id" }
+      : { ...plain, reviewTelemetry: { ...reviewTelemetry, attribution: attr("codex", { model: "current|model|id" }) }, reviewFallbackFrom: "original|model|id" };
+    const plainRow = stats([plain]).split("\n").find(line => line.startsWith("| 1 |"))!;
+    const row = stats([piped]).split("\n").find(line => line.startsWith("| 1 |"))!;
+    expect(row).toBe(plainRow.replace(
+      `${stage === "implementation" ? "success" : "approved"}; current-model-id (fallback from original-model-id)`,
+      `${stage === "implementation" ? "success" : "approved"}; current\\|model\\|id (fallback from original\\|model\\|id)`,
+    ));
+    expect(row.match(/(?<!\\)\|/g)).toHaveLength(8);
+    expect(plainRow.match(/\|/g)).toHaveLength(8);
+    expect(formatRunAutopsy({ ...AUTOPSY, passes: [piped] })).toContain(row);
+  });
+
   it("renders attributed models without prices", () => {
     expect(stats([pass])).toBe([
       "## Run stats — AII-1", "",

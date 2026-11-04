@@ -136,7 +136,7 @@ export function formatPassRow(p: StatsPass, prices?: RunModelPrices): string {
   const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
   const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
   const model = (attribution: InvocationAttributionV1 | undefined, from?: string) => attribution
-    ? `; ${attribution.model}${from ? ` (fallback from ${from})` : ""}` : "";
+    ? `; ${attribution.model.replace(/\|/g, "\\|")}${from ? ` (fallback from ${from.replace(/\|/g, "\\|")})` : ""}` : "";
   return `| ${p.iteration} | ${outcome}${model(p.attribution, p.implementFallbackFrom)} | ${formatTurnsCell(p)} | ${p.attempts ?? 1} | ${formatPassCost(p, prices)} | ${formatTokensCell(p)} | ${review}${model(p.reviewTelemetry?.attribution, p.reviewFallbackFrom)} |`;
 }
 
