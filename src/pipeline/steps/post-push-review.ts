@@ -7,7 +7,7 @@ import path from "node:path";
 import type { ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
+import { formatGitNameStatusSummary, formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
 import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
 import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
@@ -226,9 +226,8 @@ function resultMessage(result: SpawnResult): string {
   return (result.stderr || result.stdout || `exit ${result.exitCode}`).trim();
 }
 
-function llmResultMessage(result: { stdout?: string; stderr?: string; exitCode: number }): string {
-  const detail = (result.stderr || result.stdout || "").trim();
-  return detail ? `exit ${result.exitCode}: ${detail}` : `exit ${result.exitCode}`;
+function llmResultMessage(result: { stdout?: string; stderr?: string; errorMessage?: string; exitCode: number }): string {
+  return `exit ${result.exitCode}${formatLlmResultDetail(result)}`;
 }
 
 function compactErrorMessage(message: string): string {
@@ -1812,7 +1811,8 @@ async function runSelectedInternalReviewers(params: {
     if (reviewStageClassified && reviewStageClassified.category === "transient") {
       const failure = { ...reviewStageClassified, stage: "post-push-review", code: "PROVIDER_UNAVAILABLE" as const, retryable: false };
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
-      const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).`);
+      const modelErrorDetail = reviewResult.errorMessage?.trim() ? ` ${reviewFailureMessage(reviewResult)}` : "";
+      const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).${modelErrorDetail}`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "provider_unavailable";
       priorLlmFailure ||= reviewerGates(selection, provenance);
       await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
