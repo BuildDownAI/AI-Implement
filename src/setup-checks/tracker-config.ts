@@ -143,7 +143,7 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     tier: "core",
     onAdminPath: false,
     run: (ctx) => judgeLinear(ctx, (facts, projects) => perVisibleTeam(facts, projects, (team) => {
-      const lifecycle = [LINEAR_LABELS.planning, LINEAR_LABELS.planComplete, LINEAR_LABELS.working];
+      const lifecycle = [LINEAR_LABELS.planning.name, LINEAR_LABELS.planComplete.name, LINEAR_LABELS.working.name];
       const wrongCase = lifecycle.flatMap((name) => {
         const reused = reusableLabel(facts.labels[name], (label) => label.teamKey, team);
         return reused && reused.name !== name ? [`${reused.name} is used for ${name}`] : [];
@@ -163,7 +163,7 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     tier: "core",
     onAdminPath: false,
     run: (ctx) => judgeLinear(ctx, (facts) => {
-      const name = LINEAR_LABELS.readyForReview;
+      const name = LINEAR_LABELS.readyForReview.name;
       const found = facts.labels[name];
       if (found.some((label) => label.name === name)) return [{ state: "pass", detail: `The label ${name} exists` }];
       if (found.length > 0) {

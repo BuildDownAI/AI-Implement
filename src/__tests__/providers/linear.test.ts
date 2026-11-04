@@ -781,6 +781,7 @@ describe("LinearProvider.markPlanningStarted", () => {
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
+    expect(variables(fake, 2)).toEqual({ name: "AI-Planning" });
     expect(variables(fake, 3)).toEqual({ teamId: "team-uuid", name: "AI-Planning", color: "#8B5CF6" });
   });
 });
@@ -810,6 +811,25 @@ describe("LinearProvider.markPlanComplete", () => {
     expect(fake.calls).toHaveLength(7);
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
     expect(variables(fake, 6).labelIds).toEqual(["lo", "label-pc"]);
+  });
+
+  it("creates Plan-Complete with #10B981 when not found", async () => {
+    const fake = linear(
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // ensureTeamLabel: search returns empty → create
+      data({ issueLabels: { nodes: [] } }),
+      data({ issueLabelCreate: { issueLabel: { id: "new-label" } } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+    );
+
+    const p = new LinearProvider({});
+    await p.markPlanComplete("issue-1", "ENG", { awaitApproval: false });
+
+    expect(variables(fake, 3)).toEqual({ name: "Plan-Complete" });
+    expect(variables(fake, 4)).toEqual({ teamId: "team-uuid", name: "Plan-Complete", color: "#10B981" });
   });
 });
 
