@@ -116,6 +116,35 @@ export interface TrackerIssuePage {
   pageInfo: { hasNextPage: boolean; endCursor: string | null };
 }
 
+/** A label matched by name ignoring case: its exact name, and its team's key or null for a workspace label. */
+export interface FoundLabel {
+  name: string;
+  teamKey: string | null;
+}
+
+/** What one Linear read finds for the setup checks, which judge it (`src/setup-checks/tracker-config.ts`). */
+export type LinearSetupFacts =
+  | {
+      kind: "linear";
+      token: "refused";
+      /** Linear's HTTP status when it refused the credentials; null when it could not be reached. */
+      status: number | null;
+      error: string;
+    }
+  | {
+      kind: "linear";
+      token: "minted";
+      /** The pickup label as the poll reads it. */
+      pickupLabel: string;
+      /** The requested teams the app can see, each with the types of its `started` and `completed` states. */
+      teams: Record<string, string[]>;
+      /** For each label name the provider applies, every label matching it ignoring case, at workspace level or in a requested team. */
+      labels: Record<string, FoundLabel[]>;
+    };
+
+/** One provider's setup facts; each provider adds its own member. */
+export type TrackerSetupFacts = LinearSetupFacts;
+
 /** The tracker cannot be read and a retry will not help (a missing credential). `TrackerExport` answers it as terminal `tracker-unavailable`. */
 export class TrackerUnavailableError extends Error {
   constructor(message: string) {
@@ -183,6 +212,8 @@ export interface TicketingProvider {
 
   /** One page of the mapping's issues for the knowledge-graph export. Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
   listIssuesPage?(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage>;
+  /** The facts the setup checks judge for these teams, read without any write. Optional so a fork's custom provider still compiles. */
+  fetchSetupFacts?(teamKeys: string[]): Promise<TrackerSetupFacts>;
 }
 
 /** Configuration handed to provider factories. */

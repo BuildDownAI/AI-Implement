@@ -11,8 +11,11 @@ import { getEffectiveAllowlist, listAccessEntries, type AccessEntry, type Effect
 import { getMappings, type RepoMapping } from "../config.js";
 import { getDatabasePath, getDb, type DatabasePath } from "../dedup.js";
 import { getFlySessionsConfig, type FlySessionsConfig } from "../orchestrator-settings.js";
+import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
+import type { TicketingProvider, TrackerSetupFacts } from "../providers/types.js";
 import { getRunnerMode, type RunnerModeStatus } from "../runner-mode.js";
 import { ORCHESTRATOR_CONFIG_CHECKS } from "./orchestrator-config.js";
+import { TRACKER_CONFIG_CHECKS } from "./tracker-config.js";
 
 export type SetupCheckState = "pass" | "warn" | "fail" | "cannot-verify" | "not-applicable";
 export type SetupCheckTier = "core" | "mode" | "feature";
@@ -39,6 +42,14 @@ export const SETUP_CHECK_IDS = [
   "admin.providers",
   "admin.redirect-url",
   "admin.allowlist",
+  // tracker-config.ts
+  "tracker.provider",
+  "tracker.linear.credentials",
+  "tracker.linear.team-access",
+  "tracker.linear.pickup-label",
+  "tracker.linear.lifecycle-labels",
+  "tracker.linear.ready-for-review",
+  "tracker.linear.workflow-states",
 ] as const;
 
 export type SetupCheckId = (typeof SETUP_CHECK_IDS)[number];
@@ -84,6 +95,10 @@ export interface SetupCheckContext {
   databasePath(): DatabasePath;
   /** True when `dir` is on a different filesystem from `/`, which on Fly means a mounted volume. */
   onSeparateFilesystem(dir: string): boolean;
+  /** The provider for a ticketing provider id, built as the poll builds it. Throws when it cannot be built. */
+  trackerProvider(providerId: string): Promise<TicketingProvider>;
+  /** One provider's setup facts for its projects' teams, read once per context, or null when it reads none. */
+  trackerSetupFacts(providerId: string): Promise<TrackerSetupFacts | null>;
 }
 
 /**
@@ -94,7 +109,9 @@ export interface SetupCheckContext {
 export function createSetupCheckContext(
   overrides: Partial<SetupCheckContext> & Pick<SetupCheckContext, "restateStatus">,
 ): SetupCheckContext {
-  return {
+  const registry = new ProviderRegistry(providerConfigFromEnv(), () => ctx.mappings());
+  const setupFacts = new Map<string, Promise<TrackerSetupFacts | null>>();
+  const ctx: SetupCheckContext = {
     env: process.env,
     // A database error throws, so the check reports cannot-verify instead of reading a missing row.
     readSetting: (key) =>
@@ -106,8 +123,27 @@ export function createSetupCheckContext(
     effectiveAllowlist: getEffectiveAllowlist,
     databasePath: getDatabasePath,
     onSeparateFilesystem: (dir) => statSync(dir).dev !== statSync("/").dev,
+    trackerProvider: async (providerId) => {
+      const mapping = Object.values(ctx.mappings()).find((m) => m.ticketingProvider === providerId);
+      if (!mapping) throw new Error(`No project uses the ${providerId} tracker`);
+      return registry.forMapping(mapping);
+    },
+    // Every check that judges one provider's facts shares a single read per run.
+    trackerSetupFacts: (providerId) => {
+      let read = setupFacts.get(providerId);
+      if (!read) {
+        read = ctx.trackerProvider(providerId).then((provider) => {
+          if (!provider.fetchSetupFacts) return null;
+          const teams = Object.entries(ctx.mappings()).filter(([, m]) => m.ticketingProvider === providerId).map(([key]) => key);
+          return provider.fetchSetupFacts(teams);
+        });
+        setupFacts.set(providerId, read);
+      }
+      return read;
+    },
     ...overrides,
   };
+  return ctx;
 }
 
 /** What a check reports; the runner adds the check's own identity fields. */
@@ -123,7 +159,7 @@ export interface SetupCheck {
   run(ctx: SetupCheckContext): SetupCheckOutcome[] | Promise<SetupCheckOutcome[]>;
 }
 
-export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS];
+export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS, ...TRACKER_CONFIG_CHECKS];
 
 /** Runs every check. A check that throws reports `cannot-verify` with its error, and the others still run. */
 export async function runSetupChecks(

@@ -53,7 +53,7 @@ import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, count
 import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
-import { configureLinearAuth } from "./linear-app-auth.js";
+import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
@@ -312,12 +312,8 @@ function loadConfig(): AppConfig {
     console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
   }
 
-  const linearClientId = process.env.LINEAR_CLIENT_ID || null;
-  const linearClientSecret = process.env.LINEAR_CLIENT_SECRET || null;
-  if (!linearClientId || !linearClientSecret) {
+  if (!configureLinearAuthFromEnv()) {
     console.warn("[main] LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET not set — Linear mappings will be skipped (the ProviderRegistry tolerates missing per-provider config)");
-  } else {
-    configureLinearAuth(linearClientId, linearClientSecret);
   }
 
   return {
