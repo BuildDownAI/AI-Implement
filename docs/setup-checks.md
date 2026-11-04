@@ -88,5 +88,4 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.linear.team-access`](ticketing-providers.md#team-access) | A Linear project whose key names no team the app can see |
 | [`tracker.linear.pickup-label`](ticketing-providers.md#the-pickup-label) | No label with the pickup label's exact name at workspace level or in the team, or one only in a different case |
 | [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case |
-| [`tracker.linear.ready-for-review`](ticketing-providers.md#the-ready-for-review-label) | No `Ready for Review` label, which only creating it would show the app may make, or one in a different case |
 | [`tracker.linear.workflow-states`](ticketing-providers.md#workflow-states) | A team with no `started`-type or no `completed`-type state |

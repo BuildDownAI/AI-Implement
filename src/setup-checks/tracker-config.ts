@@ -143,7 +143,7 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     tier: "core",
     onAdminPath: false,
     run: (ctx) => judgeLinear(ctx, (facts, projects) => perVisibleTeam(facts, projects, (team) => {
-      const lifecycle = [LINEAR_LABELS.planning.name, LINEAR_LABELS.planComplete.name, LINEAR_LABELS.working.name];
+      const lifecycle = Object.values(LINEAR_LABELS).map((label) => label.name);
       const wrongCase = lifecycle.flatMap((name) => {
         const reused = reusableLabel(facts.labels[name], (label) => label.teamKey, team);
         return reused && reused.name !== name ? [`${reused.name} is used for ${name}`] : [];
@@ -155,30 +155,6 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: "Rename each label to the exact name shown.",
       };
     })),
-  },
-  {
-    id: "tracker.linear.ready-for-review",
-    title: "Linear Ready for Review label",
-    group: "tracker",
-    tier: "core",
-    onAdminPath: false,
-    run: (ctx) => judgeLinear(ctx, (facts) => {
-      const name = LINEAR_LABELS.readyForReview.name;
-      const found = facts.labels[name];
-      if (found.some((label) => label.name === name)) return [{ state: "pass", detail: `The label ${name} exists` }];
-      if (found.length > 0) {
-        return [{
-          state: "warn",
-          detail: `Only ${found.map((label) => label.name).join(" and ")} exists, which differs from ${name} in case. A finished run applies it, but the poll and the merge step look for the exact name.`,
-          fix: `Rename the label to exactly ${name}.`,
-        }];
-      }
-      return [{
-        state: "cannot-verify",
-        detail: `No ${name} label exists. The first finished run creates it at workspace level, which needs a workspace admin, and only that write would show whether the app is one.`,
-        fix: `Create a workspace label named exactly ${name} in Linear.`,
-      }];
-    }),
   },
   {
     id: "tracker.linear.workflow-states",

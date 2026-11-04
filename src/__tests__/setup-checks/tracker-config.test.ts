@@ -26,7 +26,6 @@ const LINEAR_IDS: SetupCheckId[] = [
   "tracker.linear.team-access",
   "tracker.linear.pickup-label",
   "tracker.linear.lifecycle-labels",
-  "tracker.linear.ready-for-review",
   "tracker.linear.workflow-states",
 ];
 
@@ -201,31 +200,15 @@ describe("tracker.linear.lifecycle-labels", () => {
     const outcomes = await run("tracker.linear.lifecycle-labels", onLinear(facts, "ENG", "OPS"));
     expect(outcomes).toMatchObject([{ project: "ENG", state: "pass" }, { project: "OPS", state: "warn" }]);
   });
-});
 
-describe("tracker.linear.ready-for-review", () => {
-  it("passes when the label exists with its exact name", async () => {
-    expect(await run("tracker.linear.ready-for-review", onLinear(makeLinearSetupFacts()))).toEqual([{ state: "pass", detail: "The label Ready for Review exists" }]);
-  });
-
-  it("warns when the label exists only in a different case", async () => {
-    const facts = makeLinearSetupFacts({ found: [{ name: "AI-Implement", teamKey: null }, { name: "Ready for review", teamKey: null }] });
-    expect(await run("tracker.linear.ready-for-review", onLinear(facts))).toEqual([
+  it("judges Ready for Review as it judges the other lifecycle labels", async () => {
+    const facts = makeLinearSetupFacts({ found: [{ name: "Ready for review", teamKey: null }] });
+    expect(await run("tracker.linear.lifecycle-labels", onLinear(facts))).toEqual([
       {
+        project: "ENG",
         state: "warn",
-        detail: "Only Ready for review exists, which differs from Ready for Review in case. A finished run applies it, but the poll and the merge step look for the exact name.",
-        fix: "Rename the label to exactly Ready for Review.",
-      },
-    ]);
-  });
-
-  it("cannot verify when no such label exists, since only creating it would show whether the app may", async () => {
-    const facts = makeLinearSetupFacts({ found: [{ name: "AI-Implement", teamKey: null }] });
-    expect(await run("tracker.linear.ready-for-review", onLinear(facts))).toEqual([
-      {
-        state: "cannot-verify",
-        detail: "No Ready for Review label exists. The first finished run creates it at workspace level, which needs a workspace admin, and only that write would show whether the app is one.",
-        fix: "Create a workspace label named exactly Ready for Review in Linear.",
+        detail: "Ready for review is used for Ready for Review. The orchestrator applies a label in a different case, but the poll and the label removal look for the exact name.",
+        fix: "Rename each label to the exact name shown.",
       },
     ]);
   });

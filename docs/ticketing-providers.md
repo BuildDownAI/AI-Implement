@@ -65,7 +65,7 @@ The admin UI warns about this on save, without blocking it: `POST /api/mappings`
 
 ## Linear setup
 
-The Linear provider relies on the app's credentials and on five things in the workspace. The setup checks get the app's token, then read the rest in one GraphQL request (`LinearProvider.fetchSetupFacts`), which never writes, and report each by id ([setup-checks.md § tracker](setup-checks.md#tracker)).
+The Linear provider relies on the app's credentials and on four things in the workspace. The setup checks get the app's token, then read the rest in one GraphQL request (`LinearProvider.fetchSetupFacts`), which never writes, and report each by id ([setup-checks.md § tracker](setup-checks.md#tracker)).
 
 ### The app's credentials
 
@@ -81,11 +81,7 @@ The poll matches the pickup label by its exact name (`labels: { name: { eq } }`)
 
 ### Lifecycle labels
 
-The lifecycle verbs apply `AI-Planning`, `Plan-Complete` and `AI-Working` (`LINEAR_LABELS`, `src/providers/linear.ts`) and create each at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); with neither, it creates the label in the team. The poll's label tests and `removeLabelByName` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
-
-### The Ready for Review label
-
-`markPrReady` applies `Ready for Review`, a workspace label. It reuses any label with that name ignoring case, and creates one at workspace level when none exists. Creating a workspace label needs workspace admin rights, which an app actor may not have (AII-231), so on a workspace without the label the first finished run can fail at that step. The poll and `markMerged` compare the exact name, so a label in a different case is applied but never recognized or removed.
+The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working` and, once a PR opens, `Ready for Review`. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
 
 ### Workflow states
 

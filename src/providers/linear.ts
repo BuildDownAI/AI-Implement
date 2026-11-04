@@ -26,7 +26,7 @@ interface GraphQLResponse<T> {
 /** How far back to scan completed feature nodes for roll-up (bounds the query). */
 const ROLLUP_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 
-/** The labels the lifecycle verbs apply and remove by name. The team ones are created at first use; `readyForReview` is a workspace label. */
+/** The labels the lifecycle verbs apply and remove by name, each created in the issue's team at first use unless the team or the workspace has it. */
 export const LINEAR_LABELS = {
   planning: { name: "AI-Planning", color: "#8B5CF6" },
   planComplete: { name: "Plan-Complete", color: "#10B981" },
@@ -119,7 +119,7 @@ export class LinearProvider implements TicketingProvider {
   private aiPlanningLabelCache = new Map<string, string>();
   private aiWorkingLabelCache = new Map<string, string>();
   private planCompleteLabelCache = new Map<string, string>();
-  private readyForReviewLabelId: string | null = null;
+  private readyForReviewLabelCache = new Map<string, string>();
   private teamIdByKey = new Map<string, string>();
   private inProgressStateByTeamKey = new Map<string, string>();
   private completedStateByTeamKey = new Map<string, string>();
@@ -697,38 +697,6 @@ export class LinearProvider implements TicketingProvider {
     return id;
   }
 
-  private async ensureWorkspaceReadyForReviewLabel(): Promise<string> {
-    if (this.readyForReviewLabelId !== null) return this.readyForReviewLabelId;
-
-    const searchData = await this.linearMutation<{
-      issueLabels: { nodes: Array<{ id: string }> };
-    }>(
-      `query {
-        issueLabels(filter: { name: { eqIgnoreCase: "${LINEAR_LABELS.readyForReview.name}" } }) {
-          nodes { id }
-        }
-      }`,
-      {},
-    );
-    if (searchData.issueLabels.nodes[0]) {
-      this.readyForReviewLabelId = searchData.issueLabels.nodes[0].id;
-      return this.readyForReviewLabelId;
-    }
-
-    const createData = await this.linearMutation<{
-      issueLabelCreate: { issueLabel: { id: string } };
-    }>(
-      `mutation {
-        issueLabelCreate(input: { name: "${LINEAR_LABELS.readyForReview.name}", color: "${LINEAR_LABELS.readyForReview.color}" }) {
-          issueLabel { id }
-        }
-      }`,
-      {},
-    );
-    this.readyForReviewLabelId = createData.issueLabelCreate.issueLabel.id;
-    return this.readyForReviewLabelId;
-  }
-
   private async getInProgressStateId(teamKey: string): Promise<string> {
     const cached = this.inProgressStateByTeamKey.get(teamKey);
     if (cached) return cached;
@@ -891,7 +859,8 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async markPrReady(issueId: string, _scopeKey: string, prUrl: string): Promise<boolean> {
-    const readyLabelId = await this.ensureWorkspaceReadyForReviewLabel();
+    const teamKey = await this.getTeamKeyForIssue(issueId);
+    const readyLabelId = await this.ensureTeamLabel(teamKey, LINEAR_LABELS.readyForReview, this.readyForReviewLabelCache);
 
     // Atomic label swap: remove AI-Working, add Ready for Review in a single
     // issueUpdate (matches legacy markIssueReadyForReview behaviour).
