@@ -268,3 +268,15 @@ describe("LinearProvider.fetchFeatureNodeRollUps — pickup label", () => {
     expect(rollUp.parent).toBeNull();
   });
 });
+
+describe("LinearProvider.fetchSetupFacts — pickup label", () => {
+  it("reads and reports the stored label, the one the poll searches for", async () => {
+    settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
+    linearAnswers({ teams: { nodes: [] }, issueLabels: { nodes: [], pageInfo: { hasNextPage: false } } });
+
+    const facts = await new LinearProvider({}).fetchSetupFacts(["ENG"]);
+
+    expect(facts).toMatchObject({ token: "minted", pickupLabel: "AI Implement - New" });
+    expect((lastCallBody().variables.names as unknown[])[0]).toEqual({ name: { eqIgnoreCase: "AI Implement - New" } });
+  });
+});

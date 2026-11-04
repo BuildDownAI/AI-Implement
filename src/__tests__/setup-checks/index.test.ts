@@ -1,9 +1,9 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { SetupCheck, SetupCheckContext, SetupCheckResult } from "../../setup-checks/index.js";
-import { makeAccessEntry, makeMapping } from "../helpers/builders.js";
-import { makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
+import { makeAccessEntry, makeMapping, makeProvider } from "../helpers/builders.js";
+import { makeLinearSetupFacts, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
 
 let dedup: typeof DedupModule;
@@ -26,6 +26,9 @@ function fakeCheck(overrides: Partial<SetupCheck> = {}): SetupCheck {
     ...overrides,
   };
 }
+
+const FAULTY_LINEAR = makeLinearSetupFacts({ teams: { ENG: ["started"] }, found: [{ name: "ai-implement", teamKey: "ENG" }, { name: "ai-working", teamKey: "ENG" }] });
+const REFUSED_LINEAR = { kind: "linear", token: "refused", status: 401, error: "Linear token mint failed (401): invalid_client" } as const;
 
 const SAVED_ROWS: Record<string, string> = { kg_base_repo: "Org/saved-repo", fly_process_level_secrets: "true" };
 const SAVED_ENTRIES = [makeAccessEntry(), makeAccessEntry({ kind: "domain", value: "example.com", role: "user" })];
@@ -87,6 +90,16 @@ const CONTEXTS: Record<string, SetupCheckContext> = {
     effectiveAllowlist: () => null,
     runnerMode: () => ({ mode: "fly", source: "env" }),
   }),
+  "Linear set up with faults": makeSetupCheckContext({
+    mappings: () => ({ ENG: makeMapping(), OPS: makeMapping({ ticketingProvider: "jira" }) }),
+    trackerProvider: async (id) => makeProvider(id === "linear" ? { fetchSetupFacts: async () => FAULTY_LINEAR } : { id }),
+    trackerSetupFacts: async (id) => (id === "linear" ? FAULTY_LINEAR : null),
+  }),
+  "Linear refusing the app": makeSetupCheckContext({
+    mappings: () => ({ ENG: makeMapping() }),
+    trackerProvider: async () => makeProvider({ fetchSetupFacts: async () => REFUSED_LINEAR }),
+    trackerSetupFacts: async () => REFUSED_LINEAR,
+  }),
   "SSO with no admin in the list": makeSetupCheckContext({
     env: { GOOGLE_OAUTH_CLIENT_ID: "gid", GOOGLE_OAUTH_CLIENT_SECRET: "gsecret", OAUTH_ALLOWED_DOMAINS: "example.com" },
     effectiveAllowlist: () => ({ entries: [makeAccessEntry({ kind: "domain", value: "example.com", role: "user", addedAt: 0, addedBy: null })], source: "env" }),
@@ -119,6 +132,7 @@ describe("SETUP_CHECKS", () => {
   });
 
   it("keeps every configured value out of id, title and state", async () => {
+    const MARKED_LINEAR = makeLinearSetupFacts({ pickupLabel: "marked-pickup", teams: { MARKED: [] }, found: [{ name: "Marked-Pickup", teamKey: "MARKED" }] });
     // Each value carries a marker no id or title contains, so a match can only be a value shown.
     const ctx = makeSetupCheckContext({
       env: {
@@ -141,6 +155,8 @@ describe("SETUP_CHECKS", () => {
       databasePath: () => ({ path: "/marked/dedup.sqlite", configured: "/marked/dedup.sqlite", fellBack: false }),
       mappings: () => ({ MARKED: makeMapping({ executionMode: "fly-machines" }) }),
       flySessions: () => ({ token: null, app: "marked-sessions-app", region: null, source: { app: "env", region: null } }),
+      trackerProvider: async () => makeProvider({ fetchSetupFacts: async () => MARKED_LINEAR }),
+      trackerSetupFacts: async () => MARKED_LINEAR,
     });
     for (const result of await resultsFor(ctx)) {
       expect([result.id, result.title, result.state].join(" ").toLowerCase(), result.id).not.toContain("marked");
@@ -239,6 +255,45 @@ describe("createSetupCheckContext", () => {
     expect(ctx.env).toBe(env);
     expect(ctx.restateStatus).toBe(restateStatus);
     expect(ctx.databasePath()).toEqual(dedup.getDatabasePath());
+  });
+
+  it("reads one provider's setup facts once per context, for the teams that provider serves", async () => {
+    const fetchSetupFacts = vi.fn(async () => makeLinearSetupFacts());
+    const ctx = checks.createSetupCheckContext({
+      restateStatus,
+      mappings: () => ({ ENG: makeMapping(), OPS: makeMapping(), SUP: makeMapping({ ticketingProvider: "jira" }) }),
+      trackerProvider: async () => makeProvider({ fetchSetupFacts }),
+    });
+
+    const [first, second] = await Promise.all([ctx.trackerSetupFacts("linear"), ctx.trackerSetupFacts("linear")]);
+    const later = await ctx.trackerSetupFacts("linear");
+
+    expect(fetchSetupFacts).toHaveBeenCalledTimes(1);
+    expect(fetchSetupFacts).toHaveBeenCalledWith(["ENG", "OPS"]);
+    expect([second, later]).toEqual([first, first]);
+  });
+
+  it("reads no facts from a provider without setup facts", async () => {
+    const ctx = checks.createSetupCheckContext({
+      restateStatus,
+      mappings: () => ({ SUP: makeMapping({ ticketingProvider: "jira" }) }),
+      trackerProvider: async () => makeProvider({ id: "jira" }),
+    });
+    expect(await ctx.trackerSetupFacts("jira")).toBeNull();
+  });
+
+  it("builds a project's provider as the poll does, and refuses a tracker no project uses", async () => {
+    // The module instance the context's registry reached, since testDb reset the registry before importing it.
+    const linearAuth = await import("../../linear-app-auth.js");
+    const mappings = () => ({ ENG: makeMapping() });
+
+    const unconfigured = checks.createSetupCheckContext({ restateStatus, mappings });
+    await expect(unconfigured.trackerProvider("jira")).rejects.toThrow("No project uses the jira tracker");
+    await expect(unconfigured.trackerProvider("linear")).rejects.toThrow(/linearClientId/);
+
+    linearAuth.configureLinearAuth("client-id", "client-secret");
+    const configured = checks.createSetupCheckContext({ restateStatus, mappings });
+    expect((await configured.trackerProvider("linear")).id).toBe("linear");
   });
 
   it("requires the caller to supply the Restate status reader", () => {

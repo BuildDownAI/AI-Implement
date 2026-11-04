@@ -10,6 +10,7 @@
 
 import { useReadOnlyDb } from "./dedup.js";
 import { parseHealthPort } from "./http-server.js";
+import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
 import { createSetupCheckContext, runSetupChecks, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus, type SetupCheckResult, type SetupCheckRun } from "./setup-checks/index.js";
 
@@ -17,6 +18,8 @@ export interface CheckSetupDependencies {
   checks: readonly SetupCheck[];
   /** Runs before any check reads, so no reader opens the database read-write. */
   useReadOnlyDb: () => void;
+  /** Configures tracker credentials as boot does, so the tracker checks can build their providers. */
+  configureTrackers: () => void;
   createContext: (restateStatus: () => SetupCheckRestateStatus) => SetupCheckContext;
   /** Fills the Fly sessions cache from Restate, as the server does each poll. */
   refreshRunnerBackend: () => Promise<void>;
@@ -30,6 +33,9 @@ export interface CheckSetupDependencies {
 const DEFAULT_DEPENDENCIES: CheckSetupDependencies = {
   checks: SETUP_CHECKS,
   useReadOnlyDb,
+  configureTrackers: () => {
+    configureLinearAuthFromEnv();
+  },
   createContext: (restateStatus) => createSetupCheckContext({ restateStatus }),
   refreshRunnerBackend: refreshRunnerBackendCache,
   fetch: (input, init) => fetch(input, init),
@@ -100,6 +106,7 @@ export async function runCheckSetup(
   }
 
   deps.useReadOnlyDb();
+  deps.configureTrackers();
   const restate = await readRestateStatus(deps);
   // The Fly sessions app can live only in Restate, so read it the way the server does once Restate answers.
   if (!(restate instanceof Error) && restate.registration.state === "registered") await deps.refreshRunnerBackend();

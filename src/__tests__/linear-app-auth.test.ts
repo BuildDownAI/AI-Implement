@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   configureLinearAuth,
+  configureLinearAuthFromEnv,
   isLinearAuthConfigured,
+  LinearApiError,
   getLinearToken,
   withLinearToken,
   clearLinearTokenCache,
@@ -84,6 +86,37 @@ describe("getLinearToken", () => {
   it("throws when the mint request fails", async () => {
     mintEndpoint({ status: 401, text: "invalid_client" });
     await expect(getLinearToken()).rejects.toThrow(/401/);
+  });
+
+  it("throws a refused mint as a LinearApiError carrying Linear's status and body", async () => {
+    mintEndpoint({ status: 401, text: "invalid_client" });
+    const err = await getLinearToken().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LinearApiError);
+    expect(err).toMatchObject({ status: 401, bodyText: "invalid_client", message: "Linear token mint failed (401): invalid_client" });
+  });
+});
+
+describe("configureLinearAuthFromEnv", () => {
+  it("configures the credential from both variables, and says so", async () => {
+    __resetLinearAuthForTest();
+    const fake = mintEndpoint(minted("from_env"));
+
+    expect(configureLinearAuthFromEnv({ LINEAR_CLIENT_ID: "env-id", LINEAR_CLIENT_SECRET: "env-secret" })).toBe(true);
+    expect(isLinearAuthConfigured()).toBe(true);
+    await getLinearToken();
+    const sent = new URLSearchParams(fake.calls[0].body);
+    expect([sent.get("client_id"), sent.get("client_secret")]).toEqual(["env-id", "env-secret"]);
+  });
+
+  it.each([
+    ["neither variable", {}],
+    ["only the id", { LINEAR_CLIENT_ID: "env-id" }],
+    ["only the secret", { LINEAR_CLIENT_SECRET: "env-secret" }],
+    ["a blank id", { LINEAR_CLIENT_ID: "", LINEAR_CLIENT_SECRET: "env-secret" }],
+  ])("leaves the credential unconfigured, and says so, with %s", (_case, env) => {
+    __resetLinearAuthForTest();
+    expect(configureLinearAuthFromEnv(env)).toBe(false);
+    expect(isLinearAuthConfigured()).toBe(false);
   });
 });
 

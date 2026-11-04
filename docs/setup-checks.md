@@ -76,3 +76,17 @@ The orchestrator's own environment and settings (`ORCHESTRATOR_CONFIG_CHECKS`, `
 | [`admin.providers`](orchestrator-configuration.md#what-boot-warns-about) | A sign-in provider that boot drops, with the reason |
 | [`admin.redirect-url`](orchestrator-configuration.md#what-boot-warns-about) | A sign-in provider without `OAUTH_REDIRECT_BASE_URL` |
 | [`admin.allowlist`](orchestrator-configuration.md#the-sign-in-allowlist) | SSO as the only admin path with no admin address in the list; with BuildDown configured it passes, naming the organization role claim |
+
+### tracker
+
+The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracker-config.ts`), explained in [ticketing-providers.md](ticketing-providers.md). Each provider reads its own facts once per run (`fetchSetupFacts`), and the checks judge them; a run that cannot read them reports its Linear checks as *cannot verify*, with the reason.
+
+| Id | Reports |
+|---|---|
+| [`tracker.provider`](ticketing-providers.md#choosing-a-provider-per-mapping) | A tracker in use whose provider cannot be built, or that has no setup checks |
+| [`tracker.linear.credentials`](ticketing-providers.md#the-apps-credentials) | Linear refusing the app's credentials, with its HTTP status |
+| [`tracker.linear.team-access`](ticketing-providers.md#team-access) | A Linear project whose key names no team the app can see |
+| [`tracker.linear.pickup-label`](ticketing-providers.md#the-pickup-label) | No label with the pickup label's exact name at workspace level or in the team, or one only in a different case |
+| [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case |
+| [`tracker.linear.ready-for-review`](ticketing-providers.md#the-ready-for-review-label) | No `Ready for Review` label, which only creating it would show the app may make, or one in a different case |
+| [`tracker.linear.workflow-states`](ticketing-providers.md#workflow-states) | A team with no `started`-type or no `completed`-type state |

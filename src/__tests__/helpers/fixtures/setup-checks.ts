@@ -1,3 +1,5 @@
+import { LINEAR_LABELS } from "../../../providers/linear.js";
+import type { FoundLabel, LinearSetupFacts } from "../../../providers/types.js";
 import type { SetupCheckContext } from "../../../setup-checks/index.js";
 
 /**
@@ -18,6 +20,29 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
     restateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
     databasePath: () => ({ path: "/data/dedup.sqlite", configured: "/data/dedup.sqlite", fellBack: false }),
     onSeparateFilesystem: () => true,
+    trackerProvider: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
+    // A provider that cannot be built has no facts to read either, as in createSetupCheckContext.
+    trackerSetupFacts: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
     ...overrides,
+  };
+}
+
+/**
+ * Linear's setup facts after a minted token, built as `LinearProvider.fetchSetupFacts` builds them: every label
+ * the read asks for, under each name it matches ignoring case. By default one team, ENG, with a started and a
+ * completed state, and the pickup and Ready for Review labels at workspace level.
+ */
+export function makeLinearSetupFacts({
+  pickupLabel = "AI-Implement",
+  teams = { ENG: ["started", "completed"] },
+  found = [{ name: "AI-Implement", teamKey: null }, { name: LINEAR_LABELS.readyForReview, teamKey: null }],
+}: { pickupLabel?: string; teams?: Record<string, string[]>; found?: FoundLabel[] } = {}): Extract<LinearSetupFacts, { token: "minted" }> {
+  const names = [pickupLabel, ...Object.values(LINEAR_LABELS)];
+  return {
+    kind: "linear",
+    token: "minted",
+    pickupLabel,
+    teams,
+    labels: Object.fromEntries(names.map((name) => [name, found.filter((label) => label.name.toLowerCase() === name.toLowerCase())])),
   };
 }

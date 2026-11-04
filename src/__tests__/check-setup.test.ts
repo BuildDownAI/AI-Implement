@@ -43,6 +43,7 @@ function deps(overrides: Partial<CheckSetupDependencies> = {}, context: Partial<
   const base: CheckSetupDependencies = {
     checks: [check()],
     useReadOnlyDb: vi.fn(),
+    configureTrackers: vi.fn(),
     createContext: (restateStatus) => makeSetupCheckContext({ ...context, restateStatus }),
     refreshRunnerBackend: vi.fn(async () => {}),
     fetch: orchestratorAnswering().fetch,
@@ -82,19 +83,22 @@ describe("runCheckSetup arguments", () => {
   });
 });
 
-describe("the database", () => {
-  it("is switched to read-only before any check reads it", async () => {
+describe("before any check reads", () => {
+  it("switches the database to read-only, then configures tracker credentials as boot does", async () => {
     const order: string[] = [];
     const d = deps({
       useReadOnlyDb: () => {
         order.push("read-only");
+      },
+      configureTrackers: () => {
+        order.push("trackers");
       },
       checks: [check({ run: () => (order.push("check"), [{ state: "pass" }]) })],
     });
 
     await runCheckSetup([], d.deps);
 
-    expect(order).toEqual(["read-only", "check"]);
+    expect(order).toEqual(["read-only", "trackers", "check"]);
   });
 });
 
