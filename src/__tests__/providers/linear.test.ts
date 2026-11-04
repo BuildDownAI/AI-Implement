@@ -1284,4 +1284,30 @@ describe("LinearProvider.fetchSetupFacts", () => {
 
     expect(await new LinearProvider({}).fetchSetupFacts(["ENG"])).toEqual({ kind: "linear", token: "refused", status: null, error: "fetch failed" });
   });
+
+  it("reports a cached token Linear has revoked, which no new mint replaces, as refused credentials", async () => {
+    // The beforeEach token is cached and in date, so only the query reveals it was revoked, as a rotated client secret does.
+    const fake = fakeFetch({
+      "POST /graphql": { status: 401, text: "Authentication required" },
+      "POST /oauth/token": { status: 401, text: "invalid_client" },
+    }).install();
+
+    expect(await new LinearProvider({}).fetchSetupFacts(["ENG"])).toEqual({
+      kind: "linear",
+      token: "refused",
+      status: 401,
+      error: "Linear token mint failed (401): invalid_client",
+    });
+    expect(fake.calls.map((call) => call.path)).toEqual(["/graphql", "/oauth/token", "/oauth/token"]);
+  });
+
+  it("rethrows a query Linear refuses while the app's token still holds, with no extra mint", async () => {
+    // No token route: a mint would fail the test.
+    const fake = fakeFetch({ "POST /graphql": { status: 400, text: "Query too complex" } }).install();
+
+    const read = new LinearProvider({}).fetchSetupFacts(["ENG"]);
+    await expect(read).rejects.toBeInstanceOf(LinearApiError);
+    await expect(read).rejects.toMatchObject({ status: 400 });
+    expect(fake.calls.map((call) => call.path)).toEqual(["/graphql"]);
+  });
 });

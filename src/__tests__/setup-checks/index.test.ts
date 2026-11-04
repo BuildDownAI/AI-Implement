@@ -28,9 +28,9 @@ function fakeCheck(overrides: Partial<SetupCheck> = {}): SetupCheck {
 }
 
 const FAULTY_LINEAR = makeLinearSetupFacts({ teams: { ENG: ["started"] }, found: [{ name: "ai-implement", teamKey: "ENG" }, { name: "ai-working", teamKey: "ENG" }] });
-const REFUSED_LINEAR ={ kind: "linear", token: "refused", status: 401, error: "Linear token mint failed (401): invalid_client" } as const;
+const REFUSED_LINEAR = { kind: "linear", token: "refused", status: 401, error: "Linear token mint failed (401): invalid_client" } as const;
 
-const SAVED_ROWS: Record<string, string> ={ kg_base_repo: "Org/saved-repo", fly_process_level_secrets: "true" };
+const SAVED_ROWS: Record<string, string> = { kg_base_repo: "Org/saved-repo", fly_process_level_secrets: "true" };
 const SAVED_ENTRIES = [makeAccessEntry(), makeAccessEntry({ kind: "domain", value: "example.com", role: "user" })];
 
 /** Contexts that between them reach every check's pass, warn, fail, cannot-verify and not-applicable branches. */

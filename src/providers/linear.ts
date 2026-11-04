@@ -93,6 +93,21 @@ function labeledAncestorChain(parent: AncestorNode): FeatureBranchChainEntry[] {
   return collected.reverse();
 }
 
+/** Linear's refusal of the app's token, as setup facts, or null while the app holds a token. */
+async function tokenRefusal(): Promise<LinearSetupFacts | null> {
+  try {
+    await getLinearToken();
+    return null;
+  } catch (err) {
+    return {
+      kind: "linear",
+      token: "refused",
+      status: err instanceof LinearApiError ? err.status : null,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export class LinearProvider implements TicketingProvider {
   readonly id = "linear";
   private static readonly MOVABLE_STATE_TYPES = new Set(["triage", "backlog", "unstarted"]);
@@ -178,16 +193,22 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async fetchSetupFacts(teamKeys: string[]): Promise<LinearSetupFacts> {
+    const refused = await tokenRefusal();
+    if (refused) return refused;
     try {
-      await getLinearToken();
+      return await this.querySetupFacts(teamKeys);
     } catch (err) {
-      return {
-        kind: "linear",
-        token: "refused",
-        status: err instanceof LinearApiError ? err.status : null,
-        error: err instanceof Error ? err.message : String(err),
-      };
+      // A cached token revoked since it was minted, as a rotated client secret does, fails the query with a 401, and the re-mint after it is refused too.
+      // That is the credentials' fault, so report it as the first mint's refusal is reported.
+      if (err instanceof LinearApiError) {
+        const refusedNow = await tokenRefusal();
+        if (refusedNow) return refusedNow;
+      }
+      throw err;
     }
+  }
+
+  private async querySetupFacts(teamKeys: string[]): Promise<LinearSetupFacts> {
     const pickupLabel = getLinearPickupLabel();
     const names = [pickupLabel, ...Object.values(LINEAR_LABELS)];
     const data = await this.linearMutation<{
