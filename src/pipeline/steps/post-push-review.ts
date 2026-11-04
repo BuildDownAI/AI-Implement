@@ -7,7 +7,7 @@ import path from "node:path";
 import type { ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
+import { formatGitNameStatusSummary, formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
 import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
 import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
@@ -227,8 +227,7 @@ function resultMessage(result: SpawnResult): string {
 }
 
 function llmResultMessage(result: { stdout?: string; stderr?: string; errorMessage?: string; exitCode: number }): string {
-  const detail = (result.errorMessage || result.stderr || result.stdout || "").trim();
-  return detail ? `exit ${result.exitCode}: ${detail}` : `exit ${result.exitCode}`;
+  return `exit ${result.exitCode}${formatLlmResultDetail(result)}`;
 }
 
 function compactErrorMessage(message: string): string {
