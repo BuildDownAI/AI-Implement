@@ -418,6 +418,11 @@ inheritance. A fallback must differ from the resolved primary model and shares t
 stage's account profile. The resolved admin route includes `values.fallbackModel`
 and `sources.fallbackModel` (null when absent).
 
+Operators edit the orchestrator default in the "Fallback model" column of the
+Orchestrator stage defaults card on Models & providers. A project override is edited
+on the project dialog's Agents tab: choose Inherit or override the value. Inherit saves
+`null`.
+
 Preparation freezes these values in `resolved_config_json.fallbackModels` alongside
 the stages and profiles, and returns them separately on its ready result. Retries
 reuse the dispatch's stored values; old rows have no fallbacks. The five-field
