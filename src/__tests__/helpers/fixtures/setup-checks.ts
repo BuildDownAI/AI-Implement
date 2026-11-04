@@ -35,9 +35,9 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
 export function makeLinearSetupFacts({
   pickupLabel = "AI-Implement",
   teams = { ENG: ["started", "completed"] },
-  found = [{ name: "AI-Implement", teamKey: null }, { name: LINEAR_LABELS.readyForReview, teamKey: null }],
+  found = [{ name: "AI-Implement", teamKey: null }, { name: LINEAR_LABELS.readyForReview.name, teamKey: null }],
 }: { pickupLabel?: string; teams?: Record<string, string[]>; found?: FoundLabel[] } = {}): Extract<LinearSetupFacts, { token: "minted" }> {
-  const names = [pickupLabel, ...Object.values(LINEAR_LABELS)];
+  const names = [pickupLabel, ...Object.values(LINEAR_LABELS).map((label) => label.name)];
   return {
     kind: "linear",
     token: "minted",

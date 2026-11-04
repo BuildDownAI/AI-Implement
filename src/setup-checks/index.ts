@@ -48,7 +48,6 @@ export const SETUP_CHECK_IDS = [
   "tracker.linear.team-access",
   "tracker.linear.pickup-label",
   "tracker.linear.lifecycle-labels",
-  "tracker.linear.ready-for-review",
   "tracker.linear.workflow-states",
 ] as const;
 

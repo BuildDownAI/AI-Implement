@@ -9,7 +9,7 @@ import {
   __resetLinearAuthForTest,
 } from "../../linear-app-auth.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
-import { fakeFetch, type FakeFetch, type Reply } from "../helpers/fake-fetch.js";
+import { fakeFetch, type FakeFetch, type Reply, type ReplyInit } from "../helpers/fake-fetch.js";
 import { linearData as data, linearGraphql } from "../helpers/replies/linear.js";
 
 // Linear auth lives in the linear-app-auth singleton now (not on ProviderConfig). Configure it
@@ -781,6 +781,7 @@ describe("LinearProvider.markPlanningStarted", () => {
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
+    expect(variables(fake, 2)).toEqual({ name: "AI-Planning" });
     expect(variables(fake, 3)).toEqual({ teamId: "team-uuid", name: "AI-Planning", color: "#8B5CF6" });
   });
 });
@@ -810,6 +811,25 @@ describe("LinearProvider.markPlanComplete", () => {
     expect(fake.calls).toHaveLength(7);
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
     expect(variables(fake, 6).labelIds).toEqual(["lo", "label-pc"]);
+  });
+
+  it("creates Plan-Complete with #10B981 when not found", async () => {
+    const fake = linear(
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // ensureTeamLabel: search returns empty → create
+      data({ issueLabels: { nodes: [] } }),
+      data({ issueLabelCreate: { issueLabel: { id: "new-label" } } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+    );
+
+    const p = new LinearProvider({});
+    await p.markPlanComplete("issue-1", "ENG", { awaitApproval: false });
+
+    expect(variables(fake, 3)).toEqual({ name: "Plan-Complete" });
+    expect(variables(fake, 4)).toEqual({ teamId: "team-uuid", name: "Plan-Complete", color: "#10B981" });
   });
 });
 
@@ -892,24 +912,89 @@ describe("LinearProvider.markImplementing", () => {
 });
 
 describe("LinearProvider.markPrReady", () => {
+  /** Linear answering each of markPrReady's requests by what it asks, so a test holds whatever order they come in. */
+  const workspace = (labels: Array<{ id: string; team: { id: string } | null }>) => {
+    const created: unknown[] = [];
+    const fake = fakeFetch({ "POST /graphql": (call) => {
+      const { query, variables: vars } = JSON.parse(call.body) as { query: string; variables: Record<string, unknown> };
+      if (query.includes("issueLabelCreate")) {
+        created.push(vars);
+        return data({ issueLabelCreate: { issueLabel: { id: "label-rfr-eng" } } }) as ReplyInit;
+      }
+      if (query.includes("issueLabels(")) return data({ issueLabels: { nodes: labels } }) as ReplyInit;
+      if (query.includes("teams(")) return data({ teams: { nodes: [{ id: "team-eng", key: "ENG" }] } }) as ReplyInit;
+      if (query.includes("team { key }")) return data({ issue: { team: { key: "ENG" } } }) as ReplyInit;
+      if (query.includes("labels { nodes { id name } }")) return data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }] } } }) as ReplyInit;
+      if (query.includes("issueUpdate")) return data({ issueUpdate: { success: true } }) as ReplyInit;
+      return data({ commentCreate: { success: true } }) as ReplyInit;
+    } }).install();
+    const labelSwap = () => fake.calls.map((c) => JSON.parse(c.body)).find((b) => b.query.includes("issueUpdate"))?.variables.labelIds;
+    return { created, labelSwap };
+  };
+
+  it("creates Ready for Review in the issue's team when no label exists, which needs no workspace admin", async () => {
+    const linearApi = workspace([]);
+    await new LinearProvider({}).markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
+
+    expect(linearApi.created).toEqual([{ teamId: "team-eng", name: "Ready for Review", color: "#4ecdc4" }]);
+    expect(linearApi.labelSwap()).toEqual(["label-rfr-eng"]);
+  });
+
+  it("never applies another team's Ready for Review label, which this team's issues cannot carry", async () => {
+    const linearApi = workspace([{ id: "label-rfr-ops", team: { id: "team-ops" } }]);
+    await new LinearProvider({}).markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
+
+    expect(linearApi.created).toEqual([{ teamId: "team-eng", name: "Ready for Review", color: "#4ecdc4" }]);
+    expect(linearApi.labelSwap()).toEqual(["label-rfr-eng"]);
+  });
+
+  it("keeps Ready for Review's label apart from the AI-Working label the same team already resolved", async () => {
+    const fake = linear(
+      // markImplementing: team key, team id, AI-Working search, label fetch, update, state (not movable)
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ issue: { state: { type: "started" } } }),
+      // markPrReady: team key, then its own search, since the team id is cached and its label is not
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ issueLabels: { nodes: [{ id: "label-rfr", team: null }] } }),
+      data({ issue: { labels: { nodes: [{ id: "label-aw", name: "AI-Working" }] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ commentCreate: { success: true } }),
+    );
+
+    const p = new LinearProvider({});
+    await p.markImplementing("issue-1", "ENG");
+    await p.markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
+
+    expect(variables(fake, 7)).toEqual({ name: "Ready for Review" });
+    expect(variables(fake, 9)).toEqual({ issueId: "issue-1", labelIds: ["label-rfr"] });
+  });
+
   it("swaps AI-Working for Ready for Review atomically and posts a PR comment", async () => {
     const fake = linear(
-      // 1. ensureWorkspaceReadyForReviewLabel: search workspace
-      data({ issueLabels: { nodes: [{ id: "label-rfr" }] } }),
-      // 2. fetch issue labels for swap
+      // 1. getTeamKeyForIssue
+      data({ issue: { team: { key: "ENG" } } }),
+      // 2. getTeamIdByKey
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // 3. ensureTeamLabel: find the existing Ready for Review (workspace-level)
+      data({ issueLabels: { nodes: [{ id: "label-rfr", team: null }] } }),
+      // 4. fetch issue labels for swap
       data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } }),
-      // 3. issueUpdate label swap
+      // 5. issueUpdate label swap
       data({ issueUpdate: { success: true } }),
-      // 4. postComment
+      // 6. postComment
       data({ commentCreate: { success: true } }),
     );
 
     const p = new LinearProvider({});
     await p.markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
 
-    expect(fake.calls).toHaveLength(4);
-    expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
-    expect(variables(fake, 3)).toEqual({
+    expect(fake.calls).toHaveLength(6);
+    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
+    expect(variables(fake, 5)).toEqual({
       issueId: "issue-1",
       body: "AI implementation PR: https://github.com/o/r/pull/7",
     });
