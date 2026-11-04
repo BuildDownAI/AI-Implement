@@ -176,6 +176,53 @@ describe("postPushReviewStep", () => {
     expect(comments.join("\n")).toContain(REVIEW_LINK);
   });
 
+  it.each(["posted", "503", "shortened"])("publishes before a fix and reuses the result on no changes: %s", async (outcome) => {
+    const events: string[] = [];
+    publicationFetch = fakeFetch({ "POST /runner/review-publication": async () => {
+      await Promise.resolve();
+      events.push("published");
+      return outcome === "503" ? { status: 503 } : { json: { status: "posted", reviewUrl: "https://github.com/acme/app/pull/42#pullrequestreview-80" } };
+    } }).install();
+    const report = outcome === "shortened" ? "Full evidence. ".repeat(3600) : "Complete reviewer evidence";
+    const comments: string[] = [];
+    const gh = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        const body = args[args.indexOf("--body") + 1];
+        comments.push(body);
+        if (body.includes("starting fix pass")) events.push("status");
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => {
+      if (invoke.mock.calls.length > 1) {
+        events.push("fix");
+        return structuredReviewResult({ fixed: [], testing: [], notes: "no changes" });
+      }
+      return structuredReviewResult({ approved: false, findings: [
+        { severity: "blocking", body: "Mapped bug. Fix the new line.", path: "src/a.ts", line: 1 },
+      ], summary: report });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 3, reviewProviders: [], ghSpawn: gh,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "code-review", gates: true }], trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review")]),
+    }, { report: vi.fn(async () => undefined) });
+    expect(out.terminationReason).toBe("no_changes");
+    expect(events).toEqual(["published", "status", "fix"]);
+    expect(publicationFetch.calls).toHaveLength(1);
+    const payload = JSON.parse(publicationFetch.calls[0].body);
+    expect(payload).toMatchObject({ headSha: PR_HEAD_SHA, iteration: 1 });
+    if (outcome !== "shortened") expect(payload.comments).toEqual([expect.objectContaining({ path: "src/a.ts", line: 1 })]);
+    const status = comments.find(body => body.includes("starting fix pass"));
+    expect(status).toContain("Mapped bug. Fix the new line.");
+    if (outcome === "posted") expect(status).toContain(REVIEW_LINK);
+    else {
+      expect(comments.join("\n")).toContain(report.trim());
+      expect(status).not.toContain(REVIEW_LINK);
+      if (outcome === "shortened") expect(status).toContain("[Shortened reviewer report]");
+    }
+  });
+
   it.each(["external", "moved-head", "unreadable-head", "unreadable-head-oversized", "overflow", "oversized", "multilingual-oversized", "multilingual-byte-only-oversized", "multilingual-update-oversized"])("bounds publication and preserves evidence: %s", async (scenario) => {
     const warn = vi.spyOn(console, "warn");
     const statusComments: string[] = [];
@@ -633,12 +680,16 @@ describe("postPushReviewStep", () => {
     });
   });
 
-  it("defaults to two fix passes plus a final review", async () => {
+  it.each([false, true])("defaults to two fix passes plus a final review (approved: %s)", async (approved) => {
     const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
     const ghComments: string[] = [];
     const gitPushCalls: string[][] = [];
+    const publicationsBeforePush: number[] = [];
     const gitSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "push") gitPushCalls.push(args);
+      if (args[0] === "push") {
+        gitPushCalls.push(args);
+        publicationsBeforePush.push(publicationFetch.calls.length);
+      }
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
@@ -653,7 +704,14 @@ describe("postPushReviewStep", () => {
       }
       return { stdout: "", exitCode: 0 };
     });
-    const ctx = makeCtx(vi.fn(async () => (structuredReviewResult(notApproved))));
+    const publicationsBeforeFix: number[] = [];
+    const invoke = vi.fn(async () => {
+      if (invoke.mock.calls.length % 2 === 0) publicationsBeforeFix.push(publicationFetch.calls.length);
+      return structuredReviewResult(approved && invoke.mock.calls.length === 5
+        ? { approved: true, blocking_issues: [], feedback: "All fixed", score: 9, progress_delta: 1 }
+        : notApproved);
+    });
+    const ctx = makeCtx(invoke);
 
     const out = await runReview(
       ctx,
@@ -661,13 +719,15 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(false);
+    expect(out.approved).toBe(approved);
     expect(out.iterations).toBe(3);
-    expect(publicationFetch.calls.map(call => JSON.parse(call.body).iteration)).toEqual([3]);
+    expect(publicationFetch.calls.map(call => JSON.parse(call.body).iteration)).toEqual([1, 2, 3]);
     expect(gitPushCalls.length).toBe(2);
+    expect(publicationsBeforeFix).toEqual([1, 2]);
+    expect(publicationsBeforePush).toEqual([1, 2]);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 1/2"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 2/2"))).toBe(true);
-    expect(ghComments.some((c) => c.includes("cap") && c.includes("Reached review cap (3 iterations)"))).toBe(true);
+    expect(ghComments.some((c) => approved ? c.includes("✅ Approved (3 iterations)") : c.includes("Reached review cap (3 iterations)"))).toBe(true);
   });
 
   it("runs a fix pass when reviewer approves but reports actionable issues", async () => {
@@ -3013,7 +3073,8 @@ describe("postPushReviewStep", () => {
     expect(fixPrompt).toContain("Required external review findings");
     expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(reviewComment).not.toContain("Reviewer summary:");
+    expect(reviewComment).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).not.toContain("Reviewer summary:");
     expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(1);
   });
 
@@ -3695,7 +3756,8 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).toContain("fix pass 1/2");
     expect(reviewComment).toContain("Blocking issues:\n1. **Fix auth flow**");
     expect(reviewComment).toContain("2. **Add regression test**");
-    expect(reviewComment).toContain("Reviewer summary:\nThe implementation is incomplete.");
+    expect(reviewComment).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).toContain("The implementation is incomplete.");
     expect(reviewComment).not.toContain("Feedback:\n");
   });
 
@@ -4008,7 +4070,8 @@ describe("postPushReviewStep", () => {
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
     expect(reviewComment).toContain("Blocking issues:\n1. **Parse failure**");
     expect(reviewComment).toContain(`Problem: ${longIssue}`);
-    expect(reviewComment).not.toContain("Reviewer summary:");
+    expect(reviewComment).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).not.toContain("Reviewer summary:");
   });
 
   it("posts a concrete fix summary when the fixer reports one", async () => {

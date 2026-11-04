@@ -18,6 +18,8 @@ import {
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { RepoMapping, ReviewerSelection } from "../config.js";
 import { makeMapping } from "./helpers/builders.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
+import { managedRunConfigFields } from "../managed-dispatch-auth.js";
 
 const full: RunConfigV1 = {
   v: 1,
@@ -1022,6 +1024,58 @@ describe("public model prices envelope", () => {
       const built = buildRunConfig({ issue: full.issue, mapping: makeMapping(), runnerPhase: "implementation", retryPolicy: null, modelPrices });
       expect(built).not.toHaveProperty("modelPrices");
       expect(decodeRunConfig(encodeRunConfig(built))).not.toHaveProperty("modelPrices");
+    }
+  });
+});
+
+describe("modelFallbacks", () => {
+  it.each([{ planning: "x" }, { planning: "x".repeat(128), implementation: "openai/model:v1", review: "review" }])("preserves public maps %j through builders and transports", (modelFallbacks) => {
+    const input = { issue: full.issue, mapping: makeMapping(), baseBranch: "testing", retryPolicy: DEFAULT_RETRY_POLICY, modelFallbacks };
+    for (const built of [buildImplRunConfig(input), buildRunConfig({ ...input, runnerPhase: "planning" })]) {
+      expect(built.modelFallbacks).toEqual(modelFallbacks);
+      expect(decodeRunConfig(encodeRunConfig(built)).modelFallbacks).toEqual(modelFallbacks);
+      expect(decodeTrustedRunConfig(encodeTrustedRunConfig(built)).modelFallbacks).toEqual(modelFallbacks);
+      expect(diagnosticProjection(built).modelFallbacks).toEqual(modelFallbacks);
+    }
+  });
+
+  it.each([null, [], {}, { unknown: "x" }, { planning: "" }, { planning: 1 }, { planning: "a b" }, { planning: "a\n" }, { planning: "é" }, { planning: "x".repeat(129) }, { planning: "ok", review: false }])("drops invalid or empty maps %j without losing config", (modelFallbacks) => {
+    const raw = Buffer.from(JSON.stringify({ ...full, modelFallbacks })).toString("base64");
+    for (const decode of [decodeRunConfig, decodeTrustedRunConfig]) {
+      expect(decode(raw)).toEqual(decode(encodeRunConfig(full)));
+      expect(decode(raw)).not.toHaveProperty("modelFallbacks");
+    }
+  });
+
+  it("keeps no-fallback envelopes byte-for-byte unchanged", () => {
+    const input = { issue: full.issue, mapping: makeMapping(), retryPolicy: null, runnerPhase: "planning" as const };
+    const before = buildRunConfig(input);
+    expect(encodeRunConfig(buildRunConfig({ ...input, modelFallbacks: {} }))).toBe(encodeRunConfig(before));
+    const minimal = { v: 1 as const, issue: full.issue };
+    expect(encodeRunConfig({ ...minimal, modelFallbacks: {} })).toBe(Buffer.from(JSON.stringify(minimal)).toString("base64"));
+  });
+
+  it("matches the pre-change trusted managed envelope bytes without fallbacks", () => {
+    // Captured with HEAD's pre-modelFallbacks builder and trusted encoder. Keep this
+    // fixed: deriving expected bytes with the current builder hides wire regressions.
+    const expected = readFileSync(new URL("./helpers/fixtures/managed-run-config-pre-fallbacks.json", import.meta.url), "utf8").trimEnd();
+    for (const fallbackModels of [undefined, {}]) {
+      const config = buildRunConfig({
+        issue: { id: "managed-1", identifier: "AII-1673", title: "Managed launch", description: "No fallback configured" },
+        mapping: makeMapping(),
+        runnerPhase: "planning",
+        baseBranch: "main",
+        runnerCallbackUrl: "https://orch.example/runner",
+        retryPolicy: null,
+        ...managedRunConfigFields({ kind: "launch", snapshot: makeSnapshot(), fallbackModels }),
+        credentials: {
+          version: 1,
+          resultToken: "fixture-result-token",
+          progressToken: "fixture-progress-token",
+          modelAuthContext: { version: 1, dispatchId: "disp-1", projectKey: "proj", backend: "gha", modelAuthUrl: "https://orch.example" },
+        },
+      });
+      expect(encodeTrustedRunConfig(config)).toBe(Buffer.from(expected, "utf8").toString("base64"));
     }
   });
 });

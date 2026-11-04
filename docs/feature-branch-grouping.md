@@ -19,8 +19,16 @@ A Linear issue tree maps onto a tree of git branches:
   (mode defaults to `feature` — see §5).
 - Its **labelled children** are worked on and open PRs **into that feature branch**, not
   into the repo's base branch.
-- Unlabelled children are ignored until they too get the pickup label — so you can
-  roll a tree out incrementally.
+- An **unlabelled child** gets no run. While it is open (neither Done nor Cancelled),
+  the parent's closing-work run waits, and consequently so does the roll-up PR. The
+  [AII-349](https://linear.app/eudoxus/issue/AII-349/grouping-cascade-parent-with-pre-done-children-finalized-during-parent)
+  guard applies to both Linear and Jira, allowing for operators still labelling children.
+  Linear's guard in `src/providers/linear.ts` logs
+  `Skipping <key>: <mode> grouping parent has undesignated non-terminal children`.
+  Jira applies the same guard via `classifyByChildren` in `src/providers/jira-hierarchy.ts`;
+  `src/providers/jira.ts` logs `[jira] Skipping <key>: grouping parent not ready (waiting-parent)`.
+  File operator-only or later tasks outside the feature node (for example under the
+  parent's own parent), or close them, before the last labelled child lands.
 - The tree is **recursive**: a child that is itself a feature node gets its own branch cut
   from its parent's branch, and so on.
 - When a feature node's children are all done, the node's **own work** runs (a parent
@@ -95,6 +103,8 @@ in flight (`Skipping <key>: feature-node parent waiting on in-flight AI-Implemen
 children`). Only once **all** its labelled children reach a terminal state does its own
 work dispatch — onto its own feature branch. "Terminal" means completed *or* cancelled, so
 a cancelled child doesn't block the parent forever.
+
+On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
 
 The internal gap-analysis and in-loop review grade a grouping parent's closing-work PR
 only against the requirements the parent keeps for itself. Child-owned requirements are
