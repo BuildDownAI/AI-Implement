@@ -421,6 +421,7 @@ and `sources.fallbackModel` (null when absent).
 Preparation freezes these values in `resolved_config_json.fallbackModels` alongside
 the stages and profiles, and returns them separately on its ready result. Retries
 reuse the dispatch's stored values; old rows have no fallbacks. The five-field
-snapshot selections and source maps are unchanged. Runner delivery and use of the
-fallback are separate work. Before reverting to code that predates this field,
+snapshot selections and source maps are unchanged. The envelope delivers the values in
+`run_config.modelFallbacks`, and the runner uses them as described in
+[Pipeline architecture](pipeline-architecture.md). Before reverting to code that predates this field,
 clear fallback models from every stored configuration.
