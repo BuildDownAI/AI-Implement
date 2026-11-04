@@ -815,6 +815,7 @@ export class ConfiguredRunError extends Error {
 export { MODEL_AUTH_ENV };
 
 export interface ConfiguredRunOptions {
+  modelFallbacks?: StageExecutorOptions["fallbackModels"];
   /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */
   agentConfig?: ResolvedAgentSnapshotV1;
   /** Local runs: protected credential source. */
@@ -1081,7 +1082,10 @@ export async function prepareConfiguredRun(input: {
       onDiagnostic: (d) => console.log(`[model-auth] ${JSON.stringify(d)}`),
     });
   }
-  return buildConfiguredRun(snapshot, client, options, syntheticProvider, implementationFullAccess);
+  const modelFallbacks = options.modelFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
+    ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).modelFallbacks
+    : undefined);
+  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks }, syntheticProvider, implementationFullAccess);
 }
 
 function buildConfiguredRun(
@@ -1132,6 +1136,7 @@ function buildConfiguredRun(
           },
         },
         snapshot,
+        fallbackModels: options.modelFallbacks,
         auth,
         logLevel: args.logLevel,
         activityReporting: args.activityReporting,

@@ -1105,7 +1105,7 @@ describe("pushStep draft PRs", () => {
     );
 
     const body = prRequest(fake);
-    expect(body.body).toContain("| 1 | success | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | in 10 / out 20 | rejected |");
+    expect(body.body).toContain("| 1 | success; m | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | in 10 / out 20 | rejected |");
     expect(body.body).not.toContain("$0.00");
   });
 

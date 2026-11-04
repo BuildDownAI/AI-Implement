@@ -341,7 +341,7 @@ describe("formatRunStats — truthful cost, turns and tokens (AII-113)", () => {
     const md = stats([codexNoCost]);
     expect(md).not.toContain("$0.00");
     expect(md).toContain("**Total cost:** unavailable");
-    expect(md).toContain("| 1 | success | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | unavailable | approved |");
+    expect(md).toContain("| 1 | success; m | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | unavailable | approved |");
     expect(md).not.toMatch(/\| 7 \|/);
   });
 
@@ -379,8 +379,8 @@ describe("formatRunStats — truthful cost, turns and tokens (AII-113)", () => {
       { ...codexNoCost, iteration: 2, tokensIn: 300, tokensOut: null },
       { iteration: 3, implementTurns: null, implementOutcome: "unknown", costUsd: 0.5, reviewApproved: null },
     ]);
-    expect(md).toContain("| 1 | success | 12 (limit 50 max turns) | 1 | $1.00 | in 1000 / out 200 | rejected |");
-    expect(md).toContain("| 2 | success | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | in 300 / out unavailable | approved |");
+    expect(md).toContain("| 1 | success; m | 12 (limit 50 max turns) | 1 | $1.00 | in 1000 / out 200 | rejected |");
+    expect(md).toContain("| 2 | success; m | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | in 300 / out unavailable | approved |");
     expect(md).toContain("| 3 | unknown | unknown | 1 | $0.50 | unavailable | not run |");
     expect(md).toContain("**Total cost:** ≥ $1.50 (partial)");
   });
@@ -411,6 +411,41 @@ describe("control-plane estimates", () => {
     attribution: attr("codex", { model: "z-seed" }),
     tokensIn: 2000000, tokensOut: 200000, cacheReadTokens: 400000, cacheCreationTokens: 200000,
   };
+  it("prices primary and persistent fallback passes using each attribution's model", () => {
+    const pricedModels = {
+      ...modelPrices,
+      prices: [
+        { ...prices[0], model: "expensive-primary", inputUsd: "0.000010", outputUsd: "0.000020" },
+        { ...prices[0], model: "cheap-fallback", inputUsd: "0.000001", outputUsd: "0.000002" },
+        { ...prices[0], model: "review-primary", inputUsd: "0.000005", outputUsd: "0.000010" },
+        { ...prices[0], model: "review-fallback", inputUsd: "0.000002", outputUsd: "0.000004" },
+      ],
+    };
+    const primary: StatsPass = {
+      ...pass, tokensIn: 1000000, tokensOut: 100000, cacheReadTokens: 0, cacheCreationTokens: 0,
+      attribution: attr("codex", { model: "expensive-primary" }), reviewApproved: false,
+      reviewTelemetry: { ...reviewTelemetry, tokensIn: 1000000, tokensOut: 100000, cacheReadTokens: 0, cacheCreationTokens: 0, attribution: attr("codex", { model: "review-primary" }) },
+    };
+    const fallback: StatsPass = {
+      ...primary, iteration: 2, implementFallbackFrom: "expensive-primary", reviewFallbackFrom: "review-primary",
+      attribution: attr("codex", { model: "cheap-fallback" }),
+      reviewTelemetry: { ...primary.reviewTelemetry!, attribution: attr("codex", { model: "review-fallback" }) },
+    };
+    const md = stats([primary, fallback, { ...fallback, iteration: 3, reviewApproved: true }], { modelPrices: pricedModels });
+    const rows = md.split("\n").filter(line => /^\| [123] \|/.test(line));
+    expect(rows).toHaveLength(3);
+    // Primary: $12 implementation + $6 review. Fallback: $1.20 + $2.40 per pass.
+    expect(rows[0]).toContain("success; expensive-primary");
+    expect(rows[0]).toContain("rejected; review-primary");
+    expect(rows[0]).toContain("~$18.00 (estimated)");
+    expect(rows[0]).not.toContain("fallback from");
+    for (const row of rows.slice(1)) {
+      expect(row).toContain("cheap-fallback (fallback from expensive-primary)");
+      expect(row).toContain("review-fallback (fallback from review-primary)");
+      expect(row).toContain("~$3.60 (estimated)");
+    }
+    expect(md).toContain("**Total cost:** ~$25.20 (estimated)");
+  });
   it("estimates missing implement cost with cache tokens using the recording", () => {
     const md = stats([pass], { modelPrices });
     // 700000 * input + 100000 * cache-write + 100000 * output = 2.736419752...
@@ -469,12 +504,12 @@ describe("control-plane estimates", () => {
       }
     }
   });
-  it("preserves the complete legacy comment byte for byte without prices", () => {
+  it("renders attributed models without prices", () => {
     expect(stats([pass])).toBe([
       "## Run stats — AII-1", "",
       "| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |",
       "|---|---|---|---|---|---|---|",
-      "| 1 | success | n/a (native turn count unavailable) | 1 | unavailable | in 1000000 / out 100000 | not run |",
+      "| 1 | success; a-dated | n/a (native turn count unavailable) | 1 | unavailable | in 1000000 / out 100000 | not run |",
       "", "**Total cost:** unavailable",
     ].join("\n"));
   });

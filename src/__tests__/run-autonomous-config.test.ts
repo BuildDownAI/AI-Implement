@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { encodeRunConfig } from "../run-config.js";
+import { encodeRunConfig, encodeTrustedRunConfig } from "../run-config.js";
 import {
   resolveRunnerInputs,
   prepareConfiguredRun,
@@ -790,6 +790,48 @@ describe("prepareConfiguredRun", () => {
     expect(client.finish).toHaveBeenCalledTimes(1);
     expect(client.finish).toHaveBeenCalledWith("p-rev", "completed");
     expect(client.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])("uses envelope fallback models after capacity failure only when present (configured=%s)", async (configured) => {
+    const env = {
+      ...envelopeEnv(snap, makeGrant(snap)),
+      AI_IMPLEMENT_RUN_CONFIG: encodeTrustedRunConfig({
+        v: 1,
+        issue: { id: "i1", identifier: "AII-1", title: "t", description: "d" },
+        agentConfig: snap,
+        credentials: { version: 1, modelAuthGrant: makeGrant(snap) },
+        ...(configured ? { modelFallbacks: { review: "claude-review-fallback" } } : {}),
+      }),
+    };
+    const run = (await prepare(env, { modelAuthClient: fakeClient() }))!;
+    const legacy = makeExecutor();
+    vi.mocked(legacy.invoke).mockResolvedValueOnce({
+      stdout: "capacity",
+      exitCode: 1,
+      tokensUsed: 0,
+      failure: {
+        category: "transient",
+        code: "PROVIDER_OVERLOADED",
+        stage: "review",
+        attempt: 3,
+        retryable: false,
+        message: "capacity",
+        evidence: { truncated: false },
+      },
+    });
+    const ex = run.createExecutor({ workspaceDir: "/tmp/ws-x", legacy });
+    const params = { prompt: "p", model: "caller", agentStage: "review" as const };
+    const failed = await ex.invoke(params);
+    expect(failed.attribution?.model).toBe("claude-review");
+    expect(failed.failure?.code).toBe("PROVIDER_OVERLOADED");
+    expect(failed.failure?.modelFallback).toEqual(configured
+      ? { stage: "review", from: "claude-review", to: "claude-review-fallback" }
+      : undefined);
+    const next = await ex.invoke(params);
+    const expectedModel = configured ? "claude-review-fallback" : "claude-review";
+    expect(vi.mocked(legacy.invoke).mock.calls.map(([call]) => call.model)).toEqual(["claude-review", expectedModel]);
+    expect(next.attribution).toMatchObject({ model: expectedModel, profileId: "p-rev", agent: "claude", provider: "anthropic" });
+    await run.finish("completed");
   });
 
   it("requires an explicit agentStage and never infers one", async () => {
