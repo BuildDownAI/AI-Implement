@@ -28,7 +28,7 @@ export const modelsAndProvidersHtml = `
         <div style="overflow-x:auto">
         <table class="tbl">
           <thead>
-            <tr><th>Stage</th><th>Agent</th><th>Provider</th><th>Model</th><th>Account profile</th><th>Elapsed time limit (ms)</th></tr>
+            <tr><th>Stage</th><th>Agent</th><th>Provider</th><th>Model</th><th>Fallback model</th><th>Account profile</th><th>Elapsed time limit (ms)</th></tr>
           </thead>
           <tbody id="mp-stage-rows"></tbody>
         </table>
@@ -228,6 +228,7 @@ export const modelsAndProvidersScript = `(function () {
         '<td><select class="input" ' + attr + ' data-field="agent"' + dis + '>' + mpOptions(MP_AGENTS, sel.agent || '') + '</select></td>' +
         '<td><select class="input" ' + attr + ' data-field="provider"' + dis + '>' + mpOptions(MP_PROVIDERS, sel.provider || '') + '</select></td>' +
         '<td><input class="input" ' + attr + ' data-field="model" value="' + window.escAttr(sel.model || '') + '" placeholder="inherit"' + dis + '></td>' +
+        '<td><input class="input" ' + attr + ' data-field="fallbackModel" aria-label="Fallback model for ' + window.escAttr(stage) + '" value="' + window.escAttr(sel.fallbackModel || '') + '" placeholder="none"' + dis + '><div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div></td>' +
         '<td>' + mpProfileSelect(stage, sel.agent || '', sel.provider || '', sel.accountProfileId || '') + '</td>' +
         '<td><input class="input" type="number" min="1" step="1" ' + attr + ' data-field="invocationTimeoutMs" value="' + window.escAttr(limit) + '" placeholder="inherit"' + dis + '></td>' +
         '</tr>';

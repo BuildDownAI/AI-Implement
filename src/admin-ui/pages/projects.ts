@@ -784,8 +784,8 @@ export const projectsScript = `
 
   // ---- Agents tab: opt-in and inherited stage settings (AII-968) ----
   var AG_STAGES = ['planning', 'implementation', 'review'];
-  var AG_FIELDS = ['agent', 'provider', 'model', 'accountProfileId', 'invocationTimeoutMs'];
-  var AG_LABELS = { agent: 'Agent', provider: 'Provider', model: 'Model', accountProfileId: 'Account profile', invocationTimeoutMs: 'Invocation timeout (ms)' };
+  var AG_FIELDS = ['agent', 'provider', 'model', 'fallbackModel', 'accountProfileId', 'invocationTimeoutMs'];
+  var AG_LABELS = { agent: 'Agent', provider: 'Provider', model: 'Model', fallbackModel: 'Fallback model', accountProfileId: 'Account profile', invocationTimeoutMs: 'Invocation timeout (ms)' };
   var AG_ERRORS = {
     resolution_failed: 'These settings do not resolve to a usable configuration. Check that every stage has an agent, provider, model, profile and timeout.',
     claude_subscription_unsupported: 'Claude subscription profiles cannot be enabled from here. Pick a different profile.',
@@ -846,7 +846,7 @@ export const projectsScript = `
       var t = agDraft(AG_STAGES[i], 'invocationTimeoutMs');
       if (t.mode === 'override' && !(Number.isInteger(Number(t.value)) && Number(t.value) > 0)) return 'Timeout for ' + AG_STAGES[i] + ' must be a positive whole number.';
       for (var j = 0; j < AG_FIELDS.length; j++) {
-        if (agEffective(AG_STAGES[i], AG_FIELDS[j]).value === undefined) return AG_LABELS[AG_FIELDS[j]] + ' for ' + AG_STAGES[i] + ' has no value.';
+        if (AG_FIELDS[j] !== 'fallbackModel' && agEffective(AG_STAGES[i], AG_FIELDS[j]).value === undefined) return AG_LABELS[AG_FIELDS[j]] + ' for ' + AG_STAGES[i] + ' has no value.';
       }
     }
     return '';
@@ -912,7 +912,7 @@ export const projectsScript = `
           + '<option value="override"' + (d.mode === 'override' ? ' selected' : '') + '>Override</option></select>';
         return '<div style="display:grid;grid-template-columns:150px 110px 1fr;gap:8px;align-items:center;margin-bottom:6px">'
           + '<label class="field-label" style="margin:0">' + window.esc(AG_LABELS[field]) + '</label>' + sel
-          + '<div>' + agValueControl(stage, field) + '<div class="field-hint" data-ag-preview="' + window.escAttr(stage + '.' + field) + '">' + window.esc(agPreviewText(stage, field)) + '</div></div></div>';
+          + '<div>' + agValueControl(stage, field) + (field === 'fallbackModel' ? '<div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div>' : '') + '<div class="field-hint" data-ag-preview="' + window.escAttr(stage + '.' + field) + '">' + window.esc(agPreviewText(stage, field)) + '</div></div></div>';
       }).join('');
       var problem = agStageProblem(stage);
       return '<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:8px">' + window.esc(stage) + '</div>' + rows
@@ -1065,7 +1065,7 @@ export const projectsScript = `
     if (!res.ok) {
       var code = data && typeof data.code === 'string' ? data.code : '';
       var msg = AG_ERRORS[code]
-        || (res.status === 400 ? AG_ERRORS.resolution_failed : 'Could not save agent settings (HTTP ' + res.status + ').');
+        || (data && typeof data.error === 'string' ? data.error : (res.status === 400 ? AG_ERRORS.resolution_failed : 'Could not save agent settings (HTTP ' + res.status + ').'));
       if (code === 'stale_inputs') await loadAgentConfig(key);
       else { agentState.draftEnabled = agentState.enabled; agRender(); }
       agShowError(msg + (data && typeof data.action === 'string' ? ' ' + data.action : ''));
