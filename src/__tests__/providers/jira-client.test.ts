@@ -202,3 +202,9 @@ describe("JiraClient Basic auth (email + API token)", () => {
     expect(() => new JiraClient({ token: "t" })).toThrow(/cloudId/);
   });
 });
+
+it("getMyself reads the account", async () => {
+  const fake = fakeFetch({ [`GET ${GATEWAY}/myself`]: { json: { accountId: "me" } } }).install();
+  expect(await new JiraClient({ token: "tok", cloudId: "CLOUD-123" }).getMyself()).toEqual({ accountId: "me" });
+  expect(fake.calls[0].method).toBe("GET");
+});

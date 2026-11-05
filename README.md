@@ -361,8 +361,8 @@ The full architecture, env-var reference, SQLite schema, multi-client deploy mod
 
 | Field name | Type | Purpose |
 |---|---|---|
-| `AI-Implement Status` | Select | Orchestrator-managed state transitions (Ready → In Progress → Ready for Review) |
-| `AI-Implement Repo` | Select | Identifies which GitHub repo the issue belongs to — each option should be `owner/repo` |
+| `AI-Implement Status` | Select | Requires the [nine status options](docs/ticketing-providers.md#the-ai-implement-status-options) |
+| `AI-Implement Repo` | Select or text | Identifies which GitHub repo the issue belongs to — each option should be `owner/repo` |
 
 ### Step 2 — GitHub App
 

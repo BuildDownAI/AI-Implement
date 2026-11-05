@@ -142,8 +142,37 @@ export type LinearSetupFacts =
       labels: Record<string, FoundLabel[]>;
     };
 
+/** Fresh reads and independent faults for one Jira mapping. */
+export interface JiraMappingSetupFacts {
+  fields?: import("./jira-fields.js").ResolvedFieldIds;
+  fieldError?: string;
+  fieldReadFailed?: boolean;
+  ambiguousOptional: string[];
+  cachedFields?: import("./jira-fields.js").ResolvedFieldIds;
+  statusOptions?: string[];
+  statusNotSelect?: boolean;
+  statusError?: string;
+  repoOptions?: string[];
+  repoNotSelect?: boolean;
+  repoError?: string;
+  queryError?: string;
+  queryUnreachable?: boolean;
+  queryOk?: boolean;
+  repoFieldValue: string;
+  autoApprovePlans: boolean;
+}
+export interface JiraSetupFacts {
+  kind: "jira";
+  oauth: boolean;
+  credentials: { ok: boolean; status?: number | null; error?: string };
+  mappings: Record<string, JiraMappingSetupFacts>;
+}
+export interface FilesystemSetupFacts {
+  kind: "filesystem";
+  directories: Record<string, { directory: string; error?: string }>;
+}
 /** One provider's setup facts; each provider adds its own member. */
-export type TrackerSetupFacts = LinearSetupFacts;
+export type TrackerSetupFacts = LinearSetupFacts | JiraSetupFacts | FilesystemSetupFacts;
 
 /** The tracker cannot be read and a retry will not help (a missing credential). `TrackerExport` answers it as terminal `tracker-unavailable`. */
 export class TrackerUnavailableError extends Error {

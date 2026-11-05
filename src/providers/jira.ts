@@ -1,4 +1,6 @@
 import type {
+  JiraSetupFacts,
+  JiraMappingSetupFacts,
   AIImplementSnapshot,
   FeatureBranchChainEntry,
   FeatureNodeRollUp,
@@ -10,9 +12,12 @@ import type {
   TrackerIssueRecord,
 } from "./types.js";
 import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
-import { JiraApiError, JiraClient, type JiraComment, type JiraIssue } from "./jira-client.js";
+import { JiraApiError, JiraFieldNotSelectError, JiraClient, type JiraComment, type JiraIssue } from "./jira-client.js";
 import {
+  buildBucketQuery,
   getCachedFieldIds,
+  peekCachedFieldIds,
+  resolveCustomFieldIds,
   STATUS_VALUES,
   type ResolvedFieldIds,
 } from "./jira-fields.js";
@@ -223,6 +228,8 @@ function exportRelationType(typeName: string | undefined): string {
 
 export interface JiraProviderConstructor {
   client: JiraClient;
+  /** Whether credentials use the non-refreshing OAuth access token mode. */
+  oauth?: boolean;
   /** Per-instance cache scope label; typically the cloud ID. */
   cacheScope: string;
   /** User-facing site URL for issueUrl(); e.g. https://yourorg.atlassian.net */
@@ -241,6 +248,7 @@ const JIRA_V2_PREFIXES = [
 
 export class JiraProvider implements TicketingProvider {
   readonly id = "jira";
+  private readonly oauth: boolean;
   private readonly client: JiraClient;
   private readonly cacheScope: string;
   private readonly siteUrl: string;
@@ -249,11 +257,48 @@ export class JiraProvider implements TicketingProvider {
   private readonly notifiedMismatches = new Set<string>();
 
   constructor(c: JiraProviderConstructor) {
+    this.oauth = c.oauth ?? false;
     this.client = c.client;
     this.cacheScope = c.cacheScope;
     this.siteUrl = c.siteUrl;
     this.getMappings = c.getMappings;
     this.onRepoFieldMismatch = c.onRepoFieldMismatch ?? (() => {});
+  }
+
+  async fetchSetupFacts(projectKeys: string[]): Promise<JiraSetupFacts> {
+    const facts: JiraSetupFacts = { kind: "jira", oauth: this.oauth, credentials: { ok: true }, mappings: {} };
+    try { await this.client.getMyself(); } catch (err) {
+      facts.credentials = { ok: false, status: err instanceof JiraApiError ? err.status : null, error: String(err) };
+      return facts;
+    }
+    for (const key of projectKeys) {
+      const mapping = this.getMappings()[key];
+      if (mapping?.ticketingConfig.kind !== "jira") continue;
+      const cfg = mapping.ticketingConfig;
+      const row: JiraMappingSetupFacts = { ambiguousOptional: [], repoFieldValue: cfg.repoFieldValue, autoApprovePlans: mapping.autoApprovePlans ?? false };
+      facts.mappings[key] = row;
+      const overrides = { statusOverride: cfg.statusFieldOverride ?? null, repoOverride: cfg.repoFieldOverride ?? null,
+        profilesOverride: cfg.profilesFieldOverride ?? null, baseBranchOverride: cfg.baseBranchFieldOverride ?? null };
+      row.cachedFields = peekCachedFieldIds(this.cacheScope, overrides);
+      try {
+        // Reuse one field list for resolution and optional-field diagnostics.
+        let listed: Awaited<ReturnType<JiraClient["listFields"]>> = [];
+        row.fields = await resolveCustomFieldIds({ listFields: async () => {
+          try { return (listed = await this.client.listFields()); }
+          catch (err) { row.fieldReadFailed = true; throw err; }
+        } }, overrides);
+        for (const [name, override] of [["AI-Implement Profiles", overrides.profilesOverride], ["AI-Implement Base Branch", overrides.baseBranchOverride]]) {
+          if (!override && listed.filter((f) => f.name === name).length > 1) row.ambiguousOptional.push(name!);
+        }
+      } catch (err) { row.fieldError = String(err); continue; }
+      try { row.statusOptions = (await this.client.getFieldOptions(row.fields.statusFieldId)).map((o) => o.value); }
+      catch (err) { if (err instanceof JiraFieldNotSelectError) row.statusNotSelect = true; else row.statusError = String(err); }
+      try { row.repoOptions = (await this.client.getFieldOptions(row.fields.repoFieldId)).map((o) => o.value); }
+      catch (err) { if (err instanceof JiraFieldNotSelectError) row.repoNotSelect = true; else row.repoError = String(err); }
+      try { await this.client.searchJqlPage(buildBucketQuery(cfg.jql, row.fields.statusFieldId), [row.fields.statusFieldId], undefined, 1); row.queryOk = true; }
+      catch (err) { row.queryError = String(err); row.queryUnreachable = !(err instanceof JiraApiError); }
+    }
+    return facts;
   }
 
   private childrenJql(parentKeys: string[], fieldIds: ResolvedFieldIds): string {
@@ -449,7 +494,7 @@ export class JiraProvider implements TicketingProvider {
       // customfield_N ids; JQL on some instances requires cf[N], so transform
       // before interpolating.
       const statusJqlField = jqlFieldRef(fieldIds.statusFieldId);
-      const bucketJql = `(${cfg.jql}) AND ${statusJqlField} in (Ready, "Plan Approved")`;
+      const bucketJql = buildBucketQuery(cfg.jql, fieldIds.statusFieldId);
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
       // Repo pass first, so the merged-blocker lookup below only carries keys from
@@ -953,6 +998,7 @@ export function createJiraProviderFromConfig(
   });
   return new JiraProvider({
     client,
+    oauth: !config.jiraEmail,
     // Field-id cache scope: unique per deployment. Site URL in Basic mode,
     // cloud id in OAuth mode (one of the two is guaranteed present above).
     cacheScope: config.jiraEmail ? config.jiraSiteUrl : config.jiraCloudId!,

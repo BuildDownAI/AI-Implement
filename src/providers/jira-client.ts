@@ -174,8 +174,9 @@ export class JiraClient {
     jql: string,
     fields: string[],
     nextPageToken?: string,
+    maxResults = SEARCH_PAGE_SIZE,
   ): Promise<{ issues: JiraIssue[]; nextPageToken?: string }> {
-    const body: Record<string, unknown> = { jql, fields, maxResults: SEARCH_PAGE_SIZE };
+    const body: Record<string, unknown> = { jql, fields, maxResults };
     if (nextPageToken) body.nextPageToken = nextPageToken;
     const res = await this.requestJson<{ issues?: JiraIssue[]; nextPageToken?: string }>(
       "POST", "/rest/api/3/search/jql", body,
@@ -235,6 +236,10 @@ export class JiraClient {
     }
 
     return all;
+  }
+
+  async getMyself(): Promise<unknown> {
+    return this.requestJson("GET", "/rest/api/3/myself");
   }
 
   async listFields(): Promise<JiraField[]> {

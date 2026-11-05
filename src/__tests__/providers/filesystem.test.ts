@@ -1,4 +1,4 @@
-import { link, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { access, link, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
@@ -8,7 +8,7 @@ import { testDir } from "../helpers/test-dir.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, link: vi.fn(actual.link) };
+  return { ...actual, access: vi.fn(actual.access), link: vi.fn(actual.link) };
 });
 
 afterEach(() => {
@@ -554,4 +554,32 @@ describe("FilesystemProvider", () => {
     expect(snap.needsPlanning.map((issue) => issue.id)).toEqual([planningId]);
     expect(snap.readyForImplementation.map((issue) => issue.id)).toEqual([implementationId]);
   });
+});
+
+it("reads directory setup through symlinks and creates nothing", async () => {
+  const { readdir } = await import("node:fs/promises");
+  const root = testDir("fs-setup");
+  const target = join(root, "target");
+  await mkdir(target);
+  await writeFile(join(root, "file"), "file");
+  await symlink(target, join(root, "alias"));
+  const mappings = Object.fromEntries(["target", "alias", "file", "missing"].map((key) => [key, mapping({ directory: join(root, key) })]));
+  const before = await readdir(root);
+  const facts = await new FilesystemProvider(() => mappings).fetchSetupFacts(Object.keys(mappings));
+  expect(facts.directories.target.error).toBeUndefined();
+  expect(facts.directories.alias.error).toBeUndefined();
+  expect(facts.directories.file.error).toContain("not a directory");
+  expect(facts.directories.missing.error).toContain("does not exist");
+  expect(await readdir(root)).toEqual(before);
+  expect(await readdir(target)).toEqual([]);
+});
+
+
+it("records denied directory access without writing", async () => {
+  const root = testDir("fs-setup-denied");
+  vi.mocked(access).mockRejectedValueOnce(new Error("EACCES"));
+  const facts = await new FilesystemProvider(() => ({ X: mapping({ directory: root }) })).fetchSetupFacts(["X"]);
+  expect(facts.directories.X.error).toContain("not writable");
+  const { readdir } = await import("node:fs/promises");
+  expect(await readdir(root)).toEqual([]);
 });
