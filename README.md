@@ -413,7 +413,7 @@ workflows/            Templates synced to target repos (claude-implement.yml, cl
 clients/              One <slug>.toml per deployed Fly app (multi-tenant deploy)
 custom/               Fork-local step/provider/pipeline overrides (see custom/README.md
                       and docs/adr/001-custom-path-precedence.md)
-scripts/              provision-client.sh (interactive onboarding for multi-tenant operators)
+scripts/              operator helpers (onboarding: npm run provision-client -- <slug>)
 session/              Entrypoint scripts for the Fly Machines runner image
 docs/                 Design notes, ADRs
 CONTEXT.md            Domain glossary — the terms the ADRs turn on (developer harness

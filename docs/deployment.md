@@ -2,7 +2,7 @@
 
 How an orchestrator instance is deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
 
-Reference for `src/deploy.ts`, `scripts/provision-client.sh`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
+Reference for `src/deploy.ts`, `npm run provision-client --`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
 
 ## GitHub App permissions (install prerequisite)
 
@@ -221,18 +221,20 @@ A fork that carries `custom/` overrides should not use this path. It updates by 
 Each client is a separate Fly app described by a file in `clients/<slug>.toml`. Copy `clients/example-client.toml` to start, or use the guided helper:
 
 ```bash
-./scripts/provision-client.sh <client-slug>
+npm run provision-client -- <client-slug>
 ```
 
-Manual equivalent:
+The command reads an existing client file without replacing it. It discovers apps, volumes and secret names through Fly JSON listings. It collects credentials with hidden prompts and validates the proposed environment with the same setup checks the orchestrator uses before writing the client file or changing Fly resources. Secrets are imported together over stdin, including the PEM with literal `\n` escapes. Empty answers keep existing secrets. Once the sessions seed is set, change the sessions app on `/admin#settings` instead.
 
-```bash
-cp clients/example-client.toml clients/<slug>.toml
-# edit the file, then:
-fly apps create <app_name> --org <org>
-fly volumes create dedup_data --size 1 --region iad --app <app_name>
-fly secrets set GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY=... --app <app_name>
-```
+Choose Google or Microsoft sign-in and Linear or Jira ticketing. Register the two redirect addresses the command prints in the sign-in provider console. Microsoft requires a single-tenant ID. Deploy tokens are app-scoped, the orchestrator deploy token expires after one year, and the optional break-glass code is shown once. Changing `RUNNER_TOKEN_SECRET` makes stored model credentials unreadable until they are re-keyed.
+
+API keys belong in an account profile on Models & providers. Opt each project in on its Agents tab before dispatching. Claude subscription projects instead use the legacy token path. The command prints the repository secret commands and guides project creation through the New project stepper.
+
+On reruns, an existing `FLY_SESSIONS_APP` means the saved runner settings own the sessions app. The command leaves both seed variables alone and does not create the local sessions app. If its token is missing, enter the active app name from `/admin#settings` explicitly. Initial Fly discovery failures stop without writes and print the setup retry, deploy, health and remote check commands.
+
+Deploy, health waiting and remote setup checks each ask first. Builds use this checkout and its source stamps, including a fork's own repository, and select the client's region. Without a knowledge graph, no GitHub build credential is needed. KG builds require local Docker with BuildKit and use its `--secret id=kg_token,src=/dev/stdin` transport with the token captured from `gh auth token`. The command pushes the image to Fly's registry and deploys it with `--image`. This differs from the manual remote build because flyctl v0.5.4 only accepts literal build-secret arguments. The token never enters process arguments. Declined or unavailable operations print their exact commands. The KG retry commands use an exported token and Docker’s environment secret source, keeping the token out of arguments.
+
+Existing secret values are unavailable from Fly listings. Local preflight validates new values and defers checks that require retained values to the remote setup checks. The remote checks also inspect the saved admin allowlist, which can override environment values.
 
 The Fly volume `dedup_data` mounts at `/data` and holds the SQLite database. Only the GitHub App pair is required for the orchestrator to boot; ticketing credentials are needed for it to poll anything. See `.env.example` for the full set.
 
@@ -244,7 +246,7 @@ At boot the orchestrator sets the snapshot retention of every volume in its own 
 
 `.github/workflows/deploy-clients.yml` exists and triggers on pushes to `main`, building a deploy matrix by globbing `clients/*.toml`. **In practice it always deploys nothing**, because `.gitignore` excludes `clients/*.toml` and un-ignores only the example — which the workflow explicitly skips. Every run finds zero clients, emits an empty matrix, and skips the deploy job via its own guard, reporting success.
 
-So a client toml is local-only unless force-added, and client instances are deployed through the wrapper script or the Fly integration rather than by this workflow. Treat the workflow as inert until that is deliberately resolved one way or the other.
+So a client toml is local-only unless force-added, and client instances are deployed through `npm run provision-client -- <slug>` and the manual deploy command rather than by this workflow. Treat the workflow as inert until that is deliberately resolved one way or the other.
 
 ### Per-instance Fly commands
 
