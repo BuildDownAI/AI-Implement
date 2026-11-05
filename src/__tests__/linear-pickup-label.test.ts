@@ -272,7 +272,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps — pickup label", () => {
 describe("LinearProvider.fetchSetupFacts — pickup label", () => {
   it("reads and reports the stored label, the one the poll searches for", async () => {
     settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
-    linearAnswers({ teams: { nodes: [] }, issueLabels: { nodes: [], pageInfo: { hasNextPage: false } } });
+    linearAnswers({ teams: { nodes: [], pageInfo: { hasNextPage: false } }, issueLabels: { nodes: [], pageInfo: { hasNextPage: false } } });
 
     const facts = await new LinearProvider({}).fetchSetupFacts(["ENG"]);
 

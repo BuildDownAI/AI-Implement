@@ -6,7 +6,7 @@ The pattern for fixing a bug in this repo. The test that proves the bug is writt
 
 1. **Find the seam.** Name the function that holds the wrong behaviour and the fake that already drives it. Most orchestrator modules take an injected `fetch` or client (`fetchImpl`, `getInstallationTokenImpl`); reuse the fake in the module's existing test file before writing a new one.
 2. **Write the failing test.** Assert the correct behaviour, not the bug. Run it on the unfixed code and keep the output.
-3. **Record the red output.** Commit the test first, or paste the failing `npx vitest run <file>` output into the PR body under "Before the fix". A pipeline run cannot do either; see "Red evidence on a pipeline run" below.
+3. **Record the red output.** Paste the failing `npx vitest run <file>` output into the PR body under "Before the fix". Do not commit the failing test on its own to show it red: CI tests only the head of each push, so a test commit pushed together with its fix never runs red, and a commit pushed red on purpose fails a CI run only to show what the pasted output already shows. A pipeline run cannot paste it; see "Red evidence on a pipeline run" below.
 4. **Fix the code** with the smallest change that turns the test green. No drive-by refactors.
 5. **Run the whole suite.** `npm test` and `npm run typecheck`. Existing tests must pass unchanged unless the bug was in what they asserted — say so in the PR.
 6. **Add a recipe when the bug is visible from outside.** If an operator can see the bug on a deployed orchestrator, add an `integration-tests/recipes/` file (AII-472 format) so the check can run again later.
