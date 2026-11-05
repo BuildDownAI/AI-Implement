@@ -214,7 +214,7 @@ export class LinearProvider implements TicketingProvider {
     const pickupLabel = getLinearPickupLabel();
     const names = [pickupLabel, ...Object.values(LINEAR_LABELS).map((label) => label.name)];
     const data = await this.linearMutation<{
-      teams: { nodes: Array<{ key: string; started: { nodes: unknown[] }; completed: { nodes: unknown[] } }> };
+      teams: { nodes: Array<{ key: string; started: { nodes: unknown[] }; completed: { nodes: unknown[] } }>; pageInfo: { hasNextPage: boolean } };
       issueLabels: { nodes: Array<{ name: string; team: { key: string } | null }>; pageInfo: { hasNextPage: boolean } };
     }>(
       // Linear refuses a query costing over 10,000 complexity points, and a connection with no `first` counts as 50 nodes.
@@ -226,6 +226,7 @@ export class LinearProvider implements TicketingProvider {
             started: states(first: 1, filter: { type: { eq: "started" } }) { nodes { id } }
             completed: states(first: 1, filter: { type: { eq: "completed" } }) { nodes { id } }
           }
+          pageInfo { hasNextPage }
         }
         issueLabels(first: 250, filter: { and: [{ or: $names }, { or: [{ team: { null: true } }, { team: { key: { in: $keys } } }] }] }) {
           nodes { name team { key } }
@@ -234,7 +235,8 @@ export class LinearProvider implements TicketingProvider {
       }`,
       { keys: teamKeys, names: names.map((name) => ({ name: { eqIgnoreCase: name } })) },
     );
-    // A cut-off list would read as a missing label, so refuse it rather than let a check judge it.
+    // A cut-off list would read as a team the app cannot see or a missing label, so refuse it rather than let a check judge it.
+    if (data.teams.pageInfo.hasNextPage) throw new Error("More teams match than one read returns.");
     if (data.issueLabels.pageInfo.hasNextPage) throw new Error("More labels match than one read returns.");
     return {
       kind: "linear",

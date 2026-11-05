@@ -1283,7 +1283,7 @@ describe("LinearProvider.fetchSetupFacts", () => {
   const answer = (
     teams: Array<{ key: string; states: string[] }>,
     labels: Array<{ name: string; team: string | null }>,
-    hasNextPage = false,
+    cutOff: { teams?: boolean; labels?: boolean } = {},
   ) => data({
     teams: {
       nodes: teams.map((t) => ({
@@ -1291,8 +1291,12 @@ describe("LinearProvider.fetchSetupFacts", () => {
         started: { nodes: t.states.includes("started") ? [{ id: `${t.key}-started` }] : [] },
         completed: { nodes: t.states.includes("completed") ? [{ id: `${t.key}-completed` }] : [] },
       })),
+      pageInfo: { hasNextPage: cutOff.teams ?? false },
     },
-    issueLabels: { nodes: labels.map((l) => ({ name: l.name, team: l.team === null ? null : { key: l.team } })), pageInfo: { hasNextPage } },
+    issueLabels: {
+      nodes: labels.map((l) => ({ name: l.name, team: l.team === null ? null : { key: l.team } })),
+      pageInfo: { hasNextPage: cutOff.labels ?? false },
+    },
   });
 
   it("reads every fact in one request, which is a query and never a mutation", async () => {
@@ -1346,8 +1350,24 @@ describe("LinearProvider.fetchSetupFacts", () => {
     });
   });
 
+  it("asks both lists whether a next page exists, so a cut-off list can be caught", async () => {
+    const fake = linear(answer([], []));
+    await new LinearProvider({}).fetchSetupFacts(["ENG"]);
+
+    const { query } = JSON.parse(fake.calls[0].body) as { query: string };
+    const teamsRead = query.slice(query.indexOf("teams("), query.indexOf("issueLabels("));
+    const labelsRead = query.slice(query.indexOf("issueLabels("));
+    expect(teamsRead).toContain("pageInfo { hasNextPage }");
+    expect(labelsRead).toContain("pageInfo { hasNextPage }");
+  });
+
+  it("refuses a team list cut off at one page, rather than let a team past it read as one the app cannot see", async () => {
+    linear(answer([{ key: "ENG", states: ["started"] }], [{ name: "AI-Implement", team: null }], { teams: true }));
+    await expect(new LinearProvider({}).fetchSetupFacts(["ENG"])).rejects.toThrow("More teams match than one read returns.");
+  });
+
   it("refuses a label list cut off at one page, rather than let it read as a missing label", async () => {
-    linear(answer([{ key: "ENG", states: ["started"] }], [{ name: "AI-Implement", team: null }], true));
+    linear(answer([{ key: "ENG", states: ["started"] }], [{ name: "AI-Implement", team: null }], { labels: true }));
     await expect(new LinearProvider({}).fetchSetupFacts(["ENG"])).rejects.toThrow("More labels match than one read returns.");
   });
 
