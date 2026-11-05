@@ -94,7 +94,7 @@ export class FilesystemProvider implements TicketingProvider {
       facts.directories[key] = row;
       const root = await existingRealDirectory(directory);
       if (!root) row.error = "does not exist or is not a directory";
-      else try { await access(root, constants.W_OK); } catch { row.error = "is not writable by the orchestrator"; }
+      else try { await access(root, constants.W_OK | constants.X_OK); } catch { row.error = "is not writable or searchable by the orchestrator"; }
     }
     return facts;
   }
