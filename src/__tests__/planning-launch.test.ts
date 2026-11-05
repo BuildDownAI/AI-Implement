@@ -700,7 +700,9 @@ describe("managed planning on GitHub Actions (AII-1420)", () => {
     expect(JSON.stringify(trusted.credentials?.modelAuthContext)).not.toMatch(/grant-dispatch|grant-project/);
   });
 
-  it("a capable launch carries the frozen snapshot and protected bootstrap privately, with no downgrade", async () => {
+  it.each([{}, { planning: "fallback-model" }])("a capable launch carries fallbacks %j and the frozen snapshot and protected bootstrap privately, with no downgrade", async (fallbackModels) => {
+    decision = { ...decision, fallbackModels };
+    vi.mocked(managed.prepareManagedDispatch).mockResolvedValue(decision);
     const prepared = await prepare();
 
     expect(managed.prepareManagedDispatch).toHaveBeenCalledWith(
@@ -710,6 +712,8 @@ describe("managed planning on GitHub Actions (AII-1420)", () => {
     const inputs = prepared.planningDispatchInputs as Record<string, string>;
     const trusted = decodeTrustedRunConfig(inputs.run_config!);
     expect(trusted.agentConfig).toEqual(snapshot);
+    if (Object.keys(decision.fallbackModels).length) expect(trusted.modelFallbacks).toEqual(decision.fallbackModels);
+    else expect(trusted).not.toHaveProperty("modelFallbacks");
     expect(trusted.credentials?.modelAuthGrant).toEqual(bootstrap);
     expect(trusted.credentials?.modelAuthContext).toEqual({
       version: 1, dispatchId: "d-gha", projectKey: "AII", backend: "gha", modelAuthUrl: "https://cb.example.test",

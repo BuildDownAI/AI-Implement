@@ -330,3 +330,50 @@ describe("config references and frozen snapshots", () => {
     expect(frozen.p.revision).toBe(before.project.revision);
   });
 });
+
+describe("stored fallback models", () => {
+  it("rejects a project primary matching an inherited fallback without appending a revision", () => {
+    store.saveAccountProfileRevision(claudeProfile());
+    store.saveAccountProfileRevision(codexProfile());
+    const config = defaults();
+    config.stages!.review!.fallbackModel = "backup";
+    store.setOrchestratorDefaults(config);
+    store.setProjectOptIn("AII", true);
+    const before = dump();
+
+    expect(() => store.setProjectStageConfig("AII", {
+      version: 1,
+      mode: "configured",
+      stages: { review: { model: "backup" } },
+    })).toThrow(/review.*fallbackModel/);
+    expect(dump()).toBe(before);
+  });
+
+  it("rejects malformed fallbacks even in legacy mode without appending a revision", () => {
+    for (const fallbackModel of ["", "   ", 123]) {
+      const before = dump();
+      const config = { version: 1, mode: "legacy", stages: { review: { fallbackModel } } } as StageAgentConfigurationV1;
+      expect(() => store.setOrchestratorDefaults(config)).toThrow(/review.*fallbackModel/);
+      expect(() => store.setProjectStageConfig("AII", config)).toThrow(/review.*fallbackModel/);
+      expect(dump()).toBe(before);
+    }
+  });
+
+  it("validates resolved equality and clears project fallback to inheritance", () => {
+    store.saveAccountProfileRevision(claudeProfile());
+    store.saveAccountProfileRevision(codexProfile());
+    const config = defaults();
+    config.stages!.review!.fallbackModel = "backup";
+    store.setOrchestratorDefaults(config);
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { fallbackModel: "project-backup" } } });
+    store.clearProjectStageField("AII", "review", "fallbackModel");
+    const result = store.resolveProjectStageConfig("AII").resolution;
+    if (result.mode !== "configured") throw new Error("expected configured");
+    expect(result.fallbackModels).toEqual({ review: "backup" });
+    const before = dump();
+    expect(() => store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { fallbackModel: "m-1" } } })).toThrow(/review.*fallbackModel/);
+    config.stages!.review!.fallbackModel = "m-1";
+    expect(() => store.setOrchestratorDefaults(config)).toThrow(/review.*fallbackModel/);
+    expect(dump()).toBe(before);
+  });
+});

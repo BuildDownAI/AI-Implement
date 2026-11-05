@@ -1,3 +1,4 @@
+import type { RunModelPrices } from "./run-config.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -436,6 +437,7 @@ function writeShellEnvFile(dest: string, before: Record<string, string | undefin
 }
 
 export interface ResolvedRunnerInputs {
+  modelPrices?: RunModelPrices;
   issueId: string;
   issueIdentifier: string;
   issueTitle: string;
@@ -697,6 +699,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     retryPolicy: normalizeRetryPolicy(cfg.retryPolicy),
     reviewFix: cfg.reviewFix,
     agentConfig: cfg.agentConfig,
+    modelPrices: cfg.modelPrices,
   };
 }
 
@@ -812,6 +815,7 @@ export class ConfiguredRunError extends Error {
 export { MODEL_AUTH_ENV };
 
 export interface ConfiguredRunOptions {
+  modelFallbacks?: StageExecutorOptions["fallbackModels"];
   /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */
   agentConfig?: ResolvedAgentSnapshotV1;
   /** Local runs: protected credential source. */
@@ -1078,7 +1082,10 @@ export async function prepareConfiguredRun(input: {
       onDiagnostic: (d) => console.log(`[model-auth] ${JSON.stringify(d)}`),
     });
   }
-  return buildConfiguredRun(snapshot, client, options, syntheticProvider, implementationFullAccess);
+  const modelFallbacks = options.modelFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
+    ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).modelFallbacks
+    : undefined);
+  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks }, syntheticProvider, implementationFullAccess);
 }
 
 function buildConfiguredRun(
@@ -1129,6 +1136,7 @@ function buildConfiguredRun(
           },
         },
         snapshot,
+        fallbackModels: options.modelFallbacks,
         auth,
         logLevel: args.logLevel,
         activityReporting: args.activityReporting,
@@ -1231,6 +1239,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     retryPolicy,
     reviewFix,
     agentConfig,
+    modelPrices,
   } = resolveRunnerInputs(process.env);
   // An opted-in run is validated here, before the branch, planning fetch, hooks, clone or any model work.
   // Injection (opts.llmExecutor) never bypasses this; absent a snapshot the run is exactly the legacy one.
@@ -1353,6 +1362,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       groupingParent,
       retryPolicy,
       callbackUrl: callbackUrl ?? undefined,
+      progressToken: progressToken ?? undefined,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
@@ -1517,6 +1527,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         ? null
         : (fbExtraCostUsd ?? 0) + (postPushReviewCostUsd ?? 0);
       writeRunStats(workspaceDir, {
+        modelPrices,
         issueIdentifier,
         passes: statPasses,
         plannedFiles: prUrl ? (planningBlock?.files ?? []) : [],

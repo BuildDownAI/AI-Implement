@@ -71,6 +71,7 @@ export interface PassStat extends Record<string, unknown> {
   implementTurns: number | null;
   implementOutcome: string;   // RunTelemetry outcome or "unknown"
   costUsd: number | null;
+  reviewTelemetry?: RunTelemetry;
   reviewCostUsd: number | null; // null when review never ran, or ran without telemetry, on this pass
   reviewApproved: boolean | null; // null when review never ran on this pass
   tokensIn?: number | null;
@@ -87,6 +88,8 @@ export interface PassStat extends Record<string, unknown> {
   implementFailureMessage?: string;
   /** Optional implement-invocation attribution (AII-946/954), carried from telemetry; absent on legacy executors. */
   attribution?: InvocationAttributionV1;
+  implementFallbackFrom?: string;
+  reviewFallbackFrom?: string;
 }
 
 export interface FeedbackLoopOutputs extends Record<string, unknown> {
@@ -214,6 +217,7 @@ export async function runFeedbackLoop(
   let reviewIssues: string[] = [];
   let terminationReason: TerminationReason = "iterations_exhausted";
   const passes: PassStat[] = [];
+  const fallbackOrigins: Partial<Record<"implementation" | "review", string>> = {};
   let postMortem: string | undefined;
   let failureForOutputs: FailureRecord | undefined;
   // Sum of every superseded implement/review retry attempt's cost — real spend that a
@@ -289,6 +293,12 @@ export async function runFeedbackLoop(
             planningContext: implementPlanningContext,
             iteration,
           });
+        const invocationFailure = outputs.invocationFailure as FailureRecord | undefined;
+        // Exit-zero fatal results normally retain partial work for review. A capacity
+        // switch must instead reach the same retry rail as a thrown invocation failure.
+        if (invocationFailure?.modelFallback || (invocationFailure?.code === "PROVIDER_OVERLOADED" && fallbackOrigins.implementation)) {
+          throw Object.assign(new Error(invocationFailure.message), { failure: invocationFailure, telemetry: outputs.telemetry });
+        }
         implementSubStep.status = "passed";
         implementSubStep.ended_at = effects.now();
         implementSubStep.outputs = outputs;
@@ -312,7 +322,10 @@ export async function runFeedbackLoop(
         const implementErrTelemetry =
           typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
         const isTransient = implementFailure.category === "transient";
-        const willRetryImplement = isTransient && implementStageAttempt <= params.retryPolicy.stageRetries;
+        const fallback = implementFailure.modelFallback;
+        const fallbackRetry = fallback?.stage === "implementation" && !fallbackOrigins.implementation;
+        if (fallbackRetry) fallbackOrigins.implementation = fallback.from;
+        const willRetryImplement = fallbackRetry || (isTransient && implementStageAttempt <= params.retryPolicy.stageRetries);
         // A retried attempt's failure must not overwrite the canonical `implement.{iteration}`
         // row — that id is reserved for the final attempt (BAC-27134's "keep every attempt's
         // evidence"), so a retried attempt's failure record and telemetry are preserved under
@@ -386,6 +399,7 @@ export async function runFeedbackLoop(
       feedback = `Model provider was unavailable during implementation after ${implementStageAttempt} attempt(s); partial changes were preserved. ${implementProviderUnavailable.message}`;
       failureForOutputs = implementProviderUnavailable;
       passes.push({
+        implementFallbackFrom: fallbackOrigins.implementation,
         iteration,
         implementTurns: implementProviderUnavailableTelemetry?.numTurns ?? null,
         implementOutcome: "error",
@@ -437,6 +451,7 @@ export async function runFeedbackLoop(
         : {}),
       ...(implementTelemetry?.attribution ? { attribution: implementTelemetry.attribution } : {}),
     };
+    pass.implementFallbackFrom = fallbackOrigins.implementation;
     passes.push(pass);
 
     const diff = effects.getDiff();
@@ -524,6 +539,8 @@ export async function runFeedbackLoop(
         reviewIssues = [...reviewOutputs.issues];
         pass.reviewApproved = reviewOutputs.approved;
         pass.reviewAttempts = reviewAttemptsTotal;
+        pass.reviewFallbackFrom = fallbackOrigins.review;
+        pass.reviewTelemetry = reviewOutputs.telemetry;
         pass.reviewCostUsd = reviewOutputs.telemetry?.costUsd ?? null;
         if (approved) terminationReason = "approved";
         effects.writeCycleSummary({
@@ -563,7 +580,10 @@ export async function runFeedbackLoop(
         const reviewErrTelemetry =
           typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
         const isTransient = reviewFailure.category === "transient";
-        const willRetryReview = isTransient && reviewStageAttempt <= params.retryPolicy.stageRetries;
+        const fallback = reviewFailure.modelFallback;
+        const fallbackRetry = fallback?.stage === "review" && !fallbackOrigins.review;
+        if (fallbackRetry) fallbackOrigins.review = fallback.from;
+        const willRetryReview = fallbackRetry || (isTransient && reviewStageAttempt <= params.retryPolicy.stageRetries);
         // A retried attempt's failure must not overwrite the canonical `review.{iteration}`
         // row — see the matching implement-stage comment above (BAC-27134).
         if (willRetryReview) {
@@ -585,6 +605,8 @@ export async function runFeedbackLoop(
         }
 
         approved = false;
+        pass.reviewFallbackFrom = fallbackOrigins.review;
+        pass.reviewTelemetry = reviewErrTelemetry;
         pass.reviewCostUsd = reviewErrTelemetry?.costUsd ?? null;
         pass.reviewAttempts = reviewAttemptsTotal;
         reviewStageFailed = true;

@@ -1,3 +1,4 @@
+import { copyModelPrices, type RunModelPrices } from "../run-config.js";
 /**
  * `ImplementationRun` — the workflow that owns one implementation attempt (AII-1553): one dispatch
  * id, one reservation, one runner. It launches the run in a journaled step, waits for it with
@@ -89,7 +90,8 @@ export interface ImplementationRunDependencies {
   /** The run or machine id of a launch that already happened for this dispatch, or `null`.
    *  `dispatchedAt` is the journaled dispatch time (epoch ms): a run created before it is not this launch. */
   findExistingRun(input: ImplementationRunInput, dispatchedAt: number): Promise<string | null>;
-  launch(input: ImplementationRunInput): Promise<ImplementationLaunchResult>;
+  readModelPrices?(): Promise<RunModelPrices | undefined>;
+  launch(input: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult>;
   /** The status of the exact run or machine. Marks the row `running` on the first `started` read; the write must be idempotent. */
   readStatus(input: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus>;
   /** Stops the exact run or machine. */
@@ -113,6 +115,11 @@ export interface ImplementationRunDependencies {
   stopMarginMs?: number;
   escapeWaitMs?: number;
   escapeTickMs?: number;
+}
+
+/** Prices are optional display data: failed or empty cache reads never block dispatch. */
+export async function readOptionalModelPrices(read: () => Promise<RunModelPrices | undefined>): Promise<RunModelPrices | undefined> {
+  try { return copyModelPrices(await read()); } catch { return undefined; }
 }
 
 export function createImplementationRunWorkflow(deps: ImplementationRunDependencies) {
@@ -240,6 +247,11 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     }
 
     try {
+      const modelPrices = deps.readModelPrices
+        ? await ctx.run("copy model prices", async () => {
+            return (await readOptionalModelPrices(deps.readModelPrices!)) ?? null;
+          }, { maxRetryAttempts: 1 })
+        : null;
       const dispatchedAt = await ctx.date.now();
       dispatchedAtForEscape = dispatchedAt;
       mayHaveLaunched = true;
@@ -249,7 +261,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           // Reconcile first: a retry after a committed-but-unacknowledged launch must adopt that run.
           const existing = await deps.findExistingRun(input, dispatchedAt);
           if (existing !== null) return { outcome: "accepted", jobId: existing };
-          const result = await deps.launch(input);
+          const result = await deps.launch(input, modelPrices ?? undefined);
           return result.jobId === undefined ? { outcome: result.outcome } : { outcome: result.outcome, jobId: result.jobId };
         },
         { maxRetryAttempts: 3 },

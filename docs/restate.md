@@ -233,7 +233,7 @@ After each run the object sends itself a delayed `refresh` carrying `scheduledFo
 
 `KgSidecarHealth` (`src/restate/kg-sidecar-health.ts`) is a Virtual Object with one key, `sidecar`, no state, and one exclusive handler, `check`. It runs the existing KG sidecar probe (`probeWithTimeout`) in one `ctx.run("probe")` step and returns the `SidecarHealth` record, which is therefore in the journal. Exclusive means a second `check` queues behind the first, so this object never runs two probes at once.
 
-The production probe returns `null` and sends nothing when `isKgUnavailable()` is false, so a `check` queued after a recovery is a no-op. `checkKgSidecarHealth()` is the poll-loop caller, under the same `kgScheduleBound` guard as `checkPipelineSchedules`: one one-way `POST KgSidecarHealth/sidecar/check/send` per cycle while the sidecar is unavailable. It makes no call during a deploy hold or unless the sidecar is `ready` and registration is `registered`, and a failed call logs one line and never throws.
+A passing probe also runs `ctx.run("notify-recovery")`, which posts `✅ KG sidecar serving again` only when a successfully delivered boot notice warned about the sidecar. The pending warning is process-local and consumed after successful delivery; completed notification steps are not repeated on replay. The production probe returns `null` and sends nothing when `isKgUnavailable()` is false and no recovery notice is pending, so a `check` queued after a recovery is a no-op. `checkKgSidecarHealth()` is the poll-loop caller, under the same `kgScheduleBound` guard as `checkPipelineSchedules`: one one-way `POST KgSidecarHealth/sidecar/check/send` per cycle while the sidecar is unavailable or a recovery notice is pending. It makes no call during a deploy hold or unless the sidecar is `ready` and registration is `registered`, and a failed call logs one line and never throws.
 
 ## The SetupChecks object
 
@@ -379,7 +379,9 @@ Both `postDeployment()` calls inside `register()` — the initial no-force attem
 
 `createSelfDeploy` (`src/restate/self-deploy.ts`) defines an app-keyed Virtual Object. It stores the deploy target and phase under `deploy`, holds dispatch during drain, and advances through short `checkDrain`, `apply` and `verify` invocations using delayed sends. It never sleeps: a sleeping deploy invocation would block its own drain and boot registration. The quiet probe excludes only its own invocation ID through the optional argument to `createRestateDrainProbes` / `queryNonCompletedInvocations`; registration supplies no exclusion. Send headers carry the deploy ID so a cancelled deploy's outstanding timer cannot advance a later deploy.
 
-Apply schedules verification before changing the image. Its retried effect lists and rereads machines before replacing each full config with only `image` changed; an already accepted image update is skipped after a crash. Published images require a registry manifest HEAD. KG builds reuse `deployArgs` with build-only/push flags. Apply allows three effect attempts; exhaustion ends the deploy with `apply-failed` and clears the hold. Each flyctl call has a ten-minute deadline and receives an abort signal that its executor must honor. The apply handler uses 65-minute inactivity and 70-minute abort timeouts to accommodate three attempts containing a build and optional detached deploy. The optional injected fly.toml setting uses detached deploy only without `FLY_IMAGE_APP`, because control-plane-created machines retain their control-plane-owned config. Verification reads the running process's source commit, and terminal transitions clear the hold and invoke the journaled `record outcome` effect.
+Apply schedules verification before changing the image, preserving the journal order `apply policy` then `apply image`. The image effect lists and rereads machines and skips work when all already run the recorded target image, including after a release replaces its own process. KG builds reuse `deployArgs` in one `flyctl deploy --remote-only --no-cache --image-label deploy-<sha7>` call that builds, pushes and releases. The label keeps the released image equal to the recorded target so replay skips a second deploy; there is no separate registry manifest check or Machines API update for built images. A built flyctl failure triggers one machine reread to reconcile an accepted release; otherwise it ends with `apply-failed` without another flyctl attempt. Built calls have a 20-minute deadline; published-image flyctl calls retain a ten-minute deadline. Each executor receives an abort signal it must honor.
+
+Published images replace each machine's full config with only `image` changed, or use a detached `flyctl deploy --image` when the optional fly.toml setting is enabled without `FLY_IMAGE_APP`, because control-plane-created machines retain their control-plane-owned config. The bounded image effect allows up to three attempts for retryable failures, including Machines API 409/429 responses; other 4xx responses fail immediately. Exhaustion ends the deploy with `apply-failed` and clears the hold. Apply failures retain a sanitized diagnostic in the effect result, log and outcome notice. The apply handler retains its 65-minute inactivity and 70-minute abort timeouts; these are handler limits, not the built flyctl deadline or a promise of three build attempts. Verification reads the running process's source commit, and terminal transitions clear the hold and invoke the journaled `record outcome` effect.
 
 All effects, configuration/credential access, and clock limits are injected. Credentials are read inside effects and never returned to the journal. It is registered at boot, keyed by `FLY_APP_NAME`, and is the only self-deploy path: the admin routes and the auto-deploy loop call it through the ingress, boot no longer clears the hold, and `onOutcome` records the outcome (see [deployment.md](deployment.md)). `options.applyFlyToml` lives in its state. Restate tests exercise both replay variants, disk-backed server/endpoint restarts and delayed-send journal snapshots (`self-deploy*.restate.test.ts`).
 
@@ -633,3 +635,63 @@ Reading a run's journal in the Restate UI works once the AII-1287 scrub row exis
 The link is hidden for a `user` session. The Journal page and the drawer's "Restate journal" section are gone.
 
 For Restate's own UI, run `fly proxy 9070:9070 -a <app>` and open `http://127.0.0.1:9070/ui/invocations/<id>`.
+
+### ModelPrices
+
+`ModelPrices/builddown` caches public USD-per-token model prices from
+`GET <BUILDDOWN_OIDC_ISSUER>/api/model-prices`. After endpoint registration, boot
+sends `refresh({ reason: "boot" })`. The exclusive handler preserves an existing
+armed timer, so restarts do not multiply the schedule. Every attempted read arms
+another refresh six hours later. Scheduled inputs carry `scheduledFor`; a timer
+superseded by a requested refresh does nothing.
+
+The shared `current` handler returns `{ prices, fetchedAt, lastError }`.
+`fetchedAt` is epoch milliseconds of the last successful read. Failures preserve
+the last good prices and timestamp and record only `network`, `http`, or
+`invalid-body`. A successful read clears the error, including when prices are
+empty. No response text or exception message leaves the bounded `ctx.run` step.
+Requests omit credentials, reject redirects, and have a 30-second fetch timeout.
+Missing or invalid HTTPS issuer configuration disables fetching and scheduling;
+`current` then returns empty prices, a null timestamp and `not-configured`.
+No MCP tool exposes this cache.
+The Restate tests run both replay variants, check fixed failure codes and journal/state
+sanitization, and inject a short interval to exercise actual delayed retry delivery.
+The production interval remains six hours.
+
+Contract synchronization uses a hand copy from the pinned Control-Plane commit
+`545a6c4`, because the runner cannot read the private `BuildDownAI/Control-Plane`
+repository. Copy `docs/contracts/model-prices/several-models.json`, `empty.json`,
+`unavailable.json`, and `response.schema.json` byte for byte into
+`src/__tests__/fixtures/contracts/model-prices/`. Verify the supplied SHA-256 hashes
+before writing the copies, and record the commit and hashes in `contracts.lock.json`.
+Never edit the copied files. The contract test checks all four hashes and validates
+recorded successful bodies against both the producer schema and the consumer
+validator. Both Restate harness variants replay the producer exchanges.
+
+## PostPushReviewPublication
+
+`PostPushReviewPublication` is a virtual object keyed by `<owner>/<repo>#<prNumber>`.
+Its exclusive `publish` handler accepts the pushed head SHA, post-push review pass
+`iteration`, body, and inline comments. The shared `get({ headSha, iteration })`
+returns the saved result or `null`. State keys are `<headSha>:<iteration>`; results
+contain review ID/URL, inline comment IDs and locations, and `inlineFallback`, or
+`stale-head`.
+The runner’s `submitPrReview` in `src/pipeline/steps/post-push-review.ts` calls `POST <callbackUrl>/runner/review-publication`; see [In-run: the post-push-review step](review-fix-rail.md#in-run-the-post-push-review-step).
+
+Inputs are limited to 48,000 UTF-8 JSON bytes and 100 inline comments. This leaves
+room under GitHub's review body limit for fallback formatting and markers. Invalid
+inputs and mismatched object keys fail terminally before GitHub is called.
+
+One `publish-review` step obtains an installation token, checks the current PR
+head, searches paginated reviews for the head/pass marker, and posts a COMMENT
+review pinned to that head if absent. Position validation failures (422) cause
+one submission without inline comments, with their text appended to the body.
+The native review body prefix is preserved and the publication marker is last.
+A separate fallback marker allows retries to recover `inlineFallback`; paginated
+review comments recover comment IDs even after a crash following publication.
+The step retries up to five times, reconciling before each submission.
+
+The token exists only inside that step: it is never returned, stored in object
+state, passed to another handler, or included in errors. Dependency exceptions
+are replaced with a fixed message before reaching Restate's journal. Only plain
+publication results cross the step boundary.

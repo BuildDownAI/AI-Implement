@@ -1,5 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { managedRunConfigFields } from "./managed-dispatch-auth.js";
+import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -98,7 +100,7 @@ import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionI
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
 import { seedSettingsFromEnv } from "./seed-once-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerReviewPublication, createReviewPublicationIngressClient, handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
 import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "./runner-tokens.js";
@@ -110,7 +112,7 @@ import { createReviewFixIngressClient, reviewFixResultIntakeFromForward } from "
 import { appendReviewFixActivityBatch, isReviewFixEvidenceTombstoned } from "./review-fix-evidence.js";
 import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fix-contract.js";
 import { handleMcpRequest } from "./mcp.js";
-import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
+import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
 import {
@@ -180,6 +182,7 @@ import { checkKgSidecarHealth } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
+import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, restateCanServe, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
@@ -3759,7 +3762,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
               runPublicationToken,
               privateTransport: reviewFixCapabilities.supportsPrivateRunConfig === true,
               credentials: ghaFixCredentials,
-              ...(ghaFixDecision.kind === "launch" ? { agentConfig: ghaFixDecision.snapshot } : {}),
+              ...managedRunConfigFields(ghaFixDecision),
               runnerImage,
               retryPolicy: getRetryPolicy(),
             })
@@ -3999,6 +4002,7 @@ const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 const selfDeployClient = createSelfDeployIngressClient();
 const trackerExportClient = createTrackerExportIngressClient();
+const reviewPublicationIngress = createReviewPublicationIngressClient();
 const lateExternalReviewIngress = createLateExternalReviewIngressClient();
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: lateExternalReviewIngress,
@@ -4165,6 +4169,51 @@ function onReviewFixActivity(batch: RunnerActivityBody): ActivityIntakeOutcome {
     return { status: "duplicate", attemptId: batch.attemptId };
   }
   return { status: "accepted", attemptId: batch.attemptId };
+}
+
+/** HTTP boundary shared by the production route and route-level tests. */
+export function handleReviewPublicationRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  deps: {
+    secret: string | null | undefined;
+    ingress: Parameters<typeof handleRunnerReviewPublication>[0]["ingress"];
+    restateReady: () => boolean;
+  },
+): void {
+  (async () => {
+    if (!deps.secret) {
+      res.writeHead(501, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Runner callback not configured" }));
+      return;
+    }
+    const body = await readBodyLimited(req, MAX_PUBLICATION_BYTES + 1024);
+    if (body === null) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Review publication too large" }));
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+      return;
+    }
+    const result = await handleRunnerReviewPublication({
+      authorization: req.headers.authorization, secret: deps.secret,
+      body: parsed, ingress: deps.ingress, restateReady: deps.restateReady,
+    });
+    res.writeHead(result.status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result.body));
+  })().catch((err) => {
+    console.error("[runner-review-publication] Unhandled error:", err);
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal server error" }));
+    }
+  });
 }
 
 function startServer(
@@ -4578,6 +4627,12 @@ function startServer(
       return;
     }
 
+    // Publish a post-push review through the durable publication object.
+    if (url === "/runner/review-publication" && req.method === "POST") {
+      handleReviewPublicationRequest(req, res, { secret: config.runnerTokenSecret, ingress: reviewPublicationIngress, restateReady: restateCanServe });
+      return;
+    }
+
     // Runner progress callback — scoped bearer token authenticated
     if (url === "/runner/progress" && req.method === "POST") {
       (async () => {
@@ -4957,6 +5012,7 @@ export async function releaseUnownedDeployHoldAtBoot(
 /** Production registration hook; only successful registration may recover the hold. */
 export async function onRestateRegistered(deps: {
   releaseHold?: () => Promise<void>;
+  armPrices?: () => Promise<void>;
   sweep: () => void;
   scrub: () => Promise<void>;
   seed: () => Promise<void>;
@@ -4965,6 +5021,7 @@ export async function onRestateRegistered(deps: {
 }): Promise<void> {
   if (getRestateStatus().registration.state === "registered") {
     await (deps.releaseHold ?? releaseUnownedDeployHoldAtBoot)();
+    await (deps.armPrices ?? armModelPricesSchedule)();
   }
   deps.sweep();
   await deps.scrub();
@@ -5238,6 +5295,7 @@ async function main(): Promise<void> {
     remediateStuckJob,
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
   }).services;
+  const postPushReviewPublication = createPostPushReviewPublication(createProductionPostPushReviewPublicationDependencies(config));
   const lateExternalReviewServices = createProductionLateExternalReviewServices(config).services;
   const trackerExportServices = createProductionTrackerExportServices().services;
   const selfDeployServices = [selfDeployRecovery, createSelfDeploy({
@@ -5275,7 +5333,7 @@ async function main(): Promise<void> {
     () => getRunnerBackendSource(),
   );
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
-    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
+    startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: () => onRestateRegistered({
       sweep: () => sweepOnRegistered(config),
@@ -5335,7 +5393,9 @@ async function main(): Promise<void> {
   // Every write postBootNotice makes — LAST_IMAGE_REF_KEY and LAST_SHUTDOWN_AT_KEY — happens
   // synchronously before its first await, so nothing is lost if the webhook never answers. Keep it
   // that way: a write moved below an await here stops persisting silently and misclassifies every later boot.
-  void postBootNotice(config);
+  void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
+    ? { probe: remainingMs => probeWithTimeout(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
+    : undefined);
 
   // Reconcile machines from any previous run before starting the poll loop
   await refreshRunnerBackendCache();

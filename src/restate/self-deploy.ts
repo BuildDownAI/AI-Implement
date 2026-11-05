@@ -81,7 +81,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
           timer = setTimeout(() => {
             controller.abort();
             reject(new Error("SelfDeploy flyctl deadline exceeded"));
-          }, limits.flyctlTimeoutMs);
+          }, deps.limits?.flyctlTimeoutMs ?? (record.target.source === "built" ? 20 * 60_000 : limits.flyctlTimeoutMs));
         }),
         deps.flyctl(record, args, token, controller.signal),
       ]);
@@ -171,7 +171,6 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
         const config = deps.config();
         const token = config.flyDeployToken!;
         const secrets = [token];
-        let built = false;
         for (let attempt = 0; ; attempt++) {
           let operation = "listMachines";
           try {
@@ -181,13 +180,13 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             const fresh = [];
             for (const machine of machines) fresh.push(await deps.fly.getMachine(token, ctx.key, machine.id));
             if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
-            if (record.target.source === "built" && !built) {
-              operation = "build";
+            if (record.target.source === "built") {
+              operation = "flyctl deploy";
               const kgToken = await deps.kgToken();
               secrets.push(kgToken);
               const args = deployArgs({ app: ctx.key, sourceCommit: record.target.commit, sourceRepo: record.target.repo, sourceBranch: record.target.branch, kgSourceRepo: config.kgSourceRepo!, kgToken });
-              await flyctl(record, [...args, "--build-only", "--push", "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
-              built = true;
+              await flyctl(record, [...args, "--image-label", `deploy-${record.target.commit.slice(0, 7)}`], token);
+              return true;
             }
             if (policy === "toml") {
               operation = "flyctl deploy";
@@ -198,6 +197,19 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             }
             return true;
           } catch (error) {
+            const builtDeployFailed = record.target.source === "built" && operation === "flyctl deploy";
+            if (builtDeployFailed) {
+              // The release may have stopped this process after accepting the deploy.
+              // Reconcile once, but never start another remote build in this effect.
+              try {
+                const machines = await deps.fly.listMachines(token, ctx.key);
+                const fresh = [];
+                for (const machine of machines) fresh.push(await deps.fly.getMachine(token, ctx.key, machine.id));
+                if (fresh.length > 0 && fresh.every(m => m.config.image === record.target.image)) return true;
+              } catch {
+                // Preserve the original deploy failure if reconciliation is unavailable.
+              }
+            }
             const raw = error instanceof Error ? error.message : "Unknown error";
             const status = (error as { status?: number } | null)?.status ?? (Number(raw.match(/(?:\(|\bHTTP\s+)([45]\d\d)\b/i)?.[1]) || undefined);
             // Keep flyctl diagnostics, but drop command/argv suffixes (including build secrets).
@@ -214,7 +226,7 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
             const machinesApi = ["listMachines", "getMachine", "updateMachine"].includes(operation);
             const fixed = status !== undefined && status >= 400 && status < 500
               && !(machinesApi && (status === 409 || status === 429));
-            if (fixed || attempt === 2) return { detail };
+            if (builtDeployFailed || fixed || attempt === 2) return { detail };
             await new Promise(resolve => setTimeout(resolve, Math.min(100 * 2 ** attempt, 1_000)));
           }
         }
@@ -262,8 +274,8 @@ export function createSelfDeploy(deps: SelfDeployDeps) {
   return restate.object({ name: "SelfDeploy", handlers: {
     start: restate.handlers.object.exclusive({ input: serde.zod(startSchema) }, start),
     checkDrain: restate.handlers.object.exclusive({ ingressPrivate: true }, checkDrain),
-    // A KG build and optional detached deploy can each take ten minutes per attempt.
-    // Leave room for three attempts and retry delays before the server aborts the effect.
+    // A built deploy makes one flyctl attempt with a twenty-minute deadline per effect.
+    // Retain the handler limits independently of that deadline and the published-path retries.
     apply: restate.handlers.object.exclusive({ ingressPrivate: true, inactivityTimeout: 65 * 60_000, abortTimeout: 70 * 60_000 }, apply),
     verify: restate.handlers.object.exclusive({ ingressPrivate: true, input: serde.zod(z.object({ attempt: z.number().int().min(1).max(5) }).strict()) }, verify),
     cancel: restate.handlers.object.exclusive({ input: serde.zod(z.object({ requestedBy: requester }).strict()) }, cancel),

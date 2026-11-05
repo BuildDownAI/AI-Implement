@@ -2,6 +2,9 @@ export const STAGE_AGENT_CONFIG_VERSION = 1;
 export const STAGE_NAMES = ["planning", "implementation", "review"] as const;
 export const STAGE_SELECTION_FIELDS = ["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"] as const;
 
+export const STORED_STAGE_SELECTION_FIELDS = [...STAGE_SELECTION_FIELDS, "fallbackModel"] as const;
+export type StoredStageSelectionField = (typeof STORED_STAGE_SELECTION_FIELDS)[number];
+
 export type StageName = (typeof STAGE_NAMES)[number];
 export type StageSelectionField = (typeof STAGE_SELECTION_FIELDS)[number];
 export type StageAgent = "claude" | "codex";
@@ -35,7 +38,7 @@ export interface StageSelection {
 
 export type StageSelectionPatch = {
   [K in StageSelectionField]?: StageSelection[K] | null;
-};
+} & { fallbackModel?: string | null };
 
 export interface StageAgentConfigurationV1 {
   version: 1;
@@ -51,6 +54,8 @@ export interface ConfiguredStageResolution {
   mode: "configured";
   stages: Record<StageName, StageSelection>;
   sources: Record<StageName, Record<StageSelectionField, FieldSource>>;
+  fallbackModels: Partial<Record<StageName, string>>;
+  fallbackModelSources: Partial<Record<StageName, FieldSource>>;
   profiles: Record<StageName, Pick<AccountProfile, "id" | "identity" | "revision" | "agent" | "provider" | "authMode">>;
 }
 
@@ -76,6 +81,12 @@ function assertKnownKeys(value: UnknownRecord, known: readonly string[], context
   }
 }
 
+export function validateFallbackModel(value: unknown, stage: string): void {
+  if (value !== undefined && value !== null && (typeof value !== "string" || value.trim() === "")) {
+    throw new Error(`${stage}.fallbackModel must be a non-empty string`);
+  }
+}
+
 function validateConfigShape(config: StageAgentConfigurationV1, name: string): void {
   if (!isRecord(config)) throw new Error(`${name} must be an object`);
   assertKnownKeys(config, ["version", "mode", "stages"], name);
@@ -92,7 +103,8 @@ function validateConfigShape(config: StageAgentConfigurationV1, name: string): v
     const patch = config.stages[stage];
     if (patch === undefined) continue;
     if (!isRecord(patch)) throw new Error(`${name}.stages.${stage} must be an object`);
-    assertKnownKeys(patch, STAGE_SELECTION_FIELDS, `${name}.stages.${stage}`);
+    validateFallbackModel(patch.fallbackModel, stage);
+    assertKnownKeys(patch, STORED_STAGE_SELECTION_FIELDS, `${name}.stages.${stage}`);
   }
 }
 
@@ -230,6 +242,8 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
   const stages = {} as Record<StageName, StageSelection>;
   const sources = {} as Record<StageName, Record<StageSelectionField, FieldSource>>;
   const profiles = {} as ConfiguredStageResolution["profiles"];
+  const fallbackModels: ConfiguredStageResolution["fallbackModels"] = {};
+  const fallbackModelSources: ConfiguredStageResolution["fallbackModelSources"] = {};
 
   for (const stage of STAGE_NAMES) {
     const resolved = resolveStage(
@@ -238,6 +252,13 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       input.projectConfig.stages?.[stage],
       input.remainingJobMs,
     );
+    const projectFallback = input.projectConfig.stages?.[stage]?.fallbackModel;
+    const fallback = projectFallback ?? input.orchestratorDefaults.stages?.[stage]?.fallbackModel;
+    if (fallback != null) {
+      if (fallback === resolved.selection.model) throw new Error(`${stage}.fallbackModel must differ from model`);
+      fallbackModels[stage] = fallback;
+      fallbackModelSources[stage] = projectFallback != null ? "project" : "orchestrator-default";
+    }
     const profile = profileById.get(resolved.selection.accountProfileId);
     if (!profile) throw new Error(`${stage}.accountProfileId does not reference a known profile`);
     validateAgentProvider(stage, resolved.selection, profile);
@@ -253,7 +274,7 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
     };
   }
 
-  return { mode: "configured", stages, sources, profiles };
+  return { mode: "configured", stages, sources, profiles, fallbackModels, fallbackModelSources };
 }
 
 export function describeInvocationLimit(selection: Pick<StageSelection, "agent" | "invocationTimeoutMs">): string {

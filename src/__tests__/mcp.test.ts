@@ -150,6 +150,7 @@ function fakeRestateContext(handlerName: string): restate.Context {
     request: () => ({ target: { handler: handlerName } }),
     // SetupChecks has its own client: get_tenant_health reads the stored run, and none has run yet.
     objectClient: (definition: { name: string }) => (definition.name === "SetupChecks" ? { get: async () => null } : {
+      current: async () => ({ prices: [] }),
       trigger: (opts: { actorEmail?: string }) => kgTriggerFake!(opts),
       status: async () => null,
       get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }),
@@ -2692,7 +2693,7 @@ describe("handleMcpRequest", () => {
         JSON.stringify({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "get_issue_report_card", arguments: { issue: "AII-1" } } }),
       );
       expect(result.statusCode).toBe(200);
-      expect(getIssueReportCard).toHaveBeenCalledWith("AII-1");
+      expect(getIssueReportCard).toHaveBeenCalledWith("AII-1", []);
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).toBeUndefined();
       expect(JSON.parse(parsed.result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5, merged: true });

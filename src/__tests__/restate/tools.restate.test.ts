@@ -1,3 +1,7 @@
+import { initReconciliationTable } from "../../reconciliation.js";
+import { readFileSync } from "node:fs";
+import { createModelPrices, type ModelPrice } from "../../restate/model-prices.js";
+import { setObjectState } from "./harness.js";
 // Binary-backed round-trip coverage for the orchestratorTools service (src/restate/tools.ts,
 // AII-710) — a real Restate server (the binary) journals the ingress body and
 // delivers it to our in-process endpoint, proving the role assertion and the discovery
@@ -172,6 +176,7 @@ describe("orchestratorTools (Restate)", () => {
     dedup.getDb();
     // getInFlightJobs (src/log.ts) reads dispatch_log, which getDb() does not create.
     initLogTable();
+    initReconciliationTable();
     // get_tenant_health also reads `mappings` (getMappings) and `settings` (getRunnerMode).
     initMappingsTable();
     initSettingsTable();
@@ -181,11 +186,38 @@ describe("orchestratorTools (Restate)", () => {
     ).run("BDS", "BuildDownAI", "skills", "claude.yml", "testing", JSON.stringify({ SUPER_SECRET: "leak-me" }));
     setKgMemoryProvider(null);
 
-    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools, authorizationTools, selfDeployStub, setupChecks]);
+    environments = await startVariants([createModelPrices({ issuer: () => "https://prices.example", fetch: (...args) => fetch(...args) }), orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools, authorizationTools, selfDeployStub, setupChecks]);
   }, 60_000);
 
   afterAll(async () => {
     await stopAll(environments);
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("estimates report-card costs from ModelPrices state (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const identifier = `AII-EST-${label}`;
+    const dispatchId = `estimate-${label}`;
+    dedup.getDb().prepare(`INSERT INTO dispatch_log (issue_id, issue_identifier, dispatched_at, phase, status, dispatch_id)
+      VALUES (?, ?, 1, 'implementation', 'completed', ?)`).run(identifier, identifier, dispatchId);
+    dedup.getDb().prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', 'a-dated', 'test', 'succeeded', 1, ?)`)
+      .run(dispatchId, dispatchId, JSON.stringify({ tokensIn: 100, tokensOut: 10, costStatus: "unavailable" }));
+    const prices: ModelPrice[] = JSON.parse(readFileSync(new URL("../fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+    for (const available of [true, false]) {
+      await setObjectState(env.adminAPIBaseUrl(), "ModelPrices", "builddown", "state", {
+        prices: available ? prices : [], fetchedAt: 1, lastError: null, nextAt: 9999999999999,
+      });
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_issue_report_card", {
+        caller: systemCaller(), args: { issue: identifier },
+      });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(JSON.parse(result.content[0]!.text).totals).toEqual({
+        dispatches: 1, passes: 0, costUsd: null,
+        estimatedCostUsd: available ? 0.00031234567890123456789 : null,
+        unpricedCalls: available ? 0 : 1,
+      });
+    }
   });
 
   it.each(VARIANTS.map(([label]) => label))("enforces every authorization state-table cell (%s)", async (label) => {

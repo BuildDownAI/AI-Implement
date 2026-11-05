@@ -45,7 +45,7 @@ import {
 import {
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
-  STAGE_SELECTION_FIELDS,
+  STORED_STAGE_SELECTION_FIELDS,
   type StageAgentConfigurationV1,
   type StageName,
 } from "./agent-config.js";
@@ -4322,7 +4322,7 @@ function validateStagesBody(stages: unknown): string | null {
     if (!(STAGE_NAMES as readonly string[]).includes(stage)) return "stages contains unknown key(s)";
     if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return `stages.${stage} must be an object`;
     for (const [field, value] of Object.entries(patch)) {
-      if (!(STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) return `stages.${stage} contains unknown key(s)`;
+      if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) return `stages.${stage} contains unknown key(s)`;
       if (value === null) continue;
       if (field === "invocationTimeoutMs" ? !Number.isSafeInteger(value) || (value as number) <= 0 : typeof value !== "string" || value.trim() === "") {
         return `stages.${stage}.${field} is malformed`;
@@ -4576,8 +4576,8 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
     const profile = resolution.profiles[stage];
     const projectionProfile = getAccountProfile(profile.id);
     stages[stage] = {
-      values: resolution.stages[stage],
-      sources: resolution.sources[stage],
+      values: { ...resolution.stages[stage], fallbackModel: resolution.fallbackModels[stage] ?? null },
+      sources: { ...resolution.sources[stage], fallbackModel: resolution.fallbackModelSources[stage] ?? null },
       profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },
       account: projectionProfile ? accountStatus({ ...projectionProfile, revision: profile.revision }, deps) : { readiness: "unknown", failureCode: "profile_not_found" },
     };

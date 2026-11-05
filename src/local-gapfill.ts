@@ -1,4 +1,5 @@
 import type { RepoMapping } from "./config.js";
+import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { buildEnvelopeDispatchInputs } from "./github.js";
 import { generateMachineNonce, generateSessionToken } from "./fly-machines.js";
 import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
@@ -73,7 +74,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     throw new Error("Local gap-fill envelope did not include run_config");
   }
   const decoded = decodeRunConfig(envelope.run_config);
-  const runConfig: RunConfigV1 = input.managed ? { ...decoded, agentConfig: input.managed.decision.snapshot } : decoded;
+  const runConfig: RunConfigV1 = input.managed ? { ...decoded, ...managedRunConfigFields(input.managed.decision) } : decoded;
 
   let protectedModelAuth: LocalRunnerInput["protectedModelAuth"];
   if (input.managed) {

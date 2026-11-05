@@ -26,7 +26,10 @@ export const FAILURE_CATEGORIES: readonly FailureCategory[] = [
   "unknown",
 ];
 
+export interface ModelFallback { stage: "planning" | "implementation" | "review"; from: string; to: string }
+
 export interface FailureRecord {
+  modelFallback?: ModelFallback;
   category: FailureCategory;
   /** Open-ended machine code, UPPER_SNAKE, e.g. PROVIDER_OVERLOADED, GIT_LEASE_REJECTED. */
   code: string;
@@ -100,7 +103,7 @@ export const PROVIDER_SIGNATURES: SignatureRow[] = [
   {
     category: "transient",
     code: "PROVIDER_OVERLOADED",
-    test: /overloaded_error|\b529\b|\boverloaded\b/i,
+    test: /overloaded_error|\b529\b|\boverloaded\b|at capacity|try a different model/i,
   },
   {
     category: "transient",
@@ -483,9 +486,9 @@ export function classifyLlmResult(
     const stdout = result.stdout ?? "";
     const stderr = result.stderr ?? "";
     const errorMessage = result.errorMessage?.trim() ?? "";
-    // The parser's terminal error text leads the message for an exit-0 failure: stdout
+    // The parser's terminal error text leads the message for every failure: stdout
     // carries only the model's final prose, which says nothing about why the stream was fatal.
-    const text = [result.exitCode === 0 ? errorMessage : "", stderr, stdout].filter(Boolean).join("\n");
+    const text = [errorMessage, stderr, stdout].filter(Boolean).join("\n");
 
     let category: FailureCategory;
     let code: string;
@@ -538,7 +541,7 @@ export function classifyLlmResult(
         code = "UNKNOWN";
       }
     } else {
-      const matched = matchSignature(PROVIDER_SIGNATURES, signatureMatchText(stdout, stderr));
+      const matched = matchSignature(PROVIDER_SIGNATURES, [errorMessage, signatureMatchText(stdout, stderr)].filter(Boolean).join("\n"));
       if (matched) {
         category = matched.category;
         code = matched.code;

@@ -34,7 +34,7 @@ import { feedbackLoopStep, projectStageReport } from "../pipeline/steps/feedback
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
-import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
+import type { LLMExecutor, RunTelemetry, Step, StepReporter } from "../pipeline/types.js";
 import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 import { makeContext, makeExecutor } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -1074,6 +1074,75 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
     mockDiff();
   });
 
+  it.each([
+    ["implementation", 0], ["implementation", 1], ["review", 0], ["review", 1],
+  ] as const)("guarantees one fallback attempt after retries are spent: %s, budget=%s", async (stage, stageRetries) => {
+    const failure: FailureRecord = { category: "transient", code: "PROVIDER_OVERLOADED", stage, attempt: 1, retryable: false, message: "capacity", evidence: { truncated: false }, modelFallback: { stage, from: "primary", to: "fallback" } };
+    const run = vi.mocked(stage === "implementation" ? implementStep.run : reviewStep.run);
+    if (stageRetries) run.mockRejectedValueOnce(Object.assign(new Error("capacity"), { failure: { ...failure, modelFallback: undefined } }));
+    run.mockRejectedValueOnce(Object.assign(new Error("capacity"), { failure }))
+      .mockRejectedValueOnce(Object.assign(new Error("capacity"), { failure: { ...failure, modelFallback: undefined } }));
+    const result = feedbackLoopStep.run(makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries } }), { ...baseInputs, sleep: NO_SLEEP }, new NoopStepReporter());
+    if (stage === "implementation") {
+      await expect(result).rejects.toMatchObject({ failure: { code: "PROVIDER_UNAVAILABLE" } });
+      expect(run).toHaveBeenCalledTimes(stageRetries + 2);
+      return;
+    }
+    const outputs = await result;
+    expect(run).toHaveBeenCalledTimes(stageRetries + 2);
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+  });
+
+  it.each(["implementation", "review"] as const)("keeps %s fallback origin across passes without renewing its extra retry", async stage => {
+    const failure: FailureRecord = { category: "transient", code: "PROVIDER_OVERLOADED", stage, attempt: 1, retryable: false, message: "capacity", evidence: { truncated: false }, modelFallback: { stage, from: "primary", to: "fallback" } };
+    const telemetry: RunTelemetry = { outcome: "error", numTurns: 3, durationMs: 100, costUsd: 0.75, tokensIn: 200, tokensOut: 30 };
+    const capacityError = () => Object.assign(new Error("capacity"), { failure, telemetry });
+    // Replay the marker on iteration 3 to prove the loop's allowance itself is run-local.
+    if (stage === "implementation") {
+      vi.mocked(implementStep.run).mockRejectedValueOnce(capacityError())
+        .mockResolvedValueOnce(IMPLEMENT_OUTPUTS).mockResolvedValueOnce(IMPLEMENT_OUTPUTS)
+        .mockRejectedValueOnce(capacityError());
+    } else {
+      vi.mocked(reviewStep.run).mockRejectedValueOnce(capacityError())
+        .mockResolvedValueOnce(REJECTED_REVIEW).mockResolvedValueOnce(REJECTED_REVIEW)
+        .mockRejectedValueOnce(capacityError());
+    }
+    if (stage === "implementation") vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+    // Dirty work makes a terminal implement failure return the preserved passes.
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/foo.ts\n"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const reports: Step[] = [];
+    const outputs = await feedbackLoopStep.run(makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), { ...baseInputs, maxIterations: 4, sleep: NO_SLEEP }, { report: async step => { reports.push(structuredClone(step)); } });
+    const retryId = `${stage === "implementation" ? "implement" : "review"}.1.retry1`;
+    expect(reports.find(step => step.id === retryId && step.status === "failed")?.outputs).toMatchObject({ failure: { modelFallback: failure.modelFallback }, telemetry });
+    expect(outputs.extraCostUsd).toBeCloseTo(0.75);
+    expect(outputs.extraCostUnreported).toBe(0);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.passes).toHaveLength(3);
+    const origin = stage === "implementation" ? "implementFallbackFrom" : "reviewFallbackFrom";
+    expect(outputs.passes.map(pass => pass[origin])).toEqual(["primary", "primary", "primary"]);
+    expect(stage === "implementation" ? implementStep.run : reviewStep.run).toHaveBeenCalledTimes(4);
+    expect(stage === "implementation" ? reviewStep.run : implementStep.run).toHaveBeenCalledTimes(stage === "implementation" ? 2 : 3);
+  });
+
+  it("retries a settled capacity failure with continuation, preserving retry evidence", async () => {
+    const failure: FailureRecord = { category: "transient", code: "PROVIDER_OVERLOADED", stage: "implementation", attempt: 1, retryable: false, message: "capacity", evidence: { truncated: false }, modelFallback: { stage: "implementation", from: "primary", to: "fallback" } };
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/foo.ts\n"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const telemetry: RunTelemetry = { outcome: "error", numTurns: 2, durationMs: 100, costUsd: 1.23, tokensIn: 150, tokensOut: 25 };
+    vi.mocked(implementStep.run).mockResolvedValueOnce({ ...IMPLEMENT_OUTPUTS, invocationFailure: failure, telemetry });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+    const reports: Step[] = [];
+    const reporter: StepReporter = { report: async step => { reports.push(structuredClone(step)); } };
+    const outputs = await feedbackLoopStep.run(makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), { ...baseInputs, sleep: NO_SLEEP }, reporter);
+    expect(outputs.approved).toBe(true);
+    expect(outputs.passes[0]?.implementFallbackFrom).toBe("primary");
+    expect(vi.mocked(implementStep.run).mock.calls[1]?.[1].prompt).toContain("Continue from the current state; do not revert it.");
+    expect(reports.find(step => step.id === "implement.1.retry1" && step.status === "failed")?.outputs).toMatchObject({ failure: { modelFallback: failure.modelFallback }, telemetry });
+    expect(outputs.extraCostUsd).toBeCloseTo(1.23);
+    expect(outputs.extraCostUnreported).toBe(0);
+    expect(outputs.passes[0]?.costUsd).toBeNull();
+  });
+
   it("implement succeeds, review transient once then approves: one PR, reviewAttempts=2, implement ran once", async () => {
     vi.mocked(reviewStep.run)
       .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
@@ -1454,11 +1523,12 @@ describe("feedback-loop core isolation (AII-626)", () => {
       return entry.name.endsWith(".ts") ? [path] : [];
     });
 
-  it("no file under src/pipeline/ imports src/restate/ or @restatedev/*", () => {
+  it("pipeline imports no Restate code", () => {
     const importRe = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g;
     const offenders: string[] = [];
     for (const file of sources(pipelineDir)) {
-      for (const match of readFileSync(file, "utf-8").matchAll(importRe)) {
+      const source = readFileSync(file, "utf-8");
+      for (const match of source.matchAll(importRe)) {
         if (match[1].startsWith("@restatedev/") || /(^|\/)restate\//.test(match[1])) offenders.push(`${file}: ${match[1]}`);
       }
     }

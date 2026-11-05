@@ -1,3 +1,4 @@
+import { modelPrices } from "./model-prices.js";
 // The tools service skeleton (AII-710): a tool() wrapper that attaches a zod input
 // schema, the fixed ToolResponse output shape, and the "mcp.type"/"mcp.role" metadata
 // Restate's admin API surfaces to src/restate/tools-client.ts's discoverTools(). The
@@ -594,7 +595,7 @@ export const getIssueDispatchStatus = tool(
 );
 
 export const GET_ISSUE_REPORT_CARD_DESCRIPTION =
-  "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, cost), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.";
+  "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, reported costUsd, estimated estimatedCostUsd, unpricedCalls), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.";
 
 export const getIssueReportCardTool = tool(
   {
@@ -602,13 +603,14 @@ export const getIssueReportCardTool = tool(
     input: z.object({ issue: z.string().optional() }),
     role: "user",
   },
-  async (_ctx, input): Promise<ToolResponse> => {
+  async (ctx, input): Promise<ToolResponse> => {
     const issue = input.args.issue;
     if (typeof issue !== "string" || !issue) {
       const result = { error: "issue is required and must be a non-empty string" };
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
-    const card = getIssueReportCard(issue);
+    const { prices } = await ctx.objectClient(modelPrices, "builddown").current();
+    const card = getIssueReportCard(issue, prices);
     const result = card ?? { error: `No dispatch records found for issue: ${issue}` };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },

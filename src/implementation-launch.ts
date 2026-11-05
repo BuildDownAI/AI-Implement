@@ -2,6 +2,7 @@
  * `dispatchLocalDocker` (AII-1551) so a workflow step can call it. The legacy callers own admission:
  * they reserve capacity before `prepareImplementationLaunch` and release it from what the launch
  * returns. Nothing in this file acquires or releases a reservation, and no launch result carries a token. */
+import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import type { AppConfig } from "./index.js";
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue, TicketingProvider } from "./providers/types.js";
@@ -60,6 +61,7 @@ async function getTargetRepoToken(
 }
 
 export interface PrepareImplementationLaunchArgs {
+  modelPrices?: RunConfigV1["modelPrices"];
   config: AppConfig;
   issue: TicketIssue;
   mapping: RepoMapping;
@@ -135,6 +137,7 @@ export async function prepareImplementationLaunch(args: PrepareImplementationLau
 
     const dispatchInputs = contract === "envelope"
       ? buildEnvelopeDispatchInputs(mapping, issue, {
+          modelPrices: args.modelPrices,
           runnerPhase: "implementation",
           baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
           runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -143,7 +146,7 @@ export async function prepareImplementationLaunch(args: PrepareImplementationLau
           runPublicationToken,
           privateTransport: workflowCapabilities.supportsPrivateRunConfig === true,
           credentials,
-          ...(managedDecision.kind === "launch" ? { agentConfig: managedDecision.snapshot } : {}),
+          ...managedRunConfigFields(managedDecision),
           runnerImage,
           groupingParent: args.isGroupingParentDispatch(issue) || undefined,
           retryPolicy: getRetryPolicy(),
@@ -298,6 +301,7 @@ export interface ImplementationSessionInput {
 }
 
 export interface LaunchImplementationSessionArgs {
+  modelPrices?: RunConfigV1["modelPrices"];
   config: AppConfig;
   issue: TicketIssue;
   mapping: RepoMapping;
@@ -360,13 +364,14 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
   }
 
   const implRunConfig: RunConfigV1 = buildImplRunConfig({
+    modelPrices: args.modelPrices,
     issue,
     mapping,
     baseBranch,
     runnerCallbackUrl,
     groupingParent: args.isGroupingParentDispatch(issue),
     retryPolicy: getRetryPolicy(),
-    ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
+    ...managedRunConfigFields(protectedLaunch),
   });
 
   let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
@@ -456,13 +461,14 @@ export async function launchImplementationLocalSession(args: LaunchImplementatio
   const protectedLaunch = managedAuth.kind === "launch" ? managedAuth : null;
 
   const localImplRunConfig: RunConfigV1 = buildImplRunConfig({
+    modelPrices: args.modelPrices,
     issue,
     mapping,
     baseBranch,
     runnerCallbackUrl,
     groupingParent: args.isGroupingParentDispatch(issue),
     retryPolicy: getRetryPolicy(),
-    ...(protectedLaunch ? { agentConfig: protectedLaunch.snapshot } : {}),
+    ...managedRunConfigFields(protectedLaunch),
   });
 
   // Every throw here precedes markLaunchAttempted so the grant is settled as rejected.

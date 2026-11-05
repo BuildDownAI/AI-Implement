@@ -255,6 +255,12 @@ export async function cancelInvocation(adminBaseUrl: string, id: string): Promis
   if (!response.ok) throw new Error(`cancel of invocation ${id} failed: HTTP ${response.status}`);
 }
 
+/** Cleanup cancellation: an invocation that finished since the last query may return HTTP 409. */
+export async function cancelInvocationIfLive(adminBaseUrl: string, id: string): Promise<void> {
+  const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/cancel`, { method: "PATCH" });
+  if (!response.ok && response.status !== 409) throw new Error(`cancel of invocation ${id} failed: HTTP ${response.status}`);
+}
+
 /** Kills one invocation through the admin API (`PATCH /invocations/<id>/kill`): no `finally` runs and callers attached to it see a 409. */
 export async function killInvocation(adminBaseUrl: string, id: string): Promise<void> {
   const response = await fetch(`${adminBaseUrl}/invocations/${encodeURIComponent(id)}/kill`, { method: "PATCH" });

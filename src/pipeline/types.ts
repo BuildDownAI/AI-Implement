@@ -89,6 +89,8 @@ export interface PipelineContextData {
   hooks?: { setup?: string; verify?: string; teardown?: string };
   /** Autonomous runner: callback URL for runner result/progress posts (from runnerCallbackUrl / RUNNER_CALLBACK_URL). */
   callbackUrl?: string;
+  /** Bearer credential for authenticated runner callbacks. */
+  progressToken?: string;
   /** Autonomous runner: per-project dependency-repo read access scope (from run_config envelope). */
   dependencyTokenScope?: "installation";
   /** Autonomous runner: reference repositories to clone read-only into the workspace (from run_config envelope). */
@@ -501,7 +503,7 @@ export interface LLMResult {
   terminalStatus?: LLMTerminalStatus;
   /** Termination signal from the CLI process's close event (e.g. SIGTERM), null when it exited normally. */
   signal?: string | null;
-  /** The agent's own terminal error text (redacted), when its event stream reported one. Classification places it ahead of stderr/stdout in the message for an exit-0 failure and records it as `evidence.llmErrorMessage`. */
+  /** The agent's own terminal error text (redacted), when its event stream reported one. Classification places it ahead of stderr/stdout in the message for every failure and records it as `evidence.llmErrorMessage`. */
   errorMessage?: string;
   /** Number of spawn attempts made for this invocation; 1 unless `retry` was supplied and a transient pre-tool-use failure was re-spawned. Optional so a custom LLMExecutor may omit it — consumers fall back to `?? 1`. */
   attempts?: number;

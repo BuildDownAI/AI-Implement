@@ -400,3 +400,31 @@ describe("resolveStageAgentConfig", () => {
     expect(err.message).not.toContain("sk-secret-field");
   });
 });
+
+describe("fallback models", () => {
+  it("inherits, overrides and restores inheritance without changing selection keys", () => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.fallbackModel = "backup";
+    for (const [patch, expected, source] of [
+      [{}, "backup", "orchestrator-default"],
+      [{ fallbackModel: "project-backup" }, "project-backup", "project"],
+      [{ fallbackModel: null }, "backup", "orchestrator-default"],
+    ] as const) {
+      const result = resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: patch }), accountProfiles });
+      if (result.mode !== "configured") throw new Error("expected configured");
+      expect(result.fallbackModels).toEqual({ planning: expected });
+      expect(result.fallbackModelSources).toEqual({ planning: source });
+      expect(Object.keys(result.stages.planning)).toHaveLength(5);
+      expect(Object.keys(result.sources.planning)).toHaveLength(5);
+    }
+    const result = resolveStageAgentConfig({ orchestratorDefaults, projectConfig: configuredProject(), accountProfiles });
+    if (result.mode !== "configured") throw new Error("expected configured");
+    expect(result.fallbackModels).toEqual({});
+  });
+
+  it("rejects inherited collisions with a project primary model", () => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.fallbackModel = "backup";
+    expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: { model: "backup" } }), accountProfiles })).toThrow(/planning.*fallbackModel/);
+  });
+});

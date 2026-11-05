@@ -33,11 +33,11 @@ function stage(profile: string, agent: "claude" | "codex", provider: "anthropic"
   return { agent, provider, model: "m", accountProfileId: profile, invocationTimeoutMs: 60_000 };
 }
 
-function useCodex() {
+function useCodex(fallbackModel?: string) {
   store.setOrchestratorDefaults({
     version: 1, mode: "configured",
     stages: {
-      planning: stage("cdx", "codex", "openai"),
+      planning: { ...stage("cdx", "codex", "openai"), ...(fallbackModel ? { fallbackModel } : {}) },
       implementation: stage("cdx", "codex", "openai"),
       review: stage("cdx", "codex", "openai"),
     },
@@ -482,4 +482,15 @@ describe("classifyLaunchError", () => {
       expect(adapter.classifyLaunchError(b, false, new Error("x"))).toBe("rejected");
     }
   });
+});
+
+it("carries preparation fallbacks and pairs managed envelope fields", async () => {
+  useCodex("fallback-model");
+  const decision = launchOf(await adapter.prepareManagedDispatch(req(), runtime));
+  expect(decision.fallbackModels).toEqual({ planning: "fallback-model" });
+  expect(adapter.managedRunConfigFields(decision)).toEqual({ agentConfig: decision.snapshot, modelFallbacks: { planning: "fallback-model" } });
+  expect(adapter.managedRunConfigFields({ ...decision, fallbackModels: {} })).toEqual({ agentConfig: decision.snapshot });
+  expect(adapter.managedRunConfigFields({ kind: "launch", snapshot: decision.snapshot })).toEqual({ agentConfig: decision.snapshot });
+  expect(adapter.managedRunConfigFields({ kind: "legacy" })).toEqual({});
+  expect(adapter.managedRunConfigFields(undefined)).toEqual({});
 });

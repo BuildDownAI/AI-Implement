@@ -4,8 +4,8 @@ import { EventEmitter } from "node:events";
 import { writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
-import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
-import { createRestateRegistrationGate, createBootReconciliation, stopSidecarsConcurrently } from "../index.js";
+import { getRestateStatus, resetRestateStatus, setRestateStatus } from "../restate/status.js";
+import { createRestateRegistrationGate, createBootReconciliation, stopSidecarsConcurrently, onRestateRegistered } from "../index.js";
 import { testDir } from "./helpers/test-dir.js";
 
 // ---------------------------------------------------------------------------
@@ -1060,5 +1060,19 @@ describe("createBootReconciliation (AII-1271)", () => {
     await boot.onRegistered();
     await boot.onRegistered();
     expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("model price schedule boot hook", () => {
+  it("arms prices only after successful registration", async () => {
+    const armPrices = vi.fn(async () => {});
+    const step = async () => {};
+    const deps = { armPrices, releaseHold: step, sweep: () => {}, scrub: step, seed: step, refresh: step, reconcile: step };
+    await onRestateRegistered(deps);
+    expect(armPrices).not.toHaveBeenCalled();
+    setRestateStatus({ registration: { state: "registered" } });
+    await onRestateRegistered(deps);
+    expect(armPrices).toHaveBeenCalledOnce();
   });
 });
