@@ -8,7 +8,7 @@
 import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext, ObjectSharedContext } from "@restatedev/restate-sdk";
 import * as restateClients from "@restatedev/restate-sdk-clients";
-import { createSetupCheckContext, runSetupChecks, type SetupCheckRun } from "../setup-checks/index.js";
+import { createSetupCheckContext, getLastSetupCheckRun, recordSetupCheckRun, runSetupChecks, type SetupCheckRun } from "../setup-checks/index.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 import { getRestateStatus, restateCanServe } from "./status.js";
 import { CALL_TOOL_TIMEOUT_MS } from "./tools-client.js";
@@ -41,6 +41,7 @@ export function createSetupChecks(deps: SetupChecksDeps) {
     handlers: {
       run: restate.handlers.object.exclusive(async (ctx: ObjectContext): Promise<SetupCheckRun> => {
         const run = await ctx.run("run checks", () => deps.runChecks());
+        recordSetupCheckRun(run);
         ctx.set<SetupCheckRun>(LAST_RUN, run);
         return run;
       }),
@@ -87,4 +88,16 @@ export function readSetupChecksViaObject(deps: SetupChecksIngressDeps = {}): Pro
 /** A new run, started and awaited through the ingress for the admin route. */
 export function runSetupChecksViaObject(deps: SetupChecksIngressDeps = {}): Promise<SetupChecksIngressResult<SetupCheckRun>> {
   return viaIngress(deps, () => ingressClient(RUN_TIMEOUT_MS, deps).run());
+}
+
+/** Called once after successful boot registration, never from the public health request. */
+export function createSetupChecksHydration(read = readSetupChecksViaObject): () => Promise<void> {
+  let started = false;
+  return async () => {
+    if (started) return;
+    started = true;
+    const result = await read();
+    // A run completed in this process is fresher than the boot read, even if the clock moved back.
+    if (result.status === "ok" && result.value && getLastSetupCheckRun() === null) recordSetupCheckRun(result.value);
+  };
 }

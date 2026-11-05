@@ -101,3 +101,19 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.linear.pickup-label`](ticketing-providers.md#the-pickup-label) | No label with the pickup label's exact name at workspace level or in the team, or one only in a different case |
 | [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case |
 | [`tracker.linear.workflow-states`](ticketing-providers.md#workflow-states) | A team with no `started`-type or no `completed`-type state |
+
+## Bootstrap mode before sign-in
+
+Before an admin path is configured, unauthenticated `GET /` shows
+`setupChecks.failingOnAdminPath`: the ids of failing local checks that can block
+reaching an admin. It checks these afresh on each request, even while Restate is
+down, without contacting any network service. It never shows titles, details,
+fixes, projects or configured values. Use the ids to identify what needs attention
+before anyone can sign in.
+
+This list stops appearing once a real access code is set, a kept SSO provider has
+its redirect URL and an admin address in the effective allowlist, or BuildDown has
+its redirect URL. An unreadable allowlist keeps bootstrap mode off, so an outage
+does not expose diagnostics. `setupChecks.checkedAt` and `failingCore` remain:
+they describe the last known setup run, restored after Restate registration on
+restart, or are both `null` before a run is known.

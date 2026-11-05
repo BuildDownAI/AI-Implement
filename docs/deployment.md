@@ -356,7 +356,16 @@ To repair a degraded image, re-deploy with `--no-cache` and a working `--build-s
 | `sidecar` | `{ reachable, toolsListed, lastError, checkedAt }` for the KG sidecar (`checkedAt` is epoch milliseconds, `null` before the first probe) |
 | `restate.sidecar.state` | `starting`, `ready`, `timeout`, `exited` (with `code`, `signal`), or `missing-binary` |
 | `restate.registration.state` | `registered`, `declined-conflict`, `unreachable`, or `not-attempted` |
+| `setupChecks` | `{ checkedAt, failingCore, failingOnAdminPath? }`: last known run time (epoch milliseconds) and failing core count, both `null` before a run is known; optional bootstrap ids as described below |
 | `deploy` | `{ held, startedAt }`: a self-deploy hold, so a deploy is not mistaken for an outage (`startedAt` is epoch milliseconds, or `null` when nothing is held) |
+
+`setupChecks.failingOnAdminPath` appears only while no admin path is configured:
+it lists failing check ids on the path to an admin, with no titles, details, fixes or
+projects. An access code, complete SSO path with an admin address, or BuildDown
+with its redirect URL ends bootstrap mode; an unreadable allowlist also keeps it
+off. The count comes from the last known run, restored after Restate registration;
+bootstrap ids are checked locally on each request. `GET /` never calls Restate or
+any other network service, so it continues answering during their outages.
 
 A healthy orchestrator shows `restate.sidecar.state: "ready"`,
 `restate.registration.state: "registered"`, and a recent `lastPollFinishedAt`.

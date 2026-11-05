@@ -30,17 +30,20 @@ Three properties of the checks need a rule, because each is easy to get wrong in
 | Surface | Audience | Content |
 |---|---|---|
 | The admin setup page and its API route | admins, and users granted the page | every check, its detail and its fix |
-| `get_tenant_health` | every allowlisted identity | each check's name and state |
+| `get_tenant_health` | every allowlisted identity | each check's `title` and state |
 | `GET /` | anyone | the count of failing core checks |
 
 A result's `id`, `title` and `state` never carry a configured value, because `get_tenant_health` shows those three fields to every allowlisted identity, and no field ever carries a secret's value.
 
 **3. Bootstrap mode.** While no admin path is configured, `GET /` also names the failing checks on the path to an admin, and only those:
-- the GitHub App credential pair;
-- the volume;
-- Restate;
-- the sign-in providers and the redirect base URL;
-- an admin address in the allowlist.
+- `env.github-app`;
+- `env.admin-access-code`;
+- `volume.database`;
+- `restate`;
+- `admin.path`;
+- `admin.providers`;
+- `admin.redirect-url`;
+- `admin.allowlist`.
 
 An admin path is configured when any of these holds:
 - `ADMIN_ACCESS_CODE` is set and is not the published `.env.example` placeholder, which boot refuses (`effectiveAccessCode`, `src/admin-session.ts`); or
@@ -82,3 +85,13 @@ Project, tracker and repository checks are never named on `GET /`. Projects are 
 **Decision 1's example no longer arises.** The orchestrator now creates `Ready for Review` in the issue's team, as it creates the other lifecycle labels, which needs no workspace admin ([AII-231](https://linear.app/eudoxus/issue/AII-231)). So no check asks whether the Linear app may create a workspace-scoped label, and `tracker.linear.lifecycle-labels` passes a missing lifecycle label, since the orchestrator creates it at first use. The rule stands: a fact only a write could prove still reports `cannot-verify`.
 
 **`get_tenant_health` shows a little more than decision 2's table names.** It landed with [AII-1538](https://linear.app/eudoxus/issue/AII-1538) as the `setupChecks` field, holding each row's `id`, `title`, `state` and `project`, the count of failing core rows (`failingCore`) and the run's `checkedAt`. A row's `project` is a configured value, unlike the three fields the decision names, but it is the project's key, which `list_projects` (`role: "user"`) already shows the same audience, so it discloses nothing new. Detail and fix stay on the admin surfaces. The admin API route landed with the same issue, as `GET /api/setup-checks` and `POST /api/setup-checks/run`. `GET /`, bootstrap mode and the admin setup page land with later children of [AII-1531](https://linear.app/eudoxus/issue/AII-1531).
+
+
+## Amendment (2026-11-05): public health bootstrap checks
+
+Decision 3 now names all eight ids the code marks `onAdminPath`, including
+`env.admin-access-code` and `admin.path`, which its earlier bullet list omitted.
+Decision 2's table now uses the contract field `title` where it previously said
+"name". These corrections follow standing rule 3: the ADR follows the code it
+governs. Public health exposes only the failing core count and last-run time,
+plus failing admin-path ids during bootstrap; titles remain off `GET /`.

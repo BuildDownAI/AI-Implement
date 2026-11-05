@@ -7,7 +7,7 @@
  */
 
 import { statSync } from "node:fs";
-import { getEffectiveAllowlist, listAccessEntries, type AccessEntry, type EffectiveAllowlist } from "../access-entries.js";
+import { isAllowlistReadAvailable, getEffectiveAllowlist, listAccessEntries, type AccessEntry, type EffectiveAllowlist } from "../access-entries.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getDatabasePath, getDb, type DatabasePath } from "../dedup.js";
 import { getFlySessionsConfig, type FlySessionsConfig } from "../orchestrator-settings.js";
@@ -97,6 +97,8 @@ export interface SetupCheckContext {
   mappings(): Record<string, RepoMapping>;
   storedAccessEntries(): AccessEntry[];
   effectiveAllowlist(): EffectiveAllowlist | null;
+  /** Availability of the latest read, even when effectiveAllowlist serves cached entries. */
+  allowlistReadAvailable(): boolean;
   restateStatus(): SetupCheckRestateStatus;
   databasePath(): DatabasePath;
   /** True when `dir` is on a different filesystem from `/`, which on Fly means a mounted volume. */
@@ -127,6 +129,7 @@ export function createSetupCheckContext(
     mappings: getMappings,
     storedAccessEntries: listAccessEntries,
     effectiveAllowlist: getEffectiveAllowlist,
+    allowlistReadAvailable: isAllowlistReadAvailable,
     databasePath: getDatabasePath,
     onSeparateFilesystem: (dir) => statSync(dir).dev !== statSync("/").dev,
     trackerProvider: async (providerId) => {
@@ -202,4 +205,13 @@ export function summarizeSetupChecks(run: SetupCheckRun | null): SetupCheckSumma
     failingCore: countFailingCore(run),
     rows: run.results.map(({ id, title, state, project }) => ({ id, title, state, ...(project === undefined ? {} : { project }) })),
   };
+}
+
+// Process-local health snapshot, independent of Restate availability.
+let lastRun: SetupCheckRun | null = null;
+export function recordSetupCheckRun(run: SetupCheckRun): void {
+  lastRun = structuredClone(run);
+}
+export function getLastSetupCheckRun(): SetupCheckRun | null {
+  return lastRun === null ? null : structuredClone(lastRun);
 }

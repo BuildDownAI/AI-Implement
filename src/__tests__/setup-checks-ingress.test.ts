@@ -1,10 +1,10 @@
 // The admin routes' two ingress functions for the SetupChecks object (AII-1538): when they call, what they call, and how a
 // refusal, an error or a hung ingress comes back.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readSetupChecksViaObject, runSetupChecksViaObject } from "../restate/setup-checks.js";
+import { createSetupChecksHydration, readSetupChecksViaObject, runSetupChecksViaObject } from "../restate/setup-checks.js";
 import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
 import { CALL_TOOL_TIMEOUT_MS } from "../restate/tools-client.js";
-import type { SetupCheckRun } from "../setup-checks/index.js";
+import { getLastSetupCheckRun, recordSetupCheckRun, type SetupCheckRun } from "../setup-checks/index.js";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 
 const BASE_URL = "http://ingress.test";
@@ -78,5 +78,34 @@ describe("runSetupChecksViaObject", () => {
     stubAbortTimeout(CALL_TOOL_TIMEOUT_MS);
     const fake = fakeFetch({ "POST /SetupChecks/orchestrator/run": hangUntilAborted });
     expect(await runSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "unavailable" });
+  });
+});
+
+
+describe("boot setup-check hydration", () => {
+  it("records the stored run once, without replacing a newer completed run", async () => {
+    const stored = { ...RUN, checkedAt: 100 };
+    const read = vi.fn(async () => ({ status: "ok" as const, value: stored }));
+    const hydrate = createSetupChecksHydration(read);
+    await hydrate();
+    await hydrate();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(getLastSetupCheckRun()).toEqual(stored);
+    const newer = { ...RUN, checkedAt: 200 };
+    recordSetupCheckRun(newer);
+    await createSetupChecksHydration(read)();
+    expect(getLastSetupCheckRun()).toEqual(newer);
+    // Readers cannot mutate the process copy.
+    getLastSetupCheckRun()!.results.length = 0;
+    expect(getLastSetupCheckRun()).toEqual(newer);
+  });
+  it.each([{ status: "ok" as const, value: null }, { status: "unavailable" as const }])("leaves the snapshot alone for %j", async (result) => {
+    const before = getLastSetupCheckRun();
+    const read = vi.fn(async () => result);
+    const hydrate = createSetupChecksHydration(read);
+    await hydrate();
+    await hydrate();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(getLastSetupCheckRun()).toEqual(before);
   });
 });

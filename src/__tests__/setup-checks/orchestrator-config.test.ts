@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SeedOnceSettingsModule from "../../seed-once-settings.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { SetupCheckContext, SetupCheckId, SetupCheckOutcome } from "../../setup-checks/index.js";
-import { ORCHESTRATOR_CONFIG_CHECKS } from "../../setup-checks/orchestrator-config.js";
+import { isAdminPathConfigured, ORCHESTRATOR_CONFIG_CHECKS } from "../../setup-checks/orchestrator-config.js";
 import { makeAccessEntry, makeMapping } from "../helpers/builders.js";
 import { makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
@@ -458,5 +458,36 @@ describe("admin.allowlist", () => {
     expect(await run("admin.allowlist", { env: { ...GOOGLE, ADMIN_ACCESS_CODE: "your-secret-access-code" }, effectiveAllowlist })).toMatchObject([
       { state: "fail", detail, fix: "Add an admin address to OAUTH_ALLOWED_EMAILS. A domain admits its addresses as user only." },
     ]);
+  });
+});
+
+
+describe("isAdminPathConfigured", () => {
+  const redirect = { OAUTH_REDIRECT_BASE_URL: "https://orchestrator.example.com" };
+  const builddown = { BUILDDOWN_OIDC_ISSUER: "https://cp.example.com", BUILDDOWN_OIDC_CLIENT_ID: "b", BUILDDOWN_OIDC_CLIENT_SECRET: "s" };
+  it.each([
+    [{}, false],
+    [{ ADMIN_ACCESS_CODE: "your-secret-access-code" }, false],
+    [{ ADMIN_ACCESS_CODE: "real-code" }, true],
+    [GOOGLE, false],
+    [{ ...GOOGLE, ...redirect }, false],
+    [builddown, false],
+    [{ ...builddown, ...redirect }, true],
+    [{ GOOGLE_OAUTH_CLIENT_ID: "partial", ...redirect }, false],
+  ])("resolves configuration %j", (env, expected) => {
+    expect(isAdminPathConfigured(makeSetupCheckContext({ env }))).toBe(expected);
+  });
+  it("requires a kept provider, redirect and an admin address for ordinary SSO", () => {
+    for (const entry of [makeAccessEntry(), makeAccessEntry({ kind: "domain", role: "user" })]) {
+      const ctx = makeSetupCheckContext({ env: { ...GOOGLE, ...redirect }, effectiveAllowlist: () => ({ entries: [entry], source: "db" }) });
+      expect(isAdminPathConfigured(ctx)).toBe(entry.kind === "address");
+      ctx.env = { MICROSOFT_OAUTH_CLIENT_ID: "m", MICROSOFT_OAUTH_CLIENT_SECRET: "s", MICROSOFT_OAUTH_TENANT: "common", ...redirect };
+      expect(isAdminPathConfigured(ctx)).toBe(false);
+    }
+  });
+  it("treats null or throwing allowlist readers as configured even without providers", () => {
+    expect(isAdminPathConfigured(makeSetupCheckContext({ allowlistReadAvailable: () => false }))).toBe(true);
+    expect(isAdminPathConfigured(makeSetupCheckContext({ effectiveAllowlist: () => null }))).toBe(true);
+    expect(isAdminPathConfigured(makeSetupCheckContext({ effectiveAllowlist: () => { throw new Error("unreadable"); } }))).toBe(true);
   });
 });

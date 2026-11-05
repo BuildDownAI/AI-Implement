@@ -1,5 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { buildHealthBody } from "./health-body.js";
+import { createSetupCheckContext, getLastSetupCheckRun } from "./setup-checks/index.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
@@ -59,7 +61,7 @@ import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
-import { readSetupChecksViaObject, runSetupChecksViaObject } from "./restate/setup-checks.js";
+import { createSetupChecksHydration, readSetupChecksViaObject, runSetupChecksViaObject } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -4248,18 +4250,16 @@ function startServer(
     // Health check
     if (url === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      const { pollCount: polls, lastPollStartedAt, lastPollFinishedAt } = getPollStats();
-      res.end(JSON.stringify({
-        status: "ok",
-        sourceCommit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
-        polls,
-        kgDegraded: isKgDegraded(),
-        ...sidecarHealthFields(),
-        restate: getRestateStatus(),
-        deploy: deployHealth(),
-        lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
-        lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
-      }));
+      void buildHealthBody({
+        sourceCommit: () => process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
+        pollStats: getPollStats,
+        kgDegraded: isKgDegraded,
+        sidecarHealthFields,
+        restateStatus: getRestateStatus,
+        deployHealth,
+        lastSetupCheckRun: getLastSetupCheckRun,
+        setupCheckContext: () => createSetupCheckContext({ restateStatus: getRestateStatus }),
+      }).then((body) => res.end(JSON.stringify(body)));
       return;
     }
 
@@ -5332,16 +5332,20 @@ async function main(): Promise<void> {
     () => startupReconciliation(config, registry),
     () => getRunnerBackendSource(),
   );
+  const hydrateSetupChecks = createSetupChecksHydration();
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
-    onRegistered: () => onRestateRegistered({
-      sweep: () => sweepOnRegistered(config),
-      scrub: async () => { await scrubOperatorLegacyTokens(); },
-      seed: seedRunnerBackends,
-      refresh: refreshRunnerBackendCache,
-      reconcile: () => bootReconciliation.onRegistered(),
-    }),
+    onRegistered: async () => {
+      if (getRestateStatus().registration.state === "registered") await hydrateSetupChecks();
+      await onRestateRegistered({
+        sweep: () => sweepOnRegistered(config),
+        scrub: async () => { await scrubOperatorLegacyTokens(); },
+        seed: seedRunnerBackends,
+        refresh: refreshRunnerBackendCache,
+        reconcile: () => bootReconciliation.onRegistered(),
+      });
+    },
   });
   // A sidecar which becomes ready after its initial timeout still registers the
   // same fully composed service set; the gate starts the endpoint only once.
