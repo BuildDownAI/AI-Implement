@@ -12,15 +12,14 @@ export type ReviewLedgerSeverity = "blocking" | "medium" | "minor";
 export type ReviewFindingsVerdict = "approve" | "changes_requested" | "incomplete";
 
 /**
- * A `review-contract` finding gates when it is `blocking`, or when the contract verdict is not
- * `approve` (a `minor` finding under `changes_requested`/`incomplete` still gets a fix pass).
- * An undefined verdict gates, so the absence of a contract verdict never relaxes the gate.
+ * Minor findings are always advisory. Blocking always gates; medium retains
+ * verdict-dependent gating. Missing/incomplete reviews are checked independently.
  */
 export function reviewContractFindingGates(
   finding: Pick<ReviewLedgerFinding, "severity">,
   verdict: ReviewFindingsVerdict | undefined,
 ): boolean {
-  return finding.severity === "blocking" || verdict !== "approve";
+  return finding.severity !== "minor" && (finding.severity === "blocking" || verdict !== "approve");
 }
 
 export const AI_IMPLEMENT_NATIVE_REVIEW_MARKER = "<!-- ai-implement native-review -->";

@@ -702,7 +702,7 @@ function buildDependencyInstallSection(installMethod: string, installError: stri
 
 function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boolean): string | null {
   if (!summary) return null;
-  const passRows = summary.passes.map(formatPassRow).join("\n");
+  const passRows = summary.passes.map(p => formatPassRow(p)).join("\n");
   // A provider outage is not a review verdict: the reviewer may never have run, so the
   // heading, the sentence and the feedback label must not claim it rejected anything.
   const providerUnavailable = summary.terminationReason === "provider_unavailable";

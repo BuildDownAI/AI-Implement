@@ -3,6 +3,7 @@ import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import type { LinearProvider as LinearProviderClass } from "../providers/linear.js";
 import type { FakeFetch } from "./helpers/fake-fetch.js";
 import { linearData, linearGraphql } from "./helpers/replies/linear.js";
+import { makeMapping } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 // AII-694: the Linear provider reads its pickup label from the settings table
@@ -22,11 +23,13 @@ function linearAnswers(...data: unknown[]): void {
 beforeEach(async () => {
   const { modules } = await testDb({
     modules: {
+      config: () => import("../config.js"),
       settings: () => import("../orchestrator-settings.js"),
       linearAuth: () => import("../linear-app-auth.js"),
       linear: () => import("../providers/linear.js"),
     },
   });
+  modules.config.upsertMapping("ENG", makeMapping());
   settings = modules.settings;
   ({ LinearProvider } = modules.linear);
   modules.linearAuth.configureLinearAuth("client-id", "client-secret");
@@ -81,6 +84,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
             children: { nodes: [] },
             parent: {
               identifier: "ENG-1",
+              team: { key: "ENG" },
               description: null,
               labels: { nodes: [{ name: "AI Implement - New" }] },
               parent: null,

@@ -609,3 +609,43 @@ describe("trustedSkillsDir wiring", () => {
     expect(codexCtorOptions.map((o) => o.implementationFullAccess)).toEqual([undefined, undefined, true]);
   });
 });
+
+describe("capacity fallback", () => {
+  it.each([false, true])("switches persistently after settled/thrown failure (thrown=%s)", async (thrown) => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const failure = { category: "transient" as const, code: "PROVIDER_OVERLOADED", stage: "implementation", attempt: 3, retryable: false, message: "capacity", evidence: { truncated: false } };
+    const primary = { ...ok, failure, exitCode: 1 };
+    const ex = fakeExec();
+    if (thrown) ex.invoke.mockRejectedValueOnce(Object.assign(new Error("capacity"), { failure }));
+    else ex.invoke.mockResolvedValueOnce(primary);
+    const auth = fakeAuth();
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth, fallbackModels: { implementation: "claude-fallback" }, createClaude: () => ex, createCodex: () => fakeExec() });
+    const params = { ...base, agentStage: "implementation" as const };
+    if (thrown) await expect(executor.invoke(params)).rejects.toMatchObject({ failure: { modelFallback: { from: "claude-impl", to: "claude-fallback" } }, attribution: { model: "claude-impl" } });
+    else expect(await executor.invoke(params)).toMatchObject({ failure: { modelFallback: { stage: "implementation" } }, attribution: { model: "claude-impl" } });
+    for (let i = 0; i < 2; i++) expect((await executor.invoke(params)).attribution).toMatchObject({ model: "claude-fallback", profileId: "p-impl", agent: "claude", provider: "anthropic" });
+    expect(ex.invoke.mock.calls[1][0]).toMatchObject({ model: "claude-fallback", invocationTimeoutMs: 2000 });
+    expect((await executor.invoke({ ...base, agentStage: "review" })).attribution?.model).toBe("gpt-rev");
+    expect(auth.invoke.mock.calls.every(c => c[0] === "p-impl")).toBe(true);
+    expect(log).toHaveBeenCalledExactlyOnceWith("[model-fallback] stage=implementation from=claude-impl to=claude-fallback after=PROVIDER_OVERLOADED");
+  });
+  it("does not switch or grant a retry marker when the fallback equals the primary", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const failure = { category: "transient" as const, code: "PROVIDER_OVERLOADED", stage: "implementation", attempt: 3, retryable: false, message: "capacity", evidence: { truncated: false } };
+    const ex = fakeExec({ ...ok, exitCode: 1, failure });
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(), fallbackModels: { implementation: "claude-impl" }, createClaude: () => ex });
+    for (let i = 0; i < 2; i++) {
+      const result = await executor.invoke({ ...base, agentStage: "implementation" });
+      expect(result.failure).toEqual(failure);
+      expect(result.failure?.modelFallback).toBeUndefined();
+      expect(result.attribution?.model).toBe("claude-impl");
+      expect(ex.invoke.mock.calls[i][0].model).toBe("claude-impl");
+    }
+    expect(log).not.toHaveBeenCalled();
+  });
+  it.each(["PROVIDER_RATE_LIMITED", "AUTH_INVALID", "CONFIG_INVALID", "PROCESS_CRASH", "PROVIDER_OVERLOADED"])("does not switch without an eligible fallback: %s", async code => {
+    const ex = fakeExec({ ...ok, failure: { category: "crash", code, stage: "implementation", attempt: 1, retryable: false, message: "failed", evidence: { truncated: false } } });
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(), fallbackModels: code === "PROVIDER_OVERLOADED" ? {} : { implementation: "claude-fallback" }, createClaude: () => ex });
+    for (let i = 0; i < 2; i++) expect(await executor.invoke({ ...base, agentStage: "implementation" })).toMatchObject({ failure: { code }, attribution: { model: "claude-impl" } });
+  });
+});

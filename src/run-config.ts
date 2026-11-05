@@ -1,3 +1,4 @@
+import type { ModelPriceRates } from "./model-price-estimate.js";
 import type { ReferenceRepo } from "./reference-repos.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import type { RepoMapping, ReviewerSelection } from "./config.js";
@@ -47,6 +48,50 @@ export interface ResolvedAgentSnapshotV1 {
   profiles: ConfiguredStageResolution["profiles"];
 }
 
+export interface RunModelPrices {
+  prices: (ModelPriceRates & { version: string; effectiveFrom: string | null })[];
+  fetchedAt: number | null;
+}
+
+/** Validate optional data and project public fields at the runner trust boundary.
+ * A malformed copy is omitted wholesale so prices cannot prevent a run from starting.
+ */
+export function copyModelPrices(value: unknown): RunModelPrices | undefined {
+  if (!isRec(value) || !Array.isArray(value.prices) || value.prices.length === 0) return undefined;
+  if (value.fetchedAt !== null && (typeof value.fetchedAt !== "number"
+    || !Number.isSafeInteger(value.fetchedAt) || value.fetchedAt < 0
+    || !Number.isFinite(new Date(value.fetchedAt).getTime()))) return undefined;
+  const prices: RunModelPrices["prices"] = [];
+  for (const price of value.prices) {
+    if (!isRec(price)) return undefined;
+    const { model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd } = price;
+    // Match the public control-plane decimal and effectiveFrom contracts without importing
+    // the Restate service (and its server dependencies) into the runner.
+    if (typeof model !== "string" || typeof version !== "string"
+      || (effectiveFrom !== null && (typeof effectiveFrom !== "string"
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(effectiveFrom)))
+      || typeof inputUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(inputUsd)
+      || typeof outputUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(outputUsd)
+      || typeof cacheReadUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(cacheReadUsd)
+      || typeof cacheWriteUsd !== "string" || !/^\d+(?:\.\d+)?$/.test(cacheWriteUsd)) return undefined;
+    prices.push({ model, version, effectiveFrom, inputUsd, outputUsd, cacheReadUsd, cacheWriteUsd });
+  }
+  return { prices, fetchedAt: value.fetchedAt };
+}
+
+/** Public model ids only; malformed optional maps never prevent a launch. */
+export function copyModelFallbacks(value: unknown): Partial<Record<StageName, string>> | undefined {
+  if (!isRec(value) || Object.keys(value).length === 0) return undefined;
+  const out: Partial<Record<StageName, string>> = {};
+  for (const [stage, model] of Object.entries(value)) {
+    // Same character contract as ATTRIBUTION_MODEL_RE, without attribution secret filtering.
+    if (!(STAGE_NAMES as readonly string[]).includes(stage)
+      || typeof model !== "string" || !/^[\x21-\x7e]{1,128}$/.test(model)) return undefined;
+    out[stage as StageName] = model;
+  }
+  return out;
+}
+
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
  * workflow_dispatch input (`run_config`) on GHA and as the
@@ -58,6 +103,8 @@ export interface ResolvedAgentSnapshotV1 {
  * `encodeRunConfig`, `decodeRunConfig`, `pickKnownKeys` or `diagnosticProjection`.
  */
 export interface RunConfigV1 {
+  modelPrices?: RunModelPrices;
+  modelFallbacks?: Partial<Record<StageName, string>>;
   v: 1;
   issue: { id: string; identifier: string; title: string; description: string };
   prNumber?: string;
@@ -442,6 +489,8 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 }
 
 export interface ImplRunConfigInput {
+  modelPrices?: RunModelPrices;
+  modelFallbacks?: Partial<Record<StageName, string>>;
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
   baseBranch: string;
@@ -462,6 +511,8 @@ export interface ImplRunConfigInput {
 export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
   const { issue, mapping, baseBranch, runnerCallbackUrl, groupingParent, retryPolicy, agentConfig } = input;
   return buildRunConfig({
+    modelPrices: input.modelPrices,
+    modelFallbacks: input.modelFallbacks,
     runnerPhase: "implementation",
     issue,
     mapping,
@@ -474,6 +525,8 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
 }
 
 export interface RunConfigBuildInput {
+  modelPrices?: RunModelPrices;
+  modelFallbacks?: Partial<Record<StageName, string>>;
   runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
@@ -502,7 +555,11 @@ export interface RunConfigBuildInput {
  */
 export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
   const { issue, mapping } = input;
+  const modelPrices = copyModelPrices(input.modelPrices);
+  const modelFallbacks = copyModelFallbacks(input.modelFallbacks);
   return {
+    ...(modelPrices ? { modelPrices } : {}),
+    ...(modelFallbacks ? { modelFallbacks } : {}),
     v: 1,
     issue: {
       id: issue.id,
@@ -601,6 +658,10 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
     kgDryRun, kgSourceRef, referenceRepos,
     reviewers, reviewProcess, trustedReviewAuthors, retryPolicy, reviewFix, agentConfig } = cfg;
   const out: RunConfigV1 = { v, issue };
+  const prices = copyModelPrices(cfg.modelPrices);
+  if (prices) out.modelPrices = prices;
+  const fallbacks = copyModelFallbacks(cfg.modelFallbacks);
+  if (fallbacks) out.modelFallbacks = fallbacks;
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
   if (runnerPhase !== undefined) out.runnerPhase = runnerPhase;

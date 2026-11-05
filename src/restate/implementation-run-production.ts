@@ -1,3 +1,6 @@
+import { modelPricesResponseSchema } from "./model-prices.js";
+import type { RunModelPrices } from "../run-config.js";
+import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 /** Production composition for the `ImplementationRun` service (AII-1557): the real deps for
  * `createImplementationRunWorkflow` on GitHub Actions, Fly Machines and local Docker. Sibling of
  * `planning-run-production.ts`; `src/index.ts` composes and registers the service and owns what this
@@ -293,7 +296,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     }
   }
 
-  async function launchSession(run: ImplementationRunInput, ctx: Prelaunch, execPath: ContainerBackend): Promise<ImplementationLaunchResult> {
+  async function launchSession(run: ImplementationRunInput, ctx: Prelaunch, execPath: ContainerBackend, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult> {
     const { issue, mapping } = ctx;
     let launchAttempted = false;
     const sessionToken = generateSessionToken();
@@ -315,7 +318,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
       }
       const args = {
-        config, issue, mapping, baseBranch: ctx.baseBranch,
+        modelPrices, config, issue, mapping, baseBranch: ctx.baseBranch,
         isGroupingParentDispatch: input.isGroupingParentDispatch,
         input: {
           sessionToken, machineNonce, runnerCallbackUrl,
@@ -354,7 +357,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     return { outcome: "accepted", jobId: launched.machineId };
   }
 
-  async function launch(run: ImplementationRunInput): Promise<ImplementationLaunchResult> {
+  async function launch(run: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult> {
     let ctx: Prelaunch;
     try {
       ctx = await prepare(run);
@@ -363,13 +366,13 @@ export function createProductionImplementationRunServices(input: ImplementationR
       return { outcome: "rejected" };
     }
     const execPath = containerBackend(run);
-    if (execPath) return launchSession(run, ctx, execPath);
+    if (execPath) return launchSession(run, ctx, execPath, modelPrices);
 
     // Pure prep: a throw is a definitive non-launch, and the prep has revoked the managed grant.
     let prepared: Awaited<ReturnType<typeof prepareImplementationLaunch>>;
     try {
       prepared = await input.prepareImplementationLaunch({
-        config, issue: ctx.issue, mapping: ctx.mapping, dispatchId: run.dispatchId,
+        modelPrices, config, issue: ctx.issue, mapping: ctx.mapping, dispatchId: run.dispatchId,
         baseBranch: ctx.baseBranch, managedDecision: ctx.managedDecision, managedRuntime: ctx.managedRuntime,
         resolveRunnerImage: input.resolveRunnerImage,
         isGroupingParentDispatch: input.isGroupingParentDispatch,
@@ -499,6 +502,14 @@ export function createProductionImplementationRunServices(input: ImplementationR
   const deps: ImplementationRunDependencies = {
     reserve,
     findExistingRun: createImplementationFindExistingRun({ getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: config.flySessionsApp }) }),
+    readModelPrices: async () => {
+      const response = await fetch(`${RESTATE_INGRESS_BASE_URL}/ModelPrices/builddown/current`, { method: "POST", headers: { "content-type": "application/json" }, body: "null", signal: AbortSignal.timeout(1000) });
+      if (!response.ok) return undefined;
+      const body = await response.json() as RunModelPrices;
+      const parsed = modelPricesResponseSchema.safeParse({ prices: body.prices });
+      if (!parsed.success || (body.fetchedAt !== null && typeof body.fetchedAt !== "number")) return undefined;
+      return { prices: parsed.data.prices, fetchedAt: body.fetchedAt };
+    },
     launch,
     readStatus,
     stop,

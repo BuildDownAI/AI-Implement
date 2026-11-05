@@ -1,3 +1,4 @@
+import { readOptionalModelPrices } from "../restate/implementation-run-workflow.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -222,6 +223,24 @@ describe("production deps", () => {
   });
 
   describe("launch", () => {
+    it.each(BACKENDS)("%s: failed and empty price reads still launch without prices", async (backend) => {
+      for (const read of [async () => { throw new Error("cache unavailable"); }, async () => ({ prices: [], fetchedAt: null })]) {
+        const { d, input } = compose();
+        const prices = await readOptionalModelPrices(read);
+        expect(prices).toBeUndefined();
+        expect(await d.launch({ ...INPUT, backend }, prices)).toMatchObject({ outcome: "accepted" });
+        const launch = backend === "github-actions" ? input.prepareImplementationLaunch : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
+        expect(vi.mocked(launch).mock.calls.at(-1)?.[0].modelPrices).toBeUndefined();
+      }
+    });
+    it.each(BACKENDS)("%s: carries cached public prices to the backend builder", async (backend) => {
+      const { d, input } = compose();
+      const modelPrices = { prices: [{ model: "m", version: "seed", effectiveFrom: null, inputUsd: "1", outputUsd: "2", cacheReadUsd: "0", cacheWriteUsd: "1" }], fetchedAt: 123 };
+      await d.launch({ ...INPUT, backend }, modelPrices);
+      const launch = backend === "github-actions" ? input.prepareImplementationLaunch : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
+      expect(vi.mocked(launch).mock.calls.at(-1)?.[0].modelPrices).toEqual(modelPrices);
+    });
+
     it.each(BACKENDS)("%s: returns the outcome and the id only, with no token", async (backend) => {
       const { d } = compose();
       const result = await d.launch({ ...INPUT, backend });

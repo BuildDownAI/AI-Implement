@@ -834,8 +834,9 @@ async function notifyKgRefreshOutcomeTeams(webhookUrl: string, n: KgRefreshOutco
 // ---------- Plain-text notification (best-effort; used where no issue context is available) ----------
 
 /** Posts a plain { text } payload — supported by both Slack and Teams incoming webhooks. */
-export async function notifyText(webhookUrl: string, message: string): Promise<void> {
+export async function notifyText(webhookUrl: string, message: string, signal?: AbortSignal): Promise<void> {
   const res = await fetch(webhookUrl, {
+    signal,
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text: message }),
@@ -844,4 +845,9 @@ export async function notifyText(webhookUrl: string, message: string): Promise<v
     const body = await res.text();
     throw new Error(`Webhook notification failed: ${res.status} — ${body}`);
   }
+}
+
+/** A recovery pairs only with a successfully posted sidecar warning. */
+export async function notifyKgRecovery(webhookUrl: string, signal?: AbortSignal): Promise<void> {
+  await notifyText(webhookUrl, "✅ KG sidecar serving again", signal);
 }

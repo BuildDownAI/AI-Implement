@@ -1,3 +1,4 @@
+import type { FailureRecord } from "./failure-classification.js";
 import { randomUUID } from "node:crypto";
 import { STAGE_NAMES, type StageName, type StageSelection } from "../agent-config.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
@@ -58,6 +59,7 @@ export class AgentRecoveryRequiredError extends Error {
 type ClaudeLike = { invoke(params: InvokeParams, options?: ClaudeInvokeOptions): Promise<LLMResult> };
 
 export interface StageExecutorOptions {
+  fallbackModels?: Partial<Record<StageName, string>>;
   workspaceDir: string;
   /** The injected legacy executor, returned untouched when no snapshot is supplied. */
   legacy: LLMExecutor;
@@ -90,6 +92,17 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
   if (!snapshot) return options.legacy;
   if (!options.auth) throw new AgentStageError("A stage snapshot requires a model auth client");
   const auth = options.auth;
+
+  const effectiveModels = new Map<StageName, string>();
+  const switchOnOverload = (stage: StageName, failure?: FailureRecord) => {
+    const from = snapshot.stages[stage].model;
+    const to = options.fallbackModels?.[stage];
+    if (failure?.code !== "PROVIDER_OVERLOADED" || !to || to === from || effectiveModels.has(stage)) return;
+    effectiveModels.set(stage, to);
+    failure.modelFallback = { stage, from, to };
+    const safeModel = (model: string) => SAFE_LABEL_RE.test(model) && !SECRET_SHAPE_RE.test(model) ? model : "unknown-model";
+    console.log(`[model-fallback] stage=${stage} from=${safeModel(from)} to=${safeModel(to)} after=PROVIDER_OVERLOADED`);
+  };
 
   let claude: ClaudeLike | undefined;
   // Profiles held for recovery, shared by every stage (and agent) that selects them. The Claude child runs in
@@ -154,7 +167,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
   return {
     async invoke(params: InvokeParams): Promise<LLMResult> {
       const stage = requireStage(params.agentStage);
-      const selection = snapshot.stages[stage];
+      const selection = { ...snapshot.stages[stage], model: effectiveModels.get(stage) ?? snapshot.stages[stage].model };
       const profile = snapshot.profiles[stage];
       const invocationId = `${stage}-${randomUUID()}`;
       // Validate the static projection before any auth acquisition or spawn: a rejected model, id or limit
@@ -208,6 +221,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         } else {
           result = await getCodex(profileId, stage).invoke(call);
         }
+        switchOnOverload(stage, result.failure);
         const attribution = attribute(result.failure ? "error" : "success", result.telemetry);
         recordInvocationOf(attribution, result.telemetry, result.attempts);
         return withAttribution(result, attribution);
@@ -220,6 +234,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
           heldProfiles.set(selection.accountProfileId, err as Error);
         }
         if (err instanceof Error || (typeof err === "object" && err !== null)) {
+          if (reachedExecutor) switchOnOverload(stage, (err as { failure?: FailureRecord }).failure);
           const carried = (err as { telemetry?: RunTelemetry }).telemetry;
           const attribution = attribute("error", carried);
           Object.assign(err, { attribution });

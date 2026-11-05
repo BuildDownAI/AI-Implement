@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import type { ModelPrice } from "../restate/model-prices.js";
 import { describe, it, expect, beforeEach } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as RcModule from "../report-card.js";
@@ -100,6 +102,36 @@ function insertSubStep(
 // ---- getIssueReportCard tests ----
 
 describe("getIssueReportCard", () => {
+  it("keeps reported totals separate from estimates across dispatches without storing estimates", () => {
+    const prices: ModelPrice[] = JSON.parse(readFileSync(new URL("./fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+    const first = insertDispatch({ issueIdentifier: "AII-EST", dispatchId: "estimate-first" });
+    insertDispatch({ issueIdentifier: "AII-EST", dispatchId: "estimate-second" });
+    insertFeedbackLoopStep(first, { approved: true, iterations: 1, terminationReason: "approved", passes: [
+      { iteration: 1, costUsd: 2, implementOutcome: "success", reviewApproved: true },
+    ] });
+    const db = dedup.getDb();
+    const insert = db.prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, ?)`);
+    const usages = [
+      { tokensIn: 100, tokensOut: 10, costUsd: 2, costStatus: "reported" },
+      { tokensIn: 100, tokensOut: 10, costStatus: "unavailable" },
+      { tokensIn: 0, tokensOut: 0, costStatus: "unavailable" },
+      { tokensIn: 100, tokensOut: null, costStatus: "unavailable" },
+      { tokensIn: 100, tokensOut: 10, costStatus: "unavailable" },
+    ];
+    usages.forEach((usage, i) => insert.run(`est-${i}`, i < 2 ? "estimate-first" : "estimate-second", i === 4 ? "unknown" : "a-dated", JSON.stringify(usage)));
+    const before = db.prepare("SELECT * FROM model_invocation_attribution").all();
+    expect(rc.getIssueReportCard("AII-EST", prices)!.totals).toEqual({
+      dispatches: 2, passes: 1, costUsd: 2, estimatedCostUsd: 0.00031234567890123456789, unpricedCalls: 2,
+    });
+    expect(rc.getIssueReportCard("AII-EST")!.totals).toMatchObject({ costUsd: 2, estimatedCostUsd: null, unpricedCalls: 4 });
+    expect(db.prepare("SELECT * FROM model_invocation_attribution").all()).toEqual(before);
+    db.prepare("DELETE FROM model_invocation_attribution WHERE invocation_id != 'est-2'").run();
+    expect(rc.getIssueReportCard("AII-EST", prices)!.totals.estimatedCostUsd).toBe(0);
+    expect(before.map(row => (row as { usage_json: string }).usage_json)).toEqual(usages.map(usage => JSON.stringify(usage)));
+  });
+
   it("returns null for unknown identifier", () => {
     expect(rc.getIssueReportCard("AII-999")).toBeNull();
   });

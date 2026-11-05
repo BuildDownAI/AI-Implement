@@ -241,6 +241,26 @@ describe("ready", () => {
 });
 
 describe("snapshot immutability and idempotence", () => {
+  it("reuses rows without a fallbackModels key", async () => {
+    const first = ready(await prep.prepareAgentRun(request(), deps));
+    expect(JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string)).not.toHaveProperty("fallbackModels");
+    expect(first.fallbackModels).toEqual({});
+    expect(ready(await prep.prepareAgentRun(request(), deps)).fallbackModels).toEqual({});
+  });
+
+  it("freezes fallbacks separately from the snapshot", async () => {
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { fallbackModel: "backup" } } });
+    const first = ready(await prep.prepareAgentRun(request(), deps));
+    expect(first.fallbackModels).toEqual({ review: "backup" });
+    expect(Object.keys(first.snapshot.stages.review)).toHaveLength(5);
+    const row = rows("run_agent_config_snapshots")[0]!;
+    expect(JSON.parse(row.resolved_config_json as string).fallbackModels).toEqual({ review: "backup" });
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { fallbackModel: "changed" } } });
+    expect(ready(await prep.prepareAgentRun(request(), deps)).fallbackModels).toEqual({ review: "backup" });
+    ownership.releaseLaunchRejected({ dispatchId: "d1", profileId: "sub", generation: first.reservations[0]!.generation });
+    expect(ready(await prep.prepareAgentRun(request({ dispatchId: "d2" }), deps)).fallbackModels).toEqual({ review: "changed" });
+  });
+
   it("does not let a settings edit change a prepared snapshot; a new dispatch sees it", async () => {
     const first = ready(await prep.prepareAgentRun(request(), deps));
     const before = JSON.stringify(rows("run_agent_config_snapshots"));
@@ -275,11 +295,15 @@ describe("snapshot immutability and idempotence", () => {
   });
 
   it("mints exactly one grant when two preparations of one dispatch overlap", async () => {
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { fallbackModel: "backup" } } });
+
     const [a, b] = await Promise.all([prep.prepareAgentRun(request(), deps), prep.prepareAgentRun(request(), deps)]);
     const ra = ready(a);
     const rb = ready(b);
     expect(rows("model_credential_grants").filter((x) => x.dispatch_id === "d1")).toHaveLength(1);
     expect(ra.grant.grantId).toBe(rb.grant.grantId);
+    expect(ra.fallbackModels).toEqual({ review: "backup" });
+    expect(rb.fallbackModels).toEqual(ra.fallbackModels);
     const bootstraps = [ra.takeBootstrap(), rb.takeBootstrap()].filter((x) => x !== undefined);
     expect(bootstraps).toHaveLength(1);
     expect([ra.reused, rb.reused].sort()).toEqual([false, true]);

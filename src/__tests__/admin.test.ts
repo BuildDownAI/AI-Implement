@@ -6544,6 +6544,32 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(patch.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
   });
 
+  it("saves and resolves fallback models with field provenance", async () => {
+    const t = await seed();
+    const deps = readyDeps();
+    const configuredDefaults = { ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, fallbackModel: "backup" } } };
+    expect((await call("/api/agent-defaults", "PUT", t, configuredDefaults)).status).toBe(200);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, deps)).status).toBe(200);
+    const resolved = async () => (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json.stages.review;
+    expect(await resolved()).toMatchObject({ values: { fallbackModel: "backup" }, sources: { fallbackModel: "orchestrator-default" } });
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel: "project-backup" } } }, deps)).status).toBe(200);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { invocationTimeoutMs: 900000 } } }, deps);
+    expect(await resolved()).toMatchObject({ values: { fallbackModel: "project-backup", invocationTimeoutMs: 900000 }, sources: { fallbackModel: "project" } });
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel: null } } }, deps);
+    expect(await resolved()).toMatchObject({ values: { fallbackModel: "backup" }, sources: { fallbackModel: "orchestrator-default" } });
+    const revs = count("stage_agent_config_revisions");
+    for (const fallbackModel of ["", "   ", 123, "gpt-x"]) {
+      const badDefault = { ...configuredDefaults, stages: { ...configuredDefaults.stages, review: { ...configuredDefaults.stages.review, fallbackModel } } };
+      const d = await call("/api/agent-defaults", "PUT", t, badDefault);
+      expect(d.status).toBe(400);
+      expect(d.json.error).toContain("review");
+      const p = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel } } }, deps);
+      expect(p.status).toBe(400);
+      expect(p.json.error).toContain("review");
+    }
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+  });
+
   it("validates defaults atomically", async () => {
     const t = await seed();
     const revs = count("stage_agent_config_revisions");

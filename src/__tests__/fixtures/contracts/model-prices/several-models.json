@@ -1,0 +1,46 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/api/model-prices",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "cache-control": "public, max-age=300",
+      "content-type": "application/json"
+    },
+    "body": {
+      "prices": [
+        {
+          "model": "a-dated",
+          "version": "2026-10-29",
+          "effectiveFrom": "2026-10-29T10:34:56.000Z",
+          "inputUsd": "0.000002123456789012345678900",
+          "outputUsd": "0.0000100",
+          "cacheReadUsd": "0",
+          "cacheWriteUsd": "0.0000025"
+        },
+        {
+          "model": "m-manual",
+          "version": "2026-10-29",
+          "effectiveFrom": "2026-10-29T10:34:56.000Z",
+          "inputUsd": "0.000002123456789012345678900",
+          "outputUsd": "0.0000100",
+          "cacheReadUsd": "0",
+          "cacheWriteUsd": "0.0000025"
+        },
+        {
+          "model": "z-seed",
+          "version": "seed",
+          "effectiveFrom": null,
+          "inputUsd": "0.000002123456789012345678900",
+          "outputUsd": "0.0000100",
+          "cacheReadUsd": "0",
+          "cacheWriteUsd": "0.0000025"
+        }
+      ]
+    }
+  }
+}

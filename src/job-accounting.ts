@@ -237,7 +237,7 @@ function timeOrNull(v: unknown): number | null {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= MAX_TIME_MS ? v : null;
 }
 
-function toInvocation(row: InvocationRow): z.infer<typeof JobAccountingInvocationSchema> {
+export function toInvocation(row: InvocationRow): z.infer<typeof JobAccountingInvocationSchema> {
   let u: Record<string, unknown> = {};
   try {
     const parsed: unknown = JSON.parse(row.usage_json);

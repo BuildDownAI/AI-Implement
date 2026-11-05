@@ -482,7 +482,7 @@ describe("projects page agents tab", () => {
     ...overrides,
   });
 
-  function mountAgents(opts: { stored?: Mapping; accounts?: Mapping[]; put?: { status: number; body: Mapping } } = {}) {
+  function mountAgents(opts: { defaults?: Mapping; stored?: Mapping; accounts?: Mapping[]; put?: { status: number; body: Mapping } } = {}) {
     const m = mountProjects(makeMapping({ executionMode: "fly-machines" }));
     const calls: { url: string; method: string; body: unknown }[] = [];
     const base = m.win.api;
@@ -492,7 +492,7 @@ describe("projects page agents tab", () => {
       if (url === "/api/mappings/AII/agent-config" && method === "GET") {
         return { ok: true, status: 200, json: async () => ({ projectKey: "AII", enabled: false, mode: "legacy", stages: {}, ...opts.stored }) };
       }
-      if (url === "/api/agent-defaults") return { ok: true, status: 200, json: async () => defaults };
+      if (url === "/api/agent-defaults") return { ok: true, status: 200, json: async () => opts.defaults ?? defaults };
       if (url === "/api/model-accounts") return { ok: true, status: 200, json: async () => ({ accounts: opts.accounts ?? [account()] }) };
       if (url === "/api/mappings/AII/agent-config" && method === "PUT") {
         const r = opts.put ?? { status: 200, body: { enabled: true, stages: {} } };
@@ -535,6 +535,82 @@ describe("projects page agents tab", () => {
     expect(puts(m)).toHaveLength(1);
     expect(puts(m)[0]).toMatchObject({ url: "/api/mappings/AII/agent-config", body: { stages: { review: { model: "gpt-custom" } } } });
     expect(m.calls.some((c) => c.url === "/api/agent-defaults" && c.method !== "GET")).toBe(false);
+  });
+
+  it("previews inherited fallback text safely through rerenders", async () => {
+    const value = '"<img src=x onerror="alert(1)">';
+    const m = mountAgents({ defaults: { ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, fallbackModel: value } } } });
+    await open(m);
+    expect(preview(m.doc, "review", "fallbackModel")).toContain(value + " (source: orchestrator default)");
+    const mode = field(m.doc, "mode", "review", "fallbackModel");
+    mode.value = "override";
+    fire(m.doc, mode);
+    expect(field(m.doc, "value", "review", "fallbackModel").value).toBe(value);
+    expect(m.doc.querySelector("#md-agents-stages img")).toBeNull();
+    await m.win.saveAgentConfig();
+    expect(puts(m)[0].body).toEqual({ stages: { review: { fallbackModel: value } } });
+  });
+
+  it("allows enabling with no fallback model", async () => {
+    const m = mountAgents();
+    await open(m);
+    const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
+    box.checked = true;
+    fire(m.doc, box);
+    await m.win.saveAgentConfig();
+    expect(puts(m)[0].body).toEqual({ enabled: true });
+    expect(m.doc.getElementById("md-agents-ok")!.classList.contains("hidden")).toBe(false);
+  });
+
+  it("loads fallback overrides safely and clears them to inherit", async () => {
+    const value = '"<img src=x onerror="alert(1)">';
+    const m = mountAgents({ stored: { stages: { review: { fallbackModel: value } } } });
+    await open(m);
+    expect(field(m.doc, "value", "review", "fallbackModel").value).toBe(value);
+    expect(preview(m.doc, "review", "fallbackModel")).toContain(value);
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(field(m.doc, "value", stage, "fallbackModel").parentElement!.textContent).toContain("Used for the rest of the run after this stage's model reports it is at capacity.");
+    }
+    const mode = field(m.doc, "mode", "review", "fallbackModel");
+    mode.value = "inherit";
+    fire(m.doc, mode);
+    expect(preview(m.doc, "review", "fallbackModel")).toContain("not set");
+    expect(m.doc.querySelector("#md-agents-stages img")).toBeNull();
+    await m.win.saveAgentConfig();
+    expect(puts(m)[0].body).toEqual({ stages: { review: { fallbackModel: null } } });
+  });
+
+  it("saves only the trimmed fallback override and retains refused drafts safely", async () => {
+    const value = '"<img src=x onerror="alert(1)">';
+    const error = "fallbackModel must differ from model " + value;
+    const m = mountAgents({ put: { status: 400, body: { error } } });
+    await open(m);
+    const mode = field(m.doc, "mode", "review", "fallbackModel");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const input = field(m.doc, "value", "review", "fallbackModel");
+    input.value = "  " + value + "  ";
+    input.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    await m.win.saveAgentConfig();
+    expect(puts(m)[0].body).toEqual({ stages: { review: { fallbackModel: value } } });
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toBe(error);
+    expect(field(m.doc, "value", "review", "fallbackModel").value).toBe("  " + value + "  ");
+    expect(preview(m.doc, "review", "fallbackModel")).toContain(value);
+    expect(m.doc.querySelector("#md-agents-stages img")).toBeNull();
+  });
+
+  it("rejects blank fallback overrides with inherit guidance", async () => {
+    const m = mountAgents();
+    await open(m);
+    const mode = field(m.doc, "mode", "review", "fallbackModel");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const input = field(m.doc, "value", "review", "fallbackModel");
+    input.value = "   ";
+    input.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toHaveLength(0);
+    expect(m.doc.getElementById("md-agents-error")!.textContent).toContain("switch it to Inherit");
   });
 
   it("does not show claude/anthropic in disabled inherited agent and provider controls", async () => {

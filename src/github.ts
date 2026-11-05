@@ -398,6 +398,8 @@ export function assigneeRunnerEnv(issue: { assigneeName?: string }): Record<stri
 }
 
 export interface EnvelopeDispatchOpts {
+  modelPrices?: RunConfigV1["modelPrices"];
+  modelFallbacks?: RunConfigV1["modelFallbacks"];
   runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   baseBranch?: string;
   runnerCallbackUrl?: string;
