@@ -8,7 +8,7 @@ import type { AccessRole } from "../access-entries.js";
 import type { Caller } from "../mcp-identity.js";
 import { systemCaller } from "../mcp-identity.js";
 import { isDeployHeld } from "../deploy-hold.js";
-import { getRestateStatus } from "./status.js";
+import { restateCanServe } from "./status.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
@@ -16,7 +16,7 @@ const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
 /** Admin discovery bound (AII-728): a hung admin API must not hang /mcp's tools/list. */
 const DISCOVER_TOOLS_TIMEOUT_MS = 5_000;
 /** Tool ingress bound (AII-728): a hung ingress must not hang a tools/call caller forever. */
-const CALL_TOOL_TIMEOUT_MS = 60_000;
+export const CALL_TOOL_TIMEOUT_MS = 60_000;
 
 export interface DiscoveredTool {
   name: string;
@@ -167,12 +167,7 @@ export async function callTool(
   if (!DEPLOY_HOLD_ALLOWED_TOOLS.has(name) && !(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) {
     return { status: "deploy-held" };
   }
-  const restateReady =
-    deps.restateReady ??
-    (() => {
-      const restate = getRestateStatus();
-      return restate.sidecar.state === "ready" && restate.registration.state === "registered";
-    });
+  const restateReady = deps.restateReady ?? restateCanServe;
   if (!restateReady()) return { status: "unavailable" };
   const ingressBaseUrl = deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;

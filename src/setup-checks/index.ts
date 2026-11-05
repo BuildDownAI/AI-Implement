@@ -71,6 +71,13 @@ export interface SetupCheckRun {
   results: SetupCheckResult[];
 }
 
+/** A run as every allowlisted identity may see it on `get_tenant_health`: each row's identity and state, never its detail or fix (ADR 047). */
+export interface SetupCheckSummary {
+  checkedAt: number;
+  failingCore: number;
+  rows: Array<Pick<SetupCheckResult, "id" | "title" | "state" | "project">>;
+}
+
 /**
  * The part of `RestateStatus` (`src/restate/status.ts`) the `restate` check reads. Declared here
  * because only door adapters may import from `src/restate/` (`restate-boundary.test.ts`).
@@ -180,4 +187,19 @@ export async function runSetupChecks(
     }];
   });
   return { checkedAt: now(), results };
+}
+
+/** The core rows in state `fail`: what the setup command's exit code, its last line and every summary count. */
+export function countFailingCore(run: SetupCheckRun): number {
+  return run.results.filter((result) => result.tier === "core" && result.state === "fail").length;
+}
+
+/** The run as every allowlisted identity may see it, or null before the first run. */
+export function summarizeSetupChecks(run: SetupCheckRun | null): SetupCheckSummary | null {
+  if (!run) return null;
+  return {
+    checkedAt: run.checkedAt,
+    failingCore: countFailingCore(run),
+    rows: run.results.map(({ id, title, state, project }) => ({ id, title, state, ...(project === undefined ? {} : { project }) })),
+  };
 }

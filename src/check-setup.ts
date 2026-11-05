@@ -12,7 +12,7 @@ import { useReadOnlyDb } from "./dedup.js";
 import { parseHealthPort } from "./http-server.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { createSetupCheckContext, runSetupChecks, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus, type SetupCheckResult, type SetupCheckRun } from "./setup-checks/index.js";
+import { countFailingCore, createSetupCheckContext, runSetupChecks, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus, type SetupCheckResult, type SetupCheckRun } from "./setup-checks/index.js";
 
 export interface CheckSetupDependencies {
   checks: readonly SetupCheck[];
@@ -116,7 +116,7 @@ export async function runCheckSetup(
     return restate;
   });
   const run = await runSetupChecks(context, deps.checks);
-  const failingCore = run.results.filter((r) => r.tier === "core" && r.state === "fail").length;
+  const failingCore = countFailingCore(run);
   deps.writeStdout(json ? `${JSON.stringify(run, null, 2)}\n` : formatRun(run, failingCore));
   return failingCore > 0 ? 1 : 0;
 }

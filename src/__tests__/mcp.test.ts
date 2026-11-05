@@ -148,7 +148,8 @@ let kgTriggerFake: ((opts: { actorEmail?: string }) => Promise<unknown>) | null 
 function fakeRestateContext(handlerName: string): restate.Context {
   return {
     request: () => ({ target: { handler: handlerName } }),
-    objectClient: () => ({
+    // SetupChecks has its own client: get_tenant_health reads the stored run, and none has run yet.
+    objectClient: (definition: { name: string }) => (definition.name === "SetupChecks" ? { get: async () => null } : {
       trigger: (opts: { actorEmail?: string }) => kgTriggerFake!(opts),
       status: async () => null,
       get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }),
@@ -174,12 +175,11 @@ vi.mock("../access-entries.js", () => ({
   recheckIdentity: vi.fn(),
 }));
 
-vi.mock("../runner-mode.js", () => ({
-  VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
+vi.mock("../runner-mode.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runner-mode.js")>()),
   getRunnerMode: vi.fn(),
   getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
   getKgExecutionMode: vi.fn(() => ({ mode: "github-actions" as const, source: "db" as const })),
-  resolveKgBackend: vi.fn(() => ({ mode: "github-actions" as const, source: "kg-setting" as const })),
 }));
 
 vi.mock("../config.js", async (importOriginal) => ({
@@ -219,10 +219,10 @@ vi.mock("../orchestrator-settings.js", async (importOriginal) => ({
   refreshRunnerBackendCache: vi.fn(async () => {}),
 }));
 
-vi.mock("../restate/tools-client.js", () => ({
+vi.mock("../restate/tools-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../restate/tools-client.js")>()),
   discoverTools: vi.fn(),
   callTool: vi.fn(),
-  IDEMPOTENCY_KEY_SHAPE: /^[A-Za-z0-9._:-]{1,128}$/,
 }));
 
 const BASE_URL = "https://orchestrator.example.com";

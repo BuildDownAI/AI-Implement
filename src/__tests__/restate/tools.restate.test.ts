@@ -18,6 +18,8 @@ import { initLogTable } from "../../log.js";
 import { initMappingsTable, getMappings } from "../../config.js";
 import { initSettingsTable } from "../../runner-mode.js";
 import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
+import { createSetupChecks } from "../../restate/setup-checks.js";
+import type { SetupCheckRun } from "../../setup-checks/index.js";
 import { VARIANTS, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
@@ -154,6 +156,13 @@ interface ToolCallResult {
 
 const SYSTEM = { kind: "system", email: null, role: "admin" } as const;
 
+/** get_tenant_health reads SetupChecks, so it is registered beside the tools, running these canned checks. */
+const SETUP_RUN: SetupCheckRun = {
+  checkedAt: 4242,
+  results: [{ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" }],
+};
+const setupChecks = createSetupChecks({ runChecks: async () => SETUP_RUN });
+
 describe("orchestratorTools (Restate)", () => {
   let environments: Map<string, RestateEnvironment>;
 
@@ -172,7 +181,7 @@ describe("orchestratorTools (Restate)", () => {
     ).run("BDS", "BuildDownAI", "skills", "claude.yml", "testing", JSON.stringify({ SUPER_SECRET: "leak-me" }));
     setKgMemoryProvider(null);
 
-    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools, authorizationTools, selfDeployStub]);
+    environments = await startVariants([orchestratorTools, failingTools, suspendingTools, idempotentTools, replayCounterTools, authorizationTools, selfDeployStub, setupChecks]);
   }, 60_000);
 
   afterAll(async () => {
@@ -335,6 +344,28 @@ describe("orchestratorTools (Restate)", () => {
       expect(health).toHaveProperty("projectCount");
       expect(health).toHaveProperty("kgDegraded");
       expect(health).toHaveProperty("kgRefreshPreflight");
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "get_tenant_health reads the stored setup-check run from the SetupChecks object, without its detail or fix (%s)",
+    async (label) => {
+      const env = environments.get(label)!;
+      const health = async () => {
+        const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
+          caller: { kind: "human", email: "user@example.com", role: "user" },
+          args: {},
+        });
+        return JSON.parse(body?.content?.[0]?.text as string) as { setupChecks: unknown };
+      };
+
+      expect((await health()).setupChecks).toBeNull();
+      await callObject(env.baseUrl(), "SetupChecks", "orchestrator", "run", undefined);
+      expect((await health()).setupChecks).toStrictEqual({
+        checkedAt: 4242,
+        failingCore: 1,
+        rows: [{ id: "restate", title: "Restate engine", state: "fail" }],
+      });
     },
   );
 

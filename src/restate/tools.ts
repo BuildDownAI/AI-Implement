@@ -25,6 +25,7 @@ import {
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { summarizeSetupChecks } from "../setup-checks/index.js";
 import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
@@ -36,6 +37,7 @@ import { isKgDegraded } from "../deploy-notify.js";
 import { sidecarHealthFields, getKgMemoryProvider, KG_TOOL_CAPABILITY } from "../kg-provider.js";
 import { getRestateRetentionDays, getVolumeSnapshotRetentionDays } from "./retention.js";
 import { getRestateStatus } from "./status.js";
+import { SETUP_CHECKS_KEY, SetupChecks } from "./setup-checks.js";
 import { readKgSourceRepo } from "../deploy.js";
 import { runKgRefreshPreflight, MIN_FREE_BYTES, type KgRefreshStage, type KgRefreshStatus } from "../kg-refresh.js";
 import type { StepStatus } from "../pipeline/types.js";
@@ -196,7 +198,7 @@ export function tool<I extends z.ZodType>(
 }
 
 export const GET_TENANT_HEALTH_DESCRIPTION =
-  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.";
+  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
 
 export const getTenantHealth = tool(
   {
@@ -204,7 +206,7 @@ export const getTenantHealth = tool(
     input: z.object({}),
     role: "user",
   },
-  async (): Promise<ToolResponse> => {
+  async (ctx): Promise<ToolResponse> => {
     const { mode, source } = getRunnerMode();
     const inFlight = getInFlightJobs();
     const db = getDb();
@@ -224,6 +226,7 @@ export const getTenantHealth = tool(
           kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         })
       : null;
+    const setupChecks = summarizeSetupChecks(await ctx.objectClient(SetupChecks, SETUP_CHECKS_KEY).get());
     const result = {
       runnerMode: { mode, source },
       inFlightJobCount: inFlight.length,
@@ -236,6 +239,7 @@ export const getTenantHealth = tool(
       restateRetentionDays: getRestateRetentionDays(),
       volumeSnapshotRetentionDays: getVolumeSnapshotRetentionDays(),
       kgRefreshPreflight,
+      setupChecks,
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
