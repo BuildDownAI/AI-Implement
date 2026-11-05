@@ -14,6 +14,7 @@ import { FakeProvider } from "../../providers/fake.js";
 import { fakeFetch } from "../fake-fetch.js";
 import { testDb } from "../test-db.js";
 import {
+  makeAccessEntry,
   makeAppConfig,
   makeAppendLogEntry,
   makeChatGptPlanRecord,
@@ -53,6 +54,35 @@ describe("makeMapping", () => {
     const first = makeMapping();
     first.extraEnv.LEAKED = "1";
     expect(makeMapping().extraEnv).toEqual({});
+  });
+});
+
+describe("makeAccessEntry", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("builds the entry an admin's own save stores and reads back", async () => {
+    const { access } = (await testDb({ modules: { access: () => import("../../../access-entries.js") } })).modules;
+    const entry = makeAccessEntry();
+    access.saveAccessEntries([{ kind: entry.kind, value: entry.value, role: entry.role }], "admin@example.com");
+    expect(access.listAccessEntries()).toEqual([entry]);
+  });
+
+  it("replaces only the overridden field", () => {
+    const user = makeAccessEntry({ role: "user" });
+    expect(user.role).toBe("user");
+    expect({ ...user, role: makeAccessEntry().role }).toEqual(makeAccessEntry());
+  });
+
+  it("returns fresh bindings on every call", () => {
+    makeAccessEntry().bindings.push({ provider: "google", subject: "leaked" });
+    expect(makeAccessEntry().bindings).toEqual([]);
   });
 });
 

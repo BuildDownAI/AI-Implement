@@ -3,12 +3,14 @@ import * as mappingConfig from "../../config.js";
 import { LinearProvider } from "../../providers/linear.js";
 import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import {
+  clearLinearTokenCache,
   configureLinearAuth,
+  LinearApiError,
   __setLinearTokenForTest,
   __resetLinearAuthForTest,
 } from "../../linear-app-auth.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
-import type { FakeFetch, Reply } from "../helpers/fake-fetch.js";
+import { fakeFetch, type FakeFetch, type Reply, type ReplyInit } from "../helpers/fake-fetch.js";
 import { linearData as data, linearGraphql } from "../helpers/replies/linear.js";
 
 // Linear auth lives in the linear-app-auth singleton now (not on ProviderConfig). Configure it
@@ -847,6 +849,7 @@ describe("LinearProvider.markPlanningStarted", () => {
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
+    expect(variables(fake, 2)).toEqual({ name: "AI-Planning" });
     expect(variables(fake, 3)).toEqual({ teamId: "team-uuid", name: "AI-Planning", color: "#8B5CF6" });
   });
 });
@@ -876,6 +879,25 @@ describe("LinearProvider.markPlanComplete", () => {
     expect(fake.calls).toHaveLength(7);
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
     expect(variables(fake, 6).labelIds).toEqual(["lo", "label-pc"]);
+  });
+
+  it("creates Plan-Complete with #10B981 when not found", async () => {
+    const fake = linear(
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // ensureTeamLabel: search returns empty → create
+      data({ issueLabels: { nodes: [] } }),
+      data({ issueLabelCreate: { issueLabel: { id: "new-label" } } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+    );
+
+    const p = new LinearProvider({});
+    await p.markPlanComplete("issue-1", "ENG", { awaitApproval: false });
+
+    expect(variables(fake, 3)).toEqual({ name: "Plan-Complete" });
+    expect(variables(fake, 4)).toEqual({ teamId: "team-uuid", name: "Plan-Complete", color: "#10B981" });
   });
 });
 
@@ -958,24 +980,89 @@ describe("LinearProvider.markImplementing", () => {
 });
 
 describe("LinearProvider.markPrReady", () => {
+  /** Linear answering each of markPrReady's requests by what it asks, so a test holds whatever order they come in. */
+  const workspace = (labels: Array<{ id: string; team: { id: string } | null }>) => {
+    const created: unknown[] = [];
+    const fake = fakeFetch({ "POST /graphql": (call) => {
+      const { query, variables: vars } = JSON.parse(call.body) as { query: string; variables: Record<string, unknown> };
+      if (query.includes("issueLabelCreate")) {
+        created.push(vars);
+        return data({ issueLabelCreate: { issueLabel: { id: "label-rfr-eng" } } }) as ReplyInit;
+      }
+      if (query.includes("issueLabels(")) return data({ issueLabels: { nodes: labels } }) as ReplyInit;
+      if (query.includes("teams(")) return data({ teams: { nodes: [{ id: "team-eng", key: "ENG" }] } }) as ReplyInit;
+      if (query.includes("team { key }")) return data({ issue: { team: { key: "ENG" } } }) as ReplyInit;
+      if (query.includes("labels { nodes { id name } }")) return data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }] } } }) as ReplyInit;
+      if (query.includes("issueUpdate")) return data({ issueUpdate: { success: true } }) as ReplyInit;
+      return data({ commentCreate: { success: true } }) as ReplyInit;
+    } }).install();
+    const labelSwap = () => fake.calls.map((c) => JSON.parse(c.body)).find((b) => b.query.includes("issueUpdate"))?.variables.labelIds;
+    return { created, labelSwap };
+  };
+
+  it("creates Ready for Review in the issue's team when no label exists, which needs no workspace admin", async () => {
+    const linearApi = workspace([]);
+    await new LinearProvider({}).markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
+
+    expect(linearApi.created).toEqual([{ teamId: "team-eng", name: "Ready for Review", color: "#4ecdc4" }]);
+    expect(linearApi.labelSwap()).toEqual(["label-rfr-eng"]);
+  });
+
+  it("never applies another team's Ready for Review label, which this team's issues cannot carry", async () => {
+    const linearApi = workspace([{ id: "label-rfr-ops", team: { id: "team-ops" } }]);
+    await new LinearProvider({}).markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
+
+    expect(linearApi.created).toEqual([{ teamId: "team-eng", name: "Ready for Review", color: "#4ecdc4" }]);
+    expect(linearApi.labelSwap()).toEqual(["label-rfr-eng"]);
+  });
+
+  it("keeps Ready for Review's label apart from the AI-Working label the same team already resolved", async () => {
+    const fake = linear(
+      // markImplementing: team key, team id, AI-Working search, label fetch, update, state (not movable)
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ issue: { state: { type: "started" } } }),
+      // markPrReady: team key, then its own search, since the team id is cached and its label is not
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ issueLabels: { nodes: [{ id: "label-rfr", team: null }] } }),
+      data({ issue: { labels: { nodes: [{ id: "label-aw", name: "AI-Working" }] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ commentCreate: { success: true } }),
+    );
+
+    const p = new LinearProvider({});
+    await p.markImplementing("issue-1", "ENG");
+    await p.markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
+
+    expect(variables(fake, 7)).toEqual({ name: "Ready for Review" });
+    expect(variables(fake, 9)).toEqual({ issueId: "issue-1", labelIds: ["label-rfr"] });
+  });
+
   it("swaps AI-Working for Ready for Review atomically and posts a PR comment", async () => {
     const fake = linear(
-      // 1. ensureWorkspaceReadyForReviewLabel: search workspace
-      data({ issueLabels: { nodes: [{ id: "label-rfr" }] } }),
-      // 2. fetch issue labels for swap
+      // 1. getTeamKeyForIssue
+      data({ issue: { team: { key: "ENG" } } }),
+      // 2. getTeamIdByKey
+      data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
+      // 3. ensureTeamLabel: find the existing Ready for Review (workspace-level)
+      data({ issueLabels: { nodes: [{ id: "label-rfr", team: null }] } }),
+      // 4. fetch issue labels for swap
       data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } }),
-      // 3. issueUpdate label swap
+      // 5. issueUpdate label swap
       data({ issueUpdate: { success: true } }),
-      // 4. postComment
+      // 6. postComment
       data({ commentCreate: { success: true } }),
     );
 
     const p = new LinearProvider({});
     await p.markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
 
-    expect(fake.calls).toHaveLength(4);
-    expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
-    expect(variables(fake, 3)).toEqual({
+    expect(fake.calls).toHaveLength(6);
+    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
+    expect(variables(fake, 5)).toEqual({
       issueId: "issue-1",
       body: "AI implementation PR: https://github.com/o/r/pull/7",
     });
@@ -1045,7 +1132,7 @@ describe("LinearProvider.clearWorkingState", () => {
 describe("LinearProvider.markPlanningFailed", () => {
   it("removes AI-Planning label and posts a failure comment", async () => {
     const fake = linear(
-      data({ issue: { labels: { nodes: [{ id: "lblP", name: "AI-Planning" }] } } }),
+      data({ issue: { labels: { nodes: [{ id: "lblP", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
       data({ issueUpdate: { success: true } }),
       data({ commentCreate: { success: true } }),
     );
@@ -1053,6 +1140,8 @@ describe("LinearProvider.markPlanningFailed", () => {
     const p = new LinearProvider({});
     const commented = await p.markPlanningFailed("issue-1", "ENG", "GraphQL exploded");
 
+    expect(fake.calls).toHaveLength(3);
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
     expect(variables(fake, fake.calls.length - 1).body).toContain("Planning failed: GraphQL exploded");
     expect(commented).toBe(true);
   });
@@ -1061,7 +1150,7 @@ describe("LinearProvider.markPlanningFailed", () => {
 describe("LinearProvider.markImplementationFailed", () => {
   it("removes AI-Working label and posts a failure comment", async () => {
     const fake = linear(
-      data({ issue: { labels: { nodes: [{ id: "lblW", name: "AI-Working" }] } } }),
+      data({ issue: { labels: { nodes: [{ id: "lblW", name: "AI-Working" }, { id: "lo", name: "Other" }] } } }),
       data({ issueUpdate: { success: true } }),
       data({ commentCreate: { success: true } }),
     );
@@ -1069,6 +1158,8 @@ describe("LinearProvider.markImplementationFailed", () => {
     const p = new LinearProvider({});
     const commented = await p.markImplementationFailed("issue-1", "ENG", "tests timed out");
 
+    expect(fake.calls).toHaveLength(3);
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
     expect(variables(fake, fake.calls.length - 1).body).toContain("Implementation failed: tests timed out");
     expect(commented).toBe(true);
   });
@@ -1177,6 +1268,13 @@ describe("LinearProvider.findByKey", () => {
     await expect(p.findByKey("ENG-1")).rejects.toThrow(/Linear API error/);
   });
 
+  it("throws an HTTP error as a LinearApiError carrying Linear's status and body", async () => {
+    linear({ status: 403, text: "forbidden" });
+    const err = await new LinearProvider({}).findByKey("ENG-1").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LinearApiError);
+    expect(err).toMatchObject({ status: 403, bodyText: "forbidden", message: expect.stringContaining("Linear API error: 403") });
+  });
+
   it("returns a TicketIssue when found", async () => {
     linear(data({
       issues: {
@@ -1245,5 +1343,144 @@ describe("LinearProvider.listIssuesPage", () => {
     __resetLinearAuthForTest();
     await expect(p.listIssuesPage(mapping, null)).rejects.toBeInstanceOf(TrackerUnavailableError);
     expect(fake.calls).toHaveLength(0);
+  });
+});
+
+describe("LinearProvider.fetchSetupFacts", () => {
+  /** Linear's answer to the read, for the requested teams and the labels matching the requested names. */
+  const answer = (
+    teams: Array<{ key: string; states: string[] }>,
+    labels: Array<{ name: string; team: string | null }>,
+    cutOff: { teams?: boolean; labels?: boolean } = {},
+  ) => data({
+    teams: {
+      nodes: teams.map((t) => ({
+        key: t.key,
+        started: { nodes: t.states.includes("started") ? [{ id: `${t.key}-started` }] : [] },
+        completed: { nodes: t.states.includes("completed") ? [{ id: `${t.key}-completed` }] : [] },
+      })),
+      pageInfo: { hasNextPage: cutOff.teams ?? false },
+    },
+    issueLabels: {
+      nodes: labels.map((l) => ({ name: l.name, team: l.team === null ? null : { key: l.team } })),
+      pageInfo: { hasNextPage: cutOff.labels ?? false },
+    },
+  });
+
+  it("reads every fact in one request, which is a query and never a mutation", async () => {
+    const fake = linear(answer([], []));
+    await new LinearProvider({}).fetchSetupFacts(["ENG", "OPS"]);
+
+    expect(fake.calls).toHaveLength(1);
+    const { query } = JSON.parse(fake.calls[0].body);
+    expect(query.trim()).toMatch(/^query\b/);
+    expect(query).not.toMatch(/\bmutation\b/);
+    expect(variables(fake, 0)).toEqual({
+      keys: ["ENG", "OPS"],
+      names: ["AI-Implement", "AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review"].map((name) => ({ name: { eqIgnoreCase: name } })),
+    });
+  });
+
+  it("asks each team for one state of each type, which keeps the read under Linear's complexity cap", async () => {
+    const fake = linear(answer([], []));
+    await new LinearProvider({}).fetchSetupFacts(["ENG"]);
+
+    // A state list with no `first` is priced at 50 states a team, which Linear refused live at 250 teams.
+    const { query } = JSON.parse(fake.calls[0].body);
+    expect(query).toMatch(/started: states\(first: 1, filter: \{ type: \{ eq: "started" \} \}\)/);
+    expect(query).toMatch(/completed: states\(first: 1, filter: \{ type: \{ eq: "completed" \} \}\)/);
+  });
+
+  it("returns each team's state types, and files each label under every name it matches ignoring case", async () => {
+    linear(answer(
+      [
+        { key: "ENG", states: ["started", "completed"] },
+        { key: "DEV", states: ["started"] },
+        { key: "QA", states: ["completed"] },
+        { key: "OPS", states: [] },
+      ],
+      [{ name: "AI-Implement", team: null }, { name: "ai-working", team: "ENG" }, { name: "Ready for Review", team: null }],
+    ));
+    const facts = await new LinearProvider({}).fetchSetupFacts(["ENG", "DEV", "QA", "OPS", "GONE"]);
+
+    expect(facts).toEqual({
+      kind: "linear",
+      token: "minted",
+      pickupLabel: "AI-Implement",
+      teams: { ENG: ["started", "completed"], DEV: ["started"], QA: ["completed"], OPS: [] },
+      labels: {
+        "AI-Implement": [{ name: "AI-Implement", teamKey: null }],
+        "AI-Planning": [],
+        "Plan-Complete": [],
+        "AI-Working": [{ name: "ai-working", teamKey: "ENG" }],
+        "Ready for Review": [{ name: "Ready for Review", teamKey: null }],
+      },
+    });
+  });
+
+  it("asks both lists whether a next page exists, so a cut-off list can be caught", async () => {
+    const fake = linear(answer([], []));
+    await new LinearProvider({}).fetchSetupFacts(["ENG"]);
+
+    const { query } = JSON.parse(fake.calls[0].body) as { query: string };
+    const teamsRead = query.slice(query.indexOf("teams("), query.indexOf("issueLabels("));
+    const labelsRead = query.slice(query.indexOf("issueLabels("));
+    expect(teamsRead).toContain("pageInfo { hasNextPage }");
+    expect(labelsRead).toContain("pageInfo { hasNextPage }");
+  });
+
+  it("refuses a team list cut off at one page, rather than let a team past it read as one the app cannot see", async () => {
+    linear(answer([{ key: "ENG", states: ["started"] }], [{ name: "AI-Implement", team: null }], { teams: true }));
+    await expect(new LinearProvider({}).fetchSetupFacts(["ENG"])).rejects.toThrow("More teams match than one read returns.");
+  });
+
+  it("refuses a label list cut off at one page, rather than let it read as a missing label", async () => {
+    linear(answer([{ key: "ENG", states: ["started"] }], [{ name: "AI-Implement", team: null }], { labels: true }));
+    await expect(new LinearProvider({}).fetchSetupFacts(["ENG"])).rejects.toThrow("More labels match than one read returns.");
+  });
+
+  it("reports a refused credential as facts, with Linear's status, and sends no query", async () => {
+    clearLinearTokenCache();
+    fakeFetch({ "POST /oauth/token": { status: 401, text: "invalid_client" } }).install();
+
+    expect(await new LinearProvider({}).fetchSetupFacts(["ENG"])).toEqual({
+      kind: "linear",
+      token: "refused",
+      status: 401,
+      error: "Linear token mint failed (401): invalid_client",
+    });
+  });
+
+  it("reports Linear unreachable at the token mint with no status", async () => {
+    clearLinearTokenCache();
+    fakeFetch({ "POST /oauth/token": () => { throw new TypeError("fetch failed"); } }).install();
+
+    expect(await new LinearProvider({}).fetchSetupFacts(["ENG"])).toEqual({ kind: "linear", token: "refused", status: null, error: "fetch failed" });
+  });
+
+  it("reports a cached token Linear has revoked, which no new mint replaces, as refused credentials", async () => {
+    // The beforeEach token is cached and in date, so only the query reveals it was revoked, as a rotated client secret does.
+    const fake = fakeFetch({
+      "POST /graphql": { status: 401, text: "Authentication required" },
+      "POST /oauth/token": { status: 401, text: "invalid_client" },
+    }).install();
+
+    expect(await new LinearProvider({}).fetchSetupFacts(["ENG"])).toEqual({
+      kind: "linear",
+      token: "refused",
+      status: 401,
+      error: "Linear token mint failed (401): invalid_client",
+    });
+    expect(fake.calls.map((call) => call.path)).toEqual(["/graphql", "/oauth/token", "/oauth/token"]);
+  });
+
+  it("rethrows a query Linear refuses while the app's token still holds, with no extra mint", async () => {
+    // No token route: a mint would fail the test.
+    const fake = fakeFetch({ "POST /graphql": { status: 400, text: "Query too complex" } }).install();
+
+    const read = new LinearProvider({}).fetchSetupFacts(["ENG"]);
+    await expect(read).rejects.toBeInstanceOf(LinearApiError);
+    await expect(read).rejects.toMatchObject({ status: 400 });
+    expect(fake.calls.map((call) => call.path)).toEqual(["/graphql"]);
   });
 });

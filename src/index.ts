@@ -55,10 +55,11 @@ import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, count
 import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
-import { configureLinearAuth } from "./linear-app-auth.js";
-import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
+import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
+import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
+import { readSetupChecksViaObject, runSetupChecksViaObject } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -91,13 +92,14 @@ import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } fr
 import { getMachine, listMachines, updateMachine, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
-import { seedKgMaterializeDirectFromEnv, seedKgExecutionModeFromEnv, getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
 import { initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, seedKgBaseRepoFromEnv, seedLinearPickupLabelFromEnv, seedRunnerImageAllowedPrefixesFromEnv, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { seedSettingsFromEnv } from "./seed-once-settings.js";
 import { handleRunnerReviewPublication, createReviewPublicationIngressClient, handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
 import type { RunnerProgressBody, RunnerResultBody, RunnerActivityBody, ActivityIntakeOutcome } from "./runner-callback.js";
@@ -112,7 +114,7 @@ import type { ReviewFixResultMetadataV1, ResultIntakeOutcome } from "./review-fi
 import { handleMcpRequest } from "./mcp.js";
 import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
-import { withRequestErrorBoundary } from "./http-server.js";
+import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
 import {
   initMcpOAuthTables,
   handleMcpProtectedResourceMetadata,
@@ -182,13 +184,14 @@ import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
 import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
-import { getRestateStatus, setRestateStatus } from "./restate/status.js";
+import { getRestateStatus, restateCanServe, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
-import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { beginCycle, isCurrentCycle, getPollStats, parsePollIntervalMs, runWithDeadline } from "./poll-cycle.js";
+import { effectiveAccessCode, PLACEHOLDER_ACCESS_CODE } from "./admin-session.js";
 import { scrubOperatorLegacyTokens } from "./restate/operator-legacy-scrub.js";
 
 /**
@@ -256,18 +259,14 @@ function loadConfig(): AppConfig {
     return val;
   };
   
-  // Microsoft's tid-based "email verified" only holds for a single-tenant issuer
-  // so it's dropped as an OAuth provider if a multi-tenant env value is provided
-  let oauthProviders = providersFromEnv(process.env);
-  const msMultiTenant = oauthProviders.some((p) => p.id === "microsoft") &&
-    ["common", "organizations", "consumers"].includes((process.env.MICROSOFT_OAUTH_TENANT || "").toLowerCase());
-  if (msMultiTenant) {
-    oauthProviders = oauthProviders.filter((p) => p.id !== "microsoft");
-    console.warn("[main] MICROSOFT_OAUTH_TENANT is a multi-tenant value — Microsoft SSO disabled. Pin a specific tenant GUID (single-tenant).");
-  }
+  const { providers: oauthProviders, dropped: droppedProviders } = resolveProviders(process.env);
+  for (const { id, reason } of droppedProviders) console.warn(`[main] ${id} sign-in disabled: ${reason}`);
   
   // Resolved admin-auth posture — now that both access-code and SSO are known.
-  const adminAccessCode = process.env.ADMIN_ACCESS_CODE || null;
+  const adminAccessCode = effectiveAccessCode(process.env.ADMIN_ACCESS_CODE);
+  if (process.env.ADMIN_ACCESS_CODE === PLACEHOLDER_ACCESS_CODE) {
+    console.warn("[main] ADMIN_ACCESS_CODE is the published .env.example placeholder, so it is refused. Set a real code, or sign in with SSO.");
+  }
   const oauthConfigured = oauthProviders.length > 0; // derive from the list, not the not-yet-seeded singleton
   if (!adminAccessCode && !oauthConfigured) {
     console.warn("[main] admin UI disabled — set ADMIN_ACCESS_CODE and/or configure OAuth providers");
@@ -317,12 +316,8 @@ function loadConfig(): AppConfig {
     console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
   }
 
-  const linearClientId = process.env.LINEAR_CLIENT_ID || null;
-  const linearClientSecret = process.env.LINEAR_CLIENT_SECRET || null;
-  if (!linearClientId || !linearClientSecret) {
+  if (!configureLinearAuthFromEnv()) {
     console.warn("[main] LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET not set — Linear mappings will be skipped (the ProviderRegistry tolerates missing per-provider config)");
-  } else {
-    configureLinearAuth(linearClientId, linearClientSecret);
   }
 
   return {
@@ -332,9 +327,9 @@ function loadConfig(): AppConfig {
     notifyType,
     adminAccessCode,
     oauthRedirectBaseUrl,
-    pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
+    pollIntervalMs: parsePollIntervalMs(process.env.POLL_INTERVAL_MS),
     pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
-    healthPort: parseInt(process.env.PORT || "8080", 10),
+    healthPort: parseHealthPort(process.env.PORT),
     get flySessionsToken() {
       return getFlySessionsConfig().token;
     },
@@ -896,7 +891,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // AII-1304: retry LateExternalReview for gap-fill rows submitted while Restate was not ready.
   try {
     await resubmitPendingGapFillReviews({
-      ready: restateReady,
+      ready: restateCanServe,
       submit: lateExternalReviewSubmitHook,
       getState: (key) => lateExternalReviewIngress.getState(key),
       getPrClosed: async ({ owner, repo, prNumber }) => {
@@ -1459,8 +1454,7 @@ export async function dispatchPlanning(
 
   // Pilot lifecycle: the PlanningRun workflow owns the reservation and launches the run.
   if (resolveReviewFixLifecycle(mapping) === "restate") {
-    const restate = getRestateStatus();
-    if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") {
+    if (!restateCanServe()) {
       console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
       return;
     }
@@ -3397,8 +3391,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           continue;
         }
         if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
-        const restate = getRestateStatus();
-        if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") continue;
+        if (!restateCanServe()) continue;
         try {
           const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
           const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
@@ -4009,16 +4002,12 @@ const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 const selfDeployClient = createSelfDeployIngressClient();
 const trackerExportClient = createTrackerExportIngressClient();
-// AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
-function restateReady(): boolean {
-  const restate = getRestateStatus();
-  return restate.sidecar.state === "ready" && restate.registration.state === "registered";
-}
 const reviewPublicationIngress = createReviewPublicationIngressClient();
 const lateExternalReviewIngress = createLateExternalReviewIngressClient();
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: lateExternalReviewIngress,
-  restateReady,
+  // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
+  restateReady: restateCanServe,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
 const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
@@ -4494,7 +4483,7 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateReady),
+        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateCanServe),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
@@ -4640,7 +4629,7 @@ function startServer(
 
     // Publish a post-push review through the durable publication object.
     if (url === "/runner/review-publication" && req.method === "POST") {
-      handleReviewPublicationRequest(req, res, { secret: config.runnerTokenSecret, ingress: reviewPublicationIngress, restateReady });
+      handleReviewPublicationRequest(req, res, { secret: config.runnerTokenSecret, ingress: reviewPublicationIngress, restateReady: restateCanServe });
       return;
     }
 
@@ -4921,7 +4910,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -5155,11 +5144,7 @@ async function main(): Promise<void> {
   initDispatchBreakerTable();
   sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
-  seedKgBaseRepoFromEnv(process.env.KG_BASE_REPO); // AII-633: seeds once, inert thereafter
-  seedKgMaterializeDirectFromEnv(process.env.KG_MATERIALIZE_DIRECT); // AII-1109: seeds once, inert thereafter
-  seedKgExecutionModeFromEnv(process.env.KG_EXECUTION_MODE); // seeds once, inert thereafter
-  seedLinearPickupLabelFromEnv(process.env.LINEAR_PICKUP_LABEL); // AII-694: seeds once, inert thereafter
-  seedRunnerImageAllowedPrefixesFromEnv(process.env.RUNNER_IMAGE_ALLOWED_PREFIXES); // AII-1321: seeds once, inert thereafter
+  seedSettingsFromEnv(); // SEED_ONCE_SETTINGS: each seeds once, inert thereafter (ADR 022)
   initAccessEntriesTable();
   initReconciliationTable();
   initStepLogTable();

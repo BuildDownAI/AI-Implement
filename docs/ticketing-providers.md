@@ -18,7 +18,7 @@ The orchestrator talks to issue trackers through one interface, `TicketingProvid
 
 Every project mapping carries `ticketingProvider` and a matching `ticketingConfig` (`ticketing-config.ts`). Linear needs no config. Jira needs `jql` (scope) and `repoFieldValue` (the `AI-Implement Repo` option), plus optional `*FieldOverride` ids.
 
-`ProviderRegistry` (`registry.ts`) resolves a provider from a mapping. It caches **one instance per provider id**: a single Linear provider and a single Jira provider serve every mapping of that kind. The cache is dropped when an admin saves or deletes a mapping. `forAllMappings` returns one provider per distinct id in use, skipping any whose construction fails; the poll loop iterates that set.
+`ProviderRegistry` (`registry.ts`) resolves a provider from a mapping. It caches **one instance per provider id**: a single Linear provider and a single Jira provider serve every mapping of that kind. The cache is dropped when an admin saves or deletes a mapping. `forAllMappings` returns one provider per distinct id in use, skipping any whose construction fails; the poll loop iterates that set. The setup check `tracker.provider` names a provider that cannot be built, and one that has no setup checks of its own ([setup-checks.md § tracker](setup-checks.md#tracker)).
 
 ## How each provider finds work
 
@@ -62,6 +62,30 @@ Selection is tracker-scoped. `mappingForProvider` and `mergeProviderSnapshots` d
 **Do not reuse a Linear team key as a Jira mapping key.** While the Jira mapping holds the key, that Linear team cannot be mapped: its issues are dropped as foreign.
 
 The admin UI warns about this on save, without blocking it: `POST /api/mappings` returns a `warnings` array when a Jira mapping is saved over a key a Linear mapping holds today. The check is advisory — no provider method lists Linear teams, so an unmapped Linear team key is not detected.
+
+## Linear setup
+
+The Linear provider relies on the app's credentials and on four things in the workspace. The setup checks get the app's token, then read the rest in one GraphQL request (`LinearProvider.fetchSetupFacts`), which never writes, and report each by id ([setup-checks.md § tracker](setup-checks.md#tracker)).
+
+### The app's credentials
+
+The orchestrator acts in Linear as an OAuth app, never as a person. Boot reads `LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` (`configureLinearAuthFromEnv`, `src/linear-app-auth.ts`), and the first request mints an app-actor token through the client-credentials grant, so the app needs client credentials tokens enabled. The token is cached and minted again an hour before it expires; a request answered 401 mints a fresh token and retries once. A refused grant is a `LinearApiError` carrying Linear's HTTP status, and without a token every Linear read and write fails.
+
+### Team access
+
+A Linear mapping's key is its team's key ("Mapping keys", above). The poll is one workspace-wide search ("How each provider finds work"), so a team the app cannot access looks exactly like a team with no labeled issues: its issues never appear. A mapping key that names no team looks the same, and Linear answers both cases the same way, with no team for that key.
+
+### The pickup label
+
+The poll matches the pickup label by its exact name (`labels: { name: { eq } }`), as a workspace label or one of the team's own. The orchestrator never creates it, and reads its name from the `linear_pickup_label` setting at the start of each poll ([ADR 022](adr/022-pickup-label-is-a-settings-row-seeded-once-from-the-environment.md)). A label that differs only in case is never matched.
+
+### Lifecycle labels
+
+The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working` and, once a PR opens, `Ready for Review`. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
+
+### Workflow states
+
+`markPlanningStarted` and `markImplementing` move an issue still in triage, the backlog or an unstarted state to the team's `started`-type state (`In Progress` when the team has one). `markMerged` moves a merged issue to its `completed`-type state (`Done` when it has one). A team with no state of that type fails the transition with `No "started" workflow state found for team …`, or the `completed` equivalent.
 
 ## Mixed deployments
 

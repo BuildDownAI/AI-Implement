@@ -11,7 +11,7 @@ import { isDeployHeld } from "../deploy-hold.js";
 import type { SidecarHealth } from "../kg-provider.js";
 import { SidecarMemoryProvider, getKgMemoryProvider, isKgUnavailable, probeWithTimeout } from "../kg-provider.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
-import { getRestateStatus } from "./status.js";
+import { restateCanServe } from "./status.js";
 
 export interface KgSidecarHealthDeps {
   /** A plain function (no ctx). Resolves `null` when there is nothing to probe. */
@@ -82,12 +82,7 @@ const SEND_TIMEOUT_MS = 10_000;
  */
 export async function checkKgSidecarHealth(deps: CheckKgSidecarHealthDeps = {}): Promise<void> {
   if ((deps.deployHeld ?? isDeployHeld)()) return;
-  const ready =
-    deps.restateReady ??
-    (() => {
-      const restateStatus = getRestateStatus();
-      return restateStatus.sidecar.state === "ready" && restateStatus.registration.state === "registered";
-    });
+  const ready = deps.restateReady ?? restateCanServe;
   if (!ready()) return;
   if (!(deps.unavailable ?? (() => isKgUnavailable() || hasKgRecoveryNotice()))()) return;
   try {

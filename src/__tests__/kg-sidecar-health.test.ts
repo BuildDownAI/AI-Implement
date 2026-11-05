@@ -4,11 +4,25 @@ import { testDb } from "./helpers/test-db.js";
 import http from "node:http";
 import { SidecarMemoryProvider, setKgMemoryProvider, sidecarHealth } from "../kg-provider.js";
 import { checkKgSidecarHealth, probeKgSidecarIfUnavailable } from "../restate/kg-sidecar-health.js";
+import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
 
 describe("checkKgSidecarHealth", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetRestateStatus();
+  });
   const ok = () => vi.fn(async () => new Response("{}", { status: 200 }));
   const base = { deployHeld: () => false, restateReady: () => true, unavailable: () => true };
+
+  it("reads the orchestrator's own Restate status when no readiness is passed", async () => {
+    const { restateReady: _ready, ...unready } = base;
+    const fetchImpl = ok();
+    await checkKgSidecarHealth({ ...unready, fetchImpl });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    await checkKgSidecarHealth({ ...unready, fetchImpl });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
 
   it("sends one POST to the check handler when unavailable and ready", async () => {
     const fetchImpl = ok();

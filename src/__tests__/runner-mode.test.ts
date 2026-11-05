@@ -1,17 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as DedupModule from "../dedup.js";
+import type * as SeedOnceSettingsModule from "../seed-once-settings.js";
 import { testDb } from "./helpers/test-db.js";
 
 let runnerMode: typeof RunnerModeModule;
 let dedup: typeof DedupModule;
+let seeds: typeof SeedOnceSettingsModule;
 
 beforeEach(async () => {
   delete process.env.RUNNER_MODE;
   delete process.env.FLY_PROCESS_LEVEL_SECRETS;
   delete process.env.KG_MATERIALIZE_DIRECT;
-  ({ runnerMode, dedup } = (
-    await testDb({ modules: { runnerMode: () => import("../runner-mode.js"), dedup: () => import("../dedup.js") } })
+  ({ runnerMode, dedup, seeds } = (
+    await testDb({
+      modules: {
+        runnerMode: () => import("../runner-mode.js"),
+        dedup: () => import("../dedup.js"),
+        seeds: () => import("../seed-once-settings.js"),
+      },
+    })
   ).modules);
 });
 
@@ -299,29 +307,29 @@ describe("runner-mode", () => {
       expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "default" });
     });
 
-    describe("seedKgMaterializeDirectFromEnv (AII-1109)", () => {
+    describe("seeding KG_MATERIALIZE_DIRECT (AII-1109)", () => {
       const rowCount = () =>
         (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM settings WHERE key = 'kg_materialize_direct'").get() as { n: number }).n;
 
       it("env true, no row → seeds the row", () => {
-        runnerMode.seedKgMaterializeDirectFromEnv("true");
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: "true" });
         expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: true, source: "db" });
       });
 
       it("env false, no row → seeds a false row", () => {
-        runnerMode.seedKgMaterializeDirectFromEnv("false");
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: "false" });
         expect(rowCount()).toBe(1);
         expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "db" });
       });
 
       it("env true, row false → row stays false", () => {
         runnerMode.setKgMaterializeDirect(false);
-        runnerMode.seedKgMaterializeDirectFromEnv("true");
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: "true" });
         expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "db" });
       });
 
       it.each([undefined, "", "  "])("env %j writes no row", (val) => {
-        runnerMode.seedKgMaterializeDirectFromEnv(val);
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: val });
         expect(rowCount()).toBe(0);
         expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "default" });
       });
@@ -350,15 +358,15 @@ describe("runner-mode", () => {
       });
 
       it("seeds once and is inert after a save", () => {
-        runnerMode.seedKgExecutionModeFromEnv("fly-machines");
+        seeds.seedSettingsFromEnv({ KG_EXECUTION_MODE: "fly-machines" });
         expect(runnerMode.getKgExecutionMode(false)).toEqual({ mode: "fly-machines", source: "db" });
         runnerMode.setKgExecutionMode("github-actions");
-        runnerMode.seedKgExecutionModeFromEnv("fly-machines");
+        seeds.seedSettingsFromEnv({ KG_EXECUTION_MODE: "fly-machines" });
         expect(runnerMode.getKgExecutionMode(false).mode).toBe("github-actions");
       });
 
       it.each([undefined, "", "  ", "bogus"])("env %j writes no row", (val) => {
-        runnerMode.seedKgExecutionModeFromEnv(val);
+        seeds.seedSettingsFromEnv({ KG_EXECUTION_MODE: val });
         expect(rowCount()).toBe(0);
       });
     });

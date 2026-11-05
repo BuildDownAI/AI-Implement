@@ -1,14 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
+import type * as SeedOnceSettingsModule from "../seed-once-settings.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import { testDb } from "./helpers/test-db.js";
 
 let dedup: typeof DedupModule;
 let settings: typeof OrchestratorSettingsModule;
+let seeds: typeof SeedOnceSettingsModule;
 
 beforeEach(async () => {
-  ({ dedup, settings } = (await testDb({
-    modules: { dedup: () => import("../dedup.js"), settings: () => import("../orchestrator-settings.js") },
+  ({ dedup, settings, seeds } = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      settings: () => import("../orchestrator-settings.js"),
+      seeds: () => import("../seed-once-settings.js"),
+    },
   })).modules);
 });
 
@@ -72,20 +78,20 @@ describe("setOrchestratorSetting", () => {
   });
 });
 
-describe("seedKgBaseRepoFromEnv", () => {
+describe("seeding KG_BASE_REPO", () => {
   it("seeds the DB value from the env value when unset", () => {
-    settings.seedKgBaseRepoFromEnv("Org/base-repo");
+    seeds.seedSettingsFromEnv({ KG_BASE_REPO: "Org/base-repo" });
     expect(settings.getOrchestratorSettings().kgBaseRepo).toBe("Org/base-repo");
   });
 
   it("does nothing when the env value is absent", () => {
-    settings.seedKgBaseRepoFromEnv(undefined);
+    seeds.seedSettingsFromEnv({ KG_BASE_REPO: undefined });
     expect(settings.getOrchestratorSettings().kgBaseRepo).toBeNull();
   });
 
   it("never overwrites an existing DB value, even on a later boot with a different env value", () => {
     settings.setOrchestratorSetting("kgBaseRepo", "Org/already-set");
-    settings.seedKgBaseRepoFromEnv("Org/different-env-value");
+    seeds.seedSettingsFromEnv({ KG_BASE_REPO: "Org/different-env-value" });
     expect(settings.getOrchestratorSettings().kgBaseRepo).toBe("Org/already-set");
   });
 });
@@ -107,23 +113,23 @@ describe("getLinearPickupLabel", () => {
   });
 });
 
-describe("seedLinearPickupLabelFromEnv", () => {
+describe("seeding LINEAR_PICKUP_LABEL", () => {
   it("seeds the DB value from the env value when unset", () => {
-    settings.seedLinearPickupLabelFromEnv("AI Implement - New");
+    seeds.seedSettingsFromEnv({ LINEAR_PICKUP_LABEL: "AI Implement - New" });
     expect(settings.getOrchestratorSettings().linearPickupLabel).toBe("AI Implement - New");
     expect(settings.getLinearPickupLabel()).toBe("AI Implement - New");
   });
 
   it("does nothing when the env value is absent or blank", () => {
-    settings.seedLinearPickupLabelFromEnv(undefined);
+    seeds.seedSettingsFromEnv({ LINEAR_PICKUP_LABEL: undefined });
     expect(settings.getOrchestratorSettings().linearPickupLabel).toBeNull();
-    settings.seedLinearPickupLabelFromEnv("   ");
+    seeds.seedSettingsFromEnv({ LINEAR_PICKUP_LABEL: "   " });
     expect(settings.getOrchestratorSettings().linearPickupLabel).toBeNull();
   });
 
   it("never overwrites an existing DB value, even on a later boot with a different env value", () => {
     settings.setOrchestratorSetting("linearPickupLabel", "Already-Set");
-    settings.seedLinearPickupLabelFromEnv("Different-Env-Value");
+    seeds.seedSettingsFromEnv({ LINEAR_PICKUP_LABEL: "Different-Env-Value" });
     expect(settings.getOrchestratorSettings().linearPickupLabel).toBe("Already-Set");
   });
 });
@@ -370,21 +376,21 @@ describe("getRunnerImageAllowedPrefixes", () => {
   });
 });
 
-describe("seedRunnerImageAllowedPrefixesFromEnv", () => {
+describe("seeding RUNNER_IMAGE_ALLOWED_PREFIXES", () => {
   it("seeds the DB value from the env value when unset", () => {
-    settings.seedRunnerImageAllowedPrefixesFromEnv("ghcr.io/acme/");
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: "ghcr.io/acme/" });
     expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/acme/");
   });
 
   it("does nothing when the env value is absent or blank", () => {
-    settings.seedRunnerImageAllowedPrefixesFromEnv(undefined);
-    settings.seedRunnerImageAllowedPrefixesFromEnv("   ");
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: undefined });
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: "   " });
     expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
   });
 
   it("never overwrites an existing DB value", () => {
     settings.setOrchestratorSetting("runnerImageAllowedPrefixes", "ghcr.io/set/");
-    settings.seedRunnerImageAllowedPrefixesFromEnv("ghcr.io/env/");
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: "ghcr.io/env/" });
     expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/set/");
   });
 
@@ -394,20 +400,54 @@ describe("seedRunnerImageAllowedPrefixesFromEnv", () => {
     ["ghcr.io/a*/", "each prefix may contain only letters, digits and . _ : / @ -"],
   ])("stores nothing and logs for the invalid env value %s", (value, error) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    settings.seedRunnerImageAllowedPrefixesFromEnv(value);
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: value });
     expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
     expect(settings.getRunnerImageAllowedPrefixes()).toEqual([]);
-    expect(warn).toHaveBeenCalledWith(`[settings] RUNNER_IMAGE_ALLOWED_PREFIXES is invalid (${error}); not seeded`);
+    expect(warn).toHaveBeenCalledWith(`[settings] RUNNER_IMAGE_ALLOWED_PREFIXES is invalid (${error}), so it was not seeded`);
     warn.mockRestore();
   });
 
   it("stores the normalized form of a valid list", () => {
-    settings.seedRunnerImageAllowedPrefixesFromEnv(" ghcr.io/acme/ , ghcr.io/b/ ");
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: " ghcr.io/acme/ , ghcr.io/b/ " });
     expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBe("ghcr.io/acme/,ghcr.io/b/");
   });
 
   it("stores nothing for a comma-only env value", () => {
-    settings.seedRunnerImageAllowedPrefixesFromEnv(",,");
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: ",," });
     expect(settings.getOrchestratorSettings().runnerImageAllowedPrefixes).toBeNull();
+  });
+});
+
+describe("seedSettingsFromEnv", () => {
+  it("stores the trimmed value of a variable with surrounding spaces", () => {
+    seeds.seedSettingsFromEnv({ KG_BASE_REPO: "  Org/base-repo  ", LINEAR_PICKUP_LABEL: " Pick me " });
+    expect(settings.getOrchestratorSettings().kgBaseRepo).toBe("Org/base-repo");
+    expect(settings.getOrchestratorSettings().linearPickupLabel).toBe("Pick me");
+  });
+
+  it("logs nothing for an invalid value once a row exists, since the variable no longer matters", () => {
+    settings.setOrchestratorSetting("runnerImageAllowedPrefixes", "ghcr.io/set/");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    seeds.seedSettingsFromEnv({ RUNNER_IMAGE_ALLOWED_PREFIXES: "ghcr.io" });
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("seeds every listed setting from one environment", () => {
+    seeds.seedSettingsFromEnv({
+      KG_BASE_REPO: "Org/base-repo",
+      KG_MATERIALIZE_DIRECT: "true",
+      KG_EXECUTION_MODE: "fly-machines",
+      LINEAR_PICKUP_LABEL: "Pick me",
+      RUNNER_IMAGE_ALLOWED_PREFIXES: "ghcr.io/acme/",
+    });
+    const rows = dedup.getDb().prepare("SELECT key, value FROM settings").all();
+    expect(rows).toEqual(expect.arrayContaining([
+      { key: "kg_base_repo", value: "Org/base-repo" },
+      { key: "kg_materialize_direct", value: "true" },
+      { key: "kg_execution_mode", value: "fly-machines" },
+      { key: "linear_pickup_label", value: "Pick me" },
+      { key: "runner_image_allowed_prefixes", value: "ghcr.io/acme/" },
+    ]));
   });
 });

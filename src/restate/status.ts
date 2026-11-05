@@ -39,6 +39,11 @@ export function getRestateStatus(): RestateStatus {
   };
 }
 
+/** Whether Restate can take a call now: the sidecar ready and this endpoint registered. Before that, a call can reach a deployment that lacks its handler and retry forever (AII-1281). */
+export function restateCanServe(status: RestateStatus = getRestateStatus()): boolean {
+  return status.sidecar.state === "ready" && status.registration.state === "registered";
+}
+
 /** Merges the supplied field(s) independently — a patch naming only one of `sidecar`/`registration` leaves the other untouched. */
 export function setRestateStatus(patch: Partial<RestateStatus>): void {
   if (patch.sidecar !== undefined) status = { ...status, sidecar: { ...patch.sidecar } };

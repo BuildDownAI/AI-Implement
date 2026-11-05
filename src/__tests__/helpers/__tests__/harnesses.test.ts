@@ -1,11 +1,11 @@
-import { beforeAll, beforeEach, describe, expect, it, onTestFailed, onTestFinished } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, onTestFailed, onTestFinished, vi } from "vitest";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type Database from "better-sqlite3";
 import { testDir, testTempRoot } from "../test-dir.js";
 import { testDb } from "../test-db.js";
-import { fakeFetch, hangUntilAborted } from "../fake-fetch.js";
+import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "../fake-fetch.js";
 import { putAppSecretsVersioned } from "../../../fly-machines.js";
 import { flySecretsUpdated } from "../replies/fly.js";
 import { githubError, githubFile } from "../replies/github.js";
@@ -358,6 +358,49 @@ describe("fakeFetch", () => {
       ]);
 
       expect(outcome).toBe("pending");
+    });
+  });
+
+  describe("stubAbortTimeout", () => {
+    it("aborts the signal right after the caller's synchronous code, with a TimeoutError", async () => {
+      stubAbortTimeout(5_000);
+      const signal = AbortSignal.timeout(5_000);
+
+      expect(signal.aborted).toBe(false);
+      await Promise.resolve();
+      expect(signal.aborted).toBe(true);
+      expect((signal.reason as Error).name).toBe("TimeoutError");
+    });
+
+    it("bounds a hangUntilAborted request without waiting for the real timeout", async () => {
+      stubAbortTimeout(60_000);
+      const api = fakeFetch({ "GET /slow": hangUntilAborted });
+
+      await expect(api.fetch(`${API}/slow`, { signal: AbortSignal.timeout(60_000) })).rejects.toMatchObject({ name: "TimeoutError" });
+    });
+
+    it("restored the real AbortSignal.timeout when the test before it finished", () => {
+      expect(vi.isMockFunction(AbortSignal.timeout)).toBe(false);
+    });
+
+    describe("a duration the test did not expect", () => {
+      let errors: string[] = [];
+
+      it.fails("fails the test even when the code under test swallows what it does", async () => {
+        onTestFailed(({ task }) => {
+          errors = (task.result?.errors ?? []).map((e) => e.message);
+        });
+        stubAbortTimeout(5_000);
+        try {
+          AbortSignal.timeout(10_000);
+        } catch {
+          // Code that catches around its fetch would hide an assertion thrown here.
+        }
+      });
+
+      it("failed it naming both durations", () => {
+        expect(errors).toEqual(["stubAbortTimeout: expected 5000 ms, the code asked for 10000 ms"]);
+      });
     });
   });
 

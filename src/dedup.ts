@@ -4,21 +4,39 @@ import { dirname } from "path";
 
 const FALLBACK_DB_PATH = "/tmp/ai-implement.sqlite";
 
-function resolveDbPath(): string {
+/** Where the database lives, and whether creating its directory failed so `/tmp` was used instead. */
+export interface DatabasePath {
+  path: string;
+  configured: string;
+  fellBack: boolean;
+}
+
+function resolveDbPath(): DatabasePath {
   const configured = process.env.DEDUP_DB_PATH || "/data/dedup.sqlite";
   try {
     mkdirSync(dirname(configured), { recursive: true });
-    return configured;
+    return { path: configured, configured, fellBack: false };
   } catch (err: any) {
     if (!["EACCES", "ENOENT", "EPERM", "EROFS"].includes(err.code)) throw err;
     console.warn(`[db] Cannot create ${dirname(configured)} (${err.code}), falling back to ${FALLBACK_DB_PATH}`);
-    return FALLBACK_DB_PATH;
+    return { path: FALLBACK_DB_PATH, configured, fellBack: true };
   }
 }
 
 const DB_PATH = resolveDbPath();
 
+export function getDatabasePath(): DatabasePath {
+  return { ...DB_PATH };
+}
+
 let db: Database.Database | null = null;
+let readOnly = false;
+
+/** Opens the database read-only from here on, with no migrations, and never creates it: for a command run beside the orchestrator. */
+export function useReadOnlyDb(): void {
+  if (db) throw new Error("useReadOnlyDb() must run before the database is opened");
+  readOnly = true;
+}
 
 function ensureDispatchedColumns(): void {
   if (!db) return;
@@ -322,8 +340,16 @@ function createAgentConfigurationTables(): void {
 }
 
 export function getDb(): Database.Database {
+  if (!db && readOnly) {
+    // A read-only open never creates the file, so a wrong path throws here instead of creating an empty database there.
+    try {
+      db = new Database(DB_PATH.path, { readonly: true });
+    } catch (err) {
+      throw new Error(`Cannot open the database at ${DB_PATH.path} read-only (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
   if (!db) {
-    db = new Database(DB_PATH);
+    db = new Database(DB_PATH.path);
     db.pragma("journal_mode = WAL");
     db.exec(`
       CREATE TABLE IF NOT EXISTS dispatched (

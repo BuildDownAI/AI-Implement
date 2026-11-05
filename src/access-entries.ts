@@ -210,13 +210,18 @@ export function matchAccessEntry(identity: MatchableIdentity, entries: AccessEnt
   return null;
 }
 
+/** Whether the list names an admin, which only an address entry can be. */
+export function hasAdminAddress(entries: readonly AccessEntry[]): boolean {
+  return entries.some((e) => e.kind === "address" && e.role === "admin");
+}
+
 /** The list in force admits people but nobody as admin: sign-in works, administering it does not. */
 export function allowlistHasNoAdmin(): boolean {
   const list = getEffectiveAllowlist();
   if (!list) return false;
   // Checked, not assumed: only the env seed reaches this while the last-admin guard holds, which is
   // why callers name OAUTH_ALLOWED_EMAILS — reword them if a stored list ever can.
-  return list.entries.length > 0 && !list.entries.some((e) => e.kind === "address" && e.role === "admin");
+  return list.entries.length > 0 && !hasAdminAddress(list.entries);
 }
 
 /** The list in force. Null only when no list has ever loaded — callers must deny. */
@@ -247,7 +252,7 @@ export function refreshEffectiveAllowlist(): void {
 }
 
 /** The env values, which apply until the first save hands authority to the stored list. */
-function allowlistFromEnv(env: NodeJS.ProcessEnv): AccessEntry[] {
+export function allowlistFromEnv(env: NodeJS.ProcessEnv): AccessEntry[] {
   const split = (raw: string | undefined) =>
     (raw || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   // addedAt 0: env entries are synthesized per read and carry no provenance.
@@ -374,7 +379,7 @@ export function saveAccessEntries(
       throw new Error("this change would remove your own access");
     }
     // An empty list is not adminless — it hands authority back to the environment.
-    if (after.length > 0 && !after.some((e) => e.kind === "address" && e.role === "admin")) {
+    if (after.length > 0 && !hasAdminAddress(after)) {
       throw new Error("this change would leave nobody able to administer this orchestrator");
     }
 

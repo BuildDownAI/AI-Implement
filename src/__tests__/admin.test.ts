@@ -8,6 +8,7 @@ import { createModelSessionKeyProvider } from "../model-session-keys.js";
 import { createModelSessionStore } from "../model-session-store.js";
 import type * as AdminModule from "../admin.js";
 import type { SelfDeployClient } from "../restate/self-deploy.js";
+import type { SetupCheckRun } from "../setup-checks/index.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { AIImplementSnapshot } from "../providers/types.js";
@@ -5720,6 +5721,57 @@ describe("per-page grants", () => {
       accessGrants.savePageGrants(["issues"], "ada@eudoxus.ai");
       const res = await request("/api/access-grants", "GET", "secret", undefined, userSession());
       expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe("the setup-check routes (AII-1538)", () => {
+    const RUN: SetupCheckRun = {
+      checkedAt: 7,
+      results: [{ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" }],
+    };
+    const ok = <T>(value: T) => vi.fn(async () => ({ status: "ok" as const, value }));
+
+    it("answers an admin the stored run with every field, and null before the first run", async () => {
+      expect(JSON.parse((await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(RUN) })).body)).toEqual(RUN);
+      const before = await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(null) });
+      expect(before.statusCode).toBe(200);
+      expect(JSON.parse(before.body)).toBeNull();
+    });
+
+    it("starts one run for an admin and answers it", async () => {
+      const run = ok(RUN);
+      const res = await requestWithDeps("/api/setup-checks/run", "POST", adminSsoSession(), { runSetupChecks: run });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(RUN);
+      expect(run).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses both routes to a user with no grant, and never calls the object", async () => {
+      const read = ok(RUN);
+      const run = ok(RUN);
+      expect((await requestWithDeps("/api/setup-checks", "GET", userSession(), { readSetupChecks: read })).statusCode).toBe(403);
+      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { runSetupChecks: run })).statusCode).toBe(403);
+      expect(read).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    });
+
+    it("refuses a run to a user granted every page, since a grant reaches only a page's GET routes", async () => {
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      const run = ok(RUN);
+      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { runSetupChecks: run })).statusCode).toBe(403);
+      expect(run).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["GET", "/api/setup-checks", "readSetupChecks"],
+      ["POST", "/api/setup-checks/run", "runSetupChecks"],
+    ] as const)("%s %s answers 503 restate-unavailable when Restate could not take the call, or nothing is wired", async (method, url, dep) => {
+      const refused = vi.fn(async () => ({ status: "unavailable" as const }));
+      const res = await requestWithDeps(url, method, adminSsoSession(), { [dep]: refused });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+      const unwired = await requestWithDeps(url, method, adminSsoSession(), {});
+      expect(unwired.statusCode).toBe(503);
     });
   });
 

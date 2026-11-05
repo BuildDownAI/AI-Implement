@@ -104,6 +104,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | KG sidecar, its OAuth flow, and the image build | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
 | MCP door, identity contract, tools service, entry points, roles | `src/restate/tools.ts`, `src/mcp.ts`, `src/mcp-oauth.ts`, `src/mcp-identity.ts` | [docs/mcp-server.md](docs/mcp-server.md), [ADR 025](docs/adr/025-mcp-tools-are-restate-handlers-and-the-operator-object-is-the-refresh-authority.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
+| Orchestrator configuration (what boot checks, which source wins) and the setup checks | `loadConfig` in `src/index.ts`, `src/setup-checks/`, `src/check-setup.ts`, `src/restate/setup-checks.ts` | [docs/orchestrator-configuration.md](docs/orchestrator-configuration.md), [docs/setup-checks.md](docs/setup-checks.md), [ADR 047](docs/adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | [docs/ticketing-providers.md](docs/ticketing-providers.md) |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
 | Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | [docs/fly-machine-lifecycle.md](docs/fly-machine-lifecycle.md), [docs/execution-backends.md](docs/execution-backends.md) |
@@ -129,13 +130,16 @@ cp .env.example .env   # GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY are the only req
 npm install
 npm run dev            # checks the Node major, loads .env when present, runs src/index.ts via tsx
 npm run dev:local      # rebuilds the local runner image, then runs dispatches in local Docker
+npm run check-setup    # runs the setup checks read-only against .env and the local database
 ```
 
 Only the GitHub App pair is hard-required — `loadConfig` throws without it. Ticketing credentials are not: an absent Linear or Jira configuration logs a warning and skips that provider's mappings, so the orchestrator still boots and serves.
 
 `npm run dev` also spawns the Restate sidecar (`RestateSidecar`, `src/restate/server.ts`) from `node_modules`, with its data under `./restate` — non-fatally, same as the KG sidecar (ADR 023, [docs/restate.md](docs/restate.md)).
 
-Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`).
+Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`; the code older `.env.example` files shipped, `your-secret-access-code`, is refused at boot).
+
+`npm run check-setup` runs the setup checks without the server: it reads the environment and the database read-only, takes Restate's status from a running orchestrator's `GET /`, and exits 1 when a core check fails. On Fly, run `fly ssh console -a <app> -C "node /app/dist/check-setup.js"`. **Full reference: [docs/setup-checks.md](docs/setup-checks.md).**
 
 Node is pinned to 24 (`engines`, `.tool-versions`). On a Node-major switch, `npm test` fails wholesale inside `getDb()` with a `NODE_MODULE_VERSION` mismatch — check which Node you are on before reaching for `npm rebuild better-sqlite3`, since the native modules are usually right and the shell is wrong.
 
@@ -202,7 +206,7 @@ Schema changes run at boot and a trigger can block a column change — read [doc
 
 ## Environment variables
 
-**`.env.example` is canonical** — it carries every orchestrator variable with grouped comments, and is kept in lockstep with the code. Consult it rather than a second list here.
+**`.env.example` is canonical** — it carries every orchestrator variable with grouped comments, and is kept in lockstep with the code. Consult it rather than a second list here. What boot checks, where a value can live besides the environment, which source wins, and how numeric values parse: **Full reference: [docs/orchestrator-configuration.md](docs/orchestrator-configuration.md).**
 
 Only the non-obvious ones are worth restating:
 

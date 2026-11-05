@@ -106,7 +106,8 @@ interface RunCall {
 function fakeContext(handlerName: string, runCalls: RunCall[] = []): restate.Context {
   return {
     request: () => ({ target: { handler: handlerName } }),
-    objectClient: () => ({ current: async () => ({ prices: [] }) }),
+    // get_tenant_health reads the stored setup-check run, and none has run yet; every other object client is ModelPrices.
+    objectClient: (definition: { name: string }) => (definition.name === "SetupChecks" ? { get: async () => null } : { current: async () => ({ prices: [] }) }),
     run: async (name: unknown, action?: unknown, options?: unknown) => {
       // ctx.run(action) and ctx.run(name, action) are unused by any write handler here, but
       // the fake still handles the two-arg form defensively rather than assuming three.
@@ -1084,6 +1085,43 @@ describe("get_tenant_health restate health field (AII-807)", () => {
     const parsed = JSON.parse(result.content[0].text) as { restateRetentionDays: unknown; volumeSnapshotRetentionDays: unknown };
     expect(typeof parsed.restateRetentionDays).toBe("number");
     expect(typeof parsed.volumeSnapshotRetentionDays).toBe("number");
+  });
+
+  it("shows setupChecks as null before the first setup-check run", async () => {
+    vi.mocked(getMappings).mockReturnValue({});
+    const result = await getTenantHealth(fakeContext("get_tenant_health"), { caller: system, args: {} });
+    expect(JSON.parse(result.content[0].text).setupChecks).toBeNull();
+  });
+
+  it("shows the stored setup-check run's summary, read from SetupChecks/orchestrator", async () => {
+    vi.mocked(getMappings).mockReturnValue({});
+    const stored = {
+      checkedAt: 1234,
+      results: [
+        { id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" },
+        { id: "tracker.linear.team-access", title: "Linear team access", group: "tracker", tier: "core", onAdminPath: false, project: "ENG", state: "pass", detail: "The app can see team ENG" },
+      ],
+    };
+    const reads: Array<[string, string]> = [];
+    const ctx = {
+      ...fakeContext("get_tenant_health"),
+      objectClient: (definition: { name: string }, key: string) => {
+        reads.push([definition.name, key]);
+        return { get: async () => stored };
+      },
+    } as unknown as restate.Context;
+
+    const result = await getTenantHealth(ctx, { caller: system, args: {} });
+
+    expect(reads).toEqual([["SetupChecks", "orchestrator"]]);
+    expect(JSON.parse(result.content[0].text).setupChecks).toStrictEqual({
+      checkedAt: 1234,
+      failingCore: 1,
+      rows: [
+        { id: "restate", title: "Restate engine", state: "fail" },
+        { id: "tracker.linear.team-access", title: "Linear team access", state: "pass", project: "ENG" },
+      ],
+    });
   });
 
   it("reflects a ready sidecar with a declined-conflict registration", async () => {

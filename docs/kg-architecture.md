@@ -630,7 +630,7 @@ figure above remains the committed setting, but the direct path is what would le
 fix be reverted instead of the memory bump.
 
 **The flag is a seed-once setting (AII-602, AII-1109).** `KG_MATERIALIZE_DIRECT` is read only at
-boot by `seedKgMaterializeDirectFromEnv()` (`src/runner-mode.ts`), which writes the `settings` row
+boot by `seedSettingsFromEnv()`, from its `SEED_ONCE_SETTINGS` entry (`src/seed-once-settings.ts`), which writes the `settings` row
 when none exists and is inert afterward. `getKgMaterializeDirect()` / `setKgMaterializeDirect()`
 resolve the stored row, else `false` (rdflib); the env var is never consulted at runtime. `materializeDirectEnabled()` in `src/kg-refresh.ts`
 reads the resolved setting rather than `process.env` directly. The Knowledge Graph Pipelines page

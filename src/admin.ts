@@ -132,6 +132,8 @@ import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 import type { callTool } from "./restate/tools-client.js";
 import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
 import type { RestateStatus } from "./restate/status.js";
+import type { SetupChecksIngressResult } from "./restate/setup-checks.js";
+import type { SetupCheckRun } from "./setup-checks/index.js";
 import type { Caller } from "./mcp-identity.js";
 import { controlPlaneTokenActive, verifyControlPlaneToken } from "./control-plane-token.js";
 import picomatch from "picomatch";
@@ -595,6 +597,10 @@ export interface AdminDeps {
    * unknown: profile statuses read `unknown` and opting a project in is refused with 501.
    */
   agentConfig?: AgentConfigAdminDeps;
+  /** Reads the stored setup-check run from the `SetupChecks` object (AII-1538). Injected for the same reason as `getRestateStatus`; absent in tests that don't exercise the route, where it answers 503. */
+  readSetupChecks?: () => Promise<SetupChecksIngressResult<SetupCheckRun | null>>;
+  /** Runs the setup checks through `SetupChecks.run` and answers the new run. Same injection as `readSetupChecks`. */
+  runSetupChecks?: () => Promise<SetupChecksIngressResult<SetupCheckRun>>;
 }
 
 export interface AgentConfigAdminDeps {
@@ -1319,6 +1325,16 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/setup-checks" && method === "GET") {
+      answerSetupChecks(res, deps.readSetupChecks);
+      return true;
+    }
+
+    if (url === "/api/setup-checks/run" && method === "POST") {
+      answerSetupChecks(res, deps.runSetupChecks);
+      return true;
+    }
+
     if (url === "/api/sessions" && method === "GET") {
       handleListSessions(req, res, config, registry);
       return true;
@@ -1494,6 +1510,13 @@ export function handleAdminRequest(
   }
 
   return false;
+}
+
+/** Answers a `SetupChecks` call, or 503 `restate-unavailable` when it is not wired or Restate could not take it (AII-1538). */
+async function answerSetupChecks<T>(res: http.ServerResponse, call: (() => Promise<SetupChecksIngressResult<T>>) | undefined): Promise<void> {
+  const result = call ? await call() : { status: "unavailable" as const };
+  if (result.status === "ok") json(res, 200, result.value);
+  else json(res, 503, { error: "restate-unavailable" });
 }
 
 async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
