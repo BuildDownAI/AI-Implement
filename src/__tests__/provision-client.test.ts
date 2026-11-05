@@ -39,8 +39,8 @@ async function fixture(options: { existing?: boolean; retained?: string[]; answe
       if (args[0] === "volumes" && args[1] === "list") stdout = JSON.stringify(options.apps ? [{ name: "dedup_data", region: "lhr" }] : []);
       if (args[0] === "secrets" && args[1] === "list") stdout = JSON.stringify(retained.map(name => ({ name })));
       if (args[0] === "tokens") stdout = args.includes("8760h") ? "deploy-token-sentinel\n" : "sessions-token-sentinel\n";
-      if (tool === "gh") stdout = args[0] === "auth" ? "github-build-token-sentinel\n" : "fork-owner/fork-repo\n";
-      if (tool === "git") stdout = args.includes("--abbrev-ref") ? "feature\n" : "0123456789abcdef\n";
+      if (tool === "gh") stdout = args[0] === "auth" ? "github-build-token-sentinel\n" : "upstream-owner/upstream-repo\n";
+      if (tool === "git") stdout = args[0] === "remote" ? "git@github.com:fork-owner/fork-repo.git\n" : args.includes("--abbrev-ref") ? "feature\n" : "0123456789abcdef\n";
       if (args[0] === "machines") stdout = '[{"state":"started"}]';
       if (args[0] === "ssh") stdout = "All setup checks pass\n";
       return { code: 0, stdout, stderr: "" };
@@ -91,6 +91,25 @@ describe("provision-client", () => {
     expect(f.calls.filter(c => c.args[1] === "import")).toEqual([]);
     expect(f.output()).toContain("/admin#settings");
     expect(f.output()).toContain("cannot be verified locally");
+  });
+
+  it.each(["google", "microsoft"])("retains a complete BuildDown provider when configuring %s on a rerun", async provider => {
+    const retained = ["BUILDDOWN_OIDC_ISSUER", "BUILDDOWN_OIDC_CLIENT_ID", "BUILDDOWN_OIDC_CLIENT_SECRET"];
+    const f = await fixture({ existing: true, apps: true, retained, answers: { "Sign-in": provider } });
+    expect(await runProvisionClient(["client"], f.deps)).toBe(0);
+    expect(f.writes).toEqual([]);
+    for (const key of retained) expect(f.imported()).not.toHaveProperty(key);
+    expect(f.imported()).toHaveProperty(`${provider.toUpperCase()}_OAUTH_CLIENT_ID`);
+    expect(f.output()).toContain("cannot be verified locally");
+    expect(f.output()).not.toContain("admin.providers: warn");
+  });
+
+  it("still rejects an incomplete retained BuildDown provider", async () => {
+    const f = await fixture({ existing: true, apps: true, retained: ["BUILDDOWN_OIDC_ISSUER", "BUILDDOWN_OIDC_CLIENT_ID"] });
+    expect(await runProvisionClient(["client"], f.deps)).toBe(1);
+    expect(f.output()).toContain("BUILDDOWN_OIDC_CLIENT_SECRET not set");
+    expect(f.calls.every(c => c.args.includes("list"))).toBe(true);
+    expect(f.writes).toEqual([]);
   });
 
   it("mints a rerun token for the explicitly selected active sessions app, without creating the local seed app", async () => {
@@ -231,7 +250,35 @@ describe("provision-client", () => {
     expect(deploy.args).toEqual(expect.arrayContaining(["--remote-only", "--no-cache", "--build-secret", "kg_token=", "KG_SOURCE_REPO=", "SOURCE_REPO=fork-owner/fork-repo", "SOURCE_COMMIT=0123456789abcdef", "SOURCE_BRANCH=feature", "--app", "ai-implement-client", "--primary-region", "iad"]));
     expect(f.calls.some(c => c.args.includes("node /app/dist/check-setup.js"))).toBe(true);
     expect(f.output()).toContain("All setup checks pass");
+    expect(f.calls).toContainEqual({ tool: "git", args: ["remote", "get-url", "origin"], stdin: undefined });
+    expect(f.calls.some(c => c.tool === "gh" && c.args[0] === "repo")).toBe(false);
     expect(f.prompts.filter(p => /^(Deploy|Wait|Run)/.test(p.label))).toHaveLength(3);
+  });
+
+  it.each(["https://github.com/fork-owner/fork-repo.git", "ssh://git@github.com/fork-owner/fork-repo.git"])("uses checkout origin %s despite a different gh default", async origin => {
+    const f = await fixture({ answers: { Deploy: "yes" } });
+    const command = f.deps.command;
+    f.deps.command = async (tool, args, stdin) => {
+      const result = await command(tool, args, stdin);
+      return tool === "git" && args[0] === "remote" ? { ...result, stdout: origin + "\n" } : result;
+    };
+    expect(await runProvisionClient(["client"], f.deps)).toBe(0);
+    expect(f.calls.find(c => c.args[0] === "deploy")?.args).toContain("SOURCE_REPO=fork-owner/fork-repo");
+    expect(f.calls.some(c => c.tool === "gh" && c.args[0] === "repo")).toBe(false);
+  });
+
+  it.each(["", "https://example.com/owner/repo.git", "https://github.com/owner/repo.git?unexpected"])("defers deployment when origin cannot identify a GitHub repository: %j", async origin => {
+    const f = await fixture({ answers: { Deploy: "yes" } });
+    const command = f.deps.command;
+    f.deps.command = async (tool, args, stdin) => {
+      const result = await command(tool, args, stdin);
+      return tool === "git" && args[0] === "remote" ? { ...result, stdout: origin } : result;
+    };
+    expect(await runProvisionClient(["client"], f.deps)).toBe(0);
+    expect(f.calls.some(c => c.args[0] === "deploy")).toBe(false);
+    expect(f.output()).toContain("Cannot identify a GitHub repository");
+    expect(f.output()).toContain("SOURCE_REPO='<owner/repo-from-origin>'");
+    expect(f.output()).not.toContain("gh repo view");
   });
 
   it("prints exact deferred commands for declined operations", async () => {
@@ -239,6 +286,7 @@ describe("provision-client", () => {
     expect(await runProvisionClient(["client"], f.deps)).toBe(0);
     expect(f.calls.some(c => c.args[0] === "deploy" || c.args[0] === "ssh")).toBe(false);
     expect(f.output()).toContain("flyctl deploy --remote-only --no-cache");
+    expect(f.output()).toContain("SOURCE_REPO=fork-owner/fork-repo");
     expect(f.output()).toContain("curl --fail https://ai-implement-client.fly.dev/");
     expect(f.output()).toContain('flyctl ssh console --app ai-implement-client -C "node /app/dist/check-setup.js"');
   });
@@ -248,6 +296,7 @@ describe("provision-client", () => {
     expect(await runProvisionClient(["client"], f.deps)).toBe(0);
     const build = f.calls.find(c => c.tool === "docker" && c.args[0] === "buildx")!;
     expect(build.args).toEqual(expect.arrayContaining(["id=kg_token,src=/dev/stdin", "KG_SOURCE_REPO=owner/graph", "SOURCE_REPO=fork-owner/fork-repo"]));
+    expect(build.args.slice(2, 4)).toEqual(["--platform", "linux/amd64"]);
     expect(build.stdin).toBe("github-build-token-sentinel");
     expect(f.calls.some(c => c.tool === "docker" && c.args[0] === "push")).toBe(true);
     expect(f.calls.find(c => c.args[0] === "deploy")?.args).toContain("--image");
@@ -262,6 +311,8 @@ describe("provision-client", () => {
       : command(tool, args, stdin);
     expect(await runProvisionClient(["client"], f.deps)).toBe(0);
     expect(f.calls.some(c => c.args[0] === "deploy" || c.args[0] === "push")).toBe(false);
+    expect(f.output()).toContain("docker buildx build --platform linux/amd64 --load");
+    expect(f.output()).toContain("SOURCE_REPO=fork-owner/fork-repo");
     expect(f.output()).toContain("--secret id=kg_token,env=GH_TOKEN");
     expect(f.output()).toContain('export GH_TOKEN="$(gh auth token)"');
     expect(f.output() + f.errors()).not.toContain("github-build-token-sentinel");

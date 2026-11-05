@@ -29,7 +29,11 @@ export async function provisionPreflight(env: Record<string, string>, retained: 
   // is determinable locally. Passing results involving retained values remain unverified.
   const known = { ...env };
   for (const key of Object.keys(known)) if (/^(GOOGLE|MICROSOFT)_OAUTH_/.test(key)) known[key] = known[key]!.trim();
-  for (const key of retained) known[key] = key === "OAUTH_ALLOWED_EMAILS" ? "retained@example.com" : "retained";
+  const retainedWitnesses: Record<string, string> = {
+    OAUTH_ALLOWED_EMAILS: "retained@example.com",
+    BUILDDOWN_OIDC_ISSUER: "https://retained.example.com",
+  };
+  for (const key of retained) known[key] = retainedWitnesses[key] ?? "retained";
   const context = createSetupCheckContext({ env: known, restateStatus: () => ({ sidecar: { state: "unknown" }, registration: { state: "unknown" } }), effectiveAllowlist: () => ({ entries: allowlistFromEnv(known), source: "env" }) });
   const rows = [];
   for (const check of PROVISION_ENV_CHECKS) {
@@ -45,6 +49,21 @@ export async function provisionPreflight(env: Record<string, string>, retained: 
 
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 const repoPattern = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+/** Read only the checkout's origin, independent of gh's default repository and GH_REPO. */
+function repoFromOrigin(remote: string): string | null {
+  const scp = remote.match(/^git@github\.com:([^\s]+)$/);
+  let path = scp?.[1];
+  if (!path) {
+    try {
+      const url = new URL(remote);
+      if (url.hostname !== "github.com" || !["https:", "ssh:", "git+ssh:"].includes(url.protocol) || url.search || url.hash) return null;
+      path = url.pathname.slice(1);
+    } catch { return null; }
+  }
+  const repo = path.replace(/\.git$/, "");
+  return repoPattern.test(repo) ? repo : null;
+}
 
 export async function runProvisionClient(args: string[], d: ProvisionDependencies): Promise<number> {
   const out = (s: string) => d.writeStdout(s + "\n");
@@ -64,16 +83,17 @@ export async function runProvisionClient(args: string[], d: ProvisionDependencie
     return value;
   };
   const prepareDeploy = async (app: string, region: string, kg: string) => {
-    const source = await command("gh", ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]);
+    const source = await command("git", ["remote", "get-url", "origin"]);
     const commit = await command("git", ["rev-parse", "HEAD"]);
     const branch = await command("git", ["rev-parse", "--abbrev-ref", "HEAD"]);
-    const sourceRepo = source.code === 0 && repoPattern.test(source.stdout.trim()) ? source.stdout.trim() : "$(gh repo view --json nameWithOwner --jq .nameWithOwner)";
-    const stamps = `--build-arg SOURCE_COMMIT=${commit.code === 0 ? quote(commit.stdout.trim()) : '"$(git rev-parse HEAD)"'} --build-arg SOURCE_REPO=${sourceRepo} --build-arg SOURCE_BRANCH=${branch.code === 0 ? quote(branch.stdout.trim()) : '"$(git rev-parse --abbrev-ref HEAD)"'}`;
+    const sourceRepo = source.code === 0 ? repoFromOrigin(source.stdout.trim()) : null;
+    if (!sourceRepo) out("Cannot identify a GitHub repository from git remote get-url origin. Replace <owner/repo-from-origin> in the deferred command with this checkout's repository before deploying.");
+    const stamps = `--build-arg SOURCE_COMMIT=${commit.code === 0 ? quote(commit.stdout.trim()) : '"$(git rev-parse HEAD)"'} --build-arg SOURCE_REPO=${sourceRepo ?? quote("<owner/repo-from-origin>")} --build-arg SOURCE_BRANCH=${branch.code === 0 ? quote(branch.stdout.trim()) : '"$(git rev-parse --abbrev-ref HEAD)"'}`;
     const imageTag = `registry.fly.io/${app}:provision-${commit.code === 0 ? commit.stdout.trim().slice(0, 12) : "manual"}`;
     const deploy = kg
       ? `export GH_TOKEN="$(gh auth token)"
 flyctl auth docker
-docker buildx build --load --no-cache --secret id=kg_token,env=GH_TOKEN --build-arg KG_SOURCE_REPO=${quote(kg)} ${stamps} --tag ${imageTag} .
+docker buildx build --platform linux/amd64 --load --no-cache --secret id=kg_token,env=GH_TOKEN --build-arg KG_SOURCE_REPO=${quote(kg)} ${stamps} --tag ${imageTag} .
 docker push ${imageTag}
 flyctl deploy --image ${imageTag} --primary-region ${region} --ha=false --app ${app}
 unset GH_TOKEN`
@@ -237,7 +257,7 @@ unset GH_TOKEN`
     out("Deploy builds this checkout with source stamps and the selected knowledge graph.");
     const deployAccepted = await yes("Deploy now?");
     // flyctl v0.5.4 only supports literal NAME=VALUE build secrets. Never leak a token in argv.
-    if (deployAccepted && source.code === 0 && commit.code === 0 && branch.code === 0) {
+    if (deployAccepted && sourceRepo && source.code === 0 && commit.code === 0 && branch.code === 0) {
       // No KG is cloned, so no GitHub build credential is needed or passed.
       const auth = await command("flyctl", ["auth", "whoami"]);
       const args = ["deploy", "--remote-only", "--no-cache", "--build-secret", "kg_token=", "--build-arg", "KG_SOURCE_REPO=", "--build-arg", `SOURCE_COMMIT=${commit.stdout.trim()}`, "--build-arg", `SOURCE_REPO=${sourceRepo}`, "--build-arg", `SOURCE_BRANCH=${branch.stdout.trim()}`, "--primary-region", region, "--ha=false", "--app", app];
@@ -247,7 +267,7 @@ unset GH_TOKEN`
         const token = await command("gh", ["auth", "token"]);
         const image = `registry.fly.io/${app}:provision-${commit.stdout.trim().slice(0, 12)}`;
         result = token.code || !token.stdout.trim() ? { code: 1, stdout: "", stderr: "" } : await command("flyctl", ["auth", "docker"]);
-        if (!result.code) result = await command("docker", ["buildx", "build", "--load", "--no-cache", "--secret", "id=kg_token,src=/dev/stdin", "--build-arg", `KG_SOURCE_REPO=${kg}`, "--build-arg", `SOURCE_COMMIT=${commit.stdout.trim()}`, "--build-arg", `SOURCE_REPO=${sourceRepo}`, "--build-arg", `SOURCE_BRANCH=${branch.stdout.trim()}`, "--tag", image, "."], token.stdout.trim());
+        if (!result.code) result = await command("docker", ["buildx", "build", "--platform", "linux/amd64", "--load", "--no-cache", "--secret", "id=kg_token,src=/dev/stdin", "--build-arg", `KG_SOURCE_REPO=${kg}`, "--build-arg", `SOURCE_COMMIT=${commit.stdout.trim()}`, "--build-arg", `SOURCE_REPO=${sourceRepo}`, "--build-arg", `SOURCE_BRANCH=${branch.stdout.trim()}`, "--tag", image, "."], token.stdout.trim());
         if (!result.code) result = await command("docker", ["push", image]);
         if (!result.code) result = await command("flyctl", [...args, "--image", image]);
       } else if (auth.code === 0) result = await command("flyctl", args);
