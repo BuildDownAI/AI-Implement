@@ -1,6 +1,6 @@
 # Setup checks
 
-The setup checks read an orchestrator's setup and report each fault before an issue is spent on it, each with the fix that clears it. A check only reads: [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md) records why, and what each audience may see. This page covers the command that runs them without the server, how to read what it prints, and every check, by group.
+The setup checks read an orchestrator's setup and report each fault before an issue is spent on it, each with the fix that clears it. A check only reads: [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md) records why, and what each audience may see. This page covers the command that runs them without the server, how to read what it prints, where a running orchestrator shows them, and every check, by group.
 
 ## Running the command
 
@@ -49,6 +49,18 @@ Each check has a tier: `core` applies to every deployment, `mode` to one executi
 | 2 | An unknown argument; nothing ran |
 
 A warning, a check that cannot verify, and a failing `mode` or `feature` check are reported without changing the exit code, so a script stops on a broken setup alone.
+
+## In a running orchestrator
+
+Inside the server, the checks run in the `SetupChecks` Restate object (`src/restate/setup-checks.ts`), which keeps the last run. Nothing starts a run on its own yet: an admin starts one, and each surface below shows the stored run, or nothing before the first.
+
+| Where | Who | Shows |
+|---|---|---|
+| `POST /api/setup-checks/run` | admins | starts a run, waits up to 60 seconds for it, and answers it with every field |
+| `GET /api/setup-checks` | admins, and a user granted a page that lists the route (none does yet) | the stored run with every field, or `null` before the first run |
+| `get_tenant_health`, field `setupChecks` | every allowlisted identity | each row's `id`, `title`, `state` and `project`, the count of failing core rows (`failingCore`) and `checkedAt`; `null` before the first run |
+
+Why each audience sees what it sees is [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md)'s second decision. Both routes answer 503 `restate-unavailable` while Restate cannot take the call (the sidecar not ready, or the endpoint not registered) or does not answer. `failingCore` counts rows, as the command's last line does, so a check that fails for two projects counts twice. A run's detail and fix are kept in the object's state and journal, which only admins can read, through the Restate UI. Neither carries a secret's value.
 
 ## The checks, by group
 

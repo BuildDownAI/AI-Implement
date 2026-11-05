@@ -50,11 +50,10 @@ vi.mock("../log.js", async (importOriginal) => ({
 vi.mock("../repo-image.js", () => ({ resolveRunnerImageForDispatch: vi.fn(async () => "runner:test") }));
 const resolvedPath = { current: "github-actions" };
 vi.mock("../runner-mode.js", async (importOriginal) => ({
-  resolveKgBackend: (await importOriginal<typeof import("../runner-mode.js")>()).resolveKgBackend,
+  ...(await importOriginal<typeof import("../runner-mode.js")>()),
   getKgExecutionMode: (flyConfigured = false) =>
     kgSetting.current ?? { mode: flyConfigured ? "fly-machines" : "github-actions", source: "default" },
-  getRunnerMode: () => ({ mode: runnerMode.current }),
-  getKgMaterializeDirect: () => ({ enabled: false }),
+  getRunnerMode: () => ({ mode: runnerMode.current, source: runnerMode.current === "default" ? "default" : "db" }),
 }));
 const runnerMode = { current: "default" };
 const kgSetting: { current: { mode: "github-actions" | "fly-machines"; source: "db" | "env" | "default" } | null } = { current: null };

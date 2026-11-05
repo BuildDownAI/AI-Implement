@@ -3,7 +3,7 @@ import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { SetupCheck, SetupCheckContext, SetupCheckResult } from "../../setup-checks/index.js";
 import { makeAccessEntry, makeMapping, makeProvider } from "../helpers/builders.js";
-import { makeLinearSetupFacts, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
+import { makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
 
 let dedup: typeof DedupModule;
@@ -164,31 +164,7 @@ describe("SETUP_CHECKS", () => {
   });
 
   it("never shows a secret's value in any field", async () => {
-    const secrets = {
-      GITHUB_APP_PRIVATE_KEY: "sentinel-app-key",
-      ADMIN_ACCESS_CODE: "sentinel-access-code",
-      RUNNER_TOKEN_SECRET: "sentinel-token-secret",
-      FLY_SESSIONS_TOKEN: "sentinel-fly-sessions-token",
-      GOOGLE_OAUTH_CLIENT_SECRET: "sentinel-google-secret",
-      MICROSOFT_OAUTH_CLIENT_SECRET: "sentinel-microsoft-secret",
-      BUILDDOWN_OIDC_CLIENT_SECRET: "sentinel-builddown-secret",
-    };
-    const ctx = makeSetupCheckContext({
-      env: {
-        ...secrets,
-        GITHUB_APP_ID: "123456",
-        RUNNER_CALLBACK_BASE_URL: "https://orchestrator.example.com",
-        GOOGLE_OAUTH_CLIENT_ID: "gid",
-        MICROSOFT_OAUTH_CLIENT_ID: "mid",
-        MICROSOFT_OAUTH_TENANT: "tenant-id",
-        BUILDDOWN_OIDC_ISSUER: "https://cp.example.com",
-        BUILDDOWN_OIDC_CLIENT_ID: "bid",
-        OAUTH_REDIRECT_BASE_URL: "https://orchestrator.example.com",
-      },
-      mappings: () => ({ ENG: makeMapping({ executionMode: "fly-machines" }) }),
-      flySessions: () => ({ token: secrets.FLY_SESSIONS_TOKEN, app: null, region: null, source: { app: null, region: null } }),
-    });
-    const results = await resultsFor(ctx);
+    const results = await resultsFor(makeSentinelSetupCheckContext());
     expect(results.length).toBe(checks.SETUP_CHECKS.length);
     expect(JSON.stringify(results)).not.toContain("sentinel-");
   });
@@ -300,5 +276,47 @@ describe("createSetupCheckContext", () => {
     // @ts-expect-error The reader depends on where the caller runs, so it has no default.
     const ctx = checks.createSetupCheckContext({});
     expect(ctx.restateStatus).toBeUndefined();
+  });
+});
+
+describe("the summary every allowlisted identity sees", () => {
+  const row = (overrides: Partial<SetupCheckResult>): SetupCheckResult => ({
+    id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "pass", ...overrides,
+  });
+
+  it("counts only the core rows in state fail", () => {
+    const run = {
+      checkedAt: 1,
+      results: [
+        row({ state: "fail" }),
+        row({ id: "tracker.linear.team-access", project: "ENG", state: "fail" }),
+        row({ id: "runner.fly-sessions", tier: "mode", state: "fail" }),
+        row({ id: "admin.redirect-url", state: "warn" }),
+        row({ id: "env.github-app", state: "cannot-verify" }),
+      ],
+    };
+    expect(checks.countFailingCore(run)).toBe(2);
+  });
+
+  it("is null before the first run", () => {
+    expect(checks.summarizeSetupChecks(null)).toBeNull();
+  });
+
+  it("keeps each row's id, title, state and project, and drops every other field", () => {
+    const run = {
+      checkedAt: 99,
+      results: [
+        row({ state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines", fixUrl: "/admin#settings" }),
+        row({ id: "tracker.linear.team-access", title: "Linear team access", group: "tracker", onAdminPath: false, project: "ENG", detail: "The app can see team ENG" }),
+      ],
+    };
+    expect(checks.summarizeSetupChecks(run)).toStrictEqual({
+      checkedAt: 99,
+      failingCore: 1,
+      rows: [
+        { id: "restate", title: "Restate engine", state: "fail" },
+        { id: "tracker.linear.team-access", title: "Linear team access", state: "pass", project: "ENG" },
+      ],
+    });
   });
 });

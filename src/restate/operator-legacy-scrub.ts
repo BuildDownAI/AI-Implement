@@ -20,7 +20,7 @@
 import { getDb } from "../dedup.js";
 import { purgeInvocation, runIntrospectionQuery } from "./endpoint.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "./server.js";
-import { getRestateStatus } from "./status.js";
+import { restateCanServe } from "./status.js";
 
 const SCRUB_KEY = "operator_legacy_scrub_completed_at";
 const CALL_TIMEOUT_MS = 10_000;
@@ -74,12 +74,7 @@ function hasLegacyToken(valueUtf8: unknown): boolean {
 }
 
 export async function scrubOperatorLegacyTokens(deps: OperatorLegacyScrubDeps = {}): Promise<OperatorLegacyScrubResult> {
-  const restateReady =
-    deps.restateReady ??
-    (() => {
-      const restate = getRestateStatus();
-      return restate.sidecar.state === "ready" && restate.registration.state === "registered";
-    });
+  const restateReady = deps.restateReady ?? restateCanServe;
   if (!restateReady()) {
     console.log("[restate] Operator legacy-token scrub skipped: Restate is not ready and registered (next boot or registration retries)");
     return { ran: false, scrubbed: 0, purged: 0 };

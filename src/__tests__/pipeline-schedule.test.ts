@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { checkPipelineSchedules, latestOccurrence, nextOccurrence } from "../restate/pipeline-schedule.js";
+import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
 
 const utc = (y: number, mo: number, d: number, h = 0, mi = 0) => Date.UTC(y, mo - 1, d, h, mi);
 
@@ -44,8 +45,20 @@ describe("nextOccurrence", () => {
 });
 
 describe("checkPipelineSchedules", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetRestateStatus();
+  });
   const ok = () => vi.fn(async () => new Response("{}", { status: 200 }));
+
+  it("reads the orchestrator's own Restate status when no readiness is passed", async () => {
+    const fetchImpl = ok();
+    await checkPipelineSchedules(["kg-refresh"], { deployHeld: () => false, fetchImpl });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    await checkPipelineSchedules(["kg-refresh"], { deployHeld: () => false, fetchImpl });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
 
   it("makes no call while a deploy holds", async () => {
     const fetchImpl = ok();

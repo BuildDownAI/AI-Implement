@@ -57,6 +57,7 @@ import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
+import { readSetupChecksViaObject, runSetupChecksViaObject } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -180,7 +181,7 @@ import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/en
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
-import { getRestateStatus, setRestateStatus } from "./restate/status.js";
+import { getRestateStatus, restateCanServe, setRestateStatus } from "./restate/status.js";
 import type { RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
@@ -887,7 +888,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // AII-1304: retry LateExternalReview for gap-fill rows submitted while Restate was not ready.
   try {
     await resubmitPendingGapFillReviews({
-      ready: restateReady,
+      ready: restateCanServe,
       submit: lateExternalReviewSubmitHook,
       getState: (key) => lateExternalReviewIngress.getState(key),
       getPrClosed: async ({ owner, repo, prNumber }) => {
@@ -1450,8 +1451,7 @@ export async function dispatchPlanning(
 
   // Pilot lifecycle: the PlanningRun workflow owns the reservation and launches the run.
   if (resolveReviewFixLifecycle(mapping) === "restate") {
-    const restate = getRestateStatus();
-    if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") {
+    if (!restateCanServe()) {
       console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
       return;
     }
@@ -3388,8 +3388,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           continue;
         }
         if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
-        const restate = getRestateStatus();
-        if (restate.sidecar.state !== "ready" || restate.registration.state !== "registered") continue;
+        if (!restateCanServe()) continue;
         try {
           const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
           const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
@@ -4000,15 +3999,11 @@ const reviewFixAttemptStore = new SqliteReviewFixAttemptStore();
 const kgRefreshIngressClient = createKgRefreshIngressClient();
 const selfDeployClient = createSelfDeployIngressClient();
 const trackerExportClient = createTrackerExportIngressClient();
-// AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
-function restateReady(): boolean {
-  const restate = getRestateStatus();
-  return restate.sidecar.state === "ready" && restate.registration.state === "registered";
-}
 const lateExternalReviewIngress = createLateExternalReviewIngressClient();
 const submitLateExternalReview = createLateExternalReviewSubmitHook({
   ingress: lateExternalReviewIngress,
-  restateReady,
+  // AII-1227: starts LateExternalReview only while the sidecar is ready and the endpoint registered.
+  restateReady: restateCanServe,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
 const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
@@ -4439,7 +4434,7 @@ function startServer(
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateReady),
+        enqueueDryRun: makeKgDryRunEnqueue(config.kgSourceRepo, kgRefreshIngressClient, restateCanServe),
         forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }, async (repository, prNumber) => { await queueReviewFixCancellationForClosedPr(repository, prNumber, reviewFixIngressClient); }, reviewFixIngressClient).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
@@ -4860,7 +4855,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
