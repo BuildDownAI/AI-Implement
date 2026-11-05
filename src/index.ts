@@ -4249,8 +4249,7 @@ function startServer(
 
     // Health check
     if (url === "/" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      void buildHealthBody({
+      return buildHealthBody({
         sourceCommit: () => process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
         pollStats: getPollStats,
         kgDegraded: isKgDegraded,
@@ -4259,8 +4258,11 @@ function startServer(
         deployHealth,
         lastSetupCheckRun: getLastSetupCheckRun,
         setupCheckContext: () => createSetupCheckContext({ restateStatus: getRestateStatus }),
-      }).then((body) => res.end(JSON.stringify(body)));
-      return;
+      }).then((body) => {
+        const json = JSON.stringify(body);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(json);
+      });
     }
 
     // Model-auth routes — every method is routed so the handler answers 405; before the general runner routes.

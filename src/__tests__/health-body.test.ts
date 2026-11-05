@@ -1,3 +1,5 @@
+import type http from "node:http";
+import { withRequestErrorBoundary } from "../http-server.js";
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { buildHealthBody, type HealthBodyReaders } from "../health-body.js";
@@ -21,6 +23,30 @@ function readers(): HealthBodyReaders {
 }
 
 describe("public health body", () => {
+  it("lets the request boundary finish a failed health build without sending 200", async () => {
+    const read = readers();
+    read.setupCheckContext = () => { throw new Error("context unavailable"); };
+    const res = {
+      headersSent: false, writeHead: vi.fn(), end: vi.fn(), destroy: vi.fn(),
+    } as unknown as http.ServerResponse;
+    const log = vi.fn();
+    const listener = withRequestErrorBoundary((_req, response) => {
+      return buildHealthBody(read).then((body) => {
+        const json = JSON.stringify(body);
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(json);
+      });
+    }, log);
+
+    listener({} as http.IncomingMessage, res);
+    expect(res.writeHead).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(res.end).toHaveBeenCalledOnce());
+    expect(res.writeHead).toHaveBeenCalledExactlyOnceWith(500, { "Content-Type": "application/json" });
+    expect(res.end).toHaveBeenCalledWith(JSON.stringify({ error: "Internal server error" }));
+    expect(res.destroy).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledOnce();
+  });
+
   it("preserves every legacy field and adds the unknown-run summary", async () => {
     expect(await buildHealthBody(readers())).toEqual({
       status: "ok", sourceCommit: "abc123", polls: 42, kgDegraded: true,
