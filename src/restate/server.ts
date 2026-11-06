@@ -37,8 +37,8 @@ export const RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE = "256 MB";
 /**
  * Data directory for the Restate sidecar's embedded store: RESTATE_DATA_DIR when set,
  * else the dedup DB's directory plus /restate. Mirrors DEDUP_DB_PATH's own default
- * (src/dedup.ts's resolveDbPath) without importing that module, since importing it
- * triggers its own mkdirSync-on-load side effect for an unrelated path.
+ * (src/dedup.ts's resolveDbPath) from the configured value, without resolving the
+ * database path, which creates its directory and may fall back to /tmp.
  */
 export function restateDataDir(
   dedupDbPath: string = process.env.DEDUP_DB_PATH || "/data/dedup.sqlite",

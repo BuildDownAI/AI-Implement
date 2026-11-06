@@ -258,7 +258,7 @@ describe("ChatGptPlanAccount with the hosted session key", () => {
     authorizeOperator: () => false,
   });
 
-  // The store uses the database `dedup.ts` resolved at import: the Restate config's in-memory one.
+  // The store uses the database `dedup.ts` resolves on first use: the Restate config's in-memory one.
   beforeAll(async () => {
     for (const m of ["log", "info", "warn", "error"] as const) {
       vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(" ")); });

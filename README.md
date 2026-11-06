@@ -410,10 +410,10 @@ The orchestrator picks it up within 60 seconds and dispatches a run. The resulti
 src/                  Polling loop, HTTP + admin server, Linear/GitHub clients, Fly Machines runner
 workflows/            Templates synced to target repos (claude-implement.yml, claude-plan.yml,
                       comment-trigger.yml, WORKFLOW.md, PLANNING.md)
-clients/              One <slug>.toml per deployed Fly app (multi-tenant deploy)
+clients/              One <slug>.toml per deployed Fly app, written by npm run provision-client -- <slug>
 custom/               Fork-local step/provider/pipeline overrides (see custom/README.md
                       and docs/adr/001-custom-path-precedence.md)
-scripts/              provision-client.sh (interactive onboarding for multi-tenant operators)
+scripts/              operator helpers
 session/              Entrypoint scripts for the Fly Machines runner image
 docs/                 Design notes, ADRs
 CONTEXT.md            Domain glossary — the terms the ADRs turn on (developer harness

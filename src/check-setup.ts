@@ -73,16 +73,20 @@ async function readRestateStatus(deps: CheckSetupDependencies): Promise<SetupChe
   return body?.restate ?? new Error(`Port ${deps.port} answered without a Restate status, so it may not be this orchestrator.`);
 }
 
-function formatRun(run: SetupCheckRun, failingCore: number): string {
+/** One check's lines: its state, id and title, then its detail and fix beneath. The provisioning command prints its own checks this way too. */
+export function formatCheckRow(r: Pick<SetupCheckResult, "state" | "id" | "project" | "title" | "detail" | "fix">): string[] {
   const indent = " ".repeat(LABEL_WIDTH + 4);
+  const lines = [`  ${STATE_LABELS[r.state].padEnd(LABEL_WIDTH)}  ${r.id}${r.project ? ` (${r.project})` : ""}: ${r.title}`];
+  if (r.detail) lines.push(`${indent}${r.detail}`);
+  if (r.fix) lines.push(`${indent}Fix: ${r.fix}`);
+  return lines;
+}
+
+function formatRun(run: SetupCheckRun, failingCore: number): string {
   const lines: string[] = [];
   for (const group of new Set(run.results.map((r) => r.group))) {
     lines.push(group);
-    for (const r of run.results.filter((result) => result.group === group)) {
-      lines.push(`  ${STATE_LABELS[r.state].padEnd(LABEL_WIDTH)}  ${r.id}${r.project ? ` (${r.project})` : ""}: ${r.title}`);
-      if (r.detail) lines.push(`${indent}${r.detail}`);
-      if (r.fix) lines.push(`${indent}Fix: ${r.fix}`);
-    }
+    for (const r of run.results.filter((result) => result.group === group)) lines.push(...formatCheckRow(r));
     lines.push("");
   }
   lines.push(failingCore === 0 ? "No core check fails." : `${failingCore} core ${failingCore === 1 ? "check fails" : "checks fail"}.`);
