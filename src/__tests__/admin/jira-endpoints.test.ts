@@ -115,8 +115,8 @@ describe("/api/jira/validate-jql", () => {
   it("returns 200 ok for valid JQL", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
-    // JiraClient.validateJql posts to /rest/api/3/jql/parse and treats any
-    // 2xx as valid.
+    // JiraClient.validateJql posts to /rest/api/3/jql/parse; a 200 whose
+    // queries[].errors is empty is valid.
     fakeFetch({
       [`POST ${GATEWAY}/jql/parse`]: [{ json: { queries: [{ query: "project = P", structure: {} }] } }],
     }).install();
@@ -143,6 +143,20 @@ describe("/api/jira/validate-jql", () => {
     const token = await login("secret");
     const res = await request("/api/jira/validate-jql", "POST", "secret", {}, token);
     expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 400 when Jira answers 200 with errors in the body", async () => {
+    process.env.JIRA_TOKEN = "t";
+    process.env.JIRA_CLOUD_ID = "c";
+    fakeFetch({
+      [`POST ${GATEWAY}/jql/parse`]: [
+        { json: { queries: [{ query: "status = Nope", errors: ["The value 'Nope' does not exist for the field 'status'."] }] } },
+      ],
+    }).install();
+    const token = await login("secret");
+    const res = await request("/api/jira/validate-jql", "POST", "secret", { jql: "status = Nope" }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("The value 'Nope' does not exist for the field 'status'.");
   });
 
   it("returns 400 on invalid JQL (Jira returns 400)", async () => {

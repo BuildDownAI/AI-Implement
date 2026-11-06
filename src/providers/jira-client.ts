@@ -183,11 +183,18 @@ export class JiraClient {
     return { issues: res.issues ?? [], nextPageToken: res.nextPageToken || undefined };
   }
 
-  /** Validate JQL without executing it via /rest/api/3/jql/parse. */
+  /**
+   * Validate JQL without executing it via /rest/api/3/jql/parse. Jira answers 200 even for a
+   * rejected query and reports the problem in `queries[].errors` (syntax errors, unknown fields,
+   * a dropdown value with no matching option), so the body must be read, not just the status.
+   */
   async validateJql(jql: string): Promise<{ valid: true } | { valid: false; errors: string[] }> {
     try {
-      await this.request("POST", "/rest/api/3/jql/parse", { queries: [jql] });
-      return { valid: true };
+      const res = await this.requestJson<{ queries?: Array<{ errors?: string[] }> }>(
+        "POST", "/rest/api/3/jql/parse", { queries: [jql] },
+      );
+      const errors = res.queries?.[0]?.errors ?? [];
+      return errors.length > 0 ? { valid: false, errors } : { valid: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { valid: false, errors: [message] };
