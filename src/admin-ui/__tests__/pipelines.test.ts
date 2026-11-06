@@ -95,8 +95,9 @@ describe("stuck job badge", () => {
     expect(make("fail", "failed", 'a"b')).toContain('title="a&quot;b"');
     expect(make("fail", "failed")).not.toContain("title=");
   });
-  it("shows needs-human only for the give-up conclusion", () => {
+  it("shows needs-human only for the give-up and stuck review-fix conclusions", () => {
     expect(badge("timed_out", "stuck_giveup")).toEqual({ cls: "fail", label: "Needs human", title: "stuck_giveup" });
+    expect(badge("timed_out", "stuck_review_fix")).toEqual({ cls: "fail", label: "Needs human", title: "stuck_review_fix" });
     expect(badge("timed_out", "stuck_requeued")).toEqual({ cls: "warn", label: "timed_out", title: "stuck_requeued" });
     expect(badge("completed", "stuck_giveup")).toEqual({ cls: "success", label: "completed", title: "stuck_giveup" });
   });

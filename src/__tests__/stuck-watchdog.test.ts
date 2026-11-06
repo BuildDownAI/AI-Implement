@@ -86,6 +86,114 @@ describe("remediateFailedJob — kg-refresh guard", () => {
   });
 });
 
+describe("review-fix (gap-analysis) jobs leave the ticket alone", () => {
+  it("remediateFailedJob makes no ticket write, dedup clear, or counter increment", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "failure");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("remediateFailedJob skips even for an owner call", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "failure", { ownerCall: true });
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [true, { backendTerminated: true }],
+    [false, { skipAdmissionRelease: true }],
+  ])("remediateStuckJob closes out the job (stop confirmed=%s) without touching the ticket", async (confirmed, opts) => {
+    const provider = makeProvider();
+    const stopRunner = vi.fn().mockResolvedValue(confirmed);
+    const result = await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "in_progress", stopRunner);
+    expect(result).toBe(confirmed);
+    expect(stopRunner).toHaveBeenCalled();
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_review_fix", undefined, opts);
+    expect(notifyStuckGiveUp).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(notifyStuckGiveUp).mock.calls[0][2]).toMatchObject({ fixRun: true });
+    expect(provider.postComment).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(provider.postComment).mock.calls[0][1]).toContain("comment `/ai-implement`");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("remediateStuckJob without a webhook still comments on the ticket and sends no notification", async () => {
+    const provider = makeProvider();
+    const stopRunner = vi.fn().mockResolvedValue(true);
+    await remediateStuckJob(
+      { ...mockConfig, notifyWebhookUrl: null },
+      provider,
+      makeJob({ phase: "gap-analysis" }),
+      "in_progress",
+      stopRunner,
+    );
+    expect(provider.postComment).toHaveBeenCalledTimes(1);
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
+  it("remediateStuckJob comment says the run was stopped at its time limit and is not retried automatically", async () => {
+    const provider = makeProvider();
+    await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "in_progress", vi.fn().mockResolvedValue(true));
+    const text = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(text).toContain("did not finish in its time limit");
+    expect(text).toContain("does not retry a review-fix or `/ai-implement` fix run automatically");
+    expect(text).not.toContain("will not start it again");
+  });
+
+  it("remediateStuckJob comment says the run was not found for run_not_found", async () => {
+    const provider = makeProvider();
+    await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "run_not_found", vi.fn().mockResolvedValue(true));
+    const text = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(text).toContain("could not find the fix run");
+    expect(text).not.toContain("time limit");
+    expect(text).toContain("does not retry a review-fix or `/ai-implement` fix run automatically");
+  });
+
+  it("remediateStuckJob without stopRunner uses the default cancel path", async () => {
+    await remediateStuckJob(mockConfig, makeProvider(), makeJob({ phase: "gap-analysis", runId: 555 }), "in_progress");
+    expect(cancelWorkflowRun).toHaveBeenCalled();
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_review_fix", undefined, { skipAdmissionRelease: true });
+  });
+
+  it("remediateStuckJob does nothing when the DB conclusion is operator_cancelled", async () => {
+    vi.mocked(getJobById).mockReturnValue({ conclusion: "operator_cancelled" } as Job);
+    const provider = makeProvider();
+    const stopRunner = vi.fn().mockResolvedValue(true);
+    const result = await remediateStuckJob(mockConfig, provider, makeJob({ phase: "gap-analysis" }), "in_progress", stopRunner);
+    expect(result).toBe(false);
+    expect(stopRunner).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+
+  it("remediateStuckJob still returns false for an operator-cancelled gap-analysis job", async () => {
+    const stopRunner = vi.fn().mockResolvedValue(true);
+    const result = await remediateStuckJob(
+      mockConfig,
+      makeProvider(),
+      makeJob({ phase: "gap-analysis", conclusion: "operator_cancelled" }),
+      "in_progress",
+      stopRunner,
+    );
+    expect(result).toBe(false);
+    expect(stopRunner).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
+  it.each(["implementation", "planning"])("%s jobs still reach boundedCleanup", async (phase) => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, makeJob({ phase }), "failure");
+    expect(incrementStuckAttempts).toHaveBeenCalled();
+    expect(provider.clearWorkingState).toHaveBeenCalled();
+  });
+});
+
 describe("remediateStuckJob — operator_cancelled guard", () => {
   it("returns immediately when job.conclusion is operator_cancelled — no runner cancel, no retry", async () => {
     const provider = makeProvider();

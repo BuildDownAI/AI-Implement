@@ -113,6 +113,11 @@ describe("overview page", () => {
     expect(overviewScript).toContain("e.conclusion === 'stuck_giveup'");
   });
 
+  it("treats stuck_review_fix like stuck_giveup in the attention and failure filters", () => {
+    const needle = "(e.conclusion === 'stuck_giveup' || e.conclusion === 'stuck_review_fix')";
+    expect(overviewScript.split(needle).length - 1).toBe(2);
+  });
+
   it("includes timed_out in statusBadge map for display consistency", () => {
     expect(overviewScript).toContain("timed_out: 'warn'");
   });

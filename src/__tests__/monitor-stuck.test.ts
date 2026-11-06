@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Job } from "../log.js";
+import type { TicketingProvider } from "../providers/types.js";
+import type { ProviderRegistry } from "../providers/registry.js";
+import type { RepoMapping } from "../config.js";
 import { shouldSkipCompletionNotice } from "../monitor-status.js";
 import { makeAppConfig, makeJob, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
 
@@ -50,6 +53,13 @@ vi.mock("../log.js", () => ({
   invalidateNonce: vi.fn(),
   stampComputeStopped: vi.fn(),
   recordGhaRunCompleted: vi.fn(),
+  getRecentFailedRunUrls: vi.fn().mockReturnValue([]),
+}));
+
+vi.mock("../dispatch-breaker.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../dispatch-breaker.js")>()),
+  recordDispatchSuccess: vi.fn(),
+  recordDispatchFailure: vi.fn().mockReturnValue({ tripped: false, failures: 1 }),
 }));
 
 vi.mock("../config.js", () => ({
@@ -81,11 +91,13 @@ import { remediateStuckJob, STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js"
 import { cancelWorkflowRun } from "../github.js";
 import { incrementStuckAttempts, updateJobStatus, getInFlightJobs, getJobById } from "../log.js";
 import { deleteDispatched } from "../dedup.js";
-import { notifyStuckGiveUp } from "../notify.js";
+import { notifyStuckGiveUp, notifyCompletion } from "../notify.js";
 import { getMappings } from "../config.js";
 import { destroyMachine } from "../fly-machines.js";
 import { removeLocalContainer } from "../local-docker.js";
-import { monitorJobs } from "../index.js";
+import { monitorJobs, reportTerminalJob } from "../index.js";
+import { recordDispatchSuccess, recordDispatchFailure } from "../dispatch-breaker.js";
+import type { AppConfig } from "../index.js";
 
 const mockConfig = {
   githubAppId: "12345",
@@ -406,6 +418,35 @@ describe("monitorJobs TTL check (AII-743)", () => {
     expect(cancelWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it("keeps stuck_review_fix on a timed-out gap-analysis job and alerts the human once", async () => {
+    vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 30 }) });
+    const provider = makeProvider();
+    const job = makeJob({
+      teamKey: "AII",
+      repo: "org/repo",
+      runId: 555,
+      phase: "gap-analysis",
+      dispatchedAt: Date.now() - 46 * 60 * 1000,
+    });
+    vi.mocked(getInFlightJobs).mockReturnValue([job]);
+    // The row reads back with whatever conclusion remediateStuckJob last wrote.
+    vi.mocked(getJobById).mockImplementation(((id: number) => {
+      const writes = vi.mocked(updateJobStatus).mock.calls.filter(([i]) => i === id);
+      return { ...job, conclusion: writes.at(-1)?.[2] ?? null } as Job;
+    }) as typeof getJobById);
+
+    await monitorJobs({ ...mockAppConfig, notifyWebhookUrl: "https://hooks.slack.com/test" }, makeRegistry({ provider }));
+
+    const writes = vi.mocked(updateJobStatus).mock.calls.filter(([id]) => id === job.id);
+    expect(writes.map((c) => c[2])).toEqual(["stuck_review_fix"]);
+    expect(provider.postComment).toHaveBeenCalledTimes(1);
+    expect(notifyStuckGiveUp).toHaveBeenCalledTimes(1);
+    // The time-limit branch continues before reportTerminalJob runs, so this only pins the branch;
+    // the reportTerminalJob suppression is pinned in "reportTerminalJob — fix runs" below.
+    expect(notifyCompletion).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+  });
+
   it("times out a job past its configured limit with conclusion ttl_expired, independent of run status", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     vi.mocked(getMappings).mockReturnValue({ AII: makeMapping({ maxJobMinutes: 30 }) });
@@ -628,5 +669,93 @@ describe("monitorJobs TTL check (AII-743)", () => {
 
     expect(updateJobStatus).not.toHaveBeenCalled();
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+});
+
+describe("reportTerminalJob — fix runs", () => {
+  function makeRegistry(provider: TicketingProvider | null): ProviderRegistry {
+    return { forMapping: vi.fn().mockResolvedValue(provider) } as unknown as ProviderRegistry;
+  }
+  const config = { ...mockConfig, notifyWebhookUrl: "https://hooks.slack.com/test" } as unknown as AppConfig;
+
+  beforeEach(() => {
+    vi.mocked(getMappings).mockReturnValue({ ENG: { repo: "org/repo" } as unknown as RepoMapping });
+    vi.mocked(recordDispatchFailure).mockReturnValue({ tripped: false, failures: 1 } as ReturnType<typeof recordDispatchFailure>);
+  });
+
+  it.each([
+    ["planning", "planning"],
+    ["implementation", "implementation"],
+    ["gap-analysis", "gap-analysis"],
+  ])("counts a %s job's outcome in the %s breaker bucket", async (phase, bucket) => {
+    await reportTerminalJob(config, makeRegistry(makeProvider()), makeJob({ phase, status: "completed", conclusion: "success" } as Partial<Job>));
+    expect(recordDispatchSuccess).toHaveBeenCalledWith("issue-1", bucket);
+    for (const status of ["failed", "timed_out", "review_failed"] as const) {
+      vi.mocked(recordDispatchFailure).mockClear();
+      await reportTerminalJob(config, makeRegistry(makeProvider()), makeJob({ phase, status, conclusion: "x" } as Partial<Job>));
+      if (status === "review_failed" && bucket === "gap-analysis") {
+        expect(recordDispatchFailure).not.toHaveBeenCalled();
+      } else {
+        expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", bucket, "x");
+      }
+    }
+  });
+
+  it("does not count review_failed fix runs toward the breaker, but does count failed ones", async () => {
+    // review_failed never reaches the breaker for a fix run
+    for (let i = 0; i < 3; i++) {
+      await reportTerminalJob(config, makeRegistry(makeProvider()), makeJob({ phase: "gap-analysis", status: "review_failed", conclusion: "review_failed" } as Partial<Job>));
+    }
+    expect(recordDispatchFailure).not.toHaveBeenCalled();
+    // failed fix runs do
+    for (let i = 0; i < 3; i++) {
+      await reportTerminalJob(config, makeRegistry(makeProvider()), makeJob({ phase: "gap-analysis", status: "failed", conclusion: "failure" } as Partial<Job>));
+    }
+    expect(recordDispatchFailure).toHaveBeenCalledTimes(3);
+    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "failure");
+  });
+
+  it("posts no second comment and no completion notice for stuck_review_fix", async () => {
+    const provider = makeProvider();
+    await reportTerminalJob(
+      config,
+      makeRegistry(provider),
+      makeJob({ phase: "gap-analysis", status: "timed_out", conclusion: "stuck_review_fix" } as Partial<Job>),
+    );
+    expect(recordDispatchFailure).toHaveBeenCalledWith("issue-1", "gap-analysis", "stuck_review_fix");
+    expect(provider.postComment).not.toHaveBeenCalled();
+    expect(notifyCompletion).not.toHaveBeenCalled();
+  });
+
+  it("sends the trip notice once when a stuck fix run trips the gap-analysis breaker", async () => {
+    vi.mocked(recordDispatchFailure).mockReturnValue({ tripped: true, failures: 3 } as ReturnType<typeof recordDispatchFailure>);
+    const provider = makeProvider();
+    await reportTerminalJob(
+      config,
+      makeRegistry(provider),
+      makeJob({ phase: "gap-analysis", status: "timed_out", conclusion: "stuck_review_fix" } as Partial<Job>),
+    );
+    expect(provider.postComment).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(provider.postComment).mock.calls[0][1]).toContain("parked this issue");
+    expect(vi.mocked(provider.postComment).mock.calls[0][1]).toContain("`gap-analysis`");
+    expect(vi.mocked(provider.postComment).mock.calls[0][1]).toContain("A person can still comment `/ai-implement`");
+    expect(notifyCompletion).not.toHaveBeenCalled();
+  });
+
+  it.each(["planning", "implementation"])("omits the fix-run sentence from the %s trip comment", async (phase) => {
+    vi.mocked(recordDispatchFailure).mockReturnValue({ tripped: true, failures: 3 } as ReturnType<typeof recordDispatchFailure>);
+    const provider = makeProvider();
+    await reportTerminalJob(config, makeRegistry(provider), makeJob({ phase, status: "failed", conclusion: "failure" } as Partial<Job>));
+    const trip = vi.mocked(provider.postComment).mock.calls.map((c) => c[1]).find((b) => b.includes("parked this issue"));
+    expect(trip).toContain(`\`${phase}\``);
+    expect(trip).not.toContain("A person can still comment `/ai-implement`");
+  });
+
+  it.each(["stuck_giveup", "stuck_requeued"])("keeps the breaker trip silent for %s", async (conclusion) => {
+    vi.mocked(recordDispatchFailure).mockReturnValue({ tripped: true, failures: 3 } as ReturnType<typeof recordDispatchFailure>);
+    const provider = makeProvider();
+    await reportTerminalJob(config, makeRegistry(provider), makeJob({ status: "timed_out", conclusion } as Partial<Job>));
+    expect(provider.postComment).not.toHaveBeenCalled();
+    expect(notifyCompletion).not.toHaveBeenCalled();
   });
 });

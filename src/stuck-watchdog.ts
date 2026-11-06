@@ -28,6 +28,73 @@ export interface StuckWatchdogConfig {
   notifyWebhookUrl: string | null;
 }
 
+function resolveIssueUrl(provider: TicketingProvider | null, job: Job): string {
+  const identifier = job.issueIdentifier || job.issueId!;
+  const fallback = `https://linear.app/issue/${identifier}`;
+  if (!provider) return fallback;
+  try {
+    const issueArg: TicketIssue = {
+      id: job.issueId!,
+      identifier,
+      title: job.issueTitle || "",
+      description: null,
+      scopeKey: job.teamKey ?? "",
+      nativeStatus: "",
+    };
+    return provider.issueUrl(issueArg);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * A stuck review-fix run is stopped and closed out, but nothing requeues it, so a human must be
+ * told once. The comment claims no retry only for review-fix and `/ai-implement` runs (a
+ * feature-branch conflict-resolution run can be re-enqueued by `auto-merge`), and says "not found"
+ * for `run_not_found`. Mirrors the give-up alert in `boundedCleanup` without touching ticket state.
+ * The webhook alert names a fix run and the `/ai-implement` next step and shows no attempt count.
+ */
+async function alertStuckReviewFix(
+  config: StuckWatchdogConfig,
+  provider: TicketingProvider | null,
+  job: Job,
+  runUrl: string | null,
+  lastRunStatus: string,
+): Promise<void> {
+  const identifier = job.issueIdentifier || job.issueId!;
+  if (config.notifyWebhookUrl) {
+    try {
+      await notifyStuckGiveUp(config.notifyType, config.notifyWebhookUrl, {
+        issueIdentifier: identifier,
+        issueTitle: job.issueTitle || "Unknown",
+        issueUrl: resolveIssueUrl(provider, job),
+        repoFullName: job.repo || "unknown",
+        runUrl,
+        lastRunStatus,
+        fixRun: true,
+        ...(job.prUrl ? { prUrl: job.prUrl } : {}),
+      });
+    } catch (err) {
+      console.error(`[monitor] Failed to send stuck review-fix notification for ${job.issueIdentifier}:`, err);
+    }
+  }
+  if (provider) {
+    const outcome =
+      lastRunStatus === "run_not_found"
+        ? "AI-Implement could not find the fix run for this pull request, so it closed the run out."
+        : "The fix run for this pull request did not finish in its time limit. AI-Implement stopped it.";
+    const text =
+      `⚠️ ${outcome} AI-Implement does not retry a review-fix or \`/ai-implement\` fix run automatically. ` +
+      "The open review findings stay open. To start a new fix run, comment `/ai-implement` on the pull request." +
+      (runUrl ? `\n\nRun: ${runUrl}` : "");
+    try {
+      await provider.postComment(job.issueId!, text);
+    } catch (err) {
+      console.error(`[monitor] Failed to post stuck review-fix comment for ${job.issueIdentifier}:`, err);
+    }
+  }
+}
+
 /**
  * Shared ticket-cleanup core: increment the stuck-attempts counter and either
  * requeue (within budget) or give-up (over budget). Returns the updated count.
@@ -68,22 +135,7 @@ async function boundedCleanup(
     }
 
     const identifier = job.issueIdentifier || job.issueId!;
-    let issueUrl = `https://linear.app/issue/${identifier}`;
-    if (provider) {
-      try {
-        const issueArg: TicketIssue = {
-          id: job.issueId!,
-          identifier,
-          title: job.issueTitle || "",
-          description: null,
-          scopeKey: job.teamKey ?? "",
-          nativeStatus: "",
-        };
-        issueUrl = provider.issueUrl(issueArg);
-      } catch {
-        // use fallback
-      }
-    }
+    const issueUrl = resolveIssueUrl(provider, job);
 
     if (config.notifyWebhookUrl) {
       try {
@@ -144,6 +196,10 @@ async function boundedCleanup(
  * label only (dedup left intact so the poller won't re-pick it), fire loud
  * notifyStuckGiveUp alert, and post a Linear comment.
  *
+ * A `gap-analysis` job (review-fix queue or `/ai-implement` comment rail) is stopped and closed out as
+ * timed_out/stuck_review_fix, skipping the ticket reset, dedup clear and attempt counter; a human is
+ * notified once (notifyStuckGiveUp + ticket comment).
+ *
  * Stop happens before dedup is cleared to prevent a race where the next poll
  * cycle re-dispatches before the zombie runner is stopped.
  *
@@ -185,6 +241,9 @@ export async function remediateStuckJob(
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusionStuck = getJobById(job.id)?.conclusion;
   if (job.conclusion === "operator_cancelled" || freshConclusionStuck === "operator_cancelled") return false;
+  // Review-fix runs (phase gap-analysis: the review-fix queue and the `/ai-implement` comment rail)
+  // leave the ticket alone and are never re-armed: nothing re-enqueues them, so a human is told instead.
+  const reviewFix = job.phase === "gap-analysis";
 
   // Stop the runner before resetting dedup — prevents a re-dispatch racing
   // with a still-live runner.
@@ -230,6 +289,22 @@ export async function remediateStuckJob(
     job.runId && job.repo
       ? `https://github.com/${job.repo}/actions/runs/${job.runId}`
       : null;
+
+  if (reviewFix) {
+    // `stuck_review_fix`, not `stuck_requeued`: nothing requeues this run.
+    updateJobStatus(
+      job.id,
+      "timed_out",
+      "stuck_review_fix",
+      undefined,
+      stopConfirmed ? { backendTerminated: true } : { skipAdmissionRelease: true },
+    );
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m — review-fix run, ticket left unchanged`,
+    );
+    await alertStuckReviewFix(config, provider, job, runUrl, lastRunStatus);
+    return stopConfirmed;
+  }
 
   const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
 
@@ -284,6 +359,9 @@ export async function remediateFailedJob(
   if (!job.issueId) return;
   // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
   if (job.phase === "kg-refresh") return;
+  // Fix runs (gap-analysis: the review-fix queue and the `/ai-implement` comment rail) never reset
+  // the ticket or dedup entry; nothing re-enqueues them, the findings stay open for a new event.
+  if (job.phase === "gap-analysis") return;
   // Restate finalizes its own attempts — never re-arm or clear dedup for them (AII-791),
   // unless the owner workflow itself asks for the handling.
   if (!opts?.ownerCall && isRestateOwnedJob(job)) return;

@@ -23,6 +23,17 @@ export function shouldCountFailure(record: { category: FailureCategory }): boole
   return record.category !== "transient";
 }
 
+/**
+ * The breaker bucket a job phase or dispatch kind counts in: a fix run (job phase
+ * `gap-analysis`, dispatch kind `gap-fill`) has its own, everything but planning
+ * shares `implementation`.
+ */
+export function breakerPhaseFor(jobPhase: string | null | undefined): "planning" | "gap-analysis" | "implementation" {
+  if (jobPhase === "planning") return "planning";
+  if (jobPhase === "gap-analysis" || jobPhase === "gap-fill") return "gap-analysis";
+  return "implementation";
+}
+
 export function initDispatchBreakerTable(): void {
   getDb().exec(`
     CREATE TABLE IF NOT EXISTS dispatch_breaker (
