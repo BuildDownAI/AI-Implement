@@ -886,3 +886,61 @@ function redirectWithError(
   res.writeHead(302, { Location: url.href });
   res.end();
 }
+
+// ---------- Routing ----------
+
+/**
+ * Routes the well-known metadata documents and every `/mcp/*` OAuth route. Returns false for
+ * any other path, including `/mcp` itself, which `handleMcpRequest` serves.
+ *
+ * Gated on the redirect base URL alone, the same as `handleMcpRequest`. These routes used to
+ * 503 without a KG memory provider too — a leftover from when `/mcp` was only a sidecar proxy —
+ * which on a sidecar-less deploy locked every client out of the non-`kg_*` tools.
+ */
+export function routeMcpOAuth(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  baseUrl: string | null,
+): boolean {
+  const isWellKnown =
+    pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-authorization-server";
+  if (!isWellKnown && !pathname.startsWith("/mcp/")) return false;
+  if (isWellKnown && req.method !== "GET") return false;
+
+  if (!baseUrl) {
+    json(res, 503, { error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" });
+    return true;
+  }
+  if (pathname === "/.well-known/oauth-protected-resource") {
+    handleMcpProtectedResourceMetadata(res, baseUrl);
+    return true;
+  }
+  if (pathname === "/.well-known/oauth-authorization-server") {
+    handleMcpAuthorizationServerMetadata(res, baseUrl);
+    return true;
+  }
+
+  const run = (label: string, handler: () => Promise<void>): true => {
+    handler().catch((err) => {
+      console.error(`[mcp-oauth] ${label} error:`, err);
+      if (!res.headersSent) json(res, 500, { error: "Internal server error" });
+    });
+    return true;
+  };
+  if (pathname === "/mcp/register" && req.method === "POST") {
+    return run("register", () => handleMcpClientRegistration(req, res));
+  }
+  if (pathname === "/mcp/authorize" && req.method === "GET") {
+    return run("authorize", () => handleMcpAuthorize(req, res, baseUrl));
+  }
+  const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
+  if (callbackMatch && req.method === "GET") {
+    const [, providerId] = callbackMatch;
+    return run("callback", () => handleMcpOidcCallback(req, res, providerId, baseUrl));
+  }
+  if (pathname === "/mcp/token" && req.method === "POST") {
+    return run("token", () => handleMcpTokenRequest(req, res));
+  }
+  return false;
+}

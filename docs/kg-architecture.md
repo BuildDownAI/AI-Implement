@@ -5,7 +5,7 @@ lifecycle stage, and the single fact that governs every operational decision —
 and the KG are one deployable unit.**
 
 Reference for the configured KG source repository (set via `KG_SOURCE_REPO`; unset builds without a
-sidecar — `/mcp` returns 503), its `kg_ingest/`, `kg_query/`,
+sidecar — `/mcp` serves without the `kg_*` tools), its `kg_ingest/`, `kg_query/`,
 and `snapshot/` directories, the KG stages of `Dockerfile`, `docker-entrypoint.sh`, and
 `src/deploy.ts`. For the `/mcp` endpoint, the OAuth flow, and the ways a build ships degraded, see
 [kg-sidecar.md](kg-sidecar.md). For deploy paths and their flags, see [deployment.md](deployment.md).

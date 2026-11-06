@@ -115,7 +115,7 @@ Four things must be true, and they are not all reported the same way:
 - **`FLY_DEPLOY_TOKEN`** is set, scoped to this app. `FLY_SESSIONS_TOKEN` is a different credential and cannot deploy the orchestrator.
 - **The running image carries its source stamps.** `AI_IMPLEMENT_SOURCE_REPO` (as `owner/repo`) and `AI_IMPLEMENT_SOURCE_BRANCH` are both required; an image built without them cannot self-deploy at all. `AI_IMPLEMENT_SOURCE_COMMIT` is not required — without it a deploy still runs, but availability reports *unknown* rather than telling you a new version exists.
 - **An admin auth method is configured** — SSO providers or `ADMIN_ACCESS_CODE`. Every `/api/` route answers 503 otherwise, this one included.
-- **The GitHub App installation can read this repository.** Its token is minted at `contents: read`, scoped to the source repo. If `KG_SOURCE_REPO` is set, the installation must also cover that repository; an unset value builds sidecar-less without requiring that second grant — the orchestrator boots normally, but `/mcp` returns 503. The Docker build arg is baked into the image as a non-secret environment value so later self-deploys keep using the same graph repo unless a runtime env override changes it.
+- **The GitHub App installation can read this repository.** Its token is minted at `contents: read`, scoped to the source repo. If `KG_SOURCE_REPO` is set, the installation must also cover that repository; an unset value builds sidecar-less without requiring that second grant — the orchestrator boots normally, and `/mcp` serves without the `kg_*` tools. The Docker build arg is baked into the image as a non-secret environment value so later self-deploys keep using the same graph repo unless a runtime env override changes it.
 
 The **Watched source** fields in `/admin#deployments` — owner/repo and ref — can shadow the build stamps. When both are set, the configured repo and ref take precedence over `AI_IMPLEMENT_SOURCE_REPO` and `AI_IMPLEMENT_SOURCE_BRANCH` for availability checks and deploys; clearing either restores the stamped values. A ref selector populated from the repository's branches and tags appears on blur.
 
@@ -174,12 +174,12 @@ Then confirm the release actually serves, because booting is not serving:
 curl -s -w '\n%{http_code}\n' -X POST https://<app-name>.fly.dev/mcp -d '{}'
 ```
 
-**401 is success** — alive and OAuth-gated. **503 means it is not serving**, from either a sidecar-less image or an unset `OAUTH_REDIRECT_BASE_URL`. The two are indistinguishable by status, which is why the body is worth printing: it names the one that fired.
+**401 is success** — alive and OAuth-gated. **503 means it is not serving**: `OAUTH_REDIRECT_BASE_URL` is unset, and the body says so. A sidecar-less image still answers 401 here, because `/mcp` serves without the `kg_*` tools; check the sidecar on the health check instead — `curl -s https://<app-name>.fly.dev/`, where `sidecar.checkedAt: null` means no sidecar was probed and `sidecar.toolsListed: true` means it serves.
 
 Every flag above is load-bearing, and each was learned from a silently degraded deploy:
 
 - **`--build-secret`** — the KG is cloned at build time through it. Without it the build fail-softs to a sidecar-less image and reports success.
-- **`--build-arg KG_SOURCE_REPO`** — the GitHub `owner/repo` to clone for the sidecar. Omit it (or leave `$KG_SOURCE_REPO` unset) to build without a KG sidecar; the orchestrator boots normally but `/mcp` returns 503. Set it to a project-specific graph such as `Answer9-llc/knowledge-graph-answer9-app` when needed. URLs and malformed values are rejected.
+- **`--build-arg KG_SOURCE_REPO`** — the GitHub `owner/repo` to clone for the sidecar. Omit it (or leave `$KG_SOURCE_REPO` unset) to build without a KG sidecar; the orchestrator boots normally and `/mcp` serves without the `kg_*` tools. Set it to a project-specific graph such as `Answer9-llc/knowledge-graph-answer9-app` when needed. URLs and malformed values are rejected.
 - **`--no-cache`** — a build secret is not part of the layer cache key, so a repeat deploy otherwise reuses a stale, possibly sidecar-less clone layer even when the secret is present.
 - **`--build-arg SOURCE_*`** — the stamps. Omit `SOURCE_REPO` or `SOURCE_BRANCH` and the image you just deployed cannot deploy itself, which is how a manual recovery quietly disables the automatic path.
 - **`--app`** — always explicit. A default would let a fork deploy itself over the upstream app.
@@ -201,7 +201,7 @@ A Fly app can watch a branch and deploy on push, with no workflow involved. Fly 
 - **Attaching does not itself deploy.** The first deploy happens on the next push to the watched branch.
 - **The release `USER` field shows the connecting account even for integration deploys**, so it cannot distinguish an automated deploy from a manual one. Correlate by timestamp instead.
 
-**This path cannot carry the sidecar, and that is why self-deploy exists.** An integration deploy has no hook for a BuildKit build secret — no pre-deploy command, nowhere to pass `--build-secret`, no `fly.toml` key for one — so every push-triggered release ships a sidecar-less image whose `/mcp` answers 503, silently overwriting a good manual deploy. Leaving auto-deploy enabled on an app that serves `/mcp` will undo a working deploy on the next merge.
+**This path cannot carry the sidecar, and that is why self-deploy exists.** An integration deploy has no hook for a BuildKit build secret — no pre-deploy command, nowhere to pass `--build-secret`, no `fly.toml` key for one — so every push-triggered release ships a sidecar-less image, whose `/mcp` serves without the `kg_*` tools, silently overwriting a good manual deploy. Leaving auto-deploy enabled on an app that serves `/mcp` will undo a working deploy on the next merge.
 
 ### Using a public source repository
 

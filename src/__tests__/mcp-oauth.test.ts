@@ -201,6 +201,56 @@ describe("handleMcpAuthorizationServerMetadata", () => {
   });
 });
 
+// ---------- Unit: route gate ----------
+
+// The OAuth routes used to 503 unless a KG memory provider was configured, which locked an
+// MCP client out of every non-kg_* tool on a sidecar-less deploy. They gate on the base URL
+// alone now, matching handleMcpRequest.
+describe("routeMcpOAuth", () => {
+  it("serves both well-known metadata documents with no KG sidecar configured", () => {
+    for (const pathname of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname), asRes(res), pathname, BASE_URL)).toBe(true);
+      expect(res.statusCode).toBe(200);
+    }
+  });
+
+  it("serves the authorize route with no KG sidecar configured", async () => {
+    const clientId = await registerClient();
+    const url = `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:8080/callback")}&state=s&code_challenge=${pkceChallenge("verifier")}&code_challenge_method=S256`;
+    const res = new MockResponse();
+    expect(mcpOauth.routeMcpOAuth(mkReq(url), asRes(res), "/mcp/authorize", BASE_URL)).toBe(true);
+    await vi.waitFor(() => expect(res.statusCode).toBe(302));
+    expect(res.headers["Location"]).toContain("accounts.google.com");
+  });
+
+  it("503s every MCP OAuth route when OAUTH_REDIRECT_BASE_URL is unset", () => {
+    for (const pathname of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server", "/mcp/register", "/mcp/token"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname), asRes(res), pathname, null)).toBe(true);
+      expect(res.statusCode).toBe(503);
+    }
+  });
+
+  // The method check sits above the base-URL gate, as the old inline routes did: a non-GET
+  // well-known request falls through to the 404 handler rather than being answered 503.
+  it("leaves a non-GET well-known request to the caller even when OAUTH_REDIRECT_BASE_URL is unset", () => {
+    for (const pathname of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname, "POST"), asRes(res), pathname, null)).toBe(false);
+      expect(res.statusCode).toBe(0);
+    }
+  });
+
+  it("leaves /mcp itself and unrelated paths to the caller", () => {
+    for (const pathname of ["/mcp", "/admin", "/api/auth/providers"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname), asRes(res), pathname, BASE_URL)).toBe(false);
+      expect(res.statusCode).toBe(0);
+    }
+  });
+});
+
 // ---------- Unit: client registration ----------
 
 describe("handleMcpClientRegistration", () => {

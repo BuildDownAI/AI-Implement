@@ -165,7 +165,8 @@ Placeholder. [AII-702](https://linear.app/eudoxus/issue/AII-702/accept-a-run-cap
 | Condition | Answer |
 | -- | -- |
 | No or invalid token, or identity no longer allowlisted | 401 |
-| `OAUTH_REDIRECT_BASE_URL` unset | 503 to every caller |
+| `OAUTH_REDIRECT_BASE_URL` unset | 503 to every caller, on `/mcp` and on the OAuth and `.well-known` routes (`routeMcpOAuth`, `src/mcp-oauth.ts`) |
+| No KG sidecar (`KG_SIDECAR_URL` unset) | Not a failure: sign-in and every non-`kg_*` tool still serve; only the `kg_*` tools are absent (row below) |
 | Allowlist unreadable | 503 |
 | `kg_*` call with no provider, or a capability the provider lacks | tool result `isError: true` with the pre-migration text (`no memory provider is configured` / `Tool not supported by this memory provider: <tool>`); the tool is also absent from `tools/list` |
 | Any handler call — read or write — while Restate is unreachable | 503 `restate-unavailable`; `initialize` and `get_session_identity` still answer, since neither is a Restate handler — `get_session_identity`'s `refresh` field degrades to `null` rather than erroring |
