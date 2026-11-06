@@ -133,7 +133,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     try {
       const mapping = requireMapping(getMapping, run.teamKey);
       const provider = await input.resolveProvider(mapping);
-      const found = await provider.findByKey(run.issueIdentifier);
+      const found = await provider.findByKey(run.issueIdentifier, run.teamKey);
       if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
       const issue = withRunScope(found, run);
       const admission = readAdmission(run.dispatchId);
@@ -165,7 +165,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     try {
       const mapping = requireMapping(getMapping, run.teamKey);
       const provider = await input.resolveProvider(mapping);
-      const found = await provider.findByKey(run.issueIdentifier);
+      const found = await provider.findByKey(run.issueIdentifier, run.teamKey);
       if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
       const issue = withRunScope(found, run);
       const admission = readAdmission(run.dispatchId);

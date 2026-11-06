@@ -1396,6 +1396,56 @@ describe("JiraProvider.findByKey", () => {
     const p = makeProvider({ cacheScope: "c-fbk2", mappings: {} });
     expect(await p.findByKey("MISS-1")).toBeNull();
   });
+
+  it("converts an ADF description to text without a scope key", async () => {
+    // API v3 returns the description as ADF; reading only strings made it always null.
+    fakeFetch({
+      [`GET ${API}/issue/PROJ-1` as const]: {
+        json: { id: "10001", key: "PROJ-1", fields: { summary: "Hello", description: adfDoc("World"), status: { name: "In Progress" } } },
+      },
+    }).install();
+    const p = makeProvider({ cacheScope: "c-fbk-adf", mappings: {} });
+    expect((await p.findByKey("PROJ-1"))?.description).toBe("World");
+  });
+
+  it("with a scope key, returns the issue the poll builds for that mapping", async () => {
+    // Restate planning and implementation runs rebuild their issue here; it must match the poll's copy.
+    clearFieldCache();
+    const fake = fakeFetch({
+      [FIELDS]: {
+        json: [
+          selectField("customfield_10100", "AI-Implement Status"),
+          selectField("customfield_10101", "AI-Implement Repo"),
+          { id: "customfield_10200", name: "AI-Implement Profiles", custom: true, schema: {} },
+          { id: "customfield_10300", name: "AI-Implement Base Branch", custom: true, schema: { type: "string" } },
+        ],
+      },
+      [`GET ${API}/issue/PROJ-1` as const]: {
+        json: {
+          id: "10001", key: "PROJ-1",
+          fields: {
+            summary: "Hello",
+            description: adfDoc("World"),
+            assignee: { displayName: "Ada Lovelace" },
+            customfield_10100: { value: "Ready" },
+            customfield_10200: [{ value: "backend" }],
+            customfield_10300: "release/1",
+          },
+        },
+      },
+    }).install();
+    const p = makeProvider({ cacheScope: "c-fbk-scoped", mappings: { "acme/x": jiraMapping() } });
+    const issue = await p.findByKey("PROJ-1", "acme/x");
+    expect(issue).toEqual({
+      id: "10001", identifier: "PROJ-1", title: "Hello", description: "World",
+      scopeKey: "acme/x", nativeStatus: "Ready", profiles: ["backend"], baseBranch: "release/1",
+      assigneeName: "Ada Lovelace",
+    });
+    const issueUrl = fake.calls.find((c) => c.path === `${API}/issue/PROJ-1`)!.url.href;
+    expect(issueUrl).toContain("customfield_10200");
+    expect(issueUrl).toContain("customfield_10300");
+    expect(issueUrl).toContain("assignee");
+  });
 });
 
 describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {

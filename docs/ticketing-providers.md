@@ -38,6 +38,13 @@ Comments: the search response embeds a capped comment list with its `total`. Onl
 
 Selection (`src/poll-selection.ts`) then matches each issue to a mapping by `scopeKey`.
 
+## Looking up an issue by key
+
+`findByKey(key, scopeKey?)` reads one issue outside the poll. A Linear key names its team, so Linear always returns the team as the scope key. A Jira key does not name the mapping:
+
+- **With `scopeKey`**, Jira reads the fields that mapping's poll reads and builds the issue the same way: scope key, description as text, profiles, base branch and assignee. The Restate planning and implementation runs use this form, with the run's team key (the scope key the poll dispatched with). Without it, those runs saw only the issue title, with no profiles or base branch.
+- **Without `scopeKey`** (an admin lookup, a review-fix description), Jira returns `scopeKey: ""` and does not read the custom fields. The description is still converted from ADF to text.
+
 ## Tracker state after each planning outcome
 
 | Outcome | Jira | Linear |
