@@ -184,9 +184,9 @@ The numeric variables are parsed by four different expressions, and a blank or n
 
 ## The database path
 
-`resolveDbPath` (`src/dedup.ts`) runs once, when `src/dedup.ts` is first imported, before `main()`. It takes `DEDUP_DB_PATH`, or `/data/dedup.sqlite` when that is unset or blank, and creates its directory with `mkdirSync(…, { recursive: true })`.
+`resolveDbPath` (`src/dedup.ts`) runs once, at the first `getDb()` or `getDatabasePath()` call, which on the server is `initMappingsTable()` at the top of `main()`. Importing `src/dedup.ts` creates nothing, so a command that reaches it through its imports without opening the database (the provisioning command) leaves no directory and logs no fallback. It takes `DEDUP_DB_PATH`, or `/data/dedup.sqlite` when that is unset or blank, and creates its directory with `mkdirSync(…, { recursive: true })`.
 
-When creating the directory fails with `EACCES`, `ENOENT`, `EPERM` or `EROFS`, it logs `[db] Cannot create <dir> (<code>), falling back to /tmp/ai-implement.sqlite` and uses `/tmp/ai-implement.sqlite`. Any other error (for example `ENOTDIR`, when a path component is a file) is rethrown during the import and the process does not start. `getDatabasePath()` reports the path in use, the configured one, and whether the fallback was taken.
+When creating the directory fails with `EACCES`, `ENOENT`, `EPERM` or `EROFS`, it logs `[db] Cannot create <dir> (<code>), falling back to /tmp/ai-implement.sqlite` and uses `/tmp/ai-implement.sqlite`. Any other error (for example `ENOTDIR`, when a path component is a file) is rethrown from that first call, and the server exits through `[main] Fatal startup error:`. The result is kept for the life of the process, so `getDatabasePath()` always reports the path the open database uses, the configured one, and whether the fallback was taken.
 
 The fallback covers only the directory step. An error opening the database file itself is not caught there: it surfaces from the first `getDb()` call, which is `initMappingsTable()` at the top of `main()`, and the process exits through `[main] Fatal startup error:`.
 

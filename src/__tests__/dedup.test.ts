@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, onTestFinished, vi } from "vitest";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import type * as DedupModule from "../dedup.js";
 import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
 let dbPath: string;
 let dedup: typeof DedupModule;
@@ -701,7 +703,22 @@ describe("getDatabasePath", () => {
     expect(dedup.getDatabasePath()).toEqual({ path: dbPath, configured: dbPath, fellBack: false });
   });
 
-  // The path resolves when dedup.ts is first imported, so each case mocks fs and imports a fresh copy.
+  // A command that imports a database module without opening the database, such as provision-client, must leave no directory and log no fallback.
+  it("creates nothing when imported, and the directory on first use", async () => {
+    const dir = join(testDir("dedup-path"), "not-yet");
+    vi.stubEnv("DEDUP_DB_PATH", join(dir, "dedup.sqlite"));
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+    });
+    vi.resetModules();
+    const fresh = await import("../dedup.js");
+
+    expect(existsSync(dir)).toBe(false);
+    expect(fresh.getDatabasePath()).toMatchObject({ path: join(dir, "dedup.sqlite"), fellBack: false });
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  // The path resolves once per module copy, on first use, so each case mocks fs and imports a fresh copy.
   it.each(["EACCES", "ENOENT", "EPERM", "EROFS"])("falls back to /tmp, and says so, when creating the directory fails with %s", async (code) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.doMock("fs", async (importOriginal) => ({
@@ -718,6 +735,32 @@ describe("getDatabasePath", () => {
     const fresh = await import("../dedup.js");
     expect(fresh.getDatabasePath()).toEqual({ path: "/tmp/ai-implement.sqlite", configured: dbPath, fellBack: true });
     expect(String(warn.mock.calls[0][0])).toContain(`(${code}), falling back to /tmp/ai-implement.sqlite`);
+  });
+
+  // volume.database reads this to say where the open database lives, so it must not change once the database has a path.
+  it("keeps reporting a fallback after the directory becomes creatable", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let failures = 1;
+    vi.doMock("fs", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("fs")>();
+      return {
+        ...actual,
+        mkdirSync: (...args: Parameters<typeof actual.mkdirSync>) => {
+          if (failures-- > 0) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+          return actual.mkdirSync(...args);
+        },
+      };
+    });
+    onTestFinished(() => {
+      vi.doUnmock("fs");
+      warn.mockRestore();
+    });
+    vi.resetModules();
+    const fresh = await import("../dedup.js");
+
+    expect(fresh.getDatabasePath().fellBack).toBe(true);
+    expect(fresh.getDatabasePath().fellBack).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });
 
