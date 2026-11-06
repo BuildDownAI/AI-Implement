@@ -2,7 +2,7 @@
 
 How an orchestrator instance is deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
 
-Reference for `src/deploy.ts`, `npm run provision-client --`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
+Reference for `src/deploy.ts`, `src/provision-client.ts`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
 
 ## GitHub App permissions (install prerequisite)
 
@@ -218,27 +218,45 @@ A fork that carries `custom/` overrides should not use this path. It updates by 
 
 ## Client instances
 
-Each client is a separate Fly app described by a file in `clients/<slug>.toml`. Copy `clients/example-client.toml` to start, or use the guided helper:
+Each client is a separate Fly app described by a file in `clients/<slug>.toml`. Copy `clients/example-client.toml` to start, or let the provisioning command (`src/provision-client.ts`) write it:
 
 ```bash
 npm run provision-client -- <client-slug>
 ```
 
-The command reads an existing client file without replacing it. It discovers apps, volumes and secret names through Fly JSON listings. It collects credentials with hidden prompts and validates the proposed environment with the same setup checks the orchestrator uses before writing the client file or changing Fly resources. Secrets are imported together over stdin, including the PEM with literal `\n` escapes. Empty answers keep existing secrets. Once the sessions seed is set, change the sessions app on `/admin#settings` instead.
+The command sets up a self-hosted orchestrator in the operator's own Fly organization, the counterpart of the control plane's set-up, and is run again to change its secrets or add target repositories. The slug takes lowercase letters, digits and hyphens; anything else exits 2.
 
-Choose Google or Microsoft sign-in and Linear or Jira ticketing. Register the two redirect addresses the command prints in the sign-in provider console. Microsoft requires a single-tenant ID. Deploy tokens are app-scoped, the orchestrator deploy token expires after one year, and the optional break-glass code is shown once. Changing `RUNNER_TOKEN_SECRET` makes stored model credentials unreadable until they are re-keyed.
+It opens by saying what it will do and linking the docs site's step-by-step guide, and each question says what its value is for and where to find it, with an example when the value has a known shape. Anything typed while the command is busy is dropped before the next question, so it cannot answer one unseen.
 
-API keys belong in an account profile on Models & providers. Opt each project in on its Agents tab before dispatching. Claude subscription projects instead use the legacy token path. The command prints the repository secret commands and guides project creation through the New project stepper.
+**Before any question** it lists the Fly apps, and the orchestrator app's secret names when that app exists. Fly lists secret names, never values. If `flyctl` is missing or signed out, it stops with exit 1 and nothing changed. For a new client it asks the orchestrator app's name, organization and region, then the sessions app's, whose organization and region default to the orchestrator's.
 
-On reruns, an existing `FLY_SESSIONS_APP` means the saved runner settings own the sessions app. The command leaves both seed variables alone and does not create the local sessions app. If its token is missing, enter the active app name from `/admin#settings` explicitly. Initial Fly discovery failures stop without writes and print the setup retry, deploy, health and remote check commands.
+**The client file** is written for a new client and never replaced after. The command adds an `[answers]` table, which it keeps last, remembering the GitHub App ID, the `.pem` path, both base URLs and `KG_SOURCE_REPO`, none of them secret, so a rerun's knowledge-graph build and closing commands need no question. Everything above that table, an operator's comments included, is kept as written.
 
-Deploy, health waiting and remote setup checks each ask first. Builds use this checkout and its source stamps, including a fork's own repository, and select the client's region. Without a knowledge graph, no GitHub build credential is needed. KG builds require local Docker with BuildKit and use its `--secret id=kg_token,src=/dev/stdin` transport with the token captured from `gh auth token`. The command pushes the image to Fly's registry and deploys it with `--image`. This differs from the manual remote build because flyctl v0.5.4 only accepts literal build-secret arguments. The token never enters process arguments. Declined or unavailable operations print their exact commands. The KG retry commands use an exported token and Docker’s environment secret source, keeping the token out of arguments.
+**The questions**, in order:
 
-Existing secret values are unavailable from Fly listings. Local preflight validates new values and defers checks that require retained values to the remote setup checks. The remote checks also inspect the saved admin allowlist, which can override environment values.
+- **Sign-in:** the admin addresses (`OAUTH_ALLOWED_EMAILS`), `RUNNER_CALLBACK_BASE_URL` and `OAUTH_REDIRECT_BASE_URL` (both default to `https://<app>.fly.dev`), then Google or Microsoft. Once the provider is chosen it prints the two redirect addresses to register in the sign-in application, before asking that provider's client credentials, and for Microsoft a single-tenant ID.
+- **The ticketing system:** Linear or Jira, and only its own variables. Jira takes basic authentication or OAuth. Switching an instance to OAuth clears `JIRA_EMAIL` after a confirmation, since basic authentication wins while it is set.
+- **The GitHub App:** its ID, and the path to its `.pem` file, where a leading `~` is the home directory.
+- **Models:** whether projects run on a Claude subscription, which asks `CLAUDE_CODE_OAUTH_TOKEN` for the legacy path. A model API key is never asked; it belongs in an account profile on Models & providers.
+- **Optional:** `NOTIFY_TYPE` and `NOTIFY_WEBHOOK_URL`.
+- **`KG_SOURCE_REPO`:** asked on every run, since the build bakes it into the image rather than Fly holding it. On a new client Enter builds without a knowledge graph; once the client file remembers one, Enter keeps it, so a rerun cannot drop the graph.
+- **A break-glass `ADMIN_ACCESS_CODE`**, if wanted, and then the target repositories, one at a time. Their jobs run in GitHub Actions by default and read the GitHub App pair, and on a subscription the Claude token, as repository secrets, so the command prints the `gh secret set` commands for each one at the end. Entering none skips them.
+
+`RUNNER_TOKEN_SECRET` and `GITHUB_WEBHOOK_SECRET` are generated, and `FLY_DEPLOY_TOKEN` (scoped to the orchestrator app, expiring after one year) and `FLY_SESSIONS_TOKEN` (scoped to the sessions app) are minted as deploy tokens; each of the four is kept when it is already set. Secrets are read with hidden prompts and everything else in the open, and an answer that is refused is asked again, up to three times.
+
+**Every answer is judged before anything is written,** by the setup checks that read only the environment: the `env.*` and `admin.*` checks and `callback.config`. The sign-in and GitHub App checks run as soon as their group is answered, and a group that fails is asked again, with Enter keeping each earlier answer; a last pass runs over every answer. A value already on Fly cannot be read, so a check that rests on one is confirmed only by the setup checks on the orchestrator after the deploy, which also see an admin allowlist saved there.
+
+**Then it writes,** in this order, naming each step as it starts: the client file, the apps that are missing, the deploy tokens, one `flyctl secrets import` over stdin carrying every value (the PEM on one line with literal `\n` escapes), and a `dedup_data` volume in the client's region when there is none. It prints the break-glass code once.
+
+**The deploy, the health wait and the setup checks each ask first.** The deploy is § Manual deploy's remote build of this checkout, stamped with its commit, its branch and its GitHub `origin` repository so a fork deploys itself, with `--primary-region` set to the client's region (`fly.toml` pins `iad`) and `--ha=false` for one machine. A knowledge-graph build gets an App installation token with `contents: read` on that one repository, minted as self-deploy mints it. It is the one secret passed as an argument, since flyctl takes a build secret only that way, and it expires within the hour. When the App cannot read the repository, the command says so and offers a deploy without a knowledge graph. flyctl's output is shown as it runs, line by line, with every secret this run holds redacted, the build token included, since a failed build can echo it. The health wait polls `GET /` for up to 15 minutes and says each minute how long it has waited, and the setup checks run `node /app/dist/check-setup.js` over `flyctl ssh console`, with every secret this run set redacted from their output. Whatever is declined or fails is printed under "Still to run"; a knowledge-graph deploy is re-run through the command, since its token has no hand-run form.
+
+Last, it prints the `gh secret set` commands for each target repository, the GitHub App webhook's address and events, the command that reads the webhook secret, a reminder of the two redirect addresses, the access-recovery command, and a link to the docs site's guide to adding a project and choosing its model access. Anything to copy sits on a line of its own. A rerun that keeps every value in a group shows no heading for it. It exits with the setup checks' own code when they fail, and 1 when the preflight, the health wait or another step failed.
+
+**On a re-run** it offers to keep every value already set and ask only what is missing. Changing `RUNNER_TOKEN_SECRET` makes every stored model credential unreadable, so each one has to be entered again. The orchestrator takes its sessions app from `FLY_SESSIONS_APP` once, at its first boot (seed-once), so the command treats the seed as taken once the orchestrator app has a release, and sets it again on a rerun before any deploy. Once it is taken, the saved runner settings own the sessions app: the command leaves both sessions seed variables alone and creates no sessions app, and the sessions app is changed on `/admin#settings`. If `FLY_SESSIONS_TOKEN` is missing then, it asks the active sessions app's name from `/admin#settings`, so the token is minted for the right app.
 
 The Fly volume `dedup_data` mounts at `/data` and holds the SQLite database. Only the GitHub App pair is required for the orchestrator to boot; ticketing credentials are needed for it to poll anything. See `.env.example` for the full set.
 
-Once the instance is deployed, run the setup checks on it: `fly ssh console --app <app_name> -C "node /app/dist/check-setup.js"`. It exits 0, or names each fault with its fix ([setup-checks.md](setup-checks.md)).
+To run the setup checks on a deployed instance again later: `fly ssh console --app <app_name> -C "node /app/dist/check-setup.js"`. It exits 0, or names each fault with its fix ([setup-checks.md](setup-checks.md)).
 
 At boot the orchestrator sets the snapshot retention of every volume in its own Fly app to the `volume_snapshot_retention_days` setting (default 14 days; Fly's own default is 5, its range 1–60), using `FLY_DEPLOY_TOKEN` and the injected `FLY_APP_NAME` through the Machines API (`src/fly-volumes.ts`). Only volumes whose retention differs are updated, and every volume in the app is covered, not just `dedup_data`. The volume also holds the Restate store under `/data/restate`, so a longer window keeps Restate history recoverable. A Fly error or a missing token or app name is logged as `[fly-volumes] snapshot retention not applied: <reason>` and never blocks boot; local runs have neither and always log it. The value is changed on `/admin#deployments` (Retention card, `GET`/`POST /api/retention`): a new volume value is applied to the Fly volumes at once, while a new `restate_retention_days` value applies at the next deploy or restart.
 
