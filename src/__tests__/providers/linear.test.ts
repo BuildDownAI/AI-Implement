@@ -614,6 +614,29 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     expect(snap.readyForImplementation).toEqual([]);
   });
 
+  it("skips issues parked for a human (AI-Needs-Human), even with the pickup label", async () => {
+    singlePage([
+      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "AI-Needs-Human"] }),
+      issueNode({ id: "b", identifier: "ENG-2", labels: ["AI-Implement"] }),
+    ]);
+
+    const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.id)).toEqual(["b"]);
+    expect(snap.readyForImplementation).toEqual([]);
+  });
+
+  it("does not count a half-parked issue (AI-Working + AI-Needs-Human) against capacity", async () => {
+    singlePage([
+      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "AI-Working", "AI-Needs-Human"] }),
+      issueNode({ id: "b", identifier: "ENG-2", labels: ["AI-Implement", "AI-Working"] }),
+    ]);
+
+    const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+
+    expect(snap.inProgressCountsByScope).toEqual({ ENG: 1 });
+  });
+
   it("skips issues with Ready for Review label", async () => {
     singlePage([
       issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "Ready for Review"] }),
@@ -1069,6 +1092,61 @@ describe("LinearProvider.markPrReady", () => {
   });
 });
 
+describe("LinearProvider.parkForHuman", () => {
+  it("adds AI-Needs-Human first, removes AI-Working and AI-Planning, and keeps the pickup label", async () => {
+    const fake = linear(
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" } } }),
+      data({ issue: { labels: { nodes: [
+        { id: "lw", name: "AI-Working" }, { id: "lp", name: "AI-Planning" },
+        { id: "li", name: "AI-Implement" }, { id: "lnh", name: "AI-Needs-Human" },
+      ] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ issue: { labels: { nodes: [
+        { id: "lp", name: "AI-Planning" }, { id: "li", name: "AI-Implement" }, { id: "lnh", name: "AI-Needs-Human" },
+      ] } } }),
+      data({ issueUpdate: { success: true } }),
+    );
+
+    const p = new LinearProvider({});
+    const internals = p as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    const ensure = vi.spyOn(internals, "ensureTeamLabel").mockResolvedValue("lnh");
+    const add = vi.spyOn(internals, "addLabelToIssue").mockResolvedValue(undefined);
+
+    await expect(p.parkForHuman("issue-1", "ENG", "implementation")).resolves.toBe(true);
+
+    expect(ensure).toHaveBeenCalledWith("ENG", expect.objectContaining({ name: "AI-Needs-Human" }), expect.any(Map));
+    expect(add).toHaveBeenCalledWith("issue-1", "lnh");
+    expect(fake.calls).toHaveLength(5);
+    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", labelIds: ["li", "lnh"] });
+  });
+
+  it("puts the marker on before any label comes off", async () => {
+    linear(
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" } } }),
+      data({ issue: { labels: { nodes: [{ id: "li", name: "AI-Implement" }] } } }),
+      data({ issue: { labels: { nodes: [{ id: "li", name: "AI-Implement" }] } } }),
+    );
+    const p = new LinearProvider({});
+    const order: string[] = [];
+    const internals = p as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    vi.spyOn(internals, "ensureTeamLabel").mockResolvedValue("lnh");
+    vi.spyOn(internals, "addLabelToIssue").mockImplementation(async () => { order.push("add"); });
+    const remove = internals.removeLabelByName.bind(p);
+    vi.spyOn(internals, "removeLabelByName").mockImplementation(async (...a: unknown[]) => { order.push("remove"); return remove(...a); });
+
+    await p.parkForHuman("issue-1", "ENG", "planning");
+
+    expect(order).toEqual(["add", "remove", "remove"]);
+  });
+
+  it.each(["completed", "canceled"])("returns false and changes nothing on a %s issue", async (type) => {
+    const fake = linear(data({ issue: { state: { type }, team: { key: "ENG" } } }));
+    const p = new LinearProvider({});
+    await expect(p.parkForHuman("issue-1", "ENG", "implementation")).resolves.toBe(false);
+    expect(fake.calls).toHaveLength(1);
+  });
+});
+
 describe("LinearProvider.clearWorkingState", () => {
   it("removes the AI-Working label from the issue", async () => {
     const fake = linear(
@@ -1079,7 +1157,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "ENG");
+    await p.clearWorkingState("issue-1", "ENG", "implementation");
 
     expect(fake.calls).toHaveLength(3);
     expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
@@ -1095,7 +1173,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "ENG");
+    await p.clearWorkingState("issue-1", "ENG", "implementation");
 
     expect(fake.calls).toHaveLength(3);
     expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
@@ -1109,7 +1187,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "ENG");
+    await p.clearWorkingState("issue-1", "ENG", "implementation");
 
     expect(fake.calls).toHaveLength(2);
   });
@@ -1122,7 +1200,7 @@ describe("LinearProvider.clearWorkingState", () => {
     );
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "ENG");
+    await p.clearWorkingState("issue-1", "ENG", "implementation");
 
     // Two labels-fetch queries run; no update mutation when there's nothing to remove
     expect(fake.calls).toHaveLength(2);
@@ -1377,7 +1455,7 @@ describe("LinearProvider.fetchSetupFacts", () => {
     expect(query).not.toMatch(/\bmutation\b/);
     expect(variables(fake, 0)).toEqual({
       keys: ["ENG", "OPS"],
-      names: ["AI-Implement", "AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review"].map((name) => ({ name: { eqIgnoreCase: name } })),
+      names: ["AI-Implement", "AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review", "AI-Needs-Human"].map((name) => ({ name: { eqIgnoreCase: name } })),
     });
   });
 
@@ -1414,6 +1492,7 @@ describe("LinearProvider.fetchSetupFacts", () => {
         "Plan-Complete": [],
         "AI-Working": [{ name: "ai-working", teamKey: "ENG" }],
         "Ready for Review": [{ name: "Ready for Review", teamKey: null }],
+        "AI-Needs-Human": [],
       },
     });
   });

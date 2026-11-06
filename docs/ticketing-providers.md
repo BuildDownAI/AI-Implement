@@ -53,6 +53,19 @@ A Jira `AI-Implement Status` field needs these options: `Ready`, `Planning`, `Pl
 
 The filesystem provider ignores `awaitApproval` as well. A parked issue needs **Unpark** at `/admin#runners` before it dispatches again.
 
+## Tracker state after a failed, stuck or given-up run
+
+Two provider verbs move a ticket after a run that did not finish. Both take the phase of the run (`planning` or `implementation`) and both refuse an issue that is already terminal (return `false`).
+
+| Verb | Used by | Jira | Linear | Filesystem |
+|---|---|---|---|---|
+| `clearWorkingState(id, scope, phase)`: put the issue back in pickup | Retries within `STUCK_JOB_MAX_ATTEMPTS`, the reaper, operator cancel, admin job destroy | planning: `Ready`; implementation: `Plan Approved` | `AI-Working` and `AI-Planning` removed | `ready` or `plan-approved`, from the task's own state |
+| `parkForHuman(id, scope, phase)`: take the issue out of pickup, no comment | The stuck watchdog's give-up (`src/stuck-watchdog.ts`) | planning: `Planning Failed`; implementation: `Implementation Failed` | `AI-Needs-Human` added first, then `AI-Working` and `AI-Planning` removed; the pickup label stays | Task `failed`, then archived by the failure reconciler |
+
+A planning reset goes to `Ready`, not `Plan Approved`: a planning run that failed left no approved plan, and `Plan Approved` would dispatch implementation. A fix run (job phase `gap-analysis`) is never reset or parked; its ticket already has a PR.
+
+On give-up, the watchdog parks first and only then clears the dedup row and the stuck-attempt counter, so a restarted ticket gets a full retry budget. When the park throws or is refused, the row and the counter stay. The give-up comment ends with the restart step: on Linear, remove the `AI-Needs-Human` label; on Jira and the filesystem provider, reset the AI-Implement status or label.
+
 ## Mapping keys
 
 Mapping keys share one namespace across providers. A Linear mapping's key must equal the Linear team key. A Jira mapping's key is an operator-chosen label.
@@ -81,7 +94,7 @@ The poll matches the pickup label by its exact name (`labels: { name: { eq } }`)
 
 ### Lifecycle labels
 
-The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working` and, once a PR opens, `Ready for Review`. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
+The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working`, once a PR opens `Ready for Review`, and, when the stuck watchdog gives up, `AI-Needs-Human`. The poll skips an issue carrying `AI-Needs-Human` before it counts capacity, so a park that added the marker but failed to remove `AI-Working` does not hold a slot. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
 
 ### Workflow states
 

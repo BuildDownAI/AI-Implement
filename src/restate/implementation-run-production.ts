@@ -452,7 +452,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         },
         clearWorkingState: async (job) => {
           const provider = await providerForJob(job);
-          if (provider && job.issueId) await provider.clearWorkingState(job.issueId, job.teamKey ?? "");
+          if (provider && job.issueId) await provider.clearWorkingState(job.issueId, job.teamKey ?? "", "implementation");
         },
       },
       dispatchId,

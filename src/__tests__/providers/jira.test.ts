@@ -314,7 +314,7 @@ describe("JiraProvider lifecycle status setters", () => {
     // dedup cannot re-dispatch already-merged work.
     const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install(); // guard pre-read
     const p = makeProvider({ cacheScope: "c7-merged", mappings: { "acme/x": jiraMapping() } });
-    await p.clearWorkingState("10001", "acme/x");
+    await p.clearWorkingState("10001", "acme/x", "implementation");
     // Pre-read is the last request: no setField PUT happened.
     expect(fake.calls).toHaveLength(2);
   });
@@ -380,9 +380,41 @@ describe("JiraProvider lifecycle status setters", () => {
   it("clearWorkingState resets status to Plan Approved", async () => {
     const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
     const p = makeProvider({ cacheScope: "c7", mappings: { "acme/x": jiraMapping() } });
-    await p.clearWorkingState("10001", "acme/x");
+    await p.clearWorkingState("10001", "acme/x", "implementation");
     expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
     expectStatusBody(fake, "Plan Approved");
+  });
+
+  it("clearWorkingState resets a failed planning run to Ready, not Plan Approved", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Planning"), [STATUS_WRITE]: written }).install();
+    const p = makeProvider({ cacheScope: "c7-planning", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.clearWorkingState("10001", "acme/x", "planning")).resolves.toBe(true);
+    expectStatusBody(fake, "Ready");
+  });
+
+  it("clearWorkingState leaves an already-Merged issue at Merged for the planning phase too", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install();
+    const p = makeProvider({ cacheScope: "c7-merged-planning", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.clearWorkingState("10001", "acme/x", "planning")).resolves.toBe(false);
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it.each([
+    ["planning", "Planning Failed"],
+    ["implementation", "Implementation Failed"],
+  ] as const)("parkForHuman for %s sets %s and posts no comment", async (phase, status) => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Implementing"), [STATUS_WRITE]: written }).install();
+    const p = makeProvider({ cacheScope: `c-park-${phase}`, mappings: { "acme/x": jiraMapping() } });
+    await expect(p.parkForHuman("10001", "acme/x", phase)).resolves.toBe(true);
+    expect(methods(fake)).toEqual(["GET", "GET", "PUT"]);
+    expectStatusBody(fake, status);
+  });
+
+  it("parkForHuman returns false and writes nothing on an already-Merged issue", async () => {
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: statusRead("Merged") }).install();
+    const p = makeProvider({ cacheScope: "c-park-merged", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.parkForHuman("10001", "acme/x", "implementation")).resolves.toBe(false);
+    expect(fake.calls).toHaveLength(2);
   });
 
   it("markMerged sets status to Merged using the supplied scopeKey", async () => {

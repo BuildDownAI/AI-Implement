@@ -413,7 +413,7 @@ describe("production deps", () => {
       vi.mocked(getJobByDispatchId).mockReturnValue({ ...failedJob, conclusion: "operator_cancelled" });
       const { d } = compose();
       expect(await d.finishJob("d-1", { kind: "run_ended" })).toEqual({ release: "cancelled" });
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("i-1", "ENG");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("i-1", "ENG", "implementation");
     });
 
     it("at the deadline with no callback remediates the stuck job with ownerCall: true", async () => {

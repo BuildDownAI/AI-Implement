@@ -133,7 +133,7 @@ describe("remediateStuckJob", () => {
       await remediateStuckJob(mockConfig, provider, job, "queued");
 
       expect(updateJobStatus).toHaveBeenCalledWith(job.id, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(provider.postComment).not.toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
@@ -172,14 +172,15 @@ describe("remediateStuckJob", () => {
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
 
-    it("clears working state but does NOT clear dedup on hard-stop", async () => {
+    it("parks the ticket, then clears dedup, on hard-stop", async () => {
       vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
       const provider = makeProvider();
 
       await remediateStuckJob(mockConfig, provider, stuckJob(), "queued");
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
-      expect(deleteDispatched).not.toHaveBeenCalled();
+      expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
+      expect(provider.clearWorkingState).not.toHaveBeenCalled();
+      expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
     });
 
     it("fires notifyStuckGiveUp on hard-stop", async () => {
@@ -274,9 +275,9 @@ describe("remediateStuckJob", () => {
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
     });
 
-    it("preserves dedup on hard-stop so poller cannot re-pick the issue", async () => {
+    it("keeps dedup on hard-stop when the park is refused, so the poller cannot re-pick the issue", async () => {
       vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
-      const provider = makeProvider();
+      const provider = makeProvider({ parkForHuman: vi.fn().mockResolvedValue(false) });
 
       await remediateStuckJob(mockConfig, provider, stuckJob(), "queued");
 
@@ -288,21 +289,23 @@ describe("remediateStuckJob", () => {
     it("calls clearWorkingState for a stuck planning job (requeue path)", async () => {
       vi.mocked(incrementStuckAttempts).mockReturnValue(1);
       const provider = makeProvider();
-      const job = stuckJob({ executionMode: "planning" });
+      const job = stuckJob({ executionMode: "planning", phase: "planning" });
 
       await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
+      // Planning phase: Jira resets to Ready, not Plan Approved.
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
     });
 
-    it("calls clearWorkingState for a stuck planning job (hard-stop path)", async () => {
+    it("parks a stuck planning job with the planning phase (hard-stop path)", async () => {
       vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
       const provider = makeProvider();
-      const job = stuckJob({ executionMode: "planning" });
+      const job = stuckJob({ executionMode: "planning", phase: "planning" });
 
       await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
+      expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
+      expect(provider.clearWorkingState).not.toHaveBeenCalled();
     });
   });
 

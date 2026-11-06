@@ -2971,7 +2971,7 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
     return;
   }
   try {
-    const applied = await provider.clearWorkingState(job.issueId, job.teamKey);
+    const applied = await provider.clearWorkingState(job.issueId, job.teamKey, job.phase === "planning" ? "planning" : "implementation");
 
     // Clear the dedup entry so the issue can be re-dispatched. Safe even when the
     // reset was refused (issue already Merged): the dispatch bucket only selects

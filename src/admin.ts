@@ -2090,12 +2090,13 @@ async function handleDestroySession(
 
   if (job) {
     updateJobStatus(job.id, "failed", "destroyed-by-admin");
-    if (job.issueId) {
+    // A gap-analysis job's ticket already has a PR; a reset would start a new implementation run.
+    if (job.issueId && job.phase !== "gap-analysis") {
       try {
         const mapping = job.teamKey ? getMappings()[job.teamKey] : undefined;
         if (mapping) {
           const provider = await registry.forMapping(mapping);
-          await provider.clearWorkingState(job.issueId, job.teamKey!);
+          await provider.clearWorkingState(job.issueId, job.teamKey!, job.phase === "planning" ? "planning" : "implementation");
           deleteDispatched(job.issueId);
         } else {
           console.warn(
