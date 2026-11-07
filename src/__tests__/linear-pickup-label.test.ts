@@ -284,3 +284,21 @@ describe("LinearProvider.fetchSetupFacts — pickup label", () => {
     expect((lastCallBody().variables.names as unknown[])[0]).toEqual({ name: { eqIgnoreCase: "AI Implement - New" } });
   });
 });
+
+describe("LinearProvider.fetchFeatureNodeRollUps — parked child", () => {
+  it("defers the roll-up while a parked child (pickup label + AI-Needs-Human) is not terminal", async () => {
+    linearAnswers({ issues: { nodes: [{
+      id: "node-id",
+      identifier: "ENG-1",
+      description: null,
+      team: { key: "ENG" },
+      children: { nodes: [
+        { identifier: "ENG-1-c0", state: { type: "completed" }, labels: { nodes: [{ name: "AI-Implement" }] } },
+        { identifier: "ENG-1-c1", state: { type: "started" }, labels: { nodes: [{ name: "AI-Implement" }, { name: "AI-Needs-Human" }] } },
+      ] },
+      parent: null,
+    }] } });
+    const p = new LinearProvider({});
+    expect(await p.fetchFeatureNodeRollUps()).toEqual([]);
+  });
+});

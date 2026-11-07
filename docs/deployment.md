@@ -2,7 +2,7 @@
 
 How an orchestrator instance is deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
 
-Reference for `src/deploy.ts`, `scripts/provision-client.sh`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
+Reference for `src/deploy.ts`, `src/provision-client.ts`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
 
 ## GitHub App permissions (install prerequisite)
 
@@ -115,7 +115,7 @@ Four things must be true, and they are not all reported the same way:
 - **`FLY_DEPLOY_TOKEN`** is set, scoped to this app. `FLY_SESSIONS_TOKEN` is a different credential and cannot deploy the orchestrator.
 - **The running image carries its source stamps.** `AI_IMPLEMENT_SOURCE_REPO` (as `owner/repo`) and `AI_IMPLEMENT_SOURCE_BRANCH` are both required; an image built without them cannot self-deploy at all. `AI_IMPLEMENT_SOURCE_COMMIT` is not required — without it a deploy still runs, but availability reports *unknown* rather than telling you a new version exists.
 - **An admin auth method is configured** — SSO providers or `ADMIN_ACCESS_CODE`. Every `/api/` route answers 503 otherwise, this one included.
-- **The GitHub App installation can read this repository.** Its token is minted at `contents: read`, scoped to the source repo. If `KG_SOURCE_REPO` is set, the installation must also cover that repository; an unset value builds sidecar-less without requiring that second grant — the orchestrator boots normally, but `/mcp` returns 503. The Docker build arg is baked into the image as a non-secret environment value so later self-deploys keep using the same graph repo unless a runtime env override changes it.
+- **The GitHub App installation can read this repository.** Its token is minted at `contents: read`, scoped to the source repo. If `KG_SOURCE_REPO` is set, the installation must also cover that repository; an unset value builds sidecar-less without requiring that second grant — the orchestrator boots normally, and `/mcp` serves without the `kg_*` tools. The Docker build arg is baked into the image as a non-secret environment value so later self-deploys keep using the same graph repo unless a runtime env override changes it.
 
 The **Watched source** fields in `/admin#deployments` — owner/repo and ref — can shadow the build stamps. When both are set, the configured repo and ref take precedence over `AI_IMPLEMENT_SOURCE_REPO` and `AI_IMPLEMENT_SOURCE_BRANCH` for availability checks and deploys; clearing either restores the stamped values. A ref selector populated from the repository's branches and tags appears on blur.
 
@@ -174,12 +174,12 @@ Then confirm the release actually serves, because booting is not serving:
 curl -s -w '\n%{http_code}\n' -X POST https://<app-name>.fly.dev/mcp -d '{}'
 ```
 
-**401 is success** — alive and OAuth-gated. **503 means it is not serving**, from either a sidecar-less image or an unset `OAUTH_REDIRECT_BASE_URL`. The two are indistinguishable by status, which is why the body is worth printing: it names the one that fired.
+**401 is success** — alive and OAuth-gated. **503 means it is not serving**: `OAUTH_REDIRECT_BASE_URL` is unset, and the body says so. A sidecar-less image still answers 401 here, because `/mcp` serves without the `kg_*` tools; check the sidecar on the health check instead — `curl -s https://<app-name>.fly.dev/`, where `sidecar.checkedAt: null` means no sidecar was probed and `sidecar.toolsListed: true` means it serves.
 
 Every flag above is load-bearing, and each was learned from a silently degraded deploy:
 
 - **`--build-secret`** — the KG is cloned at build time through it. Without it the build fail-softs to a sidecar-less image and reports success.
-- **`--build-arg KG_SOURCE_REPO`** — the GitHub `owner/repo` to clone for the sidecar. Omit it (or leave `$KG_SOURCE_REPO` unset) to build without a KG sidecar; the orchestrator boots normally but `/mcp` returns 503. Set it to a project-specific graph such as `Answer9-llc/knowledge-graph-answer9-app` when needed. URLs and malformed values are rejected.
+- **`--build-arg KG_SOURCE_REPO`** — the GitHub `owner/repo` to clone for the sidecar. Omit it (or leave `$KG_SOURCE_REPO` unset) to build without a KG sidecar; the orchestrator boots normally and `/mcp` serves without the `kg_*` tools. Set it to a project-specific graph such as `Answer9-llc/knowledge-graph-answer9-app` when needed. URLs and malformed values are rejected.
 - **`--no-cache`** — a build secret is not part of the layer cache key, so a repeat deploy otherwise reuses a stale, possibly sidecar-less clone layer even when the secret is present.
 - **`--build-arg SOURCE_*`** — the stamps. Omit `SOURCE_REPO` or `SOURCE_BRANCH` and the image you just deployed cannot deploy itself, which is how a manual recovery quietly disables the automatic path.
 - **`--app`** — always explicit. A default would let a fork deploy itself over the upstream app.
@@ -201,7 +201,7 @@ A Fly app can watch a branch and deploy on push, with no workflow involved. Fly 
 - **Attaching does not itself deploy.** The first deploy happens on the next push to the watched branch.
 - **The release `USER` field shows the connecting account even for integration deploys**, so it cannot distinguish an automated deploy from a manual one. Correlate by timestamp instead.
 
-**This path cannot carry the sidecar, and that is why self-deploy exists.** An integration deploy has no hook for a BuildKit build secret — no pre-deploy command, nowhere to pass `--build-secret`, no `fly.toml` key for one — so every push-triggered release ships a sidecar-less image whose `/mcp` answers 503, silently overwriting a good manual deploy. Leaving auto-deploy enabled on an app that serves `/mcp` will undo a working deploy on the next merge.
+**This path cannot carry the sidecar, and that is why self-deploy exists.** An integration deploy has no hook for a BuildKit build secret — no pre-deploy command, nowhere to pass `--build-secret`, no `fly.toml` key for one — so every push-triggered release ships a sidecar-less image, whose `/mcp` serves without the `kg_*` tools, silently overwriting a good manual deploy. Leaving auto-deploy enabled on an app that serves `/mcp` will undo a working deploy on the next merge.
 
 ### Using a public source repository
 
@@ -218,25 +218,45 @@ A fork that carries `custom/` overrides should not use this path. It updates by 
 
 ## Client instances
 
-Each client is a separate Fly app described by a file in `clients/<slug>.toml`. Copy `clients/example-client.toml` to start, or use the guided helper:
+Each client is a separate Fly app described by a file in `clients/<slug>.toml`. Copy `clients/example-client.toml` to start, or let the provisioning command (`src/provision-client.ts`) write it:
 
 ```bash
-./scripts/provision-client.sh <client-slug>
+npm run provision-client -- <client-slug>
 ```
 
-Manual equivalent:
+The command sets up a self-hosted orchestrator in the operator's own Fly organization, the counterpart of the control plane's set-up, and is run again to change its secrets or add target repositories. The slug takes lowercase letters, digits and hyphens; anything else exits 2.
 
-```bash
-cp clients/example-client.toml clients/<slug>.toml
-# edit the file, then:
-fly apps create <app_name> --org <org>
-fly volumes create dedup_data --size 1 --region iad --app <app_name>
-fly secrets set GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY=... --app <app_name>
-```
+It opens by saying what it will do and linking the docs site's step-by-step guide, and each question says what its value is for and where to find it, with an example when the value has a known shape. Anything typed while the command is busy is dropped before the next question, so it cannot answer one unseen.
+
+**Before any question** it lists the Fly apps, and the orchestrator app's secret names when that app exists. Fly lists secret names, never values. If `flyctl` is missing or signed out, it stops with exit 1 and nothing changed. For a new client it asks the orchestrator app's name, organization and region, then the sessions app's, whose organization and region default to the orchestrator's.
+
+**The client file** is written for a new client and never replaced after. The command adds an `[answers]` table, which it keeps last, remembering the GitHub App ID, the `.pem` path, both base URLs and `KG_SOURCE_REPO`, none of them secret, so a rerun's knowledge-graph build and closing commands need no question. Everything above that table, an operator's comments included, is kept as written.
+
+**The questions**, in order:
+
+- **Sign-in:** the admin addresses (`OAUTH_ALLOWED_EMAILS`), `RUNNER_CALLBACK_BASE_URL` and `OAUTH_REDIRECT_BASE_URL` (both default to `https://<app>.fly.dev`), then Google or Microsoft. Once the provider is chosen it prints the two redirect addresses to register in the sign-in application, before asking that provider's client credentials, and for Microsoft a single-tenant ID.
+- **The ticketing system:** Linear or Jira, and only its own variables. Jira takes basic authentication or OAuth. Switching an instance to OAuth clears `JIRA_EMAIL` after a confirmation, since basic authentication wins while it is set.
+- **The GitHub App:** its ID, and the path to its `.pem` file, where a leading `~` is the home directory.
+- **Models:** whether projects run on a Claude subscription, which asks `CLAUDE_CODE_OAUTH_TOKEN` for the legacy path. A model API key is never asked; it belongs in an account profile on Models & providers.
+- **Optional:** `NOTIFY_TYPE` and `NOTIFY_WEBHOOK_URL`.
+- **`KG_SOURCE_REPO`:** asked on every run, since the build bakes it into the image rather than Fly holding it. On a new client Enter builds without a knowledge graph; once the client file remembers one, Enter keeps it, so a rerun cannot drop the graph.
+- **A break-glass `ADMIN_ACCESS_CODE`**, if wanted, and then the target repositories, one at a time. Their jobs run in GitHub Actions by default and read the GitHub App pair, and on a subscription the Claude token, as repository secrets, so the command prints the `gh secret set` commands for each one at the end. Entering none skips them.
+
+`RUNNER_TOKEN_SECRET` and `GITHUB_WEBHOOK_SECRET` are generated, and `FLY_DEPLOY_TOKEN` (scoped to the orchestrator app, expiring after one year) and `FLY_SESSIONS_TOKEN` (scoped to the sessions app) are minted as deploy tokens; each of the four is kept when it is already set. Secrets are read with hidden prompts and everything else in the open, and an answer that is refused is asked again, up to three times.
+
+**Every answer is judged before anything is written,** by the setup checks that read only the environment: the `env.*` and `admin.*` checks and `callback.config`. The sign-in and GitHub App checks run as soon as their group is answered, and a group that fails is asked again, with Enter keeping each earlier answer; a last pass runs over every answer. A value already on Fly cannot be read, so a check that rests on one is confirmed only by the setup checks on the orchestrator after the deploy, which also see an admin allowlist saved there.
+
+**Then it writes,** in this order, naming each step as it starts: the client file, the apps that are missing, the deploy tokens, one `flyctl secrets import` over stdin carrying every value (the PEM on one line with literal `\n` escapes), and a `dedup_data` volume in the client's region when there is none. It prints the break-glass code once.
+
+**The deploy, the health wait and the setup checks each ask first.** The deploy is § Manual deploy's remote build of this checkout, stamped with its commit, its branch and its GitHub `origin` repository so a fork deploys itself, with `--primary-region` set to the client's region (`fly.toml` pins `iad`) and `--ha=false` for one machine. A knowledge-graph build gets an App installation token with `contents: read` on that one repository, minted as self-deploy mints it. It is the one secret passed as an argument, since flyctl takes a build secret only that way, and it expires within the hour. When the App cannot read the repository, the command says so and offers a deploy without a knowledge graph. flyctl's output is shown as it runs, line by line, with every secret this run holds redacted, the build token included, since a failed build can echo it. The health wait polls `GET /` for up to 15 minutes and says each minute how long it has waited, and the setup checks run `node /app/dist/check-setup.js` over `flyctl ssh console`, with every secret this run set redacted from their output. Whatever is declined or fails is printed under "Still to run"; a knowledge-graph deploy is re-run through the command, since its token has no hand-run form.
+
+Last, it prints the `gh secret set` commands for each target repository, the GitHub App webhook's address and events, the command that reads the webhook secret, a reminder of the two redirect addresses, the access-recovery command, and a link to the docs site's guide to adding a project and choosing its model access. Anything to copy sits on a line of its own. A rerun that keeps every value in a group shows no heading for it. It exits with the setup checks' own code when they fail, and 1 when the preflight, the health wait or another step failed.
+
+**On a re-run** it offers to keep every value already set and ask only what is missing. Changing `RUNNER_TOKEN_SECRET` makes every stored model credential unreadable, so each one has to be entered again. The orchestrator takes its sessions app from `FLY_SESSIONS_APP` once, at its first boot (seed-once), so the command treats the seed as taken once the orchestrator app has a release, and sets it again on a rerun before any deploy. Once it is taken, the saved runner settings own the sessions app: the command leaves both sessions seed variables alone and creates no sessions app, and the sessions app is changed on `/admin#settings`. If `FLY_SESSIONS_TOKEN` is missing then, it asks the active sessions app's name from `/admin#settings`, so the token is minted for the right app.
 
 The Fly volume `dedup_data` mounts at `/data` and holds the SQLite database. Only the GitHub App pair is required for the orchestrator to boot; ticketing credentials are needed for it to poll anything. See `.env.example` for the full set.
 
-Once the instance is deployed, run the setup checks on it: `fly ssh console --app <app_name> -C "node /app/dist/check-setup.js"`. It exits 0, or names each fault with its fix ([setup-checks.md](setup-checks.md)).
+To run the setup checks on a deployed instance again later: `fly ssh console --app <app_name> -C "node /app/dist/check-setup.js"`. It exits 0, or names each fault with its fix ([setup-checks.md](setup-checks.md)).
 
 At boot the orchestrator sets the snapshot retention of every volume in its own Fly app to the `volume_snapshot_retention_days` setting (default 14 days; Fly's own default is 5, its range 1–60), using `FLY_DEPLOY_TOKEN` and the injected `FLY_APP_NAME` through the Machines API (`src/fly-volumes.ts`). Only volumes whose retention differs are updated, and every volume in the app is covered, not just `dedup_data`. The volume also holds the Restate store under `/data/restate`, so a longer window keeps Restate history recoverable. A Fly error or a missing token or app name is logged as `[fly-volumes] snapshot retention not applied: <reason>` and never blocks boot; local runs have neither and always log it. The value is changed on `/admin#deployments` (Retention card, `GET`/`POST /api/retention`): a new volume value is applied to the Fly volumes at once, while a new `restate_retention_days` value applies at the next deploy or restart.
 
@@ -244,7 +264,7 @@ At boot the orchestrator sets the snapshot retention of every volume in its own 
 
 `.github/workflows/deploy-clients.yml` exists and triggers on pushes to `main`, building a deploy matrix by globbing `clients/*.toml`. **In practice it always deploys nothing**, because `.gitignore` excludes `clients/*.toml` and un-ignores only the example — which the workflow explicitly skips. Every run finds zero clients, emits an empty matrix, and skips the deploy job via its own guard, reporting success.
 
-So a client toml is local-only unless force-added, and client instances are deployed through the wrapper script or the Fly integration rather than by this workflow. Treat the workflow as inert until that is deliberately resolved one way or the other.
+So a client toml is local-only unless force-added, and client instances are deployed through `npm run provision-client -- <slug>` and the manual deploy command rather than by this workflow. Treat the workflow as inert until that is deliberately resolved one way or the other.
 
 ### Per-instance Fly commands
 

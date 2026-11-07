@@ -93,9 +93,28 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         const a = sampleIssue({ id: "a" });
         const provider = await factory({ initialIssues: [a] });
         await provider.markImplementing("a", "TEAM");
-        await provider.clearWorkingState("a", "TEAM");
+        await provider.clearWorkingState("a", "TEAM", "implementation");
         const snap = await provider.fetchAIImplementSnapshot();
         expect(snap.inProgressCountsByScope.TEAM ?? 0).toBe(0);
+      });
+    });
+
+    describe("parkForHuman", () => {
+      it("removes the issue from both pickup buckets", async () => {
+        const a = sampleIssue({ id: "a" });
+        const provider = await factory({ initialIssues: [a] });
+        expect(await provider.parkForHuman("a", "TEAM", "implementation")).toBe(true);
+        const snap = await provider.fetchAIImplementSnapshot();
+        expect(snap.needsPlanning.map((i) => i.id)).not.toContain("a");
+        expect(snap.readyForImplementation.map((i) => i.id)).not.toContain("a");
+        expect(snap.inProgressCountsByScope.TEAM ?? 0).toBe(0);
+      });
+
+      it("returns false for a terminal issue", async () => {
+        const a = sampleIssue({ id: "a" });
+        const provider = await factory({ initialIssues: [a] });
+        await provider.markMerged("a", "TEAM");
+        expect(await provider.parkForHuman("a", "TEAM", "implementation")).toBe(false);
       });
     });
 

@@ -359,7 +359,8 @@ describe("makeProvider", () => {
     await expect(provider.markImplementing("issue-1", "ENG")).resolves.toBeUndefined();
     await expect(provider.markPrReady("issue-1", "ENG", "https://github.com/test-org/test-repo/pull/1")).resolves.toBe(true);
     await expect(provider.markImplementationFailed("issue-1", "ENG", "reason")).resolves.toBe(true);
-    await expect(provider.clearWorkingState("issue-1", "ENG")).resolves.toBe(true);
+    await expect(provider.clearWorkingState("issue-1", "ENG", "implementation")).resolves.toBe(true);
+    await expect(provider.parkForHuman("issue-1", "ENG", "implementation")).resolves.toBe(true);
     await expect(provider.markMerged("issue-1", "ENG")).resolves.toBeUndefined();
     await expect(provider.postComment("issue-1", "body")).resolves.toBeUndefined();
     expect(await provider.fetchPlanningContext("issue-1")).toBe("");
@@ -387,7 +388,7 @@ describe("makeProvider", () => {
     const provider = makeProvider({ findByKey });
     expect(provider.findByKey).toBe(findByKey);
     expect(vi.isMockFunction(provider.postComment)).toBe(true);
-    await expect(provider.clearWorkingState("issue-1", "ENG")).resolves.toBe(true);
+    await expect(provider.clearWorkingState("issue-1", "ENG", "implementation")).resolves.toBe(true);
   });
 });
 

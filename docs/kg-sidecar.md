@@ -14,18 +14,18 @@ Startup has two entry points, tried in order: `kg/start.sh` (preferred — the v
 
 Readiness is polled for up to 30 seconds. **Any HTTP response counts as ready**, including 4xx and 5xx — the check is whether the server accepts connections, not whether it answers correctly. The poll also bails early if the sidecar process has already exited, rather than waiting out the full timeout.
 
-**Sidecar failure is non-fatal at every stage.** A missing entry point, a crash, or a readiness timeout all leave `KG_SIDECAR_URL` unset and let the orchestrator boot normally; `/mcp` returns 503 and every other route is unaffected.
+**Sidecar failure is non-fatal at every stage.** A missing entry point, a crash, or a readiness timeout all leave `KG_SIDECAR_URL` unset and let the orchestrator boot normally; `/mcp` still serves, without the `kg_*` tools, and every other route is unaffected.
 
-For local development, start the sidecar yourself and set `KG_SIDECAR_URL` in `.env`, or leave it blank to run without `/mcp`.
+For local development, start the sidecar yourself and set `KG_SIDECAR_URL` in `.env`, or leave it blank to run `/mcp` without the `kg_*` tools.
 
 ## What `/mcp` tells you, and what it hides
 
-The endpoint needs **both** `KG_SIDECAR_URL` and `OAUTH_REDIRECT_BASE_URL`, but the two are not equally visible from outside, because the auth gate sits between their checks.
+The endpoint needs `OAUTH_REDIRECT_BASE_URL`; `KG_SIDECAR_URL` only adds the `kg_*` tools. The two are not equally visible from outside, because the auth gate sits between their checks.
 
 - **`OAUTH_REDIRECT_BASE_URL` unset** — `/mcp` answers **503** to every caller.
-- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. Only an authenticated request that actually needs the sidecar reaches the 503; an authenticated `tools/list` still answers **200**, listing the built-in diagnostic tools alone. The sidecar check sits below both the auth gate and that routing deliberately, so those diagnostics stay reachable on a sidecar-less image. When a sidecar-requiring request does hit the 503, the body names the fix: `{"error":"no memory provider is configured (sidecar: KG_SIDECAR_URL unset)"}` — set `KG_SIDECAR_URL` and restart.
+- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. An authenticated `tools/list` answers **200**, listing every non-`kg_*` tool the caller's role allows; the `kg_*` tools are left out. A `kg_*` call from a stale list is not a 503 either: it answers 200 with a tool result `isError: true` and the text `no memory provider is configured` (`src/restate/tools.ts`). Set `KG_SIDECAR_URL` and restart to serve them.
 
-**So an unauthenticated probe of `/mcp` cannot distinguish a sidecar-less release from a healthy one — both answer 401.** The public endpoint that can is `/.well-known/oauth-protected-resource`, which 503s when either variable is missing.
+**So an unauthenticated probe of `/mcp` cannot distinguish a sidecar-less release from a healthy one — both answer 401.** Neither can the OAuth routes: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server` and `/mcp/*` (`routeMcpOAuth`, `src/mcp-oauth.ts`) gate on `OAUTH_REDIRECT_BASE_URL` alone, so a client can sign in and reach the non-`kg_*` tools on a sidecar-less image. They used to 503 without a sidecar too — a leftover from when `/mcp` was only a sidecar proxy — which locked every client out of those tools. The public signal is the health check **`GET /`**: `sidecar.reachable: true` with `toolsListed: true` means the boot-time probe passed, and `sidecar.checkedAt: null` means no sidecar was ever probed — a sidecar-less release.
 
 Inside the container the question is settled without a request at all: `docker-entrypoint.sh` exports `KG_SIDECAR_URL` only after the sidecar answers its readiness check, so an absent value is the sidecar-less signal. That is what the orchestrator itself reads at boot.
 
@@ -41,7 +41,7 @@ The knowledge-graph repository is private. A **BuildKit build secret** mounts a 
 
 Set `KG_SOURCE_REPO` to a GitHub `owner/repo` value to bundle a graph — for example
 `Answer9-llc/knowledge-graph-answer9-app` for a project-specific graph. An unset value builds
-without a sidecar: the orchestrator boots normally, but `/mcp` returns 503. `KG_SOURCE_REPO` is
+without a sidecar: the orchestrator boots normally, and `/mcp` serves without the `kg_*` tools. `KG_SOURCE_REPO` is
 deliberately a repo identifier, not a URL: `src/deploy.ts` validates it before minting a
 repo-scoped installation token, and the Dockerfile validates the same build arg before
 constructing the clone URL.
@@ -96,7 +96,7 @@ A release that boots is not necessarily a release that serves, and the differenc
 
 The self-deploy record is now honest about the KGB-28 failure mode (AII-648): a sidecar can come up — `KG_SIDECAR_URL` gets set, the readiness poll answered — and still not actually serve `kg_*` tools, because the Python MCP SDK's streamable-HTTP transport can reject a stateless `tools/list` with `400 Missing session ID`. Before this probe existed, that shipped as `deployed-ok`: the deploy record only checked whether `KG_SIDECAR_URL` was set, not whether the sidecar actually answered a real query. Two things had to change together, in the same file (`src/kg-provider.ts`) — the proxy has to tolerate a session-demanding sidecar for real MCP traffic (AII-649), and the boot-time record has to stop trusting the env var alone (this issue). They're separable in principle but landed together because both touch `sendWithSessionRetry`.
 
-To check by hand, poll **`/.well-known/oauth-protected-resource`** — 200 means both variables are set, 503 means one is missing. Polling `/mcp` for a 401 proves only that the route is configured.
+To check by hand, poll the health check **`GET /`**: `sidecar.reachable: true` with `toolsListed: true` means the boot-time probe passed, and `sidecar.checkedAt: null` means no sidecar was ever probed — a sidecar-less release. Polling `/mcp` for a 401, or `/.well-known/oauth-protected-resource` for a 200, proves only that `OAUTH_REDIRECT_BASE_URL` is set.
 
 ### Verifying more than "it answers"
 
@@ -116,7 +116,7 @@ Every buffered sidecar request the provider makes — the session handshake, `li
 
 ```bash
 docker build .                 # local, no secret
-fly deploy --remote-only       # degraded: /mcp returns 503, all other routes healthy
+fly deploy --remote-only       # degraded: /mcp serves without kg_* tools, all other routes healthy
 ```
 
 ## MCP OAuth

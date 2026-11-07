@@ -6345,6 +6345,38 @@ describe("admin sessions — kg-refresh destroy", () => {
     expect(res.statusCode).toBe(200);
     expect(clearWorkingState).toHaveBeenCalled();
   });
+
+  it("planning session destroy resets the ticket with the planning phase", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
+    }, token);
+    const jobId = log.appendLog({ issueId: "issue-pl", issueIdentifier: "ENG-3", teamKey: "ENG", repo: "org/repo", phase: "planning" });
+    log.updateJobMachineId(jobId, "m-pl-cancel");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-pl-cancel", token, undefined);
+
+    expect(res.statusCode).toBe(200);
+    expect(clearWorkingState).toHaveBeenCalledWith("issue-pl", "ENG", "planning");
+  });
+
+  it("gap-analysis session destroy leaves the ticket and dedup entry alone", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
+    }, token);
+    dedup.markDispatched("issue-ga", "ENG", "ENG-2", "t");
+    const jobId = log.appendLog({ issueId: "issue-ga", issueIdentifier: "ENG-2", teamKey: "ENG", repo: "org/repo", phase: "gap-analysis" });
+    log.updateJobMachineId(jobId, "m-ga-cancel");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-ga-cancel", token, undefined);
+
+    expect(res.statusCode).toBe(200);
+    expect(clearWorkingState).not.toHaveBeenCalled();
+    expect(dedup.isAlreadyDispatched("issue-ga")).toBe(true);
+  });
 });
 
 describe("admin poll-now", () => {

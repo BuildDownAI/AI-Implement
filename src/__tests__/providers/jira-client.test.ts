@@ -80,6 +80,18 @@ describe("JiraClient", () => {
     expect(await client.validateJql("project = X")).toEqual({ valid: true });
   });
 
+  it("validateJql returns valid:false when Jira reports errors in a 200 body", async () => {
+    // /jql/parse answers 200 for a rejected query; the error is only in queries[].errors.
+    fakeFetch({
+      [`POST ${GATEWAY}/jql/parse`]: { json: { queries: [{ query: "q", errors: ["The value 'acme/missing' does not exist for the field 'Repository'."] }] } },
+    }).install();
+    const client = new JiraClient(config);
+    expect(await client.validateJql('"Repository" = "acme/missing"')).toEqual({
+      valid: false,
+      errors: ["The value 'acme/missing' does not exist for the field 'Repository'."],
+    });
+  });
+
   it("validateJql returns valid:false with error on failure", async () => {
     fakeFetch({ [`POST ${GATEWAY}/jql/parse`]: { status: 400, text: '{"errors": ["bad jql"]}' } }).install();
     const client = new JiraClient(config);
@@ -201,4 +213,10 @@ describe("JiraClient Basic auth (email + API token)", () => {
   it("throws if neither email nor cloudId is provided", () => {
     expect(() => new JiraClient({ token: "t" })).toThrow(/cloudId/);
   });
+});
+
+it("getMyself reads the account", async () => {
+  const fake = fakeFetch({ [`GET ${GATEWAY}/myself`]: { json: { accountId: "me" } } }).install();
+  expect(await new JiraClient({ token: "tok", cloudId: "CLOUD-123" }).getMyself()).toEqual({ accountId: "me" });
+  expect(fake.calls[0].method).toBe("GET");
 });

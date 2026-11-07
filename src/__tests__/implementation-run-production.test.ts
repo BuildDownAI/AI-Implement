@@ -343,6 +343,12 @@ describe("production deps", () => {
       expect(vi.mocked(input.prepareImplementationLaunch).mock.calls[0][0].issue.scopeKey).toBe("ENG");
     });
 
+    it("reads the issue with the run's mapping key so Jira returns its description and custom fields", async () => {
+      const { d } = compose();
+      await d.launch(INPUT);
+      expect(provider.findByKey).toHaveBeenCalledWith(INPUT.issueIdentifier, INPUT.teamKey);
+    });
+
     it("a failure after the row was written does not throw", async () => {
       const { d } = compose({ postDispatch: vi.fn().mockRejectedValue(new Error("tracker down")) });
       expect(await d.launch(INPUT)).toEqual({ outcome: "accepted", jobId: "4242" });
@@ -413,7 +419,7 @@ describe("production deps", () => {
       vi.mocked(getJobByDispatchId).mockReturnValue({ ...failedJob, conclusion: "operator_cancelled" });
       const { d } = compose();
       expect(await d.finishJob("d-1", { kind: "run_ended" })).toEqual({ release: "cancelled" });
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("i-1", "ENG");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("i-1", "ENG", "implementation");
     });
 
     it("at the deadline with no callback remediates the stuck job with ownerCall: true", async () => {

@@ -35,11 +35,17 @@ implementation. A failed workflow dispatch writes no row.
 |---|---|
 | Dispatch rollback | The dispatch threw after the row was written |
 | Failed / timed-out run | After `clearWorkingState` resets the tracker, so the issue can be re-dispatched |
-| Stuck watchdog (`src/stuck-watchdog.ts`) | A stuck run is reset and retried, within `STUCK_JOB_MAX_ATTEMPTS` |
+| Stuck watchdog (`src/stuck-watchdog.ts`) | A stuck run is reset and retried, within `STUCK_JOB_MAX_ATTEMPTS`; past it, after `parkForHuman` moves the ticket out of pickup (the row and the attempt counter stay when the park fails or is refused) |
 | Admin job destroy (`src/admin.ts`) | An operator destroys a running job |
 | Filesystem retry (`src/filesystem-ticket-lifecycle.ts`) | A local filesystem ticket is retried |
 | Manual | `DELETE /api/dedup/{id}` — the Audit page's Delete, admin role only |
 | Reconcile loop | See below |
+
+A give-up with no resolvable provider keeps the dedup row and parks nothing. On Jira the search
+index can lag the park's status write. Normally the issue's pre-park status (`Planning` or
+`Implementing`) is already outside the pickup statuses, so a stale index cannot select it; but if
+the dispatch-time status write failed, an issue can still carry a pickup status when it is parked,
+and for the few seconds before the index catches up the cleared row lets one poll dispatch it again.
 
 ## Reconcile loop
 

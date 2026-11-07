@@ -44,6 +44,7 @@ const hoisted = vi.hoisted(() => ({
   >(() => Promise.resolve({ merged: false, state: "open", headRef: "ai-implement/eng-1" })),
   getCommitAuthorType: vi.fn<() => Promise<"Bot" | "User" | null>>(() => Promise.resolve("Bot")),
   postOrUpdateStickyComment: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+  getFailedContainerInitJob: vi.fn<() => Promise<null>>(() => Promise.resolve(null)),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {
@@ -58,6 +59,7 @@ vi.mock("../github.js", async (importOriginal) => {
     getPullRequestState: hoisted.getPullRequestState,
     getCommitAuthorType: hoisted.getCommitAuthorType,
     postOrUpdateStickyComment: hoisted.postOrUpdateStickyComment,
+    getFailedContainerInitJob: hoisted.getFailedContainerInitJob,
   };
 });
 
@@ -2540,6 +2542,106 @@ describe("handleRunnerPlanningContext", () => {
   });
 });
 
+describe("handleRunnerResult — gap-analysis disposition-gated resolution", () => {
+  const seed = (body: string) => {
+    reviewStore.upsertReviewFinding({ repo: "org/repo", prNumber: 12, source: "github-review", severity: "blocking", body });
+    return reviewStore.listOpenReviewFindings("org/repo", 12).find((f) => f.body === body)!;
+  };
+  const setup = () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    return { token, dispatchId };
+  };
+  const call = (token: string, findingDispositions: unknown[]) =>
+    runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [], findingDispositions } as never,
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+  const disp = (f: { findingKey: string }, disposition: string) => ({ findingKey: f.findingKey, disposition, reason: "r" });
+  const status = (id: number) => reviewStore.getReviewFindingById(id)?.status;
+  const countLines = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("[runner-callback] gap-analysis findings"));
+
+  it("snapshot path: resolves fixed/invalid, leaves the undisposed finding open, defers follow-up", async () => {
+    const a = seed("a");
+    const b = seed("b");
+    const c = seed("c");
+    const d = seed("d");
+    const outside = seed("outside");
+    const { token, dispatchId } = setup();
+    reviewFixQueue.recordReviewFixDispatch({
+      queueId: 1,
+      dispatchId,
+      repo: "org/repo",
+      prNumber: 12,
+      findingIds: [a.id, b.id, c.id, d.id],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    let res;
+    let lines: string[] = [];
+    try {
+      res = await call(token, [disp(a, "fixed"), disp(b, "invalid"), disp(d, "follow-up"), disp(outside, "fixed")]);
+      lines = countLines(logSpy);
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(res.status).toBe(200);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("resolved=2 deferred_on_pr=1 left_open=1");
+    expect(status(a.id)).toBe("resolved");
+    expect(status(b.id)).toBe("resolved");
+    expect(status(c.id)).toBe("open");
+    expect(status(d.id)).toBe("deferred");
+    expect(status(outside.id)).toBe("open");
+  });
+
+  it("no-snapshot path: same rule, and findings seen after dispatch stay open", async () => {
+    // Covers a key-bearing caller on the no-snapshot path.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-27T00:00:00.000Z"));
+    const a = seed("a");
+    const b = seed("b");
+    const c = seed("c");
+    vi.setSystemTime(new Date("2026-05-27T00:01:00.000Z"));
+    const { token } = setup();
+    vi.setSystemTime(new Date("2026-05-27T00:02:00.000Z"));
+    const late = seed("late");
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    let res;
+    let lines: string[] = [];
+    try {
+      res = await call(token, [disp(a, "fixed"), disp(b, "invalid"), disp(late, "fixed")]);
+      lines = countLines(logSpy);
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(res.status).toBe(200);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("resolved=2 deferred_on_pr=0 left_open=1");
+    expect(status(a.id)).toBe("resolved");
+    expect(status(b.id)).toBe("resolved");
+    expect(status(c.id)).toBe("open");
+    expect(status(late.id)).toBe("open");
+  });
+
+  it("no dispositions: nothing resolves", async () => {
+    const a = seed("a");
+    const { token } = setup();
+    const res = await call(token, []);
+    expect(res.status).toBe(200);
+    expect(status(a.id)).toBe("open");
+  });
+});
+
 describe("handleRunnerResult — gap-analysis", () => {
   it("posts comments but skips status transition on success", async () => {
     const { token } = runnerTokens.mintRunToken({
@@ -2588,6 +2690,7 @@ describe("handleRunnerResult — gap-analysis", () => {
       dispatchId,
     });
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const FIRST_KEY = reviewStore.listOpenReviewFindings("org/repo", 12)[0]!.findingKey;
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
@@ -2595,6 +2698,7 @@ describe("handleRunnerResult — gap-analysis", () => {
         phase: "gap-analysis",
         outcome: "success",
         comments: [],
+        findingDispositions: [{ findingKey: FIRST_KEY, disposition: "fixed", reason: "done" }],
       },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
@@ -2643,6 +2747,9 @@ describe("handleRunnerResult — gap-analysis", () => {
         phase: "gap-analysis",
         outcome: "success",
         comments: [],
+        findingDispositions: [
+          { findingKey: reviewStore.getReviewFindingById(1)!.findingKey, disposition: "fixed", reason: "done" },
+        ],
       },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
@@ -2820,6 +2927,7 @@ describe("handleRunnerResult — gap-analysis", () => {
       body: "Fix me",
     });
     const findingIds = reviewStore.listOpenReviewFindings("org/repo", 12).map((f) => f.id);
+    const FIRST_KEY = reviewStore.listOpenReviewFindings("org/repo", 12)[0]!.findingKey;
 
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -2842,7 +2950,7 @@ describe("handleRunnerResult — gap-analysis", () => {
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
-      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      body: { phase: "gap-analysis", outcome: "success", comments: [], findingDispositions: [{ findingKey: FIRST_KEY, disposition: "fixed", reason: "done" }] },
       secret: SECRET,
       resolveProvider: makeResolve(new FakeProvider()),
     });
@@ -3548,6 +3656,38 @@ describe("watchdogConfig — remediateFailedJob gating", () => {
     // it must NOT fire when a draft PR is already open.
     const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
     expect(clearCall).toBeUndefined();
+  });
+
+  it("does not look up the failed jobs for a runner-reported failure, even on a repeat attempt", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "t",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    log.updateJobRunId(log.getJobByDispatchId(dispatchId)!.id, 77);
+    log.incrementStuckAttempts("i");
+    hoisted.getFailedContainerInitJob.mockClear();
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "failure", failureReason: "build failed", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      watchdogConfig,
+    });
+
+    expect(hoisted.getFailedContainerInitJob).not.toHaveBeenCalled();
   });
 
   it("skips remediateFailedJob for an INSTALL_FAILED callback carrying prUrl", async () => {

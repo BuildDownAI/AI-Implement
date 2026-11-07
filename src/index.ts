@@ -54,7 +54,7 @@ import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
 import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
-import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
@@ -117,15 +117,7 @@ import { handleMcpRequest } from "./mcp.js";
 import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
-import {
-  initMcpOAuthTables,
-  handleMcpProtectedResourceMetadata,
-  handleMcpAuthorizationServerMetadata,
-  handleMcpClientRegistration,
-  handleMcpAuthorize,
-  handleMcpOidcCallback,
-  handleMcpTokenRequest,
-} from "./mcp-oauth.js";
+import { initMcpOAuthTables, routeMcpOAuth } from "./mcp-oauth.js";
 import { preparePlanningLaunch, launchPlanningRun, launchPlanningSession } from "./planning-launch.js";
 import { prepareImplementationLaunch, launchImplementationRun, launchImplementationFlySession, launchImplementationLocalSession } from "./implementation-launch.js";
 import {
@@ -1089,6 +1081,9 @@ async function fireBreakerTrip(
       : []),
     ``,
     `Unpark: admin → Runners → Unpark, or ask the operator.`,
+    ...(phase === "gap-analysis"
+      ? [``, `A person can still comment \`/ai-implement\` on the pull request to start one fix run.`]
+      : []),
   ];
 
   if (provider) {
@@ -1103,7 +1098,7 @@ async function fireBreakerTrip(
     try {
       await notifyText(
         config.notifyWebhookUrl,
-        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.`,
+        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.${phase === "gap-analysis" ? " A person can still comment /ai-implement on the pull request to run one fix run." : ""}`,
       );
     } catch (err) {
       console.error(`[breaker] Failed to send park notification for ${issueIdentifier ?? issueId}:`, err);
@@ -2327,7 +2322,8 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
   }
 }
 
-const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending"]);
+// stuck_review_fix: remediateStuckJob already closed out a review-fix run and alerted the human.
+const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending", "stuck_review_fix"]);
 
 export async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
@@ -2969,7 +2965,7 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
     return;
   }
   try {
-    const applied = await provider.clearWorkingState(job.issueId, job.teamKey);
+    const applied = await provider.clearWorkingState(job.issueId, job.teamKey, job.phase === "planning" ? "planning" : "implementation");
 
     // Clear the dedup entry so the issue can be re-dispatched. Safe even when the
     // reset was refused (issue already Merged): the dispatch bucket only selects
@@ -3015,17 +3011,25 @@ export async function reportTerminalJob(
   // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
   const recordBreaker = (): void => {
     if (job.issueId && job.phase !== "kg-refresh") {
-      const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
+      // A fix run counts in the bucket the fix-run dispatch gate reads (isParked(…, "gap-analysis")).
+      const breakerPhase = breakerPhaseFor(job.phase);
       if (job.status === "completed") {
         recordDispatchSuccess(job.issueId, breakerPhase);
-      } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
+      } else if (
+        job.status === "failed" ||
+        job.status === "timed_out" ||
+        // review_failed on a fix run is the normal outcome of a round that pushed but still has
+        // findings; the PR Dispatch Budget limits that loop, not the breaker.
+        (job.status === "review_failed" && breakerPhase !== "gap-analysis")
+      ) {
         // Skip the breaker entirely for operator_cancelled — it was a human decision,
         // not a system failure. Recording it could park the issue and permanently
         // suppress future genuine-failure alerts even after the breaker trips from
         // accumulated operator-cancel events (alreadyParked stays true forever).
         if (job.conclusion !== "operator_cancelled") {
           const breakerConclusion = job.conclusion ?? job.status;
-          // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
+          // stuck_giveup already fires notifyStuckGiveUp — don't double-fire. A stuck_review_fix
+          // alert says the run stopped; the trip notice says fix runs are now paused, so it is sent.
           const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
           // A classified transient failure (provider overload) is the provider's outage, not
           // the ticket's — don't count it toward the breaker, or three unlucky retries against
@@ -3044,10 +3048,46 @@ export async function reportTerminalJob(
   if (opts?.ownerCall) getDb().transaction(() => { recordBreaker(); markJobNotified(job.id); })();
   else recordBreaker();
 
+  // Resolve provider via the job's teamKey -> mapping so the URL matches
+  // the issue's ticketing system. Fall back to the legacy Linear URL if
+  // the mapping is gone (orphaned job).
+  const identifier = job.issueIdentifier || job.issueId;
+  let issueUrl = `https://linear.app/issue/${identifier}`;
+  let provider: TicketingProvider | null = null;
+  const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
+  if (mapping) {
+    try {
+      provider = await registry.forMapping(mapping);
+      issueUrl = provider.issueUrl({
+        id: job.issueId,
+        identifier,
+        title: job.issueTitle || "",
+        description: null,
+        scopeKey: job.teamKey ?? "",
+        nativeStatus: "",
+      });
+    } catch (err) {
+      console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
+    }
+  }
+
   // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
   // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
-  // requeue that will produce its own dispatch notice on the next cycle.
-  if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+  // requeue that will produce its own dispatch notice on the next cycle, and
+  // stuck_review_fix already alerted a human from the watchdog.
+  if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued" || job.conclusion === "stuck_review_fix") {
+    // A stuck fix run that tripped the gap-analysis breaker still sends the trip notice.
+    if (pendingBreakerTrip && job.issueId) {
+      await fireBreakerTrip(
+        config,
+        provider,
+        job.issueId,
+        job.issueIdentifier,
+        pendingBreakerTrip.phase,
+        pendingBreakerTrip.failures,
+        pendingBreakerTrip.conclusion,
+      );
+    }
     markJobNotified(job.id);
     return;
   }
@@ -3084,29 +3124,6 @@ export async function reportTerminalJob(
 
   const durationMs =
     job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
-
-  // Resolve provider via the job's teamKey -> mapping so the URL matches
-  // the issue's ticketing system. Fall back to the legacy Linear URL if
-  // the mapping is gone (orphaned job).
-  const identifier = job.issueIdentifier || job.issueId;
-  let issueUrl = `https://linear.app/issue/${identifier}`;
-  let provider: TicketingProvider | null = null;
-  const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
-  if (mapping) {
-    try {
-      provider = await registry.forMapping(mapping);
-      issueUrl = provider.issueUrl({
-        id: job.issueId,
-        identifier,
-        title: job.issueTitle || "",
-        description: null,
-        scopeKey: job.teamKey ?? "",
-        nativeStatus: "",
-      });
-    } catch (err) {
-      console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
-    }
-  }
 
   // Fire breaker trip notification now that provider is resolved.
   if (pendingBreakerTrip && job.issueId) {
@@ -4722,76 +4739,9 @@ function startServer(
       return;
     }
 
-    // MCP well-known metadata endpoints (public — no auth required)
-    if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
-      return;
-    }
-    if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
-      return;
-    }
-
-    // MCP OAuth routes — dynamic client registration, authorization, token exchange
-    if (pathname.startsWith("/mcp/")) {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      if (pathname === "/mcp/register" && req.method === "POST") {
-        handleMcpClientRegistration(req, res).catch((err) => {
-          console.error("[mcp-oauth] register error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      if (pathname === "/mcp/authorize" && req.method === "GET") {
-        handleMcpAuthorize(req, res, config.oauthRedirectBaseUrl).catch((err) => {
-          console.error("[mcp-oauth] authorize error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
-      if (callbackMatch && req.method === "GET") {
-        const [, providerId] = callbackMatch;
-        handleMcpOidcCallback(req, res, providerId, config.oauthRedirectBaseUrl).catch((err) => {
-          console.error("[mcp-oauth] callback error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      if (pathname === "/mcp/token" && req.method === "POST") {
-        handleMcpTokenRequest(req, res).catch((err) => {
-          console.error("[mcp-oauth] token error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-    }
+    // MCP well-known metadata and OAuth routes (public — no auth required): dynamic client
+    // registration, authorization, OIDC callback, token exchange.
+    if (routeMcpOAuth(req, res, pathname, config.oauthRedirectBaseUrl)) return;
 
     // MCP endpoint — OAuth bearer token authenticated. The six write tools used to be wired
     // in here as bound closures over this request's config/registry; AII-713 moved them onto

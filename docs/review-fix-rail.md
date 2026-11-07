@@ -81,7 +81,7 @@ The revision exists so a caller can hold a stale snapshot and detect that the fi
 | `review_findings` | one row per distinct finding per PR | The ledger. `status` is `open`, `resolved`, or `deferred`. A fixing agent that dispositions a finding `follow-up` (ADR 028) moves it from `open` to `deferred` — no longer counted as open, but distinct from `resolved` so it is not silently reopenable by a normal resolve call |
 | `review_fix_queue` | **one row per PR** (unique on `repo, pr_number`) | Work queue; `pending` → `dispatched` / `skipped` / `failed` |
 | `review_fix_events` | append-only, one per enqueue | Audit trail of what triggered each enqueue, with actor and source URL |
-| `review_fix_dispatches` | one per dispatch id | Snapshot of which finding ids a given dispatch is allowed to resolve |
+| `review_fix_dispatches` | one per dispatch id | Snapshot of which finding ids a given dispatch is allowed to resolve (a finding in it resolves only with a `fixed` or `invalid` disposition) |
 
 The queue's one-row-per-PR grain is deliberate. Enqueuing coalesces: a second event for a PR already queued updates the existing row rather than adding another, and if the new reason differs from the stored one the reason becomes `multiple`. Three reviewers commenting in quick succession produce one fix run, not three. The `review_fix_events` table is what preserves the individual triggers, since the queue row itself is overwritten.
 
@@ -329,7 +329,7 @@ This check only applies to implementation dispatches, never planning.
 
 1. Find the mapping whose `owner/repo` matches. **No mapping → `skipped`.**
 2. **Paused project → `skipped`.**
-3. **Snapshot the currently-open finding ids.** This is what the dispatch is permitted to resolve.
+3. **Snapshot the currently-open finding ids.** This is what the dispatch is permitted to resolve; each still needs a `fixed` or `invalid` disposition (see Resolution).
 4. Fetch an installation token, then call `getPullRequestState`. **PR merged or closed → `skipped`** with one `[review-fix]` log line; no dispatch is made (`shouldSkipReviewFix` in `src/review-fix-queue.ts`). **PR state unavailable (HTTP error, network failure, or timeout) → keep `pending`** and retry on a later poll. Only a confirmed open PR proceeds to dispatch.
 5. Mint result and progress tokens (only when a runner callback is configured).
 6. Dispatch a `gap-analysis` phase run against the existing PR.
@@ -341,12 +341,24 @@ A dispatch failure marks the row `failed` and surfaces a notification; the loop 
 
 The synthesized issue title is `Review feedback fix for PR #<n>`, and the phase is reported as `gap-analysis` so the ticket's status does not regress to in-progress for what is a follow-up pass.
 
+A failed or stuck `gap-analysis` run (review-fix queue or `/ai-implement` comment rail) does not change the ticket status or the dispatched entry (`remediateFailedJob` / `remediateStuckJob` in `src/stuck-watchdog.ts` skip the ticket reset). A stuck one is stopped, closed out as `timed_out` / `stuck_review_fix`, and a human is told once (webhook plus ticket comment); the Fly max-age sweep and the issue-terminal sweep (`src/reaper.ts`) likewise skip `resetTicket` for a `gap-analysis` job. AI-Implement does not retry a review-fix or `/ai-implement` fix run automatically (a feature-branch conflict-resolution run is separate: `src/auto-merge.ts` may enqueue a new one, up to its cap), and a run the orchestrator cannot find (`run_not_found`) is reported as not found rather than as timed out. Accordingly, its findings stay open until a new review event arrives or a person comments `/ai-implement`. The PR Dispatch Budget limits dispatches; it does not create them.
+
+A fix run's outcome counts against the `gap-analysis` dispatch-breaker bucket, the one the fix-run dispatch gate reads (`isParked(…, "gap-analysis")`); `planning` and `implementation` runs keep their own buckets. Repeated failed or stuck fix runs park fix runs on that ticket, with the normal breaker trip notice (a stuck fix run's trip sends it too), and do not block a fresh implementation dispatch. A human `/ai-implement` comment still bypasses a park.
+
+A successful fix run no longer resets the `implementation` failure count, because it counts in the `gap-analysis` bucket.
+
+A `review_failed` fix run (it pushed and the second review still has findings) does not count toward the breaker, and it does not reset the failure count either. Failed, timed-out and stuck fix runs do count. For example, `failed, failed, review_failed, failed` parks on the fourth run.
+
 ## Resolution
 
-When a `gap-analysis` run reports success, the callback resolves findings — and *which* findings depends on whether a dispatch snapshot exists:
+When a `gap-analysis` run reports success, the callback resolves a finding only when **both** hold:
 
-- **With a snapshot** — exactly the finding ids captured at dispatch time are resolved.
-- **Without one** — everything for that PR last seen at or before the job's dispatch timestamp.
+1. It is in the set the run was allowed to resolve — with a snapshot, exactly the finding ids captured at dispatch time; without one, everything for that PR last seen at or before the job's dispatch timestamp.
+2. The callback's sanitized `findingDispositions` gives its `findingKey` the disposition `fixed` or `invalid`.
+
+A finding in the allowed set with no disposition stays `open` and is shown to the next fix run (the drain reads `listOpenReviewFindings`). A finding outside the set stays `open` even with a `fixed` disposition. `follow-up` findings are deferred earlier in the callback and are unaffected. The callback logs one line per success: `resolved=` and `left_open=` count the allowed set, while `deferred_on_pr=` counts every finding on the PR that the run deferred, so the three numbers need not add up to the allowed set.
+
+A success that reports no dispositions at all — including a runner image that predates the `findingDispositions` field — resolves nothing. Only a review-fix drain run records a snapshot and shows the agent the finding keys. A `/ai-implement` comment run takes the no-snapshot path and its task carries no finding keys, so it normally reports no dispositions and resolves nothing; its findings stay `open` until a later review-fix run disposes them. This is deliberate: a finding is never resolved without a recorded disposition.
 
 The snapshot is the important case. A finding that arrives *while* a fix run is in flight was never seen by that run, and resolving it would silently drop real feedback. Scoping resolution to the snapshot leaves it open for the next queue event instead.
 

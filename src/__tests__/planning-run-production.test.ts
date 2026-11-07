@@ -286,6 +286,12 @@ describe("production deps", () => {
     expect(vi.mocked(input.launchPlanningSession).mock.calls[0][0].issue.scopeKey).toBe(INPUT.teamKey);
   });
 
+  it.each([undefined, "fly-machines"] as const)("launch (backend %s) reads the issue with the run's mapping key so Jira returns its description and custom fields", async (backend) => {
+    const { d } = compose();
+    await d.launch(backend ? { ...INPUT, backend } : INPUT);
+    expect(provider.findByKey).toHaveBeenCalledWith(INPUT.issueIdentifier, INPUT.teamKey);
+  });
+
   it.each(["fly-machines", "local-docker"] as const)("launch on %s calls launchPlanningSession with the held reservation and returns the machine id", async (backend) => {
     const { input, d } = compose();
     const result = await d.launch({ ...INPUT, backend, planningContext: { resolvedPlanningBranch: "dev", planningFieldValue: "dev" } });
@@ -480,7 +486,8 @@ describe("production deps", () => {
       expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "operator_cancelled");
       expect(remediateFailedJob).not.toHaveBeenCalled();
       // The planning label is cleared, so the ticket does not stay blocked in `AI-Planning`.
-      expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
+
+      expect(provider.clearWorkingState).toHaveBeenCalledWith(expect.anything(), expect.anything(), "planning");      expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
     });
 
     it("skips the tracker write on a retry when the failure comment is already recorded", async () => {

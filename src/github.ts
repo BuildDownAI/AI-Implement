@@ -1055,6 +1055,47 @@ export async function getWorkflowRunStatus(
   };
 }
 
+export interface FailedContainerInitJob {
+  /** The job's name, or `"unknown"` when the API omitted it. */
+  jobName: string;
+  htmlUrl: string | null;
+}
+
+/**
+ * Finds a job of a run whose `Initialize containers` step failed — GitHub's job-container image
+ * pull happens there, so this is how a denied or missing runner image shows up. Returns null for any
+ * other shape, a non-OK response, or a thrown error: a lookup failure must never make a run less
+ * retryable.
+ */
+export async function getFailedContainerInitJob(
+  token: string,
+  owner: string,
+  repo: string,
+  runId: number,
+): Promise<FailedContainerInitJob | null> {
+  try {
+    const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`;
+    const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      jobs?: Array<{
+        name?: string;
+        html_url?: string;
+        steps?: Array<{ name?: string; conclusion?: string | null }>;
+      }>;
+    };
+    for (const job of data.jobs ?? []) {
+      const failed = (job.steps ?? []).some(
+        (step) => step.name === "Initialize containers" && step.conclusion === "failure",
+      );
+      if (failed) return { jobName: job.name || "unknown", htmlUrl: job.html_url || null };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Cancels a GitHub Actions workflow run.
  * Returns true on 202 (accepted) or 409 (run not in a cancellable state — benign).

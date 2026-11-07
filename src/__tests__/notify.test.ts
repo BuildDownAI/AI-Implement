@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { notify, notifyCompletion, notifyDeploy, notifyKgRefreshOutcome } from "../notify.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { notify, notifyStuckGiveUp, notifyCompletion, notifyDeploy, notifyKgRefreshOutcome } from "../notify.js";
 import type { DeployNotification, Notification } from "../notify.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 
@@ -717,5 +717,51 @@ describe("notifyKgRefreshOutcome", () => {
         notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "failure" }),
       ).rejects.toThrow("500");
     });
+  });
+});
+
+describe("notifyStuckGiveUp", () => {
+  const base = {
+    issueIdentifier: "TEST-5",
+    issueTitle: "Fix the thing",
+    issueUrl: "https://linear.app/issue/TEST-5",
+    repoFullName: "org/repo",
+    runUrl: null,
+    attempts: 3,
+    lastRunStatus: "in_progress",
+  };
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200 } as Response)); });
+  afterEach(() => { vi.restoreAllMocks(); });
+  const body = () => (vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string;
+
+  it.each(["slack", "teams", "other"])("titles an image-pull give-up after the image pull (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", { ...base, lastRunStatus: "runner_image_pull_failed" });
+    expect(body()).toContain("AI Implementation could not pull the runner image");
+    expect(body()).not.toContain("AI Implementation Stuck");
+  });
+
+  it.each(["slack", "teams"])("keeps the give-up alert with its attempt count (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", base);
+    expect(body()).toContain("AI Implementation Stuck");
+    expect(body()).toContain("Attempts");
+    expect(body()).not.toContain("/ai-implement");
+  });
+
+  it.each(["slack", "teams"])("names the fix run and next step, with no attempt count (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", { ...base, attempts: undefined, fixRun: true });
+    expect(body()).toContain("AI Fix Run Stopped");
+    expect(body()).toContain("/ai-implement");
+    expect(body()).toContain("pull request");
+    expect(body()).not.toContain("Attempts");
+  });
+
+  it.each(["slack", "teams"])("includes the pull request URL in the fix-run alert when known (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", {
+      ...base,
+      attempts: undefined,
+      fixRun: true,
+      prUrl: "https://github.com/org/repo/pull/9",
+    });
+    expect(body()).toContain("https://github.com/org/repo/pull/9");
   });
 });

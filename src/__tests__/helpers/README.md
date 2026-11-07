@@ -54,7 +54,7 @@ Two builds of a clock or fresh-id field can differ, so a test that compares buil
 
 **`testTempRoot`.** For code that writes under `os.tmpdir()` itself rather than taking a directory, such as a background deploy's scratch directory or a container's secret env file. It creates a `testDir`, then points `TMPDIR`, `TEMP` and `TMP` at it, the variables `os.tmpdir()` reads first on POSIX and on Windows, so whatever the code creates there is removed with it. When the test finishes, each variable goes back to its earlier value, or is unset again, before the directory is removed. A `testDir` called after it lands inside it.
 
-**`testDb`.** `dedup.ts` resolves its database path once, when it is first imported. A test therefore gets its own database only by setting `DEDUP_DB_PATH`, resetting the module registry, and importing every database module again; `testDb` does these in that order, with the file inside a `testDir`. A test passes the modules it needs as loaders and gets them back, typed (paths here as written from a test file in `src/__tests__/`):
+**`testDb`.** `dedup.ts` resolves its database path once per module copy, at the first `getDb()` or `getDatabasePath()`. A test therefore gets its own database only by setting `DEDUP_DB_PATH`, resetting the module registry, and importing every database module again; `testDb` does these in that order, with the file inside a `testDir`. A test passes the modules it needs as loaders and gets them back, typed (paths here as written from a test file in `src/__tests__/`):
 
 ```ts
 const MODULES = { log: () => import("../log.js"), hold: () => import("../deploy-hold.js") };

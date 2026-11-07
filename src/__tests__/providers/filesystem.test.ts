@@ -1,14 +1,16 @@
-import { link, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { access, constants, link, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
 import { FilesystemProvider } from "../../providers/filesystem.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
 import { testDir } from "../helpers/test-dir.js";
+import { TRACKER_CONFIG_CHECKS } from "../../setup-checks/tracker-config.js";
+import { makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, link: vi.fn(actual.link) };
+  return { ...actual, access: vi.fn(actual.access), link: vi.fn(actual.link) };
 });
 
 afterEach(() => {
@@ -163,6 +165,28 @@ describe("FilesystemProvider", () => {
     await expect(p.markPlanningStarted("filesystem:A:AII-7", "B")).rejects.toThrow(/does not belong/);
   });
 
+  it("parkForHuman fails the task out of pickup without a comment, and refuses a terminal task", async () => {
+    const dir = testDir("fs-provider");
+    await writeTask(dir, "AII-20.md", "---\ntitle: Park me\n---\n\nBody.");
+    await writeTask(dir, "AII-21.md", "---\ntitle: Merged\n---\n\nBody.");
+    const mappings = { AII: mapping({ directory: dir }) };
+    const p = provider(mappings);
+    const id = "filesystem:AII:AII-20";
+
+    await p.markPlanComplete(id, "AII", { awaitApproval: false });
+    await expect(p.parkForHuman(id, "AII", "implementation")).resolves.toBe(true);
+
+    const state = JSON.parse(await readFile(join(dir, ".state", "AII", "AII-20.json"), "utf8"));
+    expect(state).toMatchObject({ status: "failed", failurePhase: "implementation" });
+    expect(state.comments).toEqual([]);
+    const snap = await provider(mappings).fetchAIImplementSnapshot();
+    expect(snap.readyForImplementation.map((i) => i.identifier)).not.toContain("AII-20");
+    expect(snap.needsPlanning.map((i) => i.identifier)).not.toContain("AII-20");
+
+    await p.markMerged("filesystem:AII:AII-21", "AII");
+    await expect(p.parkForHuman("filesystem:AII:AII-21", "AII", "planning")).resolves.toBe(false);
+  });
+
   it("serializes concurrent comments without losing updates", async () => {
     const dir = testDir("fs-provider");
     await writeTask(dir, "AII-8.md", "---\ntitle: Comment storm\n---\n\nCollect comments.");
@@ -182,7 +206,7 @@ describe("FilesystemProvider", () => {
 
     await p.markMerged("filesystem:AII:AII-9", "AII");
     await expect(p.markImplementationFailed("filesystem:AII:AII-9", "AII", "late")).resolves.toBe(false);
-    await expect(p.clearWorkingState("filesystem:AII:AII-9", "AII")).resolves.toBe(false);
+    await expect(p.clearWorkingState("filesystem:AII:AII-9", "AII", "implementation")).resolves.toBe(false);
     await expect(p.markPrReady("filesystem:AII:AII-9", "AII", "https://github.com/acme/widgets/pull/9")).resolves.toBe(false);
 
     const state = JSON.parse(await readFile(join(dir, ".state", "AII", "AII-9.json"), "utf8"));
@@ -326,9 +350,9 @@ describe("FilesystemProvider", () => {
     await writeTask(dir, "LOCAL-19.md", "---\ntitle: Has PR\n---\nDo not archive.");
 
     await p.markPlanningStarted(planningId, "LOCAL");
-    await expect(p.clearWorkingState(planningId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(planningId, "LOCAL", "planning")).resolves.toBe(true);
     await p.markImplementing(implementationId, "LOCAL");
-    await expect(p.clearWorkingState(implementationId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(implementationId, "LOCAL", "implementation")).resolves.toBe(true);
     await p.markPrReady(terminalId, "LOCAL", "https://github.com/acme/widgets/pull/19");
 
     await expect(p.archiveFailed(planningId, "LOCAL", "planning")).resolves.toBe(true);
@@ -422,7 +446,7 @@ describe("FilesystemProvider", () => {
     await p.markPlanningStarted(id, "LOCAL");
     await p.markPlanComplete(id, "LOCAL", { awaitApproval: false });
     await p.markImplementing(id, "LOCAL");
-    await expect(p.clearWorkingState(id, "LOCAL")).resolves.toBe(false);
+    await expect(p.clearWorkingState(id, "LOCAL", "implementation")).resolves.toBe(false);
     await p.postComment(id, "late comment");
     await expect(p.readIssueDetails(id)).resolves.toMatchObject({
       location: "failed",
@@ -545,13 +569,60 @@ describe("FilesystemProvider", () => {
     await writeTask(dir, "LOCAL-15.md", "---\ntitle: Implementation retry\n---\nImplement again.");
 
     await p.markPlanningFailed(planningId, "LOCAL", "temporary");
-    await expect(p.clearWorkingState(planningId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(planningId, "LOCAL", "planning")).resolves.toBe(true);
     await p.markImplementing(implementationId, "LOCAL");
     await p.markImplementationFailed(implementationId, "LOCAL", "temporary");
-    await expect(p.clearWorkingState(implementationId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(implementationId, "LOCAL", "implementation")).resolves.toBe(true);
 
     const snap = await p.fetchAIImplementSnapshot();
     expect(snap.needsPlanning.map((issue) => issue.id)).toEqual([planningId]);
     expect(snap.readyForImplementation.map((issue) => issue.id)).toEqual([implementationId]);
   });
+});
+
+it("reads directory setup through symlinks and creates nothing", async () => {
+  const { readdir } = await import("node:fs/promises");
+  const root = testDir("fs-setup");
+  const target = join(root, "target");
+  await mkdir(target);
+  await writeFile(join(root, "file"), "file");
+  await symlink(target, join(root, "alias"));
+  const mappings = Object.fromEntries(["target", "alias", "file", "missing"].map((key) => [key, mapping({ directory: join(root, key) })]));
+  const before = await readdir(root);
+  const facts = await new FilesystemProvider(() => mappings).fetchSetupFacts(Object.keys(mappings));
+  expect(facts.directories.target.error).toBeUndefined();
+  expect(facts.directories.alias.error).toBeUndefined();
+  expect(facts.directories.file.error).toContain("not a directory");
+  expect(facts.directories.missing.error).toContain("does not exist");
+  expect(await readdir(root)).toEqual(before);
+  expect(await readdir(target)).toEqual([]);
+});
+
+
+it("records denied directory access without writing", async () => {
+  const root = testDir("fs-setup-denied");
+  vi.mocked(access).mockRejectedValueOnce(new Error("EACCES"));
+  const facts = await new FilesystemProvider(() => ({ X: mapping({ directory: root }) })).fetchSetupFacts(["X"]);
+  expect(facts.directories.X.error).toContain("not writable");
+  const { readdir } = await import("node:fs/promises");
+  expect(await readdir(root)).toEqual([]);
+});
+
+it("fails the directory setup row when write access exists but search access is denied", async () => {
+  const root = testDir("fs-setup-no-search");
+  // Model search denial explicitly: a write-only check would incorrectly succeed.
+  vi.mocked(access).mockImplementationOnce(async (_path, mode) => {
+    if (mode !== undefined && (mode & constants.X_OK) !== 0) throw new Error("EACCES");
+  });
+  const mappings = { X: mapping({ directory: root }) };
+  const facts = await provider(mappings).fetchSetupFacts(["X"]);
+  expect(access).toHaveBeenLastCalledWith(root, constants.W_OK | constants.X_OK);
+  expect(facts.directories.X.error).toContain("not writable or searchable");
+  const check = TRACKER_CONFIG_CHECKS.find((c) => c.id === "tracker.filesystem.directory")!;
+  expect(await check.run(makeSetupCheckContext({
+    mappings: () => mappings,
+    trackerSetupFacts: async () => facts,
+  }))).toMatchObject([{ project: "X", state: "fail", fix: expect.stringContaining("permissions") }]);
+  const { readdir } = await import("node:fs/promises");
+  expect(await readdir(root)).toEqual([]);
 });

@@ -91,7 +91,7 @@ The orchestrator's own environment and settings (`ORCHESTRATOR_CONFIG_CHECKS`, `
 
 ### tracker
 
-The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracker-config.ts`), explained in [ticketing-providers.md](ticketing-providers.md). Each provider reads its own facts once per run (`fetchSetupFacts`), and the checks judge them; a run that cannot read them reports its Linear checks as *cannot verify*, with the reason.
+The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracker-config.ts`), explained in [ticketing-providers.md](ticketing-providers.md). Each provider reads its own facts once per run (`fetchSetupFacts`), and the checks judge them; a run that cannot read them reports its dependent checks as *cannot verify*, with the reason.
 
 | Id | Reports |
 |---|---|
@@ -101,6 +101,13 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.linear.pickup-label`](ticketing-providers.md#the-pickup-label) | No label with the pickup label's exact name at workspace level or in the team, or one only in a different case |
 | [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case |
 | [`tracker.linear.workflow-states`](ticketing-providers.md#workflow-states) | A team with no `started`-type or no `completed`-type state |
+| [`tracker.jira.credentials`](ticketing-providers.md#credentials) | Jira credentials faults (core) |
+| [`tracker.jira.fields`](ticketing-providers.md#custom-fields) | Jira fields faults (core) |
+| [`tracker.jira.field-cache`](ticketing-providers.md#field-cache) | Jira field cache faults (core) |
+| [`tracker.jira.status-options`](ticketing-providers.md#the-ai-implement-status-options) | Jira status options faults (core) |
+| [`tracker.jira.repo-option`](ticketing-providers.md#repo-option) | Jira repo option faults (core) |
+| [`tracker.jira.query`](ticketing-providers.md#bucket-query) | Jira query faults (core) |
+| [`tracker.filesystem.directory`](ticketing-providers.md#filesystem-setup) | Missing, non-directory or unwritable ticket directory (mode) |
 
 ## Bootstrap mode before sign-in
 

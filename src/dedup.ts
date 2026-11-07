@@ -23,10 +23,16 @@ function resolveDbPath(): DatabasePath {
   }
 }
 
-const DB_PATH = resolveDbPath();
+let resolvedPath: DatabasePath | null = null;
+
+/** Resolved on first use, so a process that imports this module and never opens the database creates nothing. */
+function dbPath(): DatabasePath {
+  resolvedPath ??= resolveDbPath();
+  return resolvedPath;
+}
 
 export function getDatabasePath(): DatabasePath {
-  return { ...DB_PATH };
+  return { ...dbPath() };
 }
 
 let db: Database.Database | null = null;
@@ -343,13 +349,13 @@ export function getDb(): Database.Database {
   if (!db && readOnly) {
     // A read-only open never creates the file, so a wrong path throws here instead of creating an empty database there.
     try {
-      db = new Database(DB_PATH.path, { readonly: true });
+      db = new Database(dbPath().path, { readonly: true });
     } catch (err) {
-      throw new Error(`Cannot open the database at ${DB_PATH.path} read-only (${err instanceof Error ? err.message : String(err)})`);
+      throw new Error(`Cannot open the database at ${dbPath().path} read-only (${err instanceof Error ? err.message : String(err)})`);
     }
   }
   if (!db) {
-    db = new Database(DB_PATH.path);
+    db = new Database(dbPath().path);
     db.pragma("journal_mode = WAL");
     db.exec(`
       CREATE TABLE IF NOT EXISTS dispatched (

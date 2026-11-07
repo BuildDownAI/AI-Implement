@@ -125,8 +125,14 @@ export class FakeProvider implements TicketingProvider {
     this.appendComment(issueId, `Implementation failed: ${reason}`);
     return true;
   }
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
-    await this.tick("clearWorkingState", [issueId, scopeKey]);
+  async clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    await this.tick("clearWorkingState", [issueId, scopeKey, phase]);
+    this.transition(issueId, "cleared");
+    return true;
+  }
+  async parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    await this.tick("parkForHuman", [issueId, scopeKey, phase]);
+    if (this.issues.get(issueId)?.lifecycle !== "active") return false;
     this.transition(issueId, "cleared");
     return true;
   }

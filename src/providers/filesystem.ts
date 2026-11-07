@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
+  access,
+  constants,
   mkdir,
   readFile,
   readdir,
@@ -16,6 +18,7 @@ import type { RepoMapping } from "../config.js";
 import { assemblePlanningContext } from "../planning-context-assembly.js";
 import { parseTaskDocument } from "../task-document.js";
 import type {
+  FilesystemSetupFacts,
   AIImplementSnapshot,
   FeatureNodeRollUp,
   IssueLifecycleState,
@@ -80,6 +83,21 @@ const PLANNING_PREFIXES = [
 export class FilesystemProvider implements TicketingProvider {
   readonly id = "filesystem";
   private readonly getMappings: () => Record<string, RepoMapping>;
+
+  async fetchSetupFacts(projectKeys: string[]): Promise<FilesystemSetupFacts> {
+    const facts: FilesystemSetupFacts = { kind: "filesystem", directories: {} };
+    for (const key of projectKeys) {
+      const mapping = this.getMappings()[key];
+      if (mapping?.ticketingConfig.kind !== "filesystem") continue;
+      const directory = mapping.ticketingConfig.directory;
+      const row: { directory: string; error?: string } = { directory };
+      facts.directories[key] = row;
+      const root = await existingRealDirectory(directory);
+      if (!root) row.error = "does not exist or is not a directory";
+      else try { await access(root, constants.W_OK | constants.X_OK); } catch { row.error = "is not writable or searchable by the orchestrator"; }
+    }
+    return facts;
+  }
 
   constructor(getMappings: () => Record<string, RepoMapping>) {
     this.getMappings = getMappings;
@@ -188,7 +206,8 @@ export class FilesystemProvider implements TicketingProvider {
     }, { activeOnly: true });
   }
 
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
+  // The task's own state already records which phase failed, so `_phase` is not needed here.
+  async clearWorkingState(issueId: string, scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
     const mapping = this.mappingForScope(scopeKey);
     return this.updateTask(issueId, scopeKey, (state) => {
       if (isCallbackTerminal(state.status)) return null;
@@ -200,6 +219,13 @@ export class FilesystemProvider implements TicketingProvider {
             : "plan-approved";
       const { failurePhase: _failurePhase, ...rest } = state;
       return { ...rest, status: nextStatus };
+    }, { activeOnly: true });
+  }
+
+  async parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (isCallbackTerminal(state.status)) return null;
+      return { ...state, status: "failed", failurePhase: phase };
     }, { activeOnly: true });
   }
 

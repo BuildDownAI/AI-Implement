@@ -44,6 +44,13 @@ export const SETUP_CHECK_IDS = [
   "admin.allowlist",
   // tracker-config.ts
   "tracker.provider",
+  "tracker.jira.credentials",
+  "tracker.jira.fields",
+  "tracker.jira.field-cache",
+  "tracker.jira.status-options",
+  "tracker.jira.repo-option",
+  "tracker.jira.query",
+  "tracker.filesystem.directory",
   "tracker.linear.credentials",
   "tracker.linear.team-access",
   "tracker.linear.pickup-label",

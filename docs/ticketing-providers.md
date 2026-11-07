@@ -38,6 +38,13 @@ Comments: the search response embeds a capped comment list with its `total`. Onl
 
 Selection (`src/poll-selection.ts`) then matches each issue to a mapping by `scopeKey`.
 
+## Looking up an issue by key
+
+`findByKey(key, scopeKey?)` reads one issue outside the poll. A Linear key names its team, so Linear always returns the team as the scope key. A Jira key does not name the mapping:
+
+- **With `scopeKey`**, Jira reads the fields that mapping's poll reads and builds the issue the same way: scope key, description as text, profiles, base branch and assignee. The Restate planning and implementation runs use this form, with the run's team key (the scope key the poll dispatched with). Without it, those runs saw only the issue title, with no profiles or base branch.
+- **Without `scopeKey`** (an admin lookup, a review-fix description), Jira returns `scopeKey: ""` and does not read the custom fields. The description is still converted from ADF to text.
+
 ## Tracker state after each planning outcome
 
 | Outcome | Jira | Linear |
@@ -49,9 +56,22 @@ Selection (`src/poll-selection.ts`) then matches each issue to a mapping by `sco
 | Plan recorded but status write failed | Row `failed` / `plan_status_write_failed`; issue parked; `Planning Failed` plus one comment carrying the tracker's own error (Jira: status and body) | Same, with the label kept; Unpark to retry |
 | Operator cancel | Working state cleared | Working state cleared |
 
-A Jira `AI-Implement Status` field needs these options: `Ready`, `Planning`, `Plan Approved`, `Planning Failed`, and `Awaiting Approval` when "Auto-approve plans" is off. A missing option makes the plan-complete write fail, which fails and parks the run.
+Each Jira status in this table is an option of the `AI-Implement Status` field, and a write of an option the field does not have is refused. For the plan-complete write, the refusal fails and parks the run. The field needs nine options in all; [Jira setup](#jira-setup) lists them, with what each missing one breaks.
 
 The filesystem provider ignores `awaitApproval` as well. A parked issue needs **Unpark** at `/admin#runners` before it dispatches again.
+
+## Tracker state after a failed, stuck or given-up run
+
+Two provider verbs move a ticket after a run that did not finish. Both take the phase of the run (`planning` or `implementation`) and both refuse an issue that is already terminal (return `false`).
+
+| Verb | Used by | Jira | Linear | Filesystem |
+|---|---|---|---|---|
+| `clearWorkingState(id, scope, phase)`: put the issue back in pickup | Retries within `STUCK_JOB_MAX_ATTEMPTS`, the reaper, operator cancel, admin job destroy | planning: `Ready`; implementation: `Plan Approved` | `AI-Working` and `AI-Planning` removed | `ready` or `plan-approved`, from the task's own state |
+| `parkForHuman(id, scope, phase)`: take the issue out of pickup, no comment | The stuck watchdog's give-up (`src/stuck-watchdog.ts`) | planning: `Planning Failed`; implementation: `Implementation Failed` | `AI-Needs-Human` added first, then `AI-Working` and `AI-Planning` removed; the pickup label stays | Task `failed`, then archived by the failure reconciler |
+
+A planning reset goes to `Ready`, not `Plan Approved`: a planning run that failed left no approved plan, and `Plan Approved` would dispatch implementation. A fix run (job phase `gap-analysis`) is never reset or parked; its ticket already has a PR.
+
+On give-up, the watchdog parks first and only then clears the dedup row and the stuck-attempt counter, so a restarted ticket gets a full retry budget. When the park throws or is refused, the row and the counter stay. The give-up comment ends with the restart step: on Linear, remove the `AI-Needs-Human` label; on Jira and the filesystem provider, reset the AI-Implement status or label.
 
 ## Mapping keys
 
@@ -81,11 +101,97 @@ The poll matches the pickup label by its exact name (`labels: { name: { eq } }`)
 
 ### Lifecycle labels
 
-The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working` and, once a PR opens, `Ready for Review`. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
+The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working`, once a PR opens `Ready for Review`, and, when the stuck watchdog gives up, `AI-Needs-Human`. The poll skips an issue carrying `AI-Needs-Human` before it counts capacity, so a park that added the marker but failed to remove `AI-Working` does not hold a slot. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
 
 ### Workflow states
 
 `markPlanningStarted` and `markImplementing` move an issue still in triage, the backlog or an unstarted state to the team's `started`-type state (`In Progress` when the team has one). `markMerged` moves a merged issue to its `completed`-type state (`Done` when it has one). A team with no state of that type fails the transition with `No "started" workflow state found for team …`, or the `completed` equivalent.
+
+## Jira setup
+
+The setup checks read Jira's facts in one pass that never writes (`JiraProvider.fetchSetupFacts`): the account, each mapping's fields resolved fresh, the status and repo fields' options, and one result of each mapping's bucket query.
+
+### Credentials
+
+`JIRA_EMAIL` selects the mode.
+
+| Mode | Variables | Requests go to | Header |
+|---|---|---|---|
+| Basic (API token) | `JIRA_EMAIL`, `JIRA_TOKEN`, `JIRA_SITE_URL` | `JIRA_SITE_URL` | `Basic` of `email:token` |
+| OAuth | `JIRA_TOKEN` (access token), `JIRA_CLOUD_ID`, `JIRA_SITE_URL`; `JIRA_EMAIL` empty | `https://api.atlassian.com/ex/jira/<cloudId>` | `Bearer` |
+
+Neither mode refreshes. `JiraClient` builds its Authorization header once and the registry reads environment variables once at boot; changing an expired token requires replacing it and restarting the orchestrator. `JIRA_SITE_URL` is required in both modes for issue links. Missing token or site URL, or neither email nor cloud ID, makes `createJiraProviderFromConfig` throw `MissingProviderConfigError`; the registry skips Jira and polls other trackers. Basic auth with an API token is recommended for a long-lived setup.
+
+The account lists fields, searches, reads issues and comments, sets the status field and adds comments. Setup checks only use GET requests and the poll's search POST.
+
+### Field cache
+
+`tracker.jira.field-cache` compares fresh IDs with the poll cache without filling it. Restart the orchestrator if they differ.
+
+### Bucket query
+
+`tracker.jira.query` runs the exact poll bucket query for one result. Correct the mapping JQL if Jira refuses it; it does not use the parse endpoint.
+
+### Repo option
+
+`tracker.jira.repo-option` requires a select option equal to the mapping’s `repoFieldValue`; add the exact option or correct the mapping. Text fields need no option.
+
+### Custom fields
+
+| Field | Required | What the code reads | Override |
+|---|---|---|---|
+| `AI-Implement Status` | yes | single-select option value | `statusFieldOverride` |
+| `AI-Implement Repo` | yes | single-select or text matching `repoFieldValue` | `repoFieldOverride` |
+| `AI-Implement Profiles` | no | multi-select option values | `profilesFieldOverride` |
+| `AI-Implement Base Branch` | no | non-blank text | `baseBranchFieldOverride` |
+| `Epic Link` | no | classic-project epic key | none |
+
+`resolveCustomFieldIds` matches exact, case-sensitive names. Missing or duplicate required fields throw; absent or ambiguous optional fields warn and stay off. Epic Link takes the first match. Overrides are letters-digits-underscores IDs used as given, without validation against Jira. With all four overrides set, the field list is never read and Epic Link is not resolved. A repo mismatch drops the issue with one warning per issue.
+
+Resolved IDs are cached by site (site URL for Basic, cloud ID for OAuth) and all four overrides for the life of the process. A mapping save does not clear this cache. Failed resolutions are not cached. Setup resolves fresh and warns on drift; restart the orchestrator to use the current fields.
+
+### The `AI-Implement Status` options
+
+The poll's bucket is `(<mapping jql>) AND <status field> in (Ready, "Plan Approved")`. Nine values are read or written (`STATUS_VALUES`):
+
+| Option | Set by | When missing |
+|---|---|---|
+| `Ready` | a person | no issue can be queued |
+| `Planning` | `markPlanningStarted` | write fails; run continues and issue stays Ready |
+| `Awaiting Approval` | `markPlanComplete`, auto-approval off | plan-complete write fails and parks the run |
+| `Plan Approved` | `markPlanComplete`, auto-approval on; `clearWorkingState`; a person | plan-complete write and resets fail |
+| `Implementing` | `markImplementing` | write fails after launch |
+| `PR Ready` | `markPrReady` | write fails; review comment is lost |
+| `Merged` | `markMerged` | merge completion never updates the issue |
+| `Planning Failed` | `markPlanningFailed` | write fails; failure comment is lost |
+| `Implementation Failed` | `markImplementationFailed` | write fails; failure comment is lost |
+
+`Awaiting Approval` is required only with auto-approval off. `clearWorkingState` writes Plan Approved for operator cancels, admin machine stops, watchdog and monitor resets.
+
+Comment-carrying setters write status first, so a rejected write loses the comment. Merged is terminal: `setStatus` refuses to move an issue off Merged, but proceeds if its pre-read fails. A refused regression makes `markPlanningFailed` and `markPrReady` post nothing; `markImplementationFailed` posts a late-report comment instead. `markMerged` changes only the custom field; native Done or field Merged counts as finished.
+
+Without a Merged option, merge reconciliation retries once per poll and dead-letters after five failures. The issue keeps PR Ready and, until its native status becomes Done, holds grouping-parent dispatch and roll-up and issues it Blocks.
+
+## Filesystem setup
+
+The provider needs no tracker credentials and requires `RUNNER_MODE=local`. Mapping directories must be absolute, exist as directories and be writable. The check resolves symlinks through `existingRealDirectory`, just like the poll, and tests access without writing. Missing directories are silently skipped by the poll. The provider writes `.state/<mapping key>/<identifier>.json` and `completed/` and `failed/` archives; archiving is skipped with a warning when mappings share a directory. See [filesystem-tickets.md](filesystem-tickets.md) for the format.
+
+## When a tracker write fails
+
+A missing label, state, team or option shows up as one of these writes failing. The handling belongs to the caller, so it is the same for every tracker.
+
+| Write | Called | On failure |
+|---|---|---|
+| planning started (`markPlanningStarted`) | after a planning run launches | caught and logged, warning that the next poll may re-dispatch planning; the run continues |
+| plan complete (`markPlanComplete`) | on the planning success callback | the run fails as `plan_status_write_failed` and the issue is parked; see the planning-outcome table |
+| implementing (`markImplementing`) | after an implementation run launches (`postDispatch`) | throws out of dispatch, and the poll logs `[poll] Error processing <key>`; the run continues. On Fly Machines and local Docker, `dispatchSession` also deletes the issue's dedup row and records a dispatch failure |
+| PR ready (`markPrReady`) | on the implementation success callback, and from the monitor | logged; the callback also returns it in `warnings` |
+| failed (`markPlanningFailed`, `markImplementationFailed`) | on the failure callback (`handleRunnerResult`), among other callers | in the callback, logged and returned in `warnings` |
+| merged (`markMerged`) | from merge reconciliation and grouping-parent finalize paths | reconciliation makes one attempt per poll and marks the row `failed` after the fifth failure; finalize paths log |
+
+## When one tracker's snapshot fails
+
+`fetchProviderSnapshots` settles providers separately. A rejected snapshot logs `[poll] <provider> snapshot failed, its issues sit out this cycle`; other trackers still dispatch, and skip-reason memory retains failed-provider issues. Jira rejects on missing or duplicate required fields, failed field listing or search, affecting every Jira mapping. Linear rejects on token mint or API/GraphQL errors. Construction failures are skipped by the registry, which retains them until a mapping save.
 
 ## Mixed deployments
 

@@ -1,0 +1,23 @@
+# The build context is only what Dockerfile and Dockerfile.session copy, so nothing else in a
+# checkout leaves the machine: .env, a GitHub App .pem, the local database, clients/*.toml,
+# node_modules and .git included. Docker and flyctl upload the whole directory otherwise.
+# A new COPY source in either Dockerfile needs its line here.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!pipelines/
+!workflows/
+!kg/
+!custom/
+!session/
+!docker-entrypoint.sh
+
+# Kept out even inside the directories above.
+**/.env
+**/.env.*
+**/*.pem
+**/*.sqlite
+**/*.sqlite-*
+**/node_modules
