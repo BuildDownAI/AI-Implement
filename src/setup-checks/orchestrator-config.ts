@@ -10,7 +10,21 @@ import { MAX_POLL_INTERVAL_MS, parsePollIntervalMs } from "../poll-cycle.js";
 import { parseBreakerThreshold } from "../dispatch-breaker.js";
 import { FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveExecutionPath, resolveFlyProcessLevelSecrets, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
 import { missingRunnerCallbackConfig } from "../runner-callback.js";
-import type { SetupCheck } from "./index.js";
+import type { SetupCheck, SetupCheckContext } from "./index.js";
+
+/** Configuration only: an allowlist outage must never expose bootstrap diagnostics. */
+export function isAdminPathConfigured({ env, effectiveAllowlist, allowlistReadAvailable }: Pick<SetupCheckContext, "env" | "effectiveAllowlist" | "allowlistReadAvailable">): boolean {
+  if (effectiveAccessCode(env.ADMIN_ACCESS_CODE) !== null) return true;
+  let list;
+  try {
+    list = effectiveAllowlist();
+    if (!allowlistReadAvailable()) return true;
+  } catch { return true; }
+  if (list === null) return true;
+  const providers = resolveProviders(env).providers;
+  return Boolean(env.OAUTH_REDIRECT_BASE_URL && providers.length > 0 &&
+    (providers.some((provider) => provider.id === "builddown") || hasAdminAddress(list.entries)));
+}
 
 export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
   {

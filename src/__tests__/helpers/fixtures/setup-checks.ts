@@ -30,6 +30,7 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
     mappings: () => ({}),
     storedAccessEntries: () => [],
     effectiveAllowlist: () => ({ entries: [], source: "env" }),
+    allowlistReadAvailable: () => true,
     restateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
     databasePath: () => ({ path: "/data/dedup.sqlite", configured: "/data/dedup.sqlite", fellBack: false }),
     onSeparateFilesystem: () => true,

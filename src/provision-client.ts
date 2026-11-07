@@ -202,6 +202,7 @@ function envOnlyContext(env: Record<string, string>): SetupCheckContext {
     mappings: unavailable,
     storedAccessEntries: unavailable,
     effectiveAllowlist: () => ({ entries: allowlistFromEnv(env), source: "env" }),
+    allowlistReadAvailable: () => true,
     restateStatus: unavailable,
     databasePath: unavailable,
     onSeparateFilesystem: unavailable,

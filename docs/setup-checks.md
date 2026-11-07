@@ -108,3 +108,19 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.jira.repo-option`](ticketing-providers.md#repo-option) | Jira repo option faults (core) |
 | [`tracker.jira.query`](ticketing-providers.md#bucket-query) | Jira query faults (core) |
 | [`tracker.filesystem.directory`](ticketing-providers.md#filesystem-setup) | Missing, non-directory or unwritable ticket directory (mode) |
+
+## Bootstrap mode before sign-in
+
+Before an admin path is configured, unauthenticated `GET /` shows
+`setupChecks.failingOnAdminPath`: the ids of failing local checks that can block
+reaching an admin. It checks these afresh on each request, even while Restate is
+down, without contacting any network service. It never shows titles, details,
+fixes, projects or configured values. Use the ids to identify what needs attention
+before anyone can sign in.
+
+This list stops appearing once a real access code is set, a kept SSO provider has
+its redirect URL and an admin address in the effective allowlist, or BuildDown has
+its redirect URL. An unreadable allowlist keeps bootstrap mode off, so an outage
+does not expose diagnostics. `setupChecks.checkedAt` and `failingCore` remain:
+they describe the last known setup run, restored after Restate registration on
+restart, or are both `null` before a run is known.

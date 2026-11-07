@@ -3,7 +3,7 @@
 // Run with `npm run test:restate`; excluded from `npm test`.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createSetupChecks } from "../../restate/setup-checks.js";
-import { runSetupChecks, SETUP_CHECKS, type SetupCheckRun } from "../../setup-checks/index.js";
+import { getLastSetupCheckRun, runSetupChecks, SETUP_CHECKS, type SetupCheckRun } from "../../setup-checks/index.js";
 import { makeSentinelSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import type { RestateEnvironment } from "./harness.js";
 import { VARIANTS, callObject, eventually, gate, journalEntries, journalText, journaledRunResult, queryInvocations, settle, startVariants, stopAll } from "./harness.js";
@@ -41,14 +41,16 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
 
   it("runs the checks once, journals the run, and keeps it for get", async () => {
     let calls = 0;
-    nextRun = async () => runAt(1000 + ++calls);
+    const checkedAt = Date.now();
+    nextRun = async () => runAt(checkedAt + ++calls);
     const run = await call<SetupCheckRun>("once", "run");
 
-    expect(run).toEqual(runAt(1001));
+    expect(run).toEqual(runAt(checkedAt + 1));
+    expect(getLastSetupCheckRun()).toEqual(run);
     expect(calls).toBe(1);
-    expect(await call("once", "get")).toEqual(runAt(1001));
+    expect(await call("once", "get")).toEqual(runAt(checkedAt + 1));
     const rows = await invocations("once", "run");
-    expect(journaledRunResult(await journalEntries(env().adminAPIBaseUrl(), String(rows[0].id)), "run checks")).toEqual(runAt(1001));
+    expect(journaledRunResult(await journalEntries(env().adminAPIBaseUrl(), String(rows[0].id)), "run checks")).toEqual(runAt(checkedAt + 1));
   });
 
   it("never runs two check runs at once, and keeps the later one", async () => {

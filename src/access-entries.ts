@@ -67,6 +67,7 @@ const DOMAIN_SHAPE = /^[^\s@.]+(\.[^\s@.]+)+$/;
 
 let cached: EffectiveAllowlist | null = null;
 let cachedAt = 0;
+let allowlistReadAvailable = false;
 
 /**
  * How long a cached list serves before it is re-read: one poll interval, so a write from another
@@ -230,6 +231,13 @@ export function getEffectiveAllowlist(): EffectiveAllowlist | null {
   return cached;
 }
 
+/** Whether the latest stored-list read succeeded, independently of the last good entries.
+ * Call after getEffectiveAllowlist so an expired cache has been refreshed first.
+ */
+export function isAllowlistReadAvailable(): boolean {
+  return allowlistReadAvailable;
+}
+
 /** Re-read after a write, or once the cached list has aged out. */
 export function refreshEffectiveAllowlist(): void {
   try {
@@ -238,7 +246,9 @@ export function refreshEffectiveAllowlist(): void {
       ? { entries: stored, source: "db" }
       : { entries: withBindings(allowlistFromEnv(process.env), loadBindings()), source: "env" };
     cachedAt = Date.now();
+    allowlistReadAvailable = true;
   } catch (err) {
+    allowlistReadAvailable = false;
     if (cached) {
       // Back off to one attempt per window: the last good list serves correctly meanwhile, and
       // retrying per request would warn on every one.
@@ -412,4 +422,5 @@ export function clearAccessBindings(value: string, actor: string | null): number
 export function __resetAllowlistCacheForTest(): void {
   cached = null;
   cachedAt = 0;
+  allowlistReadAvailable = false;
 }
