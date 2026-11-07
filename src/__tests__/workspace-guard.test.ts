@@ -114,6 +114,35 @@ describe("workspace guard", () => {
     expect(restoreWorkspace(snap)).toBe(false);
   });
 
+  it("restores pre-hook ignore semantics when a hook edits .gitignore to hide a file it creates", () => {
+    const snap = snapshotWorkspace(dir);
+    // Hook: appends a pattern to .gitignore and creates a file that pattern now matches.
+    writeFileSync(join(dir, ".gitignore"), "bin/\ngenerated.ts\n");
+    writeFileSync(join(dir, "generated.ts"), "export const x = 1;\n");
+
+    expect(restoreWorkspace(snap)).toBe(true);
+
+    expect(existsSync(join(dir, "generated.ts"))).toBe(false);
+    expect(read(".gitignore")).toBe("bin/\n");
+    // The push step's `git add -A` must not pick the file back up.
+    git("add", "-A");
+    const staged = execFileSync("git", ["status", "--porcelain"], { cwd: dir }).toString();
+    expect(staged).not.toContain("generated.ts");
+  });
+
+  it("leaves pre-existing ignored build output alone when a hook removes its ignore rule", () => {
+    mkdirSync(join(dir, "bin"));
+    writeFileSync(join(dir, "bin", "output.dll"), "binary\n");
+    const snap = snapshotWorkspace(dir);
+    // Hook: removes the bin/ ignore rule, un-ignoring build output it did not create.
+    writeFileSync(join(dir, ".gitignore"), "");
+
+    expect(restoreWorkspace(snap)).toBe(true);
+
+    expect(read("bin/output.dll")).toBe("binary\n");
+    expect(read(".gitignore")).toBe("bin/\n");
+  });
+
   it.each(["read-tree", "checkout-index"])("returns false when %s fails during the revert", (failing) => {
     const snap = snapshotWorkspace(dir);
     writeFileSync(join(dir, "c.txt"), "C-hook\n");

@@ -462,6 +462,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
                 const hookStarted = Date.now();
                 let exitCode: number;
                 let hookOutput: string;
+                let hookSecrets: string[] | undefined;
                 // The hook runs before push, which stages with `git add -A`: whatever it changes in
                 // the tree would ship. Snapshot first and restore after, pass or fail.
                 const workspaceSnapshot = snapshotWorkspace(workspaceDir);
@@ -470,6 +471,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
                   const result = await runHookScript("verify", verifyScriptPath, workspaceDir);
                   exitCode = result.exitCode;
                   hookOutput = result.output;
+                  hookSecrets = result.secrets;
                 } catch (err) {
                   // A missing script or spawn failure is a hook failure the agent can act on, not a crash.
                   exitCode = 1;
@@ -479,7 +481,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
                 }
                 return {
                   exitCode,
-                  output: neutralizeFences(hookOutputTail(hookOutput)),
+                  output: neutralizeFences(hookOutputTail(hookOutput, hookSecrets)),
                   guarded,
                   durationMs: Date.now() - hookStarted,
                 };

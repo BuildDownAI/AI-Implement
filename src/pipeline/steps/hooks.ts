@@ -11,6 +11,16 @@ export interface HookResult {
   exitCode: number;
   /** Bounded tail of the hook's combined stdout/stderr in arrival order (it was already streamed to the runner log). Unredacted. */
   output: string;
+  /**
+   * Union of `redactionSecrets()` taken before the hook spawned and again after its
+   * `$GITHUB_ENV` writes were merged into `process.env`. A hook that prints a forwarded
+   * secret's old value and then overwrites that key (e.g. rotating `DB_PASS`) would
+   * otherwise only have the new value in `redactionSecrets()` by the time the output is
+   * redacted, leaving the old value exposed in the prompt, PR body and ticket comment. Optional
+   * so callers that construct a `HookResult` without running a real hook (tests, mocks) can omit
+   * it; `hookOutputTail` falls back to the current `redactionSecrets()` when it is absent.
+   */
+  secrets?: string[];
 }
 
 /** Lines of hook output kept for feedback, PR body and ticket comment. */
@@ -26,8 +36,8 @@ const HOOK_CAPTURE_MAX_CHARS = 256 * 1024;
  * PR body and the ticket comment show the same text. Forwarded secrets reach the hook, and the
  * prompt and PR body are model-visible and public, hence the redaction.
  */
-export function hookOutputTail(output: string): string {
-  let tail = redactEvidence(output, redactionSecrets()).replace(/\s+$/, "");
+export function hookOutputTail(output: string, secrets: string[] = redactionSecrets()): string {
+  let tail = redactEvidence(output, secrets).replace(/\s+$/, "");
   const lines = tail.split("\n");
   if (lines.length > HOOK_OUTPUT_TAIL_LINES) tail = lines.slice(-HOOK_OUTPUT_TAIL_LINES).join("\n");
   if (tail.length > HOOK_OUTPUT_TAIL_MAX_CHARS) tail = tail.slice(-HOOK_OUTPUT_TAIL_MAX_CHARS);
@@ -65,6 +75,7 @@ export async function runHookScript(
   const envDir = mkdtempSync(join(tmpdir(), "ai-implement-hook-"));
   const githubEnvFile = join(envDir, "github_env");
   writeFileSync(githubEnvFile, "");
+  const preHookSecrets = redactionSecrets();
 
   try {
     let tail = "";
@@ -105,7 +116,12 @@ export async function runHookScript(
     });
 
     mergeGithubEnv(githubEnvFile);
-    return { exitCode, output: tail.length > HOOK_CAPTURE_MAX_CHARS ? tail.slice(-HOOK_CAPTURE_MAX_CHARS) : tail };
+    const secrets = [...new Set([...preHookSecrets, ...redactionSecrets()])];
+    return {
+      exitCode,
+      output: tail.length > HOOK_CAPTURE_MAX_CHARS ? tail.slice(-HOOK_CAPTURE_MAX_CHARS) : tail,
+      secrets,
+    };
   } finally {
     rmSync(envDir, { recursive: true, force: true });
   }
