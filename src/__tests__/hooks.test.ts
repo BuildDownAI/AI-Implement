@@ -154,6 +154,26 @@ describe.skipIf(isWindows)("runHookScript", () => {
     expect(captured).toContain("AI_IMPLEMENT_FORWARDED_SECRETS=");
   });
 
+  it("keeps a forwarded secret's pre-hook value redacted after the hook rotates it via GITHUB_ENV", async () => {
+    process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "DB_PASS";
+    process.env.DB_PASS = "synthetic-before-value";
+    writeFileSync(
+      join(dir, "verify.sh"),
+      'echo "connecting with synthetic-before-value"\necho "DB_PASS=synthetic-after-value" >> "$GITHUB_ENV"\nexit 1\n',
+    );
+    try {
+      const result = await runHookScript("verify", "verify.sh", dir);
+      expect(result.exitCode).toBe(1);
+      // The merge already happened: process.env reflects the hook's new value.
+      expect(process.env.DB_PASS).toBe("synthetic-after-value");
+      const tail = hookOutputTail(result.output, result.secrets);
+      expect(tail).not.toContain("synthetic-before-value");
+      expect(tail).not.toContain("synthetic-after-value");
+    } finally {
+      delete process.env.DB_PASS;
+    }
+  });
+
   it("ignores GHA heredoc multiline values (only KEY=value is supported)", async () => {
     // A heredoc opener (KEY<<EOF) must NOT be parsed as an env var; the simple
     // line on the same file is still merged.
