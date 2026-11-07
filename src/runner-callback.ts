@@ -374,24 +374,55 @@ export function formatFailureComment(
     // trip reported through the FailureRecord path.
     c = sensitiveFilesGuardrailClassification(redactedGuardrailReason(failureReason));
   } else if (failureCode === "REVIEW_UNAPPROVED" || failureCode === "MAX_TURNS_EXHAUSTED") {
-    const cause =
-      failureCode === "MAX_TURNS_EXHAUSTED"
-        ? "the implementation hit its turn cap before completing"
-        : "the automated reviewer did not approve within the allotted iterations";
+    // REVIEW_UNAPPROVED covers two stages: the first review (before the PR, which then opens
+    // as a draft) and the second review (on an open, non-draft PR, often stopped by a timeout
+    // or unreadable reviewer output rather than by a finding). Its wording must hold for both,
+    // so it names neither a draft nor an iteration limit; failureReason names the stage. It
+    // is written for readers who do not know AI-Implement.
+    const maxTurns = failureCode === "MAX_TURNS_EXHAUSTED";
+    // An initial run with no PR changed no files (a first-review approval among them), and an
+    // unapproved gap-fill does not push, so its change is discarded. Neither has a change in a
+    // PR to examine.
+    const gapFill = isInitialRun === false;
+    const noPr = !maxTurns && !gapFill && !prUrl;
     c = {
-      summary: `🟡 Implementation finished without review approval — ${cause}.`,
+      summary: maxTurns
+        ? "🟡 AI-Implement did not finish the implementation."
+        : gapFill
+          ? "🟡 A review did not approve the new change, so AI-Implement discarded it."
+          : noPr
+            ? "🟡 AI-Implement did not open a pull request."
+            : "🟡 AI-Implement made the change, but a review did not approve it.",
       detail: [
-        prUrl
-          ? isInitialRun === false
-            ? "The existing PR is unchanged by this run."
-            : `The work so far is preserved in a draft PR: ${prUrl}`
-          : "No PR could be opened (no code changes were produced).",
+        // A gap-fill push reports no prUrl, so check the run kind first.
+        isInitialRun === false
+          ? "The existing PR is unchanged by this run."
+          : prUrl
+            ? maxTurns
+              ? `The work so far is preserved in a draft PR: ${prUrl}`
+              : `The change is in this pull request: ${prUrl}`
+            // The no-PR summary and the reason below it already say there is no PR.
+            : noPr ? "" : "No PR could be opened (no code changes were produced).",
         failureReason ?? "",
       ]
         .filter(Boolean)
         .join("\n\n"),
-      remediation:
-        "Review the draft PR and the run autopsy comment. Likely causes: over-broad issue scope, missing prerequisites, or thin context — split the ticket or add context, then re-dispatch.",
+      remediation: maxTurns
+        ? `${gapFill || !prUrl ? "Read" : "Review the draft PR and"} the run autopsy comment. Likely causes: over-broad issue scope, missing prerequisites, or thin context. Split the ticket or add context. Then reset the AI-Implement status or label on the ticket to start AI-Implement again.`
+        : [
+          "",
+          ...(noPr || gapFill
+            ? [
+              "1. Read the reason above.",
+              "2. If the ticket needs a code change, add more information to the ticket.",
+            ]
+            : [
+              "1. If the review did not finish, the change can be correct. Examine the pull request yourself.",
+              "2. If the review found problems, make the ticket smaller or add more information to it.",
+            ]),
+          // Provider-neutral: this comment serves every ticketing provider.
+          "3. To start AI-Implement again, reset the AI-Implement status or label on the ticket.",
+        ].join("\n"),
       docsUrl: TROUBLESHOOTING_URL,
     };
   } else if (failureCode === "INSTALL_FAILED") {
@@ -408,7 +439,7 @@ export function formatFailureComment(
         .filter(Boolean)
         .join("\n\n"),
       remediation:
-        "Fix the install (lockfile, peer ranges, registry access), or set packageManager: none in .ai-implement/config.yml and install in a setup hook. Then re-dispatch or review the PR by hand.",
+        "Fix the install (lockfile, peer ranges, registry access), or set packageManager: none in .ai-implement/config.yml and install in a setup hook. Then run it again, or review the PR by hand.",
       docsUrl: TROUBLESHOOTING_URL,
     };
   } else if (failure) {

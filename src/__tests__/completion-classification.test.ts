@@ -332,7 +332,7 @@ describe("classificationForFailure — PR phrasing", () => {
     expect(c.detail).toContain(`The work so far is preserved in a draft PR: ${PR}`);
   });
 
-  it("says the existing PR is unchanged when isInitialRun is explicitly false (gap-fill / re-dispatch)", () => {
+  it("says the existing PR is unchanged when isInitialRun is explicitly false (gap-fill / repeat run)", () => {
     const c = classificationForFailure(failure, PR, null, null, false);
     expect(c.detail).toContain("The existing PR is unchanged by this run.");
     expect(c.detail).not.toContain("preserved in a draft PR");
@@ -374,8 +374,8 @@ describe("classificationForFailure — PROVIDER_UNAVAILABLE", () => {
     const c = classificationForFailure(providerUnavailableFailure("implement"), PR);
     expect(c.summary).toContain("partially implemented");
     expect(c.detail).toContain(`The work so far is preserved in a draft PR: ${PR}`);
-    expect(c.remediation).toContain("re-trigger the run once the provider recovers");
-    // Never the generic branch's transient wording — this is not a re-dispatch-after-fixing-nothing.
+    expect(c.remediation).toContain("reset the AI-Implement status or label on the ticket once the provider recovers");
+    // Never the generic branch's transient wording — this is not a new run after fixing nothing.
     expect(c.remediation).not.toContain("retry budget was exhausted");
     expect(c.summary).not.toContain("Failed at stage");
   });
@@ -390,6 +390,16 @@ describe("classificationForFailure — PROVIDER_UNAVAILABLE", () => {
     const c = classificationForFailure(providerUnavailableFailure("post-push-review"), PR);
     expect(c.summary).toContain("not reviewed");
     expect(c.summary).not.toContain("implemented");
+  });
+
+  it("renders the provider outage in plain words, with the code at the end", () => {
+    expect(classificationForFailure(providerUnavailableFailure("post-push-review"), PR).summary).toBe(
+      "🟠 The AI service was not available during the second review. The code was not reviewed. (Code: `provider_unavailable`)",
+    );
+    expect(classificationForFailure(providerUnavailableFailure("implement"), undefined).summary).toBe(
+      "🟠 The AI service was not available during implementation. The code was not implemented. (Code: `provider_unavailable`)",
+    );
+    expect(classificationForFailure(providerUnavailableFailure("review"), PR).summary).not.toMatch(/post-push|model provider/i);
   });
 
   it("says the PR is open and ready for human review for the post-push-review stage, not that a draft PR preserved the work — the PR predates this failure (BAC-27134 follow-up)", () => {
@@ -435,6 +445,13 @@ describe("classificationForFailure — REVIEWER_TURNS_EXHAUSTED", () => {
   it("falls back to DEFAULT_RETRY_POLICY.reviewMaxTurns when the field is absent (a record from before this change)", () => {
     const c = classificationForFailure(reviewerTurnsExhaustedFailure(undefined), PR);
     expect(c.summary).toContain(`(${DEFAULT_RETRY_POLICY.reviewMaxTurns})`);
+  });
+
+  it("uses the autopsy's wording and never says post-push or that the change was rejected", () => {
+    const c = classificationForFailure(reviewerTurnsExhaustedFailure(30), PR);
+    expect(c.summary).toContain("The second review (on the pull request) did not finish. A reviewer used all of its permitted steps (30)");
+    expect(c.summary).not.toMatch(/post-push/i);
+    expect(c.summary).not.toContain("did not approve");
   });
 
   it("links the PR when present, and says no PR was opened when absent", () => {

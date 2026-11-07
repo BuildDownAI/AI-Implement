@@ -55,7 +55,16 @@ import { CodexRecoveryRequiredError } from "./pipeline/codex-executor.js";
 import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
-import { writeRunAutopsy, writeRunStats, type StatsPass } from "./run-autopsy.js";
+import {
+  writeRunAutopsy,
+  writeRunStats,
+  APPROVED_WITHOUT_PR,
+  FIRST_REVIEW,
+  SECOND_REVIEW,
+  reasonCodeTag,
+  terminationReasonSentence,
+  type StatsPass,
+} from "./run-autopsy.js";
 import { dependenciesMissing, shouldSkipPostPushReview } from "./pipeline/pipeline-loader.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
@@ -1529,6 +1538,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       writeRunStats(workspaceDir, {
         modelPrices,
         issueIdentifier,
+        existingPrUrl: prNumber ? `https://github.com/${githubOwner}/${githubRepo}/pull/${prNumber}` : undefined,
         passes: statPasses,
         plannedFiles: prUrl ? (planningBlock?.files ?? []) : [],
         filesChanged,
@@ -1613,23 +1623,51 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
             ? "MAX_TURNS_EXHAUSTED"
             : "REVIEW_UNAPPROVED";
     const reviewMaxTurns = reviewerFailure?.reviewMaxTurns ?? retryPolicy.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
+    // Names the review stage that stopped the run in plain words, then the reviewer's own
+    // notes. The ticket comment for REVIEW_UNAPPROVED is stage-neutral, because the
+    // orchestrator cannot tell the stages apart, so the stage and the draft cue live here.
+    const reviewStopReason = (): string => {
+      // On max_turns the feedback is the implement loop's own message, not a review's.
+      const notesLabel = terminationReason === "max_turns" ? "Run notes" : "Review notes";
+      const notes = finalFeedback.trim() ? `\n\n${notesLabel}: ${finalFeedback.slice(0, 500)}` : "";
+      if (!postPushReviewRejected && fbOutputs.approved === true && !prUrl) return APPROVED_WITHOUT_PR + notes;
+      // The MAX_TURNS_EXHAUSTED comment names the draft PR itself, so only REVIEW_UNAPPROVED needs this.
+      const draft = !postPushReviewRejected && terminationReason !== "max_turns" && prUrl && pushOutputs.draft === true
+        ? "AI-Implement opened a draft pull request."
+        : "";
+      // feedback-loop stops before the review on max_turns, so no review declined anything. A
+      // run on an existing PR (prNumber) has one review, on that PR, so it names no stage.
+      const lead = terminationReason === "max_turns"
+        ? ""
+        : prNumber
+          ? "The review did not approve the change."
+          : `${postPushReviewRejected ? SECOND_REVIEW : FIRST_REVIEW} did not approve the change.`;
+      const sentences = [lead, terminationReasonSentence(terminationReason, iterations), draft, reasonCodeTag(terminationReason)];
+      return sentences.filter(Boolean).join(" ") + notes;
+    };
     const failureReason = reviewerTurnsExhausted
-      ? `🟠 A post-push reviewer reached its turn limit (${reviewMaxTurns}); required review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
+      ? `🟠 ${SECOND_REVIEW} did not finish. A reviewer used all of its permitted steps (${reviewMaxTurns}), so the review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
       : providerUnavailable
-        ? finalFeedback || "The model provider was unavailable and the run could not complete."
+        // The outage gets its own first line. The ticket comment renders the FailureRecord, not
+        // this reason. When the run opened no PR, the stuck-job "Last run status" cell and the
+        // give-up alert show it, and they keep only the first line (`boundStatusText`). The
+        // second review's feedback names the outage again; only a ticket comment for a
+        // provider_unavailable run with no FailureRecord would show both copies.
+        ? finalFeedback.trim()
+          ? `The AI service was not available.\n\n${finalFeedback.slice(0, 500)}`
+          : "The AI service was not available and the run could not complete."
         : checksPermissionDenied
           ? finalFeedback || "Check runs could not be read due to a missing permission and the run could not complete review."
-          : `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
-            finalFeedback.slice(0, 500);
+          : reviewStopReason();
 
     const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
     disposition = reviewerTurnsExhausted
-      ? `${prDisposition} — reviewer ran out of turns at the cap after ${iterations} iteration(s) (${terminationReason})`
+      ? `${prDisposition} — a reviewer used all of its permitted steps after ${iterations} iteration(s) (${terminationReason})`
       : providerUnavailable
-        ? `${prDisposition} — provider unavailable after ${iterations} iteration(s) (${terminationReason})`
+        ? `${prDisposition} — AI service not available after ${iterations} iteration(s) (${terminationReason})`
         : checksPermissionDenied
           ? `${prDisposition} — check runs could not be read due to a missing permission after ${iterations} iteration(s) (${terminationReason})`
           : `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
@@ -1644,13 +1682,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       prUrl,
       reviewMaxTurns: reviewerTurnsExhausted ? reviewMaxTurns : undefined,
       failure: reviewerFailure,
+      stoppedByPostPushReview: postPushReviewRejected,
+      existingPrUrl: prNumber ? `https://github.com/${githubOwner}/${githubRepo}/pull/${prNumber}` : undefined,
     });
     console.warn(
       reviewerTurnsExhausted
-        ? `::warning::AI-Implement: post-push reviewer ran out of turns at the cap after ${iterations} iteration(s) (${terminationReason}) — ` +
+        ? `::warning::AI-Implement: a reviewer used all of its permitted steps after ${iterations} iteration(s) (${terminationReason}) — ` +
           (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
         : providerUnavailable
-          ? `::warning::AI-Implement: model provider was unavailable after ${iterations} iteration(s) (${terminationReason}) — ` +
+          ? `::warning::AI-Implement: the AI service was not available after ${iterations} iteration(s) (${terminationReason}) — ` +
             (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
           : checksPermissionDenied
             ? `::warning::AI-Implement: check runs could not be read due to a missing permission after ${iterations} iteration(s) (${terminationReason}) — ` +

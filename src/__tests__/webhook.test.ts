@@ -1347,6 +1347,45 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  // The native review's lead sentence changed from "AI-Implement post-push review …" to
+  // "AI-Implement second review …". Reviews already on open PRs keep the old text, so both
+  // prefixes must still be recognised without the marker.
+  it.each([
+    ["the old prefix", "AI-Implement post-push review found unresolved blockers.", 47],
+    ["the new prefix", "AI-Implement second review: the pull request still has blocking problems.", 48],
+  ])("ignores AI-Implement native request-changes reviews detected by %s alone, with no marker", async (_label, body, prNumber) => {
+    const jobId = appendDispatch({
+      issueId: `issue-self-${prNumber}`,
+      issueIdentifier: `AII-${prNumber}`,
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${prNumber}`);
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body,
+        html_url: `https://github.com/org/repo/pull/${prNumber}#pullrequestreview-1`,
+        user: { login: "ai-implement[bot]", type: "Bot" },
+      },
+      pull_request: {
+        number: prNumber,
+        html_url: `https://github.com/org/repo/pull/${prNumber}`,
+        head: { ref: `ai-implement/aii-${prNumber}-fix` },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true, reason: "self_review" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", prNumber)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it("ignores malformed review payloads with 200 so GitHub does not retry", async () => {
     const { req, res } = makeRequest(SECRET, "pull_request_review", {
       action: "submitted",

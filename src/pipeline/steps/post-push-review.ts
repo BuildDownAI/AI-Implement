@@ -41,6 +41,7 @@ import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
 import { DEFAULT_MODEL } from "../default-model.js";
 import { safeLimitLabel } from "../stage-executor.js";
+import { reasonCodeTag, terminationReasonSentence } from "../../run-autopsy.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -426,6 +427,9 @@ function internalReviewerGates(
   return reviewers.find((reviewer) => reviewer.id === reviewerId)?.gates ?? false;
 }
 
+/** The step feedback for `external_review_pending`: only what the failure reason does not already say. */
+export const EXTERNAL_REVIEW_PENDING_NEXT_STEP = "Open the pull request's checks to see the external review's status.";
+
 /**
  * `summaryBlockingGates` is set under the Claude Code Review process: a `blocking` finding from a
  * trusted Claude summary (a 🔴 heading) gates there, while minor and medium summary findings stay advisory.
@@ -535,20 +539,20 @@ function suppressDuplicateExternalFeedback(feedback: string, externalFindings: R
 }
 
 function findingsUnavailableBlock(unavailable: boolean): string {
-  return unavailable ? "\n\n⚠️ External review findings could not be parsed — verdict from reviewer summary only." : "";
+  return unavailable ? "\n\n⚠️ AI-Implement could not read the findings of the external review. The verdict comes from the summary of the second review only." : "";
 }
 
 /** Feedback for the "verdict unavailable" ending. No verdict comes first: the comment the reader found may predate the head. */
 function externalVerdictUnavailableFeedback(cause: { noVerdict: boolean; verdictBlocks: boolean }): string {
-  if (cause.noVerdict) return "External review check finished without a verdict the gate can read (see the PR's checks for its result); not auto-approving.";
-  if (cause.verdictBlocks) return "External review returned a structured verdict that blocks merge without machine-readable findings; not auto-approving.";
-  return "External review findings could not be parsed; not auto-approving.";
+  if (cause.noVerdict) return "The external review check finished. AI-Implement cannot read its verdict. See the checks on the pull request for the result.";
+  if (cause.verdictBlocks) return "The external review blocks the merge, but AI-Implement cannot read its findings.";
+  return "AI-Implement could not read the findings of the external review.";
 }
 
 function internalReviewSummaryBlock(feedback: string): string {
   const summary = feedback.trim();
   if (!summary) return "";
-  return `\n\nInternal review:\n${summary}`;
+  return `\n\nSummary from the second review:\n${summary}`;
 }
 
 interface CiChecksReadResult {
@@ -1548,9 +1552,9 @@ function reviewerFindingToLedgerFinding(
 }
 
 function selectionFailureMessage(kind: "empty-selection" | "empty-internal" | "unresolved", ids?: string[]): string {
-  if (kind === "empty-selection") return "Project reviewer selection is empty; automated review is incomplete.";
-  if (kind === "empty-internal") return "Project reviewer selection contains no internal reviewers; automated review is incomplete.";
-  return `Selected reviewer(s) did not resolve from trusted code or default-branch config definitions: ${(ids ?? []).join(", ")}. Automated review is incomplete.`;
+  if (kind === "empty-selection") return "The reviewer selection for this project is empty. The second review is not complete.";
+  if (kind === "empty-internal") return "The reviewer selection for this project has no AI-Implement reviewers. The second review is not complete.";
+  return `These selected reviewers have no trusted definition in the code or in the config on the default branch: ${(ids ?? []).join(", ")}. The second review is not complete.`;
 }
 
 async function reportReviewerSelectionFailure(
@@ -1575,11 +1579,11 @@ async function reportReviewerSelectionFailure(
     ghSpawn,
     prNumber,
     `${marker}
-⚠️ Post-push review could not start.
+⚠️ The second review could not start.
 
 ${feedback}
 
-**Merge readiness:** Manual review required; automated review did not complete.`,
+**Merge readiness:** Manual review required; the review did not finish.`,
     marker,
   );
   return { approved: false, iterations: 0, finalFeedback: feedback, forcePushedRevisions: 0, terminationReason: "invalid_review", costUsd: null, findingDispositions: [] };
@@ -1812,7 +1816,7 @@ async function runSelectedInternalReviewers(params: {
       const failure = { ...reviewStageClassified, stage: "post-push-review", code: "PROVIDER_UNAVAILABLE" as const, retryable: false };
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
       const modelErrorDetail = reviewResult.errorMessage?.trim() ? ` ${reviewFailureMessage(reviewResult)}` : "";
-      const feedback = compactErrorMessage(`Reviewer ${label} could not run because the model provider was unavailable after ${reviewStageAttempt} attempt(s) (${telemetryPart}).${modelErrorDetail}`);
+      const feedback = compactErrorMessage(`The reviewer ${label} could not run because the AI service was not available after ${reviewStageAttempt} attempt(s) (${telemetryPart}).${modelErrorDetail}`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "provider_unavailable";
       priorLlmFailure ||= reviewerGates(selection, provenance);
       await reportIncompleteFailure(feedback, reviewResult.telemetry, { failure }, reviewStartedAt, reviewEndedAt);
@@ -1831,8 +1835,7 @@ async function runSelectedInternalReviewers(params: {
       const partialReport = partialVerdict
         ? `\n\n${reviewerEvidenceReport(label, partialVerdict, true)}`
         : "\n\nNo usable partial structured review evidence was returned before the cap.";
-      const capMessage = `ran out of turns at the configured cap (${maxTurns})`;
-      const feedback = `${label} ${capMessage}. ${summaryLine(reviewResult.telemetry)}${partialReport}`;
+      const feedback = `${label} used all of its permitted steps (${maxTurns}). ${summaryLine(reviewResult.telemetry)}${partialReport}`;
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "reviewer_turns_exhausted";
       await reportIncompleteFailure(
         feedback,
@@ -1860,8 +1863,8 @@ async function runSelectedInternalReviewers(params: {
 
     if (reviewResult.structuredOutput === undefined) {
       const feedback = compactErrorMessage(legacy
-        ? `Reviewer returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`
-        : `Reviewer ${label} returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
+        ? `The reviewer returned no result that AI-Implement can read. Reviewer output: ${reviewResult.stdout || "(empty stdout)"}`
+        : `The reviewer ${label} returned no result that AI-Implement can read. Reviewer output: ${reviewResult.stdout || "(empty stdout)"}`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
       await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
       continue;
@@ -1968,7 +1971,7 @@ async function reportInvalidStructuredReview(
   postPrComment(
     ghSpawn,
     prNumber,
-    `${marker}\n⚠️ Post-push review returned invalid output.\n\n${feedback}\n\nThe implementation PR is still available, but this automated review pass did not finish. No actionable code feedback was produced by this review attempt.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
+    `${marker}\n⚠️ The second review returned a result that AI-Implement cannot read.\n\n${feedback}\n\nThe pull request is still open. This review pass did not finish, and it gave no feedback on the code. A person must review the pull request.\n\n**Merge readiness:** Manual review required; the review did not finish.`,
     marker,
   );
 }
@@ -2012,7 +2015,7 @@ async function reportChecksPermissionDenied(
   postPrComment(
     ghSpawn,
     prNumber,
-    `${marker}\n🔒 Post-push review could not verify check runs.\n\n${CHECKS_PERMISSION_DENIED_MESSAGE}\n\n**Merge readiness:** Manual review required; check runs could not be read.`,
+    `${marker}\n🔒 The second review could not read the checks on the pull request.\n\n${CHECKS_PERMISSION_DENIED_MESSAGE}\n\n**Merge readiness:** Manual review required; check runs could not be read.`,
     marker,
   );
   return failure;
@@ -2441,12 +2444,12 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review did not complete for every required reviewer. Manual review required.${blockingIssuesBlock(issues)}${internalReviewSummaryBlock(feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: at least one required reviewer did not finish. Manual review required.${blockingIssuesBlock(issues)}${internalReviewSummaryBlock(feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n🟠 Required automated review is incomplete; at least one reviewer did not finish.\n\n${reviewReportForComment(reviewUrl, feedback)}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
+          `${marker}\n🟠 The second review is not complete. At least one required reviewer did not finish.\n\n${reviewReportForComment(reviewUrl, feedback)}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; the review did not finish.`,
           marker,
         );
         break;
@@ -2509,7 +2512,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (cleanInternalNoGatingFindings && externalReviewPending) {
         terminationReason = "external_review_pending";
         reviewedHeadSha = externalReviewResult.headSha || undefined;
-        feedback = "External review did not complete within the wait budget; not auto-approving.";
+        feedback = EXTERNAL_REVIEW_PENDING_NEXT_STEP;
         await reporter.report({
           id: `post-push-review.${iteration}`,
           type: "custom",
@@ -2525,12 +2528,12 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review did not complete within the wait budget. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: the AI-Implement reviewers found no problems, but the external review check did not finish in the time limit. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}\n\n**Merge readiness:** Manual review required; external review did not complete.`,
+          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But the external review check did not finish in the time limit. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}\n\n**Merge readiness:** Manual review required; the external review check did not finish.`,
           marker,
         );
         break;
@@ -2592,12 +2595,12 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: the AI-Implement reviewers found no problems, but AI-Implement cannot read the verdict of the external review. Manual review required.${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not auto-approving.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; external review verdict unavailable.`,
+          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But AI-Implement cannot read the verdict of the external review. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; the external review verdict is not available.`,
           marker,
         );
         break;
@@ -2628,7 +2631,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       if (approved) {
         terminationReason = "approved";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        const reviewUrl = await publishReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.${internalReviewSummaryBlock(verdict.feedback)}`);
+        const reviewUrl = await publishReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review approved this pull request.${internalReviewSummaryBlock(verdict.feedback)}`);
         postPrComment(
           ghSpawn,
           prNumber,
@@ -2644,12 +2647,12 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         const reviewUrl = await publishReview(
           ghSpawn,
           prNumber,
-          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement second review: the pull request still has blocking problems.\n\n${formatIssueList(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(verdict.feedback)}`,
         );
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ AI-Implement did not approve the change. ${terminationReasonSentence("iterations_exhausted", iteration)} ${reasonCodeTag("iterations_exhausted")}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -2836,7 +2839,7 @@ ${externalFindingsFixBlock}
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the second review.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         writeCycleSummary(inputs.workspaceDir, {

@@ -226,7 +226,7 @@ export function makeFeedbackLoopOutputs(overrides: Partial<FeedbackLoopOutputs> 
     iterations_exhausted: "Changes requested.",
     max_turns: "Implementation hit the 50-turn cap before completing (50 turns used).",
     review_error: "Review step failed and was skipped: Error: review failed",
-    provider_unavailable: `Model provider was unavailable during implementation after 2 attempt(s); partial changes were preserved. ${outage.message}`,
+    provider_unavailable: `Tried 2 time(s); partial changes were kept. ${outage.message}`,
   }[terminationReason];
   return {
     approved,

@@ -3499,7 +3499,7 @@ describe("unapproved-run failure codes", () => {
       "Automated review did not approve (iterations_exhausted after 3 iteration(s)). Missing tests.",
       { prUrl: "https://github.com/o/r/pull/9" },
     );
-    expect(comment).toContain("without review approval");
+    expect(comment).toContain("a review did not approve it");
     expect(comment).toContain("https://github.com/o/r/pull/9");
     expect(comment).toContain("Missing tests.");
     expect(comment).toContain("**Next step:**");
@@ -3514,10 +3514,111 @@ describe("unapproved-run failure codes", () => {
     expect(comment).not.toContain("preserved in a draft PR");
   });
 
+  it("formatFailureComment says the existing PR is unchanged for a gap-fill even without a prUrl", () => {
+    // A gap-fill push reports prUrl: null, so the PR line must not fall through to "No PR".
+    const comment = formatFailureComment("REVIEW_UNAPPROVED", "reason", { isInitialRun: false });
+    expect(comment).toContain("The existing PR is unchanged by this run.");
+    expect(comment).not.toContain("No PR could be opened");
+    // An unapproved gap-fill does not push, so its change is discarded: nothing to examine.
+    expect(comment).toContain("🟡 A review did not approve the new change, so AI-Implement discarded it.");
+    expect(comment).not.toContain("made the change");
+    expect(comment).not.toContain("Examine the pull request");
+    expect(comment).toContain("1. Read the reason above.");
+  });
+
+  it("formatFailureComment points MAX_TURNS_EXHAUSTED with no PR at no draft PR", () => {
+    // The implementation can hit its turn cap having changed no files, so push opens no PR.
+    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap", {});
+    expect(comment).toContain("No PR could be opened");
+    expect(comment).not.toContain("draft PR");
+  });
+
+  it("formatFailureComment states the MAX_TURNS_EXHAUSTED explanation once", () => {
+    const explanation = "The implementation used all of its permitted steps before it finished.";
+    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", `${explanation} (Code: \`max_turns\`)`, {});
+    expect(comment).toContain("🟡 AI-Implement did not finish the implementation.");
+    expect(comment.split(explanation).length - 1).toBe(1);
+  });
+
+  it("formatFailureComment points MAX_TURNS_EXHAUSTED on a gap-fill at no draft PR", () => {
+    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap", { isInitialRun: false });
+    expect(comment).toContain("The existing PR is unchanged by this run.");
+    expect(comment).not.toContain("draft PR");
+  });
+
+  it("formatFailureComment keeps REVIEW_UNAPPROVED self-consistent when no PR was opened", () => {
+    // The first review approved, but the change modified no files, so push opened no PR.
+    const comment = formatFailureComment(
+      "REVIEW_UNAPPROVED",
+      "The first review approved the change. AI-Implement did not open a pull request, because the change did not modify any files.",
+      {},
+    );
+    expect(comment).toContain("🟡 AI-Implement did not open a pull request.");
+    // The summary and the reason already say there is no PR; no third line repeats it.
+    expect(comment).not.toContain("No PR could be opened");
+    expect(comment).not.toContain("did not approve it");
+    expect(comment).not.toContain("Examine the pull request");
+    expect(comment).toContain(
+      [
+        "1. Read the reason above.",
+        "2. If the ticket needs a code change, add more information to the ticket.",
+        "3. To start AI-Implement again, reset the AI-Implement status or label on the ticket.",
+      ].join("\n"),
+    );
+  });
+
+  it("formatFailureComment puts the non-approval right under the no-PR summary", () => {
+    // The first review rejected the change, and the run produced no files to push.
+    const reason = "The first review (before the pull request) did not approve the change. The review examined the change 3 times and found problems each time. (Code: `iterations_exhausted`)";
+    const comment = formatFailureComment("REVIEW_UNAPPROVED", reason, {});
+    expect(comment).toContain(`🟡 AI-Implement did not open a pull request.\n\n${reason}`);
+  });
+
+  it("formatFailureComment's REVIEW_UNAPPROVED wording holds when the second review stopped the run", () => {
+    // The second review timed out on an open, non-draft PR: no iterations ran out, the PR is
+    // not a draft, and the ticket's scope is not the likely cause.
+    const comment = formatFailureComment(
+      "REVIEW_UNAPPROVED",
+      "The second review (on the pull request) did not approve the change. The external review check did not finish in the time limit. (Code: `external_review_pending`)",
+      { prUrl: "https://github.com/o/r/pull/9" },
+    );
+    expect(comment).toContain("🟡 AI-Implement made the change, but a review did not approve it.");
+    expect(comment).not.toContain("allotted iterations");
+    expect(comment).not.toContain("draft");
+    expect(comment).toContain("The change is in this pull request: https://github.com/o/r/pull/9");
+  });
+
+  it("formatFailureComment gives REVIEW_UNAPPROVED's next step as numbered plain-language commands", () => {
+    const comment = formatFailureComment("REVIEW_UNAPPROVED", "reason", { prUrl: "https://github.com/o/r/pull/9" });
+    expect(comment).toContain(
+      [
+        "1. If the review did not finish, the change can be correct. Examine the pull request yourself.",
+        "2. If the review found problems, make the ticket smaller or add more information to it.",
+        "3. To start AI-Implement again, reset the AI-Implement status or label on the ticket.",
+      ].join("\n"),
+    );
+    expect(comment).not.toContain("re-dispatch");
+    // The comment serves every ticketing provider, so it names none of them.
+    expect(comment).not.toContain("Jira");
+    expect(comment).not.toContain("Linear");
+  });
+
   it("formatFailureComment renders MAX_TURNS_EXHAUSTED distinctly", () => {
     const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap");
-    expect(comment).toContain("turn cap");
+    expect(comment).toContain("🟡 AI-Implement did not finish the implementation.");
+    expect(comment).not.toMatch(/no review ran|before the first review ran|review never ran/i);
+    expect(comment).not.toContain("review approval");
+    expect(comment).not.toContain("re-dispatch");
+    expect(comment).toContain("reset the AI-Implement status or label on the ticket");
+    expect(comment).not.toContain("Jira");
+    expect(comment).not.toContain("Linear");
     expect(comment).toContain("No PR could be opened");
+  });
+
+  it("formatFailureComment keeps MAX_TURNS_EXHAUSTED's draft PR line and scope advice", () => {
+    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap", { prUrl: "https://github.com/o/r/pull/9" });
+    expect(comment).toContain("The work so far is preserved in a draft PR: https://github.com/o/r/pull/9");
+    expect(comment).toContain("over-broad issue scope");
   });
 
   it("unknown failureCode still falls through to the generic summary", () => {

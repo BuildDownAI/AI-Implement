@@ -58,14 +58,14 @@ describe("job drawer", () => {
 
   it("maps local-docker jobs into the implementation/review timeline", () => {
     expect(drawerScript).toContain("mode === 'local-docker'");
-    expect(drawerScript).toContain("post-push review running");
+    expect(drawerScript).toContain("second review running");
   });
 
   it("shows review_failed jobs as review attention instead of completed", () => {
     expect(drawerScript).toContain("s === 'review_failed'");
     expect(drawerScript).toContain("Review failed");
     expect(drawerScript).toContain("Review incomplete");
-    expect(drawerScript).toContain("post-push review needs attention");
+    expect(drawerScript).toContain("second review needs attention");
   });
 
   it("renders passed step records as success badges", () => {
@@ -255,14 +255,21 @@ describe("job drawer failure evidence", () => {
     expect(doc.getElementById("drawer-issue-row")!.textContent).toContain("review incomplete");
     expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Review incomplete");
     expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Cause: reviewer turn limit");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("The second review (on the pull request) did not finish.");
+    expect(doc.getElementById("drawer-failure-alert")!.textContent).not.toMatch(/post-push/i);
     expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Limit: 45 turns");
     expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("code-review");
     expect(doc.getElementById("drawer-failure-alert")!.textContent).toContain("Checked API validation before interruption.");
-    expect(doc.getElementById("drawer-timeline")!.textContent).toContain("post-push review incomplete");
+    expect(doc.getElementById("drawer-timeline")!.textContent).toContain("second review incomplete");
     const details = doc.querySelector("#drawer-steps details.failure-evidence")!;
     expect(details.textContent).toContain("Review status: incomplete");
     expect(details.textContent).toContain("limit 45 turns");
     win.closeJobDrawer();
+  });
+
+  it("words the provider-unavailable review detail as \"AI service\"", () => {
+    expect(drawerScript).toContain("The AI service was not available during the review.");
+    expect(drawerScript).not.toContain("The model provider was unavailable");
   });
 
   it("keeps ordinary code rejection labeled review failed", async () => {

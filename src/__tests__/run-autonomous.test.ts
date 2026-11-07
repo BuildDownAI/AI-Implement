@@ -24,6 +24,7 @@ import { DISPOSITIONS_FILE, stableReviewFindingKey, type FindingDisposition } fr
 import { CYCLE_SUMMARY_FILE, type CycleSummary } from "../pipeline/cycle-summary.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
 import type { ReviewFixMetadataV1 } from "../review-fix-contract.js";
+import { EXTERNAL_REVIEW_PENDING_NEXT_STEP } from "../pipeline/steps/post-push-review.js";
 import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 import { NOW, SENTINEL_BEARER, envelopeEnv, fakeClient, makeGrant, makeSnapshot } from "./helpers/fixtures/configured-run.js";
@@ -1808,6 +1809,46 @@ describe("runAutonomous", () => {
     expect(resultBody(fake)).not.toHaveProperty("externalReviewPending");
   });
 
+  it("names no review stage when a run on an existing PR is not approved", async () => {
+    // A gap-fill has one review, on the open PR; "before the pull request" would be false.
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 2,
+        finalFeedback: "Still missing a test.",
+        terminationReason: "iterations_exhausted",
+        passes: [],
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue({}) }],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as { failureReason: string };
+    expect(body.failureReason).toContain(
+      "The review did not approve the change. The review examined the change 2 times and found problems each time. (Code: `iterations_exhausted`)",
+    );
+    expect(body.failureReason).not.toContain("before the pull request");
+    expect(body.failureReason).not.toContain("second review");
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("The existing PR is unchanged by this run: https://github.com/acme/app/pull/42");
+    expect(autopsy).not.toContain("No PR could be opened");
+    expect(autopsy).not.toContain("before the pull request");
+  });
+
   it("uses RUNNER_PHASE instead of inferring callback phase from PR_NUMBER", async () => {
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_PHASE", "implementation");
@@ -1880,6 +1921,76 @@ describe("runAutonomous", () => {
     expect(body.prUrl).toBeUndefined();
   });
 
+  it("does not credit the post-push review when the in-loop review approved but push opened no PR", async () => {
+    // Post-push review is skipped without a PR, so the run ends with the in-loop result
+    // ("approved"). The autopsy must not say a post-push review ran.
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true }],
+      }) }],
+      ["push", { run: vi.fn().mockResolvedValue({}) }],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as { failureReason: string };
+    expect(body.failureReason).not.toContain("second review");
+    expect(body.failureReason).toContain(
+      "The first review approved the change. AI-Implement did not open a pull request, because the change did not modify any files.",
+    );
+    expect(body.failureReason).not.toContain("did not approve");
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("AI-Implement did not open a pull request, because the change did not modify any files.");
+    expect(autopsy).not.toContain("second review");
+  });
+
+  it("states the external_review_pending sentence and code tag once in the failure reason", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, finalFeedback: "ok", terminationReason: "approved", passes: [] }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/9", prNumber: 9, branchPushed: true }) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 1,
+        finalFeedback: EXTERNAL_REVIEW_PENDING_NEXT_STEP,
+        terminationReason: "external_review_pending",
+      }) }],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    const body = resultBody(fake) as { failureReason: string };
+    const count = (text: string) => body.failureReason.split(text).length - 1;
+    expect(count("The external review check did not finish in the time limit.")).toBe(1);
+    expect(count("(Code: `external_review_pending`)")).toBe(1);
+    expect(count("did not approve")).toBe(1);
+    expect(body.failureReason).toContain(`Review notes: ${EXTERNAL_REVIEW_PENDING_NEXT_STEP}`);
+  });
+
   it("reports failure with REVIEW_UNAPPROVED and the draft PR url when the loop never approved", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
@@ -1914,6 +2025,12 @@ describe("runAutonomous", () => {
     expect(body.outcome).toBe("failure");
     expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
     expect(body.failureReason).toContain("iterations_exhausted");
+    expect(body.failureReason).not.toContain("second review");
+    // Names the stage, and keeps the draft cue the ticket comment no longer carries.
+    expect(body.failureReason).toContain(
+      "The first review (before the pull request) did not approve the change. The review examined the change 1 time and found problems. AI-Implement opened a draft pull request. (Code: `iterations_exhausted`)",
+    );
+    expect(body.failureReason).toContain("Review notes: Changes requested.");
     expect(body.prUrl).toBe("https://github.com/acme/app/pull/9");
   });
 
@@ -2316,6 +2433,16 @@ describe("runAutonomous", () => {
     expect(postPushReviewRun).not.toHaveBeenCalled();
     expect(body.failureCode).toBe("MAX_TURNS_EXHAUSTED");
     expect(body.failureReason).toContain("ran out of turns");
+    // The review never examined the last pass, so the reason must not call it a non-approval.
+    // The ticket comment for MAX_TURNS_EXHAUSTED already names the draft PR.
+    expect(body.failureReason).toContain(
+      "The implementation used all of its permitted steps before it finished. Thus the review did not examine the final version of the change. (Code: `max_turns`)",
+    );
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.failureReason).not.toContain("draft pull request");
+    // The feedback is the implement loop's own message, not a review's.
+    expect(body.failureReason).toContain("Run notes: ran out of turns");
+    expect(body.failureReason).not.toContain("Review notes");
   });
 
   it("uses PROVIDER_UNAVAILABLE with the classified failure when the in-loop review stage is exhausted by a transient outage (BAC-27134)", async () => {
@@ -2339,6 +2466,7 @@ describe("runAutonomous", () => {
         {
           run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
             approved: false,
+            finalFeedback: "Tried 2 time(s). upstream returned 529 overloaded_error",
             terminationReason: "provider_unavailable",
             failure: providerFailure,
           })),
@@ -2367,6 +2495,61 @@ describe("runAutonomous", () => {
     expect(postPushReviewRun).not.toHaveBeenCalled();
     expect(body.failureCode).toBe("PROVIDER_UNAVAILABLE");
     expect(body.failureReason).not.toContain("did not approve");
+    // The stuck-job status cell and the give-up alert keep only the first line, so it names the outage.
+    expect(body.failureReason).toBe("The AI service was not available.\n\nTried 2 time(s). upstream returned 529 overloaded_error");
+    expect(body.failure).toEqual(providerFailure);
+  });
+
+  it("words the PROVIDER_UNAVAILABLE fallback reason as the AI service when the run has no feedback", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const providerFailure = {
+      category: "transient" as const,
+      code: "PROVIDER_UNAVAILABLE",
+      stage: "review",
+      attempt: 2,
+      retryable: false,
+      message: "upstream returned 529 overloaded_error",
+      evidence: { truncated: false },
+    };
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
+            approved: false,
+            finalFeedback: "",
+            terminationReason: "provider_unavailable",
+            failure: providerFailure,
+          })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12, { draft: true })) }],
+      ["post-push-review", { run: postPushReviewRun }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof providerFailure;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
+    expect(body.failureCode).toBe("PROVIDER_UNAVAILABLE");
+    expect(body.failureReason).toBe("The AI service was not available and the run could not complete.");
     expect(body.failure).toEqual(providerFailure);
   });
 
@@ -2396,7 +2579,7 @@ describe("runAutonomous", () => {
           run: vi.fn().mockResolvedValue({
             approved: false,
             iterations: 1,
-            finalFeedback: "Post-push reviewer ran out of turns at the configured cap (30).",
+            finalFeedback: "The reviewer used all of its permitted steps.",
             terminationReason: "reviewer_turns_exhausted",
             forcePushedRevisions: 0,
             failure: reviewerFailure,
@@ -2421,7 +2604,10 @@ describe("runAutonomous", () => {
       failure?: typeof reviewerFailure;
     };
     expect(body.failureCode).toBe("REVIEWER_TURNS_EXHAUSTED");
-    expect(body.failureReason).toContain("reached its turn limit");
+    expect(body.failureReason).toContain("The second review (on the pull request) did not finish.");
+    expect(body.failureReason).not.toMatch(/post-push/i);
+    expect(body.failureReason).toContain("the review is incomplete");
+    expect(body.failureReason).not.toContain("did not approve");
     expect(body.failureReason).toContain("completed reviewer reports");
     expect(body.failure).toEqual(reviewerFailure);
   });
@@ -2617,10 +2803,10 @@ describe("runAutonomous", () => {
       error.mockRestore();
       warn.mockRestore();
       // disposition
-      expect(summary).toContain("reviewer ran out of turns at the cap after 2 iteration(s) (reviewer_turns_exhausted)");
+      expect(summary).toContain("a reviewer used all of its permitted steps after 2 iteration(s) (reviewer_turns_exhausted)");
       // ::warning:: text
       expect(warnings).toContain(
-        "::warning::AI-Implement: post-push reviewer ran out of turns at the cap after 2 iteration(s) (reviewer_turns_exhausted)",
+        "::warning::AI-Implement: a reviewer used all of its permitted steps after 2 iteration(s) (reviewer_turns_exhausted)",
       );
       expect(warnings).toContain("PR opened: https://github.com/acme/app/pull/12");
       expect(warnings).not.toContain("draft PR opened");
@@ -2628,7 +2814,7 @@ describe("runAutonomous", () => {
 
     expect(result!.exitCode).toBe(0);
     const body = resultBody(fake) as { failureReason: string };
-    expect(body.failureReason).toContain("required review is incomplete");
+    expect(body.failureReason).toContain("the review is incomplete");
     expect(body.failureReason).not.toContain("the code was not reviewed");
   });
 
@@ -2659,7 +2845,7 @@ describe("runAutonomous", () => {
           run: vi.fn().mockResolvedValue({
             approved: false,
             iterations: 1,
-            finalFeedback: "Post-push reviewer ran out of turns.",
+            finalFeedback: "gap-analysis used all of its permitted steps.",
             terminationReason: "reviewer_turns_exhausted",
             forcePushedRevisions: 0,
             failure: {
@@ -2688,7 +2874,7 @@ describe("runAutonomous", () => {
     const body = resultBody(fake) as { failureReason: string };
     // DEFAULT_RETRY_POLICY.reviewMaxTurns is 30 — the value normalizeRetryPolicy substitutes
     // for the missing field, which this fallback then reads back out.
-    expect(body.failureReason).toContain("turn limit (30)");
+    expect(body.failureReason).toContain("permitted steps (30)");
   });
 
   it("uses the reviewer-specific exhausted turn cap in the ticket comment and autopsy", async () => {
@@ -2708,7 +2894,7 @@ describe("runAutonomous", () => {
           run: vi.fn().mockResolvedValue({
             approved: false,
             iterations: 1,
-            finalFeedback: "gap-analysis ran out of turns at the configured cap (3).",
+            finalFeedback: "gap-analysis used all of its permitted steps.",
             terminationReason: "reviewer_turns_exhausted",
             forcePushedRevisions: 0,
             failure: {
@@ -2736,11 +2922,11 @@ describe("runAutonomous", () => {
     });
 
     const body = resultBody(fake) as { failureReason: string };
-    expect(body.failureReason).toContain("configured cap (3)");
-    expect(body.failureReason).not.toContain("configured cap (30)");
+    expect(body.failureReason).toContain("permitted steps (3)");
+    expect(body.failureReason).not.toContain("permitted steps (30)");
     const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
-    expect(autopsy).toContain("configured cap (3)");
-    expect(autopsy).not.toContain("configured cap (30)");
+    expect(autopsy).toContain("permitted steps (3)");
+    expect(autopsy).not.toContain("permitted steps (30)");
   });
 
   it("writes the autopsy comment file on unapproved runs", async () => {
@@ -2901,7 +3087,14 @@ describe("runAutonomous", () => {
     expect(body.outcome).toBe("failure");
     expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
     expect(body.failureReason).toContain("iterations_exhausted");
+    expect(body.failureReason).toContain(
+      "The second review (on the pull request) did not approve the change. The review examined the change 2 times and found problems each time. (Code: `iterations_exhausted`)",
+    );
+    expect(body.failureReason).toContain("Review notes: External Claude finding remains.");
     expect(body.prUrl).toBe("https://github.com/acme/app/pull/12");
+    // The ticket's autopsy names the stage that stopped the run.
+    const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+    expect(autopsy).toContain("Then the second review (on the pull request) stopped the run.");
   });
 
   it("approved mounted run exits 0, posts success with no prUrl, writes no autopsy", async () => {

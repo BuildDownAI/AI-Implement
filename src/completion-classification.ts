@@ -1,4 +1,5 @@
 import type { Job } from "./log.js";
+import { reasonCodeTag, SECOND_REVIEW } from "./run-autopsy.js";
 import { GUARDRAIL_REASON_MAX_CHARS, providerUnavailablePhrase, redactAndCap } from "./pipeline/failure-classification.js";
 import type { FailureCategory, FailureRecord } from "./pipeline/failure-classification.js";
 import { DEFAULT_RETRY_POLICY } from "./pipeline/retry-backoff.js";
@@ -16,13 +17,13 @@ export interface Classification {
 
 /** Exact remediation copy per BAC-27112 — every category has a row, `unknown` never invents a cause. */
 const CATEGORY_NEXT_STEPS: Record<FailureCategory, string> = {
-  transient: "The provider or remote was unavailable. Re-dispatch when it recovers; the retry budget was exhausted.",
-  auth: "A credential expired or was rejected. Check the GitHub App and provider keys, then re-dispatch.",
-  config: "The run configuration is invalid (model id, env). Fix the mapping or config.yml, then re-dispatch.",
-  conflict: "The remote branch changed under the run. Inspect the branch, then re-dispatch.",
-  invalid_output: "The model returned no usable result. Re-dispatch; if it repeats, narrow the issue.",
-  cancelled: "The run was cancelled. Re-dispatch.",
-  crash: "The runner exited unexpectedly. Check the run logs, then re-dispatch.",
+  transient: "The provider or remote was unavailable. Run it again when it recovers; the retry budget was exhausted.",
+  auth: "A credential expired or was rejected. Check the GitHub App and provider keys, then run it again.",
+  config: "The run configuration is invalid (model id, env). Fix the mapping or config.yml, then run it again.",
+  conflict: "The remote branch changed under the run. Inspect the branch, then run it again.",
+  invalid_output: "The model returned no usable result. Run it again; if it repeats, narrow the issue.",
+  cancelled: "The run was cancelled. Run it again.",
+  crash: "The runner exited unexpectedly. Check the run logs, then run it again.",
   unknown: "The failure could not be classified. Check the run logs.",
 };
 
@@ -217,7 +218,7 @@ function statusLineFor(failure: FailureRecord, lastSuccessfulStage?: string | nu
  * PROVIDER_UNAVAILABLE — the stage-retry rail exhausted its budget against a transient
  * provider outage (BAC-27134). Not a code problem, so the summary/remediation deliberately
  * avoid the generic branch's "Failed at stage" framing and CATEGORY_NEXT_STEPS wording —
- * the fix here is time, not a re-dispatch after changing anything. `providerUnavailablePhrase`
+ * the fix here is time, not a new run after changing anything. `providerUnavailablePhrase`
  * is the same helper `formatRunAutopsy` (run-autopsy.ts) uses for its own wording, so the two
  * surfaces describe the same outage consistently even though they render to different places.
  */
@@ -241,16 +242,16 @@ function providerUnavailableClassification(
   detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
 
   return {
-    summary: `🟠 The model provider was unavailable during ${stageLabel}; the code was ${codeState}.`,
+    summary: `🟠 The AI service was not available during ${stageLabel}. The code was ${codeState}. ${reasonCodeTag("provider_unavailable")}`,
     detail: detailParts.join("\n\n"),
-    remediation: "This was a provider outage, not a code problem — re-trigger the run once the provider recovers.",
+    remediation: "This was a provider outage, not a code problem — reset the AI-Implement status or label on the ticket once the provider recovers, to start AI-Implement again.",
     docsUrl: TROUBLESHOOTING_URL,
     ...(runUrl ? { runUrl } : {}),
   };
 }
 
 /**
- * REVIEWER_TURNS_EXHAUSTED — the post-push reviewer burned its whole turn cap
+ * REVIEWER_TURNS_EXHAUSTED — the second-review reviewer burned its whole turn cap
  * (`retryPolicy.reviewMaxTurns`, stamped onto the record by post-push-review.ts) without
  * reaching a verdict. Never a rejection, so — like PROVIDER_UNAVAILABLE above — this bypasses
  * CATEGORY_NEXT_STEPS: the actionable step is raising the cap in Settings, not fixing code.
@@ -272,7 +273,7 @@ function reviewerTurnsExhaustedClassification(
   detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
 
   return {
-    summary: `🟠 A post-push reviewer reached its turn limit (${cap}); required review is incomplete.`,
+    summary: `🟠 ${SECOND_REVIEW} did not finish. A reviewer used all of its permitted steps (${cap}), so the review is incomplete.`,
     detail: detailParts.join("\n\n"),
     remediation: `Complete the missing review before merging. Adjust the reviewer's Max turns in Projects (/admin#projects), or the inherited Review Max Turns in Settings (/admin#settings). Completed reviewer reports remain on the existing PR.`,
     docsUrl: TROUBLESHOOTING_URL,
@@ -281,7 +282,7 @@ function reviewerTurnsExhaustedClassification(
 }
 
 /**
- * CHECKS_PERMISSION_DENIED — a check-runs read (post-push review's external-review wait, or its
+ * CHECKS_PERMISSION_DENIED — a check-runs read (the second review's external-review wait, or its
  * CI gate) failed with a 403/"Resource not accessible by integration" rather than a transient
  * error (AII-736). Not a code problem and not a timeout — the App's own permissions are the
  * cause, so this bypasses CATEGORY_NEXT_STEPS's generic auth wording (which points at
@@ -302,7 +303,7 @@ function checksPermissionDeniedClassification(
   return {
     summary: "🔒 The GitHub App cannot read check runs on this repo.",
     detail: detailParts.join("\n\n"),
-    remediation: "Grant Checks: read to the GitHub App and accept the updated permissions on the installation, then re-dispatch.",
+    remediation: "Grant Checks: read to the GitHub App and accept the updated permissions on the installation, then run it again.",
     docsUrl: TROUBLESHOOTING_URL,
     ...(runUrl ? { runUrl } : {}),
   };
@@ -321,7 +322,7 @@ function checksPermissionDeniedClassification(
  *
  * `isInitialRun` distinguishes the three things a truthy `prUrl` can mean: a fresh draft PR
  * this failing run just opened (initial run — `undefined`/`true`), a PR that already existed
- * before this run was dispatched and is untouched by the failure (gap-fill or re-dispatch —
+ * before this run was dispatched and is untouched by the failure (gap-fill or a repeat run —
  * `false`), or — `null` — that which of those two is true cannot be determined at all. The
  * monitor path (`classifyCompletion`) always passes `null`, for every phase and every terminal
  * status it renders: it reconstructs this classification entirely after the fact from the job
@@ -475,8 +476,8 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     detail,
     remediation:
       job.phase === "implementation"
-        ? "Check the run logs — the run likely errored before pushing — then re-dispatch."
-        : "Check the run logs for the planning failure, then re-dispatch.",
+        ? "Check the run logs — the run likely errored before pushing — then run it again."
+        : "Check the run logs for the planning failure, then run it again.",
     docsUrl: TROUBLESHOOTING_URL,
   };
 }

@@ -464,7 +464,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       // long as attempts remain.
       if (attempt >= maxPushAttempts) {
         // Exhausted retries get their own code and are never retryable — an
-        // orchestrator rail keying off `retryable` must not re-dispatch a run that
+        // orchestrator rail keying off `retryable` must not start a run again that
         // already spent its whole push-retry budget. `category` stays "transient"
         // since that is still the accurate classification of what happened.
         const exhaustedSuffix = ` (exhausted after ${attempt} attempt${attempt === 1 ? "" : "s"})`;
@@ -632,7 +632,7 @@ function buildPullRequestBody(
       explicitTestsSummary ??
       (inputs.reviewSummary
         ? providerUnavailableForTestsSummary
-          ? "Automated verification was skipped — the model provider was unavailable and the run was interrupted."
+          ? "Automated verification was skipped — the AI service was not available and the run was interrupted."
           : "Automated verification was skipped — the review loop did not approve this change."
         : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
   const testsSummaryChecked = dependenciesFailed ? false : explicitTestsSummary != null || !inputs.reviewSummary;
@@ -707,10 +707,10 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
   // heading, the sentence and the feedback label must not claim it rejected anything.
   const providerUnavailable = summary.terminationReason === "provider_unavailable";
   return [
-    providerUnavailable ? "## 🟠 The model provider was unavailable during this run" : "## ⚠️ Automated review did not approve",
+    providerUnavailable ? "## 🟠 The AI service was not available during this run" : "## ⚠️ Automated review did not approve",
     "",
     providerUnavailable
-      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the model provider was unavailable and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI service was not available and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
       : `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
     "",
     providerUnavailable ? "**Run notes:**" : "**Reviewer's final feedback:**",
