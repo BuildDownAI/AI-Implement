@@ -738,6 +738,42 @@ describe("sweepOrphanedMachines — kg-refresh max-age rule", () => {
     expect(invalidateNonce).toHaveBeenCalledWith(kgRefreshInflight.id);
   });
 
+  it("does not call resetTicket for an aged-out gap-analysis machine", async () => {
+    const gapJob = { ...kgRefreshInflight, id: 30, issueId: "issue-200", issueIdentifier: "ENG-200", teamKey: "ENG", repo: "org/repo", phase: "gap-analysis" };
+    const oldMachine = makeMachine("m-kg", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(gapJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(30, "timed_out", "machine_max_age_sweep", undefined, { backendTerminated: true });
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
+  });
+
+  it("does not call resetTicket for an in-flight gap-analysis machine on a cancelled ticket", async () => {
+    const gapJob = { ...kgRefreshInflight, id: 31, issueId: "issue-201", issueIdentifier: "ENG-201", teamKey: "ENG", repo: "org/repo", phase: "gap-analysis" };
+    const machine = makeMachine("m-gap", { created_at: new Date(Date.now() - 60_000).toISOString() });
+    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(gapJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    const helpers = makeHelpers();
+    const fakeProv = makeProvider();
+    vi.mocked(fakeProv.fetchLifecycleStates).mockResolvedValue(new Map([["issue-201", "cancelled"]]) as never);
+    const config = makeConfig(false, {
+      registry: makeRegistry({ provider: fakeProv }),
+      getMappings: () => ({ ENG: makeMapping() }),
+    });
+
+    await sweepOrphanedMachines(config, helpers);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(31, "timed_out", "issue_completed_sweep", undefined, { backendTerminated: true });
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
+  });
+
   it("issue-keyed max-age still calls resetTicket (regression pin)", async () => {
     const issueJob = makeJob({
       id: 20,

@@ -205,7 +205,7 @@ export const pipelinesScript = `
         }
         function statusBadge(status, conclusion, failure, phase) {
           const reason = (failure && typeof failure.code === 'string' && failure.code) || conclusion || '';
-          if (status === 'timed_out' && conclusion === 'stuck_giveup') {
+          if (status === 'timed_out' && (conclusion === 'stuck_giveup' || conclusion === 'stuck_review_fix')) {
             return makeBadge('fail', 'Needs human', reason);
           }
           if (phase === 'kg-refresh') {

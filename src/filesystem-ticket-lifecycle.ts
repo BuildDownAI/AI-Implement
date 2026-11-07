@@ -1,6 +1,6 @@
 import { getDb, deleteDispatched, isAlreadyDispatched } from "./dedup.js";
 import { getMappings } from "./config.js";
-import { isParked, unpark } from "./dispatch-breaker.js";
+import { isParked, unpark, breakerPhaseFor } from "./dispatch-breaker.js";
 import { getInFlightIssueIds, getStuckAttempts, resetStuckAttempts, suppressStaleNotifications } from "./log.js";
 import { getRunnerMode } from "./runner-mode.js";
 import { STUCK_JOB_MAX_ATTEMPTS } from "./stuck-watchdog.js";
@@ -81,9 +81,11 @@ export async function reconcileFilesystemFailures(registry: ProviderRegistry): P
       if (!(provider instanceof FilesystemProvider)) continue;
       const details = await provider.readIssueDetails(job.issue_id);
       if (!details || details.location === "failed" || details.state?.prUrls.length) continue;
-      const phase = job.phase === "planning" ? "planning" : "implementation";
-      if (job.conclusion === "stuck_requeued") continue;
-      const parked = isParked(job.issue_id, phase);
+      const breakerPhase = breakerPhaseFor(job.phase);
+      // archiveFailed knows only planning and implementation; a fix run archives as implementation.
+      const phase = breakerPhase === "planning" ? "planning" : "implementation";
+      if (job.conclusion === "stuck_requeued" || job.conclusion === "stuck_review_fix") continue;
+      const parked = isParked(job.issue_id, breakerPhase);
       const gaveUp = job.conclusion === "stuck_giveup" && isAlreadyDispatched(job.issue_id);
       const exhausted = isWatchdogExhausted(job.issue_id);
       const failedState = details.state?.status === "failed";

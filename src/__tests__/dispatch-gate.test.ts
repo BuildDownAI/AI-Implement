@@ -723,3 +723,19 @@ describe("remediateStuckJob — admission release only on confirmed stop (AII-78
     expect(retry).toEqual({ ok: false, reason: "occupied", count: 1, cap: 1 });
   });
 });
+
+describe("canDispatch — a gap-analysis park", () => {
+  it("does not block a fresh implementation dispatch for the same issue", () => {
+    parkAt("issue-fix", "gap-analysis");
+    expect(
+      gate.canDispatch({ issueId: "issue-fix", kind: "implementation", teamKey: "AII", maxInProgressAiIssues: 5 }),
+    ).toEqual({ ok: true });
+  });
+
+  it("blocks automatic fix runs but still lets a human /ai-implement request through", () => {
+    parkAt("issue-fix2", "gap-analysis");
+    const base = { issueId: "issue-fix2", kind: "gap-fill" as const, teamKey: "AII", maxInProgressAiIssues: 5 };
+    expect(gate.canDispatch(base)).toEqual({ ok: false, reason: "parked" });
+    expect(gate.canDispatch({ ...base, humanRequested: true })).toEqual({ ok: true });
+  });
+});

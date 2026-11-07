@@ -341,6 +341,14 @@ A dispatch failure marks the row `failed` and surfaces a notification; the loop 
 
 The synthesized issue title is `Review feedback fix for PR #<n>`, and the phase is reported as `gap-analysis` so the ticket's status does not regress to in-progress for what is a follow-up pass.
 
+A failed or stuck `gap-analysis` run (review-fix queue or `/ai-implement` comment rail) does not change the ticket status or the dispatched entry (`remediateFailedJob` / `remediateStuckJob` in `src/stuck-watchdog.ts` skip the ticket reset). A stuck one is stopped, closed out as `timed_out` / `stuck_review_fix`, and a human is told once (webhook plus ticket comment); the Fly max-age sweep and the issue-terminal sweep (`src/reaper.ts`) likewise skip `resetTicket` for a `gap-analysis` job. AI-Implement does not retry a review-fix or `/ai-implement` fix run automatically (a feature-branch conflict-resolution run is separate: `src/auto-merge.ts` may enqueue a new one, up to its cap), and a run the orchestrator cannot find (`run_not_found`) is reported as not found rather than as timed out. Accordingly, its findings stay open until a new review event arrives or a person comments `/ai-implement`. The PR Dispatch Budget limits dispatches; it does not create them.
+
+A fix run's outcome counts against the `gap-analysis` dispatch-breaker bucket, the one the fix-run dispatch gate reads (`isParked(…, "gap-analysis")`); `planning` and `implementation` runs keep their own buckets. Repeated failed or stuck fix runs park fix runs on that ticket, with the normal breaker trip notice (a stuck fix run's trip sends it too), and do not block a fresh implementation dispatch. A human `/ai-implement` comment still bypasses a park.
+
+A successful fix run no longer resets the `implementation` failure count, because it counts in the `gap-analysis` bucket.
+
+A `review_failed` fix run (it pushed and the second review still has findings) does not count toward the breaker, and it does not reset the failure count either. Failed, timed-out and stuck fix runs do count. For example, `failed, failed, review_failed, failed` parks on the fourth run.
+
 ## Resolution
 
 When a `gap-analysis` run reports success, the callback resolves a finding only when **both** hold:

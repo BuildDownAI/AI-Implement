@@ -52,7 +52,7 @@ import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
 import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
-import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
@@ -1079,6 +1079,9 @@ async function fireBreakerTrip(
       : []),
     ``,
     `Unpark: admin → Runners → Unpark, or ask the operator.`,
+    ...(phase === "gap-analysis"
+      ? [``, `A person can still comment \`/ai-implement\` on the pull request to start one fix run.`]
+      : []),
   ];
 
   if (provider) {
@@ -1093,7 +1096,7 @@ async function fireBreakerTrip(
     try {
       await notifyText(
         config.notifyWebhookUrl,
-        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.`,
+        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.${phase === "gap-analysis" ? " A person can still comment /ai-implement on the pull request to run one fix run." : ""}`,
       );
     } catch (err) {
       console.error(`[breaker] Failed to send park notification for ${issueIdentifier ?? issueId}:`, err);
@@ -2317,7 +2320,8 @@ export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatc
   }
 }
 
-const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending"]);
+// stuck_review_fix: remediateStuckJob already closed out a review-fix run and alerted the human.
+const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending", "stuck_review_fix"]);
 
 export async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
@@ -3005,17 +3009,25 @@ export async function reportTerminalJob(
   // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
   const recordBreaker = (): void => {
     if (job.issueId && job.phase !== "kg-refresh") {
-      const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
+      // A fix run counts in the bucket the fix-run dispatch gate reads (isParked(…, "gap-analysis")).
+      const breakerPhase = breakerPhaseFor(job.phase);
       if (job.status === "completed") {
         recordDispatchSuccess(job.issueId, breakerPhase);
-      } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
+      } else if (
+        job.status === "failed" ||
+        job.status === "timed_out" ||
+        // review_failed on a fix run is the normal outcome of a round that pushed but still has
+        // findings; the PR Dispatch Budget limits that loop, not the breaker.
+        (job.status === "review_failed" && breakerPhase !== "gap-analysis")
+      ) {
         // Skip the breaker entirely for operator_cancelled — it was a human decision,
         // not a system failure. Recording it could park the issue and permanently
         // suppress future genuine-failure alerts even after the breaker trips from
         // accumulated operator-cancel events (alreadyParked stays true forever).
         if (job.conclusion !== "operator_cancelled") {
           const breakerConclusion = job.conclusion ?? job.status;
-          // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
+          // stuck_giveup already fires notifyStuckGiveUp — don't double-fire. A stuck_review_fix
+          // alert says the run stopped; the trip notice says fix runs are now paused, so it is sent.
           const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
           // A classified transient failure (provider overload) is the provider's outage, not
           // the ticket's — don't count it toward the breaker, or three unlucky retries against
@@ -3034,10 +3046,46 @@ export async function reportTerminalJob(
   if (opts?.ownerCall) getDb().transaction(() => { recordBreaker(); markJobNotified(job.id); })();
   else recordBreaker();
 
+  // Resolve provider via the job's teamKey -> mapping so the URL matches
+  // the issue's ticketing system. Fall back to the legacy Linear URL if
+  // the mapping is gone (orphaned job).
+  const identifier = job.issueIdentifier || job.issueId;
+  let issueUrl = `https://linear.app/issue/${identifier}`;
+  let provider: TicketingProvider | null = null;
+  const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
+  if (mapping) {
+    try {
+      provider = await registry.forMapping(mapping);
+      issueUrl = provider.issueUrl({
+        id: job.issueId,
+        identifier,
+        title: job.issueTitle || "",
+        description: null,
+        scopeKey: job.teamKey ?? "",
+        nativeStatus: "",
+      });
+    } catch (err) {
+      console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
+    }
+  }
+
   // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
   // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
-  // requeue that will produce its own dispatch notice on the next cycle.
-  if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+  // requeue that will produce its own dispatch notice on the next cycle, and
+  // stuck_review_fix already alerted a human from the watchdog.
+  if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued" || job.conclusion === "stuck_review_fix") {
+    // A stuck fix run that tripped the gap-analysis breaker still sends the trip notice.
+    if (pendingBreakerTrip && job.issueId) {
+      await fireBreakerTrip(
+        config,
+        provider,
+        job.issueId,
+        job.issueIdentifier,
+        pendingBreakerTrip.phase,
+        pendingBreakerTrip.failures,
+        pendingBreakerTrip.conclusion,
+      );
+    }
     markJobNotified(job.id);
     return;
   }
@@ -3074,29 +3122,6 @@ export async function reportTerminalJob(
 
   const durationMs =
     job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
-
-  // Resolve provider via the job's teamKey -> mapping so the URL matches
-  // the issue's ticketing system. Fall back to the legacy Linear URL if
-  // the mapping is gone (orphaned job).
-  const identifier = job.issueIdentifier || job.issueId;
-  let issueUrl = `https://linear.app/issue/${identifier}`;
-  let provider: TicketingProvider | null = null;
-  const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
-  if (mapping) {
-    try {
-      provider = await registry.forMapping(mapping);
-      issueUrl = provider.issueUrl({
-        id: job.issueId,
-        identifier,
-        title: job.issueTitle || "",
-        description: null,
-        scopeKey: job.teamKey ?? "",
-        nativeStatus: "",
-      });
-    } catch (err) {
-      console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
-    }
-  }
 
   // Fire breaker trip notification now that provider is resolved.
   if (pendingBreakerTrip && job.issueId) {

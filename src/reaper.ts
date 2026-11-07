@@ -304,7 +304,8 @@ export async function sweepOrphanedMachines(
           updateJobStatus(job.id, "timed_out", "machine_max_age_sweep", undefined, { skipAdmissionRelease: true });
         }
         invalidateNonce(job.id);
-        if (job.phase !== "kg-refresh") {
+        // A gap-analysis (review-fix) run leaves the ticket and dispatched entry alone, as in the stuck watchdog.
+        if (job.phase !== "kg-refresh" && job.phase !== "gap-analysis") {
           await helpers.resetTicket(job);
         }
       }
@@ -339,7 +340,11 @@ export async function sweepOrphanedMachines(
           updateJobStatus(job.id, "timed_out", "issue_completed_sweep", undefined, { skipAdmissionRelease: true });
         }
         invalidateNonce(job.id);
-        await helpers.resetTicket(job);
+        // A gap-analysis (review-fix) run leaves the ticket alone: resetting a cancelled ticket
+        // would set Plan Approved and re-dispatch it.
+        if (job.phase !== "kg-refresh" && job.phase !== "gap-analysis") {
+          await helpers.resetTicket(job);
+        }
       }
     }
   }

@@ -379,3 +379,17 @@ describe("initDispatchBreakerTable idempotency", () => {
     expect(names).toContain("parked_at");
   });
 });
+
+describe("breakerPhaseFor", () => {
+  it.each([
+    ["planning", "planning"],
+    ["gap-analysis", "gap-analysis"],
+    ["gap-fill", "gap-analysis"],
+    ["implementation", "implementation"],
+    ["kg-refresh", "implementation"],
+    [null, "implementation"],
+    [undefined, "implementation"],
+  ])("maps job phase %s to the %s bucket", (phase, bucket) => {
+    expect(breaker.breakerPhaseFor(phase as string | null | undefined)).toBe(bucket);
+  });
+});
