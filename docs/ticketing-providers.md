@@ -109,7 +109,7 @@ The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working`, once a P
 
 ## Jira setup
 
-The setup checks read Jira's facts in one pass that never writes (`JiraProvider.fetchSetupFacts`): the account, each mapping's fields resolved fresh, the status and repo fields' options, and one result of each mapping's bucket query.
+The setup checks read Jira's facts in one pass that never writes (`JiraProvider.fetchSetupFacts`). They prove the credentials first, then, for each Jira project, resolve its fields fresh, read the status and repo fields' options, and run its JQL as the poll runs it for one result. Each failed read is recorded with Jira's HTTP status, or none when Jira could not be reached, so one project's fault never hides another project's facts. Each check reports by id ([setup-checks.md § tracker](setup-checks.md#tracker)).
 
 ### Credentials
 
@@ -120,61 +120,61 @@ The setup checks read Jira's facts in one pass that never writes (`JiraProvider.
 | Basic (API token) | `JIRA_EMAIL`, `JIRA_TOKEN`, `JIRA_SITE_URL` | `JIRA_SITE_URL` | `Basic` of `email:token` |
 | OAuth | `JIRA_TOKEN` (access token), `JIRA_CLOUD_ID`, `JIRA_SITE_URL`; `JIRA_EMAIL` empty | `https://api.atlassian.com/ex/jira/<cloudId>` | `Bearer` |
 
-Neither mode refreshes. `JiraClient` builds its Authorization header once and the registry reads environment variables once at boot; changing an expired token requires replacing it and restarting the orchestrator. `JIRA_SITE_URL` is required in both modes for issue links. Missing token or site URL, or neither email nor cloud ID, makes `createJiraProviderFromConfig` throw `MissingProviderConfigError`; the registry skips Jira and polls other trackers. Basic auth with an API token is recommended for a long-lived setup.
+**Basic mode is the supported path.** It acts as the person whose API token it holds, and Atlassian caps an API token's lifetime at a year, so Jira stops answering on the token's expiry date with no warning first. OAuth mode sends one access token as a bearer and never refreshes it, while Atlassian's OAuth access tokens last an hour, so `tracker.jira.credentials` fails OAuth mode even when Jira accepts the token. Neither mode reloads its credentials: `JiraClient` builds its Authorization header once and the registry reads the environment once at boot, so a new token takes a restart. `JIRA_SITE_URL` is required in both modes for issue links. A missing token or site URL, or neither email nor cloud ID, makes `createJiraProviderFromConfig` throw `MissingProviderConfigError`, and the registry skips Jira and polls the other trackers.
 
-The account lists fields, searches, reads issues and comments, sets the status field and adds comments. Setup checks only use GET requests and the poll's search POST.
+The check proves the credentials with `JiraClient.verifyCredentials`, a `GET /rest/api/3/resolution/search?maxResults=1`, which needs only "Permission to access Jira" and, for an OAuth token, the `read:jira-work` scope the poll needs. Most Jira reads answer a wrong or missing credential as an anonymous caller instead of refusing it (`/mypermissions` answered 200 to a wrong token on a Jira Cloud site), while this one answers 401.
 
-### Field cache
-
-`tracker.jira.field-cache` compares fresh IDs with the poll cache without filling it. Restart the orchestrator if they differ.
-
-### Bucket query
-
-`tracker.jira.query` runs the exact poll bucket query for one result. Correct the mapping JQL if Jira refuses it; it does not use the parse endpoint.
-
-### Repo option
-
-`tracker.jira.repo-option` requires a select option equal to the mapping’s `repoFieldValue`; add the exact option or correct the mapping. Text fields need no option.
+The account lists fields, searches, reads issues and comments, sets the status field and adds comments. Reading a field's options takes more than the poll needs: the **Administer Jira** global permission (`manage:jira-configuration` for an OAuth token). Atlassian's API reference also lists the **Edit Workflows** project permission, but on a Jira Cloud site an account holding it without Administer Jira was refused both the field's contexts and its options with 403 ("Only Jira administrators can manage custom field options."), while listing fields and the credentials read still worked. Without Administer Jira, `tracker.jira.status-options` and `tracker.jira.repo-option` report *cannot verify* and name the permission. The setup checks send only GET requests and the poll's search POST.
 
 ### Custom fields
 
-| Field | Required | What the code reads | Override |
+| Field | Required | What the code reads | Override (the project's setting on `/admin#projects`) |
 |---|---|---|---|
-| `AI-Implement Status` | yes | single-select option value | `statusFieldOverride` |
-| `AI-Implement Repo` | yes | single-select or text matching `repoFieldValue` | `repoFieldOverride` |
-| `AI-Implement Profiles` | no | multi-select option values | `profilesFieldOverride` |
-| `AI-Implement Base Branch` | no | non-blank text | `baseBranchFieldOverride` |
+| `AI-Implement Status` | yes | single-select option value | `statusFieldOverride` (**Status Field**) |
+| `AI-Implement Repo` | yes | single-select or text matching `repoFieldValue` | `repoFieldOverride` (**Repo Field**) |
+| `AI-Implement Profiles` | no | multi-select option values | `profilesFieldOverride` (**Profiles Field**) |
+| `AI-Implement Base Branch` | no | non-blank text | `baseBranchFieldOverride` (**Base Branch Field**) |
 | `Epic Link` | no | classic-project epic key | none |
 
-`resolveCustomFieldIds` matches exact, case-sensitive names. Missing or duplicate required fields throw; absent or ambiguous optional fields warn and stay off. Epic Link takes the first match. Overrides are letters-digits-underscores IDs used as given, without validation against Jira. With all four overrides set, the field list is never read and Epic Link is not resolved. A repo mismatch drops the issue with one warning per issue.
+`resolveCustomFieldIds` matches exact, case-sensitive names. A required field that matches no field or several throws `JiraFieldResolutionError`, which fails the whole Jira snapshot, every Jira project included ("When one tracker's snapshot fails", below), and `tracker.jira.fields` fails the project, naming the setting that picks the field instead. An optional field that is absent or matches several stays off, and `tracker.jira.fields` warns of a duplicated one, naming the feature it leaves off. Epic Link takes the first match. Overrides are IDs of letters, digits and underscores, used as given and never checked against Jira. With all four overrides set, the field list is never read and Epic Link is not resolved. A repo mismatch drops the issue with one warning per issue.
 
-Resolved IDs are cached by site (site URL for Basic, cloud ID for OAuth) and all four overrides for the life of the process. A mapping save does not clear this cache. Failed resolutions are not cached. Setup resolves fresh and warns on drift; restart the orchestrator to use the current fields.
+### Field cache
+
+Resolved IDs are cached by site (the site URL in Basic mode, the cloud ID in OAuth mode) and all four overrides, for the life of the process. A mapping save does not clear the cache, and a failed resolution is not cached. `tracker.jira.field-cache` compares the IDs it resolves fresh with the cached ones without filling the cache (`peekCachedFieldIds`), and warns when they differ: the poll is still using fields from before a change in Jira, and a restart makes it read the current ones.
 
 ### The `AI-Implement Status` options
 
-The poll's bucket is `(<mapping jql>) AND <status field> in (Ready, "Plan Approved")`. Nine values are read or written (`STATUS_VALUES`):
+The poll's bucket is `(<project jql>) AND <status field> in (Ready, "Plan Approved")`. Nine values are read or written (`STATUS_VALUES`):
 
 | Option | Set by | When missing |
 |---|---|---|
-| `Ready` | a person | no issue can be queued |
+| `Ready` | a person; `clearWorkingState` after a planning run | no issue can be queued, and a stopped planning run cannot return its issue to the queue |
 | `Planning` | `markPlanningStarted` | write fails; run continues and issue stays Ready |
 | `Awaiting Approval` | `markPlanComplete`, auto-approval off | plan-complete write fails and parks the run |
-| `Plan Approved` | `markPlanComplete`, auto-approval on; `clearWorkingState`; a person | plan-complete write and resets fail |
+| `Plan Approved` | `markPlanComplete`, auto-approval on; `clearWorkingState` after an implementation run; a person | plan-complete write and implementation resets fail |
 | `Implementing` | `markImplementing` | write fails after launch |
 | `PR Ready` | `markPrReady` | write fails; review comment is lost |
 | `Merged` | `markMerged` | merge completion never updates the issue |
-| `Planning Failed` | `markPlanningFailed` | write fails; failure comment is lost |
-| `Implementation Failed` | `markImplementationFailed` | write fails; failure comment is lost |
+| `Planning Failed` | `markPlanningFailed`; `parkForHuman` after a planning run | write fails; failure comment is lost, and a planning run the stuck watchdog gives up on is not parked |
+| `Implementation Failed` | `markImplementationFailed`; `parkForHuman` after an implementation run | write fails; failure comment is lost, and an implementation run the stuck watchdog gives up on is not parked |
 
-`Awaiting Approval` is required only with auto-approval off. `clearWorkingState` writes Plan Approved for operator cancels, admin machine stops, watchdog and monitor resets.
+`Awaiting Approval` is required only with auto-approval off, and `tracker.jira.status-options` asks for it only then. Which run outcome writes which option is in "Tracker state after a failed, stuck or given-up run", above.
 
 Comment-carrying setters write status first, so a rejected write loses the comment. Merged is terminal: `setStatus` refuses to move an issue off Merged, but proceeds if its pre-read fails. A refused regression makes `markPlanningFailed` and `markPrReady` post nothing; `markImplementationFailed` posts a late-report comment instead. `markMerged` changes only the custom field; native Done or field Merged counts as finished.
 
 Without a Merged option, merge reconciliation retries once per poll and dead-letters after five failures. The issue keeps PR Ready and, until its native status becomes Done, holds grouping-parent dispatch and roll-up and issues it Blocks.
 
+### Repo option
+
+`tracker.jira.repo-option` requires the repo field to have an option spelled exactly as the project's **Repo Field Value** (`repoFieldValue`). The poll drops every issue whose repo field holds another value, so without that option it finds none of the project's issues. A text repo field has no options, so the check does not apply to it; the poll compares its text instead (`readRepoFieldValue`). Reading the options needs the permission in "Credentials", above.
+
+### JQL
+
+`tracker.jira.jql` runs the project's JQL as the poll runs it, `(<project jql>) AND <status field> in (Ready, "Plan Approved")` from `buildBucketQuery`, with a `customfield_N` status field written as `cf[N]`, asking for one result. A query Jira refuses fails the check with Jira's status and error. It also fails the whole Jira snapshot, as a missing field does, so the fix is the project's **JQL** on `/admin#projects`, leaving the status filter to the poll. The check runs the search, not `validateJql`'s parse endpoint, so it judges the query Jira will actually run.
+
 ## Filesystem setup
 
-The provider needs no tracker credentials and requires `RUNNER_MODE=local`. Mapping directories must be absolute, exist as directories and be writable. The check resolves symlinks through `existingRealDirectory`, just like the poll, and tests access without writing. Missing directories are silently skipped by the poll. The provider writes `.state/<mapping key>/<identifier>.json` and `completed/` and `failed/` archives; archiving is skipped with a warning when mappings share a directory. See [filesystem-tickets.md](filesystem-tickets.md) for the format.
+The provider needs no tracker credentials and requires `RUNNER_MODE=local`. A project's **Ticket Directory** must be absolute (a mapping save refuses any other), exist as a directory, and let the orchestrator create entries in it, which needs search permission as well as write. `tracker.filesystem.directory` resolves symlinks through `existingRealDirectory`, as the poll does, and asks for both with `access(W_OK | X_OK)`, writing nothing. The poll skips a missing directory silently, so the check is the only report of one. The provider writes `.state/<mapping key>/<identifier>.json` and `completed/` and `failed/` archives; archiving is skipped with a warning when mappings share a directory. See [filesystem-tickets.md](filesystem-tickets.md) for the format.
 
 ## When a tracker write fails
 

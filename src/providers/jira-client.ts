@@ -5,10 +5,9 @@ export interface JiraClientConfig {
   token: string;
   /**
    * Service-account email. When set, the client authenticates with Basic auth
-   * (email:token) against `siteUrl` — the durable API-token path for Jira
-   * Cloud (tokens from id.atlassian.com don't expire). When unset, it falls
-   * back to Bearer auth through the OAuth gateway (api.atlassian.com), which
-   * requires `cloudId`.
+   * (email:token) against `siteUrl`, with an API token from id.atlassian.com,
+   * which Atlassian caps at a year. When unset, it falls back to Bearer auth
+   * through the OAuth gateway (api.atlassian.com), which requires `cloudId`.
    */
   email?: string;
   /** Site base URL (https://<site>.atlassian.net). Required for Basic auth. */
@@ -245,8 +244,13 @@ export class JiraClient {
     return all;
   }
 
-  async getMyself(): Promise<unknown> {
-    return this.requestJson("GET", "/rest/api/3/myself");
+  /**
+   * Proves the credentials with the cheapest call any account that can use Jira may make, needing only the
+   * `read:jira-work` scope the poll needs. Most reads answer a wrong or missing credential as an anonymous
+   * caller instead of refusing it, and this one refuses with 401.
+   */
+  async verifyCredentials(): Promise<void> {
+    await this.requestJson("GET", "/rest/api/3/resolution/search?maxResults=1");
   }
 
   async listFields(): Promise<JiraField[]> {
@@ -254,26 +258,16 @@ export class JiraClient {
   }
 
   /**
-   * Returns the merged option list for a select-type custom field.
+   * Returns the merged option list for a select-type custom field, every page of contexts and of options.
    * Throws JiraFieldNotSelectError if the field has no contexts (typically
    * means it is not a select / multi-select).
-   *
-   * Note: reads only the first page of contexts and the first page of options
-   * per context. Jira's default page size is 100, which is far above any
-   * realistic AI-Implement Repo or Status field. If a field exceeds that, the
-   * returned list will be silently truncated — add pagination if that becomes
-   * a real-world concern.
    */
   async getFieldOptions(fieldId: string): Promise<Array<{ id: string; value: string }>> {
     const id = encodeURIComponent(fieldId);
 
     let contexts: Array<{ id: string }>;
     try {
-      const res = await this.requestJson<{ values: Array<{ id: string }> }>(
-        "GET",
-        `/rest/api/3/field/${id}/context`,
-      );
-      contexts = res.values;
+      contexts = await this.allPages<{ id: string }>(`/rest/api/3/field/${id}/context`);
     } catch (err) {
       if (err instanceof JiraApiError && err.status === 404) {
         throw new JiraFieldNotSelectError(fieldId);
@@ -283,15 +277,24 @@ export class JiraClient {
 
     const merged = new Map<string, { id: string; value: string }>();
     for (const ctx of contexts) {
-      const ctxId = encodeURIComponent(ctx.id);
-      const optRes = await this.requestJson<{ values: Array<{ id: string; value: string }> }>(
-        "GET",
-        `/rest/api/3/field/${id}/context/${ctxId}/option`,
+      const options = await this.allPages<{ id: string; value: string }>(
+        `/rest/api/3/field/${id}/context/${encodeURIComponent(ctx.id)}/option`,
       );
-      for (const opt of optRes.values) {
+      for (const opt of options) {
         if (!merged.has(opt.id)) merged.set(opt.id, opt);
       }
     }
     return Array.from(merged.values());
+  }
+
+  /** Every page of a `startAt`-paged list. A page without `isLast` is taken as the last. */
+  private async allPages<T>(path: string): Promise<T[]> {
+    const all: T[] = [];
+    for (;;) {
+      // The first page needs no offset, since startAt defaults to 0.
+      const page = await this.requestJson<{ values: T[]; isLast?: boolean }>("GET", all.length === 0 ? path : `${path}?startAt=${all.length}`);
+      all.push(...page.values);
+      if (page.isLast !== false || page.values.length === 0) return all;
+    }
   }
 }

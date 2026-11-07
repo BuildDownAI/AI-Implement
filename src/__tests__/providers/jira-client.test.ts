@@ -215,8 +215,63 @@ describe("JiraClient Basic auth (email + API token)", () => {
   });
 });
 
-it("getMyself reads the account", async () => {
-  const fake = fakeFetch({ [`GET ${GATEWAY}/myself`]: { json: { accountId: "me" } } }).install();
-  expect(await new JiraClient({ token: "tok", cloudId: "CLOUD-123" }).getMyself()).toEqual({ accountId: "me" });
-  expect(fake.calls[0].method).toBe("GET");
+describe("JiraClient.verifyCredentials", () => {
+  const client = () => new JiraClient({ token: "tok", cloudId: "CLOUD-123" });
+
+  it("asks for one resolution, a read that refuses an anonymous caller", async () => {
+    const fake = fakeFetch({ [`GET ${GATEWAY}/resolution/search`]: { json: { values: [{ id: "1" }] } } }).install();
+    await expect(client().verifyCredentials()).resolves.toBeUndefined();
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].url.searchParams.get("maxResults")).toBe("1");
+  });
+
+  it("throws Jira's refusal with its status", async () => {
+    fakeFetch({ [`GET ${GATEWAY}/resolution/search`]: { status: 401, text: "Client must be authenticated" } }).install();
+    await expect(client().verifyCredentials()).rejects.toMatchObject({ name: "JiraApiError", status: 401 });
+  });
+});
+
+describe("JiraClient.getFieldOptions", () => {
+  const client = () => new JiraClient({ token: "tok", cloudId: "CLOUD-123" });
+
+  it("reads every page of contexts and of each context's options, starting the next page after the last value", async () => {
+    const fake = fakeFetch({
+      [`GET ${GATEWAY}/field/customfield_1/context`]: [
+        { json: { values: [{ id: "10" }], isLast: false } },
+        { json: { values: [{ id: "20" }], isLast: true } },
+      ],
+      [`GET ${GATEWAY}/field/customfield_1/context/10/option`]: [
+        { json: { values: [{ id: "a", value: "Ready" }, { id: "b", value: "Merged" }], isLast: false } },
+        { json: { values: [{ id: "c", value: "PR Ready" }], isLast: true } },
+      ],
+      [`GET ${GATEWAY}/field/customfield_1/context/20/option`]: { json: { values: [{ id: "a", value: "Ready" }], isLast: true } },
+    }).install();
+
+    expect((await client().getFieldOptions("customfield_1")).map((option) => option.value)).toEqual(["Ready", "Merged", "PR Ready"]);
+    const offsets = fake.calls.map((call) => `${call.path.split("/field/")[1]} ${call.url.searchParams.get("startAt") ?? "-"}`);
+    expect(offsets).toEqual([
+      "customfield_1/context -",
+      "customfield_1/context 1",
+      "customfield_1/context/10/option -",
+      "customfield_1/context/10/option 2",
+      "customfield_1/context/20/option -",
+    ]);
+  });
+
+  it("takes a page without isLast as the last, so an older server cannot loop it", async () => {
+    const fake = fakeFetch({
+      [`GET ${GATEWAY}/field/customfield_1/context`]: { json: { values: [{ id: "10" }] } },
+      [`GET ${GATEWAY}/field/customfield_1/context/10/option`]: { json: { values: [{ id: "a", value: "Ready" }] } },
+    }).install();
+    expect(await client().getFieldOptions("customfield_1")).toEqual([{ id: "a", value: "Ready" }]);
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("stops at an empty page even when it claims more follow", async () => {
+    const fake = fakeFetch({
+      [`GET ${GATEWAY}/field/customfield_1/context`]: { json: { values: [], isLast: false } },
+    }).install();
+    expect(await client().getFieldOptions("customfield_1")).toEqual([]);
+    expect(fake.calls).toHaveLength(1);
+  });
 });

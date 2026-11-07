@@ -101,13 +101,13 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.linear.pickup-label`](ticketing-providers.md#the-pickup-label) | No label with the pickup label's exact name at workspace level or in the team, or one only in a different case |
 | [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case |
 | [`tracker.linear.workflow-states`](ticketing-providers.md#workflow-states) | A team with no `started`-type or no `completed`-type state |
-| [`tracker.jira.credentials`](ticketing-providers.md#credentials) | Jira credentials faults (core) |
-| [`tracker.jira.fields`](ticketing-providers.md#custom-fields) | Jira fields faults (core) |
-| [`tracker.jira.field-cache`](ticketing-providers.md#field-cache) | Jira field cache faults (core) |
-| [`tracker.jira.status-options`](ticketing-providers.md#the-ai-implement-status-options) | Jira status options faults (core) |
-| [`tracker.jira.repo-option`](ticketing-providers.md#repo-option) | Jira repo option faults (core) |
-| [`tracker.jira.query`](ticketing-providers.md#bucket-query) | Jira query faults (core) |
-| [`tracker.filesystem.directory`](ticketing-providers.md#filesystem-setup) | Missing, non-directory or unwritable ticket directory (mode) |
+| [`tracker.jira.credentials`](ticketing-providers.md#credentials) | Jira refusing the credentials, with its HTTP status, or OAuth mode, whose access token is never refreshed |
+| [`tracker.jira.fields`](ticketing-providers.md#custom-fields) | A required field that matches no field or several by name, which stops every Jira project; a warning for an optional field named twice |
+| [`tracker.jira.field-cache`](ticketing-providers.md#field-cache) | Field IDs the poll cached before the project's fields changed in Jira |
+| [`tracker.jira.status-options`](ticketing-providers.md#the-ai-implement-status-options) | A status field that is not a select field, or lacks an option the project uses |
+| [`tracker.jira.repo-option`](ticketing-providers.md#repo-option) | A select repo field with no option equal to the project's Repo Field Value |
+| [`tracker.jira.jql`](ticketing-providers.md#jql) | The project's JQL refused by Jira as the poll runs it |
+| [`tracker.filesystem.directory`](ticketing-providers.md#filesystem-setup) | A ticket directory that is missing, is not a directory, or that the orchestrator cannot write and search |
 
 ## Bootstrap mode before sign-in
 

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
+import type { FilesystemSetupFacts, JiraSetupFacts } from "../../providers/types.js";
 import type { SetupCheck, SetupCheckContext, SetupCheckResult } from "../../setup-checks/index.js";
 import { makeAccessEntry, makeMapping, makeProvider } from "../helpers/builders.js";
 import { makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
@@ -29,6 +30,28 @@ function fakeCheck(overrides: Partial<SetupCheck> = {}): SetupCheck {
 
 const FAULTY_LINEAR = makeLinearSetupFacts({ teams: { ENG: ["started"] }, found: [{ name: "ai-implement", teamKey: "ENG" }, { name: "ai-working", teamKey: "ENG" }] });
 const REFUSED_LINEAR = { kind: "linear", token: "refused", status: 401, error: "Linear token mint failed (401): invalid_client" } as const;
+// One Jira project whose status field is missing, one whose reads each fail or warn, and a Filesystem
+// directory the orchestrator cannot write: between them, every Jira and Filesystem fault branch.
+const FAULTY_JIRA: JiraSetupFacts = {
+  kind: "jira",
+  credentials: "accepted",
+  oauth: true,
+  projects: {
+    OPS: { fields: "unresolved", field: "AI-Implement Status", fault: "missing" },
+    WEB: {
+      fields: "resolved",
+      ids: { statusFieldId: "customfield_1", repoFieldId: "customfield_2", profilesFieldId: null, baseBranchFieldId: null },
+      cachedIds: { statusFieldId: "customfield_9", repoFieldId: "customfield_2", profilesFieldId: null, baseBranchFieldId: null },
+      ambiguousOptional: ["AI-Implement Profiles"],
+      statusOptions: { read: "options", values: ["Ready"] },
+      repoOptions: { read: "failed", failure: { status: 403, error: "forbidden" } },
+      jql: { accepted: false, failure: { status: 400, error: "Error in the JQL Query" } },
+    },
+  },
+};
+// A Jira config as the store reads one back with no field overrides.
+const NO_FIELD_OVERRIDES = { statusFieldOverride: null, repoFieldOverride: null, profilesFieldOverride: null, baseBranchFieldOverride: null };
+const FAULTY_FILESYSTEM: FilesystemSetupFacts = { kind: "filesystem", directories: { LOCAL: { directory: "/tickets", fault: "not-writable" } } };
 
 const SAVED_ROWS: Record<string, string> = { kg_base_repo: "Org/saved-repo", fly_process_level_secrets: "true" };
 const SAVED_ENTRIES = [makeAccessEntry(), makeAccessEntry({ kind: "domain", value: "example.com", role: "user" })];
@@ -94,6 +117,15 @@ const CONTEXTS: Record<string, SetupCheckContext> = {
     mappings: () => ({ ENG: makeMapping(), OPS: makeMapping({ ticketingProvider: "jira" }) }),
     trackerProvider: async (id) => makeProvider(id === "linear" ? { fetchSetupFacts: async () => FAULTY_LINEAR } : { id }),
     trackerSetupFacts: async (id) => (id === "linear" ? FAULTY_LINEAR : null),
+  }),
+  "Jira and Filesystem set up with faults": makeSetupCheckContext({
+    mappings: () => ({
+      OPS: makeMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = OPS", repoFieldValue: "acme/ops", ...NO_FIELD_OVERRIDES } }),
+      WEB: makeMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = WEB", repoFieldValue: "acme/web", ...NO_FIELD_OVERRIDES } }),
+      LOCAL: makeMapping({ ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tickets" } }),
+    }),
+    trackerProvider: async (id) => makeProvider({ id, fetchSetupFacts: async () => (id === "jira" ? FAULTY_JIRA : FAULTY_FILESYSTEM) }),
+    trackerSetupFacts: async (id) => (id === "jira" ? FAULTY_JIRA : id === "filesystem" ? FAULTY_FILESYSTEM : null),
   }),
   "Linear refusing the app": makeSetupCheckContext({
     mappings: () => ({ ENG: makeMapping() }),

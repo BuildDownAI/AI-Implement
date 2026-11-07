@@ -5,8 +5,6 @@ import type { RepoMapping } from "../../config.js";
 import { FilesystemProvider } from "../../providers/filesystem.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
 import { testDir } from "../helpers/test-dir.js";
-import { TRACKER_CONFIG_CHECKS } from "../../setup-checks/tracker-config.js";
-import { makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -580,49 +578,54 @@ describe("FilesystemProvider", () => {
   });
 });
 
-it("reads directory setup through symlinks and creates nothing", async () => {
-  const { readdir } = await import("node:fs/promises");
-  const root = testDir("fs-setup");
-  const target = join(root, "target");
-  await mkdir(target);
-  await writeFile(join(root, "file"), "file");
-  await symlink(target, join(root, "alias"));
-  const mappings = Object.fromEntries(["target", "alias", "file", "missing"].map((key) => [key, mapping({ directory: join(root, key) })]));
-  const before = await readdir(root);
-  const facts = await new FilesystemProvider(() => mappings).fetchSetupFacts(Object.keys(mappings));
-  expect(facts.directories.target.error).toBeUndefined();
-  expect(facts.directories.alias.error).toBeUndefined();
-  expect(facts.directories.file.error).toContain("not a directory");
-  expect(facts.directories.missing.error).toContain("does not exist");
-  expect(await readdir(root)).toEqual(before);
-  expect(await readdir(target)).toEqual([]);
-});
+describe("FilesystemProvider.fetchSetupFacts", () => {
+  it("resolves each directory as the poll does, through symlinks, and writes nothing", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const root = testDir("fs-setup");
+    const target = join(root, "target");
+    await mkdir(target);
+    await writeFile(join(root, "file"), "file");
+    await symlink(target, join(root, "alias"));
+    const mappings = Object.fromEntries(["target", "alias", "file", "missing"].map((key) => [key, mapping({ directory: join(root, key) })]));
+    const before = await readdir(root);
 
+    const facts = await provider(mappings).fetchSetupFacts(Object.keys(mappings));
 
-it("records denied directory access without writing", async () => {
-  const root = testDir("fs-setup-denied");
-  vi.mocked(access).mockRejectedValueOnce(new Error("EACCES"));
-  const facts = await new FilesystemProvider(() => ({ X: mapping({ directory: root }) })).fetchSetupFacts(["X"]);
-  expect(facts.directories.X.error).toContain("not writable");
-  const { readdir } = await import("node:fs/promises");
-  expect(await readdir(root)).toEqual([]);
-});
-
-it("fails the directory setup row when write access exists but search access is denied", async () => {
-  const root = testDir("fs-setup-no-search");
-  // Model search denial explicitly: a write-only check would incorrectly succeed.
-  vi.mocked(access).mockImplementationOnce(async (_path, mode) => {
-    if (mode !== undefined && (mode & constants.X_OK) !== 0) throw new Error("EACCES");
+    expect(facts).toEqual({
+      kind: "filesystem",
+      directories: {
+        target: { directory: target, fault: null },
+        alias: { directory: join(root, "alias"), fault: null },
+        file: { directory: join(root, "file"), fault: "missing" },
+        missing: { directory: join(root, "missing"), fault: "missing" },
+      },
+    });
+    expect(await readdir(root)).toEqual(before);
+    expect(await readdir(target)).toEqual([]);
   });
-  const mappings = { X: mapping({ directory: root }) };
-  const facts = await provider(mappings).fetchSetupFacts(["X"]);
-  expect(access).toHaveBeenLastCalledWith(root, constants.W_OK | constants.X_OK);
-  expect(facts.directories.X.error).toContain("not writable or searchable");
-  const check = TRACKER_CONFIG_CHECKS.find((c) => c.id === "tracker.filesystem.directory")!;
-  expect(await check.run(makeSetupCheckContext({
-    mappings: () => mappings,
-    trackerSetupFacts: async () => facts,
-  }))).toMatchObject([{ project: "X", state: "fail", fix: expect.stringContaining("permissions") }]);
-  const { readdir } = await import("node:fs/promises");
-  expect(await readdir(root)).toEqual([]);
+
+  it("asks for write and search access together, and records a directory missing either", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const root = testDir("fs-setup-no-search");
+    // Search denied alone: a check asking only for write access would pass this directory.
+    vi.mocked(access).mockImplementationOnce(async (_path, mode) => {
+      if (mode !== undefined && (mode & constants.X_OK) !== 0) throw new Error("EACCES");
+    });
+
+    const facts = await provider({ X: mapping({ directory: root }) }).fetchSetupFacts(["X"]);
+
+    expect(access).toHaveBeenLastCalledWith(root, constants.W_OK | constants.X_OK);
+    expect(facts.directories.X).toEqual({ directory: root, fault: "not-writable" });
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  it("reads only the Filesystem projects it is asked for", async () => {
+    const root = testDir("fs-setup-scope");
+    const facts = await provider({
+      LOCAL: mapping({ directory: root }),
+      ELSEWHERE: makeMapping({ ticketingProvider: "linear" }),
+    }).fetchSetupFacts(["LOCAL", "ELSEWHERE"]);
+
+    expect(Object.keys(facts.directories)).toEqual(["LOCAL"]);
+  });
 });
