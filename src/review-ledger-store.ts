@@ -103,27 +103,52 @@ export function markReviewFindingsResolvedForPr(repo: string, prNumber: number):
   return result.changes;
 }
 
-export function markReviewFindingsResolvedForPrSeenBefore(repo: string, prNumber: number, seenBefore: number): number {
+/**
+ * Resolves only open rows last seen at or before `seenBefore` whose
+ * `finding_key` is in `keys` — the keys the agent disposed `fixed` or
+ * `invalid`. An empty `keys` resolves nothing on purpose (fail closed): a
+ * finding is never resolved without a recorded disposition.
+ */
+export function markReviewFindingsResolvedForPrSeenBefore(
+  repo: string,
+  prNumber: number,
+  seenBefore: number,
+  keys: string[],
+): number {
+  if (keys.length === 0) return 0;
+  const placeholders = keys.map(() => "?").join(", ");
   const result = getDb()
     .prepare(`
       UPDATE review_findings
       SET status = 'resolved', resolved_at = ?, last_seen_at = ?
-      WHERE repo = ? AND pr_number = ? AND status = 'open' AND last_seen_at <= ?
+      WHERE repo = ? AND pr_number = ? AND status = 'open' AND last_seen_at <= ? AND finding_key IN (${placeholders})
     `)
-    .run(Date.now(), Date.now(), repo, prNumber, seenBefore);
+    .run(Date.now(), Date.now(), repo, prNumber, seenBefore, ...keys);
   return result.changes;
 }
 
-export function markReviewFindingsResolvedByIds(repo: string, prNumber: number, findingIds: number[]): number {
-  if (findingIds.length === 0) return 0;
+/**
+ * Resolves only open rows whose id is in `findingIds` (the dispatch snapshot)
+ * and whose `finding_key` is in `keys` — the keys the agent disposed `fixed`
+ * or `invalid`. An empty `keys` resolves nothing on purpose (fail closed): a
+ * finding is never resolved without a recorded disposition.
+ */
+export function markReviewFindingsResolvedByIds(
+  repo: string,
+  prNumber: number,
+  findingIds: number[],
+  keys: string[],
+): number {
+  if (findingIds.length === 0 || keys.length === 0) return 0;
   const placeholders = findingIds.map(() => "?").join(", ");
+  const keyPlaceholders = keys.map(() => "?").join(", ");
   const result = getDb()
     .prepare(`
       UPDATE review_findings
       SET status = 'resolved', resolved_at = ?, last_seen_at = ?
-      WHERE repo = ? AND pr_number = ? AND status = 'open' AND id IN (${placeholders})
+      WHERE repo = ? AND pr_number = ? AND status = 'open' AND id IN (${placeholders}) AND finding_key IN (${keyPlaceholders})
     `)
-    .run(Date.now(), Date.now(), repo, prNumber, ...findingIds);
+    .run(Date.now(), Date.now(), repo, prNumber, ...findingIds, ...keys);
   return result.changes;
 }
 

@@ -37,6 +37,7 @@ import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { acceptReviewFixWebhookEvent, getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import {
   getReviewFindingsByKeys,
+  listOpenReviewFindings,
   markReviewFindingsDeferredByKeys,
   markReviewFindingsResolvedByIds,
   markReviewFindingsResolvedForPrSeenBefore,
@@ -1097,12 +1098,13 @@ async function handleRunnerResultInternal(
   // Applies on any phase/outcome once a PR exists, so it is not nested in the
   // outcome/phase branches that follow.
   const followUpDispositions = sanitizedFindingDispositions.filter((d) => d.disposition === "follow-up");
+  let deferredCount = 0;
   if (followUpDispositions.length > 0) {
     const dispositionJob = getJobByDispatchId(claims.dispatchId);
     const dispositionPrNumber = parsePrNumber(dispositionJob?.prUrl ?? null);
     if (dispositionJob?.repo && dispositionPrNumber !== null) {
       const keys = followUpDispositions.map((d) => d.findingKey);
-      markReviewFindingsDeferredByKeys(dispositionJob.repo, dispositionPrNumber, keys);
+      deferredCount = markReviewFindingsDeferredByKeys(dispositionJob.repo, dispositionPrNumber, keys);
       const rowsByKey = new Map(
         getReviewFindingsByKeys(dispositionJob.repo, dispositionPrNumber, keys).map((row) => [row.findingKey, row]),
       );
@@ -1362,11 +1364,23 @@ async function handleRunnerResultInternal(
     const prNumber = parsePrNumber(job?.prUrl ?? null);
     if (job?.repo && prNumber !== null) {
       const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
-      if (snapshot) {
-        markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds);
-      } else {
-        markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
-      }
+      // Only findings the agent disposed `fixed` or `invalid` resolve; an
+      // undisposed finding stays open so the next fix run sees it. `follow-up` rows were
+      // deferred above and are no longer open.
+      const resolveKeys = sanitizedFindingDispositions
+        .filter((d) => d.disposition === "fixed" || d.disposition === "invalid")
+        .map((d) => d.findingKey);
+      const openNow = listOpenReviewFindings(snapshot?.repo ?? job.repo, snapshot?.prNumber ?? prNumber);
+      const snapshotIds = snapshot ? new Set(snapshot.findingIds) : null;
+      const allowedCount = openNow.filter((f) =>
+        snapshotIds ? snapshotIds.has(f.id) : f.lastSeenAt <= job.dispatchedAt,
+      ).length;
+      const resolvedCount = snapshot
+        ? markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds, resolveKeys)
+        : markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt, resolveKeys);
+      console.log(
+        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} left_open=${allowedCount - resolvedCount}`,
+      );
       // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
       // AII-1291: no approval mark here. The gap-fill pushed a head the external review has not
