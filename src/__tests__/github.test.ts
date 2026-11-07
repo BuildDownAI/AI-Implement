@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments } from "../github.js";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -1171,5 +1171,47 @@ describe("listPrComments strict option (AII-1309)", () => {
       ],
     }).install();
     await expect(listPrComments("t", "o", "r", 5, { strict: true })).rejects.toThrow(/502/);
+  });
+});
+
+describe("getFailedContainerInitJob", () => {
+  const JOBS = "GET /repos/o/r/actions/runs/5/jobs" as const;
+  const jobs = (steps: Array<{ name: string; conclusion: string | null }>): ReplyInit => ({
+    json: { jobs: [{ name: "implement", html_url: "https://github.com/o/r/actions/runs/5/job/9", steps }] },
+  });
+
+  it("returns the job name and URL when Initialize containers failed", async () => {
+    const fake = fakeFetch({ [JOBS]: jobs([
+      { name: "Set up job", conclusion: "success" },
+      { name: "Initialize containers", conclusion: "failure" },
+    ]) }).install();
+    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toEqual({
+      jobName: "implement",
+      htmlUrl: "https://github.com/o/r/actions/runs/5/job/9",
+    });
+    expect(fake.calls[0].url.search).toBe("?filter=latest&per_page=100");
+  });
+
+  it("matches a failed Initialize containers step on a job without name or html_url", async () => {
+    fakeFetch({ [JOBS]: { json: { jobs: [{ steps: [{ name: "Initialize containers", conclusion: "failure" }] }] } } }).install();
+    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toEqual({ jobName: "unknown", htmlUrl: null });
+  });
+
+  it("returns null when a different step failed", async () => {
+    fakeFetch({ [JOBS]: jobs([
+      { name: "Initialize containers", conclusion: "success" },
+      { name: "Run pipeline", conclusion: "failure" },
+    ]) }).install();
+    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toBeNull();
+  });
+
+  it("returns null on a non-OK response", async () => {
+    fakeFetch({ [JOBS]: githubError(403, "Forbidden") }).install();
+    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toBeNull();
+  });
+
+  it("returns null when the request throws", async () => {
+    fakeFetch({ [JOBS]: () => { throw new Error("network down"); } }).install();
+    expect(await getFailedContainerInitJob("token", "o", "r", 5)).toBeNull();
   });
 });

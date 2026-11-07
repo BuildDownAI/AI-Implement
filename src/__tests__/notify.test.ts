@@ -734,6 +734,12 @@ describe("notifyStuckGiveUp", () => {
   afterEach(() => { vi.restoreAllMocks(); });
   const body = () => (vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string;
 
+  it.each(["slack", "teams", "other"])("titles an image-pull give-up after the image pull (%s)", async (type) => {
+    await notifyStuckGiveUp(type, "https://webhook.example.com/x", { ...base, lastRunStatus: "runner_image_pull_failed" });
+    expect(body()).toContain("AI Implementation could not pull the runner image");
+    expect(body()).not.toContain("AI Implementation Stuck");
+  });
+
   it.each(["slack", "teams"])("keeps the give-up alert with its attempt count (%s)", async (type) => {
     await notifyStuckGiveUp(type, "https://webhook.example.com/x", base);
     expect(body()).toContain("AI Implementation Stuck");

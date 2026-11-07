@@ -50,6 +50,18 @@ On the GHA path, `claude-implement.yml` and `claude-plan.yml` authenticate the p
 
 This is why the default image stays public: a cross-org `GITHUB_TOKEN` cannot pull it, so making it private would break every customer repo. The default must also be public for Fly, which pulls anonymously. New GHCR packages default to Private, and the organization must permit public container packages first (Org Settings → Packages).
 
+### When a GitHub Actions image pull fails
+
+If GitHub Actions cannot pull the job-container image, the job fails in its `Initialize containers` step before the runner starts, so no callback reports a failure code. After a failed GitHub Actions implementation run, `remediateFailedJob` (`src/stuck-watchdog.ts`) reads the run's jobs (`getFailedContainerInitJob`, `src/github.ts`). The usual cause of a failed `Initialize containers` step is a denied or missing image, which a retry cannot fix; a short registry outage can also fail this step. So the orchestrator:
+
+- retries **once**: the first such failure takes the normal retry (working state and dedup entry cleared);
+- gives up from the second attempt: it parks the ticket out of pickup (`parkForHuman`; see [ticketing-providers.md](ticketing-providers.md)), then clears the dedup entry and the stuck-attempt counter;
+- posts a comment naming the image, the repo, the attempt count and the failed job, in place of the generic "Needs Human" comment, and sends `notifyStuckGiveUp` with `lastRunStatus: "runner_image_pull_failed"` (`IMAGE_PULL_FAILED_STATUS`), which titles the alert after the image pull.
+
+For a private GHCR package, the fix is to grant the target repo **Read** access to the package (package settings → **Manage Actions access**). For an image in another organization, see the section above. To start again, reset the AI-Implement status or label on the ticket (on Linear, remove the `AI-Needs-Human` label); the run gets a full retry budget.
+
+The jobs lookup runs only from the second attempt (on the first failure its result is unused) and never for a failure the runner reported through its callback, since then the runner started. The attempt counter is shared with other failures, so a ticket that already failed once for another reason gives up on its first image-pull failure. If the lookup fails (non-OK response, error), the normal bounded retry applies. Fly Machines, local Docker, fix runs and kg-refresh runs are not affected.
+
 ## Channels
 
 `.github/workflows/build-runner.yml` publishes to `ghcr.io/<owner>/ai-implement-runner`, lowercasing the owner of the repo it runs in — so a fork's builds land in its own namespace automatically, one the GHA allowlist already trusts. The built-in fallback in code and in the synced workflows stays `ghcr.io/builddownai/ai-implement-runner` regardless; a fork wanting its own image used must pin it rather than edit the fallback.

@@ -8,6 +8,7 @@ vi.mock("../github.js", () => ({
   // this is the realistic case, since GHA does not stop a run the instant it accepts
   // a cancel request. Tests that need a confirmed stop override this explicitly.
   getWorkflowRunStatus: vi.fn().mockResolvedValue({ status: "in_progress", conclusion: null, html_url: "https://x" }),
+  getFailedContainerInitJob: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("../github-app-auth.js", () => ({
@@ -15,6 +16,7 @@ vi.mock("../github-app-auth.js", () => ({
 }));
 
 vi.mock("../log.js", () => ({
+  getStuckAttempts: vi.fn().mockReturnValue(0),
   incrementStuckAttempts: vi.fn(),
   updateJobStatus: vi.fn(),
   resetStuckAttempts: vi.fn(),
@@ -30,14 +32,15 @@ vi.mock("../dispatch-admission.js", () => ({
 }));
 
 vi.mock("../notify.js", () => ({
+  IMAGE_PULL_FAILED_STATUS: "runner_image_pull_failed",
   notifyStuckGiveUp: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { remediateStuckJob, remediateFailedJob } from "../stuck-watchdog.js";
-import { incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "../log.js";
+import { getStuckAttempts, incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "../log.js";
 import { deleteDispatched } from "../dedup.js";
 import { notifyStuckGiveUp } from "../notify.js";
-import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
+import { cancelWorkflowRun, getWorkflowRunStatus, getFailedContainerInitJob } from "../github.js";
 import { read as readAdmission } from "../dispatch-admission.js";
 
 const mockConfig = {
@@ -505,5 +508,114 @@ describe("boundedCleanup give-up — parkForHuman", () => {
     const provider = makeProvider();
     await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "planning" }), "failure");
     expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
+  });
+});
+
+describe("remediateFailedJob — runner image pull failure", () => {
+  const initFailure = { jobName: "implement", htmlUrl: "https://github.com/org/repo/actions/runs/99/job/7" };
+  const ghaJob = (overrides: Partial<Job> = {}) =>
+    stuckJob({ repo: "org/repo", executionMode: "github-actions", phase: "implementation", ...overrides });
+
+  beforeEach(() => {
+    vi.mocked(getStuckAttempts).mockReturnValue(1);
+  });
+
+  it("gives up on attempt 2: parks, clears dedup, posts the image-pull comment, notifies", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedContainerInitJob).mockResolvedValueOnce(initFailure);
+    const provider = makeProvider({ id: "jira" });
+
+    await remediateFailedJob(mockConfig, provider, ghaJob({ sessionImage: "ghcr.io/org/runner:1" }), "failure");
+
+    expect(getFailedContainerInitJob).toHaveBeenCalledWith("gh-token-mock", "org", "repo", 99);
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body).toContain("could not pull the runner image");
+    expect(body).toContain("`ghcr.io/org/runner:1`");
+    expect(body).toContain("`org/repo`");
+    expect(body).toContain("AI-Implement tried 2 times.");
+    expect(body).toContain("Manage Actions access");
+    expect(body).toContain("3. To start AI-Implement again, reset the AI-Implement status or label on the ticket.");
+    expect(body).toContain(`Failed job (\`implement\`): ${initFailure.htmlUrl}`);
+    expect(body).not.toContain("Needs Human");
+    expect(notifyStuckGiveUp).toHaveBeenCalledWith(
+      "slack",
+      "https://hooks.slack.com/test",
+      expect.objectContaining({ lastRunStatus: "runner_image_pull_failed" }),
+    );
+  });
+
+  it("on Linear the image-pull comment's restart step removes the marker", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedContainerInitJob).mockResolvedValueOnce(initFailure);
+    const provider = makeProvider({ id: "linear" });
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body).toContain("3. To start AI-Implement again, remove the AI-Needs-Human label from the ticket.");
+  });
+
+  it("falls back to 'the resolved runner image' when sessionImage is unset", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedContainerInitJob).mockResolvedValueOnce(initFailure);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob({ sessionImage: null }), "failure");
+    expect(vi.mocked(provider.postComment).mock.calls[0][1]).toContain("The image was the resolved runner image.");
+  });
+
+  it("shows the run URL when the failed job has no name or URL", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedContainerInitJob).mockResolvedValueOnce({ jobName: "unknown", htmlUrl: null });
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body).toContain("Failed job: https://github.com/org/repo/actions/runs/99");
+    expect(body).not.toContain("null");
+  });
+
+  it("skips the jobs lookup on attempt 1 and takes the normal retry", async () => {
+    vi.mocked(getStuckAttempts).mockReturnValue(0);
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    expect(getFailedContainerInitJob).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.postComment).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
+  it("skips the jobs lookup for a runner-reported failure", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    await remediateFailedJob(mockConfig, makeProvider(), ghaJob(), "failure", { runnerReported: true });
+    expect(getFailedContainerInitJob).not.toHaveBeenCalled();
+  });
+
+  it("takes the normal retry when no Initialize containers step failed", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    expect(getFailedContainerInitJob).toHaveBeenCalled();
+    expect(provider.parkForHuman).not.toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+
+  it("takes the normal retry when the jobs lookup throws", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    vi.mocked(getFailedContainerInitJob).mockRejectedValueOnce(new Error("boom"));
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    expect(provider.parkForHuman).not.toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+
+  it.each(["fly-machines", "local-docker"])("skips the jobs lookup for a %s job", async (executionMode) => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(2);
+    await remediateFailedJob(mockConfig, makeProvider(), ghaJob({ executionMode }), "failure");
+    expect(getFailedContainerInitJob).not.toHaveBeenCalled();
   });
 });

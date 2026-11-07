@@ -1257,6 +1257,7 @@ async function handleRunnerResultInternal(
               provider,
               job,
               boundStatusText(input.body.failureReason ?? input.body.failureCode ?? "failure"),
+              { runnerReported: true },
             );
           }
         }

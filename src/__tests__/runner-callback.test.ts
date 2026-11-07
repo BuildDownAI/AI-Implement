@@ -44,6 +44,7 @@ const hoisted = vi.hoisted(() => ({
   >(() => Promise.resolve({ merged: false, state: "open", headRef: "ai-implement/eng-1" })),
   getCommitAuthorType: vi.fn<() => Promise<"Bot" | "User" | null>>(() => Promise.resolve("Bot")),
   postOrUpdateStickyComment: vi.fn<() => Promise<void>>(() => Promise.resolve()),
+  getFailedContainerInitJob: vi.fn<() => Promise<null>>(() => Promise.resolve(null)),
 }));
 
 vi.mock("../github-app-auth.js", async (importOriginal) => {
@@ -58,6 +59,7 @@ vi.mock("../github.js", async (importOriginal) => {
     getPullRequestState: hoisted.getPullRequestState,
     getCommitAuthorType: hoisted.getCommitAuthorType,
     postOrUpdateStickyComment: hoisted.postOrUpdateStickyComment,
+    getFailedContainerInitJob: hoisted.getFailedContainerInitJob,
   };
 });
 
@@ -3654,6 +3656,38 @@ describe("watchdogConfig — remediateFailedJob gating", () => {
     // it must NOT fire when a draft PR is already open.
     const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
     expect(clearCall).toBeUndefined();
+  });
+
+  it("does not look up the failed jobs for a runner-reported failure, even on a repeat attempt", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "t",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    log.updateJobRunId(log.getJobByDispatchId(dispatchId)!.id, 77);
+    log.incrementStuckAttempts("i");
+    hoisted.getFailedContainerInitJob.mockClear();
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "failure", failureReason: "build failed", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      watchdogConfig,
+    });
+
+    expect(hoisted.getFailedContainerInitJob).not.toHaveBeenCalled();
   });
 
   it("skips remediateFailedJob for an INSTALL_FAILED callback carrying prUrl", async () => {

@@ -1,9 +1,9 @@
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import type { Job } from "./log.js";
-import { cancelWorkflowRun, getWorkflowRunStatus } from "./github.js";
-import { incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "./log.js";
+import { cancelWorkflowRun, getWorkflowRunStatus, getFailedContainerInitJob } from "./github.js";
+import { getStuckAttempts, incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
-import { notifyStuckGiveUp } from "./notify.js";
+import { IMAGE_PULL_FAILED_STATUS, notifyStuckGiveUp } from "./notify.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 
@@ -107,9 +107,46 @@ function restartSentence(provider: TicketingProvider | null): string {
     : "To start AI-Implement again, reset the AI-Implement status or label on the ticket.";
 }
 
+/** The attempt from which an image-pull failure stops retrying. */
+const IMAGE_PULL_GIVE_UP_ATTEMPT = 2;
+
+/** The failed-job details kept from the jobs lookup. */
+type ImagePullFailure = { jobName: string; htmlUrl: string | null };
+
+function isImagePullGiveUp(imagePullFailure: ImagePullFailure | undefined, attempts: number): boolean {
+  return imagePullFailure !== undefined && attempts >= IMAGE_PULL_GIVE_UP_ATTEMPT;
+}
+
+/** The give-up comment for a run whose job-container image pull failed. */
+function imagePullCommentLines(
+  job: Job,
+  failure: ImagePullFailure,
+  runUrl: string | null,
+  attempts: number,
+  provider: TicketingProvider | null,
+): string[] {
+  const failedJobUrl = failure.htmlUrl ?? runUrl;
+  const jobLabel = failure.jobName === "unknown" ? "Failed job" : `Failed job (\`${failure.jobName}\`)`;
+  const repo = job.repo || "unknown";
+  const image = job.sessionImage ? `\`${job.sessionImage}\`` : "the resolved runner image";
+  return [
+    `**AI-Implement could not start: GitHub Actions could not pull the runner image**`,
+    ``,
+    `The run failed in the \`Initialize containers\` step for \`${repo}\`. The image was ${image}. AI-Implement tried ${attempts} times. A retry with the same permissions fails again, so AI-Implement stopped.`,
+    ``,
+    `To fix this:`,
+    `1. If the image is a private GHCR package, open the package settings, go to "Manage Actions access", and add \`${repo}\` with the Read role.`,
+    `2. If the image is in a different GitHub organization from the repository, \`GITHUB_TOKEN\` cannot pull it. See "Private images constrain the execution mode" in docs/runner-images.md.`,
+    `3. ${restartSentence(provider)}`,
+    ...(failedJobUrl ? [``, `${jobLabel}: ${failedJobUrl}`] : []),
+  ];
+}
+
 /**
  * Shared ticket-cleanup core: increment the stuck-attempts counter and either
  * requeue (within budget) or give-up (over budget). Returns the updated count.
+ * An image-pull failure gives up from attempt 2: one retry covers a registry
+ * outage, and a denied pull fails the same way every time.
  *
  * Does NOT stop the runner, update job status, or log — all of which vary
  * between the timeout and failure paths and are handled by each caller.
@@ -120,10 +157,12 @@ async function boundedCleanup(
   job: Job,
   runUrl: string | null,
   lastRunStatus: string,
+  imagePullFailure?: ImagePullFailure,
 ): Promise<number> {
   const attempts = incrementStuckAttempts(job.issueId!);
+  const imagePullGiveUp = isImagePullGiveUp(imagePullFailure, attempts);
 
-  if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
+  if (!imagePullGiveUp && attempts <= STUCK_JOB_MAX_ATTEMPTS) {
     if (provider) {
       try {
         const applied = await provider.clearWorkingState(job.issueId!, job.teamKey ?? "", ticketPhase(job));
@@ -166,7 +205,7 @@ async function boundedCleanup(
           repoFullName: job.repo || "unknown",
           runUrl,
           attempts,
-          lastRunStatus,
+          lastRunStatus: imagePullGiveUp ? IMAGE_PULL_FAILED_STATUS : lastRunStatus,
         });
       } catch (err) {
         console.error(
@@ -177,21 +216,23 @@ async function boundedCleanup(
     }
 
     if (provider) {
-      const lines = [
-        `**AI Implementation Stuck — Needs Human**`,
-        ``,
-        `This issue has failed to complete ${attempts} times and has been removed from automated retry.`,
-        ``,
-        `| | |`,
-        `|---|---|`,
-        `| Issue | ${identifier} |`,
-        `| Repo | \`${job.repo || "unknown"}\` |`,
-        `| Attempts | ${attempts} |`,
-        `| Last run status | \`${lastRunStatus}\` |`,
-        ...(runUrl ? [`| Last run | ${runUrl} |`] : []),
-        ``,
-        restartSentence(provider),
-      ];
+      const lines = imagePullGiveUp && imagePullFailure
+        ? imagePullCommentLines(job, imagePullFailure, runUrl, attempts, provider)
+        : [
+          `**AI Implementation Stuck — Needs Human**`,
+          ``,
+          `This issue has failed to complete ${attempts} times and has been removed from automated retry.`,
+          ``,
+          `| | |`,
+          `|---|---|`,
+          `| Issue | ${identifier} |`,
+          `| Repo | \`${job.repo || "unknown"}\` |`,
+          `| Attempts | ${attempts} |`,
+          `| Last run status | \`${lastRunStatus}\` |`,
+          ...(runUrl ? [`| Last run | ${runUrl} |`] : []),
+          ``,
+          restartSentence(provider),
+        ];
       try {
         await provider.postComment(job.issueId!, lines.join("\n"));
       } catch (err) {
@@ -362,6 +403,10 @@ export async function remediateStuckJob(
  * Attempts 1-3: clear AI-Working + dedup so a later poll (or a human re-label)
  * can re-dispatch.
  *
+ * An image-pull failure (a failed `Initialize containers` step on a GitHub Actions job) gives up
+ * from attempt 2 instead: the jobs lookup runs only from attempt 2, and is skipped on attempt 1
+ * and when the runner itself reported the failure (`opts.runnerReported`).
+ *
  * Attempt 4+: park the ticket out of pickup, then clear dedup and reset the
  * counter (only when the park was applied), fire notifyStuckGiveUp, and post
  * a comment. Reuses incrementStuckAttempts so the budget spans both timeouts
@@ -376,6 +421,9 @@ export async function remediateFailedJob(
     /** The `PlanningRun` workflow running the handling for the job it owns. A Legacy monitor leaves
      *  this unset, because it must never re-arm a job that a workflow owns. */
     ownerCall?: boolean;
+    /** The runner started and reported the failure through its callback, so `Initialize containers`
+     *  did not fail and the jobs lookup cannot match. */
+    runnerReported?: boolean;
   },
 ): Promise<void> {
   if (!job.issueId) return;
@@ -398,9 +446,38 @@ export async function remediateFailedJob(
       ? `https://github.com/${job.repo}/actions/runs/${job.runId}`
       : null;
 
-  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
+  // A denied runner-image pull is not transient: give up from the second attempt (see
+  // boundedCleanup). Any lookup error falls through to the normal bounded retry. On attempt 1
+  // the result is unused, so the lookup is skipped (read the count before boundedCleanup
+  // increments it).
+  let imagePullFailure: ImagePullFailure | undefined;
+  if (
+    !opts?.runnerReported &&
+    job.executionMode === "github-actions" &&
+    job.runId &&
+    job.repo &&
+    getStuckAttempts(job.issueId) > 0
+  ) {
+    const [owner, repo] = job.repo.split("/");
+    if (owner && repo) {
+      try {
+        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+        const found = await getFailedContainerInitJob(ghToken, owner, repo, job.runId);
+        if (found) imagePullFailure = { jobName: found.jobName, htmlUrl: found.htmlUrl };
+      } catch (err) {
+        console.warn(`[monitor] Could not inspect jobs for run ${job.runId}:`, err);
+      }
+    }
+  }
 
-  if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus, imagePullFailure);
+
+  if (isImagePullGiveUp(imagePullFailure, attempts)) {
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) could not pull the runner image ` +
+        `(attempt ${attempts}) — giving up, needs human`,
+    );
+  } else if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) failed after ${elapsedMin}m ` +
         `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — clearing for requeue`,

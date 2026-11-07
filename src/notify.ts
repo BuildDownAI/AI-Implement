@@ -125,6 +125,10 @@ const DEPLOY_EVENTS: Record<DeployNotification["kind"], {
   },
 };
 
+/** `lastRunStatus` of a give-up after a runner-image pull failure. */
+export const IMAGE_PULL_FAILED_STATUS = "runner_image_pull_failed";
+const IMAGE_PULL_GIVE_UP_TITLE = "AI Implementation could not pull the runner image \u2014 Needs Human";
+
 export async function notifyStuckGiveUp(
   type: string,
   webhookUrl: string,
@@ -600,7 +604,7 @@ async function notifyStuckGiveUpSlack(
 ): Promise<void> {
   let text = n.fixRun
     ? `:rotating_light: *AI Fix Run Stopped — Needs Human*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`\nLast status: \`${n.lastRunStatus}\`\nNext step: comment \`/ai-implement\` on the pull request${n.prUrl ? ` (${n.prUrl})` : ""} to start a new fix run.`
-    : `:rotating_light: *AI Implementation Stuck — Needs Human*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`${n.attempts != null ? `\nAttempts: ${n.attempts}` : ""}\nLast status: \`${n.lastRunStatus}\``;
+    : `:rotating_light: *${n.lastRunStatus === IMAGE_PULL_FAILED_STATUS ? IMAGE_PULL_GIVE_UP_TITLE : "AI Implementation Stuck — Needs Human"}*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`${n.attempts != null ? `\nAttempts: ${n.attempts}` : ""}\nLast status: \`${n.lastRunStatus}\``;
   if (n.runUrl) {
     text += `\nRun: <${n.runUrl}|View Workflow Run>`;
   }
@@ -653,7 +657,9 @@ async function notifyStuckGiveUpTeams(
               type: "TextBlock",
               text: n.fixRun
                 ? "&#x1F6A8; AI Fix Run Stopped \u2014 Needs Human"
-                : "&#x1F6A8; AI Implementation Stuck \u2014 Needs Human",
+                : n.lastRunStatus === IMAGE_PULL_FAILED_STATUS
+                  ? `&#x1F6A8; ${IMAGE_PULL_GIVE_UP_TITLE}`
+                  : "&#x1F6A8; AI Implementation Stuck \u2014 Needs Human",
               weight: "Bolder",
               size: "Medium",
             },
