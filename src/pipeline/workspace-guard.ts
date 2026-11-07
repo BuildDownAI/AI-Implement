@@ -83,6 +83,8 @@ interface GitignorePin {
   originalContent: Buffer | null;
   /** Content actually on disk right now (post-hook), or null if it does not currently exist. */
   liveContent: Buffer | null;
+  /** Ignored under the pinned pre-hook rules: leave this build-output file alone. */
+  ignoredBeforeHook: boolean;
 }
 
 /**
@@ -96,20 +98,38 @@ interface GitignorePin {
  */
 function pinGitignoreRules(workspaceDir: string, tree: string): GitignorePin[] {
   const treePaths = new Set(listPaths(workspaceDir, ["ls-tree", "-r", "--name-only", "-z", tree]).filter(isGitignorePath));
-  const livePaths = listPaths(workspaceDir, ["ls-files", "-z", "--cached", "--others"]).filter(isGitignorePath);
+  const livePaths = listPaths(workspaceDir, ["ls-files", "-z", "--cached", "--others", "--", ":(glob)**/.gitignore"]).filter(isGitignorePath);
   const allPaths = new Set<string>([...treePaths, ...livePaths]);
   const pins: GitignorePin[] = [];
   for (const path of allPaths) {
     const absPath = resolve(workspaceDir, path);
     const liveContent = existsSync(absPath) ? readFileSync(absPath) : null;
     const originalContent = treePaths.has(path) ? gitBuffer(workspaceDir, ["show", `${tree}:${path}`]) : null;
-    pins.push({ path, absPath, originalContent, liveContent });
+    pins.push({ path, absPath, originalContent, liveContent, ignoredBeforeHook: false });
     if (originalContent !== null) {
       mkdirSync(dirname(absPath), { recursive: true });
       writeFileSync(absPath, originalContent);
     } else if (liveContent !== null) {
       rmSync(absPath, { force: true });
     }
+  }
+  // A .gitignore inside an ignored build directory was deliberately absent from
+  // the snapshot. Classify it only after all publishable rules have been pinned,
+  // so the hook's temporary patterns cannot change whether we preserve it.
+  const absentFromSnapshot = pins.filter((pin) => pin.originalContent === null);
+  if (absentFromSnapshot.length > 0) {
+    const ignored = spawnSync("git", ["check-ignore", "--no-index", "-z", "--stdin"], {
+      cwd: workspaceDir,
+      input: absentFromSnapshot.map((pin) => pin.path).join("\0") + "\0",
+      maxBuffer: 256 * 1024 * 1024,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    if (ignored.error || (ignored.status !== 0 && ignored.status !== 1)) {
+      unpinGitignoreRules(pins);
+      throw new Error("could not classify .gitignore paths under the pre-hook rules");
+    }
+    const ignoredPaths = new Set(ignored.stdout.toString().split("\0"));
+    for (const pin of absentFromSnapshot) pin.ignoredBeforeHook = ignoredPaths.has(pin.path);
   }
   return pins;
 }
@@ -215,7 +235,7 @@ export function restoreWorkspace(snapshot: WorkspaceSnapshot | null): boolean {
     for (const pin of pins) {
       if (buffersEqual(pin.originalContent, pin.liveContent)) continue;
       if (pin.originalContent === null) {
-        if (!created.includes(pin.path)) created.push(pin.path);
+        if (!pin.ignoredBeforeHook && !created.includes(pin.path)) created.push(pin.path);
       } else if (!revert.includes(pin.path)) {
         revert.push(pin.path);
       }

@@ -61,6 +61,27 @@ describe("workspace guard", () => {
     expect(readFileSync(join(dir, ".git", "index")).equals(indexBefore)).toBe(true);
   });
 
+  it("preserves .gitignore files inside ignored build output", () => {
+    mkdirSync(join(dir, "bin"));
+    writeFileSync(join(dir, "bin", ".gitignore"), "local-cache\n");
+    const snap = snapshotWorkspace(dir);
+    writeFileSync(join(dir, "c.txt"), "hook edit\n");
+    expect(restoreWorkspace(snap)).toBe(true);
+    expect(read("bin/.gitignore")).toBe("local-cache\n");
+    expect(read("c.txt")).toBe("c.txt-head\n");
+  });
+
+  it("restores nested ignore rules before removing hook-created files", () => {
+    mkdirSync(join(dir, "src"));
+    writeFileSync(join(dir, "src", ".gitignore"), "cache/\n");
+    const snap = snapshotWorkspace(dir);
+    writeFileSync(join(dir, "src", ".gitignore"), "cache/\ngenerated.ts\n");
+    writeFileSync(join(dir, "src", "generated.ts"), "hook code\n");
+    expect(restoreWorkspace(snap)).toBe(true);
+    expect(read("src/.gitignore")).toBe("cache/\n");
+    expect(existsSync(join(dir, "src", "generated.ts"))).toBe(false);
+  });
+
   it("restores a file the hook modified that the agent had also modified", () => {
     writeFileSync(join(dir, "a.txt"), "A-agent\n");
     const snap = snapshotWorkspace(dir);
