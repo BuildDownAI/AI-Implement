@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
 import { prepareScratchExclusion } from "../pipeline/scratch-exclude.js";
-import { isReviewLedgerFindingGating, postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { EXTERNAL_REVIEW_PENDING_NEXT_STEP, isReviewLedgerFindingGating, postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import type { LLMExecutor, PipelineContextData } from "../pipeline/types.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -356,7 +356,7 @@ describe("postPushReviewStep", () => {
     expect(publicationFetch.calls).toHaveLength(1);
     const bodyArg = submittedReview(ghSpawn);
     expect(bodyArg).toContain("<!-- ai-implement native-review -->");
-    expect(bodyArg).toContain("AI-Implement post-push review approved this PR.");
+    expect(bodyArg).toContain("AI-Implement second review approved this pull request.");
   });
 
   it.each(["503", "network", "stale-head", "no-callback", "no-token", "invalid-url", "401"])("keeps the full status report on %s publication fallback", async (failure) => {
@@ -455,9 +455,9 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("fix-complete") && c.includes("Awaiting follow-up review"))).toBe(true);
     expect(ghComments.some((c) => c.includes("fix-complete") && c.includes("Fix pass 1/1"))).toBe(true);
     expect(ghComments.some((c) => c.includes("fix-complete") && c.includes("Fix pass 1/2"))).toBe(false);
-    expect(ghComments.some((c) => c.includes("⚠️") && c.includes("cap"))).toBe(true);
-    expect(ghComments.some((c) => c.includes("cap") && c.includes("Not ready to merge"))).toBe(true);
-    expect(ghComments.some((c) => c.includes("cap") && c.includes("Blocking issues:\n1. **bug**"))).toBe(true);
+    expect(ghComments.some((c) => c.includes("⚠️") && c.includes("AI-Implement did not approve the change."))).toBe(true);
+    expect(ghComments.some((c) => c.includes("iterations_exhausted") && c.includes("Not ready to merge"))).toBe(true);
+    expect(ghComments.some((c) => c.includes("iterations_exhausted") && c.includes("Blocking issues:\n1. **bug**"))).toBe(true);
     expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
@@ -640,7 +640,7 @@ describe("postPushReviewStep", () => {
       expect(comments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
       const report = submittedReview(gh);
       expect(report).toContain("ran out of its time budget (timeout 90s)");
-      expect([...comments, report].join("\n")).not.toContain("ran out of turns");
+      expect([...comments, report].join("\n")).not.toContain("used all of its permitted steps");
     });
 
     it("keeps the Claude and legacy cap message in turns", async () => {
@@ -657,7 +657,7 @@ describe("postPushReviewStep", () => {
         });
         await runWith(makeCtx(vi.fn(async () => capped), data), 1, {}, gh as any);
         expect(comments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
-        expect(submittedReview(gh)).toMatch(/ran out of turns at the configured cap \(\d+\)/);
+        expect(submittedReview(gh)).toMatch(/used all of its permitted steps \(\d+\)/);
       }
     });
 
@@ -758,7 +758,7 @@ describe("postPushReviewStep", () => {
     expect(publicationsBeforePush).toEqual([1, 2]);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 1/2"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 2/2"))).toBe(true);
-    expect(ghComments.some((c) => approved ? c.includes("✅ Approved (3 iterations)") : c.includes("Reached review cap (3 iterations)"))).toBe(true);
+    expect(ghComments.some((c) => approved ? c.includes("✅ Approved (3 iterations)") : (c.includes("The review examined the change 3 times and found problems each time.") && c.includes("(Code: `iterations_exhausted`)")))).toBe(true);
   });
 
   it("runs a fix pass when reviewer approves but reports actionable issues", async () => {
@@ -1178,7 +1178,9 @@ describe("postPushReviewStep", () => {
         { report: vi.fn(async () => undefined) },
       );
       expect(out.approved).toBe(false);
-      expect(ghComments.some((comment) => comment.includes("automated review is incomplete"))).toBe(true);
+      const selectionFailures = ghComments.filter((comment) => comment.includes("The second review is not complete"));
+      expect(selectionFailures).toHaveLength(1);
+      expect(selectionFailures[0]).toContain("⚠️ The second review could not start.");
     }
   });
 
@@ -1484,7 +1486,7 @@ describe("postPushReviewStep", () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invokeArg(invoke, 0).stage).toBe("post-push-review/branch-advisory-0-domain-review-review-1");
     expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(REVIEW_LINK);
-    expect(submittedReview(ghSpawn)).toContain("Reviewer domain-review (branch advisory) returned no structured_output");
+    expect(submittedReview(ghSpawn)).toContain("The reviewer domain-review (branch advisory) returned no result that AI-Implement can read");
   });
 
   it("does not rerun a branch config preview when prompt and model match the trusted selected config", async () => {
@@ -1521,7 +1523,7 @@ describe("postPushReviewStep", () => {
         terminalStatus: { subtype: "success", isError: false },
         telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
       }),
-      "returned no structured_output",
+      "returned no result that AI-Implement can read",
     ],
     [
       "turn cap",
@@ -1530,7 +1532,7 @@ describe("postPushReviewStep", () => {
         terminalStatus: { subtype: "error_max_turns", isError: true },
         telemetry: { outcome: "max_turns" as const, numTurns: 45, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
       }),
-      "ran out of turns",
+      "used all of its permitted steps",
     ],
     [
       "provider failure",
@@ -1543,7 +1545,7 @@ describe("postPushReviewStep", () => {
         terminalStatus: { subtype: "error", isError: true },
         telemetry: { outcome: "error" as const, numTurns: 1, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
       }),
-      "provider was unavailable",
+      "the AI service was not available",
     ],
   ])("keeps same-id changed branch preview %s advisory when trusted selected config approves", async (_name, branchResult, feedbackText) => {
     const ghComments: string[] = [];
@@ -1783,7 +1785,7 @@ describe("postPushReviewStep", () => {
     expect(reports.find((report) => report.id === "post-push-review.1.reviewer.1.branch.domain-review")?.status).toBe("failed");
     expect(reports.find((report) => report.id === "post-push-review.1")?.outputs.telemetry.costUsd).toBe(0.4);
     expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(REVIEW_LINK);
-    expect(submittedReview(ghSpawn)).toContain("Reviewer domain-review (branch advisory) returned no structured_output");
+    expect(submittedReview(ghSpawn)).toContain("The reviewer domain-review (branch advisory) returned no result that AI-Implement can read");
   });
 
   it("keeps unselected config turn exhaustion advisory without running a fix pass", async () => {
@@ -1819,7 +1821,7 @@ describe("postPushReviewStep", () => {
       "post-push-review/branch-advisory-1-domain-review-review-1",
     ]);
     expect(ghComments.find((comment) => comment.includes("Ready to merge"))).toContain(REVIEW_LINK);
-    expect(submittedReview(ghSpawn)).toContain("domain-review (branch advisory) ran out of turns");
+    expect(submittedReview(ghSpawn)).toContain("domain-review (branch advisory) used all of its permitted steps");
   });
 
   it("fails closed when a selected config reviewer returns invalid output", async () => {
@@ -1847,8 +1849,8 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     expect(out.terminationReason).toBe("invalid_review");
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(ghComments.find((comment) => comment.includes("automated review is incomplete"))).toContain(REVIEW_LINK);
-    expect(submittedReview(ghSpawn)).toContain("Reviewer domain-review returned no structured_output");
+    expect(ghComments.find((comment) => comment.includes("The second review is not complete"))).toContain(REVIEW_LINK);
+    expect(submittedReview(ghSpawn)).toContain("The reviewer domain-review returned no result that AI-Implement can read");
   });
 
   it("fails closed when a selected reviewer returns invalid structured output", async () => {
@@ -1897,7 +1899,7 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).toBe("invalid_review");
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(comments.some((comment) => comment.includes(REVIEW_LINK))).toBe(true);
-    expect(submittedReview(ghSpawn)).toContain("returned no structured_output");
+    expect(submittedReview(ghSpawn)).toContain("returned no result that AI-Implement can read");
   });
 
   it("fails closed when the terminal result is an error even with exit 0", async () => {
@@ -2007,7 +2009,7 @@ describe("postPushReviewStep", () => {
       }),
     }));
     expect(ghComments.some((c) => c.includes("reviewer-turns-exhausted") && c.includes(REVIEW_LINK))).toBe(true);
-    expect(submittedReview(ghSpawn)).toContain("ran out of turns");
+    expect(submittedReview(ghSpawn)).toContain("used all of its permitted steps");
     expect(submittedReview(ghSpawn)).toContain("(30)");
   });
 
@@ -2110,7 +2112,7 @@ describe("postPushReviewStep", () => {
     expect(out.finalFeedback).toContain("Blocking issues from the previous review:");
 
     const exhaustedComment = ghComments.find((c) => c.includes("reviewer-turns-exhausted"));
-    expect(exhaustedComment).toContain("automated review is incomplete");
+    expect(exhaustedComment).toContain("The second review is not complete");
     expect(exhaustedComment).toContain(REVIEW_LINK);
     const exhaustedReview = submittedReview(ghSpawn);
     expect(exhaustedReview).toContain("Blocking issues from the previous review:");
@@ -2202,8 +2204,8 @@ describe("postPushReviewStep", () => {
     expect(out.failure).toEqual(expect.objectContaining({ code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" }));
     // 1 initial + 1 retry (stageRetries=1), then exhausted.
     expect(invoke).toHaveBeenCalledTimes(2);
-    expect(ghComments.some((c) => c.includes(REVIEW_LINK) && c.includes("review is incomplete"))).toBe(true);
-    expect(submittedReview(ghSpawn)).toContain("provider was unavailable");
+    expect(ghComments.some((c) => c.includes(REVIEW_LINK) && c.includes("The second review is not complete"))).toBe(true);
+    expect(submittedReview(ghSpawn)).toContain("the AI service was not available");
     expect(ghComments.every((c) => !c.includes("did not approve"))).toBe(true);
   });
   it("carries the prior iteration's blockers and fix-revision count forward when the provider is unavailable on iteration >= 2 (BAC-27134)", async () => {
@@ -2266,7 +2268,7 @@ describe("postPushReviewStep", () => {
     expect(out.finalFeedback).toContain("Missing null check");
 
     const providerComment = ghComments.find((c) => c.includes("provider-unavailable"));
-    expect(providerComment).toContain("automated review is incomplete");
+    expect(providerComment).toContain("The second review is not complete");
     expect(providerComment).toContain(REVIEW_LINK);
     const providerReview = submittedReview(ghSpawn);
     expect(providerReview).toContain("1 automated fix revision(s) were pushed and not fully re-reviewed.");
@@ -3316,8 +3318,8 @@ describe("postPushReviewStep", () => {
       }),
     }));
     expect(ghComments.some((comment) => comment.includes("review-failed"))).toBe(true);
-    expect(ghComments.some((comment) => comment.includes("review is incomplete"))).toBe(true);
-    expect(ghComments.some((comment) => comment.includes("Manual review required; automated review did not complete"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes("The second review is not complete"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes("Manual review required; the review did not finish"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Not ready to merge until manually reviewed"))).toBe(false);
   });
 
@@ -3346,7 +3348,7 @@ describe("postPushReviewStep", () => {
       id: "post-push-review.1",
       status: "failed",
       outputs: expect.objectContaining({
-        feedback: expect.stringContaining("Reviewer returned no structured_output"),
+        feedback: expect.stringContaining("The reviewer returned no result that AI-Implement can read"),
         issues: [],
         blockingIssues: [],
       }),
@@ -4567,15 +4569,22 @@ describe("postPushReviewStep", () => {
       "post-push-review/gap-analysis-review-1",
       "post-push-review/code-review-review-1",
     ]);
-    expect(reviewCalls.some((call) => call.some((arg) => arg.includes("approved this PR")))).toBe(false);
+    expect(reviewCalls.some((call) => call.some((arg) => arg.includes("approved this pull request")))).toBe(false);
     const submittedReviewBody = submittedReview(ghSpawn);
     expect(submittedReviewBody).toContain("<!-- ai-implement native-review -->");
-    expect(submittedReviewBody).toContain("AI-Implement internal review passed");
+    expect(submittedReviewBody).toContain("AI-Implement second review: the AI-Implement reviewers found no problems");
     expect(submittedReviewBody).toContain("gap-analysis: approved");
     expect(submittedReviewBody).toContain("code-review: approved");
-    expect(ghComments.some((c) => c.includes("did not complete") && c.includes("Manual review required"))).toBe(true);
-    const statusComment = ghComments.find((c) => c.includes("did not complete") && c.includes("Manual review required"));
+    expect(ghComments.some((c) => c.includes("did not finish in the time limit") && c.includes("Manual review required"))).toBe(true);
+    const statusComment = ghComments.find((c) => c.includes("did not finish in the time limit") && c.includes("Manual review required"));
     expect(statusComment).toContain(REVIEW_LINK);
+    expect(statusComment).toContain("The AI-Implement reviewers found no problems. But the external review check did not finish in the time limit. AI-Implement did not approve the change.");
+    expect(statusComment).toContain("**Merge readiness:** Manual review required; the external review check did not finish.");
+    expect(statusComment).toContain("<!-- ai-implement post-push iter=1 external-pending -->");
+    const visible = String(statusComment).replace(/<!--[\s\S]*?-->/g, "");
+    expect(visible).not.toMatch(/post-push|wait budget|auto-approv|re-dispatch/i);
+    expect(out.finalFeedback).toBe(EXTERNAL_REVIEW_PENDING_NEXT_STEP);
+    expect(out.finalFeedback).not.toMatch(/did not approve|external_review_pending/);
   });
 
   it("recognizes 'review' and 'code-review-plugin' check names as the external review gate by default", async () => {
@@ -4720,7 +4729,7 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     // The submitted BODY, not the review event: submitPrReview hard-codes event=COMMENT
     // (GitHub 422s an APPROVE on your own PR), so asserting on the event can never fail.
-    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this PR")))).toBe(false);
+    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this pull request")))).toBe(false);
     expect(f.probes()).toBeGreaterThan(1);   // the condition really did recur
     expect(warnings).toHaveLength(1);        // ...and was reported once, despite differing text
   });
@@ -5044,7 +5053,7 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     // The submitted BODY, not the review event: submitPrReview hard-codes event=COMMENT
     // (GitHub 422s an APPROVE on your own PR), so asserting on the event can never fail.
-    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this PR")))).toBe(false);
+    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this pull request")))).toBe(false);
   });
 
   it("restarts the confirmation when the run set changes between sightings", async () => {
@@ -5073,7 +5082,7 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     // The submitted BODY, not the review event: submitPrReview hard-codes event=COMMENT
     // (GitHub 422s an APPROVE on your own PR), so asserting on the event can never fail.
-    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this PR")))).toBe(false);
+    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this pull request")))).toBe(false);
   });
 
   it("fails open and approves when no external review check exists for the head SHA", async () => {
@@ -5416,11 +5425,11 @@ describe("postPushReviewStep", () => {
       expect(out.approved).toBe(false);
       expect(out.terminationReason).toBe("invalid_review");
       expect(out).not.toHaveProperty("reviewedHeadSha");
-      expect(out.finalFeedback).toContain("finished without a verdict");
+      expect(out.finalFeedback).toContain("AI-Implement cannot read its verdict");
       const comment = ghComments.find((c) => c.includes("invalid-external-review"));
-      expect(comment).toContain("Not auto-approving.");
+      expect(comment).toContain("Manual review required; the external review verdict is not available.");
       expect(comment).not.toContain("late external review");
-      expect(comment).not.toContain("could not be parsed");
+      expect(comment).not.toContain("could not read the findings");
       expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
     }
 
@@ -5605,7 +5614,7 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("✅"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(true);
     // No unavailability note: the clean verdict was parseable
-    expect(ghComments.every((c) => !c.includes("findings could not be parsed"))).toBe(true);
+    expect(ghComments.every((c) => !c.includes("could not read the findings"))).toBe(true);
   });
 
   it("T-2 (KGB-9): internal approval + failing CI check → Not ready to merge, check named", async () => {
@@ -5715,7 +5724,7 @@ describe("postPushReviewStep", () => {
     const approvalComment = ghComments.find((c) => c.includes("invalid-external-review"));
     expect(approvalComment).toBeDefined();
     expect(approvalComment).not.toContain("late external review");
-    expect(approvalComment).toContain("findings could not be parsed");
+    expect(approvalComment).toContain("could not read the findings");
     expect(approvalComment).not.toContain("External review findings are blocking");
   });
 
@@ -7564,7 +7573,7 @@ describe("postPushReviewStep review process gate", () => {
     const blocked = await run(f, { reviewProcess: "ai-implement" });
     expect(blocked.out.approved).toBe(false);
     expect(blocked.out.terminationReason).toBe("invalid_review");
-    expect(f.posted.join("\n")).toContain("Project reviewer selection is empty");
+    expect(f.posted.join("\n")).toContain("The reviewer selection for this project is empty");
   });
 });
 

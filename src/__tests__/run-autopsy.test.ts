@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { formatRunAutopsy, writeRunAutopsy, formatRunStats, type RunAutopsy, type StatsPass } from "../run-autopsy.js";
+import { formatRunAutopsy, writeRunAutopsy, formatRunStats, terminationReasonSentence, type RunAutopsy, type StatsPass } from "../run-autopsy.js";
 import { testDir } from "./helpers/test-dir.js";
 
 const AUTOPSY: RunAutopsy = {
@@ -19,7 +19,7 @@ describe("formatRunAutopsy", () => {
     const md = formatRunAutopsy(AUTOPSY);
     expect(md).toContain("DF-6");
     expect(md).toContain("iterations_exhausted");
-    expect(md).toContain("3 iteration(s)");
+    expect(md).toContain("3 times");
     expect(md).toContain("Missing provider wiring.");
     expect(md).toContain("| 1 | success | 98 | 1 | ≥ $3.21 (partial) | unavailable | rejected |");
     expect(md).toContain("Post-mortem");
@@ -48,6 +48,128 @@ describe("formatRunAutopsy", () => {
     expect(md).not.toContain("Reviewer's final feedback");
   });
 
+  it("labels the per-pass column as the first review", () => {
+    const md = formatRunAutopsy(AUTOPSY);
+    expect(md).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | First review |");
+  });
+
+  it("names the first review in plain words when it stopped the run", () => {
+    const md = formatRunAutopsy(AUTOPSY);
+    expect(md).toContain(
+      "The first review (before the pull request) did not approve the change. The review examined the change 3 times and found problems each time. (Code: `iterations_exhausted`)",
+    );
+    expect(md).not.toContain("second review");
+  });
+
+  describe("a run stopped by the second review", () => {
+    // The first review approved pass 1 and the PR was opened; the second review then timed
+    // out waiting for the external check. The table alone read "approved" under a headline
+    // that said the run ended without review approval.
+    const POST_PUSH_STOP: RunAutopsy = {
+      ...AUTOPSY,
+      terminationReason: "external_review_pending",
+      iterations: 1,
+      passes: [{ iteration: 1, implementTurns: 16, implementOutcome: "success", costUsd: 0.48, reviewApproved: true }],
+      stoppedByPostPushReview: true,
+    };
+
+    it("names the second review and explains the reason code in the headline", () => {
+      const md = formatRunAutopsy(POST_PUSH_STOP);
+      expect(md).toContain(
+        "AI-Implement opened the pull request. Then the second review (on the pull request) stopped the run. It did not approve the change. The external review check did not finish in the time limit. (Code: `external_review_pending`)",
+      );
+      expect(md).not.toContain("first review (before the pull request) did not approve");
+    });
+
+    it("calls the PR open for review, not a draft", () => {
+      const md = formatRunAutopsy(POST_PUSH_STOP);
+      expect(md).toContain("The PR is open and ready for human review: https://github.com/acme/app/pull/9");
+      expect(md).not.toContain("preserved in a draft PR");
+    });
+
+    it("explains why the first-review table reads approved", () => {
+      const md = formatRunAutopsy(POST_PUSH_STOP);
+      expect(md).toContain("| 1 | success | 16 | 1 | ≥ $0.48 (partial) | unavailable | approved |");
+      expect(md).toContain(
+        "_This table shows only the first review. The first review occurs before AI-Implement opens the pull request. It approved pass 1, so AI-Implement opened the pull request. Then the second review examined the pull request._",
+      );
+    });
+
+    it("words a missing Checks permission as an unfinished review an administrator can fix", () => {
+      const md = formatRunAutopsy({ ...POST_PUSH_STOP, terminationReason: "checks_permission_denied" });
+      expect(md).toContain(
+        "🔒 The second review did not finish. The AI-Implement GitHub App cannot read the checks on the pull request. The change is not the cause. An administrator must give the App the \"Checks: read\" permission.",
+      );
+      expect(md).not.toContain("did not approve");
+      expect(md).toContain("The PR is open and ready for human review: https://github.com/acme/app/pull/9");
+    });
+
+    it("keeps the turn-cap headline, and never calls an incomplete review a non-approval", () => {
+      const md = formatRunAutopsy({ ...POST_PUSH_STOP, terminationReason: "reviewer_turns_exhausted", reviewMaxTurns: 30 });
+      expect(md).toContain("A reviewer used all of its permitted steps (30)");
+      expect(md).not.toContain("did not approve");
+      expect(md).toContain("_This table shows only the first review.");
+    });
+  });
+
+  it("says the first review did not examine the last pass when the implementation hit its turn cap", () => {
+    // feedback-loop breaks before the review on max_turns, so the last pass reads "not run".
+    const md = formatRunAutopsy({
+      ...AUTOPSY,
+      terminationReason: "max_turns",
+      iterations: 1,
+      passes: [{ iteration: 1, implementTurns: 50, implementOutcome: "max_turns", costUsd: 2.1, reviewApproved: null }],
+    });
+    expect(md).toContain("The implementation used all of its permitted steps before it finished. Thus the review did not examine the final version of the change. (Code: `max_turns`)");
+    expect(md).toContain("| not run |");
+    expect(md).not.toContain("did not approve");
+    expect(md).toContain("**Run notes:**");
+    expect(md).not.toContain("Reviewer's final feedback");
+  });
+
+  it("names no review stage for a run on an existing PR, and says that PR is unchanged", () => {
+    // A gap-fill has one review, on the open PR, and an unapproved one does not push.
+    const md = formatRunAutopsy({ ...AUTOPSY, prUrl: undefined, existingPrUrl: "https://github.com/acme/app/pull/42" });
+    expect(md).toContain(
+      "The review did not approve the change. The review examined the change 3 times and found problems each time. (Code: `iterations_exhausted`)",
+    );
+    expect(md).toContain("The existing PR is unchanged by this run: https://github.com/acme/app/pull/42");
+    expect(md).not.toContain("No PR could be opened");
+    expect(md).not.toContain("before the pull request");
+    expect(md).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |");
+  });
+
+  it("adds no reason sentence for a code it does not know, and keeps the code", () => {
+    const md = formatRunAutopsy({
+      ...AUTOPSY,
+      terminationReason: "post_push_review_unapproved",
+      iterations: 1,
+      passes: [{ iteration: 1, implementTurns: 16, implementOutcome: "success", costUsd: 0.48, reviewApproved: true }],
+      stoppedByPostPushReview: true,
+    });
+    expect(md).toContain(
+      "Then the second review (on the pull request) stopped the run. It did not approve the change. (Code: `post_push_review_unapproved`)",
+    );
+    expect(md).not.toContain("The run stopped.");
+  });
+
+  it("says nothing about a second review when push opened no PR after a first-review approval", () => {
+    // The second review is skipped without a PR, so the reason is the first review's "approved".
+    const md = formatRunAutopsy({
+      ...AUTOPSY,
+      terminationReason: "approved",
+      prUrl: undefined,
+      passes: [{ iteration: 1, implementTurns: 16, implementOutcome: "success", costUsd: 0.48, reviewApproved: true }],
+    });
+    // The headline already says there is no PR and why; no second line repeats it.
+    expect(md).not.toContain("No PR could be opened");
+    expect(md).not.toContain("second review");
+    expect(md).toContain(
+      "The first review approved the change. AI-Implement did not open a pull request, because the change did not modify any files.",
+    );
+    expect(md).not.toContain("did not approve");
+  });
+
   it("notes when no PR could be opened", () => {
     const md = formatRunAutopsy({ ...AUTOPSY, prUrl: undefined });
     expect(md).toContain("No PR could be opened");
@@ -59,8 +181,8 @@ describe("formatRunAutopsy", () => {
       terminationReason: "reviewer_turns_exhausted",
       reviewMaxTurns: 30,
     });
-    expect(md).toContain("A post-push reviewer reached its configured cap (30) after 3 iteration(s); required review is incomplete.");
-    expect(md).toContain("Other reviewer results are preserved below.");
+    expect(md).toContain("The second review (on the pull request) did not finish. A reviewer used all of its permitted steps (30) after 3 iteration(s).");
+    expect(md).toContain("The results of the other reviewers are below. (Code: `reviewer_turns_exhausted`)");
     expect(md).toContain("The PR is open and ready for human review: https://github.com/acme/app/pull/9");
     expect(md).not.toContain("preserved in a draft PR");
     // Heading reflects that this is carried telemetry/context, not a completed review.
@@ -75,7 +197,7 @@ describe("formatRunAutopsy", () => {
       reviewMaxTurns: 30,
       iterations: 1,
     });
-    expect(md).toContain("required review is incomplete.");
+    expect(md).toContain("The second review (on the pull request) did not finish.");
     expect(md).not.toContain("the code was not reviewed");
     expect(md).not.toContain("the latest revision was not reviewed");
   });
@@ -92,7 +214,7 @@ describe("formatRunAutopsy", () => {
       terminationReason: "reviewer_turns_exhausted",
       reviewMaxTurns: undefined,
     });
-    expect(md).toContain("configured cap (30) after 3 iteration(s)");
+    expect(md).toContain("permitted steps (30) after 3 iteration(s)");
     expect(md).not.toContain("undefined");
   });
 
@@ -110,7 +232,7 @@ describe("formatRunAutopsy", () => {
         evidence: { truncated: false },
       },
     });
-    expect(md).toContain("🟠 The model provider was unavailable during review after 3 iteration(s); the code was not reviewed.");
+    expect(md).toContain("🟠 The AI service was not available during the review, after 3 iteration(s). The code was not reviewed. (Code: `provider_unavailable`)");
     expect(md).toContain("The work so far is preserved in a draft PR: https://github.com/acme/app/pull/9");
     expect(md).not.toContain("did not approve");
     expect(md).not.toContain("without review approval");
@@ -134,7 +256,7 @@ describe("formatRunAutopsy", () => {
         evidence: { truncated: false },
       },
     });
-    expect(md).toContain("The model provider was unavailable during implementation");
+    expect(md).toContain("The AI service was not available during implementation");
     expect(md).toContain("partially implemented");
     expect(md).toContain("preserved in a draft PR");
   });
@@ -154,7 +276,7 @@ describe("formatRunAutopsy", () => {
         evidence: { truncated: false },
       },
     });
-    expect(md).toContain("The model provider was unavailable during implementation");
+    expect(md).toContain("The AI service was not available during implementation");
     expect(md).toContain("not implemented");
     expect(md).not.toContain("partially implemented");
     expect(md).toContain("No PR could be opened");
@@ -174,7 +296,7 @@ describe("formatRunAutopsy", () => {
         evidence: { truncated: false },
       },
     });
-    expect(md).toContain("The model provider was unavailable during post-push review");
+    expect(md).toContain("The AI service was not available during the second review, after 3 iteration(s). The code was not reviewed. (Code: `provider_unavailable`)");
     expect(md).toContain("The PR is open and ready for human review: https://github.com/acme/app/pull/9");
     expect(md).not.toContain("preserved in a draft PR");
   });
@@ -193,6 +315,37 @@ describe("formatRunAutopsy", () => {
 const STAT_PASSES = [
   { iteration: 1, implementTurns: 42, implementOutcome: "success", costUsd: 1.5, reviewApproved: true, attempts: 2 },
 ];
+
+describe("terminationReasonSentence", () => {
+  it("explains each reason code in one plain sentence", () => {
+    expect(terminationReasonSentence("external_review_pending", 1)).toBe("The external review check did not finish in the time limit.");
+    expect(terminationReasonSentence("invalid_review", 1)).toBe("AI-Implement could not read the result of the review.");
+    expect(terminationReasonSentence("review_failed", 1)).toBe("The review stopped because of an error.");
+    expect(terminationReasonSentence("review_error", 1)).toBe("The review stopped because of an error.");
+    expect(terminationReasonSentence("fix_failed", 1)).toBe("AI-Implement could not apply a fix.");
+    expect(terminationReasonSentence("no_changes", 1)).toBe("A fix attempt did not change any files.");
+    expect(terminationReasonSentence("max_turns", 1)).toBe(
+      "The implementation used all of its permitted steps before it finished. Thus the review did not examine the final version of the change.",
+    );
+    expect(terminationReasonSentence("operator_cancelled", 1)).toBe("A person stopped the run.");
+  });
+
+  it("does not count review passes it has no count for", () => {
+    expect(terminationReasonSentence("iterations_exhausted", 0)).toBe(
+      "The review found problems, and the fixes did not correct all of them.",
+    );
+  });
+
+  it("counts the review passes for iterations_exhausted", () => {
+    expect(terminationReasonSentence("iterations_exhausted", 3)).toBe("The review examined the change 3 times and found problems each time.");
+    expect(terminationReasonSentence("iterations_exhausted", 1)).toBe("The review examined the change 1 time and found problems.");
+  });
+
+  it("returns no sentence for a code it does not know", () => {
+    // The headline already says the run stopped; the code tag carries the detail.
+    expect(terminationReasonSentence("something_new", 2)).toBe("");
+  });
+});
 
 describe("formatRunStats", () => {
   it("surfaces a failed implement invocation on an approved pass (TEST-2 shape)", () => {
@@ -221,6 +374,14 @@ describe("formatRunStats", () => {
       filesChanged: null,
     });
     expect(md).toContain("| 1 | success | 42 | 2 | ≥ $1.50 (partial) | unavailable | approved |");
+    expect(md).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | First review |");
+  });
+
+  it("heads the review column plainly on a run that works on an existing PR", () => {
+    // A gap-fill has one review, on the open PR, so "First review" would be wrong.
+    const md = formatRunStats({ issueIdentifier: "AII-1", passes: STAT_PASSES, plannedFiles: [], filesChanged: null, existingPrUrl: "https://github.com/acme/app/pull/42" });
+    expect(md).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |");
+    expect(md).not.toContain("First review");
   });
 
   it("sums implement and in-loop review cost per pass and in the total, not implement cost alone (BAC-27201)", () => {
@@ -552,7 +713,7 @@ describe("control-plane estimates", () => {
   it("renders attributed models without prices", () => {
     expect(stats([pass])).toBe([
       "## Run stats — AII-1", "",
-      "| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |",
+      "| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | First review |",
       "|---|---|---|---|---|---|---|",
       "| 1 | success; a-dated | n/a (native turn count unavailable) | 1 | unavailable | in 1000000 / out 100000 | not run |",
       "", "**Total cost:** unavailable",

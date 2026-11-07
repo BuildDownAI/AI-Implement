@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob } from "../github.js";
+import { describe, it, expect, vi } from "vitest";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -1213,5 +1213,84 @@ describe("getFailedContainerInitJob", () => {
   it("returns null when the request throws", async () => {
     fakeFetch({ [JOBS]: () => { throw new Error("network down"); } }).install();
     expect(await getFailedContainerInitJob("token", "o", "r", 5)).toBeNull();
+  });
+});
+
+describe("getPrReadiness", () => {
+  const PULL = "GET /repos/o/r/pulls/7";
+  const REVIEWS = "GET /repos/o/r/pulls/7/reviews";
+  const pull = (o: Record<string, unknown> = {}): ReplyInit =>
+    ({ json: { state: "open", draft: false, mergeable: true, mergeable_state: "clean", head: { sha: "sha1" }, ...o } });
+  const run = (expected?: string, sleep = vi.fn(async () => {})) => getPrReadiness("tok", "o", "r", 7, expected, { sleep });
+
+  it("clean at the expected head with no changes requested -> ready", async () => {
+    fakeFetch({ [PULL]: pull(), [REVIEWS]: { json: [] } }).install();
+    expect(await run("sha1")).toEqual({ ready: true, reason: "clean", headSha: "sha1", mergeableState: "clean" });
+  });
+
+  it("re-reads a lazily computed mergeable state until it is known", async () => {
+    const sleep = vi.fn(async () => {});
+    const fake = fakeFetch({
+      [PULL]: [pull({ mergeable: null, mergeable_state: "unknown" }), pull()],
+      [REVIEWS]: { json: [] },
+    }).install();
+    expect((await run("sha1", sleep)).ready).toBe(true);
+    expect(fake.calls.filter((c) => c.path === "/repos/o/r/pulls/7")).toHaveLength(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up as unknown after 1 + 3 reads", async () => {
+    const sleep = vi.fn(async () => {});
+    const unknown = pull({ mergeable: null, mergeable_state: "unknown" });
+    fakeFetch({ [PULL]: [unknown, unknown, unknown, unknown] }).install();
+    expect(await run("sha1", sleep)).toMatchObject({ ready: false, reason: "unknown" });
+    expect(sleep).toHaveBeenCalledTimes(3);
+  });
+
+  for (const state of ["dirty", "behind", "blocked", "unstable"]) {
+    it(`${state} -> not ready with that reason, without reading reviews`, async () => {
+      fakeFetch({ [PULL]: pull({ mergeable: state !== "dirty", mergeable_state: state }) }).install();
+      expect(await run("sha1")).toMatchObject({ ready: false, reason: state, mergeableState: state });
+    });
+  }
+
+  it("a latest CHANGES_REQUESTED review -> changes_requested", async () => {
+    fakeFetch({ [PULL]: pull(), [REVIEWS]: { json: [{ user: { id: 1 }, state: "CHANGES_REQUESTED" }] } }).install();
+    expect(await run("sha1")).toMatchObject({ ready: false, reason: "changes_requested" });
+  });
+
+  it("a non-OK PR read -> error", async () => {
+    fakeFetch({ [PULL]: { status: 500, json: {} } }).install();
+    expect(await run("sha1")).toMatchObject({ ready: false, reason: "error" });
+  });
+
+  it("a rejected fetch -> error, never throws", async () => {
+    fakeFetch({ [PULL]: () => { throw new Error("network down"); } }).install();
+    expect(await run("sha1")).toMatchObject({ ready: false, reason: "error" });
+  });
+});
+
+describe("classifyPullReadiness", () => {
+  const base = { state: "open", draft: false, mergeable: true, mergeable_state: "clean", head: { sha: "sha1" } };
+
+  it("closed or merged wins over every other condition", () => {
+    expect(classifyPullReadiness({ ...base, state: "closed", draft: true }, "other").reason).toBe("closed");
+    expect(classifyPullReadiness({ ...base, merged: true }).reason).toBe("closed");
+  });
+
+  it("draft, then a moved head", () => {
+    expect(classifyPullReadiness({ ...base, draft: true }).reason).toBe("draft");
+    expect(classifyPullReadiness(base, "other")).toMatchObject({ ready: false, reason: "head_moved", headSha: "sha1" });
+    expect(classifyPullReadiness(base).ready).toBe(true);
+  });
+
+  it("an unlisted mergeable_state is unrecognized, never dirty or blocked", () => {
+    expect(classifyPullReadiness({ ...base, mergeable_state: "has_hooks" }).reason).toBe("unrecognized");
+    expect(classifyPullReadiness({ ...base, mergeable: false, mergeable_state: undefined }).reason).toBe("unrecognized");
+  });
+
+  it("clean requires mergeable === true", () => {
+    expect(classifyPullReadiness({ ...base, mergeable: false }).ready).toBe(false);
+    expect(classifyPullReadiness({ ...base, mergeable: null }).reason).toBe("unknown");
   });
 });

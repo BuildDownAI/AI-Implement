@@ -4,6 +4,7 @@ import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
+import { recordReviewFinding } from "./review-ledger-store.js";
 import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, reviewContractFindingGates, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings, resolveReviewFixLifecycle } from "./config.js";
 import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
@@ -16,6 +17,9 @@ import { addCommentReaction, listPullRequestFiles, postPrComment } from "./githu
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
 import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
+
+/** The old prefix stays: comments already on open PRs still start with it. */
+const AI_IMPLEMENT_NATIVE_REVIEW_PREFIXES = ["AI-Implement post-push review", "AI-Implement second review"];
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -747,6 +751,20 @@ async function handleReviewCommentWebhook(
     res.end(JSON.stringify({ ignored: true, reason: "advisory_finding" }));
     return;
   }
+  // A human's inline comment is recorded but never starts a run on its own: a reviewer
+  // leaving comments one at a time would otherwise start a fix run per comment. A
+  // "Request changes" review or an `/ai-implement` comment starts the run, and both read
+  // every open finding on the PR, so the recorded comments ride it. This holds for both
+  // lifecycles: the comment is not forwarded to Restate either.
+  if (!isBotAuthor) {
+    // Not upsertReviewFinding: this path skips the delivery-id dedup in
+    // acceptReviewFixWebhookEvent, so a redelivery must not bump the finding's revision.
+    const findingId = recordReviewFinding({ repo: repoFullName, prNumber, ...finding });
+    console.log(`[webhook] Recorded human inline comment on PR #${prNumber} as finding #${findingId}; awaiting a Request changes review or /ai-implement`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ recorded: true, reason: "awaiting_changes_requested", findingId }));
+    return;
+  }
   if (reviewProcess.restate) {
     await forwardReviewFixEvent(res, ingress, input, deliveryId, payload.installation?.id);
     return;
@@ -1125,8 +1143,9 @@ async function handleIssueCommentWebhook(
 }
 
 function isAiImplementNativeReviewBody(body: string): boolean {
-  return body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER) ||
-    body.replace(/\s+/g, " ").trim().startsWith("AI-Implement post-push review");
+  if (body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER)) return true;
+  const normalized = body.replace(/\s+/g, " ").trim();
+  return AI_IMPLEMENT_NATIVE_REVIEW_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 /** Parses an ISO-8601 timestamp to milliseconds since epoch, treating a missing or malformed
@@ -1184,9 +1203,11 @@ function resolveReviewFixEventId(
 /**
  * Gates whether a review-shaped webhook event (a `pull_request_review`, a
  * `pull_request_review_comment`, or a trusted-author `issue_comment`) should enqueue a
- * review-fix run. Human authors always enqueue. A bot's event only enqueues when it
- * describes the PR's current head and no run has been dispatched since — otherwise a
- * bot reviewing its own fix's push starts another run, looping (ADR 027).
+ * review-fix run. Human authors always pass this gate, but the
+ * `pull_request_review_comment` caller then only records a human's comment and does not
+ * enqueue. A bot's event only enqueues when it describes the PR's current head and no run
+ * has been dispatched since — otherwise a bot reviewing its own fix's push starts another
+ * run, looping (ADR 027).
  */
 export function shouldEnqueueReviewEvent(input: {
   authorType: string | undefined;

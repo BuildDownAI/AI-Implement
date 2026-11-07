@@ -32,7 +32,15 @@ export interface StatsPass {
   verifyGuarded?: false;
 }
 
-export const STATS_TABLE_HEADER = "| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |";
+/**
+ * The pass table's review column holds the in-loop review. An initial run has a second review
+ * after it, on the opened PR, so the column is headed "First review"; a run on an existing PR
+ * has one review, headed "Review".
+ */
+export function statsTableHeader(reviewColumn: "First review" | "Review" = "First review"): string {
+  return `| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | ${reviewColumn} |`;
+}
+export const STATS_TABLE_HEADER = statsTableHeader();
 export const STATS_TABLE_DIVIDER = "|---|---|---|---|---|---|---|";
 
 interface CostCell {
@@ -159,6 +167,120 @@ export interface RunAutopsy {
   reviewMaxTurns?: number;
   /** Set only when terminationReason is "provider_unavailable" — names which stage was mid-flight. */
   failure?: FailureRecord;
+  /**
+   * True when the post-push review, which runs on the opened PR, ended the run. `passes` then
+   * describe the in-loop review that ran before the PR was opened, and that review approved.
+   */
+  stoppedByPostPushReview?: boolean;
+  /**
+   * Set when the run worked on an existing PR (a gap-fill): that PR's URL. Such a run has one
+   * review, on that PR, so no stage is named; an unapproved run does not push, so the PR is
+   * unchanged.
+   */
+  existingPrUrl?: string;
+}
+
+/**
+ * Ticket text names the two review stages in plain words, for readers who do not know the
+ * pipeline: the first review is `feedback-loop`'s, before the PR is opened; the
+ * second review is `post-push-review`'s, on the opened PR.
+ */
+export const FIRST_REVIEW = "The first review (before the pull request)";
+export const SECOND_REVIEW = "The second review (on the pull request)";
+export const SECOND_REVIEW_LOWER = "the second review (on the pull request)";
+
+/** An in-loop approval whose push opened no PR ends with the reason "approved". */
+export const APPROVED_WITHOUT_PR =
+  "The first review approved the change. AI-Implement did not open a pull request, because the change did not modify any files.";
+
+// reviewer_turns_exhausted, provider_unavailable and checks_permission_denied have their own
+// wording on every surface, pr_merged ends a run approved, and operator_cancelled re-throws, so
+// their entries here are fallbacks that today's callers never reach.
+const REASON_SENTENCES: Record<string, string> = {
+  external_review_pending: "The external review check did not finish in the time limit.",
+  invalid_review: "AI-Implement could not read the result of the review.",
+  review_failed: "The review stopped because of an error.",
+  review_error: "The review stopped because of an error.",
+  fix_failed: "AI-Implement could not apply a fix.",
+  no_changes: "A fix attempt did not change any files.",
+  reviewer_turns_exhausted: "The review used all of its permitted steps before it finished.",
+  max_turns:
+    "The implementation used all of its permitted steps before it finished. Thus the review did not examine the final version of the change.",
+  provider_unavailable: "The AI service was not available.",
+  operator_cancelled: "A person stopped the run.",
+  checks_permission_denied: "The AI-Implement GitHub App cannot read the checks on the pull request.",
+  pr_merged: "A person merged the pull request during the review.",
+};
+
+/**
+ * One plain sentence for a review stage's termination reason code, or "" for a code it does not
+ * know: the surrounding text already says the run stopped, and the code tag carries the detail.
+ */
+export function terminationReasonSentence(code: string, iterations: number): string {
+  if (code === "iterations_exhausted") {
+    if (iterations < 1) return "The review found problems, and the fixes did not correct all of them.";
+    return iterations === 1
+      ? "The review examined the change 1 time and found problems."
+      : `The review examined the change ${iterations} times and found problems each time.`;
+  }
+  return REASON_SENTENCES[code] ?? "";
+}
+
+/** The raw code, kept at the end of the text so support and searches still find it. */
+export function reasonCodeTag(code: string): string {
+  return `(Code: \`${code}\`)`;
+}
+
+/**
+ * The autopsy's first sentence. Turn-cap, provider-outage and missing-permission stops are an
+ * incomplete review, and an implementation turn cap (max_turns) stops before the review runs,
+ * so none of them is worded as "not approved". Of the rest, name the stage that stopped the
+ * run: the second review on the open PR, or the first review before it.
+ */
+function autopsyHeadline(a: RunAutopsy): string {
+  if (a.terminationReason === "verify_failed") {
+    return `The repository's verify hook still failed after ${a.iterations} iteration(s), so the review did not examine the last pass. ${reasonCodeTag(a.terminationReason)}`;
+  }
+  if (a.terminationReason === "reviewer_turns_exhausted") {
+    return `${SECOND_REVIEW} did not finish. A reviewer used all of its permitted steps (${a.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns}) after ${a.iterations} iteration(s). The results of the other reviewers are below. ${reasonCodeTag(a.terminationReason)}`;
+  }
+  if (a.terminationReason === "provider_unavailable") {
+    const { stageLabel, codeState } = providerUnavailablePhrase(a.failure?.stage, Boolean(a.prUrl));
+    return `🟠 The AI service was not available during ${stageLabel}, after ${a.iterations} iteration(s). The code was ${codeState}. ${reasonCodeTag(a.terminationReason)}`;
+  }
+  if (a.terminationReason === "checks_permission_denied") {
+    return '🔒 The second review did not finish. The AI-Implement GitHub App cannot read the checks on the pull request. The change is not the cause. An administrator must give the App the "Checks: read" permission.';
+  }
+  const reason = [terminationReasonSentence(a.terminationReason, a.iterations), reasonCodeTag(a.terminationReason)]
+    .filter(Boolean)
+    .join(" ");
+  // feedback-loop stops before the review on max_turns, so no review declined anything.
+  if (a.terminationReason === "max_turns") return reason;
+  if (a.stoppedByPostPushReview === true) {
+    return `AI-Implement opened the pull request. Then ${SECOND_REVIEW_LOWER} stopped the run. It did not approve the change. ${reason}`;
+  }
+  if (a.existingPrUrl) return `The review did not approve the change. ${reason}`;
+  if (!a.prUrl && a.terminationReason === "approved") return APPROVED_WITHOUT_PR;
+  return `${FIRST_REVIEW} did not approve the change. ${reason}`;
+}
+
+/**
+ * Where the work is, or "" when the headline already said. A PR the second review ran on, or
+ * reviewed only partly, is open, not a draft.
+ */
+function autopsyPrLine(a: RunAutopsy): string {
+  // A gap-fill push reports no prUrl, and an unapproved gap-fill does not push.
+  if (a.existingPrUrl) return `The existing PR is unchanged by this run: ${a.existingPrUrl}`;
+  if (!a.prUrl) {
+    // APPROVED_WITHOUT_PR already says there is no PR and why.
+    return a.terminationReason === "approved" ? "" : "No PR could be opened (no code changes were produced).";
+  }
+  const open = a.terminationReason === "reviewer_turns_exhausted"
+    || a.stoppedByPostPushReview === true
+    || (a.terminationReason === "provider_unavailable" && a.failure?.stage === "post-push-review");
+  return open
+    ? `The PR is open and ready for human review: ${a.prUrl}`
+    : `The work so far is preserved in a draft PR: ${a.prUrl}`;
 }
 
 /** Markdown autopsy posted to the ticket via the ai-output/comments plumbing. */
@@ -167,26 +289,29 @@ export function formatRunAutopsy(a: RunAutopsy): string {
   const providerUnavailable = a.terminationReason === "provider_unavailable";
   // Not a review verdict: the verify hook still failed after the last pass, so no review ran on it.
   const verifyFailed = a.terminationReason === "verify_failed";
+  const checksPermissionDenied = a.terminationReason === "checks_permission_denied";
   const passRows = a.passes.map(p => formatPassRow(p)).join("\n");
-  const { stageLabel, codeState } = providerUnavailablePhrase(a.failure?.stage, Boolean(a.prUrl));
+  // The table holds the in-loop review, which runs before the PR is opened. When the
+  // post-push review ended the run, that table's last row reads "approved"; name the stage
+  // in the headline and explain the row, rather than leave an "approved" row under a
+  // "without review approval" headline.
+  const stoppedByPostPush = a.stoppedByPostPushReview === true;
+  const lastPass = a.passes.at(-1);
+  const prLine = autopsyPrLine(a);
+  const inLoopTableNote = stoppedByPostPush && lastPass?.reviewApproved === true
+    ? [
+        "",
+        `_This table shows only the first review. The first review occurs before AI-Implement opens the pull request. It approved pass ${lastPass.iteration}, so AI-Implement opened the pull request. Then the second review examined the pull request._`,
+      ]
+    : [];
   return [
     `## 🔎 Run autopsy — ${a.issueIdentifier}`,
     "",
-    reviewerTurnsExhausted
-      ? `A post-push reviewer reached its configured cap (${a.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns}) after ${a.iterations} iteration(s); required review is incomplete. Other reviewer results are preserved below.`
-      : providerUnavailable
-        ? `🟠 The model provider was unavailable during ${stageLabel} after ${a.iterations} iteration(s); the code was ${codeState}.`
-        : verifyFailed
-          ? `The repository's verify hook still failed after ${a.iterations} iteration(s) (reason: \`verify_failed\`), so the review did not examine the last pass.`
-          : `The implementation run ended **without review approval** (reason: \`${a.terminationReason}\`) after ${a.iterations} iteration(s).`,
+    autopsyHeadline(a),
     "",
-    a.prUrl
-      ? reviewerTurnsExhausted || (providerUnavailable && a.failure?.stage === "post-push-review")
-        ? `The PR is open and ready for human review: ${a.prUrl}`
-        : `The work so far is preserved in a draft PR: ${a.prUrl}`
-      : "No PR could be opened (no code changes were produced).",
-    "",
-    providerUnavailable || verifyFailed
+    ...(prLine ? [prLine, ""] : []),
+    // On max_turns the feedback is the implement loop's own message, not a review's.
+    verifyFailed || providerUnavailable || checksPermissionDenied || a.terminationReason === "max_turns"
       ? "**Run notes:**"
       : reviewerTurnsExhausted
         ? "**Reviewer telemetry and carried context:**"
@@ -194,9 +319,10 @@ export function formatRunAutopsy(a: RunAutopsy): string {
     "",
     ...a.finalFeedback.split("\n").map((l) => `> ${l}`),
     "",
-    STATS_TABLE_HEADER,
+    statsTableHeader(a.existingPrUrl ? "Review" : "First review"),
     STATS_TABLE_DIVIDER,
     passRows,
+    ...inLoopTableNote,
     ...(a.postMortem ? ["", a.postMortem] : []),
   ].join("\n");
 }
@@ -218,6 +344,8 @@ export function writeRunAutopsy(workspaceDir: string, a: RunAutopsy): void {
 export interface RunStats {
   modelPrices?: RunModelPrices;
   issueIdentifier: string;
+  /** Set for a run on an existing PR (a gap-fill), as in RunAutopsy: it has one review, so the column is not "First review". */
+  existingPrUrl?: string;
   passes: StatsPass[];
   plannedFiles: string[];
   filesChanged: string[] | null;
@@ -240,7 +368,7 @@ export function formatRunStats(s: RunStats): string {
   const lines: string[] = [
     `## Run stats — ${s.issueIdentifier}`,
     "",
-    STATS_TABLE_HEADER,
+    statsTableHeader(s.existingPrUrl ? "Review" : "First review"),
     STATS_TABLE_DIVIDER,
     passRows,
     ...(s.modelPrices && s.passes.some(p => formatPassCost(p, s.modelPrices).includes("(estimated)"))

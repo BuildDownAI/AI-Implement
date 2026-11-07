@@ -1163,7 +1163,7 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
   });
 
-  it("a redelivered pull_request_review_comment (same x-github-delivery) is a no-op (AII-792)", async () => {
+  it("a redelivered bot pull_request_review_comment (same x-github-delivery) is a no-op (AII-792)", async () => {
     const jobId = appendDispatch({
       issueId: "issue-dup-comment",
       issueIdentifier: "AII-804",
@@ -1178,12 +1178,14 @@ describe("review feedback ingestion", () => {
         html_url: "https://github.com/org/repo/pull/53#discussion_r1",
         path: "src/auth.ts",
         line: 12,
-        user: { login: "a-human", type: "User" },
+        user: { login: "claude[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: new Date(Date.now() + 1_000).toISOString(),
       },
       pull_request: {
         number: 53,
         html_url: "https://github.com/org/repo/pull/53",
-        head: { ref: "ai-implement/aii-804-fix" },
+        head: { ref: "ai-implement/aii-804-fix", sha: "sha-current" },
       },
       repository: { full_name: "org/repo" },
     };
@@ -1206,18 +1208,27 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.listReviewFixEvents(firstResponse.reviewFixId)).toHaveLength(1);
   });
 
-  it("keeps headerless inline comments at different paths distinct even with identical text", async () => {
+  it("keeps headerless bot inline comments at different paths distinct even with identical text", async () => {
     const jobId = appendDispatch({ issueId: "issue-inline-paths", issueIdentifier: "AII-805", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/54");
     const base = {
       action: "created",
-      pull_request: { number: 54, html_url: "https://github.com/org/repo/pull/54", head: { ref: "ai-implement/aii-805-fix" } },
+      pull_request: { number: 54, html_url: "https://github.com/org/repo/pull/54", head: { ref: "ai-implement/aii-805-fix", sha: "sha-current" } },
       repository: { full_name: "org/repo" },
     };
+    // One timestamp for both deliveries, so the path is the only field that differs.
+    const createdAt = new Date(Date.now() + 1_000).toISOString();
     const deliver = async (path: string) => {
       const request = makeRequest(SECRET, "pull_request_review_comment", {
         ...base,
-        comment: { body: "Guard this value.", path, line: 12, user: { login: "a-human", type: "User" }, created_at: "2026-01-01T00:00:00Z" },
+        comment: {
+          body: "Guard this value.",
+          path,
+          line: 12,
+          user: { login: "claude[bot]", type: "Bot" },
+          commit_id: "sha-current",
+          created_at: createdAt,
+        },
       }, undefined, { "x-github-delivery": "" });
       webhook.handleGitHubWebhook(request.req as never, request.res as never, SECRET);
       await request.res.done;
@@ -1347,6 +1358,45 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  // The native review's lead sentence changed from "AI-Implement post-push review …" to
+  // "AI-Implement second review …". Reviews already on open PRs keep the old text, so both
+  // prefixes must still be recognised without the marker.
+  it.each([
+    ["the old prefix", "AI-Implement post-push review found unresolved blockers.", 47],
+    ["the new prefix", "AI-Implement second review: the pull request still has blocking problems.", 48],
+  ])("ignores AI-Implement native request-changes reviews detected by %s alone, with no marker", async (_label, body, prNumber) => {
+    const jobId = appendDispatch({
+      issueId: `issue-self-${prNumber}`,
+      issueIdentifier: `AII-${prNumber}`,
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", `https://github.com/org/repo/pull/${prNumber}`);
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body,
+        html_url: `https://github.com/org/repo/pull/${prNumber}#pullrequestreview-1`,
+        user: { login: "ai-implement[bot]", type: "Bot" },
+      },
+      pull_request: {
+        number: prNumber,
+        html_url: `https://github.com/org/repo/pull/${prNumber}`,
+        head: { ref: `ai-implement/aii-${prNumber}-fix` },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true, reason: "self_review" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", prNumber)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it("ignores malformed review payloads with 200 so GitHub does not retry", async () => {
     const { req, res } = makeRequest(SECRET, "pull_request_review", {
       action: "submitted",
@@ -1371,7 +1421,7 @@ describe("review feedback ingestion", () => {
     });
   });
 
-  it("stores PR review comments as non-blocking context and queues a late fix for matching AI PRs", async () => {
+  it("stores a human PR review comment as non-blocking context without queueing a fix run", async () => {
     const jobId = appendDispatch({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
@@ -1408,7 +1458,8 @@ describe("review feedback ingestion", () => {
         line: 12,
       },
     ]);
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(JSON.parse(res.body)).toMatchObject({ recorded: true, reason: "awaiting_changes_requested" });
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
   it("ignores edited PR review comments so typo fixes do not requeue gap-fill", async () => {
@@ -2113,33 +2164,160 @@ describe("bot review gate integration (AII-745)", () => {
     logSpy.mockRestore();
   });
 
-  it("still enqueues a human's pull_request_review_comment on a stale commit", async () => {
+  it("records a human's inline comment without queueing, then a Request changes review queues one fix run carrying it", async () => {
     const jobId = appendDispatch({ issueId: "issue-52", issueIdentifier: "AII-52", repo: "org/repo" });
     log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/52");
 
-    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+    const pullRequest = {
+      number: 52,
+      html_url: "https://github.com/org/repo/pull/52",
+      head: { ref: "ai-implement/AII-52-fix", sha: "sha-current" },
+    };
+    const human = { login: "a-human", type: "User" };
+
+    for (const [index, body] of ["Still missing a null check here.", "Rename this variable."].entries()) {
+      const comment = makeRequest(SECRET, "pull_request_review_comment", {
+        action: "created",
+        comment: {
+          id: 101 + index,
+          body,
+          html_url: `https://github.com/org/repo/pull/52#discussion_r${101 + index}`,
+          path: "src/x.ts",
+          line: 5 + index,
+          user: human,
+          commit_id: "sha-current",
+          created_at: new Date().toISOString(),
+        },
+        pull_request: pullRequest,
+        repository: { full_name: "org/repo" },
+      });
+      webhook.handleGitHubWebhook(comment.req as never, comment.res as never, SECRET);
+      await comment.res.done;
+
+      expect(comment.res.statusCode).toBe(200);
+      expect(JSON.parse(comment.res.body)).toMatchObject({ recorded: true, reason: "awaiting_changes_requested" });
+    }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 52)).toHaveLength(2);
+
+    const review = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        id: 900,
+        state: "changes_requested",
+        body: "Please address the inline comments.",
+        html_url: "https://github.com/org/repo/pull/52#pullrequestreview-900",
+        user: human,
+        commit_id: "sha-current",
+        submitted_at: new Date().toISOString(),
+      },
+      pull_request: pullRequest,
+      repository: { full_name: "org/repo" },
+    });
+    webhook.handleGitHubWebhook(review.req as never, review.res as never, SECRET);
+    await review.res.done;
+
+    expect(review.res.statusCode).toBe(200);
+    expect(JSON.parse(review.res.body)).toMatchObject({ queued: true });
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 52).map((f) => f.source)).toEqual([
+      "github-review-thread",
+      "github-review-thread",
+      "github-review",
+    ]);
+  });
+
+  it("a redelivered human inline comment does not bump the recorded finding's revision", async () => {
+    const jobId = log.appendLog({ issueId: "issue-58", issueIdentifier: "AII-58", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/58");
+
+    const payload = {
       action: "created",
       comment: {
-        body: "Still missing a null check here.",
-        html_url: "https://github.com/org/repo/pull/52#discussion_r101",
+        id: 158,
+        body: "Guard this value.",
+        path: "src/x.ts",
+        line: 3,
         user: { login: "a-human", type: "User" },
-        commit_id: "sha-old",
-        created_at: new Date().toISOString(),
       },
       pull_request: {
-        number: 52,
-        html_url: "https://github.com/org/repo/pull/52",
-        head: { ref: "ai-implement/aii-52-fix", sha: "sha-current" },
+        number: 58,
+        html_url: "https://github.com/org/repo/pull/58",
+        head: { ref: "ai-implement/AII-58-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    };
+    const headers = { "x-github-delivery": "delivery-human-comment-1" };
+
+    const responses: Array<{ findingId: number }> = [];
+    for (let i = 0; i < 2; i++) {
+      const { req, res } = makeRequest(SECRET, "pull_request_review_comment", payload, undefined, headers);
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+      responses.push(JSON.parse(res.body) as { findingId: number });
+    }
+
+    expect(responses[1].findingId).toBe(responses[0].findingId);
+    expect(reviewStore.getReviewFindingById(responses[0].findingId)?.revision).toBe(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("reopens a resolved finding when a human posts the same inline comment again", async () => {
+    const jobId = log.appendLog({ issueId: "issue-59", issueIdentifier: "AII-59", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/59");
+
+    const deliver = async (commentId: number) => {
+      const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+        action: "created",
+        comment: {
+          id: commentId,
+          body: "Guard this value.",
+          path: "src/x.ts",
+          line: 3,
+          user: { login: "a-human", type: "User" },
+        },
+        pull_request: {
+          number: 59,
+          html_url: "https://github.com/org/repo/pull/59",
+          head: { ref: "ai-implement/AII-59-fix" },
+        },
+        repository: { full_name: "org/repo" },
+      });
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      await res.done;
+      return JSON.parse(res.body) as { findingId: number };
+    };
+
+    const first = await deliver(159);
+    expect(reviewStore.markReviewFindingResolvedIfRevision(first.findingId, 1)).toBe(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 59)).toEqual([]);
+
+    const second = await deliver(160);
+    expect(second.findingId).toBe(first.findingId);
+    expect(reviewStore.getReviewFindingById(first.findingId)).toMatchObject({ status: "open", revision: 2 });
+  });
+
+  it("does not queue a fix run for an inline comment with no author type, treating it as human", async () => {
+    const jobId = log.appendLog({ issueId: "issue-57", issueIdentifier: "AII-57", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/57");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: { body: "Guard this value.", path: "src/x.ts", line: 3 },
+      pull_request: {
+        number: 57,
+        html_url: "https://github.com/org/repo/pull/57",
+        head: { ref: "ai-implement/AII-57-fix" },
       },
       repository: { full_name: "org/repo" },
     });
-
     webhook.handleGitHubWebhook(req as never, res as never, SECRET);
     await res.done;
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(JSON.parse(res.body)).toMatchObject({ recorded: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 57)).toHaveLength(1);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
   it("rejects a bot pull_request_review_comment as run_after_review when a run was dispatched after it", async () => {
@@ -2767,7 +2945,8 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
       payload: {
         action: "created",
         installation: { id: 7 },
-        comment: { id: pr, body, html_url: `https://github.com/org/repo/pull/${pr}#discussion_r${pr}`, path: "a.ts", line: 3, user: { login: "human", type: "User" }, commit_id: commit },
+        // A trusted bot: a human's inline comment is recorded, never forwarded or queued.
+        comment: { id: pr, body, html_url: `https://github.com/org/repo/pull/${pr}#discussion_r${pr}`, path: "a.ts", line: 3, user: { login: "claude[bot]", type: "Bot" }, commit_id: commit, created_at: new Date(Date.now() + 1_000).toISOString() },
         pull_request: pull(pr),
         repository: { full_name: "org/repo" },
       },
@@ -2842,6 +3021,21 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     expect(event.eventId).toBe("gh-delivery:d-abc");
     expect(opts.idempotencyKey).toBe("d-abc");
     expect(reviewStore.listOpenReviewFindings("org/repo", 10)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("records a human's inline comment on a Restate project without forwarding it", async () => {
+    mapRepo("restate");
+    seedDispatch(13);
+    const ingress = fakeIngress();
+    const { event, payload } = payloads.reviewComment!(13, "Please fix this.");
+    (payload as { comment: { user: unknown } }).comment.user = { login: "human", type: "User" };
+    const { req, res } = makeRequest(SECRET, event, payload, undefined, { "x-github-delivery": "d-human" });
+    await webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ recorded: true, reason: "awaiting_changes_requested" });
+    expect(ingress.feedback).not.toHaveBeenCalled();
+    expect(reviewStore.listOpenReviewFindings("org/repo", 13)).toHaveLength(1);
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 

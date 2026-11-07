@@ -52,3 +52,12 @@ We store no per-run head SHA to do this.
   human. Human reviews still enqueue without limit, bounded only by the per-PR budget.
 - The rule depends on `commit_id` and `head.sha` in the webhook payload. A replayed or synthetic
   event without them does not enqueue for a bot author.
+
+## Amendment (2026-11-06)
+
+A human inline comment is recorded, not enqueued. "Human reviews always enqueue" no longer covers a human's `pull_request_review_comment`. Each
+inline comment enqueued its own fix run, so a reviewer leaving comments one at a time started a run
+per comment until the PR budget parked the PR. The webhook now records the comment in the ledger and
+starts no run; a Request changes review or an `/ai-implement` comment starts one run that reads every
+open finding. A human `pull_request_review` (Request changes) still always enqueues. See
+[review-fix-rail.md](../review-fix-rail.md#a-human-inline-comment-is-recorded-not-enqueued).

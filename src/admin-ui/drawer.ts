@@ -137,7 +137,7 @@ export const drawerScript = `
     if (failure.code === 'REVIEWER_TURNS_EXHAUSTED') {
       return {
         title: 'Review incomplete',
-        detail: 'The post-push reviewer ran out of turns before reaching a verdict.',
+        detail: 'The second review (on the pull request) did not finish. A reviewer used all of its permitted steps.',
         cause: 'reviewer turn limit',
         limit: failure.reviewMaxTurns,
         reviewer: reviewerNameFromFailure(failure),
@@ -148,8 +148,8 @@ export const drawerScript = `
     if (failure.code === 'PROVIDER_UNAVAILABLE' && (!failure.stage || String(failure.stage).includes('review'))) {
       return {
         title: 'Review incomplete',
-        detail: 'The model provider was unavailable during automated review.',
-        cause: 'provider unavailable',
+        detail: 'The AI service was not available during the review.',
+        cause: 'AI service not available',
         limit: failure.reviewMaxTurns,
         reviewer: reviewerNameFromFailure(failure),
         failureDetails: failure.message || null,
@@ -304,7 +304,7 @@ export const drawerScript = `
       { label: 'Queued', detail: 'queued in ticketing system' },
       { label: 'Planning', detail: 'claude-plan.yml' },
       { label: 'Implementing', detail: job.executionMode ? window.esc(job.executionMode) + ' run' : 'implementation run' },
-      { label: 'Review', detail: reviewIncompleteInfo(job, steps) ? 'post-push review incomplete' : (job.status === 'review_failed' ? 'post-push review needs attention' : (latestRunningStep && latestRunningStep.stepId === 'post-push-review' ? 'post-push review running' : (job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR'))) },
+      { label: 'Review', detail: reviewIncompleteInfo(job, steps) ? 'second review incomplete' : (job.status === 'review_failed' ? 'second review needs attention' : (latestRunningStep && latestRunningStep.stepId === 'post-push-review' ? 'second review running' : (job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR'))) },
       { label: 'Done', detail: 'merged' }
     ];
 

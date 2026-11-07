@@ -397,7 +397,7 @@ export async function runFeedbackLoop(
             code: "PROVIDER_UNAVAILABLE",
             // Exhausted the stage-retry budget: this record is terminal, matching the
             // convention push.ts's GIT_PUSH_RETRIES_EXHAUSTED states — an orchestrator
-            // rail keying off `retryable` must not re-dispatch a run that already spent
+            // rail keying off `retryable` must not start a run again that already spent
             // its whole stage-retry budget.
             retryable: false,
           };
@@ -426,7 +426,7 @@ export async function runFeedbackLoop(
 
     if (implementProviderUnavailable) {
       terminationReason = "provider_unavailable";
-      feedback = `Model provider was unavailable during implementation after ${implementStageAttempt} attempt(s); partial changes were preserved. ${implementProviderUnavailable.message}`;
+      feedback = `Tried ${implementStageAttempt} time(s); partial changes were kept. ${implementProviderUnavailable.message}`;
       failureForOutputs = implementProviderUnavailable;
       passes.push({
         implementFallbackFrom: fallbackOrigins.implementation,
@@ -680,7 +680,7 @@ export async function runFeedbackLoop(
           // Terminal: the stage-retry budget is spent (matches push.ts's
           // GIT_PUSH_RETRIES_EXHAUSTED convention) — never retryable.
           failureForOutputs = { ...reviewFailure, stage: "review", code: "PROVIDER_UNAVAILABLE", retryable: false };
-          feedback = `Model provider was unavailable during review after ${reviewStageAttempt} attempt(s). ${reviewFailure.message}`;
+          feedback = `Tried ${reviewStageAttempt} time(s). ${reviewFailure.message}`;
         } else {
           effects.warn(
             `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,

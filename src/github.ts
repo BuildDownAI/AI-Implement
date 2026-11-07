@@ -1498,6 +1498,86 @@ export async function hasChangesRequestedReview(
   return [...latest.values()].includes("CHANGES_REQUESTED");
 }
 
+export type PrReadinessReason =
+  | "clean" | "closed" | "draft" | "head_moved" | "dirty" | "behind" | "blocked" | "unstable"
+  | "unknown" | "unrecognized" | "changes_requested" | "error";
+
+export interface PrReadiness {
+  ready: boolean;
+  reason: PrReadinessReason;
+  headSha: string | null;
+  mergeableState: string | null;
+}
+
+/** The fields of a `GET /pulls/{n}` response that readiness reads. */
+export interface PullReadinessFields {
+  state?: string;
+  draft?: boolean;
+  merged?: boolean;
+  mergeable?: boolean | null;
+  mergeable_state?: string;
+  head?: { sha?: string };
+}
+
+/**
+ * The one rule for "GitHub reports this PR clean to merge at this head": open, not a draft,
+ * head equal to `expectedHeadSha` when given, `mergeable === true` and `mergeable_state === "clean"`.
+ * Pure; reviews are not read here. Shared by child auto-merge (via `getPrReadiness`) and the
+ * review-fix merge policy (`src/review-fix-github-adapter.ts`).
+ */
+export function classifyPullReadiness(pr: PullReadinessFields, expectedHeadSha?: string): PrReadiness {
+  const headSha = pr.head?.sha ?? null;
+  const mergeableState = pr.mergeable_state ?? null;
+  const result = (ready: boolean, reason: PrReadinessReason): PrReadiness => ({ ready, reason, headSha, mergeableState });
+  if (pr.state !== "open" || pr.merged) return result(false, "closed");
+  if (pr.draft) return result(false, "draft");
+  if (expectedHeadSha && headSha !== expectedHeadSha) return result(false, "head_moved");
+  if (pr.mergeable === null || pr.mergeable === undefined || mergeableState === "unknown") return result(false, "unknown");
+  if (mergeableState !== "clean" || pr.mergeable !== true) {
+    const known: PrReadinessReason[] = ["dirty", "behind", "blocked", "unstable"];
+    return result(false, known.find((k) => k === mergeableState) ?? "unrecognized");
+  }
+  return result(true, "clean");
+}
+
+export interface PrReadinessOpts {
+  sleep?: (ms: number) => Promise<void>;
+  retries?: number;
+  intervalMs?: number;
+}
+
+/**
+ * Whether GitHub reports the PR clean to merge at `expectedHeadSha` (see `classifyPullReadiness`),
+ * with no reviewer's latest review `CHANGES_REQUESTED`. `mergeable` is computed lazily, so an
+ * unknown state is re-read a few times before giving up (the caller's next tick tries again).
+ * Never throws; a failed read is `reason: "error"`.
+ */
+export async function getPrReadiness(
+  token: string, owner: string, repo: string, prNumber: number,
+  expectedHeadSha?: string, opts: PrReadinessOpts = {},
+): Promise<PrReadiness> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const retries = opts.retries ?? 3;
+  const intervalMs = opts.intervalMs ?? 2000;
+  const failed: PrReadiness = { ready: false, reason: "error", headSha: null, mergeableState: null };
+  try {
+    let verdict: PrReadiness = failed;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+        { headers: ghHeaders(token), signal: defaultFetchSignal() });
+      if (!res.ok) return failed;
+      verdict = classifyPullReadiness((await res.json()) as PullReadinessFields, expectedHeadSha);
+      if (verdict.reason !== "unknown") break;
+      if (attempt < retries) await sleep(intervalMs);
+    }
+    if (!verdict.ready) return verdict;
+    if (await hasChangesRequestedReview(token, owner, repo, prNumber)) return { ...verdict, ready: false, reason: "changes_requested" };
+    return verdict;
+  } catch {
+    return failed;
+  }
+}
+
 export async function mergePullRequest(
   token: string, owner: string, repo: string, prNumber: number, sha: string,
   method: "merge" | "squash" | "rebase",
