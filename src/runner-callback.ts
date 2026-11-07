@@ -341,7 +341,7 @@ export function boundStatusText(text: string): string {
  * When the runner reports a known `failureCode`, makes use of the helper's structured description so the ticket reader has actionable context.
  * Passes along the raw `failureReason` string for all other failures.
  *
- * SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED, MAX_TURNS_EXHAUSTED and INSTALL_FAILED are not
+ * SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED, MAX_TURNS_EXHAUSTED, VERIFY_FAILED and INSTALL_FAILED are not
  * part of the BAC-27111 failure taxonomy (they are guardrail/policy outcomes, not classified
  * failures), so they are checked first and keep their existing wording regardless of `failure`.
  * The stage-retry rail's REVIEWER_TURNS_EXHAUSTED and PROVIDER_UNAVAILABLE codes, by
@@ -423,6 +423,29 @@ export function formatFailureComment(
           // Provider-neutral: this comment serves every ticketing provider.
           "3. To start AI-Implement again, reset the AI-Implement status or label on the ticket.",
         ].join("\n"),
+      docsUrl: TROUBLESHOOTING_URL,
+    };
+  } else if (failureCode === "VERIFY_FAILED") {
+    // Not a review verdict: the repo's verify hook still failed after the last implement pass,
+    // so the review never ran on it. failureReason carries the exit code and the output tail.
+    const gapFill = isInitialRun === false;
+    c = {
+      summary: gapFill
+        ? "🟡 The verify hook failed, so AI-Implement discarded the new change."
+        : "🟡 Implementation finished, but the repository's verify hook still failed.",
+      detail: [
+        // A gap-fill push reports no prUrl, and an unapproved gap-fill does not push.
+        gapFill
+          ? "The existing PR is unchanged by this run."
+          : prUrl
+            ? `The work is in a draft PR: ${prUrl}`
+            : "No PR could be opened (no code changes were produced).",
+        failureReason ?? "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      remediation:
+        "Read the hook output above: the build or check in the `verify` script failed. Fix the cause by hand or add context to the ticket, then re-dispatch.",
       docsUrl: TROUBLESHOOTING_URL,
     };
   } else if (failureCode === "INSTALL_FAILED") {
@@ -1279,7 +1302,7 @@ async function handleRunnerResultInternal(
             updateJobPrUrl(job.id, input.body.prUrl);
           }
           // Skip bounded cleanup for coded failures that already pushed a draft PR
-          // (REVIEW_UNAPPROVED / MAX_TURNS_EXHAUSTED): clearing AI-Working + dedup
+          // (REVIEW_UNAPPROVED / MAX_TURNS_EXHAUSTED / VERIFY_FAILED): clearing AI-Working + dedup
           // would re-queue an issue that already has an open draft PR, contradicting
           // the "leave for human" intent. Mirror the Fly/local monitor's isDraftPr guard.
           if (input.watchdogConfig && !input.body.prUrl) {

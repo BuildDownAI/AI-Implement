@@ -27,6 +27,12 @@ describe.skipIf(isWindows)("setupStep", () => {
 });
 
 describe.skipIf(isWindows)("verifyStep", () => {
+  it("is a no-op when scriptPath is missing", async () => {
+    await expect(
+      verifyStep.run(makeContext(), { workspaceDir: dir }, new NoopStepReporter()),
+    ).resolves.toEqual({ ran: false, skipped: true });
+  });
+
   it("throws when the verify script fails", async () => {
     writeFileSync(join(dir, "v.sh"), "exit 2\n");
     await expect(

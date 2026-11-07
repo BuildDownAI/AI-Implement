@@ -26,6 +26,10 @@ export interface StatsPass {
   attribution?: InvocationAttributionV1;
   implementFallbackFrom?: string;
   reviewFallbackFrom?: string;
+  /** Set when the verify hook ran after this pass; non-zero means the review was skipped. */
+  verifyExitCode?: number;
+  /** `false` when the verify hook ran unguarded (workspace snapshot or restore failed). */
+  verifyGuarded?: false;
 }
 
 /**
@@ -141,7 +145,10 @@ export function formatTokensCell(p: StatsPass): string {
 }
 
 export function formatPassRow(p: StatsPass, prices?: RunModelPrices): string {
-  const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
+  const reviewBase = p.reviewApproved == null
+    ? p.verifyExitCode ? `not run (verify hook exit ${p.verifyExitCode})` : "not run"
+    : p.reviewApproved ? "approved" : "rejected";
+  const review = p.verifyGuarded === false ? `${reviewBase} (verify hook ran unguarded)` : reviewBase;
   const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
   const model = (attribution: InvocationAttributionV1 | undefined, from?: string) => attribution
     ? `; ${attribution.model.replace(/\|/g, "\\|")}${from ? ` (fallback from ${from.replace(/\|/g, "\\|")})` : ""}` : "";
@@ -231,6 +238,9 @@ export function reasonCodeTag(code: string): string {
  * run: the second review on the open PR, or the first review before it.
  */
 function autopsyHeadline(a: RunAutopsy): string {
+  if (a.terminationReason === "verify_failed") {
+    return `The repository's verify hook still failed after ${a.iterations} iteration(s), so the review did not examine the last pass. ${reasonCodeTag(a.terminationReason)}`;
+  }
   if (a.terminationReason === "reviewer_turns_exhausted") {
     return `${SECOND_REVIEW} did not finish. A reviewer used all of its permitted steps (${a.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns}) after ${a.iterations} iteration(s). The results of the other reviewers are below. ${reasonCodeTag(a.terminationReason)}`;
   }
@@ -277,6 +287,8 @@ function autopsyPrLine(a: RunAutopsy): string {
 export function formatRunAutopsy(a: RunAutopsy): string {
   const reviewerTurnsExhausted = a.terminationReason === "reviewer_turns_exhausted";
   const providerUnavailable = a.terminationReason === "provider_unavailable";
+  // Not a review verdict: the verify hook still failed after the last pass, so no review ran on it.
+  const verifyFailed = a.terminationReason === "verify_failed";
   const checksPermissionDenied = a.terminationReason === "checks_permission_denied";
   const passRows = a.passes.map(p => formatPassRow(p)).join("\n");
   // The table holds the in-loop review, which runs before the PR is opened. When the
@@ -299,7 +311,7 @@ export function formatRunAutopsy(a: RunAutopsy): string {
     "",
     ...(prLine ? [prLine, ""] : []),
     // On max_turns the feedback is the implement loop's own message, not a review's.
-    providerUnavailable || checksPermissionDenied || a.terminationReason === "max_turns"
+    verifyFailed || providerUnavailable || checksPermissionDenied || a.terminationReason === "max_turns"
       ? "**Run notes:**"
       : reviewerTurnsExhausted
         ? "**Reviewer telemetry and carried context:**"

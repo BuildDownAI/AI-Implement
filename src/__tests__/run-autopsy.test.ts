@@ -26,6 +26,28 @@ describe("formatRunAutopsy", () => {
     expect(md).toContain("https://github.com/acme/app/pull/9");
   });
 
+  it("marks a pass whose verify hook ran unguarded", () => {
+    const base = AUTOPSY.passes[0];
+    const md = formatRunAutopsy({ ...AUTOPSY, passes: [{ ...base, verifyGuarded: false }, { ...base, iteration: 2 }] });
+    expect(md).toContain("| 1 | success | 98 | 1 | ≥ $3.21 (partial) | unavailable | rejected (verify hook ran unguarded) |");
+    expect(md).toContain("| 2 | success | 98 | 1 | ≥ $3.21 (partial) | unavailable | rejected |");
+  });
+
+  it("words a verify_failed run as a failing hook, not a review rejection", () => {
+    const md = formatRunAutopsy({
+      ...AUTOPSY,
+      terminationReason: "verify_failed",
+      iterations: 2,
+      finalFeedback: "The verify hook failed with exit code 3.",
+      passes: [{ iteration: 2, implementTurns: 12, implementOutcome: "success", costUsd: 0.5, reviewApproved: null, verifyExitCode: 3 }],
+    });
+    expect(md).toContain("The repository's verify hook still failed after 2 iteration(s)");
+    expect(md).toContain("| not run (verify hook exit 3) |");
+    expect(md).toContain("**Run notes:**");
+    expect(md).not.toContain("without review approval");
+    expect(md).not.toContain("Reviewer's final feedback");
+  });
+
   it("labels the per-pass column as the first review", () => {
     const md = formatRunAutopsy(AUTOPSY);
     expect(md).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | First review |");

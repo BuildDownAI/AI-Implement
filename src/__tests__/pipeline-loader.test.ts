@@ -530,33 +530,83 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.scriptPath).toBe("scripts/setup.sh");
   });
 
-  it("skips verify when no verify hook, or when feedback-loop not approved", () => {
+  it("runs a custom/steps/verify override after push; skips without one", async () => {
+    const load = (existsSyncImpl: (p: string) => boolean, importFn: (u: string) => Promise<unknown> = async () => ({ default: {} })) =>
+      loadPipelineDefinition("pipelines/autonomous.yml", {
+        customRoot: "/ws",
+        bakedRoot: "/baked",
+        existsSyncImpl,
+        importFn,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      }).steps.find((s) => s.id === "verify")!;
+    const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctx.setOutputs("feedback-loop", { approved: true });
+
+    expect(await load(() => false).skip?.(ctx)).toBe("verify hook runs inside feedback-loop");
+    expect(await load((p) => p === "/ws/custom/steps/verify.ts").skip?.(ctx)).toBe(false);
+    // Image-baked override resolves through the same search roots.
+    expect(await load((p) => p === "/baked/custom/steps/verify.js").skip?.(ctx)).toBe(false);
+    // A custom file with no default export is not an override (resolveModuleImport ignores it).
+    expect(await load((p) => p === "/ws/custom/steps/verify.ts", async () => ({ named: 1 })).skip?.(ctx)).toBe(
+      "verify hook runs inside feedback-loop",
+    );
+  });
+
+  it("post-push verify passes an override no scriptPath", () => {
+    const step = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    }).steps.find((s) => s.id === "verify")!;
+    const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.scriptPath).toBeUndefined();
+    expect(ctx.data.hooks?.verify).toBe("scripts/verify.sh");
+  });
+
+  it("post-push verify keeps its old guards ahead of the override check", async () => {
+    const step = loadPipelineDefinition("pipelines/autonomous.yml", {
+      customRoot: "/ws",
+      existsSyncImpl: (p) => p === "/ws/custom/steps/verify.ts",
+      importFn: async () => ({ default: {} }),
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    }).steps.find((s) => s.id === "verify")!;
+
+    const noHook = makeContext();
+    noHook.setOutputs("feedback-loop", { approved: true });
+    expect(await step.skip?.(noHook)).toBeTruthy();
+
+    const unapproved = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    unapproved.setOutputs("feedback-loop", { approved: false });
+    expect(await step.skip?.(unapproved)).toBeTruthy();
+
+    const depsMissing = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    depsMissing.setOutputs("feedback-loop", { approved: true });
+    depsMissing.setOutputs("install", { installFailed: true });
+    depsMissing.setOutputs("install-retry", { installFailed: true });
+    expect(await step.skip?.(depsMissing)).toBeTruthy();
+  });
+
+  it("skips the post-push verify step without an override; the hook runs inside feedback-loop", async () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
       readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
     });
-
     const step = pipeline.steps.find((s) => s.id === "verify")!;
+    const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctx.setOutputs("feedback-loop", { approved: true });
+    expect(await step.skip?.(ctx)).toBe("verify hook runs inside feedback-loop");
 
-    // No hook -> skip even if approved.
-    const ctxNoHook = makeContext();
-    ctxNoHook.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
-    expect(step.skip?.(ctxNoHook)).toBe(true);
-
-    // Hook present but loop not approved -> skip.
-    const ctxNotApproved = makeContext({ hooks: { verify: "scripts/verify.sh" } });
-    ctxNotApproved.setOutputs("feedback-loop", makeFeedbackLoopOutputs({ approved: false }));
-    expect(step.skip?.(ctxNotApproved)).toBe(true);
-
-    // Hook present and approved -> run, with scriptPath wired.
-    const ctxRun = makeContext({ hooks: { verify: "scripts/verify.sh" } });
-    ctxRun.setOutputs("clone", { workspaceDir: "/tmp/repo" });
-    ctxRun.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
-    expect(step.skip?.(ctxRun)).toBe(false);
-    const inputs = ctxRun.resolveInputs(step.inputs);
-    expect(inputs.workspaceDir).toBe("/tmp/repo");
-    expect(inputs.scriptPath).toBe("scripts/verify.sh");
+    // The hook path is handed to the feedback loop instead.
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    const flInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "feedback-loop")!.inputs);
+    expect(flInputs.verifyScriptPath).toBe("scripts/verify.sh");
+    const noHook = makeContext();
+    noHook.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    expect(noHook.resolveInputs(pipeline.steps.find((s) => s.id === "feedback-loop")!.inputs).verifyScriptPath).toBeUndefined();
   });
+
 
   it("custom pipeline with extra step is used by the pipeline runner", async () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
@@ -760,7 +810,7 @@ describe("loadPipelineDefinition", () => {
       }
     }
 
-    it("row: install ok, approved -> preflight/verify run, post-push-review as today, draft=false", () => {
+    it("row: install ok, approved -> preflight/verify run, post-push-review as today, draft=false", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: false });
@@ -768,13 +818,13 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(false);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("verify hook runs inside feedback-loop");
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(false);
       const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
       expect(pushInputs.draft).toBe(false);
     });
 
-    it("row: install ok, unapproved -> preflight/verify/post-push-review skip, draft=true", () => {
+    it("row: install ok, unapproved -> preflight/verify/post-push-review skip, draft=true", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: false });
@@ -782,13 +832,13 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("feedback loop did not approve");
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
       const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
       expect(pushInputs.draft).toBe(true);
     });
 
-    it("row: install skipped (no package.json), approved -> preflight/verify run, draft=false", () => {
+    it("row: install skipped (no package.json), approved -> preflight/verify run, draft=false", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       ctx.setOutputs("install", { installFailed: false, installMethod: "skipped: no package.json" });
@@ -796,13 +846,13 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(false);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("verify hook runs inside feedback-loop");
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(false);
       const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
       expect(pushInputs.draft).toBe(false);
     });
 
-    it("row: install failed, retry ok, approved -> preflight/verify run, draft=false", () => {
+    it("row: install failed, retry ok, approved -> preflight/verify run, draft=false", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: false });
@@ -810,13 +860,13 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(false);
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(false);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("verify hook runs inside feedback-loop");
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(false);
       const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
       expect(pushInputs.draft).toBe(false);
     });
 
-    it("row: install failed, retry ok, unapproved -> preflight/verify/post-push-review skip, draft=true", () => {
+    it("row: install failed, retry ok, unapproved -> preflight/verify/post-push-review skip, draft=true", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: false });
@@ -824,13 +874,13 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("feedback loop did not approve");
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
       const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
       expect(pushInputs.draft).toBe(true);
     });
 
-    it("row: both install attempts failed, approved -> preflight skips with reason string, verify/post-push-review skip, draft=true", () => {
+    it("row: both install attempts failed, approved -> preflight skips with reason string, verify/post-push-review skip, draft=true", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
@@ -838,13 +888,13 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe("dependency install failed");
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("dependencies missing");
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
       const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
       expect(pushInputs.draft).toBe(true);
     });
 
-    it("row: both install attempts failed, unapproved -> preflight/verify/post-push-review skip (not the reason string), draft=true", () => {
+    it("row: both install attempts failed, unapproved -> preflight/verify/post-push-review skip (not the reason string), draft=true", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
@@ -852,7 +902,7 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 1 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe(true);
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("feedback loop did not approve");
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);
       const pushInputs = ctx.resolveInputs(pipeline.steps.find((s) => s.id === "push")!.inputs);
       expect(pushInputs.draft).toBe(true);
@@ -868,7 +918,7 @@ describe("loadPipelineDefinition", () => {
       expect(push.skip?.(ctx)).toBe(false);
     });
 
-    it("gap-fill run: preflight/verify/post-push-review still skip when dependencies are missing", () => {
+    it("gap-fill run: preflight/verify/post-push-review still skip when dependencies are missing", async () => {
       const pipeline = buildPipeline();
       const ctx = makeContext({ prNumber: "42", hooks: { verify: "scripts/verify.sh" } });
       setInstallOutputs(ctx, { installFailed: true, retryFailed: true });
@@ -876,7 +926,7 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("push", { branchPushed: true, prNumber: 42 });
 
       expect(pipeline.steps.find((s) => s.id === "preflight")!.skip?.(ctx)).toBe("dependency install failed");
-      expect(pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe(true);
+      expect(await pipeline.steps.find((s) => s.id === "verify")!.skip?.(ctx)).toBe("dependencies missing");
       // Gap-fill runs always skip post-push-review (existing prNumber check), independent
       // of dependenciesMissing.
       expect(pipeline.steps.find((s) => s.id === "post-push-review")!.skip?.(ctx)).toBe(true);

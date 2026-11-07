@@ -622,6 +622,7 @@ function buildPullRequestBody(
   // A provider outage is not a review verdict — the reviewer may never have run, so this
   // fallback must not claim the review loop rejected the change (BAC-27201).
   const providerUnavailableForTestsSummary = inputs.reviewSummary?.terminationReason === "provider_unavailable";
+  const verifyFailedForTestsSummary = inputs.reviewSummary?.terminationReason === "verify_failed";
   // A failed install (after the retry) is a more specific reason than a review rejection —
   // preflight/verify never ran either way, but the install failure is the actual cause.
   const testsSummary = dependenciesFailed
@@ -633,7 +634,9 @@ function buildPullRequestBody(
       (inputs.reviewSummary
         ? providerUnavailableForTestsSummary
           ? "Automated verification was skipped — the AI service was not available and the run was interrupted."
-          : "Automated verification was skipped — the review loop did not approve this change."
+          : verifyFailedForTestsSummary
+            ? "Automated verification ran and failed — the repository's verify hook did not pass."
+            : "Automated verification was skipped — the review loop did not approve this change."
         : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
   const testsSummaryChecked = dependenciesFailed ? false : explicitTestsSummary != null || !inputs.reviewSummary;
 
@@ -706,14 +709,20 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
   // A provider outage is not a review verdict: the reviewer may never have run, so the
   // heading, the sentence and the feedback label must not claim it rejected anything.
   const providerUnavailable = summary.terminationReason === "provider_unavailable";
+  // A failing verify hook is not a review verdict either: the review never examined the last pass.
+  const verifyFailed = summary.terminationReason === "verify_failed";
   return [
-    providerUnavailable ? "## 🟠 The AI service was not available during this run" : "## ⚠️ Automated review did not approve",
+    verifyFailed
+      ? "## ⚠️ The verify hook failed"
+      : providerUnavailable ? "## 🟠 The AI service was not available during this run" : "## ⚠️ Automated review did not approve",
     "",
-    providerUnavailable
+    verifyFailed
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the repository's verify hook still failed after ${summary.iterations} iteration(s); the review did not examine the last pass.`
+      : providerUnavailable
       ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI service was not available and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
       : `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
     "",
-    providerUnavailable ? "**Run notes:**" : "**Reviewer's final feedback:**",
+    verifyFailed ? "**Verify hook result:**" : providerUnavailable ? "**Run notes:**" : "**Reviewer's final feedback:**",
     "",
     ...summary.finalFeedback.split("\n").map((l) => `> ${l}`),
     "",
@@ -724,7 +733,8 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
     passRows,
     ...(summary.postMortem ? ["", "<details><summary><strong>Post-mortem</strong></summary>", "", summary.postMortem, "", "</details>"] : []),
     "",
-    providerUnavailable ? "_Preflight and verify hooks were skipped because the run was interrupted._" : "_Preflight and verify hooks were skipped for this unapproved run._",
+    // The verify hook runs inside the feedback loop, so only preflight is skipped here.
+    providerUnavailable ? "_Preflight was skipped because the run was interrupted._" : "_Preflight was skipped for this unapproved run._",
   ].join("\n");
 }
 

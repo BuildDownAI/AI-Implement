@@ -600,7 +600,7 @@ export interface StepDefinition {
   moduleId?: string;
   inputs?: Record<string, unknown> | ((context: PipelineContext) => Record<string, unknown>);
   /** Return `false`/falsy to run the step. A truthy string is logged as the skip reason; bare `true` gets a generic fallback. */
-  skip?: (context: PipelineContext) => boolean | string;
+  skip?: (context: PipelineContext) => boolean | string | Promise<boolean | string>;
 }
 
 export interface PipelineDefinition {

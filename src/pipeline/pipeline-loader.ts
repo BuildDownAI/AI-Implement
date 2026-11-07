@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
-import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
+import { hasResolvableCustomModule, resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
 import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./steps/kg-tracker-data.js";
 import { skillAgentsForSnapshot } from "./steps/install-skills.js";
@@ -34,6 +34,8 @@ interface YamlPipeline {
 export interface LoadPipelineOptions extends ResolveModuleOptions {
   /** Injectable fs.readFileSync for testing. */
   readFileSyncImpl?: (path: string, encoding: "utf-8") => string;
+  /** Injectable import function for the custom-override check (testing). Receives a file:// URL. */
+  importFn?: (url: string) => Promise<unknown>;
 }
 
 function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
@@ -134,7 +136,7 @@ export function shouldSkipPostPushReview(ctx: PipelineContext): boolean {
  * Standard input wiring for the autonomous pipeline steps. Applied by step ID
  * so the YAML only needs to declare IDs, types, and optional moduleIds.
  */
-function applyWiring(step: YamlStep): StepDefinition {
+function applyWiring(step: YamlStep, options?: LoadPipelineOptions): StepDefinition {
   switch (step.id) {
     case "clone":
       return {
@@ -244,6 +246,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             maxIterations: ctx.data.maxIterations,
             reviewRubric: ctx.data.reviewRubric,
             installFailed: installOutputs.installFailed === true,
+            verifyScriptPath: ctx.data.hooks?.verify,
             installMethod:
               typeof installOutputs.installMethod === "string" ? installOutputs.installMethod : undefined,
             installError:
@@ -326,12 +329,21 @@ function applyWiring(step: YamlStep): StepDefinition {
         ...step,
         inputs: (ctx: PipelineContext) => ({
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
-          scriptPath: ctx.data.hooks?.verify,
         }),
-        skip: (ctx: PipelineContext) => {
-          if (!ctx.data.hooks?.verify) return true;
-          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
-          return dependenciesMissing(ctx);
+        // The built-in hook runs inside feedback-loop (after each implement pass, before its
+        // review). This step skips, in order: (1) no `verify:` hook, (2) the loop did not
+        // approve, (3) dependencies missing, (4) no `custom/steps/verify.ts` override.
+        // `runner.ts` evaluates `skip` before it loads the module, so an override only runs
+        // when all four pass: it then runs after push. No `scriptPath` is passed, because the
+        // loop already ran the hook; an override that wants it again reads
+        // `context.data.hooks.verify` itself. The built-in `steps/verify.ts` stays registered
+        // as the fallback module for that path.
+        skip: async (ctx: PipelineContext) => {
+          if (!ctx.data.hooks?.verify) return "no verify hook configured";
+          if (ctx.getOutputs("feedback-loop").approved !== true) return "feedback loop did not approve";
+          if (dependenciesMissing(ctx)) return "dependencies missing";
+          // Same rule as resolveModuleImport: a custom file with no default export is no override.
+          return (await hasResolvableCustomModule("steps/verify", options)) ? false : "verify hook runs inside feedback-loop";
         },
       };
 
@@ -534,6 +546,6 @@ export function loadPipelineDefinition(
   const parsed = parseYamlPipeline(raw, resolvedPath);
   return {
     id: parsed.id,
-    steps: parsed.steps.map(applyWiring),
+    steps: parsed.steps.map((s) => applyWiring(s, options)),
   };
 }

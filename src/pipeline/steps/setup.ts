@@ -16,7 +16,7 @@ export const setupStep: StepModule<SetupInputs, SetupOutputs> = {
     inputs: SetupInputs,
     _reporter: StepReporter,
   ): Promise<SetupOutputs> {
-    const result = runHookScript("setup", inputs.scriptPath, inputs.workspaceDir);
+    const result = await runHookScript("setup", inputs.scriptPath, inputs.workspaceDir);
     if (result.exitCode !== 0) {
       throw new Error(`setup hook failed with exit code ${result.exitCode}`);
     }

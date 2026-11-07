@@ -47,6 +47,15 @@ export interface CycleVerdict {
 
 export type CycleOutputCommitStatus = "committed" | "pending_push" | "not_applicable";
 
+export interface CycleVerifyHook {
+  ran: boolean;
+  exitCode: number | null;
+  durationMs: number;
+  /** `false` when the workspace snapshot or restore failed, so hook output could have shipped.
+   *  Absent when the guard worked. */
+  guarded?: boolean;
+}
+
 export interface CycleSummary {
   /** Stable per-cycle identity (e.g. "feedback-loop.2", "post-push-review.fix-1"). Writing the
    *  same id again with identical content is an idempotent no-op; writing it again with
@@ -64,6 +73,8 @@ export interface CycleSummary {
   tests: CycleTestResult[];
   verdict: CycleVerdict;
   usage: CycleUsage;
+  /** The pass's `verify` hook run. Absent when no hook was configured or it did not run. */
+  verifyHook?: CycleVerifyHook;
   /** True when any field below was capped (verdict summary redaction/cap, or the whole-record
    *  byte limit below). */
   truncated: boolean;
@@ -171,6 +182,12 @@ export function isCycleSummary(value: unknown): value is CycleSummary {
   if (!isRecord(value.usage)) return false;
   for (const field of [value.usage.tokensIn, value.usage.tokensOut, value.usage.costUsd]) {
     if (field !== null && (typeof field !== "number" || !Number.isFinite(field))) return false;
+  }
+  if (value.verifyHook !== undefined) {
+    const h = value.verifyHook;
+    if (!isRecord(h) || typeof h.ran !== "boolean" || !Number.isFinite(h.durationMs)
+      || (h.exitCode !== null && !Number.isSafeInteger(h.exitCode))
+      || (h.guarded !== undefined && typeof h.guarded !== "boolean")) return false;
   }
   if (value.attribution !== undefined && sanitizeAttribution(value.attribution) === null) return false;
   if (typeof value.truncated !== "boolean" || typeof value.limitReached !== "boolean") return false;
@@ -396,6 +413,7 @@ export function writeCycleSummary(
       ...(verdictSummary !== undefined ? { summary: verdictSummary } : {}),
     },
     usage: input.usage,
+    ...(input.verifyHook ? { verifyHook: input.verifyHook } : {}),
     truncated,
     limitReached: false,
     completedAt,

@@ -12,6 +12,9 @@ import { normalizeRetryPolicy } from "../retry-backoff.js";
 import { writeCycleSummary } from "../cycle-summary.js";
 import { runFeedbackLoop, splitPlanningContext, type FeedbackLoopOutputs, type PassStat, type TerminationReason } from "../feedback-loop-core.js";
 import { DEFAULT_MODEL } from "../default-model.js";
+import { hookOutputTail, runHookScript } from "./hooks.js";
+import { neutralizeFences } from "../../completion-classification.js";
+import { restoreWorkspace, snapshotWorkspace } from "../workspace-guard.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 
@@ -45,6 +48,9 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   sleep?: (ms: number) => Promise<void>;
   /** True when the first install attempt failed (`install` step output). */
   installFailed?: boolean;
+  /** `hooks.verify` script path. When set (and the install succeeded), the hook runs after every
+   *  implement pass that ends normally, before that pass's review. */
+  verifyScriptPath?: string;
   /** The install command that failed (`install` step output). */
   installMethod?: string;
   /** Redacted tail of the failed install's output (`install` step output). */
@@ -358,6 +364,12 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       tenantModel ??
       DEFAULT_MODEL;
 
+    const verifyScriptPath =
+      typeof inputs.verifyScriptPath === "string" && inputs.verifyScriptPath ? inputs.verifyScriptPath : undefined;
+    // The loop only knows the first install result (install-retry runs after it); a failed first
+    // install skips the hook, as `dependenciesMissing` skipped the old post-push step.
+    const verifyEnabled = verifyScriptPath !== undefined && inputs.installFailed !== true;
+
     const rawPlanningContext =
       inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined;
     const workspaceDir = String(inputs.workspaceDir);
@@ -387,6 +399,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         retryPolicy: normalizeRetryPolicy(context.data.retryPolicy),
         runStartHead,
         parentStepId,
+        verifyEnabled,
       },
       {
         implement: (args) =>
@@ -443,6 +456,38 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         sleep,
         now: () => new Date().toISOString(),
         warn: (message) => console.warn(message),
+        ...(verifyScriptPath
+          ? {
+              runVerifyHook: async () => {
+                const hookStarted = Date.now();
+                let exitCode: number;
+                let hookOutput: string;
+                let hookSecrets: string[] | undefined;
+                // The hook runs before push, which stages with `git add -A`: whatever it changes in
+                // the tree would ship. Snapshot first and restore after, pass or fail.
+                const workspaceSnapshot = snapshotWorkspace(workspaceDir);
+                let guarded = workspaceSnapshot !== null;
+                try {
+                  const result = await runHookScript("verify", verifyScriptPath, workspaceDir);
+                  exitCode = result.exitCode;
+                  hookOutput = result.output;
+                  hookSecrets = result.secrets;
+                } catch (err) {
+                  // A missing script or spawn failure is a hook failure the agent can act on, not a crash.
+                  exitCode = 1;
+                  hookOutput = String(err instanceof Error ? err.message : err);
+                } finally {
+                  if (!restoreWorkspace(workspaceSnapshot)) guarded = false;
+                }
+                return {
+                  exitCode,
+                  output: neutralizeFences(hookOutputTail(hookOutput, hookSecrets)),
+                  guarded,
+                  durationMs: Date.now() - hookStarted,
+                };
+              },
+            }
+          : {}),
       },
     );
     const feedback = result.finalFeedback;

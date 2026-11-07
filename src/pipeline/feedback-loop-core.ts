@@ -3,7 +3,7 @@ import type { ReferenceRepoResult } from "../reference-repos.js";
 import { wrapWithPlanningGuard } from "../planning-context-assembly.js";
 import { classifyThrown, type FailureRecord } from "./failure-classification.js";
 import { computeBackoffMs, type RetryPolicy } from "./retry-backoff.js";
-import { inferTestResults, sumUsage, toolTraceLines, type CycleSummaryInput } from "./cycle-summary.js";
+import { inferTestResults, sumUsage, toolTraceLines, type CycleSummaryInput, type CycleVerifyHook } from "./cycle-summary.js";
 
 /**
  * Control flow of the implement/review loop, extracted from `feedbackLoopStep`
@@ -64,7 +64,8 @@ export type TerminationReason =
   | "iterations_exhausted"
   | "review_error"
   | "max_turns"
-  | "provider_unavailable";
+  | "provider_unavailable"
+  | "verify_failed";
 
 export interface PassStat extends Record<string, unknown> {
   iteration: number;
@@ -90,6 +91,10 @@ export interface PassStat extends Record<string, unknown> {
   attribution?: InvocationAttributionV1;
   implementFallbackFrom?: string;
   reviewFallbackFrom?: string;
+  /** Exit code of the `verify` hook run after this pass; absent when the hook did not run. */
+  verifyExitCode?: number;
+  /** `false` when the verify hook ran with the workspace guard failed (snapshot or restore); absent otherwise. */
+  verifyGuarded?: false;
 }
 
 export interface FeedbackLoopOutputs extends Record<string, unknown> {
@@ -126,6 +131,8 @@ function buildImplementPrompt(
   installFailed?: boolean,
   installMethod?: string,
   installError?: string,
+  verifyFailure?: string,
+  verifyHookConfigured?: boolean,
 ): string {
   const basePrompt =
     implementationPrompt && implementationPrompt.trim()
@@ -139,6 +146,14 @@ function buildImplementPrompt(
   // its own defects.
   if (installFailed) {
     prompt += `\n\n## Dependency install failed\n\n\`${installMethod ?? "install"}\` failed in this workspace, so \`node_modules\` is missing or incomplete:\n\n\`\`\`\n${installError ?? ""}\n\`\`\`\n\nBuild, test, lint, and typecheck commands will not work until this is resolved.\nDo not treat their failure as a defect in the code you are asked to change. If the\ndependency problem is within the scope of this issue, fixing it is in scope. The\npipeline runs the install again after you finish. Otherwise work from source and\nsay so in your summary.`;
+  }
+
+  if (verifyHookConfigured) {
+    prompt += `\n\n## Verify hook\n\nAfter each pass the pipeline runs this repo's verify hook (build and checks) and sends you its output if it fails. You do not need to repeat full builds in a loop; you can still run a build when you want to.`;
+  }
+
+  if (verifyFailure) {
+    prompt += `\n\n## Verify hook failed\n\n${verifyFailure}\n\nFix the cause of this failure. The pipeline runs the hook again after your pass.`;
   }
 
   if (reviewFeedback || reviewIssues.length > 0) {
@@ -183,6 +198,13 @@ export interface LoopEffects {
   /** ISO timestamp. */
   now(): string;
   warn(message: string): void;
+  /**
+   * Runs the repo's `verify` hook with the workspace guarded (snapshot before, restore after),
+   * so the hook cannot change what ships. A missing script or spawn failure resolves to a
+   * non-zero `exitCode` rather than throwing. `output` is the redacted tail of the hook's output,
+   * already safe to embed in a fenced block. Required when `params.verifyEnabled` is true.
+   */
+  runVerifyHook?(): Promise<{ exitCode: number; output: string; guarded: boolean; durationMs: number }>;
 }
 
 export interface FeedbackLoopCoreParams {
@@ -205,6 +227,9 @@ export interface FeedbackLoopCoreParams {
   /** HEAD at the start of the run; recorded as each cycle summary's input commit. */
   runStartHead: string;
   parentStepId: string;
+  /** True when a `verify` hook is configured and the first install succeeded: the hook runs after
+   *  every implement pass that ends normally, before that pass's review (`effects.runVerifyHook`). */
+  verifyEnabled?: boolean;
 }
 
 export async function runFeedbackLoop(
@@ -226,6 +251,9 @@ export async function runFeedbackLoop(
   // so the ticket-facing total can agree with the report card (BAC-27201).
   let extraCostUsd: number | null = null;
   let extraCostUnreported = 0;
+  // Verify-hook failure from the previous pass, shown to the next implement pass; cleared by a passing hook.
+  let verifyFailure: string | undefined;
+  const verifyEnabled = params.verifyEnabled === true && effects.runVerifyHook !== undefined;
 
   const rawPlanningContext = params.planningContext;
   const { acceptanceBar, mapSection } = splitPlanningContext(rawPlanningContext ?? "");
@@ -255,6 +283,8 @@ export async function runFeedbackLoop(
       params.installFailed === true,
       params.installMethod,
       params.installError,
+      verifyFailure,
+      verifyEnabled,
     );
 
     // --- implement sub-step (stage-level retry on a transient failure, BAC-27134) ---
@@ -491,6 +521,35 @@ export async function runFeedbackLoop(
       break;
     }
 
+    // --- verify hook: runs after every pass that ended normally, before that pass's review ---
+    let verifyHook: CycleVerifyHook | undefined;
+    verifyFailure = undefined;
+    if (verifyEnabled && effects.runVerifyHook) {
+      const hookResult = await effects.runVerifyHook();
+      const exitCode = hookResult.exitCode;
+      verifyHook = { ran: true, exitCode, durationMs: hookResult.durationMs, ...(hookResult.guarded ? {} : { guarded: false }) };
+      if (!hookResult.guarded) pass.verifyGuarded = false;
+      pass.verifyExitCode = exitCode;
+      if (exitCode !== 0) {
+        verifyFailure = `The verify hook failed with exit code ${exitCode}. Last part of its output:\n\n\`\`\`\n${hookResult.output}\n\`\`\``;
+        terminationReason = "verify_failed";
+        effects.writeCycleSummary({
+          id: `feedback-loop.${iteration}`,
+          stage: "feedback-loop",
+          cycle: iteration,
+          inputCommit: params.runStartHead,
+          outputCommit: null,
+          outputCommitStatus: "pending_push",
+          dispositions: [],
+          tests: inferTestResults(toolTraceLines(implementTelemetry), undefined, implementTelemetry?.executedCommands),
+          verdict: { approved: null, reason: "verify_failed", summary: verifyFailure },
+          usage: sumUsage(implementTelemetry),
+          verifyHook,
+        });
+        continue;
+      }
+    }
+
     // --- review sub-step (stage-level retry on a transient failure, BAC-27134) ---
     const reviewRubric = params.reviewRubric;
     let reviewStageAttempt = 0;
@@ -542,7 +601,8 @@ export async function runFeedbackLoop(
         pass.reviewFallbackFrom = fallbackOrigins.review;
         pass.reviewTelemetry = reviewOutputs.telemetry;
         pass.reviewCostUsd = reviewOutputs.telemetry?.costUsd ?? null;
-        if (approved) terminationReason = "approved";
+        // Reset, not just set on approval: an earlier pass may have ended verify_failed.
+        terminationReason = approved ? "approved" : "iterations_exhausted";
         effects.writeCycleSummary({
           id: `feedback-loop.${iteration}`,
           stage: "feedback-loop",
@@ -561,6 +621,7 @@ export async function runFeedbackLoop(
               : reviewOutputs.feedback,
           },
           usage: sumUsage(implementTelemetry, reviewOutputs.telemetry),
+          ...(verifyHook ? { verifyHook } : {}),
         });
         break;
       } catch (err) {
@@ -638,6 +699,7 @@ export async function runFeedbackLoop(
           tests: inferTestResults(toolTraceLines(implementTelemetry), undefined, implementTelemetry?.executedCommands),
           verdict: { approved: null, reason: terminationReason, summary: feedback },
           usage: sumUsage(implementTelemetry, reviewErrTelemetry),
+          ...(verifyHook ? { verifyHook } : {}),
         });
         break;
       }
@@ -646,16 +708,19 @@ export async function runFeedbackLoop(
     if (reviewStageFailed) break;
   }
 
+  // A run that ends on a failing hook reports the hook's output, not the last review's feedback.
+  const finalFeedback = terminationReason === "verify_failed" && verifyFailure ? verifyFailure : feedback;
+
   if (!approved) {
     effects.warn(
-      `[feedback-loop] exited without approval (${terminationReason}) after ${iteration}/${params.maxIterations} iteration(s). Final feedback: ${feedback || "(none)"}`,
+      `[feedback-loop] exited without approval (${terminationReason}) after ${iteration}/${params.maxIterations} iteration(s). Final feedback: ${finalFeedback || "(none)"}`,
     );
   }
 
   return {
     approved,
     iterations: iteration,
-    finalFeedback: feedback,
+    finalFeedback,
     terminationReason,
     passes,
     extraCostUsd,

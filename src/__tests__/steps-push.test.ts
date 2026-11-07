@@ -999,6 +999,98 @@ describe("pushStep draft PRs", () => {
     vi.clearAllMocks();
   });
 
+  it("verify_failed PR body names the hook and carries the output", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        draft: true,
+        reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "verify_failed", finalFeedback: "The verify hook failed with exit code 3." },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("The verify hook failed");
+    expect(body.body).toContain("exit code 3");
+    expect(body.body).not.toContain("Automated review did not approve");
+  });
+
+  it("verify_failed pass table shows the verify hook exit code in the review column", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          terminationReason: "verify_failed",
+          finalFeedback: "The verify hook failed with exit code 3.",
+          passes: [{ ...REVIEW_SUMMARY.passes[0], reviewApproved: null, verifyExitCode: 3 }],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("not run (verify hook exit 3)");
+  });
+
+  it("marks a pass whose verify hook ran unguarded, and leaves a guarded pass unchanged", async () => {
+    const render = async (pass: Record<string, unknown>) => {
+      mockGitSuccess("abc123");
+      const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+      await pushStep.run(
+        makeContext(),
+        {
+          ...BASE_INPUTS,
+          draft: true,
+          reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "verify_failed", finalFeedback: "x", passes: [{ ...REVIEW_SUMMARY.passes[0], reviewApproved: null, verifyExitCode: 3, ...pass }] },
+        },
+        new NoopStepReporter(),
+      );
+      return prRequest(fake).body;
+    };
+    const unguarded = await render({ verifyGuarded: false });
+    expect(unguarded).toContain("not run (verify hook exit 3) (verify hook ran unguarded)");
+    const guarded = await render({});
+    expect(guarded).toContain("not run (verify hook exit 3) |");
+    expect(guarded).not.toContain("unguarded");
+  });
+
+  it("verify_failed Test plan line says the hook ran and failed, not that verification was skipped", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "verify_failed", finalFeedback: "The verify hook failed with exit code 2." } },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("Automated verification ran and failed — the repository's verify hook did not pass.");
+    expect(body.body).not.toContain("the review loop did not approve this change");
+  });
+
+  it("review-reason PR body does not claim the verify hook was skipped", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(makeContext(), { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY }, new NoopStepReporter());
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("Automated review did not approve");
+    expect(body.body).toContain("Preflight was skipped for this unapproved run.");
+    expect(body.body).not.toMatch(/verify hooks? (was|were) skipped/i);
+  });
+
   it("creates a draft PR with an unapproved section in the body", async () => {
     mockGitSuccess("abc123");
     const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();

@@ -51,8 +51,14 @@ model: claude-sonnet-5-5
                to Claude and all subsequent steps. Only the simple `VAR=value` form
                is supported; GitHub Actions' heredoc multiline syntax (`VAR<<EOF`) is
                NOT — such lines are ignored with a warning.
-    verify     Path to a shell script that runs AFTER Claude, only on success.
-               Use this to run tests or smoke checks.
+    verify     Path to a shell script that runs after each implement pass, before
+               that pass's review. A non-zero exit sends its output back to the agent
+               as feedback (the pass counts as one iteration). Keep it fast: it runs
+               up to Max Iterations times. Use it for the build and smoke checks.
+               Changes the script makes to tracked or non-ignored files are reverted
+               after it runs; only `.gitignore`d build output stays. Env changes are
+               not reverted: a `KEY=value` line the script writes to "$GITHUB_ENV"
+               changes the env of the next implement pass.
     teardown   Path to a shell script that runs AFTER Claude, even on failure.
                Use this to stop containers or clean up resources.
 
