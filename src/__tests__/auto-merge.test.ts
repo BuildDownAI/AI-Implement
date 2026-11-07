@@ -6,6 +6,7 @@ import type * as LogModule from "../log.js";
 import type * as AutoMergeModule from "../auto-merge.js";
 import type * as LedgerModule from "../review-ledger-store.js";
 import type { RepoMapping } from "../config.js";
+import type { PrReadiness, PrReadinessReason } from "../github.js";
 import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -14,8 +15,7 @@ vi.mock("../github-app-auth.js", () => ({
 }));
 vi.mock("../github.js", () => ({
   listOpenPullRequests: vi.fn(),
-  getCombinedChecksState: vi.fn(),
-  hasChangesRequestedReview: vi.fn(),
+  getPrReadiness: vi.fn(),
   mergePullRequest: vi.fn(),
   mergeBranch: vi.fn(),
   listCheckRuns: vi.fn(),
@@ -27,13 +27,17 @@ vi.mock("../comment-gapfill-queue.js", () => ({
   enqueueConflictResolution: vi.fn(),
 }));
 
-import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest, mergeBranch, listCheckRuns, getCommitTime } from "../github.js";
+import { listOpenPullRequests, getPrReadiness, mergePullRequest, mergeBranch, listCheckRuns, getCommitTime } from "../github.js";
 import { hasPendingConflictResolution, countConflictAttempts, enqueueConflictResolution } from "../comment-gapfill-queue.js";
 
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let autoMerge: typeof AutoMergeModule;
 let ledger: typeof LedgerModule;
+
+const READY: PrReadiness = { ready: true, reason: "clean", headSha: "sha5", mergeableState: "clean" };
+const notReady = (reason: PrReadinessReason, mergeableState: string | null = reason): PrReadiness =>
+  ({ ready: false, reason, headSha: "sha5", mergeableState });
 
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -49,8 +53,7 @@ beforeEach(async () => {
   ).modules);
 
   vi.mocked(listOpenPullRequests).mockResolvedValue([]);
-  vi.mocked(getCombinedChecksState).mockResolvedValue("success");
-  vi.mocked(hasChangesRequestedReview).mockResolvedValue(false);
+  vi.mocked(getPrReadiness).mockResolvedValue(READY);
   vi.mocked(mergePullRequest).mockResolvedValue("merged");
   vi.mocked(mergeBranch).mockResolvedValue("noop");
   vi.mocked(listCheckRuns).mockResolvedValue([]);
@@ -212,24 +215,34 @@ describe("runAutoMerges", () => {
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
   });
 
-  it("waits (no merge) when checks are pending", async () => {
+  // GitHub reports the PR not clean to merge although its checks may be green: the child must wait.
+  for (const reason of ["behind", "blocked", "unstable", "unknown", "head_moved", "changes_requested", "unrecognized", "error"] as const) {
+    it(`does not merge an approved child when readiness reports ${reason}`, async () => {
+      const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+      log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
+      vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+      vi.mocked(getPrReadiness).mockResolvedValue(notReady(reason));
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      await autoMerge.runAutoMerges([mapping()], deps());
+      expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+      expect(vi.mocked(enqueueConflictResolution)).not.toHaveBeenCalled();
+      expect(logSpy.mock.calls.some((c) => String(c[0]).includes(`not ready (${reason}`))).toBe(true);
+      logSpy.mockRestore();
+    });
+  }
+
+  it("evaluates readiness at the listed head SHA", async () => {
+    const id = appendDispatch("issue-aii-300", "AII-300", "Add thing");
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/BuildDownAI/AI-Implement/pull/5");
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
-    vi.mocked(getCombinedChecksState).mockResolvedValue("pending");
     await autoMerge.runAutoMerges([mapping()], deps());
-    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(getPrReadiness)).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", 5, "sha5");
   });
 
-  it("skips (no merge) when checks failed", async () => {
+  it("does not read readiness for a child with no approval mark", async () => {
     vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
-    vi.mocked(getCombinedChecksState).mockResolvedValue("failure");
     await autoMerge.runAutoMerges([mapping()], deps());
-    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
-  });
-
-  it("skips when hasChangesRequestedReview returns true", async () => {
-    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
-    vi.mocked(hasChangesRequestedReview).mockResolvedValue(true);
-    await autoMerge.runAutoMerges([mapping()], deps());
+    expect(vi.mocked(getPrReadiness)).not.toHaveBeenCalled();
     expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
   });
 
@@ -490,6 +503,16 @@ describe("conflict detection in autoMergeRepo", () => {
       owner: "BuildDownAI", repo: "AI-Implement", prNumber: 5,
       featureBranch: "ai-implement/feature/aii-200-feat",
     });
+  });
+
+  it("enqueues conflict resolution without attempting the merge when readiness reports dirty", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+    vi.mocked(getPrReadiness).mockResolvedValue(notReady("dirty"));
+
+    await autoMerge.runAutoMerges([mapping()], deps());
+
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(enqueueConflictResolution)).toHaveBeenCalledOnce();
   });
 
   it("enqueues conflict resolution when merge returns 'blocked' and no prior attempts", async () => {
