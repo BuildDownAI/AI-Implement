@@ -49,6 +49,12 @@ For each claimed item the drain resolves the PR's dispatch row, in this order:
    2. In-flight run: the newest `dispatched`/`running` row in the same repo whose issue identifier matches the head branch (`branchMatchesIssueIdentifier`). The PR's own run has the branch identifier but no `pr_url` until it completes. Ended runs already have `pr_url` and are not matched.
 3. No match: "no record" reply.
 
+## Open review findings
+
+The run's instruction is the comment's text followed by the PR's open review findings (`buildCommentGapfillInstruction`, `src/comment-gapfill-drain.ts`, reading `listOpenReviewFindings`). A human's inline review comment is recorded in the ledger and starts no run on its own ([review-fix-rail.md](review-fix-rail.md#a-human-inline-comment-is-recorded-not-enqueued)), and the agent cannot read the PR, so this block is how `/ai-implement` addresses those comments. A bare `/ai-implement` gets the block alone; with no open findings the instruction is the comment text unchanged.
+
+Each finding is rendered whole under its `finding_key`, the same shape a review-fix task uses, so the agent's `fixed` / `invalid` disposition resolves it when the run succeeds and anything undisposed stays open (review-fix-rail.md § "Resolution"). The block holds at most 30 findings and 12,000 characters (`MAX_COMMENT_FINDINGS_BLOCK_CHARS`), because `commentInstruction` has no cap of its own; a finding that does not fit is left out whole, never clipped, and the block says how many were left out. A conflict-resolution row (`CONFLICT_COMMENTER`) gets no block, since review work could fail its review and lose the merge commit; a push-retry row replays a human comment and keeps it.
+
 ## In-flight deferral
 
 When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left `pending` with no reply, and the next drain retries it. Once the run sets `pr_url`, step 1 finds it and the item dispatches. There is no age cap: the job timeout, stuck watchdog and reaper end the run. Other `canDispatch` or admission refusals (`pr_budget`, capacity) defer the same way.

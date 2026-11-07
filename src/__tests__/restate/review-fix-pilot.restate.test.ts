@@ -1367,14 +1367,17 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
 
     const secret = "webhook-forward-secret";
     const ingress = createReviewFixIngressClient(env.baseUrl());
-    const body = JSON.stringify({
+    // Only a trusted review bot's inline comment is forwarded. A human's is recorded and waits for a
+    // Request changes review, so the forward path is driven by `claude[bot]` here.
+    const payloadFor = (user: { login: string; type: string }, commentBody: string) => JSON.stringify({
       action: "created",
       installation: { id: fixture.scope.installationId },
-      comment: { id: 99, body: "unchecked null in parser", html_url: "https://github.com/x/c", path: "a.ts", line: 4,
-        user: { login: "reviewer", type: "User" }, commit_id: "sha-1", created_at: new Date().toISOString() },
+      comment: { id: 99, body: commentBody, html_url: "https://github.com/x/c", path: "a.ts", line: 4,
+        user, commit_id: "sha-1", created_at: new Date().toISOString() },
       pull_request: { number: 1, html_url: `https://github.com/${owner}/${repo}/pull/1`, head: { ref: "ai-implement/AII-9-fix", sha: "sha-1" } },
       repository: { full_name: fixture.scope.repository },
     });
+    let body = payloadFor({ login: "claude[bot]", type: "Bot" }, "unchecked null in parser");
     const deliver = async (deliveryId: string) => {
       const req = Object.assign(new EventEmitter(), { headers: {
         "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
@@ -1397,5 +1400,11 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(counts()).toEqual({ findings: 1, queue: 1 });
     expect(await deliver(deliveryId)).toEqual({ status: 202, body: { forwarded: true } });
     expect(counts()).toEqual({ findings: 1, queue: 1 });
+
+    body = payloadFor({ login: "reviewer", type: "User" }, "rename this variable");
+    expect(await deliver(`wh-${randomUUID()}`)).toEqual({
+      status: 200, body: { recorded: true, reason: "awaiting_changes_requested", findingId: expect.any(Number) },
+    });
+    expect(counts()).toEqual({ findings: 2, queue: 1 });
   }, 20_000);
 });

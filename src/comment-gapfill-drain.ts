@@ -10,7 +10,7 @@ import {
   release as releaseAdmission,
   type DispatchAdmissionBackend,
 } from "./dispatch-admission.js";
-import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
+import { CONFLICT_COMMENTER, claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
@@ -22,6 +22,8 @@ import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, guestSize } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
+import { listOpenReviewFindings } from "./review-ledger-store.js";
+import { MAX_TASK_FINDINGS, formatTaskFinding, type ReviewFixTaskFinding } from "./review-fix-queue.js";
 import {
   classifyLaunchError,
   ghaLaunchOutcome,
@@ -38,6 +40,52 @@ import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
 
 type ContractProbeResult = WorkflowContract | WorkflowCapabilities;
+
+/**
+ * Cap on the open-findings block. `commentInstruction` rides run_config (a workflow_dispatch
+ * input) with no length cap of its own, so the block carries one.
+ */
+export const MAX_COMMENT_FINDINGS_BLOCK_CHARS = 12_000;
+
+/**
+ * The operator instruction for an `/ai-implement` run: the comment's own text, followed by
+ * the PR's open review findings. A human's inline comment is recorded in the ledger and
+ * waits for a run, and the agent cannot read the PR itself, so without this block those
+ * comments never reach an `/ai-implement` run. Each finding is rendered whole under its
+ * `finding_key`, so the agent's `fixed` / `invalid` disposition resolves it and every
+ * other finding stays open for the next fix run. A finding that would push the block over
+ * its cap is left out (still open), never clipped.
+ */
+export function buildCommentGapfillInstruction(
+  instruction: string,
+  findings: ReviewFixTaskFinding[],
+): string | undefined {
+  const text = instruction.trim();
+  if (findings.length === 0) return text || undefined;
+
+  const sections: string[] = [
+    "## Open review findings on this PR",
+    text
+      ? "Reviewers left these findings on the PR and they are not yet resolved. Address them unless the instruction above says otherwise."
+      : "Reviewers left these findings on the PR and they are not yet resolved. Address them.",
+  ];
+  let size = sections.join("\n\n").length;
+  let included = 0;
+  for (const finding of findings.slice(0, MAX_TASK_FINDINGS)) {
+    const rendered = formatTaskFinding(finding);
+    if (size + 2 + rendered.length > MAX_COMMENT_FINDINGS_BLOCK_CHARS) continue;
+    sections.push(rendered);
+    size += 2 + rendered.length;
+    included += 1;
+  }
+  const omitted = findings.length - included;
+  if (omitted > 0) {
+    sections.push(`${omitted} more open finding${omitted === 1 ? " was" : "s were"} left out of this run; ${omitted === 1 ? "it stays" : "they stay"} open for a later fix run.`);
+  }
+
+  const block = sections.join("\n\n");
+  return text ? `${text}\n\n${block}` : block;
+}
 
 /** Row fields for tracker kind and issue URL; a lookup failure never blocks the job row. */
 async function gapfillAccounting(
@@ -341,6 +389,20 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
 
       const [scopeKey, mapping] = mappingEntry;
+      // A conflict-resolution run only merges the grouping branch; review work in it could
+      // fail its review and lose the merge commit, so it carries no findings.
+      const commentInstruction = buildCommentGapfillInstruction(
+        item.instruction,
+        item.commenter === CONFLICT_COMMENTER ? [] : listOpenReviewFindings(fullRepo, item.prNumber).map((finding) => ({
+          finding_key: finding.findingKey,
+          source: finding.source,
+          severity: finding.severity,
+          path: finding.path ?? null,
+          line: finding.line ?? null,
+          body: finding.body,
+          url: finding.url ?? null,
+        })),
+      );
 
       if (mapping.paused) {
         console.log(`[comment-gapfill] Project ${fullRepo} is paused, skipping item #${item.id}`);
@@ -475,7 +537,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             runToken: runToken || undefined,
             runProgressToken: runProgressToken || undefined,
             runPublicationToken,
-            commentInstruction: item.instruction || undefined,
+            commentInstruction,
             retryPolicy: getRetryPolicy(),
             onBeforeLaunch: () => { launchStarted = true; },
             ...(localDecision.kind === "launch" ? { managed: { decision: localDecision, modelAuthUrl: localModelAuthUrl } } : {}),
@@ -605,7 +667,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
               mapping,
               runnerCallbackUrl: runnerCallbackUrl || undefined,
               prNumber: String(item.prNumber),
-              commentInstruction: item.instruction || undefined,
+              commentInstruction,
               retryPolicy: getRetryPolicy(),
             }),
             ...managedRunConfigFields(protectedLaunch),
@@ -788,7 +850,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             ? buildEnvelopeDispatchInputs(mapping, gapFillIssue, {
                 runnerPhase: "gap-analysis",
                 prNumber: String(item.prNumber),
-                commentInstruction: item.instruction || undefined,
+                commentInstruction,
                 runnerCallbackUrl: runnerCallbackUrl || undefined,
                 runToken,
                 runProgressToken,
@@ -812,7 +874,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
                 runner_callback_url: runnerCallbackUrl,
                 run_token: runToken,
                 run_progress_token: runProgressToken,
-                ...(item.instruction ? { comment_instruction: item.instruction } : {}),
+                ...(commentInstruction ? { comment_instruction: commentInstruction } : {}),
                 ...(runnerImage ? { runner_image: runnerImage } : {}),
               }) as Record<string, string | undefined>;
         } catch (err) {

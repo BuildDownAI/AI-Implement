@@ -77,6 +77,22 @@ export function upsertReviewFinding(input: UpsertReviewFindingInput): number {
   return row.id;
 }
 
+/**
+ * Records a finding without starting a new version of one already open or deferred.
+ * Unlike `upsertReviewFinding`, a repeat of the same finding (a webhook redelivery,
+ * or the same comment posted twice) leaves the row's revision untouched, so the
+ * revision-keyed attempt and disposition checks still match it. A resolved finding
+ * posted again reopens as a new revision.
+ */
+export function recordReviewFinding(input: UpsertReviewFindingInput): number {
+  const findingKey = stableReviewFindingKey(input);
+  const existing = getDb()
+    .prepare("SELECT id, status FROM review_findings WHERE repo = ? AND pr_number = ? AND finding_key = ?")
+    .get(input.repo, input.prNumber, findingKey) as { id: number; status: StoredReviewFinding["status"] } | undefined;
+  if (existing && existing.status !== "resolved") return existing.id;
+  return upsertReviewFinding(input);
+}
+
 export function upsertReviewFindings(repo: string, prNumber: number, findings: ReviewLedgerFinding[]): number[] {
   return findings.map((finding) => upsertReviewFinding({ repo, prNumber, ...finding }));
 }
