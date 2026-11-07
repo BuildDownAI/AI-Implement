@@ -756,6 +756,7 @@ describe("protocol driver seam (AII-1001)", () => {
 
   it("lets the executor own timeout and aborts the driver's halt signal", async () => {
     let halted = false;
+    // Freeze the deadline clock so setup cannot expire it before the driver runs; the timeout timer stays real.
     const { executor, log } = withDriver([{ hang: true, dieOn: ["SIGTERM"] }], (i) => {
       return new Promise((resolve) => {
         i.io.halt.addEventListener("abort", () => {
@@ -763,7 +764,7 @@ describe("protocol driver seam (AII-1001)", () => {
           resolve(okTransport({ result: { ...okTransport().result, exitCode: 1, terminalStatus: { subtype: "error", isError: true } } }));
         });
       });
-    });
+    }, { nowImpl: () => 0 });
     const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
     expect(halted).toBe(true);
     expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
@@ -1033,7 +1034,8 @@ describe("app-server trusted view (AII-1002)", () => {
         root = dirname(log[0].env.HOME);
         return new Promise((resolve) => i.io.halt.addEventListener("abort", () => resolve({ ...okResult(), stopReason: null })));
       };
-      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, halting, { trustedSkillsDir: skills });
+      // View construction must not consume the deadline before the driver captures root; the timeout timer stays real.
+      const { executor } = run([{ hang: true, dieOn: ["SIGTERM"] }], log, halting, { trustedSkillsDir: skills, nowImpl: () => 0 });
       try {
         const result = await executor.invoke({ ...base, invocationTimeoutMs: 20 });
         expect(result.failure?.code).toBe("INVOCATION_TIMEOUT");
