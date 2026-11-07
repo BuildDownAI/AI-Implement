@@ -117,7 +117,8 @@ function incomplete(category: ReviewFixIncompleteCategory, reason: string): Revi
   return { status: "incomplete", category, reason };
 }
 
-function formatTaskFinding(finding: ReviewFixTaskFinding): string {
+/** Renders one finding under its `finding_key` heading, the key the agent's disposition names. */
+export function formatTaskFinding(finding: ReviewFixTaskFinding): string {
   const location = finding.path
     ? (typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path)
     : undefined;

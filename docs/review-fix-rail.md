@@ -22,7 +22,7 @@ The post-run half's finding-driven enqueues are **entirely webhook-driven**. Thr
 | Event | Gate | Recorded as |
 |-------|------|-------------|
 | `pull_request_review` | `action=submitted` **and** `state=CHANGES_REQUESTED` | `github-review`, severity `blocking` |
-| `pull_request_review_comment` | `action=created` | `github-review-thread`, severity `medium` |
+| `pull_request_review_comment` | `action=created`; only a **bot** author enqueues — a human's comment is recorded but starts no run (see below) | `github-review-thread`, severity `medium` |
 | `issue_comment` | `classifyReviewIssueComment` (`src/pipeline/review-ledger.ts`) accepts `github-actions[bot]` (author `type === "Bot"`) or a login in the project's trusted authors (the review process's authors plus the project's Trusted Review Authors) | `review-contract` (fenced block, source `review-contract`, reason `review_contract`) when present, else `claude-review-summary` prose (reason `claude_review_summary`) |
 
 The `issue_comment` path calls the same `classifyReviewIssueComment` function post-push review uses (`collectClaudeIssueComments` in `src/pipeline/review-ledger.ts`), so both readers share one author rule and one parse order: the fenced `review-findings` contract block first (`extractReviewFindingsBlock`, "The review-findings contract" below), then heading-based prose. A block that parses to an `approve` verdict with no findings is ignored with reason `approved`; a broken/unclosed block, or a well-formed block whose verdict is `incomplete` with no findings, is ignored with reason `findings_unavailable` and logged. Only when no block is present does a trusted-author comment fall back to prose scanning.
@@ -30,6 +30,21 @@ The `issue_comment` path calls the same `classifyReviewIssueComment` function po
 `GITHUB_WEBHOOK_SECRET` must be set, and deliveries are rejected 401 on an invalid signature. Note that `pull_request` and `issue_comment` are already needed for merge reconciliation and `/ai-implement` handling respectively — the two review events are the ones easily missed.
 
 Every path additionally requires a **matching dispatch record**: the orchestrator looks up the PR against its own dispatch log, and ignores anything it did not create. Reviews on unrelated PRs in the same repo are not picked up.
+
+### A human inline comment is recorded, not enqueued
+
+The rail collects a human reviewer's feedback and starts one run for it, not one per comment. A human's `pull_request_review_comment` writes its `github-review-thread` finding to the ledger and answers `{ recorded: true, reason: "awaiting_changes_requested", findingId }` without queueing a review-fix row or forwarding to `ReviewFixPR.feedback` — the same under both lifecycles. Any author whose `user.type` is not `Bot`, including a missing one, takes this path. Each recorded comment logs `[webhook] Recorded human inline comment on PR #<n> as finding #<id>`.
+
+A human starts the fix run in one of two ways, and both read every open finding on the PR, so the recorded comments ride it:
+
+- Submitting the review as **Request changes** (the `pull_request_review` row above). The review-fix drain builds its task from `listOpenReviewFindings`, and a Restate attempt from `unprocessedOpenReviewFindings`, not only from the event that queued it.
+- Commenting `/ai-implement`. The comment gap-fill rail appends the PR's open findings to the comment's instruction ([comment-gapfill-rail.md](comment-gapfill-rail.md#open-review-findings)).
+
+A review submitted as "Comment" or "Approve" queues nothing; its inline comments stay open in the ledger until a Request changes review, a bot finding, or `/ai-implement` starts a run. The same holds for an inline comment that arrives after a run has already been dispatched — GitHub sends the review and its comments as independent deliveries with no ordering guarantee.
+
+The record-only path uses `recordReviewFinding` (`src/review-ledger-store.ts`), not `upsertReviewFinding`. It skips `acceptReviewFixWebhookEvent` and so its delivery-id dedup, so a redelivered or repeated comment must leave the finding's `revision` alone: the Restate attempt filter and the revision-conditional disposition helpers key on it. A comment repeating a finding that is already resolved reopens it as a new revision.
+
+Under the `codex-code-review` process a human's comment is `medium`, so it is still ignored as `advisory_finding` before this path and is not recorded.
 
 ### Codex Code Review
 
@@ -44,7 +59,7 @@ Past the matching-dispatch check, `shouldEnqueueReviewEvent` (`src/webhook.ts:99
 | Condition | Result | Reason |
 |---|---|---|
 | Body contains `<!-- ai-implement` | never enqueues, any author | `self` |
-| Author is not `Bot` | always enqueues | — |
+| Author is not `Bot` | enqueues, except a `pull_request_review_comment`, which is recorded only (see above) | — |
 | Bot author; `commitId` and `headSha` are both present and differ | does not enqueue | `stale_head` |
 | Bot author; the event's timestamp is before the latest dispatch recorded for the PR | does not enqueue | `run_after_review` |
 | Bot author; `commitId` and `headSha` are both undefined, and the event timestamp is also undefined | does not enqueue | `missing_fields` |
@@ -140,9 +155,9 @@ Findings are collected from bot comments, and the rail itself posts bot comments
 
 Trusted comment authors come from the project's review process (`src/review-process.ts`, ADR 038) plus the project's `trustedReviewAuthors`, through `isTrustedReviewAuthor`. The webhook reads both from the project mapping; the in-run ledger receives them as the `{ process, extraAuthors }` options argument, defaulting to the `ai-implement` process. The built-in authors stay trusted whatever the extra list holds, and `webhook.ts` and `review-ledger.ts` hold no author list of their own.
 
-Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` and `claude-code-review-repository-fix` (the definition's `classifyInline` classifier) classify a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and always enqueues (ADR 027), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
+Inline-comment severity follows the process. `ai-implement` keeps `medium` for every inline webhook comment. `claude-code-review` and `claude-code-review-repository-fix` (the definition's `classifyInline` classifier) classify a trusted bot's comment by its leading marker: 🔴 `blocking`, 🟡 or untagged `minor`, and 🟣 is skipped (the webhook answers `{ ignored: true, reason: "pre_existing" }` and stores nothing). Under that process a bot that is not trusted is ignored (`untrusted_author`). A human's inline comment is always `medium` and is recorded without enqueueing (see "A human inline comment is recorded, not enqueued"), and a CHANGES_REQUESTED author's thread stays `blocking` whatever its marker.
 
-**An approve verdict with only non-gating findings starts no fix run.** In the `issue_comment` summary path, when the `review-findings` block's verdict is `approve` and no finding gates under `reviewContractFindingGates` (`src/pipeline/review-ledger.ts`; only `blocking` gates under `approve`), the webhook answers `{ ignored: true, reason: "approved" }` before any queue entry, `ReviewFixPR.feedback` forward, or ledger row. A `blocking` finding under `approve`, or any finding under `changes_requested`, still enqueues. The inline-comment rail above is unchanged: a 🟡 `minor` inline comment still queues a fix.
+**An approve verdict with only non-gating findings starts no fix run.** In the `issue_comment` summary path, when the `review-findings` block's verdict is `approve` and no finding gates under `reviewContractFindingGates` (`src/pipeline/review-ledger.ts`; only `blocking` gates under `approve`), the webhook answers `{ ignored: true, reason: "approved" }` before any queue entry, `ReviewFixPR.feedback` forward, or ledger row. A `blocking` finding under `approve`, or any finding under `changes_requested`, still enqueues. The inline-comment rail above is unchanged: a trusted bot's 🟡 `minor` inline comment still queues a fix.
 
 **The in-run gate's inline fallback honours thread state.** Under `claude-code-review`, when the resolution-aware thread list is empty but the check-and-comments verdict is `changes_requested`, the gate falls back to the REST inline findings. Those carry no thread state, so `collectClosedReviewThreadCommentUrls` (`src/pipeline/review-ledger.ts`) reads the review threads and the gate drops each finding whose comment URL sits on a resolved or outdated thread. If no blocking finding remains, the verdict is treated as `approve`. A failed thread read keeps every finding, so the gate stays blocked.
 
@@ -358,7 +373,7 @@ When a `gap-analysis` run reports success, the callback resolves a finding only 
 
 A finding in the allowed set with no disposition stays `open` and is shown to the next fix run (the drain reads `listOpenReviewFindings`). A finding outside the set stays `open` even with a `fixed` disposition. `follow-up` findings are deferred earlier in the callback and are unaffected. The callback logs one line per success: `resolved=` and `left_open=` count the allowed set, while `deferred_on_pr=` counts every finding on the PR that the run deferred, so the three numbers need not add up to the allowed set.
 
-A success that reports no dispositions at all — including a runner image that predates the `findingDispositions` field — resolves nothing. Only a review-fix drain run records a snapshot and shows the agent the finding keys. A `/ai-implement` comment run takes the no-snapshot path and its task carries no finding keys, so it normally reports no dispositions and resolves nothing; its findings stay `open` until a later review-fix run disposes them. This is deliberate: a finding is never resolved without a recorded disposition.
+A success that reports no dispositions at all — including a runner image that predates the `findingDispositions` field — resolves nothing. Only a review-fix drain run records a snapshot. A `/ai-implement` comment run takes the no-snapshot path; its instruction lists the PR's open findings under their finding keys, so the agent's `fixed` or `invalid` dispositions resolve those findings, and a finding it leaves undisposed, or one left out of the instruction by its size cap, stays `open` for a later run. This is deliberate: a finding is never resolved without a recorded disposition.
 
 The snapshot is the important case. A finding that arrives *while* a fix run is in flight was never seen by that run, and resolving it would silently drop real feedback. Scoping resolution to the snapshot leaves it open for the next queue event instead.
 
