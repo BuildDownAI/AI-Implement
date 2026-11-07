@@ -1,6 +1,9 @@
 import type {
+  JiraFieldOptions,
+  JiraJqlResult,
+  JiraProjectSetupFacts,
   JiraSetupFacts,
-  JiraMappingSetupFacts,
+  TrackerReadFailure,
   AIImplementSnapshot,
   FeatureBranchChainEntry,
   FeatureNodeRollUp,
@@ -14,11 +17,16 @@ import type {
 import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
 import { JiraApiError, JiraFieldNotSelectError, JiraClient, type JiraComment, type JiraIssue } from "./jira-client.js";
 import {
+  BASE_BRANCH_FIELD_NAME,
   buildBucketQuery,
   getCachedFieldIds,
+  JiraFieldResolutionError,
+  jqlFieldRef,
   peekCachedFieldIds,
+  PROFILES_FIELD_NAME,
   resolveCustomFieldIds,
   STATUS_VALUES,
+  type OverrideOptions,
   type ResolvedFieldIds,
 } from "./jira-fields.js";
 import type { RepoMapping } from "../config.js";
@@ -76,9 +84,32 @@ function descriptionText(fields: Record<string, unknown>): string | null {
   return typeof d === "string" ? d : d ? adfToPlainText(d) : null;
 }
 
-function jqlFieldRef(fieldId: string): string {
-  const match = /^customfield_(\d+)$/.exec(fieldId);
-  return match ? `cf[${match[1]}]` : fieldId;
+type JiraTicketingConfig = Extract<RepoMapping["ticketingConfig"], { kind: "jira" }>;
+
+/** The field-ID overrides a project sets, which key the poll's field cache. */
+function fieldOverrides(cfg: JiraTicketingConfig): OverrideOptions {
+  return {
+    statusOverride: cfg.statusFieldOverride ?? null,
+    repoOverride: cfg.repoFieldOverride ?? null,
+    profilesOverride: cfg.profilesFieldOverride ?? null,
+    baseBranchOverride: cfg.baseBranchFieldOverride ?? null,
+  };
+}
+
+/** A failed Jira call as setup facts: Jira's status when it answered, or null when it could not be reached. */
+function readFailure(err: unknown): TrackerReadFailure {
+  return { status: err instanceof JiraApiError ? err.status : null, error: err instanceof Error ? err.message : String(err) };
+}
+
+/** Optional fields with no override whose name matches several fields, which `resolveCustomFieldIds` leaves off. */
+function ambiguousOptionalFields(listed: Array<{ name: string }>, overrides: OverrideOptions): string[] {
+  const optional: Array<[string, string | null]> = [
+    [PROFILES_FIELD_NAME, overrides.profilesOverride],
+    [BASE_BRANCH_FIELD_NAME, overrides.baseBranchOverride],
+  ];
+  return optional
+    .filter(([name, override]) => override === null && listed.filter((field) => field.name === name).length > 1)
+    .map(([name]) => name);
 }
 
 /**
@@ -266,39 +297,77 @@ export class JiraProvider implements TicketingProvider {
   }
 
   async fetchSetupFacts(projectKeys: string[]): Promise<JiraSetupFacts> {
-    const facts: JiraSetupFacts = { kind: "jira", oauth: this.oauth, credentials: { ok: true }, mappings: {} };
-    try { await this.client.getMyself(); } catch (err) {
-      facts.credentials = { ok: false, status: err instanceof JiraApiError ? err.status : null, error: String(err) };
-      return facts;
+    try {
+      await this.client.verifyCredentials();
+    } catch (err) {
+      return { kind: "jira", credentials: "refused", ...readFailure(err) };
     }
+    const projects: Record<string, JiraProjectSetupFacts> = {};
     for (const key of projectKeys) {
-      const mapping = this.getMappings()[key];
-      if (mapping?.ticketingConfig.kind !== "jira") continue;
-      const cfg = mapping.ticketingConfig;
-      const row: JiraMappingSetupFacts = { ambiguousOptional: [], repoFieldValue: cfg.repoFieldValue, autoApprovePlans: mapping.autoApprovePlans ?? false };
-      facts.mappings[key] = row;
-      const overrides = { statusOverride: cfg.statusFieldOverride ?? null, repoOverride: cfg.repoFieldOverride ?? null,
-        profilesOverride: cfg.profilesFieldOverride ?? null, baseBranchOverride: cfg.baseBranchFieldOverride ?? null };
-      row.cachedFields = peekCachedFieldIds(this.cacheScope, overrides);
-      try {
-        // Reuse one field list for resolution and optional-field diagnostics.
-        let listed: Awaited<ReturnType<JiraClient["listFields"]>> = [];
-        row.fields = await resolveCustomFieldIds({ listFields: async () => {
-          try { return (listed = await this.client.listFields()); }
-          catch (err) { row.fieldReadFailed = true; throw err; }
-        } }, overrides);
-        for (const [name, override] of [["AI-Implement Profiles", overrides.profilesOverride], ["AI-Implement Base Branch", overrides.baseBranchOverride]]) {
-          if (!override && listed.filter((f) => f.name === name).length > 1) row.ambiguousOptional.push(name!);
-        }
-      } catch (err) { row.fieldError = String(err); continue; }
-      try { row.statusOptions = (await this.client.getFieldOptions(row.fields.statusFieldId)).map((o) => o.value); }
-      catch (err) { if (err instanceof JiraFieldNotSelectError) row.statusNotSelect = true; else row.statusError = String(err); }
-      try { row.repoOptions = (await this.client.getFieldOptions(row.fields.repoFieldId)).map((o) => o.value); }
-      catch (err) { if (err instanceof JiraFieldNotSelectError) row.repoNotSelect = true; else row.repoError = String(err); }
-      try { await this.client.searchJqlPage(buildBucketQuery(cfg.jql, row.fields.statusFieldId), [row.fields.statusFieldId], undefined, 1); row.queryOk = true; }
-      catch (err) { row.queryError = String(err); row.queryUnreachable = !(err instanceof JiraApiError); }
+      const cfg = this.getMappings()[key]?.ticketingConfig;
+      if (cfg?.kind === "jira") projects[key] = await this.readProjectSetup(cfg);
     }
-    return facts;
+    return { kind: "jira", credentials: "accepted", oauth: this.oauth, projects };
+  }
+
+  /** One project's facts. Its fields are resolved fresh, never through the poll's cache, which `cachedIds` reads without filling. */
+  private async readProjectSetup(cfg: JiraTicketingConfig): Promise<JiraProjectSetupFacts> {
+    const overrides = fieldOverrides(cfg);
+    // One field list serves the resolution and the optional-field check, and tells a failed read from a missing field.
+    const list: { fields: Array<{ name: string }>; failure: TrackerReadFailure | null } = { fields: [], failure: null };
+    let ids: ResolvedFieldIds;
+    try {
+      ids = await resolveCustomFieldIds({
+        listFields: async () => {
+          try {
+            const fields = await this.client.listFields();
+            list.fields = fields;
+            return fields;
+          } catch (err) {
+            list.failure = readFailure(err);
+            throw err;
+          }
+        },
+      }, overrides);
+    } catch (err) {
+      if (list.failure) return { fields: "unreadable", failure: list.failure };
+      if (err instanceof JiraFieldResolutionError) return { fields: "unresolved", field: err.fieldName, fault: err.fault };
+      throw err;
+    }
+    const [statusOptions, repoOptions, jql] = await Promise.all([
+      this.readFieldOptions(ids.statusFieldId),
+      this.readFieldOptions(ids.repoFieldId),
+      this.tryProjectJql(cfg.jql, ids.statusFieldId),
+    ]);
+    return {
+      fields: "resolved",
+      ids,
+      cachedIds: peekCachedFieldIds(this.cacheScope, overrides) ?? null,
+      ambiguousOptional: ambiguousOptionalFields(list.fields, overrides),
+      statusOptions,
+      repoOptions,
+      jql,
+    };
+  }
+
+  private async readFieldOptions(fieldId: string): Promise<JiraFieldOptions> {
+    try {
+      const options = await this.client.getFieldOptions(fieldId);
+      return { read: "options", values: options.map((option) => option.value) };
+    } catch (err) {
+      if (err instanceof JiraFieldNotSelectError) return { read: "not-select" };
+      return { read: "failed", failure: readFailure(err) };
+    }
+  }
+
+  /** Runs the project's JQL as the poll runs it, asking for one result. */
+  private async tryProjectJql(jql: string, statusFieldId: string): Promise<JiraJqlResult> {
+    try {
+      await this.client.searchJqlPage(buildBucketQuery(jql, statusFieldId), [statusFieldId], undefined, 1);
+      return { accepted: true };
+    } catch (err) {
+      return { accepted: false, failure: readFailure(err) };
+    }
   }
 
   private childrenJql(parentKeys: string[], fieldIds: ResolvedFieldIds): string {
@@ -313,12 +382,7 @@ export class JiraProvider implements TicketingProvider {
     if (!m || m.ticketingConfig.kind !== "jira") {
       throw new Error(`No Jira mapping found for scopeKey=${scopeKey}`);
     }
-    return getCachedFieldIds(this.cacheScope, this.client, {
-      statusOverride: m.ticketingConfig.statusFieldOverride ?? null,
-      repoOverride: m.ticketingConfig.repoFieldOverride ?? null,
-      profilesOverride: m.ticketingConfig.profilesFieldOverride ?? null,
-      baseBranchOverride: m.ticketingConfig.baseBranchFieldOverride ?? null,
-    });
+    return getCachedFieldIds(this.cacheScope, this.client, fieldOverrides(m.ticketingConfig));
   }
 
   /** Writes the AI-Implement Status field. Merged is terminal: a run can outlive its
@@ -1002,8 +1066,8 @@ export function createJiraProviderFromConfig(
   if (!config.jiraToken || !config.jiraSiteUrl) {
     throw new MissingProviderConfigError("jira", "jiraToken/jiraSiteUrl");
   }
-  // Auth mode: Basic (email + API token) when jiraEmail is set — the durable
-  // Jira Cloud path; otherwise OAuth Bearer via the gateway, which needs cloudId.
+  // Auth mode: Basic (email + API token) when jiraEmail is set, the supported path.
+  // Otherwise OAuth Bearer via the gateway, which needs cloudId.
   if (!config.jiraEmail && !config.jiraCloudId) {
     throw new MissingProviderConfigError("jira", "jiraEmail (API-token auth) or jiraCloudId (OAuth)");
   }

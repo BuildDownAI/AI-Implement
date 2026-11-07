@@ -1,5 +1,6 @@
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
 import type { RepoMapping } from "../config.js";
+import type { ResolvedFieldIds } from "./jira-fields.js";
 
 /** One rung of a feature-branch grouping chain → branch `ai-implement/<mode>/<identifier>`. */
 export interface FeatureBranchChainEntry {
@@ -122,15 +123,15 @@ export interface FoundLabel {
   teamKey: string | null;
 }
 
+/** A tracker read that did not succeed: the tracker's HTTP status when it refused, or null when it could not be reached. */
+export interface TrackerReadFailure {
+  status: number | null;
+  error: string;
+}
+
 /** What one Linear read finds for the setup checks, which judge it (`src/setup-checks/tracker-config.ts`). */
 export type LinearSetupFacts =
-  | {
-      kind: "linear";
-      token: "refused";
-      /** Linear's HTTP status when it refused the credentials; null when it could not be reached. */
-      status: number | null;
-      error: string;
-    }
+  | ({ kind: "linear"; token: "refused" } & TrackerReadFailure)
   | {
       kind: "linear";
       token: "minted";
@@ -142,35 +143,49 @@ export type LinearSetupFacts =
       labels: Record<string, FoundLabel[]>;
     };
 
-/** Fresh reads and independent faults for one Jira mapping. */
-export interface JiraMappingSetupFacts {
-  fields?: import("./jira-fields.js").ResolvedFieldIds;
-  fieldError?: string;
-  fieldReadFailed?: boolean;
-  ambiguousOptional: string[];
-  cachedFields?: import("./jira-fields.js").ResolvedFieldIds;
-  statusOptions?: string[];
-  statusNotSelect?: boolean;
-  statusError?: string;
-  repoOptions?: string[];
-  repoNotSelect?: boolean;
-  repoError?: string;
-  queryError?: string;
-  queryUnreachable?: boolean;
-  queryOk?: boolean;
-  repoFieldValue: string;
-  autoApprovePlans: boolean;
-}
-export interface JiraSetupFacts {
-  kind: "jira";
-  oauth: boolean;
-  credentials: { ok: boolean; status?: number | null; error?: string };
-  mappings: Record<string, JiraMappingSetupFacts>;
-}
+/** A select field's options, or why they cannot be judged. A field whose contexts answer 404 is not a select field. */
+export type JiraFieldOptions =
+  | { read: "options"; values: string[] }
+  | { read: "not-select" }
+  | { read: "failed"; failure: TrackerReadFailure };
+
+/** Whether Jira accepts a project's JQL as the poll runs it, asked for one result. */
+export type JiraJqlResult = { accepted: true } | { accepted: false; failure: TrackerReadFailure };
+
+/** What the reads for one Jira project find. Each read is recorded, so one fault never hides another project's facts. */
+export type JiraProjectSetupFacts =
+  | { fields: "unreadable"; failure: TrackerReadFailure }
+  /** A required field matches no field or several by name (`JiraFieldResolutionError`). */
+  | { fields: "unresolved"; field: string; fault: "missing" | "duplicate" }
+  | {
+      fields: "resolved";
+      ids: ResolvedFieldIds;
+      /** The IDs the poll cached for this project's site and overrides, or null before the poll has read them. */
+      cachedIds: ResolvedFieldIds | null;
+      /** Optional fields whose name matches several fields, so their feature stays off. */
+      ambiguousOptional: string[];
+      statusOptions: JiraFieldOptions;
+      repoOptions: JiraFieldOptions;
+      jql: JiraJqlResult;
+    };
+
+/** What one Jira read finds for the setup checks, which judge it (`src/setup-checks/tracker-config.ts`). */
+export type JiraSetupFacts =
+  | ({ kind: "jira"; credentials: "refused" } & TrackerReadFailure)
+  | {
+      kind: "jira";
+      credentials: "accepted";
+      /** OAuth mode, whose access token is never refreshed. */
+      oauth: boolean;
+      projects: Record<string, JiraProjectSetupFacts>;
+    };
+
+/** Each Filesystem project's ticket directory, resolved as the poll resolves it, and why the orchestrator cannot use it, or null when it can. */
 export interface FilesystemSetupFacts {
   kind: "filesystem";
-  directories: Record<string, { directory: string; error?: string }>;
+  directories: Record<string, { directory: string; fault: "missing" | "not-writable" | null }>;
 }
+
 /** One provider's setup facts; each provider adds its own member. */
 export type TrackerSetupFacts = LinearSetupFacts | JiraSetupFacts | FilesystemSetupFacts;
 
@@ -254,8 +269,8 @@ export interface TicketingProvider {
 
   /** One page of the mapping's issues for the knowledge-graph export. Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
   listIssuesPage?(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage>;
-  /** The facts the setup checks judge for these teams, read without any write. Optional so a fork's custom provider still compiles. */
-  fetchSetupFacts?(teamKeys: string[]): Promise<TrackerSetupFacts>;
+  /** The facts the setup checks judge for these projects, read without any write. A Linear project's key is its team's key. Optional so a fork's custom provider still compiles. */
+  fetchSetupFacts?(projectKeys: string[]): Promise<TrackerSetupFacts>;
 }
 
 /** Configuration handed to provider factories. */

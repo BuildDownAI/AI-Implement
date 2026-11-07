@@ -84,23 +84,20 @@ export class FilesystemProvider implements TicketingProvider {
   readonly id = "filesystem";
   private readonly getMappings: () => Record<string, RepoMapping>;
 
-  async fetchSetupFacts(projectKeys: string[]): Promise<FilesystemSetupFacts> {
-    const facts: FilesystemSetupFacts = { kind: "filesystem", directories: {} };
-    for (const key of projectKeys) {
-      const mapping = this.getMappings()[key];
-      if (mapping?.ticketingConfig.kind !== "filesystem") continue;
-      const directory = mapping.ticketingConfig.directory;
-      const row: { directory: string; error?: string } = { directory };
-      facts.directories[key] = row;
-      const root = await existingRealDirectory(directory);
-      if (!root) row.error = "does not exist or is not a directory";
-      else try { await access(root, constants.W_OK | constants.X_OK); } catch { row.error = "is not writable or searchable by the orchestrator"; }
-    }
-    return facts;
-  }
-
   constructor(getMappings: () => Record<string, RepoMapping>) {
     this.getMappings = getMappings;
+  }
+
+  async fetchSetupFacts(projectKeys: string[]): Promise<FilesystemSetupFacts> {
+    const directories: FilesystemSetupFacts["directories"] = {};
+    for (const key of projectKeys) {
+      const cfg = this.getMappings()[key]?.ticketingConfig;
+      if (cfg?.kind !== "filesystem") continue;
+      // Resolved as the poll resolves it, so the two agree on symlinks.
+      const root = await existingRealDirectory(cfg.directory);
+      directories[key] = { directory: cfg.directory, fault: root === null ? "missing" : await accessFault(root) };
+    }
+    return { kind: "filesystem", directories };
   }
 
   async fetchAIImplementSnapshot(): Promise<AIImplementSnapshot> {
@@ -521,6 +518,16 @@ async function existingRealDirectory(path: string): Promise<string | null> {
     return await realpath(resolved);
   } catch {
     return null;
+  }
+}
+
+/** Whether the orchestrator can create entries in `directory`, which needs search access as well as write, asked without writing. */
+async function accessFault(directory: string): Promise<"not-writable" | null> {
+  try {
+    await access(directory, constants.W_OK | constants.X_OK);
+    return null;
+  } catch {
+    return "not-writable";
   }
 }
 

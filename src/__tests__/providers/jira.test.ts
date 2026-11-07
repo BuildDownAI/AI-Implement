@@ -153,6 +153,7 @@ function makeProvider(opts: {
   cacheScope: string;
   mappings: Record<string, RepoMapping>;
   onRepoFieldMismatch?: (mappingId: string, issueKey: string, actual: string) => void;
+  oauth?: boolean;
 }): JiraProvider {
   return new JiraProvider({
     client: new JiraClient({ token: "t", cloudId: "c" }),
@@ -160,6 +161,7 @@ function makeProvider(opts: {
     siteUrl: "https://x",
     getMappings: () => opts.mappings,
     onRepoFieldMismatch: opts.onRepoFieldMismatch,
+    oauth: opts.oauth,
   });
 }
 
@@ -1838,116 +1840,181 @@ describe("JiraProvider.listIssuesPage", () => {
   });
 });
 
-describe("Jira setup facts", () => {
-  it("uses only reads and the shared bucket search, without filling an empty cache", async () => {
-    const fields = await import("../../providers/jira-fields.js");
-    clearFieldCache();
-    const helper = vi.spyOn(fields, "buildBucketQuery").mockReturnValue("shared query changed by test");
-    const fake = fakeFetch({
-      [`GET ${API}/myself`]: { json: { accountId: "me" } },
-      [`GET ${API}/field/customfield_10100/context`]: { json: { values: [] } },
-      [`GET ${API}/field/customfield_10101/context`]: { status: 404 },
-      [SEARCH]: { json: { issues: [] } },
-    }).install();
-    const mappings = { X: makeMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project = X", repoFieldValue: "repo", ...ALL_OVERRIDES } }) };
-    const p = makeProvider({ cacheScope: "setup-empty", mappings });
-    try {
-      const facts = await p.fetchSetupFacts(["X"]);
-      expect(facts.mappings.X.statusOptions).toEqual([]);
-      expect(facts.mappings.X.repoNotSelect).toBe(true);
-      expect(fields.peekCachedFieldIds("setup-empty", { statusOverride: ALL_OVERRIDES.statusFieldOverride, repoOverride: ALL_OVERRIDES.repoFieldOverride, profilesOverride: ALL_OVERRIDES.profilesFieldOverride, baseBranchOverride: ALL_OVERRIDES.baseBranchFieldOverride })).toBeUndefined();
-      await p.fetchAIImplementSnapshot();
-      const searches = fake.calls.filter((c) => c.method === "POST");
-      expect(searches.length).toBeGreaterThanOrEqual(2);
-      expect(JSON.parse(searches[0].body!)).toMatchObject({ jql: "shared query changed by test", maxResults: 1 });
-      expect(JSON.parse(searches[1].body!)).toMatchObject({ jql: "shared query changed by test", maxResults: 100 });
-      for (const call of fake.calls) expect(call.method === "GET" || (call.method === "POST" && call.url.pathname.endsWith("/search/jql"))).toBe(true);
-    } finally { helper.mockRestore(); }
+describe("JiraProvider.fetchSetupFacts", () => {
+  const CREDENTIALS = `GET ${API}/resolution/search` as const;
+  const STATUS_CONTEXTS = `GET ${API}/field/customfield_10100/context` as const;
+  const REPO_CONTEXTS = `GET ${API}/field/customfield_10101/context` as const;
+  const STATUS_OPTIONS = `GET ${API}/field/customfield_10100/context/1/option` as const;
+  // The four overrides as the poll's field cache keys them.
+  const CACHE_OVERRIDES = {
+    statusOverride: ALL_OVERRIDES.statusFieldOverride,
+    repoOverride: ALL_OVERRIDES.repoFieldOverride,
+    profilesOverride: ALL_OVERRIDES.profilesFieldOverride,
+    baseBranchOverride: ALL_OVERRIDES.baseBranchFieldOverride,
+  };
+  // A project whose four fields are overridden, so its reads skip the field list: the status field has
+  // one context holding Ready, the repo field is text, and its JQL is accepted.
+  const readableProject = (): Routes => ({
+    [CREDENTIALS]: { json: { values: [{ id: "1" }] } },
+    [STATUS_CONTEXTS]: { json: { values: [{ id: "1" }], isLast: true } },
+    [STATUS_OPTIONS]: { json: { values: [{ id: "a", value: "Ready" }], isLast: true } },
+    [REPO_CONTEXTS]: { status: 404 },
+    [SEARCH]: { json: { issues: [] } },
   });
 
-  it("records refused credentials without reading mappings", async () => {
-    const fake = fakeFetch({ [`GET ${API}/myself`]: { status: 401, json: { errorMessages: ["refused"] } } }).install();
-    const facts = await makeProvider({ cacheScope: "refused", mappings: {} }).fetchSetupFacts(["X"]);
-    expect(facts.credentials).toMatchObject({ ok: false, status: 401 });
+  beforeEach(() => clearFieldCache());
+
+  it("proves the credentials first, then reads each project with GETs and the poll's own search, leaving the cache empty", async () => {
+    const fields = await import("../../providers/jira-fields.js");
+    const shared = vi.spyOn(fields, "buildBucketQuery").mockReturnValue("the poll's query");
+    onTestFinished(() => shared.mockRestore());
+    const fake = fakeFetch(readableProject()).install();
+
+    const facts = await makeProvider({ cacheScope: "setup", mappings: { X: jiraMapping({ ...ALL_OVERRIDES, jql: "project = X" }) } }).fetchSetupFacts(["X"]);
+
+    expect(facts).toEqual({
+      kind: "jira",
+      credentials: "accepted",
+      oauth: false,
+      projects: {
+        X: {
+          fields: "resolved",
+          ids: { statusFieldId: "customfield_10100", repoFieldId: "customfield_10101", profilesFieldId: "customfield_10200", baseBranchFieldId: "customfield_10300" },
+          cachedIds: null,
+          ambiguousOptional: [],
+          statusOptions: { read: "options", values: ["Ready"] },
+          repoOptions: { read: "not-select" },
+          jql: { accepted: true },
+        },
+      },
+    });
+    expect(fake.calls[0].path).toBe(`${API}/resolution/search`);
+    expect(shared).toHaveBeenCalledWith("project = X", "customfield_10100");
+    expect(JSON.parse(fake.calls.find((call) => call.method === "POST")!.body)).toMatchObject({ jql: "the poll's query", maxResults: 1 });
+    for (const call of fake.calls) expect(call.method === "GET" || call.path === `${API}/search/jql`).toBe(true);
+    expect(fields.peekCachedFieldIds("setup", CACHE_OVERRIDES)).toBeUndefined();
+  });
+
+  it("records refused credentials with Jira's status, and reads nothing else", async () => {
+    const fake = fakeFetch({ [CREDENTIALS]: jiraError(401, "Client must be authenticated to access this resource.") }).install();
+    const facts = await makeProvider({ cacheScope: "refused", mappings: { X: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["X"]);
+    expect(facts).toMatchObject({ kind: "jira", credentials: "refused", status: 401 });
     expect(fake.calls).toHaveLength(1);
   });
-});
 
-it("compares fresh IDs against the poll cache", async () => {
-  clearFieldCache();
-  const { getCachedFieldIds } = await import("../../providers/jira-fields.js");
-  const overrides = { statusOverride: null, repoOverride: null, profilesOverride: "profiles", baseBranchOverride: "branch" };
-  const client = stubClient();
-  const fake = fakeFetch({
-    [`GET ${API}/myself`]: { json: {} },
-    [FIELDS]: { json: [selectField("old", "AI-Implement Status"), selectField("repo", "AI-Implement Repo")] },
-    [`GET ${API}/field/new/context`]: { status: 404 },
-    [`GET ${API}/field/repo/context`]: { status: 404 },
-    [`GET ${API}/field/customfield_10100/context`]: { json: { values: [] } },
-    [`GET ${API}/field/customfield_10101/context`]: { status: 404 },
-    [SEARCH]: { json: { issues: [] } },
-  }).install();
-  await getCachedFieldIds("drift", client, overrides);
-  // Reinstall a changed field list while retaining the process's cached IDs.
-  fakeFetch({
-    [`GET ${API}/myself`]: { json: {} },
-    [FIELDS]: { json: [selectField("new", "AI-Implement Status"), selectField("repo", "AI-Implement Repo")] },
-    [`GET ${API}/field/new/context`]: { status: 404 },
-    [`GET ${API}/field/repo/context`]: { status: 404 },
-    [SEARCH]: { json: { issues: [] } },
-  }).install();
-  const m = makeMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project=X", repoFieldValue: "repo", profilesFieldOverride: "profiles", baseBranchFieldOverride: "branch" } });
-  const facts = await makeProvider({ cacheScope: "drift", mappings: { X: m } }).fetchSetupFacts(["X"]);
-  expect(facts.mappings.X.fields?.statusFieldId).toBe("new");
-  expect(facts.mappings.X.cachedFields?.statusFieldId).toBe("old");
-  expect(facts.mappings.X.statusNotSelect).toBe(true);
-  expect(fake.calls).toHaveLength(1);
-});
+  it("records a Jira it cannot reach with a null status", async () => {
+    fakeFetch({ [CREDENTIALS]: () => { throw new TypeError("fetch failed"); } }).install();
+    const facts = await makeProvider({ cacheScope: "unreachable", mappings: {} }).fetchSetupFacts([]);
+    expect(facts).toMatchObject({ kind: "jira", credentials: "refused", status: null });
+  });
 
-it.each(["AI-Implement Status", "AI-Implement Repo"].flatMap((name) =>
-  ["missing", "duplicate"].map((fault) => ({ name, fault })),
-))("isolates $fault required field $name", async ({ name, fault }) => {
-  const other = name === "AI-Implement Status" ? "AI-Implement Repo" : "AI-Implement Status";
-  const listed = [selectField("other", other), ...(fault === "duplicate" ? [selectField("a", name), selectField("b", name)] : [])];
-  fakeFetch({
-    [`GET ${API}/myself`]: { json: {} },
-    [FIELDS]: { json: listed },
-    [`GET ${API}/field/customfield_10100/context`]: { json: { values: [] } },
-    [`GET ${API}/field/customfield_10101/context`]: { status: 404 },
-    [SEARCH]: { json: { issues: [] } },
-  }).install();
-  const cfg = { kind: "jira" as const, jql: "project=X", repoFieldValue: "repo" };
-  const facts = await makeProvider({ cacheScope: "isolation", mappings: {
-    BAD: makeMapping({ ticketingProvider: "jira", ticketingConfig: cfg }),
-    GOOD: makeMapping({ ticketingProvider: "jira", ticketingConfig: { ...cfg, ...ALL_OVERRIDES } }),
-  } }).fetchSetupFacts(["BAD", "GOOD"]);
-  expect(facts.mappings.BAD.fieldError).toBe(fault === "missing"
-    ? `Error: Custom field "${name}" not found in Jira instance`
-    : `Error: Multiple custom fields named "${name}" — set explicit ID override`);
-  expect(facts.mappings.BAD.fields).toBeUndefined();
-  expect(facts.mappings.GOOD.queryOk).toBe(true);
-});
+  it("records OAuth mode, whose access token the client never refreshes", async () => {
+    fakeFetch({ [CREDENTIALS]: readableProject()[CREDENTIALS] }).install();
+    const facts = await makeProvider({ cacheScope: "oauth", mappings: {}, oauth: true }).fetchSetupFacts([]);
+    expect(facts).toEqual({ kind: "jira", credentials: "accepted", oauth: true, projects: {} });
+  });
 
+  it("compares the fresh field IDs with the ones the poll cached before the fields changed", async () => {
+    const { getCachedFieldIds } = await import("../../providers/jira-fields.js");
+    const overrides = { statusOverride: null, repoOverride: "customfield_10101", profilesOverride: "customfield_10200", baseBranchOverride: "customfield_10300" };
+    fakeFetch({ [FIELDS]: { json: [selectField("customfield_1", "AI-Implement Status")] } }).install();
+    await getCachedFieldIds("drift", stubClient(), overrides);
+    fakeFetch({
+      ...readableProject(),
+      [FIELDS]: { json: [selectField("customfield_10100", "AI-Implement Status")] },
+    }).install();
 
-it.each([
-  ["AI-Implement Profiles", "profilesFieldId"],
-  ["AI-Implement Base Branch", "baseBranchFieldId"],
-] as const)("resolves ambiguous optional %s with its feature off", async (name, fieldId) => {
-  fakeFetch({
-    [`GET ${API}/myself`]: { json: {} },
-    [FIELDS]: { json: [
-      selectField("status", "AI-Implement Status"), selectField("repo", "AI-Implement Repo"),
-      selectField("optional_a", name), selectField("optional_b", name),
-    ] },
-    [`GET ${API}/field/status/context`]: { json: { values: [] } },
-    [`GET ${API}/field/repo/context`]: { status: 404 },
-    [SEARCH]: { json: { issues: [] } },
-  }).install();
-  const facts = await makeProvider({ cacheScope: "optional-ambiguity", mappings: {
-    X: makeMapping({ ticketingProvider: "jira", ticketingConfig: { kind: "jira", jql: "project=X", repoFieldValue: "repo" } }),
-  } }).fetchSetupFacts(["X"]);
-  expect(facts.mappings.X.ambiguousOptional).toEqual([name]);
-  expect(facts.mappings.X.fields?.[fieldId]).toBeNull();
-  expect(facts.mappings.X.fieldError).toBeUndefined();
-  expect(facts.mappings.X.queryOk).toBe(true);
+    const facts = await makeProvider({ cacheScope: "drift", mappings: {
+      X: jiraMapping({ repoFieldOverride: "customfield_10101", profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300" }),
+    } }).fetchSetupFacts(["X"]);
+
+    expect(facts).toMatchObject({ projects: { X: { fields: "resolved", ids: { statusFieldId: "customfield_10100" }, cachedIds: { statusFieldId: "customfield_1" } } } });
+  });
+
+  it.each([
+    ["AI-Implement Status", "missing"],
+    ["AI-Implement Status", "duplicate"],
+    ["AI-Implement Repo", "missing"],
+    ["AI-Implement Repo", "duplicate"],
+  ] as const)("records %s %s by name, and still reads a project that overrides it", async (name, fault) => {
+    const other = name === "AI-Implement Status" ? "AI-Implement Repo" : "AI-Implement Status";
+    const listed = [selectField("customfield_9", other), ...(fault === "duplicate" ? [selectField("customfield_7", name), selectField("customfield_8", name)] : [])];
+    fakeFetch({ ...readableProject(), [FIELDS]: { json: listed } }).install();
+
+    const facts = await makeProvider({ cacheScope: "isolation", mappings: { BAD: jiraMapping(), GOOD: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["BAD", "GOOD"]);
+
+    expect(facts).toMatchObject({ projects: { BAD: { fields: "unresolved", field: name, fault }, GOOD: { fields: "resolved", jql: { accepted: true } } } });
+  });
+
+  it("records a field list Jira refuses as unreadable, which a project with every field overridden never asks for", async () => {
+    fakeFetch({ ...readableProject(), [FIELDS]: jiraError(403, "forbidden") }).install();
+    const facts = await makeProvider({ cacheScope: "unreadable", mappings: { LISTS: jiraMapping(), OVERRIDES: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["LISTS", "OVERRIDES"]);
+    expect(facts).toMatchObject({ projects: { LISTS: { fields: "unreadable", failure: { status: 403 } }, OVERRIDES: { fields: "resolved" } } });
+  });
+
+  it.each([
+    ["AI-Implement Profiles", "profilesFieldId"],
+    ["AI-Implement Base Branch", "baseBranchFieldId"],
+  ] as const)("records an optional field named %s twice, leaving it off", async (name, fieldId) => {
+    fakeFetch({
+      ...readableProject(),
+      [FIELDS]: { json: [
+        selectField("customfield_10100", "AI-Implement Status"), selectField("customfield_10101", "AI-Implement Repo"),
+        selectField("customfield_1", name), selectField("customfield_2", name),
+      ] },
+    }).install();
+    const facts = await makeProvider({ cacheScope: "ambiguous", mappings: { X: jiraMapping() } }).fetchSetupFacts(["X"]);
+    expect(facts).toMatchObject({ projects: { X: { fields: "resolved", ambiguousOptional: [name], ids: { [fieldId]: null } } } });
+  });
+
+  it("records an optional field as ambiguous only when several fields share its name and no override picks one", async () => {
+    fakeFetch({
+      ...readableProject(),
+      [FIELDS]: { json: [
+        selectField("customfield_10100", "AI-Implement Status"), selectField("customfield_10101", "AI-Implement Repo"),
+        selectField("customfield_1", "AI-Implement Profiles"), selectField("customfield_2", "AI-Implement Profiles"),
+        selectField("customfield_3", "AI-Implement Base Branch"),
+      ] },
+    }).install();
+
+    const facts = await makeProvider({ cacheScope: "optional", mappings: {
+      NAMES: jiraMapping(),
+      PICKED: jiraMapping({ profilesFieldOverride: "customfield_2" }),
+    } }).fetchSetupFacts(["NAMES", "PICKED"]);
+
+    expect(facts).toMatchObject({ projects: {
+      NAMES: { ambiguousOptional: ["AI-Implement Profiles"], ids: { baseBranchFieldId: "customfield_3" } },
+      PICKED: { ambiguousOptional: [], ids: { profilesFieldId: "customfield_2" } },
+    } });
+  });
+
+  it("throws an error that is neither a refused field list nor a field fault, so the run reports it", async () => {
+    const fields = await import("../../providers/jira-fields.js");
+    const resolve = vi.spyOn(fields, "resolveCustomFieldIds").mockRejectedValue(new TypeError("unexpected"));
+    onTestFinished(() => resolve.mockRestore());
+    fakeFetch({ [CREDENTIALS]: readableProject()[CREDENTIALS] }).install();
+
+    await expect(makeProvider({ cacheScope: "unexpected", mappings: { X: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["X"]))
+      .rejects.toThrow("unexpected");
+  });
+
+  it("records an option read Jira refuses, and the JQL it refuses, each with Jira's status", async () => {
+    fakeFetch({
+      ...readableProject(),
+      [STATUS_CONTEXTS]: jiraError(403, "forbidden"),
+      [SEARCH]: jiraError(400, "Error in the JQL Query"),
+    }).install();
+    const facts = await makeProvider({ cacheScope: "refusals", mappings: { X: jiraMapping(ALL_OVERRIDES) } }).fetchSetupFacts(["X"]);
+    expect(facts).toMatchObject({ projects: { X: {
+      statusOptions: { read: "failed", failure: { status: 403 } },
+      jql: { accepted: false, failure: { status: 400 } },
+    } } });
+  });
+
+  it("reads only the Jira projects it is asked for", async () => {
+    fakeFetch(readableProject()).install();
+    const facts = await makeProvider({ cacheScope: "scope", mappings: { X: jiraMapping(ALL_OVERRIDES), L: makeMapping({ ticketingProvider: "linear" }) } }).fetchSetupFacts(["X", "L"]);
+    expect(facts).toMatchObject({ credentials: "accepted" });
+    expect(facts.credentials === "accepted" && Object.keys(facts.projects)).toEqual(["X"]);
+  });
 });

@@ -1,14 +1,23 @@
 /** Checks of each project's tracker: the `tracker` group. Each judges the facts its provider reads once per run (`fetchSetupFacts`). */
 
 import { LINEAR_LABELS, reusableLabel } from "../providers/linear.js";
-import { STATUS_VALUES } from "../providers/jira-fields.js";
-import type { JiraMappingSetupFacts } from "../providers/types.js";
-import type { LinearSetupFacts } from "../providers/types.js";
+import {
+  BASE_BRANCH_FIELD_NAME,
+  PROFILES_FIELD_NAME,
+  REPO_FIELD_NAME,
+  STATUS_FIELD_NAME,
+  STATUS_VALUES,
+  type ResolvedFieldIds,
+} from "../providers/jira-fields.js";
+import type { JiraFieldOptions, JiraProjectSetupFacts, JiraSetupFacts, LinearSetupFacts } from "../providers/types.js";
 import type { SetupCheck, SetupCheckContext, SetupCheckOutcome } from "./index.js";
 
 type MintedLinearFacts = Extract<LinearSetupFacts, { token: "minted" }>;
+type AcceptedJiraFacts = Extract<JiraSetupFacts, { credentials: "accepted" }>;
+type ResolvedJiraProject = Extract<JiraProjectSetupFacts, { fields: "resolved" }>;
 
 const NO_LINEAR_PROJECT: SetupCheckOutcome[] = [{ state: "not-applicable", detail: "No project uses Linear" }];
+const NO_JIRA_PROJECT: SetupCheckOutcome[] = [{ state: "not-applicable", detail: "No project uses Jira" }];
 
 /** The keys of the projects whose tracker is `providerId`. For Linear, each is its team's key. */
 function projectsOn(ctx: SetupCheckContext, providerId: string): string[] {
@@ -45,72 +54,79 @@ function labelsInScope(facts: MintedLinearFacts, name: string, team: string) {
   return facts.labels[name].filter((label) => label.teamKey === null || label.teamKey === team);
 }
 
-const jiraWrites: Record<string, string> = {
-  Ready: "poll bucket pickup", Planning: "markPlanningStarted", "Awaiting Approval": "markPlanComplete",
-  "Plan Approved": "markPlanComplete and clearWorkingState", Implementing: "markImplementing",
-  "PR Ready": "markPrReady", Merged: "markMerged", "Planning Failed": "markPlanningFailed", "Implementation Failed": "markImplementationFailed",
-};
-const jiraFix = "Check JIRA_TOKEN and JIRA_SITE_URL, and JIRA_EMAIL for Basic auth or JIRA_CLOUD_ID for OAuth; use Basic auth with an API token for a long-lived setup. Restart after changing variables and check that the orchestrator can reach Jira.";
-const blocked = (check: string): SetupCheckOutcome => ({ state: "cannot-verify", detail: "Required facts could not be read", fix: `Clear ${check} first.` });
-
-function judgeJiraRow(id: string, row: JiraMappingSetupFacts): SetupCheckOutcome {
-  if (id === "fields") {
-    if (row.fieldReadFailed) return { state: "cannot-verify", detail: row.fieldError ?? "The field list could not be read", fix: "Clear tracker.jira.credentials first; allow the account to list Jira fields." };
-    if (row.fieldError) return { state: "fail", detail: row.fieldError, fix: "Create or rename AI-Implement Status and AI-Implement Repo, or set statusFieldOverride or repoFieldOverride to the field's ID." };
-    if (row.ambiguousOptional.length) return { state: "warn", detail: `${row.ambiguousOptional.join(", ")} resolves to several fields; the feature stays off`, fix: "Rename the fields or set profilesFieldOverride or baseBranchFieldOverride to the field's ID." };
-    return { state: "pass", detail: "Required fields resolve" };
+/** Judges Jira's facts once Jira accepts the credentials, or says why they cannot be read. */
+async function judgeJira(
+  ctx: SetupCheckContext,
+  judge: (facts: AcceptedJiraFacts, projects: string[]) => SetupCheckOutcome[],
+): Promise<SetupCheckOutcome[]> {
+  const projects = projectsOn(ctx, "jira");
+  if (projects.length === 0) return NO_JIRA_PROJECT;
+  const facts = await ctx.trackerSetupFacts("jira");
+  if (facts === null || facts.kind !== "jira") return [{ state: "cannot-verify", detail: "The Jira provider reads no setup facts", fix: "Check the projects' fields and JQL by hand." }];
+  if (facts.credentials === "refused") {
+    return [{ state: "cannot-verify", detail: "Jira did not accept the credentials, so this cannot be read", fix: "Clear tracker.jira.credentials first." }];
   }
-  if (!row.fields) return blocked("tracker.jira.fields");
-  if (id === "field-cache") {
-    const drift = row.cachedFields && [...new Set([...Object.keys(row.fields), ...Object.keys(row.cachedFields)])].some((key) => row.fields![key as keyof typeof row.fields] !== row.cachedFields![key as keyof typeof row.cachedFields]);
-    return drift ? { state: "warn", detail: "Fresh field IDs differ from the IDs cached by this process", fix: "Restart the orchestrator so the poll uses the current fields." } : { state: "pass", detail: "No cached field IDs differ from the fresh resolution" };
-  }
-  if (id === "status-options") {
-    if (row.statusNotSelect) return { state: "fail", detail: "AI-Implement Status is not a select field", fix: "Create a select field and set statusFieldOverride to its ID." };
-    if (row.statusError || !row.statusOptions) return { state: "cannot-verify", detail: row.statusError ?? "Status options could not be read", fix: "Clear tracker.jira.fields first; allow the account to read field contexts and options." };
-    const missing = Object.values(STATUS_VALUES).filter((v) => !(v === "Awaiting Approval" && row.autoApprovePlans) && !row.statusOptions!.includes(v));
-    return missing.length ? { state: "fail", detail: missing.map((v) => `${v} is missing, breaking ${jiraWrites[v]}`).join("; "), fix: `Add these options to AI-Implement Status, spelled exactly: ${missing.join(", ")}.` } : { state: "pass", detail: "Every status option used by this mapping exists" };
-  }
-  if (id === "repo-option") {
-    if (row.repoNotSelect) return { state: "not-applicable", detail: "The repo field is a text field" };
-    if (row.repoError || !row.repoOptions) return { state: "cannot-verify", detail: row.repoError ?? "Repo options could not be read", fix: "Clear tracker.jira.fields first; allow the account to read field contexts and options." };
-    return row.repoOptions.includes(row.repoFieldValue) ? { state: "pass", detail: "The repo option matches the mapping" } : { state: "fail", detail: `The repo field has no option equal to ${row.repoFieldValue}`, fix: `Add the option ${row.repoFieldValue}, spelled exactly, or correct the mapping's repoFieldValue.` };
-  }
-  if (row.queryUnreachable) return { state: "cannot-verify", detail: row.queryError ?? "Jira could not be reached for the bucket query", fix: "Clear tracker.jira.credentials first and check Jira connectivity." };
-  return row.queryOk ? { state: "pass", detail: "The poll's bucket query succeeds" } : { state: "fail", detail: `Jira refused the bucket query: ${row.queryError}`, fix: "Correct the mapping's JQL." };
+  return judge(facts, projects);
 }
 
-const JIRA_CHECKS: SetupCheck[] = ["credentials", "fields", "field-cache", "status-options", "repo-option", "query"].map((id): SetupCheck => ({
-  id: `tracker.jira.${id}` as SetupCheck["id"], title: `Jira ${id}`, group: "tracker", tier: "core", onAdminPath: false,
-  run: async (ctx) => {
-    const projects = projectsOn(ctx, "jira");
-    if (!projects.length) return [{ state: "not-applicable", detail: "No project uses Jira" }];
-    const facts = await ctx.trackerSetupFacts("jira").catch(() => null);
-    if (id === "credentials") {
-      if (facts?.kind !== "jira") return [blocked("tracker.provider")];
-      if (!facts.credentials.ok) return [{ state: facts.credentials.status == null ? "cannot-verify" : "fail", detail: `Jira credentials check: ${facts.credentials.status == null ? facts.credentials.error : `HTTP ${facts.credentials.status}`}`, fix: jiraFix }];
-      return [{ state: facts.oauth ? "warn" : "pass", detail: facts.oauth ? "OAuth access tokens are never refreshed" : "Jira accepted the Basic auth credentials", ...(facts.oauth ? { fix: jiraFix } : {}) }];
-    }
-    return projects.map((project) => ({ project, ...(facts?.kind !== "jira" ? blocked("tracker.provider") : !facts.credentials.ok ? blocked("tracker.jira.credentials") : !facts.mappings[project] ? blocked("tracker.provider") : judgeJiraRow(id, facts.mappings[project])) }));
-  },
-}));
+/** One outcome per project, `cannot-verify` where the project's fields cannot be found. */
+function perResolvedProject(
+  facts: AcceptedJiraFacts,
+  projects: string[],
+  judge: (project: ResolvedJiraProject, key: string) => SetupCheckOutcome,
+): SetupCheckOutcome[] {
+  return projects.map((key): SetupCheckOutcome => {
+    const project = facts.projects[key];
+    return {
+      ...(project?.fields === "resolved"
+        ? judge(project, key)
+        : { state: "cannot-verify", detail: "This project's Jira fields cannot be found, so this cannot be read", fix: "Clear tracker.jira.fields first." }),
+      project: key,
+    };
+  });
+}
 
-const FILESYSTEM_CHECK: SetupCheck = {
-  id: "tracker.filesystem.directory", title: "Filesystem directory", group: "tracker", tier: "mode", onAdminPath: false,
-  run: async (ctx) => {
-    const projects = projectsOn(ctx, "filesystem");
-    if (!projects.length) return [{ state: "not-applicable", detail: "No project uses Filesystem" }];
-    const facts = await ctx.trackerSetupFacts("filesystem").catch(() => null);
-    return projects.map((project) => {
-      const row = facts?.kind === "filesystem" ? facts.directories[project] : undefined;
-      return { project, ...(!row ? blocked("tracker.provider") : row.error ? { state: "fail" as const, detail: `${row.directory} ${row.error}`, fix: "Create the directory or fix its permissions; the orchestrator needs to write .state/ and the completed/ and failed/ archives into it." } : { state: "pass" as const, detail: `${row.directory} is a writable directory` }) };
-    });
-  },
+/** Each Jira field's setting on a project's ticketing settings, as the admin UI labels it. */
+const FIELD_SETTING: Record<string, string> = {
+  [STATUS_FIELD_NAME]: "Status Field",
+  [REPO_FIELD_NAME]: "Repo Field",
+  [PROFILES_FIELD_NAME]: "Profiles Field",
+  [BASE_BRANCH_FIELD_NAME]: "Base Branch Field",
 };
 
+/** What each optional field feeds, which stays off while its name matches several fields. */
+const OPTIONAL_FEATURE: Record<string, string> = {
+  [PROFILES_FIELD_NAME]: "issue profiles",
+  [BASE_BRANCH_FIELD_NAME]: "per-issue base branches",
+};
+
+/** What stops working while the status field lacks each option. */
+const MISSING_STATUS_OPTION: Record<string, string> = {
+  [STATUS_VALUES.READY]: "no issue can be queued for the orchestrator, and a stopped planning run cannot return its issue to the queue",
+  [STATUS_VALUES.PLANNING]: "the issue does not show that planning started",
+  [STATUS_VALUES.AWAITING_APPROVAL]: "a finished plan cannot be recorded, so its run fails",
+  [STATUS_VALUES.APPROVED]: "a plan cannot be approved, and a stopped implementation run cannot return its issue to the queue",
+  [STATUS_VALUES.IMPLEMENTING]: "the issue does not show that implementation started",
+  [STATUS_VALUES.PR_READY]: "the issue does not show its pull request, and the pull request comment is not posted",
+  [STATUS_VALUES.MERGED]: "a merged pull request never completes its issue",
+  [STATUS_VALUES.PLANNING_FAILED]: "a failed plan is not reported on the issue, and a planning run the orchestrator gives up on is not set aside for a person",
+  [STATUS_VALUES.IMPLEMENTATION_FAILED]: "a failed implementation is not reported on the issue, and an implementation run the orchestrator gives up on is not set aside for a person",
+};
+
+function sameFieldIds(a: ResolvedFieldIds, b: ResolvedFieldIds): boolean {
+  return (["statusFieldId", "repoFieldId", "profilesFieldId", "baseBranchFieldId", "epicLinkFieldId"] as const).every((key) => a[key] === b[key]);
+}
+
+/** A field's options that could not be read, so whatever the check would judge is unknown. Jira shows them only to a Jira administrator, which the poll's account never needs to be. */
+function unreadOptions(options: Extract<JiraFieldOptions, { read: "failed" }>, field: string): SetupCheckOutcome {
+  return {
+    state: "cannot-verify",
+    detail: `Jira did not return the ${field}'s options: ${options.failure.error}`,
+    fix: "Reading a field's options needs the Jira account to hold the Administer Jira global permission. Grant it, or compare the options with this project's settings by hand.",
+  };
+}
+
 export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
-  ...JIRA_CHECKS,
-  FILESYSTEM_CHECK,
   {
     id: "tracker.provider",
     title: "Tracker providers",
@@ -238,5 +254,201 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
         fix: `Add a ${missing.join(" and a ")} state to the team's workflow in Linear.`,
       };
     })),
+  },
+  {
+    id: "tracker.jira.credentials",
+    title: "Jira credentials",
+    group: "tracker",
+    tier: "core",
+    onAdminPath: false,
+    run: async (ctx) => {
+      if (projectsOn(ctx, "jira").length === 0) return NO_JIRA_PROJECT;
+      const facts = await ctx.trackerSetupFacts("jira");
+      if (facts === null || facts.kind !== "jira") return [{ state: "cannot-verify", detail: "The Jira provider reads no setup facts", fix: "Check the credentials by hand." }];
+      if (facts.credentials === "refused") {
+        if (facts.status === null) {
+          return [{
+            state: "cannot-verify",
+            detail: `Jira could not be reached: ${facts.error}`,
+            fix: "Check that the orchestrator can reach JIRA_SITE_URL, or api.atlassian.com in OAuth mode.",
+          }];
+        }
+        return [{
+          state: "fail",
+          detail: `Jira refused the credentials with HTTP ${facts.status}`,
+          fix: "Check JIRA_TOKEN, and JIRA_EMAIL in Basic mode or JIRA_CLOUD_ID in OAuth mode, then restart the orchestrator, which reads them only at boot.",
+        }];
+      }
+      if (facts.oauth) {
+        return [{
+          state: "fail",
+          detail: "Jira accepted the OAuth access token, but it expires within an hour and the orchestrator never refreshes it, so every Jira call fails after that",
+          fix: "Use Basic mode: set JIRA_EMAIL to the account's address and JIRA_TOKEN to an API token, then restart the orchestrator.",
+        }];
+      }
+      return [{ state: "pass", detail: "Jira accepted the credentials" }];
+    },
+  },
+  {
+    id: "tracker.jira.fields",
+    title: "Jira fields",
+    group: "tracker",
+    tier: "core",
+    onAdminPath: false,
+    run: (ctx) => judgeJira(ctx, (facts, projects) => projects.map((key): SetupCheckOutcome => {
+      const project = facts.projects[key];
+      if (project.fields === "unreadable") {
+        return {
+          project: key,
+          state: "cannot-verify",
+          detail: `Jira did not list its fields: ${project.failure.error}`,
+          fix: "Check that the Jira account can list fields, then run the checks again.",
+        };
+      }
+      if (project.fields === "unresolved") {
+        return {
+          project: key,
+          state: "fail",
+          detail: project.fault === "missing"
+            ? `No field named ${project.field} exists in Jira, so every Jira project sits out the poll`
+            : `Several fields are named ${project.field} in Jira, so every Jira project sits out the poll`,
+          fix: project.fault === "missing"
+            ? `Create a field named exactly ${project.field} in Jira, or pick the field to use as the project's ${FIELD_SETTING[project.field]} on /admin#projects.`
+            : `Rename the extra fields in Jira, or pick the one to use as the project's ${FIELD_SETTING[project.field]} on /admin#projects.`,
+        };
+      }
+      if (project.ambiguousOptional.length > 0) {
+        const names = project.ambiguousOptional;
+        return {
+          project: key,
+          state: "warn",
+          detail: `Several fields are named ${names.join(" and ")} in Jira, so this project reads no ${names.map((name) => OPTIONAL_FEATURE[name]).join(" or ")}`,
+          fix: `Rename the extra fields in Jira, or pick the one to use as the project's ${names.map((name) => FIELD_SETTING[name]).join(" and ")} on /admin#projects.`,
+        };
+      }
+      return { project: key, state: "pass", detail: "Jira has the fields this project uses" };
+    })),
+  },
+  {
+    id: "tracker.jira.field-cache",
+    title: "Jira field cache",
+    group: "tracker",
+    tier: "core",
+    onAdminPath: false,
+    run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project) => {
+      if (project.cachedIds === null || sameFieldIds(project.ids, project.cachedIds)) {
+        return { state: "pass", detail: "The poll uses this project's current field IDs" };
+      }
+      return {
+        state: "warn",
+        detail: "The poll still uses field IDs it read before this project's fields changed in Jira",
+        fix: "Restart the orchestrator so the poll reads the current fields.",
+      };
+    })),
+  },
+  {
+    id: "tracker.jira.status-options",
+    title: "Jira status options",
+    group: "tracker",
+    tier: "core",
+    onAdminPath: false,
+    run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project, key) => {
+      const options = project.statusOptions;
+      if (options.read === "failed") return unreadOptions(options, "status field");
+      if (options.read === "not-select") {
+        return {
+          state: "fail",
+          detail: "The project's status field is not a select field, so the orchestrator cannot set an issue's status",
+          fix: `Create a single-select field named exactly ${STATUS_FIELD_NAME} in Jira, or pick one as the project's Status Field on /admin#projects.`,
+        };
+      }
+      const autoApprove = ctx.mappings()[key].autoApprovePlans ?? false;
+      const missing = Object.values(STATUS_VALUES).filter((value) =>
+        !(value === STATUS_VALUES.AWAITING_APPROVAL && autoApprove) && !options.values.includes(value));
+      if (missing.length === 0) return { state: "pass", detail: "The status field has every option this project uses" };
+      return {
+        state: "fail",
+        detail: `The status field is missing ${missing.join(", ")}. ${missing.map((value) => `Without ${value}, ${MISSING_STATUS_OPTION[value]}.`).join(" ")}`,
+        fix: `Add ${missing.join(", ")} to the status field's options in Jira, spelled exactly.`,
+      };
+    })),
+  },
+  {
+    id: "tracker.jira.repo-option",
+    title: "Jira repo option",
+    group: "tracker",
+    tier: "core",
+    onAdminPath: false,
+    run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project, key) => {
+      const options = project.repoOptions;
+      if (options.read === "failed") return unreadOptions(options, "repo field");
+      if (options.read === "not-select") return { state: "not-applicable", detail: "The repo field is a text field, so it has no options to check" };
+      const config = ctx.mappings()[key].ticketingConfig;
+      const value = config.kind === "jira" ? config.repoFieldValue : "";
+      if (options.values.includes(value)) return { state: "pass", detail: `The repo field has the option ${value}` };
+      return {
+        state: "fail",
+        detail: `The repo field has no ${value} option, so the poll finds none of this project's issues`,
+        fix: `Add ${value} to the repo field's options in Jira, spelled exactly, or correct the project's Repo Field Value on /admin#projects.`,
+      };
+    })),
+  },
+  {
+    id: "tracker.jira.jql",
+    title: "Jira JQL",
+    group: "tracker",
+    tier: "core",
+    onAdminPath: false,
+    run: (ctx) => judgeJira(ctx, (facts, projects) => perResolvedProject(facts, projects, (project) => {
+      if (project.jql.accepted) return { state: "pass", detail: "Jira runs the project's JQL as the poll runs it" };
+      const { status, error } = project.jql.failure;
+      if (status === null) {
+        return {
+          state: "cannot-verify",
+          detail: `Jira could not be reached to run the project's JQL: ${error}`,
+          fix: "Check that the orchestrator can reach Jira, then run the checks again.",
+        };
+      }
+      return {
+        state: "fail",
+        detail: `Jira refused the project's JQL as the poll runs it, with HTTP ${status}: ${error}`,
+        fix: "Correct the project's JQL on /admin#projects. The poll adds its own status filter, so the JQL needs none.",
+      };
+    })),
+  },
+  {
+    id: "tracker.filesystem.directory",
+    title: "Filesystem ticket directory",
+    group: "tracker",
+    tier: "mode",
+    onAdminPath: false,
+    run: async (ctx) => {
+      const projects = projectsOn(ctx, "filesystem");
+      if (projects.length === 0) return [{ state: "not-applicable", detail: "No project uses Filesystem" }];
+      const facts = await ctx.trackerSetupFacts("filesystem");
+      if (facts === null || facts.kind !== "filesystem") {
+        return [{ state: "cannot-verify", detail: "The Filesystem provider reads no setup facts", fix: "Check each project's ticket directory by hand." }];
+      }
+      return projects.map((key): SetupCheckOutcome => {
+        const { directory, fault } = facts.directories[key];
+        if (fault === "missing") {
+          return {
+            project: key,
+            state: "fail",
+            detail: `${directory} does not exist or is not a directory, so the poll finds no tickets for this project`,
+            fix: "Create the directory, or correct the project's Ticket Directory on /admin#projects.",
+          };
+        }
+        if (fault === "not-writable") {
+          return {
+            project: key,
+            state: "fail",
+            detail: `The orchestrator cannot create files in ${directory}, so it cannot record ticket state or archive finished tickets`,
+            fix: "Give the orchestrator's user write and search permission on the directory.",
+          };
+        }
+        return { project: key, state: "pass", detail: `${directory} is a directory the orchestrator can write to` };
+      });
+    },
   },
 ];
