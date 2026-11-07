@@ -115,15 +115,7 @@ import { handleMcpRequest } from "./mcp.js";
 import { resolveMemoryProvider, providerUnconfiguredReason, SidecarMemoryProvider, REQUIRED_KG_TOOL_COUNT, BOOT_PROBE_TIMEOUT_MS, probeWithTimeout, sidecarHealthFields, setKgMemoryProvider } from "./kg-provider.js";
 import type { MemoryProvider } from "./kg-provider.js";
 import { parseHealthPort, withRequestErrorBoundary } from "./http-server.js";
-import {
-  initMcpOAuthTables,
-  handleMcpProtectedResourceMetadata,
-  handleMcpAuthorizationServerMetadata,
-  handleMcpClientRegistration,
-  handleMcpAuthorize,
-  handleMcpOidcCallback,
-  handleMcpTokenRequest,
-} from "./mcp-oauth.js";
+import { initMcpOAuthTables, routeMcpOAuth } from "./mcp-oauth.js";
 import { preparePlanningLaunch, launchPlanningRun, launchPlanningSession } from "./planning-launch.js";
 import { prepareImplementationLaunch, launchImplementationRun, launchImplementationFlySession, launchImplementationLocalSession } from "./implementation-launch.js";
 import {
@@ -4720,76 +4712,9 @@ function startServer(
       return;
     }
 
-    // MCP well-known metadata endpoints (public — no auth required)
-    if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
-      return;
-    }
-    if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
-      return;
-    }
-
-    // MCP OAuth routes — dynamic client registration, authorization, token exchange
-    if (pathname.startsWith("/mcp/")) {
-      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
-        return;
-      }
-      if (pathname === "/mcp/register" && req.method === "POST") {
-        handleMcpClientRegistration(req, res).catch((err) => {
-          console.error("[mcp-oauth] register error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      if (pathname === "/mcp/authorize" && req.method === "GET") {
-        handleMcpAuthorize(req, res, config.oauthRedirectBaseUrl).catch((err) => {
-          console.error("[mcp-oauth] authorize error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
-      if (callbackMatch && req.method === "GET") {
-        const [, providerId] = callbackMatch;
-        handleMcpOidcCallback(req, res, providerId, config.oauthRedirectBaseUrl).catch((err) => {
-          console.error("[mcp-oauth] callback error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-      if (pathname === "/mcp/token" && req.method === "POST") {
-        handleMcpTokenRequest(req, res).catch((err) => {
-          console.error("[mcp-oauth] token error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-    }
+    // MCP well-known metadata and OAuth routes (public — no auth required): dynamic client
+    // registration, authorization, OIDC callback, token exchange.
+    if (routeMcpOAuth(req, res, pathname, config.oauthRedirectBaseUrl)) return;
 
     // MCP endpoint — OAuth bearer token authenticated. The six write tools used to be wired
     // in here as bound closures over this request's config/registry; AII-713 moved them onto
