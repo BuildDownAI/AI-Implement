@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { LinearSetupFacts } from "../../providers/types.js";
 import type { SetupCheckContext, SetupCheckId, SetupCheckOutcome } from "../../setup-checks/index.js";
 import { TRACKER_CONFIG_CHECKS } from "../../setup-checks/tracker-config.js";
@@ -8,7 +8,16 @@ import { makeLinearSetupFacts, makeSetupCheckContext } from "../helpers/fixtures
 async function run(id: SetupCheckId, overrides: Partial<SetupCheckContext> = {}): Promise<SetupCheckOutcome[]> {
   const check = TRACKER_CONFIG_CHECKS.find((c) => c.id === id);
   if (!check) throw new Error(`no check ${id}`);
-  return check.run(makeSetupCheckContext(overrides));
+  const outcomes = await check.run(makeSetupCheckContext(overrides));
+  if (id.startsWith("tracker.jira.") || id === "tracker.filesystem.directory") {
+    for (const outcome of outcomes) expect(`${outcome.detail} ${outcome.fix}`).not.toMatch(/docs\//);
+    if (!id.endsWith(".credentials") && outcomes.some((o) => o.state !== "not-applicable" || o.project)) {
+      expect(outcomes.map((o) => o.project)).toEqual(Object.entries(makeSetupCheckContext(overrides).mappings())
+        .filter(([, m]) => m.ticketingProvider === (id.startsWith("tracker.jira.") ? "jira" : "filesystem"))
+        .map(([key]) => key));
+    }
+  }
+  return outcomes;
 }
 
 /** One Linear project per key, each its team's key, reading `facts`. */
@@ -228,5 +237,118 @@ describe("tracker.linear.workflow-states", () => {
   ])("fails a team whose states are %j", async (types, detail, fix) => {
     const facts = makeLinearSetupFacts({ teams: { ENG: types } });
     expect(await run("tracker.linear.workflow-states", onLinear(facts))).toEqual([{ project: "ENG", state: "fail", detail, fix }]);
+  });
+});
+
+describe("Jira setup", () => {
+  const options = ["Ready", "Planning", "Awaiting Approval", "Plan Approved", "Implementing", "PR Ready", "Merged", "Planning Failed", "Implementation Failed"];
+  const writes = ["poll bucket pickup", "markPlanningStarted", "markPlanComplete", "clearWorkingState", "markImplementing", "markPrReady", "markMerged", "markPlanningFailed", "markImplementationFailed"];
+  const row = () => ({ fields: { statusFieldId: "s", repoFieldId: "r", profilesFieldId: null, baseBranchFieldId: null }, ambiguousOptional: [] as string[], statusOptions: options, repoOptions: ["repo"], repoFieldValue: "repo", autoApprovePlans: false, queryOk: true });
+  function context(rows = { A: row() }, credentials = { ok: true } as { ok: boolean; status?: number | null }, oauth = false): Partial<SetupCheckContext> {
+    return { mappings: () => Object.fromEntries(Object.keys(rows).map((k) => [k, makeMapping({ ticketingProvider: "jira" })])), trackerSetupFacts: async () => ({ kind: "jira", oauth, credentials, mappings: rows }) };
+  }
+  const ids = ["credentials", "fields", "field-cache", "status-options", "repo-option", "query"] as const;
+  async function check(id: typeof ids[number], ctx = context()) {
+    const outcomes = await run(`tracker.jira.${id}`, ctx);
+    for (const o of outcomes) expect(`${o.detail} ${o.fix}`).not.toMatch(/docs\//);
+    return outcomes;
+  }
+  it.each(options)("names missing option %s and its operation", async (option) => {
+    const r = row(); r.statusOptions = options.filter((v) => v !== option);
+    expect(await check("status-options", context({ A: r }))).toMatchObject([{ project: "A", state: "fail", detail: expect.stringContaining(writes[options.indexOf(option)]), fix: expect.stringContaining(option) }]);
+  });
+  it.each(ids.filter((id) => id !== "credentials"))("gates %s on credentials", async (id) => {
+    expect(await check(id, context(undefined, { ok: false, status: 401 }))).toMatchObject([{ project: "A", state: "cannot-verify", fix: expect.stringContaining("tracker.jira.credentials") }]);
+  });
+  it("judges credentials", async () => {
+    expect(await check("credentials", context(undefined, { ok: false, status: 403 }))).toMatchObject([{ state: "fail", detail: expect.stringContaining("403") }]);
+    expect(await check("credentials", context(undefined, { ok: false, status: null }))).toMatchObject([{ state: "cannot-verify" }]);
+    expect(await check("credentials", context(undefined, { ok: true }, true))).toMatchObject([{ state: "warn", fix: expect.stringContaining("JIRA_EMAIL") }]);
+  });
+  it.each(["AI-Implement Status", "AI-Implement Repo"].flatMap((name) =>
+    ["not found", "Multiple"].map((fault) => ({ name, fault })),
+  ))("judges $fault $name and isolates the mapping", async ({ name, fault }) => {
+    const bad = { ...row(), fields: undefined, fieldError: `${fault}: ${name}` };
+    const ctx = context({ A: bad, B: row() } as unknown as { A: ReturnType<typeof row> });
+    expect(await check("fields", ctx)).toMatchObject([
+      { project: "A", state: "fail", detail: expect.stringContaining(name),
+        fix: expect.stringMatching(/Create or rename.*statusFieldOverride or repoFieldOverride.*ID/) },
+      { project: "B", state: "pass" },
+    ]);
+    for (const id of ["status-options", "repo-option", "query"] as const) expect(await check(id, ctx)).toMatchObject([{ project: "A", state: "cannot-verify", fix: expect.stringContaining("tracker.jira.fields") }, { project: "B", state: "pass" }]);
+  });
+  it.each([
+    ["AI-Implement Profiles", "profilesFieldOverride"],
+    ["AI-Implement Base Branch", "baseBranchFieldOverride"],
+  ])("names the remediation for ambiguous %s", async (name, override) => {
+    const [outcome] = await check("fields", context({ A: { ...row(), ambiguousOptional: [name] } }));
+    expect(outcome).toMatchObject({ project: "A", state: "warn", detail: expect.stringContaining(name),
+      fix: expect.stringContaining(override) });
+    expect(outcome.detail).toContain("feature stays off");
+    expect(outcome.fix).toMatch(/Rename.*field's ID/);
+  });
+  it("judges feature ambiguity, cache drift, non-selects, query and repo failures", async () => {
+    const r = { ...row(), ambiguousOptional: ["AI-Implement Profiles"], cachedFields: { ...row().fields, statusFieldId: "old" }, statusNotSelect: true, repoNotSelect: true, queryOk: false, queryError: "HTTP 400 bad JQL" };
+    const ctx = context({ A: r });
+    expect(await check("field-cache", ctx)).toMatchObject([{ project: "A", state: "warn",
+      detail: expect.stringContaining("Fresh field IDs differ"), fix: "Restart the orchestrator so the poll uses the current fields." }]);
+    expect(await check("status-options", ctx)).toMatchObject([{ project: "A", state: "fail",
+      detail: "AI-Implement Status is not a select field", fix: "Create a select field and set statusFieldOverride to its ID." }]);
+    expect(await check("repo-option", ctx)).toMatchObject([{ project: "A", state: "not-applicable", detail: "The repo field is a text field" }]);
+    expect(await check("query", ctx)).toMatchObject([{ project: "A", state: "fail",
+      detail: "Jira refused the bucket query: HTTP 400 bad JQL", fix: "Correct the mapping's JQL." }]);
+    expect(await check("repo-option", context({ A: { ...row(), repoOptions: [] } }))).toMatchObject([{ state: "fail", fix: expect.stringContaining("repoFieldValue") }]);
+    expect(await check("status-options", context({ A: { ...row(), autoApprovePlans: true, statusOptions: options.filter((v) => v !== "Awaiting Approval") } }))).toMatchObject([{ state: "pass" }]);
+  });
+});
+
+it("judges every directory fault and names a fix without documentation paths", async () => {
+  for (const error of [undefined, "does not exist", "is not a directory", "is not writable"]) {
+    const outcomes = await run("tracker.filesystem.directory", {
+      mappings: () => ({ LOCAL: makeMapping({ ticketingProvider: "filesystem" }) }),
+      trackerSetupFacts: async () => ({ kind: "filesystem", directories: { LOCAL: { directory: "/tickets", error } } }),
+    });
+    expect(outcomes).toMatchObject([{ project: "LOCAL", state: error ? "fail" : "pass" }]);
+    for (const o of outcomes) expect(`${o.detail} ${o.fix}`).not.toMatch(/docs\//);
+    if (error) expect(outcomes[0].fix).toContain("permissions");
+  }
+});
+
+it("reports Jira ready when the provider supplies setup facts", async () => {
+  expect(await run("tracker.provider", {
+    mappings: () => ({ J: makeMapping({ ticketingProvider: "jira" }) }),
+    trackerProvider: async () => makeProvider({ id: "jira", fetchSetupFacts: async () => ({ kind: "jira", oauth: false, credentials: { ok: true }, mappings: {} }) }),
+  })).toMatchObject([{ state: "pass", detail: expect.stringContaining("jira provider is ready") }]);
+});
+
+it("cannot verify unreadable Jira facts and names the prerequisite", async () => {
+  const mapping = { fields: { statusFieldId: "s", repoFieldId: "r", profilesFieldId: null, baseBranchFieldId: null }, ambiguousOptional: [], repoFieldValue: "repo", autoApprovePlans: false };
+  for (const [id, extra] of [
+    ["fields", { fieldReadFailed: true, fieldError: "HTTP 403" }],
+    ["status-options", { statusError: "HTTP 403" }],
+    ["repo-option", { repoError: "HTTP 403" }],
+    ["query", { queryError: "network error", queryUnreachable: true }],
+  ] as const) {
+    const outcomes = await run(`tracker.jira.${id}`, {
+      mappings: () => ({ J: makeMapping({ ticketingProvider: "jira" }) }),
+      trackerSetupFacts: async () => ({ kind: "jira", oauth: false, credentials: { ok: true }, mappings: { J: { ...mapping, ...extra } } }),
+    });
+    expect(outcomes).toMatchObject([{ project: "J", state: "cannot-verify", fix: expect.stringContaining("Clear tracker.jira.") }]);
+    for (const o of outcomes) expect(`${o.detail} ${o.fix}`).not.toMatch(/docs\//);
+  }
+});
+
+
+describe("new tracker checks without mappings", () => {
+  it.each([
+    "tracker.jira.credentials", "tracker.jira.fields", "tracker.jira.field-cache",
+    "tracker.jira.status-options", "tracker.jira.repo-option", "tracker.jira.query",
+    "tracker.filesystem.directory",
+  ] as const)("%s is not applicable and reads no facts", async (id) => {
+    const trackerSetupFacts = vi.fn(async () => null);
+    expect(await run(id, { mappings: () => ({}), trackerSetupFacts })).toEqual([
+      { state: "not-applicable", detail: id.startsWith("tracker.jira.") ? "No project uses Jira" : "No project uses Filesystem" },
+    ]);
+    expect(trackerSetupFacts).not.toHaveBeenCalled();
   });
 });

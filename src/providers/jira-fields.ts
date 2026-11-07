@@ -103,12 +103,21 @@ export async function getCachedFieldIds(
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
   // Override values must participate in the key — changing them on a live mapping otherwise serves stale IDs.
-  const fullKey = `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}::${overrides.baseBranchOverride ?? ""}`;
+  const fullKey = fieldCacheKey(cacheKey, overrides);
   const existing = cache.get(fullKey);
   if (existing) return existing;
   const ids = await resolveCustomFieldIds(client, overrides);
   cache.set(fullKey, ids);
   return ids;
+}
+
+function fieldCacheKey(cacheKey: string, overrides: OverrideOptions): string {
+  return `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}::${overrides.baseBranchOverride ?? ""}`;
+}
+
+/** Inspect without resolving or populating the poll's cache. */
+export function peekCachedFieldIds(cacheKey: string, overrides: OverrideOptions): ResolvedFieldIds | undefined {
+  return cache.get(fieldCacheKey(cacheKey, overrides));
 }
 
 export function clearFieldCache(): void {
@@ -147,4 +156,11 @@ export function adfWithLink(prefix: string, label: string, url: string): unknown
       ],
     }],
   };
+}
+
+/** The exact bucket search shared by polling and setup. Overrides are used as given. */
+export function buildBucketQuery(jql: string, statusFieldId: string): string {
+  const match = /^customfield_(\d+)$/.exec(statusFieldId);
+  const ref = match ? `cf[${match[1]}]` : statusFieldId;
+  return `(${jql}) AND ${ref} in (Ready, "Plan Approved")`;
 }
