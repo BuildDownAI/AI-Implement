@@ -1,7 +1,7 @@
 import { resolveReviewFixLifecycle, type RepoMapping } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import {
-  listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest, mergeBranch,
+  listOpenPullRequests, getPrReadiness, mergePullRequest, mergeBranch,
 } from "./github.js";
 import {
   countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
@@ -108,13 +108,6 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
     try {
       if (!isGroupingBranch(pr.base) || pr.base === defaultBranch) continue;
       if (pr.draft) continue;
-      const checks = await getCombinedChecksState(token, owner, repo, pr.headSha);
-      if (checks === "pending") { console.log(`[auto-merge] Waiting on checks: PR #${pr.number} -> ${pr.base}`); continue; }
-      if (checks === "failure") { console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: checks failed`); continue; }
-      if (await hasChangesRequestedReview(token, owner, repo, pr.number)) {
-        console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: changes requested`);
-        continue;
-      }
       // If the PR title format ever changes (e.g. a leading emoji or prefix is added), non-matching
       // PRs will fall silently into the "no issue key" hold bucket rather than raising a visible error.
       const issueKeyMatch = pr.title.match(/^([A-Z][A-Z0-9]*-\d+):/);
@@ -142,7 +135,16 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
         console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: blocking finding on current head`);
         continue;
       }
-      const result = await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");
+      // Last, after the local and per-head checks: an unknown mergeability re-reads with sleeps.
+      const readiness = await getPrReadiness(token, owner, repo, pr.number, pr.headSha);
+      // A dirty PR (GitHub reports a conflict) is not merged, but still flows into the conflict
+      // re-queue rail below. Every other not-ready reason waits for a later tick.
+      const dirty = readiness.reason === "dirty";
+      if (!readiness.ready && !dirty) {
+        console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: not ready (${readiness.reason}, mergeable_state=${readiness.mergeableState ?? "none"})`);
+        continue;
+      }
+      const result = dirty ? "conflict" : await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");
       if (result === "merged") {
         console.log(`[auto-merge] Merged PR #${pr.number} -> ${pr.base} (${owner}/${repo})`);
         if (deps.notify) {

@@ -5,7 +5,7 @@
 import type { AttemptId, ScopedPrIdentity } from "./review-fix-contract.js";
 import type { ReviewFixGitHubAdapter } from "./review-fix-finalize.js";
 import type { ReviewFixWorkerCredentialResolver } from "./review-fix-worker.js";
-import { defaultFetchSignal } from "./github.js";
+import { classifyPullReadiness, defaultFetchSignal, type PullReadinessFields } from "./github.js";
 
 export interface ReviewFixGithubAdapterDeps {
   credentials: ReviewFixWorkerCredentialResolver;
@@ -45,8 +45,7 @@ export function createReviewFixGithubAdapter(deps: ReviewFixGithubAdapterDeps): 
     return response;
   }
 
-  async function pull(scope: ScopedPrIdentity): Promise<{ state?: string; draft?: boolean; merged?: boolean;
-    mergeable?: boolean | null; mergeable_state?: string; head?: { sha?: string } }> {
+  async function pull(scope: ScopedPrIdentity): Promise<PullReadinessFields> {
     return await (await request(scope, `/pulls/${scope.prNumber}`)).json();
   }
 
@@ -78,7 +77,7 @@ export function createReviewFixGithubAdapter(deps: ReviewFixGithubAdapterDeps): 
     async evaluateMergePolicy(scope, _dispositions) {
       try {
         const pr = await pull(scope);
-        if (pr.state !== "open" || pr.draft || pr.merged || pr.mergeable !== true || pr.mergeable_state !== "clean") return false;
+        if (!classifyPullReadiness(pr).ready) return false;
         const sha = pr.head?.sha;
         if (!sha || !/^[0-9a-f]{40}$/.test(sha)) return false;
         const checks = await request(scope, `/commits/${sha}/check-runs?per_page=100`);
