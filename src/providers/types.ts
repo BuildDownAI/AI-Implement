@@ -207,8 +207,10 @@ export interface TicketingProvider {
   issueUrl(issue: TicketIssue): string;
 
   /** Look up an issue by its human-readable identifier (e.g. "ENG-123", "PROJ-456").
-   *  Returns null if not found. */
-  findByKey(key: string): Promise<TicketIssue | null>;
+   *  Returns null if not found. With `scopeKey`, returns the issue as that mapping's poll
+   *  builds it (scope key, description, profiles, base branch, assignee). Without it, a
+   *  provider that cannot infer the mapping from the key (Jira) answers `scopeKey: ""`. */
+  findByKey(key: string, scopeKey?: string): Promise<TicketIssue | null>;
 
   /** One page of the mapping's issues for the knowledge-graph export. Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
   listIssuesPage?(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage>;

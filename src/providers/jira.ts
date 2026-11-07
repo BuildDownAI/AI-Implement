@@ -429,18 +429,7 @@ export class JiraProvider implements TicketingProvider {
       if (m.ticketingConfig.kind !== "jira") continue;
       const cfg = m.ticketingConfig;
       const fieldIds = await this.fields(scopeKey);
-      const fieldsToFetch = [
-        "summary",
-        "description",
-        "issuelinks",
-        "parent",
-        "assignee",
-        fieldIds.statusFieldId,
-        fieldIds.repoFieldId,
-        ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
-        ...(fieldIds.profilesFieldId ? [fieldIds.profilesFieldId] : []),
-        ...(fieldIds.baseBranchFieldId ? [fieldIds.baseBranchFieldId] : []),
-      ];
+      const fieldsToFetch = this.issueFields(fieldIds);
 
       // Reference the status field by its resolved customfield id, not a hardcoded
       // display name. Jira instances often name the field differently than
@@ -554,6 +543,22 @@ export class JiraProvider implements TicketingProvider {
       }
     }
     return merged;
+  }
+
+  /** The fields the poll reads for an issue; `findByKey` with a scope key reads the same. */
+  private issueFields(fieldIds: ResolvedFieldIds): string[] {
+    return [
+      "summary",
+      "description",
+      "issuelinks",
+      "parent",
+      "assignee",
+      fieldIds.statusFieldId,
+      fieldIds.repoFieldId,
+      ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
+      ...(fieldIds.profilesFieldId ? [fieldIds.profilesFieldId] : []),
+      ...(fieldIds.baseBranchFieldId ? [fieldIds.baseBranchFieldId] : []),
+    ];
   }
 
   private toTicketIssue(
@@ -911,21 +916,25 @@ export class JiraProvider implements TicketingProvider {
     return `${this.siteUrl}/browse/${issue.identifier}`;
   }
 
-  async findByKey(key: string): Promise<TicketIssue | null> {
+  async findByKey(key: string, scopeKey?: string): Promise<TicketIssue | null> {
+    // With a scope key (a run that knows its mapping), read the issue as that mapping's poll
+    // does: the same fields, built by toTicketIssue. Without one (an admin lookup), a Jira key
+    // does not name the mapping, so scopeKey is "" and the custom fields are not read.
+    const fieldIds = scopeKey ? await this.fields(scopeKey) : null;
     let issue;
     try {
-      issue = await this.client.getIssue(key, ["summary", "description", "status"]);
+      issue = await this.client.getIssue(key, fieldIds ? this.issueFields(fieldIds) : ["summary", "description", "status"]);
     } catch (err) {
       if (err instanceof JiraApiError && err.status === 404) return null;
       throw err;
     }
-    // scopeKey is intentionally "" — the verb's use case (admin UI lookup)
-    // doesn't need scopeKey accuracy.
+    if (scopeKey && fieldIds) return this.toTicketIssue(issue, scopeKey, fieldIds);
     return {
       id: issue.id,
       identifier: issue.key,
       title: (issue.fields.summary as string) ?? "",
-      description: typeof issue.fields.description === "string" ? issue.fields.description : null,
+      // API v3 returns ADF: read it as text, the same way the poll does.
+      description: parseIssueConfig(descriptionText(issue.fields), issue.key).description,
       scopeKey: "",
       nativeStatus: ((issue.fields.status as { name?: string } | null)?.name) ?? "",
     };
