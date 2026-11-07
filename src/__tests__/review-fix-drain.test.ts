@@ -521,6 +521,10 @@ describe("processReviewFixQueue — dispatch gate", () => {
 });
 
 describe("processReviewFixQueue — PR dispatch budget", () => {
+  beforeEach(() => {
+    vi.spyOn(github, "listPrComments").mockResolvedValue([]);
+  });
+
   /** Seeds a completed gap-analysis dispatch counted toward a PR's 24h budget.
    *  Terminal status keeps it out of the in_flight gate, which would otherwise
    *  mask the pr_budget reason this suite exercises. */
@@ -590,7 +594,7 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
     expect(owner).toBe("acme");
     expect(repo).toBe("billing");
     expect(prNumber).toBe(42);
-    expect(body.startsWith("<!-- ai-implement pr-budget -->")).toBe(true);
+    expect(body).toMatch(/^<!-- ai-implement pr-budget park=\d+ -->\n/);
     expect(body).toContain("Needs Human");
     expect(body).toContain("limit of 2 automatic fix runs");
 
@@ -607,6 +611,37 @@ describe("processReviewFixQueue — PR dispatch budget", () => {
     expect(pending[0]!.status).toBe("pending");
 
     consoleLogSpy.mockRestore();
+  });
+
+  it("posts the PR budget comment once when the dispatch breaker parked the fix runs first", async () => {
+    const mapping = acmeBilling({ prDispatchBudget: 2 });
+    configModule.upsertMapping("AII", mapping);
+
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
+    seedGapAnalysisDispatch("issue-1", "AII-1", "acme/billing", 42);
+    // Three failed fix runs tripped the breaker, and its trip comment reached the tracker.
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-1", "gap-analysis", "failed");
+    breaker.markTripNotified("issue-1", "gap-analysis");
+
+    reviewFixQueue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "acme/billing",
+      prNumber: 42,
+      reason: "review_comment",
+    });
+
+    const postPrCommentSpy = vi.spyOn(github, "postPrComment").mockResolvedValue(undefined);
+
+    await indexModule.processReviewFixQueue(config, registry);
+    await indexModule.processReviewFixQueue(config, registry);
+
+    expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
+    expect(postPrCommentSpy).toHaveBeenCalledTimes(1);
+    expect(postPrCommentSpy.mock.calls[0]![4]).toContain("Needs Human");
+    // The tracker already has the breaker's trip comment.
+    expect(trackerPostCommentMock).not.toHaveBeenCalled();
+    expect(breaker.listParked()[0]!.lastConclusion).toBe("failed");
   });
 
   it("posts no additional comments on a second drain tick in the same state", async () => {

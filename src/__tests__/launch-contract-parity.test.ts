@@ -362,6 +362,7 @@ const gapFill = (runnerMode: "gha" | "fly" | "local"): LaunchPath => async (w) =
       return ACCEPTED;
     },
     postComment: async () => undefined,
+    listPrComments: async () => [],
     postTrackerComment: async () => undefined,
     onDispatchFailure: async () => undefined,
     flySessionsToken: CONFIG.flySessionsToken,

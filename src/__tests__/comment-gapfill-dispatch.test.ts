@@ -178,6 +178,7 @@ function makeBaseDrainOpts(overrides: Partial<DrainInput> = {}): DrainInput {
     checkContract: vi.fn<DrainInput["checkContract"]>(async () => "envelope"),
     dispatch: vi.fn<DrainInput["dispatch"]>(async () => ACCEPTED_DISPATCH),
     postComment: vi.fn<DrainInput["postComment"]>(async () => undefined),
+    listPrComments: vi.fn<DrainInput["listPrComments"]>(async () => []),
     postTrackerComment: vi.fn<DrainInput["postTrackerComment"]>(async () => undefined),
     onDispatchFailure: vi.fn<DrainInput["onDispatchFailure"]>(async () => undefined),
     flySessionsToken: null,
@@ -1112,7 +1113,7 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     expect(owner).toBe("acme");
     expect(repo).toBe("billing");
     expect(prNumber).toBe(42);
-    expect(body.startsWith("<!-- ai-implement pr-budget -->")).toBe(true);
+    expect(body).toMatch(/^<!-- ai-implement pr-budget park=\d+ -->\n/);
     expect(body).toContain("Needs Human");
     expect(body).toContain("limit of 2 automatic fix runs");
 
@@ -1191,8 +1192,9 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     seedDispatchLog("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
     seedGapAnalysisDispatch("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
     seedGapAnalysisDispatch("issue-22", "AII-202", "Synthetic no-bypass test", "acme", "billing", 42);
-    // Simulate a PR already parked by an earlier tick.
-    breaker.parkIssue("issue-22", "gap-analysis", "pr_budget");
+    // Simulate the dispatch breaker parking the row (and telling the tracker) before the budget gate refuses.
+    breaker.parkIssue("issue-22", "gap-analysis", "breaker");
+    breaker.markTripNotified("issue-22", "gap-analysis");
 
     const queueId = queue.enqueueConflictResolution({
       owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/foo",
@@ -1210,13 +1212,180 @@ describe("drainCommentGapfillQueue — PR dispatch budget", () => {
     }));
 
     expect(dispatchSpy).not.toHaveBeenCalled();
-    // Already parked before this tick: parkIssue returns false, so no new comments.
-    expect(postCommentSpy).not.toHaveBeenCalled();
+    // Parked first by the breaker, then refused by the PR budget gate: the PR still gets
+    // its budget comment once; the tracker already has the breaker's trip comment.
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    expect(postCommentSpy.mock.calls[0]![4]).toMatch(/^<!-- ai-implement pr-budget park=\d+ -->/);
+    expect(postTrackerCommentSpy).not.toHaveBeenCalled();
+
+    // A later tick with the gate still refusing posts nothing more.
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ AII: mapping }),
+      dispatch: dispatchSpy,
+      postComment: postCommentSpy,
+      postTrackerComment: postTrackerCommentSpy,
+    }));
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
     expect(postTrackerCommentSpy).not.toHaveBeenCalled();
 
     const pending = queue.claimPendingCommentGapfills();
     expect(pending).toHaveLength(1);
     expect(pending[0]!.id).toBe(queueId);
+  });
+
+  const seedAtBudget = (issueId: string, identifier: string) => {
+    seedDispatchLog(issueId, identifier, "Budget notice", "acme", "billing", 42);
+    seedGapAnalysisDispatch(issueId, identifier, "Budget notice", "acme", "billing", 42);
+    seedGapAnalysisDispatch(issueId, identifier, "Budget notice", "acme", "billing", 42);
+    queue.enqueueConflictResolution({
+      owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/foo",
+    });
+  };
+  /** A fake PR comment list that sees what `postComment` posted. */
+  const fakePrComments = (onPost?: () => void) => {
+    const posted: Array<{ body: string }> = [];
+    const postComment = vi.fn<DrainInput["postComment"]>(async (_t, _o, _r, _n, body) => {
+      posted.push({ body });
+      onPost?.();
+    });
+    return { postComment, listPrComments: async () => [...posted] };
+  };
+
+  it("posts the tracker budget comment when a stuck fix run parked the row without a trip comment", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+    seedAtBudget("issue-23", "AII-203");
+    breaker.parkIssue("issue-23", "gap-analysis", "stuck_giveup");
+
+    const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+    const postTrackerCommentSpy = vi.fn<DrainInput["postTrackerComment"]>(async () => undefined);
+    const opts = makeBaseDrainOpts({
+      getMappings: () => ({ AII: mapping }),
+      postComment: postCommentSpy,
+      postTrackerComment: postTrackerCommentSpy,
+    });
+
+    await drain.drainCommentGapfillQueue(opts);
+    await drain.drainCommentGapfillQueue(opts);
+
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    expect(postTrackerCommentSpy).toHaveBeenCalledTimes(1);
+    expect(postTrackerCommentSpy.mock.calls[0]![2]).toContain("Needs Human");
+  });
+
+  it("keeps the breaker's last_conclusion when the budget gate refuses an already-parked row", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+    seedAtBudget("issue-25", "AII-205");
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-25", "gap-analysis", "crash");
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({ getMappings: () => ({ AII: mapping }) }));
+
+    expect(breaker.listParked()[0]!.lastConclusion).toBe("crash");
+  });
+
+  it("retries a failed tracker post without posting the PR comment twice", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+    seedAtBudget("issue-26", "AII-206");
+    const pr = fakePrComments();
+    const postTrackerCommentSpy = vi
+      .fn<DrainInput["postTrackerComment"]>()
+      .mockRejectedValueOnce(new Error("tracker down"))
+      .mockResolvedValue(undefined);
+    const opts = makeBaseDrainOpts({ getMappings: () => ({ AII: mapping }), ...pr, postTrackerComment: postTrackerCommentSpy });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await drain.drainCommentGapfillQueue(opts);
+    await drain.drainCommentGapfillQueue(opts);
+    await drain.drainCommentGapfillQueue(opts);
+
+    expect(pr.postComment).toHaveBeenCalledTimes(1);
+    expect(postTrackerCommentSpy).toHaveBeenCalledTimes(2);
+    errSpy.mockRestore();
+  });
+
+  it("does not post a second PR comment when the first reached GitHub but the client threw", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+    seedAtBudget("issue-27", "AII-207");
+    let first = true;
+    const pr = fakePrComments(() => {
+      if (first) { first = false; throw new Error("timeout after send"); }
+    });
+    const opts = makeBaseDrainOpts({ getMappings: () => ({ AII: mapping }), ...pr });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await drain.drainCommentGapfillQueue(opts);
+    await drain.drainCommentGapfillQueue(opts);
+
+    expect(pr.postComment).toHaveBeenCalledTimes(1);
+    errSpy.mockRestore();
+  });
+
+  it("does not post when the PR comment list is unreadable, and retries on the next tick", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+    seedAtBudget("issue-29", "AII-209");
+    const postCommentSpy = vi.fn<DrainInput["postComment"]>(async () => undefined);
+    const listPrComments = vi.fn<DrainInput["listPrComments"]>()
+      .mockRejectedValueOnce(new Error("HTTP 502"))
+      .mockResolvedValue([]);
+    const opts = makeBaseDrainOpts({ getMappings: () => ({ AII: mapping }), postComment: postCommentSpy, listPrComments });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await drain.drainCommentGapfillQueue(opts);
+    expect(postCommentSpy).not.toHaveBeenCalled();
+    await drain.drainCommentGapfillQueue(opts);
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    errSpy.mockRestore();
+  });
+
+  it("posts a new PR comment when the row is parked again after an unpark", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+    seedAtBudget("issue-28", "AII-208");
+    const pr = fakePrComments();
+    const opts = makeBaseDrainOpts({ getMappings: () => ({ AII: mapping }), ...pr });
+
+    // Start the fake clock at the real time so the seeded dispatches stay inside the 24h window.
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(t0);
+      await drain.drainCommentGapfillQueue(opts);
+      expect(pr.postComment).toHaveBeenCalledTimes(1);
+
+      breaker.unpark("issue-28");
+      vi.setSystemTime(t0 + 5 * 60_000);
+      await drain.drainCommentGapfillQueue(opts);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(pr.postComment).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries the budget notice on the next tick when the PR comment post fails", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 2 });
+    seedAtBudget("issue-24", "AII-204");
+    const postCommentSpy = vi
+      .fn<DrainInput["postComment"]>()
+      .mockRejectedValueOnce(new Error("github down"))
+      .mockResolvedValue(undefined);
+    const postTrackerCommentSpy = vi.fn<DrainInput["postTrackerComment"]>(async () => undefined);
+    const opts = makeBaseDrainOpts({
+      getMappings: () => ({ AII: mapping }),
+      postComment: postCommentSpy,
+      postTrackerComment: postTrackerCommentSpy,
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await drain.drainCommentGapfillQueue(opts);
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+    expect(postTrackerCommentSpy).not.toHaveBeenCalled();
+
+    await drain.drainCommentGapfillQueue(opts);
+    expect(postCommentSpy).toHaveBeenCalledTimes(2);
+    expect(postTrackerCommentSpy).toHaveBeenCalledTimes(1);
+
+    await drain.drainCommentGapfillQueue(opts);
+    expect(postCommentSpy).toHaveBeenCalledTimes(2);
+    errSpy.mockRestore();
   });
 });
 
@@ -1249,7 +1418,7 @@ describe("drainCommentGapfillQueue — push retry (AII-922)", () => {
     }));
     expect(dispatchSpy).not.toHaveBeenCalled();
     expect(postCommentSpy).toHaveBeenCalledTimes(1);
-    expect(postCommentSpy.mock.calls[0]![4]).toContain("<!-- ai-implement pr-budget -->");
+    expect(postCommentSpy.mock.calls[0]![4]).toMatch(/^<!-- ai-implement pr-budget park=\d+ -->/);
     expect(breaker.isParked("issue-30", "gap-analysis")).toBe(true);
   });
 });

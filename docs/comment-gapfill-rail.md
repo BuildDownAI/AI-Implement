@@ -59,4 +59,4 @@ When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left 
 |---|---|---|
 | PR cannot be read (null or throw) | "could not read this PR from GitHub just now … repost" | `failed` |
 | No dispatch row, no roll-up parent, no in-flight match | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
-| PR dispatch budget reached | budget park message (once, on the park transition) | `pending` |
+| PR dispatch budget reached | budget park message (once per park, also when the dispatch breaker parked the PR first) | `pending` |
