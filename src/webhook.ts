@@ -18,6 +18,9 @@ import { refreshAvailability, type SelfDeployTarget } from "./deploy-availabilit
 import type { KgDryRunReportTarget } from "./kg-refresh.js";
 import { KG_SNAPSHOT_BRANCH_PREFIX } from "./pipeline/steps/kg-snapshot-push.js";
 
+/** The old prefix stays: comments already on open PRs still start with it. */
+const AI_IMPLEMENT_NATIVE_REVIEW_PREFIXES = ["AI-Implement post-push review", "AI-Implement second review"];
+
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -1140,8 +1143,9 @@ async function handleIssueCommentWebhook(
 }
 
 function isAiImplementNativeReviewBody(body: string): boolean {
-  return body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER) ||
-    body.replace(/\s+/g, " ").trim().startsWith("AI-Implement post-push review");
+  if (body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER)) return true;
+  const normalized = body.replace(/\s+/g, " ").trim();
+  return AI_IMPLEMENT_NATIVE_REVIEW_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 /** Parses an ISO-8601 timestamp to milliseconds since epoch, treating a missing or malformed

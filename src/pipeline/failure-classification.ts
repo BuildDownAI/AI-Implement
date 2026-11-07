@@ -694,8 +694,8 @@ export function providerUnavailablePhrase(
       ? { stageLabel: "implementation", codeState: "partially implemented" }
       : { stageLabel: "implementation", codeState: "not implemented" };
   }
-  if (stage === "post-push-review") return { stageLabel: "post-push review", codeState: "not reviewed" };
-  return { stageLabel: "review", codeState: "not reviewed" };
+  if (stage === "post-push-review") return { stageLabel: "the second review", codeState: "not reviewed" };
+  return { stageLabel: "the review", codeState: "not reviewed" };
 }
 
 function attachedFailure(err: unknown): FailureRecord | null {

@@ -1173,6 +1173,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("provider_unavailable");
     expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.finalFeedback).toBe("Tried 2 time(s). upstream returned 529 overloaded_error");
     expect(outputs.failure?.stage).toBe("review");
     expect(outputs.failure?.retryable).toBe(false);
     expect(reviewStep.run).toHaveBeenCalledTimes(2);
@@ -1275,6 +1276,7 @@ describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
     expect(outputs.approved).toBe(false);
     expect(outputs.terminationReason).toBe("provider_unavailable");
     expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.finalFeedback).toBe("Tried 1 time(s); partial changes were kept. upstream returned 529 overloaded_error");
     expect(outputs.failure?.stage).toBe("implement");
     expect(outputs.failure?.retryable).toBe(false);
     expect(implementStep.run).toHaveBeenCalledTimes(1);

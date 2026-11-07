@@ -992,7 +992,7 @@ function reviewSummary(run: ReturnType<typeof makeFeedbackLoopOutputs>) {
 const REVIEW_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ approved: false, iterations: 3, finalFeedback: "Missing tests for the retry path." }));
 // Only a run that hit the turn cap carries a post-mortem.
 const MAX_TURNS_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ terminationReason: "max_turns", postMortem: "## Post-mortem\nScope too broad." }));
-const OUTAGE_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ terminationReason: "provider_unavailable" }));
+const OUTAGE_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ terminationReason: "provider_unavailable", finalFeedback: "Tried 2 time(s); partial changes were kept." }));
 
 describe("pushStep draft PRs", () => {
   beforeEach(() => {
@@ -1037,18 +1037,18 @@ describe("pushStep draft PRs", () => {
     expect(outputs.draft).toBe(true);
     const body = prRequest(fake);
     expect(body.draft).toBe(true);
-    expect(body.body).toContain("The model provider was unavailable during this run");
+    expect(body.body).toContain("The AI service was not available during this run");
     expect(body.body).not.toContain("Automated review did not approve");
     expect(body.body).not.toContain("Reviewer's final feedback");
     expect(body.body).not.toContain("unapproved run");
     expect(body.body).toContain("Run notes");
-    expect(body.body).toContain("partial changes were preserved");
+    expect(body.body).toContain("partial changes were kept");
     // The column is specifically the implement call's spawn attempts (not review's).
-    expect(body.body).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |");
+    expect(body.body).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | First review |");
     // The test-plan line must not read as a review rejection on a provider outage — the
     // reviewer may never have run at all (BAC-27201).
-    expect(body.body).toContain("- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted.");
-    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted."}\n\n${TEST_VERDICT_SENTENCE}\n`);
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the AI service was not available and the run was interrupted.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the AI service was not available and the run was interrupted."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("the review loop did not approve this change");
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });

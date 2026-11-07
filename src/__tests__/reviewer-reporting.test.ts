@@ -69,7 +69,7 @@ describe("reviewer evidence reports", () => {
     const { result, nativeBodies } = await runReview(malformed, false, 1, { strictReport: true });
     expect(result.approved).toBe(false);
     expect(result.terminationReason).toBe("invalid_review");
-    expect(nativeBodies.join("\n")).not.toContain("approved this PR");
+    expect(nativeBodies.join("\n")).not.toContain("approved this pull request");
   });
 
   it("renders markup in report text visibly rather than letting GitHub interpret it", async () => {
