@@ -29,7 +29,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -54,7 +54,7 @@ import { handleAdminRequest } from "./admin.js";
 import type { AdminDeps } from "./admin.js";
 import { trackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { initLogTable, appendLog, recordGhaRunCompleted, type MachineSize, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, getJobByDispatchId, getRecentFailedRunUrls } from "./log.js";
-import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor } from "./dispatch-breaker.js";
+import { listParked, recordDispatchFailure, recordDispatchSuccess, shouldCountFailure, initDispatchBreakerTable, parkIssue, prBudgetParkMessage, isParked, breakerPhaseFor, claimPrBudgetNotice, prBudgetMarker, releasePrBudgetNotice, prBudgetTrackerCommentOwed, markTripNotified } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getInstallationId, getAppSlug, getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
@@ -1010,6 +1010,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       checkContract: (params) => resolveWorkflowCapabilities(params),
       dispatch: dispatchWorkflow,
       postComment: postPrComment,
+      listPrComments: (token, owner, repo, prNumber) => listPrComments(token, owner, repo, prNumber, { strict: true }),
       postTrackerComment: async (mapping, issueId, body) => {
         const provider = await registry.forMapping(mapping);
         await provider.postComment(issueId, body);
@@ -1089,6 +1090,7 @@ async function fireBreakerTrip(
   if (provider) {
     try {
       await provider.postComment(issueId, commentLines.join("\n"));
+      markTripNotified(issueId, phase);
     } catch (err) {
       console.error(`[breaker] Failed to post park comment for ${issueIdentifier ?? issueId}:`, err);
     }
@@ -1107,10 +1109,10 @@ async function fireBreakerTrip(
 }
 
 /**
- * Fires when the gate's `pr_budget` reason for a gap-fill dispatch is the one
- * that actually parks the PR (parkIssue returns true exactly once, on that
- * transition). Posts one PR comment and one tracker comment, both best-effort.
- * Never throws.
+ * Fires whenever the gate returns `pr_budget` for a gap-fill dispatch, whoever
+ * parked the row. Posts one PR comment per park (also when the breaker parked
+ * first) and a tracker comment unless the breaker's trip comment already reached
+ * the tracker, both best-effort. Never throws.
  */
 async function firePrBudgetPark(
   config: AppConfig,
@@ -1121,25 +1123,45 @@ async function firePrBudgetPark(
   prNumber: number,
   budget: number,
 ): Promise<void> {
-  if (!parkIssue(issueId, "gap-analysis", "pr_budget")) return;
+  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget");
+  const parkedAt = claimPrBudgetNotice(issueId, "gap-analysis");
+  if (parkedAt == null) return;
 
-  console.warn(`[dispatch-gate] Parked PR #${prNumber} in ${repo} at its dispatch budget (${budget}/24h)`);
+  console.warn(
+    newlyParked
+      ? `[dispatch-gate] Parked PR #${prNumber} in ${repo} at its dispatch budget (${budget}/24h)`
+      : `[dispatch-gate] PR #${prNumber} in ${repo} is at its dispatch budget (${budget}/24h); already parked, posting the budget notice`,
+  );
 
   const body = prBudgetParkMessage(budget);
+  const marker = prBudgetMarker(parkedAt);
   const [owner, repoName] = repo.split("/");
 
   try {
     const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-    await postPrComment(ghToken, owner, repoName, prNumber, `<!-- ai-implement pr-budget -->\n${body}`);
+    // A previous tick of this park may have posted the comment and then failed on the tracker.
+    // The strict read throws on an unreadable list, so a retry never posts blind.
+    const existing = await listPrComments(ghToken, owner, repoName, prNumber, { strict: true });
+    if (!existing.some((c) => c.body.includes(marker))) {
+      await postPrComment(ghToken, owner, repoName, prNumber, `${marker}\n${body}`);
+    }
   } catch (err) {
     console.error(`[dispatch-gate] Failed to post PR budget comment on ${repo}#${prNumber}:`, err);
+    // Give the claim back so the next tick retries the notice.
+    releasePrBudgetNotice(issueId, "gap-analysis");
+    return;
   }
+
+  // The breaker's trip comment already told the tracker when it parked the row first.
+  if (!prBudgetTrackerCommentOwed(issueId, "gap-analysis")) return;
 
   try {
     const provider = await registry.forMapping(mapping);
     await provider.postComment(issueId, body);
   } catch (err) {
     console.error(`[dispatch-gate] Failed to post tracker comment for PR budget park (${issueId}):`, err);
+    // Retry next tick; the PR comment's marker keeps that retry from posting it twice.
+    releasePrBudgetNotice(issueId, "gap-analysis");
   }
 }
 

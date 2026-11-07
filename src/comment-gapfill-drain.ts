@@ -4,7 +4,7 @@ import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { canDispatch } from "./dispatch-gate.js";
-import { parkIssue, prBudgetParkMessage, isParked } from "./dispatch-breaker.js";
+import { claimPrBudgetNotice, isParked, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
 import {
   acquire as acquireAdmission,
   release as releaseAdmission,
@@ -117,6 +117,8 @@ export interface DrainCommentGapfillsInput {
   checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string; ref: string }): Promise<ContractProbeResult>;
   dispatch(token: string, mapping: RepoMapping, inputs: Record<string, string | undefined>, opts?: { returnRunDetails?: boolean }): Promise<DispatchResult>;
   postComment(token: string, owner: string, repo: string, prNumber: number, body: string): Promise<void>;
+  /** The PR's comments, so the budget notice skips one that already reached GitHub. Must throw on an unreadable list. */
+  listPrComments(token: string, owner: string, repo: string, prNumber: number): Promise<Array<{ body: string }>>;
   postTrackerComment(mapping: RepoMapping, issueId: string, body: string): Promise<void>;
   /** Tracker kind and issue URL for the job row; absent, the row keeps the kind and a null URL. */
   trackerAccounting?(mapping: RepoMapping, issue: { id: string; identifier?: string | null; title?: string | null }): Promise<TrackerAccounting>;
@@ -237,9 +239,10 @@ function resolveInFlightDispatch(owner: string, repo: string, headRef: string | 
 }
 
 /**
- * Fires when the gate's `pr_budget` reason is the one that actually parks the
- * PR (parkIssue returns true exactly once, on that transition). Posts one PR
- * comment and one tracker comment, both best-effort. Never throws.
+ * Fires whenever the gate returns `pr_budget` for a gap-fill dispatch, whoever
+ * parked the row. Posts one PR comment per park (also when the breaker parked
+ * first) and a tracker comment unless the breaker's trip comment already reached
+ * the tracker, both best-effort. Never throws.
  */
 async function firePrBudgetPark(
   opts: DrainCommentGapfillsInput,
@@ -250,23 +253,43 @@ async function firePrBudgetPark(
   prNumber: number,
   budget: number,
 ): Promise<void> {
-  if (!parkIssue(issueId, "gap-analysis", "pr_budget")) return;
+  const newlyParked = parkIssue(issueId, "gap-analysis", "pr_budget");
+  const parkedAt = claimPrBudgetNotice(issueId, "gap-analysis");
+  if (parkedAt == null) return;
 
-  console.warn(`[comment-gapfill] Parked PR #${prNumber} in ${owner}/${repo} at its dispatch budget (${budget}/24h)`);
+  console.warn(
+    newlyParked
+      ? `[comment-gapfill] Parked PR #${prNumber} in ${owner}/${repo} at its dispatch budget (${budget}/24h)`
+      : `[comment-gapfill] PR #${prNumber} in ${owner}/${repo} is at its dispatch budget (${budget}/24h); already parked, posting the budget notice`,
+  );
 
   const body = prBudgetParkMessage(budget);
+  const marker = prBudgetMarker(parkedAt);
 
   try {
     const ghToken = await opts.getInstallationToken(owner);
-    await opts.postComment(ghToken, owner, repo, prNumber, `<!-- ai-implement pr-budget -->\n${body}`);
+    // A previous tick of this park may have posted the comment and then failed on the tracker.
+    // `listPrComments` must throw on an unreadable list, so a retry never posts blind.
+    const existing = await opts.listPrComments(ghToken, owner, repo, prNumber);
+    if (!existing.some((c) => c.body.includes(marker))) {
+      await opts.postComment(ghToken, owner, repo, prNumber, `${marker}\n${body}`);
+    }
   } catch (err) {
     console.error(`[comment-gapfill] Failed to post PR budget comment on ${owner}/${repo}#${prNumber}:`, err);
+    // Give the claim back so the next tick retries the notice.
+    releasePrBudgetNotice(issueId, "gap-analysis");
+    return;
   }
+
+  // The breaker's trip comment already told the tracker when it parked the row first.
+  if (!prBudgetTrackerCommentOwed(issueId, "gap-analysis")) return;
 
   try {
     await opts.postTrackerComment(mapping, issueId, body);
   } catch (err) {
     console.error(`[comment-gapfill] Failed to post tracker comment for PR budget park (${issueId}):`, err);
+    // Retry next tick; the PR comment's marker keeps that retry from posting it twice.
+    releasePrBudgetNotice(issueId, "gap-analysis");
   }
 }
 

@@ -365,6 +365,29 @@ describe("initDispatchBreakerTable idempotency", () => {
     expect(() => breaker.initDispatchBreakerTable()).not.toThrow();
   });
 
+  it("adds the notice columns to an old table, leaving old rows null, and a second boot changes nothing", () => {
+    const db = dedup.getDb();
+    db.exec("DROP TABLE dispatch_breaker");
+    db.exec(`CREATE TABLE dispatch_breaker (
+      issue_id TEXT NOT NULL, phase TEXT NOT NULL,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_conclusion TEXT, last_failure_at INTEGER, parked_at INTEGER,
+      PRIMARY KEY (issue_id, phase))`);
+    db.prepare("INSERT INTO dispatch_breaker (issue_id, phase, parked_at) VALUES ('i', 'gap-analysis', 1)").run();
+
+    breaker.initDispatchBreakerTable();
+    breaker.initDispatchBreakerTable();
+
+    const names = (db.prepare("PRAGMA table_info(dispatch_breaker)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(names).toContain("pr_budget_notified_at");
+    expect(names).toContain("trip_notified_at");
+    expect(db.prepare("SELECT pr_budget_notified_at, trip_notified_at FROM dispatch_breaker WHERE issue_id = 'i'").get())
+      .toEqual({ pr_budget_notified_at: null, trip_notified_at: null });
+    expect(breaker.prBudgetTrackerCommentOwed("i", "gap-analysis")).toBe(true);
+    expect(breaker.claimPrBudgetNotice("i", "gap-analysis")).toBe(1);
+    expect(breaker.claimPrBudgetNotice("i", "gap-analysis")).toBeNull();
+  });
+
   it("table has the expected columns after init", () => {
     const db = dedup.getDb();
     const cols = db
@@ -391,5 +414,67 @@ describe("breakerPhaseFor", () => {
     [undefined, "implementation"],
   ])("maps job phase %s to the %s bucket", (phase, bucket) => {
     expect(breaker.breakerPhaseFor(phase as string | null | undefined)).toBe(bucket);
+  });
+});
+
+describe("claimPrBudgetNotice", () => {
+  it("claims once per park, regardless of who parked first", () => {
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i1", "gap-analysis", "failure");
+    expect(breaker.parkIssue("i1", "gap-analysis", "pr_budget")).toBe(false);
+    expect(breaker.claimPrBudgetNotice("i1", "gap-analysis")).toBe(breaker.listParked()[0]!.parkedAt);
+    expect(breaker.claimPrBudgetNotice("i1", "gap-analysis")).toBeNull();
+  });
+
+  it("keeps the breaker's last_conclusion when the budget path parks an already-parked row", () => {
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("i2", "gap-analysis", "crash");
+    breaker.parkIssue("i2", "gap-analysis", "pr_budget");
+    expect(breaker.listParked()[0]!.lastConclusion).toBe("crash");
+  });
+
+  it("claims again after unpark, with the new park's time", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000);
+      breaker.parkIssue("i3", "gap-analysis", "pr_budget");
+      expect(breaker.claimPrBudgetNotice("i3", "gap-analysis")).toBe(1_000);
+      breaker.unpark("i3");
+      vi.setSystemTime(2_000);
+      breaker.parkIssue("i3", "gap-analysis", "pr_budget");
+      expect(breaker.claimPrBudgetNotice("i3", "gap-analysis")).toBe(2_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not claim a row that is not parked, and a release lets the next call claim", () => {
+    breaker.recordDispatchFailure("i4", "gap-analysis", "failure");
+    expect(breaker.claimPrBudgetNotice("i4", "gap-analysis")).toBeNull();
+    breaker.parkIssue("i5", "gap-analysis", "pr_budget");
+    expect(breaker.claimPrBudgetNotice("i5", "gap-analysis")).not.toBeNull();
+    breaker.releasePrBudgetNotice("i5", "gap-analysis");
+    expect(breaker.claimPrBudgetNotice("i5", "gap-analysis")).not.toBeNull();
+  });
+});
+
+describe("prBudgetMarker", () => {
+  it("differs between parks, so an earlier park's comment does not match", () => {
+    expect(breaker.prBudgetMarker(1_000)).toBe("<!-- ai-implement pr-budget park=1000 -->");
+    expect(`${breaker.prBudgetMarker(1_000)}\nbody`).not.toContain(breaker.prBudgetMarker(10_000));
+  });
+});
+
+describe("prBudgetTrackerCommentOwed", () => {
+  it("is owed after a stuck park even when a later failure overwrites last_conclusion", () => {
+    breaker.parkIssue("t1", "gap-analysis", "stuck_giveup");
+    breaker.recordDispatchFailure("t1", "gap-analysis", "failed");
+    expect(breaker.prBudgetTrackerCommentOwed("t1", "gap-analysis")).toBe(true);
+  });
+
+  it("is not owed once the trip comment was posted, and is owed again after unpark", () => {
+    breaker.parkIssue("t2", "gap-analysis", "failure");
+    breaker.markTripNotified("t2", "gap-analysis");
+    expect(breaker.prBudgetTrackerCommentOwed("t2", "gap-analysis")).toBe(false);
+    breaker.unpark("t2");
+    expect(breaker.prBudgetTrackerCommentOwed("t2", "gap-analysis")).toBe(true);
   });
 });

@@ -46,6 +46,13 @@ export function initDispatchBreakerTable(): void {
       PRIMARY KEY (issue_id, phase)
     )
   `);
+  const cols = getDb().prepare("PRAGMA table_info(dispatch_breaker)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "pr_budget_notified_at")) {
+    getDb().exec("ALTER TABLE dispatch_breaker ADD COLUMN pr_budget_notified_at INTEGER");
+  }
+  if (!cols.some((c) => c.name === "trip_notified_at")) {
+    getDb().exec("ALTER TABLE dispatch_breaker ADD COLUMN trip_notified_at INTEGER");
+  }
 }
 
 /**
@@ -87,7 +94,8 @@ export function recordDispatchFailure(
 
 /**
  * Records a successful dispatch for an issue+phase. Resets the consecutive
- * failure counter to 0. Does NOT clear parked_at — unpark is human-only.
+ * failure counter to 0. Does NOT clear parked_at, pr_budget_notified_at or
+ * trip_notified_at — only `unpark` (human-only) clears them.
  */
 export function recordDispatchSuccess(issueId: string, phase: string): void {
   getDb()
@@ -119,7 +127,7 @@ export function parkIssue(issueId: string, phase: string, conclusion: string): b
     INSERT INTO dispatch_breaker (issue_id, phase, consecutive_failures, last_conclusion, last_failure_at, parked_at)
     VALUES (?, ?, 0, ?, NULL, ?)
     ON CONFLICT (issue_id, phase) DO UPDATE SET
-      last_conclusion = excluded.last_conclusion,
+      last_conclusion = CASE WHEN dispatch_breaker.parked_at IS NULL THEN excluded.last_conclusion ELSE dispatch_breaker.last_conclusion END,
       parked_at        = COALESCE(dispatch_breaker.parked_at, excluded.parked_at)
   `).run(issueId, phase, conclusion, now);
 
@@ -127,8 +135,62 @@ export function parkIssue(issueId: string, phase: string, conclusion: string): b
 }
 
 /**
- * The "Needs Human" notice posted once (PR comment + tracker comment) the moment
- * `parkIssue` transitions a PR from `pr_budget`-blocked to actually parked.
+ * Claims the once-per-park PR budget notice for a parked issue+phase row.
+ * Returns the row's `parked_at` when this call took the claim, and null when
+ * the notice is already claimed (or the row is not parked) until `unpark` (or
+ * `releasePrBudgetNotice`) clears the claim. Independent of who parked the
+ * row, so a breaker-first park still owes the PR its budget comment. Call after
+ * `parkIssue` so the row exists. Pass the result to `prBudgetMarker`.
+ */
+export function claimPrBudgetNotice(issueId: string, phase: string): number | null {
+  const row = getDb()
+    .prepare(
+      "UPDATE dispatch_breaker SET pr_budget_notified_at = ? WHERE issue_id = ? AND phase = ? AND pr_budget_notified_at IS NULL AND parked_at IS NOT NULL RETURNING parked_at",
+    )
+    .get(Date.now(), issueId, phase) as { parked_at: number } | undefined;
+  return row?.parked_at ?? null;
+}
+
+/**
+ * The hidden marker that starts the PR budget comment for one park. It carries
+ * the park's `parked_at`, so a retry in the same park finds the comment it
+ * already posted, and a comment from an earlier park (before an `unpark`) does
+ * not match.
+ */
+export function prBudgetMarker(parkedAt: number): string {
+  return `<!-- ai-implement pr-budget park=${parkedAt} -->`;
+}
+
+/** Gives back a claim taken by `claimPrBudgetNotice` when the PR comment failed to post, so the next tick retries. */
+export function releasePrBudgetNotice(issueId: string, phase: string): void {
+  getDb()
+    .prepare("UPDATE dispatch_breaker SET pr_budget_notified_at = NULL WHERE issue_id = ? AND phase = ?")
+    .run(issueId, phase);
+}
+
+/** Records that the breaker's trip comment reached the tracker for this row. Cleared by `unpark`. */
+export function markTripNotified(issueId: string, phase: string): void {
+  getDb()
+    .prepare("UPDATE dispatch_breaker SET trip_notified_at = ? WHERE issue_id = ? AND phase = ?")
+    .run(Date.now(), issueId, phase);
+}
+
+/**
+ * Whether the tracker still needs the PR budget comment for a parked row: true
+ * unless `fireBreakerTrip` posted its tracker comment (`trip_notified_at`). A
+ * stuck fix run parks without a trip comment, and a budget-parked row never had one.
+ */
+export function prBudgetTrackerCommentOwed(issueId: string, phase: string): boolean {
+  const row = getDb()
+    .prepare("SELECT trip_notified_at FROM dispatch_breaker WHERE issue_id = ? AND phase = ?")
+    .get(issueId, phase) as { trip_notified_at: number | null } | undefined;
+  return row?.trip_notified_at == null;
+}
+
+/**
+ * The "Needs Human" notice for a PR at its dispatch budget. Posted as a PR
+ * comment and (when owed) a tracker comment once per `claimPrBudgetNotice`
+ * claim — whoever parked the row, until `unpark` clears the claim.
  */
 export function prBudgetParkMessage(budget: number): string {
   return `**AI-Implement: Needs Human.** This PR reached its limit of ${budget} automatic fix runs in 24 hours, so AI-Implement stopped starting new ones. Comment \`/ai-implement\` on the PR to run once more, or unpark the issue at /admin to resume automatic runs.`;
@@ -143,8 +205,9 @@ export function isParked(issueId: string, phase: string): boolean {
 }
 
 /**
- * Clears parked_at AND the consecutive_failures counter so the issue can be
- * re-dispatched. Two failures after unpark will not re-park (the full threshold
+ * Clears parked_at, pr_budget_notified_at, trip_notified_at AND the
+ * consecutive_failures counter so the issue can be re-dispatched, and a later
+ * park notifies again. Two failures after unpark will not re-park (the full threshold
  * must be reached from zero).
  *
  * @param phase - If omitted, clears all phases for the issue.
@@ -155,12 +218,12 @@ export function unpark(issueId: string, phase?: string): boolean {
     phase === undefined
       ? getDb()
           .prepare(
-            "UPDATE dispatch_breaker SET parked_at = NULL, consecutive_failures = 0 WHERE issue_id = ?",
+            "UPDATE dispatch_breaker SET parked_at = NULL, pr_budget_notified_at = NULL, trip_notified_at = NULL, consecutive_failures = 0 WHERE issue_id = ?",
           )
           .run(issueId)
       : getDb()
           .prepare(
-            "UPDATE dispatch_breaker SET parked_at = NULL, consecutive_failures = 0 WHERE issue_id = ? AND phase = ?",
+            "UPDATE dispatch_breaker SET parked_at = NULL, pr_budget_notified_at = NULL, trip_notified_at = NULL, consecutive_failures = 0 WHERE issue_id = ? AND phase = ?",
           )
           .run(issueId, phase);
   return result.changes > 0;
