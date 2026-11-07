@@ -3514,6 +3514,19 @@ describe("unapproved-run failure codes", () => {
     expect(comment).not.toContain("preserved in a draft PR");
   });
 
+  it("formatFailureComment renders VERIFY_FAILED with the hook output, not review wording", () => {
+    const reason = "The verify hook failed with exit code 3.\n\nerror CS1002";
+    const initial = formatFailureComment("VERIFY_FAILED", reason, { prUrl: "https://github.com/o/r/pull/9" });
+    expect(initial).toContain("verify hook still failed");
+    expect(initial).toContain("error CS1002");
+    expect(initial).toContain("The work is in a draft PR: https://github.com/o/r/pull/9");
+    expect(initial).not.toContain("review approval");
+    // A gap-fill push reports no prUrl, and an unapproved gap-fill does not push.
+    const gapFill = formatFailureComment("VERIFY_FAILED", reason, { isInitialRun: false });
+    expect(gapFill).toContain("The existing PR is unchanged by this run.");
+    expect(gapFill).not.toContain("No PR could be opened");
+  });
+
   it("formatFailureComment renders MAX_TURNS_EXHAUSTED distinctly", () => {
     const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap");
     expect(comment).toContain("turn cap");

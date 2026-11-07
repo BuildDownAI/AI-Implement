@@ -215,6 +215,8 @@ export function makeFeedbackLoopOutputs(overrides: Partial<FeedbackLoopOutputs> 
     max_turns: { implementTurns: 50, implementOutcome: "max_turns", costUsd: null, reviewCostUsd: null, reviewApproved: null, attempts: 1 },
     review_error: { ...reviewed(false), reviewApproved: null },
     provider_unavailable: { implementTurns: null, implementOutcome: "error", costUsd: null, reviewCostUsd: null, reviewApproved: null, attempts: 2 },
+    // The verify hook failed after the pass, so its review never ran.
+    verify_failed: { implementTurns: 1, implementOutcome: "success", costUsd: null, reviewCostUsd: null, reviewApproved: null, attempts: 1, verifyExitCode: 1 },
   }[terminationReason];
   // The default retry policy gives the implement stage two attempts; the terminal record is restamped for the stage.
   const outage: FailureRecord = {
@@ -227,6 +229,7 @@ export function makeFeedbackLoopOutputs(overrides: Partial<FeedbackLoopOutputs> 
     max_turns: "Implementation hit the 50-turn cap before completing (50 turns used).",
     review_error: "Review step failed and was skipped: Error: review failed",
     provider_unavailable: `Model provider was unavailable during implementation after 2 attempt(s); partial changes were preserved. ${outage.message}`,
+    verify_failed: "The verify hook failed with exit code 1. Last part of its output:\n\n```\nbuild failed\n```",
   }[terminationReason];
   return {
     approved,

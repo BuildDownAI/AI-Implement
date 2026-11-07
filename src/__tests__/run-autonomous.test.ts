@@ -15,6 +15,8 @@ import {
 } from "../run-autonomous.js";
 import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
+import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
+import { verifyStep } from "../pipeline/steps/verify.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { buildImplRunConfig, encodeRunConfig } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -1878,6 +1880,60 @@ describe("runAutonomous", () => {
       failureCode: "REVIEW_UNAPPROVED",
     });
     expect(body.prUrl).toBeUndefined();
+  });
+
+  it("reports VERIFY_FAILED when the loop ended on a failing verify hook", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 2,
+            finalFeedback: "The verify hook failed with exit code 3.",
+            terminationReason: "verify_failed",
+            passes: [],
+          }),
+        },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode: string;
+      failureReason: string;
+      prUrl: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("VERIFY_FAILED");
+    expect(body.failureReason).toContain("The verify hook failed with exit code 3.");
+    expect(body.failureReason).not.toContain("did not approve");
+    expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
   });
 
   it("reports failure with REVIEW_UNAPPROVED and the draft PR url when the loop never approved", async () => {
@@ -4051,7 +4107,13 @@ describe("runAutonomousLocally", () => {
     writeFileSync(join(workspaceDir, "verify.sh"), "exit 1\n");
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()),
+      run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 1,
+        terminationReason: "verify_failed",
+        passes: [],
+        finalFeedback: "",
+      }),
     });
 
     const result = await runAutonomousLocally({
@@ -4068,13 +4130,56 @@ describe("runAutonomousLocally", () => {
     expect(result.approved).toBe(false);
   });
 
-  it.skipIf(isWindows)("verify does not run when review did not approve", async () => {
+  it.skipIf(isWindows)("default local pipeline hands hooks.verify to the feedback loop", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nverify: verify.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "verify.sh"), "exit 0\n");
+
+    let captured: Record<string, unknown> | undefined;
+    const runner = new PipelineRunner().register("feedback-loop", {
+      run: vi.fn().mockImplementation(async (_ctx, inputs) => {
+        captured = inputs as Record<string, unknown>;
+        return {
+          approved: true,
+          iterations: 1,
+          terminationReason: "approved",
+          passes: [],
+          finalFeedback: "",
+        };
+      }),
+    });
+
+    // No `pipeline` option: exercises LOCAL_FEEDBACK_PIPELINE.
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      runner,
+    });
+
+    expect(captured?.verifyScriptPath).toBe("verify.sh");
+  });
+
+  it.skipIf(isWindows)("unapproved: the loop receives verifyScriptPath and the post-push verify step does not run the hook", async () => {
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nverify: verify.sh\n---\nbody\n");
     writeFileSync(join(workspaceDir, "verify.sh"), 'printf "" > verify-ran.marker\n');
 
-    const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({ approved: false })),
-    });
+    const full = loadPipelineDefinition("pipelines/autonomous.yml", { existsSyncImpl: () => false });
+    const pipeline: PipelineDefinition = {
+      id: "test-local-verify",
+      steps: full.steps
+        .filter((s) => s.id === "feedback-loop" || s.id === "verify")
+        .map((s) => (s.id === "verify" ? { ...s, inputs: () => ({ workspaceDir, scriptPath: "verify.sh" }) } : s)),
+    };
+    let loopInputs: Record<string, unknown> | undefined;
+    const runner = new PipelineRunner()
+      .register("feedback-loop", {
+        run: vi.fn().mockImplementation(async (_ctx, inputs) => {
+          loopInputs = inputs as Record<string, unknown>;
+          return { approved: false, iterations: 2, terminationReason: "iterations_exhausted", passes: [], finalFeedback: "" };
+        }),
+      })
+      .register("verify", verifyStep);
 
     await runAutonomousLocally({
       workspaceDir,
@@ -4085,6 +4190,7 @@ describe("runAutonomousLocally", () => {
       runner,
     });
 
+    expect(loopInputs?.verifyScriptPath).toBe("verify.sh");
     expect(existsSync(join(workspaceDir, "verify-ran.marker"))).toBe(false);
   });
 

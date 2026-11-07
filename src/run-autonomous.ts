@@ -1603,7 +1603,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const reviewerFailure = isFailureRecord(authoritativeReviewOutputs.failure)
       ? authoritativeReviewOutputs.failure
       : undefined;
-    const failureCode = reviewerTurnsExhausted
+    // The verify hook still failed after the last iteration. Never a review verdict, so it gets
+    // its own failureCode/wording; the hook's output tail rides in finalFeedback.
+    const verifyFailed = terminationReason === "verify_failed";
+    const failureCode = verifyFailed
+      ? "VERIFY_FAILED"
+      : reviewerTurnsExhausted
       ? "REVIEWER_TURNS_EXHAUSTED"
       : providerUnavailable
         ? "PROVIDER_UNAVAILABLE"
@@ -1613,7 +1618,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
             ? "MAX_TURNS_EXHAUSTED"
             : "REVIEW_UNAPPROVED";
     const reviewMaxTurns = reviewerFailure?.reviewMaxTurns ?? retryPolicy.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
-    const failureReason = reviewerTurnsExhausted
+    const failureReason = verifyFailed
+      ? `The repository's verify hook still failed after ${iterations} iteration(s), so the review did not examine the last pass.\n\n${finalFeedback}`
+      : reviewerTurnsExhausted
       ? `🟠 A post-push reviewer reached its turn limit (${reviewMaxTurns}); required review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
       : providerUnavailable
         ? finalFeedback || "The model provider was unavailable and the run could not complete."
@@ -1626,7 +1633,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
-    disposition = reviewerTurnsExhausted
+    disposition = verifyFailed
+      ? `${prDisposition} — verify hook failed after ${iterations} iteration(s) (${terminationReason})`
+      : reviewerTurnsExhausted
       ? `${prDisposition} — reviewer ran out of turns at the cap after ${iterations} iteration(s) (${terminationReason})`
       : providerUnavailable
         ? `${prDisposition} — provider unavailable after ${iterations} iteration(s) (${terminationReason})`
@@ -1646,7 +1655,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       failure: reviewerFailure,
     });
     console.warn(
-      reviewerTurnsExhausted
+      verifyFailed
+        ? `::warning::AI-Implement: the verify hook failed after ${iterations} iteration(s) (${terminationReason}) — ` +
+          (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
+        : reviewerTurnsExhausted
         ? `::warning::AI-Implement: post-push reviewer ran out of turns at the cap after ${iterations} iteration(s) (${terminationReason}) — ` +
           (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
         : providerUnavailable
@@ -1721,7 +1733,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     }
     if (teardownHook) {
       try {
-        const result = runHookScript("teardown", teardownHook, workspaceDir);
+        const result = await runHookScript("teardown", teardownHook, workspaceDir);
         if (result.exitCode !== 0) {
           console.error(`teardown hook exited with code ${result.exitCode}`);
         }
@@ -1776,6 +1788,7 @@ const LOCAL_FEEDBACK_PIPELINE: PipelineDefinition = {
         provider: ctx.data.provider,
         maxTurns: ctx.data.maxTurns,
         maxIterations: ctx.data.maxIterations,
+        verifyScriptPath: ctx.data.hooks?.verify,
       }),
     },
   ],
@@ -1921,6 +1934,8 @@ export async function runAutonomousLocally(
       agentConfig: configured?.snapshot,
       maxTurns: opts.maxTurns,
       maxIterations: opts.maxIterations,
+      // setup/teardown run by hand here; verify runs inside the feedback loop.
+      hooks: { verify: verifyHook },
       profiles: [],
       groupingParent: false,
     },
@@ -1938,7 +1953,7 @@ export async function runAutonomousLocally(
   try {
     if (setupHook) {
       try {
-        const setupResult = runHookScript("setup", setupHook, workspaceDir);
+        const setupResult = await runHookScript("setup", setupHook, workspaceDir);
         if (setupResult.exitCode !== 0) {
           return {
             exitCode: 1,
@@ -1980,42 +1995,12 @@ export async function runAutonomousLocally(
       : [];
     const finalFeedback = typeof fb.finalFeedback === "string" ? fb.finalFeedback : "";
 
-    if (approved && verifyHook) {
-      try {
-        const verifyResult = runHookScript("verify", verifyHook, workspaceDir);
-        if (verifyResult.exitCode !== 0) {
-          return {
-            exitCode: 1,
-            approved: false,
-            terminationReason: "verify_failed",
-            iterations,
-            passes,
-            finalFeedback: `Verify hook exited with code ${verifyResult.exitCode}`,
-            effectiveMaxTurns,
-            effectiveMaxIterations,
-            tokenSummary: buildTokenSummary(passes),
-            ...attributionField(passAttribution(passes)),
-          };
-        }
-      } catch (err) {
-        return {
-          exitCode: 1,
-          approved: false,
-          terminationReason: "verify_failed",
-          iterations,
-          passes,
-          finalFeedback: `Verify hook error: ${String(err)}`,
-          effectiveMaxTurns,
-          effectiveMaxIterations,
-          tokenSummary: buildTokenSummary(passes),
-          ...attributionField(passAttribution(passes)),
-        };
-      }
-    }
-
+    // The verify hook runs inside the feedback loop (after every implement pass), so an approved
+    // run here has already passed it; there is no post-approval verify.
     runCompleted = approved;
     return {
-      exitCode: 0,
+      // verify_failed is a failure locally; the loop ran the hook.
+      exitCode: terminationReason === "verify_failed" ? 1 : 0,
       approved,
       terminationReason,
       iterations,
@@ -2042,7 +2027,7 @@ export async function runAutonomousLocally(
   } finally {
     if (setupRan && teardownHook) {
       try {
-        const result = runHookScript("teardown", teardownHook, workspaceDir);
+        const result = await runHookScript("teardown", teardownHook, workspaceDir);
         if (result.exitCode !== 0) {
           console.error(`teardown hook exited with code ${result.exitCode}`);
         }

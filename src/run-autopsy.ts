@@ -26,6 +26,10 @@ export interface StatsPass {
   attribution?: InvocationAttributionV1;
   implementFallbackFrom?: string;
   reviewFallbackFrom?: string;
+  /** Set when the verify hook ran after this pass; non-zero means the review was skipped. */
+  verifyExitCode?: number;
+  /** `false` when the verify hook ran unguarded (workspace snapshot or restore failed). */
+  verifyGuarded?: false;
 }
 
 export const STATS_TABLE_HEADER = "| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | Review |";
@@ -133,7 +137,10 @@ export function formatTokensCell(p: StatsPass): string {
 }
 
 export function formatPassRow(p: StatsPass, prices?: RunModelPrices): string {
-  const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
+  const reviewBase = p.reviewApproved == null
+    ? p.verifyExitCode ? `not run (verify hook exit ${p.verifyExitCode})` : "not run"
+    : p.reviewApproved ? "approved" : "rejected";
+  const review = p.verifyGuarded === false ? `${reviewBase} (verify hook ran unguarded)` : reviewBase;
   const outcome = p.implementFailureCode ? `${p.implementOutcome} (${p.implementFailureCode})` : p.implementOutcome;
   const model = (attribution: InvocationAttributionV1 | undefined, from?: string) => attribution
     ? `; ${attribution.model.replace(/\|/g, "\\|")}${from ? ` (fallback from ${from.replace(/\|/g, "\\|")})` : ""}` : "";
@@ -158,6 +165,8 @@ export interface RunAutopsy {
 export function formatRunAutopsy(a: RunAutopsy): string {
   const reviewerTurnsExhausted = a.terminationReason === "reviewer_turns_exhausted";
   const providerUnavailable = a.terminationReason === "provider_unavailable";
+  // Not a review verdict: the verify hook still failed after the last pass, so no review ran on it.
+  const verifyFailed = a.terminationReason === "verify_failed";
   const passRows = a.passes.map(p => formatPassRow(p)).join("\n");
   const { stageLabel, codeState } = providerUnavailablePhrase(a.failure?.stage, Boolean(a.prUrl));
   return [
@@ -167,7 +176,9 @@ export function formatRunAutopsy(a: RunAutopsy): string {
       ? `A post-push reviewer reached its configured cap (${a.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns}) after ${a.iterations} iteration(s); required review is incomplete. Other reviewer results are preserved below.`
       : providerUnavailable
         ? `🟠 The model provider was unavailable during ${stageLabel} after ${a.iterations} iteration(s); the code was ${codeState}.`
-        : `The implementation run ended **without review approval** (reason: \`${a.terminationReason}\`) after ${a.iterations} iteration(s).`,
+        : verifyFailed
+          ? `The repository's verify hook still failed after ${a.iterations} iteration(s) (reason: \`verify_failed\`), so the review did not examine the last pass.`
+          : `The implementation run ended **without review approval** (reason: \`${a.terminationReason}\`) after ${a.iterations} iteration(s).`,
     "",
     a.prUrl
       ? reviewerTurnsExhausted || (providerUnavailable && a.failure?.stage === "post-push-review")
@@ -175,7 +186,7 @@ export function formatRunAutopsy(a: RunAutopsy): string {
         : `The work so far is preserved in a draft PR: ${a.prUrl}`
       : "No PR could be opened (no code changes were produced).",
     "",
-    providerUnavailable
+    providerUnavailable || verifyFailed
       ? "**Run notes:**"
       : reviewerTurnsExhausted
         ? "**Reviewer telemetry and carried context:**"

@@ -478,7 +478,13 @@ describe("runLocalFullLoop", () => {
     writeFileSync(join(ws, "verify.sh"), "exit 1\n");
 
     const { pipeline, runner } = makeFeedbackLoopPipeline({
-      run: vi.fn(async () => makeFeedbackLoopOutputs()),
+      run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 1,
+        terminationReason: "verify_failed",
+        passes: [],
+        finalFeedback: "",
+      }),
     });
 
     const result = await runLocalFullLoop({

@@ -76,7 +76,7 @@ export class PipelineRunner {
     }
 
     for (const definition of pipeline.steps) {
-      const skipResult = definition.skip?.(context);
+      const skipResult = await definition.skip?.(context);
       if (skipResult) {
         const reason = typeof skipResult === "string" ? skipResult : "skip condition met";
         console.log(`[runner] skipping ${definition.id}: ${reason}`);
