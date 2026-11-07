@@ -206,7 +206,8 @@ export class FilesystemProvider implements TicketingProvider {
     }, { activeOnly: true });
   }
 
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
+  // The task's own state already records which phase failed, so `_phase` is not needed here.
+  async clearWorkingState(issueId: string, scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
     const mapping = this.mappingForScope(scopeKey);
     return this.updateTask(issueId, scopeKey, (state) => {
       if (isCallbackTerminal(state.status)) return null;
@@ -218,6 +219,13 @@ export class FilesystemProvider implements TicketingProvider {
             : "plan-approved";
       const { failurePhase: _failurePhase, ...rest } = state;
       return { ...rest, status: nextStatus };
+    }, { activeOnly: true });
+  }
+
+  async parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (isCallbackTerminal(state.status)) return null;
+      return { ...state, status: "failed", failurePhase: phase };
     }, { activeOnly: true });
   }
 

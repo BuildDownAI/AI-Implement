@@ -70,7 +70,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
 
       expect(stopRunner).toHaveBeenCalledOnce();
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -112,15 +112,16 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
 
-    it("clears working state but preserves dedup on hard-stop", async () => {
+    it("parks the ticket, then clears dedup, on hard-stop", async () => {
       vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
       const provider = makeProvider();
       const stopRunner = vi.fn().mockResolvedValue(true);
 
       await remediateStuckJob(mockConfig, provider, stuckJob(), "machine_timeout", stopRunner);
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
-      expect(deleteDispatched).not.toHaveBeenCalled();
+      expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
+      expect(provider.clearWorkingState).not.toHaveBeenCalled();
+      expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
     });
 
     it("fires notifyStuckGiveUp with machine_timeout lastRunStatus on hard-stop", async () => {
@@ -165,7 +166,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
 
       expect(stopRunner).toHaveBeenCalledOnce();
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -197,7 +198,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     });
 
-    it("clears working state but preserves dedup on hard-stop", async () => {
+    it("parks the ticket, then clears dedup, on hard-stop", async () => {
       vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
       const provider = makeProvider();
       const stopRunner = vi.fn().mockResolvedValue(true);
@@ -205,8 +206,9 @@ describe("remediateStuckJob — local-docker timeout path", () => {
 
       await remediateStuckJob(mockConfig, provider, job, "container_timeout", stopRunner);
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
-      expect(deleteDispatched).not.toHaveBeenCalled();
+      expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
+      expect(provider.clearWorkingState).not.toHaveBeenCalled();
+      expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
     });
 
     it("fires notifyStuckGiveUp with container_timeout lastRunStatus on hard-stop", async () => {
@@ -286,7 +288,7 @@ describe("remediateFailedJob — under-budget requeue (attempts 1-3)", () => {
     await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
 
     expect(incrementStuckAttempts).toHaveBeenCalledWith("issue-abc");
-    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
+    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
     expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
     expect(notifyStuckGiveUp).not.toHaveBeenCalled();
   });
@@ -321,14 +323,15 @@ describe("remediateFailedJob — under-budget requeue (attempts 1-3)", () => {
 });
 
 describe("remediateFailedJob — hard-stop (attempt 4+ = budget exhausted)", () => {
-  it("clears working state but preserves dedup on hard-stop", async () => {
+  it("parks the ticket, then clears dedup, on hard-stop", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
     const provider = makeProvider();
 
     await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
 
-    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
-    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "AII", "implementation");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
   });
 
   it("fires notifyStuckGiveUp with the failure lastRunStatus on hard-stop", async () => {

@@ -486,7 +486,8 @@ describe("production deps", () => {
       expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "operator_cancelled");
       expect(remediateFailedJob).not.toHaveBeenCalled();
       // The planning label is cleared, so the ticket does not stay blocked in `AI-Planning`.
-      expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
+
+      expect(provider.clearWorkingState).toHaveBeenCalledWith(expect.anything(), expect.anything(), "planning");      expect(provider.clearWorkingState).toHaveBeenCalledTimes(1);
     });
 
     it("skips the tracker write on a retry when the failure comment is already recorded", async () => {

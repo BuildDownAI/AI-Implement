@@ -34,7 +34,7 @@ vi.mock("../notify.js", () => ({
 }));
 
 import { remediateStuckJob, remediateFailedJob } from "../stuck-watchdog.js";
-import { incrementStuckAttempts, updateJobStatus, getJobById } from "../log.js";
+import { incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "../log.js";
 import { deleteDispatched } from "../dedup.js";
 import { notifyStuckGiveUp } from "../notify.js";
 import { cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
@@ -421,5 +421,89 @@ describe("remediateStuckJob — Restate-owned job", () => {
     expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "kg-refresh" }), "x", undefined, { ownerCall: true })).toBe(false);
     expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", conclusion: "operator_cancelled" }), "x", undefined, { ownerCall: true })).toBe(false);
     expect(incrementStuckAttempts).not.toHaveBeenCalled();
+  });
+});
+
+describe("boundedCleanup give-up — parkForHuman", () => {
+  const GIVE_UP = 4;
+  const linearLine = "To start AI-Implement again, remove the AI-Needs-Human label from the ticket.";
+  const resetLine = "To start AI-Implement again, reset the AI-Implement status or label on the ticket.";
+
+  beforeEach(() => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(GIVE_UP);
+  });
+
+  it("implementation give-up parks, then clears dedup and the counter; no clearWorkingState", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "implementation" }), "failure");
+
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    const park = vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0];
+    expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+  });
+
+  it("planning give-up parks with the planning phase", async () => {
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "planning" }), "failure");
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
+  });
+
+  it("the timeout path (remediateStuckJob) gives up the same way", async () => {
+    const provider = makeProvider();
+    await remediateStuckJob(mockConfig, provider, stuckJob(), "in_progress", async () => true);
+    expect(provider.parkForHuman).toHaveBeenCalled();
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+  });
+
+  it("keeps dedup and the counter when parkForHuman returns false", async () => {
+    const provider = makeProvider({ parkForHuman: vi.fn().mockResolvedValue(false) });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("keeps dedup and the counter when parkForHuman throws, and still comments and notifies", async () => {
+    const provider = makeProvider({ parkForHuman: vi.fn().mockRejectedValue(new Error("tracker down")) });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
+    expect(provider.postComment).toHaveBeenCalledOnce();
+    expect(notifyStuckGiveUp).toHaveBeenCalledOnce();
+  });
+
+  it("on Linear the give-up comment ends with the remove-the-marker line", async () => {
+    const provider = makeProvider({ id: "linear" });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body.endsWith(linearLine)).toBe(true);
+  });
+
+  it.each(["jira", "filesystem"] as const)("on %s the give-up comment ends with the reset line", async (id) => {
+    const provider = makeProvider({ id });
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    const body = vi.mocked(provider.postComment).mock.calls[0][1];
+    expect(body.endsWith(resetLine)).toBe(true);
+  });
+
+  it("the retry branch is unchanged: clearWorkingState and dedup, no park", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
+    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(provider.parkForHuman).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
+  });
+
+  it("a failed planning job is reset with the planning phase (Ready, not Plan Approved)", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+    await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "planning" }), "failure");
+    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
   });
 });

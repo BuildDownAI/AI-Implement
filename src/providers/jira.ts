@@ -931,8 +931,16 @@ export class JiraProvider implements TicketingProvider {
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
     return true;
   }
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
-    return this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
+  async clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    // A failed planning run has no approved plan: Plan Approved would dispatch implementation.
+    return this.setStatus(issueId, scopeKey, phase === "planning" ? STATUS_VALUES.READY : STATUS_VALUES.APPROVED);
+  }
+  async parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    return this.setStatus(
+      issueId,
+      scopeKey,
+      phase === "planning" ? STATUS_VALUES.PLANNING_FAILED : STATUS_VALUES.IMPLEMENTATION_FAILED,
+    );
   }
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.MERGED);

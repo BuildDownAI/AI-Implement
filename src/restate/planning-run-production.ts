@@ -228,7 +228,7 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
       const cancelledMapping = job.teamKey ? getMapping(job.teamKey) : undefined;
       if (cancelledMapping && job.issueId) {
         const cancelledProvider = await input.resolveProvider(cancelledMapping);
-        await cancelledProvider.clearWorkingState(job.issueId, job.teamKey ?? "");
+        await cancelledProvider.clearWorkingState(job.issueId, job.teamKey ?? "", "planning");
       }
       return;
     }

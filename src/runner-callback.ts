@@ -1206,7 +1206,7 @@ async function handleRunnerResultInternal(
         // and skip retry remediation. The one informational notice fires later via
         // the notification loop in index.ts.
         try {
-          await provider.clearWorkingState(claims.issueId, mappingTeamKey);
+          await provider.clearWorkingState(claims.issueId, mappingTeamKey, "implementation");
         } catch (err) {
           warn("clearWorkingState(operator_cancelled)", err);
         }

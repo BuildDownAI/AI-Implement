@@ -1,7 +1,7 @@
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import type { Job } from "./log.js";
 import { cancelWorkflowRun, getWorkflowRunStatus } from "./github.js";
-import { incrementStuckAttempts, updateJobStatus, getJobById } from "./log.js";
+import { incrementStuckAttempts, resetStuckAttempts, updateJobStatus, getJobById } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
 import { notifyStuckGiveUp } from "./notify.js";
 import { getInstallationToken } from "./github-app-auth.js";
@@ -95,6 +95,18 @@ async function alertStuckReviewFix(
   }
 }
 
+/** The pickup phase a failed run belongs to; only planning and implementation runs reach this. */
+function ticketPhase(job: Job): "planning" | "implementation" {
+  return job.phase === "planning" ? "planning" : "implementation";
+}
+
+/** The restart instruction; on Linear only the AI-Needs-Human marker holds a parked issue. */
+function restartSentence(provider: TicketingProvider | null): string {
+  return provider?.id === "linear"
+    ? "To start AI-Implement again, remove the AI-Needs-Human label from the ticket."
+    : "To start AI-Implement again, reset the AI-Implement status or label on the ticket.";
+}
+
 /**
  * Shared ticket-cleanup core: increment the stuck-attempts counter and either
  * requeue (within budget) or give-up (over budget). Returns the updated count.
@@ -114,7 +126,7 @@ async function boundedCleanup(
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
     if (provider) {
       try {
-        const applied = await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
+        const applied = await provider.clearWorkingState(job.issueId!, job.teamKey ?? "", ticketPhase(job));
         deleteDispatched(job.issueId!);
         console.log(
           applied
@@ -127,10 +139,18 @@ async function boundedCleanup(
     }
   } else {
     if (provider) {
+      // Park the ticket out of pickup, and only then release dedup and the attempt budget:
+      // clearing dedup while the ticket still looks ready would start a retry loop.
       try {
-        await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
+        const parked = await provider.parkForHuman(job.issueId!, job.teamKey ?? "", ticketPhase(job));
+        if (parked) {
+          deleteDispatched(job.issueId!);
+          resetStuckAttempts(job.issueId!);
+        } else {
+          console.warn(`[monitor] ${job.issueIdentifier} park refused (issue already terminal) — dedup kept`);
+        }
       } catch (err) {
-        console.error(`[monitor] Failed to clear working state for ${job.issueIdentifier}:`, err);
+        console.error(`[monitor] Failed to park ${job.issueIdentifier} for a human:`, err);
       }
     }
 
@@ -170,7 +190,7 @@ async function boundedCleanup(
         `| Last run status | \`${lastRunStatus}\` |`,
         ...(runUrl ? [`| Last run | ${runUrl} |`] : []),
         ``,
-        `Please investigate and re-label when ready to re-dispatch.`,
+        restartSentence(provider),
       ];
       try {
         await provider.postComment(job.issueId!, lines.join("\n"));
@@ -192,9 +212,10 @@ async function boundedCleanup(
  * Attempts 1-3: stop the runner, mark timed_out/stuck_requeued, reset ticket
  * for re-dispatch (clears AI-Working label + dedup entry).
  *
- * Attempt 4+: stop the runner, mark timed_out/stuck_giveup, clear AI-Working
- * label only (dedup left intact so the poller won't re-pick it), fire loud
- * notifyStuckGiveUp alert, and post a Linear comment.
+ * Attempt 4+: stop the runner, mark timed_out/stuck_giveup, park the ticket
+ * out of pickup (`parkForHuman`), then clear dedup and reset the attempt counter
+ * (only when the park was applied), fire loud notifyStuckGiveUp alert, and post
+ * a ticket comment.
  *
  * A `gap-analysis` job (review-fix queue or `/ai-implement` comment rail) is stopped and closed out as
  * timed_out/stuck_review_fix, skipping the ticket reset, dedup clear and attempt counter; a human is
@@ -341,9 +362,10 @@ export async function remediateStuckJob(
  * Attempts 1-3: clear AI-Working + dedup so a later poll (or a human re-label)
  * can re-dispatch.
  *
- * Attempt 4+: clear AI-Working only (dedup stays to prevent re-dispatch), fire
- * notifyStuckGiveUp, and post a comment. Reuses incrementStuckAttempts so the
- * budget spans both timeouts and failures for the same issue.
+ * Attempt 4+: park the ticket out of pickup, then clear dedup and reset the
+ * counter (only when the park was applied), fire notifyStuckGiveUp, and post
+ * a comment. Reuses incrementStuckAttempts so the budget spans both timeouts
+ * and failures for the same issue.
  */
 export async function remediateFailedJob(
   config: StuckWatchdogConfig,

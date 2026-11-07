@@ -218,8 +218,19 @@ export interface TicketingProvider {
   markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<boolean>;
   /** Returns whether a failure comment was actually posted — see `markPlanningFailed`. */
   markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean>;
-  /** Returns whether the reset was applied; false when refused (issue already Merged). */
-  clearWorkingState(issueId: string, scopeKey: string): Promise<boolean>;
+  /** Put the issue back in pickup after a failed or timed-out run, so it can be dispatched again.
+   *  `phase` is the phase of the run that failed: a planning reset goes back to the planning pickup
+   *  state (Jira: Ready), an implementation reset to the implementation pickup state (Jira: Plan
+   *  Approved). Returns whether the reset was applied; false when refused (issue already Merged). */
+  clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
+  /** Move the issue out of pickup so a human decides what happens next, and post no comment (the
+   *  caller comments). Unlike `clearWorkingState`, the ticket must not look ready for pickup
+   *  (Jira: Planning Failed / Implementation Failed; Linear: the `AI-Needs-Human` label;
+   *  filesystem: a failed task). Returns whether the write was applied; false when refused
+   *  because the issue is already terminal (Jira: Merged; Linear: completed or canceled;
+   *  filesystem: a terminal task). Not the dispatch-breaker park (`src/dispatch-breaker.ts`),
+   *  which holds re-dispatch per phase. */
+  parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;

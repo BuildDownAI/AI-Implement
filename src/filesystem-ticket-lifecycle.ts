@@ -86,6 +86,8 @@ export async function reconcileFilesystemFailures(registry: ProviderRegistry): P
       const phase = breakerPhase === "planning" ? "planning" : "implementation";
       if (job.conclusion === "stuck_requeued" || job.conclusion === "stuck_review_fix") continue;
       const parked = isParked(job.issue_id, breakerPhase);
+      // gaveUp and exhausted are true only when the give-up park failed: a successful park
+      // (`parkForHuman`) leaves failedState set, or clears them. They cover that half-failed case.
       const gaveUp = job.conclusion === "stuck_giveup" && isAlreadyDispatched(job.issue_id);
       const exhausted = isWatchdogExhausted(job.issue_id);
       const failedState = details.state?.status === "failed";
