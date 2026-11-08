@@ -1,3 +1,4 @@
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { readFileSync } from "node:fs";
@@ -45,8 +46,8 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     gitSpawn: () => ({ stdout: "", exitCode: 0 }),
     reviewProviders: externalPending ? ["github-claude-code-review"] : [],
     sleep: async () => {}, reviewWaitPollMs: 1, reviewWaitTimeoutMs: 2,
-    reviewers: [{ id: "code-review", gates: true }],
-    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: options.buildPrompt ?? (() => "Review"), outputSchema: options.outputSchema ?? { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
+    reviewers: DEFAULT_REVIEWER_SELECTION,
+    trustedReviewerDefinitions: new Map(DEFAULT_REVIEWER_SELECTION.map(({ id }) => [id, { id, buildPrompt: options.buildPrompt ?? (() => "Review"), outputSchema: options.outputSchema ?? { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }])),
   }, { report });
   const nativeBodies = publication.calls.map(call => JSON.parse(call.body).body as string);
   const comments = ghSpawn.mock.calls.filter(([args]) => args[0] === "pr" && args[1] === "comment")

@@ -13,10 +13,8 @@ export interface MemoryProviderCapabilities {
 /**
  * Outcome of a non-streaming `callKgTool`: either the sidecar's own JSON-RPC `result`
  * (whatever shape that tool returns — e.g. kg_hybrid_search's `degraded` flag travels
- * inside it untouched), or a human-readable error string. The error text matches what
- * `proxyCall`'s `writeConnectionError` used to write into a 502 body, or the sidecar's
- * own JSON-RPC error message, so a caller migrating off `/mcp`'s raw proxy sees the same
- * wording it always has.
+ * inside it untouched), or a human-readable transport error or the sidecar's own
+ * JSON-RPC error message.
  */
 export type KgToolResult = { ok: true; result: unknown } | { ok: false; error: string };
 
@@ -25,8 +23,6 @@ export interface MemoryProvider {
   readonly capabilities: MemoryProviderCapabilities;
   /** Return the list of MCP tool definitions this provider can serve. */
   listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]>;
-  /** Forward a tool call to the provider, writing the response directly to `res`. */
-  proxyCall(req: http.IncomingMessage, res: http.ServerResponse, body: Buffer): void;
   /**
    * Calls a single `kg_*` tool and returns its parsed result rather than writing to an
    * HTTP response — the path a Restate tool handler (src/restate/tools.ts) uses, since it
@@ -111,19 +107,17 @@ function recordSidecarHealth(patch: Omit<SidecarHealth, "checkedAt">): SidecarHe
   return { ...sidecarHealth };
 }
 
-/** Re-probes triggered by a failed listTools/proxyCall are throttled to this interval. */
+/** Re-probes triggered by a failed listTools/callKgTool are throttled to this interval. */
 const PROBE_THROTTLE_MS = 60_000;
 
 /**
- * Bounds every buffered `sendToSidecar` call (the session handshake, `listTools`, and
- * both probe steps). Mirrors the 2s-timeout pattern `KgSidecar`'s own readiness poll
- * uses in src/kg-sidecar.ts, scaled up because these calls run a real query rather than
+ * Bounds every buffered `sendToSidecar` call (the session handshake, `listTools`,
+ * `callKgTool`, and both probe steps). Mirrors the 2s-timeout pattern `KgSidecar`'s
+ * own readiness poll uses in src/kg-sidecar.ts, scaled up because these calls run a real query rather than
  * checking whether the port accepts connections. Without this bound, a sidecar that
  * accepts the connection but never answers — e.g. `[kg] sidecar ready` already logged,
  * then a deadlock or a cold-start query hang — leaves the boot-time probe in main()
  * unresolved forever, which stalls startServer() and postBootNotice() along with it.
- * Deliberately not applied to `sendOrStream` (proxyCall's real-traffic path): a
- * legitimate hybrid-search or embedding query can run longer than this.
  */
 const SIDECAR_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -164,11 +158,6 @@ export function parseSidecarRpcResponse(raw: string, contentType: string | undef
   }
 }
 
-function writeJson(res: http.ServerResponse, status: number, data: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(data));
-}
-
 type SidecarHeaders = Record<string, string | string[] | undefined>;
 
 type SidecarPostResult =
@@ -195,10 +184,6 @@ function classifySessionError(
   }
   return null;
 }
-
-/** A proxyCall outcome whose response was relayed to the client as it arrived. */
-type StreamedOutcome = { ok: true; streamed: true };
-type SendOutcome = SidecarPostResult | StreamedOutcome;
 
 /** Wraps the existing KG sidecar at `kgSidecarUrl` as the default provider. */
 /**
@@ -267,53 +252,6 @@ export class SidecarMemoryProvider implements MemoryProvider {
   }
 
   /**
-   * proxyCall's sender. A 400 or 404 from the sidecar may be a session signal, so those
-   * small JSON bodies are buffered and returned for classification. Any other status is
-   * relayed as it arrives — headers first, then each chunk — so a long or SSE response is
-   * never held in memory and never waits for the sidecar to close the stream (review of
-   * AII-649: the first version buffered every response, which would have stalled a GET
-   * event stream proxied through the "everything else" path in src/mcp.ts).
-   */
-  private sendOrStream(
-    target: URL,
-    transport: typeof http | typeof https,
-    method: string,
-    headers: SidecarHeaders,
-    body: Buffer,
-    res: http.ServerResponse,
-  ): Promise<SendOutcome> {
-    return new Promise((resolve) => {
-      const options: http.RequestOptions = {
-        hostname: target.hostname,
-        port: target.port || (target.protocol === "https:" ? "443" : "80"),
-        path: target.pathname + target.search,
-        method,
-        headers: { ...headers, host: target.host },
-      };
-      const proxyReq = transport.request(options, (proxyRes) => {
-        const status = proxyRes.statusCode ?? 0;
-        if (status === 400 || status === 404) {
-          const chunks: Buffer[] = [];
-          proxyRes.on("data", (chunk: Buffer) => chunks.push(chunk));
-          proxyRes.on("end", () => resolve({ ok: true, status, headers: proxyRes.headers, raw: Buffer.concat(chunks) }));
-          proxyRes.on("error", (err) => resolve({ ok: false, error: err as NodeJS.ErrnoException }));
-          return;
-        }
-        const outHeaders = { ...proxyRes.headers } as http.OutgoingHttpHeaders;
-        delete outHeaders["transfer-encoding"];
-        res.writeHead(status, outHeaders);
-        proxyRes.on("data", (chunk: Buffer) => res.write(chunk));
-        proxyRes.on("end", () => res.end());
-        proxyRes.on("error", (err) => res.destroy(err));
-        resolve({ ok: true, streamed: true });
-      });
-      proxyReq.on("error", (err: NodeJS.ErrnoException) => resolve({ ok: false, error: err }));
-      if (body.length > 0) proxyReq.write(body);
-      proxyReq.end();
-    });
-  }
-
-  /**
    * Performs the MCP `initialize` → `notifications/initialized` handshake
    * against the sidecar and returns the negotiated `mcp-session-id`. Throws
    * when the sidecar doesn't answer with a session header, so callers can
@@ -359,8 +297,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
   /**
    * Sends via `send`, and if the sidecar reports a session error, runs the
    * handshake once and retries `send` with the negotiated session id. Shared
-   * by `listTools` and `proxyCall`, which differ only in how they consume the
-   * result (parsed tool list vs. raw response forwarding).
+   * by `listTools`, `callKgTool`, and both probe steps.
    *
    * On success `handshakeError` is absent and `result`/`parsed` reflect the
    * final attempt. If the handshake itself throws, `result`/`parsed` reflect
@@ -372,12 +309,12 @@ export class SidecarMemoryProvider implements MemoryProvider {
     target: URL,
     transport: typeof http | typeof https,
     forwardHeaders: SidecarHeaders,
-    send: (sessionId: string | null) => Promise<SendOutcome>,
-  ): Promise<{ result: SendOutcome; parsed: SidecarRpcResponse | null; handshakeError?: unknown }> {
+    send: (sessionId: string | null) => Promise<SidecarPostResult>,
+  ): Promise<{ result: SidecarPostResult; parsed: SidecarRpcResponse | null; handshakeError?: unknown }> {
     const first = await send(this.sessionId);
-    if (!first.ok || "streamed" in first) return { result: first, parsed: null };
+    if (!first.ok) return { result: first, parsed: null };
 
-    let result: SendOutcome = first;
+    let result: SidecarPostResult = first;
     let parsed = parseSidecarRpcResponse(first.raw.toString(), first.headers["content-type"]);
     const kind = classifySessionError(first.status, parsed, this.sessionId);
     if (kind) {
@@ -388,7 +325,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
         console.error(`[mcp] KG sidecar demanded a session; initialized (id ${sessionId}) and retried`);
         const retry = await send(sessionId);
         result = retry;
-        parsed = retry.ok && !("streamed" in retry) ? parseSidecarRpcResponse(retry.raw.toString(), retry.headers["content-type"]) : null;
+        parsed = retry.ok ? parseSidecarRpcResponse(retry.raw.toString(), retry.headers["content-type"]) : null;
       } catch (err) {
         return { result, parsed, handshakeError: err };
       }
@@ -401,12 +338,11 @@ export class SidecarMemoryProvider implements MemoryProvider {
    * result. Shared by both probe steps (tools/list and the kg_neighbors call).
    */
   private describeSendFailure(
-    outcome: { result: SendOutcome; parsed: SidecarRpcResponse | null; handshakeError?: unknown },
+    outcome: { result: SidecarPostResult; parsed: SidecarRpcResponse | null; handshakeError?: unknown },
     label: string,
   ): string | null {
     const { result, parsed, handshakeError } = outcome;
     if (!result.ok) return `${label} failed: ${result.error.message}`;
-    if ("streamed" in result) return `${label} returned a streamed response instead of JSON`;
     if (handshakeError) {
       const msg = handshakeError instanceof Error ? handshakeError.message : String(handshakeError);
       return `${label} session handshake failed: ${msg}`;
@@ -493,7 +429,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
   }
 
   /**
-   * Re-probes when `listTools`/`proxyCall` hits a failure, throttled to one real
+   * Re-probes when `listTools`/`callKgTool` hits a failure, throttled to one real
    * sidecar round-trip per PROBE_THROTTLE_MS. Callers fire this and move on rather than
    * awaiting it (AII-650 refinement #2): awaiting made the first failing call after an
    * outage pay for a full extra probe (up to two more 10s-bounded sidecar round trips)
@@ -535,7 +471,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
     };
 
     const { result, parsed } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
-    if (!result.ok || "streamed" in result) {
+    if (!result.ok) {
       void this.maybeReprobe();
       return [];
     }
@@ -555,8 +491,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
   }
 
   /**
-   * Shared by `proxyCall`'s `writeConnectionError` and `callKgTool`: classifies a transport
-   * failure into the same wording both paths have always used, logging as a side effect.
+   * Classifies a transport failure into a human-readable error, logging as a side effect.
    */
   private describeConnectionFailure(err: NodeJS.ErrnoException): string {
     if (err.code === "ECONNREFUSED") {
@@ -572,7 +507,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
    * to an HTTP response — built on the same session-tolerant send path and probe headers
    * `probe()` uses, so a Restate handler (src/restate/tools.ts) with no `res` to stream into
    * can still call the sidecar. Never throws: every failure resolves to `{ ok: false }` with
-   * the same wording `proxyCall` has always produced for the same failure.
+   * a human-readable transport error or the sidecar's own JSON-RPC error message.
    */
   async callKgTool(name: string, args: Record<string, unknown>): Promise<KgToolResult> {
     const target = new URL(this.kgSidecarUrl);
@@ -591,10 +526,6 @@ export class SidecarMemoryProvider implements MemoryProvider {
       void this.maybeReprobe();
       return { ok: false, error: this.describeConnectionFailure(result.error) };
     }
-    if ("streamed" in result) {
-      // sendToSidecar (unlike sendOrStream) never streams; unreachable in practice.
-      return { ok: false, error: "KG sidecar error" };
-    }
     if (handshakeError) {
       console.error(`[mcp] KG sidecar session initialize failed calling ${name}; forwarding the original rejection:`, handshakeError);
       void this.maybeReprobe();
@@ -611,58 +542,6 @@ export class SidecarMemoryProvider implements MemoryProvider {
       return { ok: false, error: typeof err.message === "string" ? err.message : JSON.stringify(parsed.error) };
     }
     return { ok: true, result: parsed.result };
-  }
-
-  proxyCall(req: http.IncomingMessage, res: http.ServerResponse, body: Buffer): void {
-    const target = new URL(this.kgSidecarUrl);
-    const transport = target.protocol === "https:" ? https : http;
-
-    const forwardHeaders: SidecarHeaders = { ...req.headers };
-    delete forwardHeaders.authorization;
-    delete forwardHeaders.host;
-    delete forwardHeaders.cookie;
-    delete forwardHeaders["transfer-encoding"];
-
-    const send = (sessionId: string | null) => {
-      const reqHeaders: SidecarHeaders = { ...forwardHeaders };
-      if (sessionId) reqHeaders["mcp-session-id"] = sessionId;
-      if (body.length > 0) {
-        reqHeaders["content-length"] = String(body.length);
-      } else {
-        delete reqHeaders["content-length"];
-      }
-      return this.sendOrStream(target, transport, req.method ?? "POST", reqHeaders, body, res);
-    };
-
-    const writeConnectionError = (err: NodeJS.ErrnoException) => {
-      if (res.headersSent) {
-        res.destroy(err);
-        return;
-      }
-      writeJson(res, 502, { error: this.describeConnectionFailure(err) });
-    };
-
-    void (async () => {
-      const { result, handshakeError } = await this.sendWithSessionRetry(target, transport, forwardHeaders, send);
-      if (!result.ok) {
-        void this.maybeReprobe();
-        writeConnectionError(result.error);
-        return;
-      }
-      if ("streamed" in result) return; // relayed to the client as it arrived
-      if (handshakeError) {
-        // Surface the sidecar's own rejection (status + JSON-RPC error body) rather than a
-        // synthetic 502 — parity with listTools and with docs/kg-sidecar.md.
-        console.error("[mcp] KG sidecar session initialize failed; forwarding the original rejection:", handshakeError);
-        void this.maybeReprobe();
-      }
-
-      const outHeaders = { ...result.headers } as http.OutgoingHttpHeaders;
-      delete outHeaders["transfer-encoding"];
-      outHeaders["content-length"] = String(result.raw.length);
-      res.writeHead(result.status, outHeaders);
-      res.end(result.raw);
-    })();
   }
 }
 

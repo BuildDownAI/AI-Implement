@@ -334,8 +334,10 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
       : new NoopStepReporter());
 
+  const untilStep = process.env.AI_IMPLEMENT_UNTIL_STEP?.trim() || undefined;
+
   try {
-    await runner.run(pipeline, context, reporter);
+    await runner.run(pipeline, context, reporter, { stopAfterStep: untilStep });
   } catch (err) {
     const isMissing = err instanceof KgSnapshotMissingError;
     const isStale = err instanceof KgSnapshotStaleError;
