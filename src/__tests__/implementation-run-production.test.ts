@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import { makeJob, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { buildRunConfig } from "../run-config.js";
 
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async (importOriginal) => ({
@@ -223,6 +224,30 @@ describe("production deps", () => {
   });
 
   describe("launch", () => {
+    it.each(BACKENDS)("%s: runner configuration preserves issue limits and falls back to project defaults", async (backend) => {
+      const storedMapping = makeMapping({ maxTurns: 100, maxIterations: 10 });
+      for (const limits of [
+        { maxTurns: 20, maxIterations: 2 },
+        { maxTurns: 20 },
+        { maxIterations: 2 },
+        {},
+      ]) {
+        provider.findByKey.mockResolvedValue({ ...issue, ...limits });
+        const { d, input } = compose({ getMapping: () => storedMapping });
+        expect(await d.launch({ ...INPUT, backend })).toMatchObject({ outcome: "accepted" });
+        const launch = backend === "github-actions" ? input.prepareImplementationLaunch : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
+        const args = vi.mocked(launch).mock.calls[0][0];
+        const runnerConfig = buildRunConfig({
+          issue: args.issue, mapping: args.mapping, runnerPhase: "implementation", retryPolicy: null,
+        });
+        expect(runnerConfig).toMatchObject({
+          maxTurns: limits.maxTurns ?? 100,
+          maxIterations: limits.maxIterations ?? 10,
+        });
+        expect(storedMapping).toMatchObject({ maxTurns: 100, maxIterations: 10 });
+      }
+    });
+
     it.each(BACKENDS)("%s: failed and empty price reads still launch without prices", async (backend) => {
       for (const read of [async () => { throw new Error("cache unavailable"); }, async () => ({ prices: [], fetchedAt: null })]) {
         const { d, input } = compose();

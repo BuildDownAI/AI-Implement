@@ -212,12 +212,18 @@ export function createProductionImplementationRunServices(input: ImplementationR
   /** Everything before the launch call. A throw is a definitive non-launch; the managed grant is revoked here
    *  for a decision taken, and the workflow releases the reservation on `rejected`. */
   async function prepare(run: ImplementationRunInput): Promise<Prelaunch> {
-    const mapping = requireMapping(getMapping, run.teamKey);
-    const provider = await input.resolveProvider(mapping);
+    const storedMapping = requireMapping(getMapping, run.teamKey);
+    const provider = await input.resolveProvider(storedMapping);
     const found = await provider.findByKey(run.issueIdentifier, run.teamKey);
     if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
     // The run's mapping key is the source of truth: a provider's `findByKey` may return an empty `scopeKey` (Jira).
     const issue: TicketIssue = { ...found, scopeKey: run.teamKey };
+    // Match poll's effective limits without mutating the stored project defaults.
+    const mapping = {
+      ...storedMapping,
+      maxTurns: issue.maxTurns ?? storedMapping.maxTurns,
+      maxIterations: issue.maxIterations ?? storedMapping.maxIterations,
+    };
     const admission = readAdmission(run.dispatchId);
     if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
 
