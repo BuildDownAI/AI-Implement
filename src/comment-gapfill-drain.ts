@@ -11,16 +11,15 @@ import {
   type DispatchAdmissionBackend,
 } from "./dispatch-admission.js";
 import { CONFLICT_COMMENTER, claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
-import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
+import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job, type MachineSize } from "./log.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
-import { checkForcedPathEligibility, resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
+import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
 import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
-import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState, type DispatchResult } from "./github.js";
-import { buildRunConfig, encodeRunConfig, type RunConfigV1, type RunCredentialsV1 } from "./run-config.js";
+import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, type DispatchResult } from "./github.js";
+import type { RunCredentialsV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
-import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, guestSize } from "./fly-machines.js";
-import { resolveSessionImage } from "./repo-image.js";
+import { dispatchFlyGapfill } from "./gapfill-launch.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { MAX_TASK_FINDINGS, formatTaskFinding, type ReviewFixTaskFinding } from "./review-fix-queue.js";
@@ -35,7 +34,6 @@ import {
   type ManagedDispatchDecision,
 } from "./managed-dispatch-auth.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
-import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
 
@@ -644,135 +642,49 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           admission, gapFillIssue.identifier,
         );
         if (!flyDecision) continue;
-        const protectedLaunch = flyDecision.kind === "launch" ? flyDecision : null;
-
-        const flyToken = opts.flySessionsToken;
-        const flyApp = opts.flySessionsApp;
-        let resolvedImage: string;
-        let machineNonce: string;
-        let machineConfig: ReturnType<typeof buildSessionMachineConfig>;
+        let launchAttempted = false;
+        let machineSize: MachineSize | undefined;
+        let launched: Awaited<ReturnType<typeof dispatchFlyGapfill>>;
         try {
-          const minSecretsVersion = getFlySecretsMinVersion();
-
-          let allSecretNames: string[] = [];
-          try {
-            const secrets = await listAppSecrets(flyToken, flyApp);
-            allSecretNames = secrets.map((s) => s.name);
-          } catch (err) {
-            console.warn(`[comment-gapfill] Failed to fetch app secrets for ${gapFillIssue.identifier}, proceeding without team secrets:`, err);
-          }
-
-          const resolved = await resolveSessionImage({
+          launched = await dispatchFlyGapfill({
+            mapping,
+            issue: prLog,
             owner: item.owner,
             repo: item.repo,
-            token: ghToken,
-            defaultImage: opts.sessionImage,
-          });
-          resolvedImage = resolved.image;
-          // Every throw in this block precedes the launch, so the grant is settled as rejected.
-          if (protectedLaunch) {
-            if (resolved.source === "override") throw new Error("managed dispatch refused: repository image override");
-            if (!opts.runnerCallbackBaseUrl) throw new Error("managed dispatch refused: no runner callback base URL");
-          }
-
-          const sessionToken = generateSessionToken();
-          machineNonce = generateMachineNonce();
-
-          const gapFillRunConfig: RunConfigV1 = {
-            ...buildRunConfig({
-              runnerPhase: "gap-analysis",
-              issue: {
-                id: prLog.issueId,
-                identifier: prLog.issueIdentifier ?? prLog.issueId,
-                title: prLog.issueTitle ?? prLog.issueId,
-                description: prLog.issueTitle ?? prLog.issueId,
-              },
-              mapping,
-              runnerCallbackUrl: runnerCallbackUrl || undefined,
-              prNumber: String(item.prNumber),
-              commentInstruction,
-              retryPolicy: getRetryPolicy(),
-            }),
-            ...managedRunConfigFields(protectedLaunch),
-          };
-
-          let protectedModelBootstrap: Awaited<ReturnType<typeof buildProtectedFlyBootstrap>> | undefined;
-          if (protectedLaunch) {
-            const bootstrap = protectedLaunch.takeBootstrap();
-            if (!bootstrap) throw new Error("managed dispatch refused: bootstrap unavailable");
-            protectedModelBootstrap = await buildProtectedFlyBootstrap({
-              token: flyToken,
-              app: flyApp,
-              bootstrap,
-              projectKey: scopeKey,
-              runConfig: gapFillRunConfig,
-              modelAuthUrl: opts.runnerCallbackBaseUrl!,
-            });
-          }
-
-          machineConfig = buildSessionMachineConfig({
-            image: resolvedImage,
-            issueId: prLog.issueId,
-            issueIdentifier: prLog.issueIdentifier ?? prLog.issueId,
-            issueTitle: prLog.issueTitle ?? prLog.issueId,
-            issueDescription: prLog.issueTitle ?? prLog.issueId,
-            owner: item.owner,
-            repo: item.repo,
-            defaultBranch: mapping.defaultBranch,
-            anthropicApiKey: protectedLaunch ? undefined : (opts.anthropicApiKey ?? undefined),
-            claudeOAuthToken: protectedLaunch ? undefined : (opts.claudeOAuthToken ?? undefined),
+            prNumber: item.prNumber,
+            issueIdentifier: gapFillIssue.identifier,
             githubToken: ghToken,
-            sessionToken,
-            machineNonce,
-            sessionMode: mapping.sessionMode,
-            region: opts.flySessionsRegion ?? undefined,
-            cpus: mapping.machineCpus,
-            memoryMb: mapping.machineMemoryMb,
-            teamKey: scopeKey,
-            teamSecretNames: allSecretNames,
+            scopeKey,
             allTeamKeys: Object.keys(teamRepoMap),
-            flyProcessLevelSecrets: getFlyProcessLevelSecrets().enabled,
-            minSecretsVersion: minSecretsVersion ?? undefined,
-            orchestratorUrl: opts.runnerCallbackBaseUrl ?? undefined,
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken: runToken || undefined,
-            runProgressToken: runProgressToken || undefined,
+            flySessionsToken: opts.flySessionsToken,
+            flySessionsApp: opts.flySessionsApp,
+            flySessionsRegion: opts.flySessionsRegion,
+            flyOrchestratorApp: opts.flyOrchestratorApp,
+            sessionImage: opts.sessionImage,
+            runnerCallbackBaseUrl: opts.runnerCallbackBaseUrl,
+            tenantId: opts.tenantId,
+            anthropicApiKey: opts.anthropicApiKey,
+            claudeOAuthToken: opts.claudeOAuthToken,
+            runnerCallbackUrl,
+            runToken,
+            runProgressToken,
             runPublicationToken,
-            orchestratorApp: opts.flyOrchestratorApp ?? undefined,
-            tenantId: opts.tenantId ?? undefined,
-            extraEnv: (() => {
-              const merged = {
-                ...mapping.extraEnv,
-                ...capRunnerEnv(mapping),
-                ...branchPrefixRunnerEnv(mapping),
-                ...skillsRepoRunnerEnv(mapping),
-                ...(protectedLaunch ? {} : { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(gapFillRunConfig) }),
-              };
-              return Object.keys(merged).length > 0 ? merged : undefined;
-            })(),
-            ...(protectedLaunch && protectedModelBootstrap ? { protectedModelBootstrap, dispatchId: protectedLaunch.dispatchId } : {}),
+            commentInstruction,
+            decision: flyDecision,
+            onBeforeLaunch: (requestedSize) => {
+              machineSize = requestedSize;
+              launchAttempted = true;
+            },
           });
-          if (getFlyProcessLevelSecrets().enabled) {
-            const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
-            console.log(`[comment-gapfill] process-level secrets for ${prLog.issueIdentifier ?? prLog.issueId}: [${secretNames.join(", ")}]`);
-          }
-        } catch (err) {
-          settleManaged(opts, flyDecision, "rejected");
-          releaseGapfillAdmission(admission);
-          throw err;
-        }
-
-        let machine: Awaited<ReturnType<typeof createMachine>>;
-        try {
-          machine = await createMachine(flyToken, flyApp, machineConfig);
         } catch (err) {
           // A definitive 4xx never created a machine: free the admission. A 5xx or transport error is
-          // ambiguous, so the admission stays for reconciliation. Either way the grant is revoked.
-          const outcome = classifyLaunchError("fly-machines", true, err);
+          // ambiguous, so the admission stays for reconciliation. Preparation errors always release it.
+          const outcome = launchAttempted ? classifyLaunchError("fly-machines", true, err) : "rejected";
           settleManaged(opts, flyDecision, outcome);
           if (outcome === "rejected") releaseGapfillAdmission(admission);
           throw err;
         }
+        const { machine, machineNonce, resolvedImage } = launched;
 
         const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
         const jobId = appendLog({
@@ -787,7 +699,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           executionMode: "fly-machines",
           machineNonce,
           machineId: machine.id,
-          machineSize: guestSize(machineConfig) ?? null,
+          machineSize: machineSize ?? null,
           computeStartedAt: Date.now(),
           runnerMode: opts.runnerMode,
           sessionImage: resolvedImage,
