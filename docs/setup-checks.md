@@ -81,9 +81,9 @@ The orchestrator's own environment and settings (`ORCHESTRATOR_CONFIG_CHECKS`, `
 | [`settings.env-override`](orchestrator-configuration.md#environment-overrides) | `RUNNER_MODE` or `FLY_PROCESS_LEVEL_SECRETS` overriding a different saved value |
 | [`settings.allowlist-env`](orchestrator-configuration.md#the-sign-in-allowlist) | `OAUTH_ALLOWED_*` made inert by a saved list |
 | [`volume.database`](orchestrator-configuration.md#the-database-path) | The `/tmp` fallback, or on Fly a database off the volume |
-| [`restate`](orchestrator-configuration.md#boot) | The sidecar not ready, or the endpoint not registered; see [restate.md](restate.md) |
+| [`restate`](orchestrator-configuration.md#boot) | The sidecar not ready, or the endpoint not registered; see [restate.md](restate.md). The orchestrator does not dispatch until Restate serves. |
 | [`callback.config`](orchestrator-configuration.md#what-boot-warns-about) | No callback URL, set or derived, or no `RUNNER_TOKEN_SECRET` |
-| [`runner.fly-sessions`](orchestrator-configuration.md#the-summary-main-logs) | Projects whose path resolves to Fly Machines without the sessions token or app |
+| [`runner.fly-sessions`](orchestrator-configuration.md#the-summary-main-logs) | Projects whose path resolves to Fly Machines while the backend source is `not-loaded` (Restate has not answered yet), or with source `restate` without the sessions token or app. Wait for Restate to serve; read the [restate] lines in the orchestrator log. |
 | [`admin.path`](orchestrator-configuration.md#what-boot-warns-about) | No usable access code and no sign-in provider |
 | [`admin.providers`](orchestrator-configuration.md#what-boot-warns-about) | A sign-in provider that boot drops, with the reason |
 | [`admin.redirect-url`](orchestrator-configuration.md#what-boot-warns-about) | A sign-in provider without `OAUTH_REDIRECT_BASE_URL` |

@@ -2922,14 +2922,12 @@ function flySettingsView(): Record<string, unknown> {
       runtimeValue: fly.app,
       dbValue: dbSettings.flySessionsApp,
       envValue: envApp,
-      overriddenByEnv: source === "fallback" && envApp !== null,
       source,
     },
     flySessionsRegion: {
       runtimeValue: fly.region,
       dbValue: dbSettings.flySessionsRegion,
       envValue: envRegion,
-      overriddenByEnv: source === "fallback" && envRegion !== null,
       source,
     },
   };

@@ -273,10 +273,10 @@ describe("RunnerBackend cache (AII-1243)", () => {
   beforeEach(() => { for (const k of KEYS) delete process.env[k]; });
   afterEach(() => { for (const k of KEYS) delete process.env[k]; vi.restoreAllMocks(); });
 
-  it("returns null before any successful read, with source fallback", () => {
+  it("returns null before any successful read, with source not-loaded", () => {
     settings.setOrchestratorSetting("flySessionsApp", "row-app");
     process.env.FLY_SESSIONS_REGION = "env-region";
-    expect(settings.getRunnerBackendSource()).toBe("fallback");
+    expect(settings.getRunnerBackendSource()).toBe("not-loaded");
     expect(settings.getFlySessionsConfig()).toMatchObject({ app: null, region: null, source: { app: null, region: null } });
   });
 
@@ -318,6 +318,7 @@ describe("RunnerBackend cache (AII-1243)", () => {
     const down = async () => { throw new Error("ECONNREFUSED"); };
     await settings.refreshRunnerBackendCache({ readFlyMachines: down });
     await settings.refreshRunnerBackendCache({ readFlyMachines: down });
+    expect(settings.getRunnerBackendSource()).toBe("restate");
     expect(settings.getFlySessionsConfig()).toMatchObject({ app: "a", region: "r" });
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0][0])).toContain("[runner-backend] Restate unreachable; serving last value");
@@ -330,7 +331,7 @@ describe("RunnerBackend cache (AII-1243)", () => {
     process.env.FLY_SESSIONS_APP = "env-app";
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await expect(settings.refreshRunnerBackendCache({ readFlyMachines: async () => { throw new Error("down"); } })).resolves.toBeUndefined();
-    expect(settings.getRunnerBackendSource()).toBe("fallback");
+    expect(settings.getRunnerBackendSource()).toBe("not-loaded");
     expect(settings.getFlySessionsConfig()).toMatchObject({ app: null, region: null, source: { app: null, region: null } });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("nothing loaded yet"));
   });

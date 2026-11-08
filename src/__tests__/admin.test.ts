@@ -2824,7 +2824,12 @@ describe("admin settings", () => {
     expect(JSON.parse(res.body).flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
     expect(get.runnerBackendSource).toBe("restate");
-    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate", overriddenByEnv: false });
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
     expect(get.flySessionsApp.dbValue).toBeNull();
   });
 
@@ -2845,7 +2850,12 @@ describe("admin settings", () => {
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
     expect(get.flySessionsApp.dbValue).toBeNull();
     expect(get.flySessionsRegion.dbValue).toBeNull();
-    expect(get.runnerBackendSource).toBe("fallback");
+    expect(get.runnerBackendSource).toBe("not-loaded");
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
   });
 
   it("POST /api/settings answers 503 when callTool throws", async () => {
@@ -2854,12 +2864,17 @@ describe("admin settings", () => {
     expect(res.statusCode).toBe(503);
   });
 
-  it("GET /api/settings reports source fallback before any Restate read, with a null runtime value despite env", async () => {
+  it("GET /api/settings reports source not-loaded before any Restate read, with a null runtime value despite env", async () => {
     process.env.FLY_SESSIONS_APP = "env-app";
     const token = await login("secret");
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
-    expect(get.runnerBackendSource).toBe("fallback");
-    expect(get.flySessionsApp).toMatchObject({ runtimeValue: null, source: "fallback" });
+    expect(get.runnerBackendSource).toBe("not-loaded");
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: null, source: "not-loaded", envValue: "env-app", dbValue: null });
   });
 
 

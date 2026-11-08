@@ -223,6 +223,7 @@ function envOnlyContext(env: Record<string, string>): SetupCheckContext {
     readSetting: unavailable,
     runnerMode: unavailable,
     flySessions: unavailable,
+    runnerBackendSource: unavailable,
     mappings: unavailable,
     storedAccessEntries: unavailable,
     effectiveAllowlist: () => ({ entries: allowlistFromEnv(env), source: "env" }),
