@@ -273,3 +273,16 @@ it("missing title retains the shared launch helper's issue-id fallback", async (
   await d.launch(run);
   expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({ issue: { issueId: run.issueId, issueIdentifier: run.issueIdentifier } }));
 });
+it.each(["missing title", "different issue"])("recovers the input issue's title when the PR row has %s", async reason => {
+  vi.mocked(getLatestDispatchForPr).mockReturnValueOnce(makeJob({
+    issueId: reason === "different issue" ? "other-issue" : run.issueId,
+    issueTitle: reason === "different issue" ? "Another issue's title" : null,
+  }));
+  const job = makeJob({ issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: "Original tracked issue title" });
+  vi.mocked(getLatestDispatchForIssueIdentifier).mockReturnValueOnce(job);
+  await d.launch(run);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({
+    issue: { issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: job.issueTitle },
+  }));
+  expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ issueTitle: job.issueTitle }));
+});

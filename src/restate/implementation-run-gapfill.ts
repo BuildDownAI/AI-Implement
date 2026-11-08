@@ -74,8 +74,10 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         if (!item) throw new Error(`gap-fill queue item ${gap.queueItemId} not found`);
         // The input carries identity only. Recover the same title the comment drain
         // uses, including PRs whose original dispatch has no PR URL recorded yet.
-        const prLog = getLatestDispatchForPr(item.owner, item.repo, gap.prNumber)
-          ?? getLatestDispatchForIssueIdentifier(item.owner, item.repo, run.issueIdentifier);
+        let prLog = getLatestDispatchForPr(item.owner, item.repo, gap.prNumber);
+        if (prLog?.issueId !== run.issueId || prLog.issueTitle == null) {
+          prLog = getLatestDispatchForIssueIdentifier(item.owner, item.repo, run.issueIdentifier);
+        }
         if (prLog?.issueId === run.issueId) issue.issueTitle = prLog.issueTitle ?? undefined;
         const admission = read(run.dispatchId);
         if (!admission || admission.releasedAt !== null) throw new Error("no active gap-fill reservation");
