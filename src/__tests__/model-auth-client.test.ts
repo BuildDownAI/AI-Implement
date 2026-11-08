@@ -22,6 +22,7 @@ import {
   type ModelAuthGrantBootstrapV1,
   type SafeModelAuthDiagnostic,
 } from "../model-auth-contract.js";
+import { modelProcessEnv, repoProcessEnv } from "../pipeline/process-env.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
@@ -457,6 +458,36 @@ describe("client", () => {
       expect((err as ModelAuthClientError).category).toBe("server_rejected");
       expect((err as ModelAuthClientError).serverCategory).toBe("busy");
     });
+  });
+
+  it("delivers a hosted Claude setup-token to the CLI environment", async () => {
+    const token = "SENTINEL-claude-setup";
+    const { transport } = fakeTransport(() => okCheckout({ secret: { kind: "claude-oauth-token", token } }));
+    const diagnostics: SafeModelAuthDiagnostic[] = [];
+    const client = make(transport, {
+      inheritedEnv: { CLAUDE_CODE_OAUTH_TOKEN: S_INHERITED },
+      onDiagnostic: (d) => { diagnostics.push(d); },
+    });
+    await client.checkout(sub);
+    await client.invoke("sub", async (inv) => {
+      expect(inv.env.CLAUDE_CODE_OAUTH_TOKEN === token).toBe(true);
+      expect(modelProcessEnv(false, inv).CLAUDE_CODE_OAUTH_TOKEN === token).toBe(true);
+      expect(inv.env.ANTHROPIC_API_KEY === undefined).toBe(true);
+    });
+    expect(readdirSync(authRoot)).toEqual([]);
+    await client.dispose();
+    expect(JSON.stringify(diagnostics).includes(token)).toBe(false);
+  });
+
+  it("strips Claude Code names including forwarded collisions from repository children", () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", S_INHERITED);
+    vi.stubEnv("CLAUDE_CODE_EXTRA", S_INHERITED);
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "CLAUDE_CODE_OAUTH_TOKEN,CLAUDE_CODE_EXTRA");
+    try {
+      const env = repoProcessEnv({ configured: true });
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN === undefined).toBe(true);
+      expect(env.CLAUDE_CODE_EXTRA === undefined).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("API mode keeps everything in memory, no files, only the selected key", async () => {
@@ -1115,5 +1146,28 @@ describe("ChatGPT plan access token (codex-subscription)", () => {
     });
     expect(env[CHATGPT_PLAN_ACCESS_TOKEN_ENV]).toBe(S_TOKEN);
     for (const k of ["CODEX_HOME", "CODEX_API_KEY", "OPENAI_API_KEY"]) expect(env).not.toHaveProperty(k);
+  });
+});
+
+describe("Claude token mode compatibility", () => {
+  it.each(["anthropic-api-key", "openai-api-key", "bedrock", "codex-subscription"] as const)(
+    "rejects a Claude token for %s", (authMode) => {
+      expect(category(() => buildModelInvocationEnv({
+        authMode, secret: { kind: "claude-oauth-token", token: S_API }, inheritedEnv: {},
+      }))).toBe("credential_source_mismatch");
+    },
+  );
+  it("requires authDir for a Claude session and rejects other secret kinds", () => {
+    const secrets = [
+      { kind: "session", sessionData: S_SESSION, stateSequence: 0 },
+      { kind: "api-key", apiKey: S_API },
+      { kind: "chatgpt-access-token", accessToken: S_API, expiresAt: NOW },
+      { kind: "aws-bedrock", region: "us-east-1", accessKeyId: "synthetic", secretAccessKey: S_AWS_SECRET },
+    ] as const;
+    for (const secret of secrets) {
+      expect(category(() => buildModelInvocationEnv({
+        authMode: "claude-subscription", secret, inheritedEnv: {},
+      }))).toBe("credential_source_mismatch");
+    }
   });
 });

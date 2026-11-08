@@ -494,3 +494,34 @@ describe("parseModelAuthContext (AII-1427)", () => {
     if (!r.ok) expect(r.error).not.toContain("orch.example.com");
   });
 });
+
+describe("Claude setup-token checkout", () => {
+  const token = "SENTINEL-claude-setup";
+  const response = (secret: unknown, authMode = "claude-subscription") => ({
+    version: 1, ok: true, profileId: "sub", authMode,
+    ...(authMode === "claude-subscription" ? { ownerGeneration: 3 } : {}), secret,
+  });
+  it("accepts bounded tokens and rejects invalid shapes without disclosure", () => {
+    for (const value of [token, "x".repeat(MAX_API_CREDENTIAL_LENGTH)]) {
+      expect(parseModelAuthCheckoutResponse(response({ kind: "claude-oauth-token", token: value })).ok).toBe(true);
+    }
+    for (const secret of [
+      { kind: "claude-oauth-token" },
+      { kind: "claude-oauth-token", token: "" },
+      { kind: "claude-oauth-token", token: 42 },
+      { kind: "claude-oauth-token", token: token + "x".repeat(MAX_API_CREDENTIAL_LENGTH) },
+      { kind: "claude-oauth-token", token, extra: token },
+    ]) {
+      const result = parseModelAuthCheckoutResponse(response(secret));
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result).includes(token)).toBe(false);
+    }
+  });
+  it.each(["codex-subscription", "openai-api-key", "anthropic-api-key", "bedrock"])(
+    "rejects tokens for %s", (mode) => {
+      const result = parseModelAuthCheckoutResponse(response({ kind: "claude-oauth-token", token }, mode));
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result).includes(token)).toBe(false);
+    },
+  );
+});
