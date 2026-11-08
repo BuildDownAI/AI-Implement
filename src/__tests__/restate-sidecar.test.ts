@@ -5,7 +5,7 @@ import { writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
-import { createRestateRegistrationGate, createMainShutdown, runMainBoot, waitForRestateServing, RESTATE_BOOT_DEADLINE_MS, stopSidecarsConcurrently, onRestateRegistered } from "../index.js";
+import { createRestateExitHandler, createRestateRegistrationGate, createMainShutdown, runMainBoot, waitForRestateServing, RESTATE_BOOT_DEADLINE_MS, stopSidecarsConcurrently, onRestateRegistered } from "../index.js";
 import { testDir } from "./helpers/test-dir.js";
 
 // ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ describe("readiness polling", () => {
     const exitedDuringStartup = stderrOutput.filter((line) => line.includes("exited during startup"));
     expect(exitedDuringStartup).toHaveLength(1);
 
-    const degraded = stderrOutput.filter((line) => line.includes("continuing without sidecar"));
+    const degraded = stderrOutput.filter((line) => line.includes("orchestrator will exit"));
     expect(degraded).toHaveLength(1);
   });
 
@@ -349,6 +349,39 @@ describe("env allowlist (AII-728)", () => {
 // ---------------------------------------------------------------------------
 // Stop / shutdown behaviour
 // ---------------------------------------------------------------------------
+
+describe("unexpected child exit", () => {
+  it.each([0, 1, null])("reports exit %s once and suppresses intentional teardown", async code => {
+    const onUnexpectedExit = vi.fn();
+    const children: EventEmitter[] = [];
+    const sidecar = new RestateSidecar(
+      { dataDir: testDir("restate-exit"), onUnexpectedExit },
+      { resolveBinary: () => "/fake", httpGet: async () => true, spawn: () => {
+        const child = Object.assign(new EventEmitter(), {
+          exitCode: null, signalCode: null,
+          kill: () => { child.emit("exit", null, "SIGTERM"); child.emit("close"); return true; },
+        });
+        children.push(child);
+        return child as unknown as ChildProcess;
+      } },
+    );
+    await sidecar.start();
+    await sidecar.restart();
+    expect(onUnexpectedExit).not.toHaveBeenCalled();
+    children[1].emit("exit", code, "SIGKILL");
+    children[1].emit("exit", code, null);
+    expect(onUnexpectedExit.mock.calls).toEqual([[{ code, signal: "SIGKILL" }]]);
+    children[1].emit("close");
+    await sidecar.start();
+    children[2].emit("error", new Error("dead"));
+    children[2].emit("exit", 1, null);
+    expect(onUnexpectedExit.mock.calls[1]).toEqual([{ code: null, signal: null }]);
+    expect(onUnexpectedExit).toHaveBeenCalledTimes(2);
+    await sidecar.start();
+    await sidecar.stop();
+    expect(onUnexpectedExit).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("stop / shutdown", () => {
   it("stop() sends SIGTERM to child", async () => {
@@ -1237,16 +1270,55 @@ describe("main shutdown during Restate boot", () => {
     const reconcile = vi.fn(async () => {});
     const startInterval = vi.fn();
     const startServer = vi.fn();
+    const restateExit = createRestateExitHandler();
     const boot = (wait: () => ReturnType<typeof waitForRestateServing>) => runMainBoot({
       registerSignal: (signal, handler) => { signals.set(signal, handler); },
+      onServing: () => restateExit.arm(shutdown),
       startServer, wait, isShuttingDown: () => shuttingDown, shutdown,
       postBootNotice, poll, logFly, refreshCache, reconcile, startInterval,
     });
-    return { kg, restate, closeServer, exit, postShutdownNotice, recordShutdown, shutdown,
+    return { restateExit, kg, restate, closeServer, exit, postShutdownNotice, recordShutdown, shutdown,
       boot, signals, postBootNotice, poll, logFly, refreshCache, reconcile, startInterval, startServer,
       isShuttingDown: () => shuttingDown };
 
   }
+
+  it("runtime exit notifies and exits 1 once during pending shutdown", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const f = fixture();
+    await f.boot(async () => "serving");
+    let release!: () => void;
+    f.kg.stop.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    f.restateExit.onUnexpectedExit({ code: 0, signal: null });
+    expect(errors).toHaveBeenCalledExactlyOnceWith("[main] Restate sidecar exited (code=0); shutting down");
+    await vi.waitFor(() => expect(f.kg.stop).toHaveBeenCalledOnce());
+    f.restateExit.onUnexpectedExit({ code: 1, signal: null });
+    release();
+    await vi.waitFor(() => expect(f.exit).toHaveBeenCalledExactlyOnceWith(1));
+    expect(f.recordShutdown).toHaveBeenCalledOnce();
+    expect(f.postShutdownNotice).toHaveBeenCalledOnce();
+    expect(f.restate.stop).toHaveBeenCalledOnce();
+    expect(f.closeServer).toHaveBeenCalledOnce();
+  });
+
+  it("early exit during start leaves fatal boot in charge", async () => {
+    const f = fixture();
+    const child = new EventEmitter();
+    const sidecar = new RestateSidecar(
+      { dataDir: testDir("restate-early"), onUnexpectedExit: f.restateExit.onUnexpectedExit },
+      { resolveBinary: () => "/fake", spawn: () => child as ChildProcess,
+        httpGet: async () => { child.emit("error", new Error("boot exit")); return true; } },
+    );
+    await expect(sidecar.start()).resolves.toBe(false);
+    expect(f.exit).not.toHaveBeenCalled();
+    await f.boot(async () => {
+      f.restateExit.onUnexpectedExit({ code: 1, signal: null });
+      return "exited";
+    });
+    expect(f.exit).toHaveBeenCalledExactlyOnceWith(1);
+    expect(f.recordShutdown).not.toHaveBeenCalled();
+    expect(f.postShutdownNotice).not.toHaveBeenCalled();
+  });
 
   it.each(["missing-binary", "exited", "unreachable", "hook-failed", "deadline"] as const)("fatal %s stops both children, closes HTTP and exits 1 without notice writes", async reason => {
     const f = fixture();
