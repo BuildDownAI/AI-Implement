@@ -2,6 +2,7 @@
  * Every lookup is bound to a durable attempt ID and restricted to administrators;
  * no guessed URL can move another scope. Actions preserve the exact owner and
  * never free capacity without the workflow's backend-terminal confirmation. */
+import { sameExecution } from "./review-fix-contract.js";
 import type { ReviewFixAttemptsFacade, ReviewFixAttemptCaller, ReviewFixAttemptCycleSummary } from "./admin.js";
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import { getDb } from "./dedup.js";
@@ -141,8 +142,7 @@ export function createReviewFixAdminFacade(
       const bound = await store.bindExecution(attemptId, found.execution, Date.now());
       if (bound.status === "not_owner") return { status: "rejected", reason: "attempt no longer owns the PR" };
       if (bound.status === "already_bound" &&
-        (bound.execution.githubRunId !== found.execution.githubRunId
-          || bound.execution.githubRunAttempt !== found.execution.githubRunAttempt)) {
+        !sameExecution(bound.execution, found.execution)) {
         return { status: "rejected", reason: "another execution already owns the attempt" };
       }
       return { status: "accepted" };
@@ -154,12 +154,13 @@ export function createReviewFixAdminFacade(
       if (row.released_at !== null) return { status: "rejected", reason: "attempt is already released" };
       const scope = { installationId: Number(row.installation_id), repository: row.repository, prNumber: row.pr_number };
       const found = await worker.reconcile(attemptId, scope);
-      if (found.status !== "found" || String(found.execution.githubRunId) !== execution.githubRunId
+      if (found.status !== "found"
+        || (found.execution.backend !== undefined && found.execution.backend !== "github-actions")
+        || String(found.execution.githubRunId) !== execution.githubRunId
         || found.execution.githubRunAttempt !== execution.githubRunAttempt) return { status: "unverified" };
       const bound = await store.bindExecution(attemptId, found.execution, Date.now());
       return bound.status === "not_owner" || bound.status === "already_bound"
-        && (bound.execution.githubRunId !== found.execution.githubRunId
-          || bound.execution.githubRunAttempt !== found.execution.githubRunAttempt)
+        && !sameExecution(bound.execution, found.execution)
         ? { status: "rejected", reason: "another execution already owns the attempt" }
         : { status: "accepted" };
     },

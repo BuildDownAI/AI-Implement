@@ -64,6 +64,7 @@
  * PR that moved again after this read can only withhold approval, never grant a
  * false one.
  */
+import { normalizeExecutionIdentity } from "./review-fix-contract.js";
 import { managedRunConfigFields, type ManagedDispatchDecision } from "./managed-dispatch-auth.js";
 import { getInstallation } from "./github-app-auth.js";
 import {
@@ -375,7 +376,7 @@ const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 // ---------------------------------------------------------------------------
 
 function executionKey(execution: WorkerExecutionIdentity): string {
-  return `${execution.githubRunId}:${execution.githubRunAttempt}`;
+  return JSON.stringify(normalizeExecutionIdentity(execution));
 }
 
 /**
@@ -534,6 +535,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     // Non-authoritative routing store only, not a network call — see module doc comment.
     await this.scopeStore.rememberAttempt(attempt.attemptId, attempt.scope);
     return {
+      executionBackend: attempt.executionBackend ?? "github-actions",
       attemptId: attempt.attemptId,
       scope: attempt.scope,
       taskText: attempt.taskText,
@@ -542,6 +544,9 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   }
 
   async launch(plan: WorkerLaunchPlan): Promise<WorkerLaunchOutcome> {
+    if ((plan.executionBackend ?? "github-actions") !== "github-actions") {
+      return { status: "rejected", reason: "GitHub worker requires a github-actions launch plan" };
+    }
     const mapping = findMapping(plan.scope.repository);
     if (!mapping) return { status: "unknown" };
 
@@ -642,7 +647,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     if (result.outcome === "accepted" && result.runId !== undefined) {
       // A freshly dispatched run always starts at its first attempt; GitHub's dispatch
       // response carries no run_attempt field of its own to read this from.
-      const execution: WorkerExecutionIdentity = { githubRunId: result.runId, githubRunAttempt: 1 };
+      const execution: WorkerExecutionIdentity = { backend: "github-actions", githubRunId: result.runId, githubRunAttempt: 1 };
       await this.remember(plan.attemptId, plan.scope, execution);
       return finish({ status: "accepted", execution });
     }
@@ -692,12 +697,13 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     if (matches.length !== 1) return { status: "unknown" };
 
     const match = matches[0];
-    const execution: WorkerExecutionIdentity = { githubRunId: match.runId, githubRunAttempt: match.runAttempt as number };
+    const execution: WorkerExecutionIdentity = { backend: "github-actions", githubRunId: match.runId, githubRunAttempt: match.runAttempt as number };
     await this.remember(attemptId, scope, execution);
     return { status: "found", execution };
   }
 
   async cancel(attemptId: AttemptId, execution: WorkerExecutionIdentity): Promise<WorkerCancelOutcome> {
+    if (execution.backend && execution.backend !== "github-actions") return { status: "unknown" };
     const scope = (await this.scopeStore.scopeForAttempt(attemptId)) ?? (await this.scopeStore.scopeForExecution(execution));
     if (!scope) return { status: "unknown" };
     const mapping = findMapping(scope.repository);
@@ -727,6 +733,7 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
   }
 
   async inspectTerminal(execution: WorkerExecutionIdentity): Promise<WorkerTerminalInspection> {
+    if (execution.backend && execution.backend !== "github-actions") return { reached: false };
     const scope = await this.scopeStore.scopeForExecution(execution);
     if (!scope) return { reached: false };
     const mapping = findMapping(scope.repository);

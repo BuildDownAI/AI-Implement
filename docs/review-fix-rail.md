@@ -426,3 +426,11 @@ See [ADR 028](adr/028-the-fixing-agent-dispositions-each-finding-and-may-defer-o
 On overflow the durable loader throws `ReviewFixFeedbackIncompleteError` before `admit`, so no snapshot, attempt, token or dispatch exists and every finding version stays pending. The legacy loop logs a bounded warning and leaves the queue item `pending`. An over-limit set needs source reduction or a later batching capability. `GithubReviewFixWorker.launch` also decodes the encoded `run_config` and refuses to dispatch unless `issue.description` and `commentInstruction` equal the admitted task text. `dispatchFindingIds` and the durable snapshot are exactly the rendered findings (AII-758 invariant).
 
 Non-launch reads of over-budget feedback (`inspectPendingReviewFixFeedback`) report `incomplete` instead of throwing: the admin attempt detail shows `pendingFeedback: true`, and the Restate `load()` resolves with no pending feedback and logs only the bounded category, so nothing is admitted, nothing is retried in a tight loop, and every finding stays pending until the set is reduced.
+
+Review-fix execution binding uses the attempt's frozen execution backend. GitHub
+Actions identities bind the run ID and run attempt; Fly Machines and local Docker
+identities bind a backend-scoped `execution_ref`. Cross-backend binding is rejected
+without changing the attempt. Historical journal identities without a backend
+normalize to GitHub Actions. Result evidence and the operator adopt request remain
+GitHub-only; machine identities can bind and reach terminal completion without
+granting result-based approval.

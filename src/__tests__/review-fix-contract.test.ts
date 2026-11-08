@@ -245,7 +245,7 @@ describe("execution identity", () => {
 });
 
 describe("worker launch outcome", () => {
-  const execution = { githubRunId: 1, githubRunAttempt: 1 };
+  const execution = { backend: "github-actions" as const, githubRunId: 1, githubRunAttempt: 1 };
 
   it("accepted requires an execution identity", () => {
     expect(validateWorkerLaunchOutcome({ status: "accepted", execution })).toEqual({
@@ -280,7 +280,7 @@ describe("worker launch outcome", () => {
 });
 
 describe("worker lookup outcome", () => {
-  const execution = { githubRunId: 1, githubRunAttempt: 1 };
+  const execution = { backend: "github-actions" as const, githubRunId: 1, githubRunAttempt: 1 };
 
   it("pins found / not_found / unknown", () => {
     expect(validateWorkerLookupOutcome({ status: "found", execution })).toEqual({
@@ -480,5 +480,13 @@ describe("contract version constants", () => {
   it("are 1", () => {
     expect(REVIEW_FIX_CONTRACT_VERSION).toBe(1);
     expect(REVIEW_FIX_ACTIVITY_VERSION).toBe(1);
+  });
+});
+
+describe("machine worker outcomes", () => {
+  it.each(["fly-machines", "local-docker"] as const)("accepts %s launch and lookup identities", (backend) => {
+    const execution = { backend, runRef: "machine-123" };
+    expect(validateWorkerLaunchOutcome({ status: "accepted", execution })).toEqual({ ok: true, value: { status: "accepted", execution } });
+    expect(validateWorkerLookupOutcome({ status: "found", execution })).toEqual({ ok: true, value: { status: "found", execution } });
   });
 });

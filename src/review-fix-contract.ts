@@ -247,11 +247,7 @@ export function validateReviewFixResultMetadata(raw: unknown): ValidationResult<
 // Worker launch / lookup / cancel / terminal outcomes
 // ---------------------------------------------------------------------------
 
-/** The GitHub Actions execution a launch was accepted onto, or a lookup found. */
-export interface WorkerExecutionIdentity {
-  readonly githubRunId: number;
-  readonly githubRunAttempt: number;
-}
+export type WorkerExecutionIdentity = ExecutionIdentity;
 
 /** Backend-neutral identity; omitted backends preserve legacy GitHub journal values. */
 export type ExecutionIdentity =
@@ -306,7 +302,7 @@ export function resultMatchesExecution(result: ReviewFixResultMetadataV1, execut
     && result.githubRunId === identity.githubRunId && result.githubRunAttempt === identity.githubRunAttempt;
 }
 
-function validateWorkerExecutionIdentity(raw: unknown): ValidationResult<WorkerExecutionIdentity> {
+function validateWorkerExecutionIdentity(raw: unknown): ValidationResult<{ githubRunId: number; githubRunAttempt: number }> {
   if (!isPlainObject(raw)) return err("execution identity must be an object");
   const githubRunId = validatePositiveInt(raw.githubRunId, "githubRunId");
   if (!githubRunId.ok) return githubRunId;
@@ -331,7 +327,7 @@ export function validateWorkerLaunchOutcome(raw: unknown): ValidationResult<Work
   switch (raw.status) {
     case "accepted": {
       if (raw.reason !== undefined) return err("accepted launch outcome must not carry a rejection reason");
-      const execution = validateWorkerExecutionIdentity(raw.execution);
+      const execution = validateExecutionIdentity(raw.execution);
       if (!execution.ok) return execution;
       return ok({ status: "accepted", execution: execution.value });
     }
@@ -362,7 +358,7 @@ export function validateWorkerLookupOutcome(raw: unknown): ValidationResult<Work
   if (!isPlainObject(raw)) return err("worker lookup outcome must be an object");
   switch (raw.status) {
     case "found": {
-      const execution = validateWorkerExecutionIdentity(raw.execution);
+      const execution = validateExecutionIdentity(raw.execution);
       if (!execution.ok) return execution;
       return ok({ status: "found", execution: execution.value });
     }
