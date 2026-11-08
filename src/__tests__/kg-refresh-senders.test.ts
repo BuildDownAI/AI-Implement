@@ -71,6 +71,31 @@ function makeDeps(overrides: Partial<KgRefreshSenderDeps> = {}, configOverrides:
 }
 
 describe("fly-machines sender", () => {
+  it.each([null, "m-kept"])("excludes all app secrets on launch (kept machine: %s), even with the global switch off", async (machineId) => {
+    vi.stubEnv("FLY_PROCESS_LEVEL_SECRETS", "false");
+    try {
+      const { deps, fly, created } = makeDeps();
+      await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId }));
+      const cfg = machineId === null
+        ? created[0]!.config
+        : vi.mocked(fly.updateMachine).mock.calls[0]![1];
+      expect(cfg.processes).toEqual([{ ignore_app_secrets: true, secrets: [] }]);
+      expect(cfg.env).toMatchObject({
+        MACHINE_NONCE: NONCE,
+        RUN_TOKEN: TOKENS.runToken,
+        RUN_PROGRESS_TOKEN: TOKENS.progressToken,
+        RUN_PUBLICATION_TOKEN: TOKENS.publicationToken,
+        GITHUB_TOKEN: "scoped-boot-token",
+        ORCHESTRATOR_URL: CALLBACK_BASE,
+        ISSUE_IDENTIFIER: IDENTIFIER,
+      });
+      expect(decodeRunConfig(cfg.env!.AI_IMPLEMENT_RUN_CONFIG!)).toEqual(envelope);
+      expect(cfg.metadata).toMatchObject({ purpose: "durable-runner", pipeline: "kg-refresh", dispatch_id: "d-1" });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("throws when the machine nonce is missing", async () => {
     const { deps, created } = makeDeps();
     await expect(createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineNonce: null }))).rejects.toThrow(/machineNonce is required/);

@@ -62,17 +62,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git lfs install --system \
     && rm -rf /var/lib/apt/lists/*
 
-# Ensure TOML parsing support is present at build time. Prefer stdlib tomllib;
-# install tomli only if the base image's python3 does not provide it.
-RUN python3 - <<'PY'
-import importlib.util
-import subprocess
-import sys
-
-if importlib.util.find_spec("tomllib") is None:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "tomli"])
-PY
-
 # yq (mikefarah, single binary) — Debian's yq is a Python impl with a different CLI, so install upstream.
 RUN ARCH=$(dpkg --print-architecture) \
     && curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}" \

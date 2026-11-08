@@ -389,7 +389,7 @@ describe("buildSessionMachineConfig", () => {
     // The App private key must never reach a runner — only the short-lived install token.
     expect(env.GITHUB_APP_ID).toBeUndefined();
     expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
-    expect(env.SESSION_MODE).toBe("autonomous");
+    expect(env).not.toHaveProperty("SESSION_MODE");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
   });
 
@@ -435,15 +435,15 @@ describe("buildSessionMachineConfig", () => {
     expect(result.region).toBe("iad");
   });
 
-  it("passes sessionMode through to env", () => {
-    const result = buildSessionMachineConfig({ ...baseInput, sessionMode: "hybrid" });
-    expect(result.config.env!.SESSION_MODE).toBe("hybrid");
-  });
-
-  it("defaults sessionMode to autonomous", () => {
-    const result = buildSessionMachineConfig(baseInput);
-    expect(result.config.env!.SESSION_MODE).toBe("autonomous");
-  });
+  it.each([undefined, "autonomous", "hybrid", "shadow", ""])(
+    "ignores deprecated sessionMode %j",
+    (sessionMode) => {
+      const result = buildSessionMachineConfig({ ...baseInput, sessionMode });
+      expect(result).toEqual(buildSessionMachineConfig(baseInput));
+      expect(result.config.env).not.toHaveProperty("SESSION_MODE");
+      expect(result.config.metadata).not.toHaveProperty("session_mode");
+    },
+  );
 
   it("defaults RUNNER_PHASE to implementation", () => {
     const result = buildSessionMachineConfig(baseInput);
@@ -468,7 +468,6 @@ describe("buildSessionMachineConfig", () => {
       issue_id: "uuid-123",
       issue_identifier: "ENG-42",
       repo: "test-org/test-repo",
-      session_mode: "autonomous",
     });
   });
 
@@ -482,11 +481,6 @@ describe("buildSessionMachineConfig", () => {
     expect(metadata.purpose).toBe("session");
     expect(metadata).not.toHaveProperty("pipeline");
     expect(metadata).not.toHaveProperty("dispatch_id");
-  });
-
-  it("includes session_mode in metadata", () => {
-    const result = buildSessionMachineConfig({ ...baseInput, sessionMode: "shadow" });
-    expect(result.config.metadata!.session_mode).toBe("shadow");
   });
 
   it("includes orchestrator_app in metadata when provided", () => {
@@ -626,14 +620,14 @@ describe("buildSessionMachineConfig", () => {
   it("extraEnv overrides standard env vars when keys collide", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
-      extraEnv: { SESSION_MODE: "overridden" },
+      extraEnv: { ISSUE_ID: "overridden" },
     });
-    expect(result.config.env!.SESSION_MODE).toBe("overridden");
+    expect(result.config.env!.ISSUE_ID).toBe("overridden");
   });
 
   it("omitting extraEnv leaves standard env vars unchanged", () => {
     const result = buildSessionMachineConfig(baseInput);
-    expect(result.config.env!.SESSION_MODE).toBe("autonomous");
+    expect(result.config.env!.ISSUE_ID).toBe(baseInput.issueId);
     expect(result.config.env!.DEDUP_DB_PATH).toBeUndefined();
   });
 
@@ -790,15 +784,34 @@ describe("buildSessionMachineConfig", () => {
       expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBe("QA_PROBE");
     });
 
-    it("flag on: no teamKey → no processes", () => {
+    it.each([undefined, ""])("flag on: missing teamKey (%s) excludes all known team secrets", (teamKey) => {
       const result = buildSessionMachineConfig({
         ...baseInput,
-        teamSecretNames: ["NPM_TOKEN"],
-        allTeamKeys: ["ENG"],
+        teamKey,
+        teamSecretNames: ["ENG_X", "SAN_Y", "GLOBAL_Z", MODEL_AUTH_ENV.protectionKey],
+        allTeamKeys: ["ENG", "SAN"],
         flyProcessLevelSecrets: true,
       });
-      expect(result.config.processes).toBeUndefined();
+      expect(result.config.processes?.[0]).toEqual({
+        ignore_app_secrets: true,
+        secrets: [{ env_var: "GLOBAL_Z" }],
+      });
       expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBeUndefined();
+    });
+
+    it.each([undefined, ""])("flag on: missing teamKey (%s) with empty names fails closed", (teamKey) => {
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        teamKey,
+        teamSecretNames: [],
+        flyProcessLevelSecrets: true,
+      });
+      expect(result.config.processes?.[0]).toEqual({ ignore_app_secrets: true, secrets: [] });
+    });
+
+    it("flag on: no teamKey and undefined names without protection leaves processes unset", () => {
+      const result = buildSessionMachineConfig({ ...baseInput, flyProcessLevelSecrets: true });
+      expect(result.config.processes).toBeUndefined();
     });
 
     it("flag on: own-team secrets only, no globals", () => {
@@ -873,7 +886,6 @@ describe("buildSessionMachineConfig", () => {
     expect(typeof meta.issue_id).toBe("string");
     expect(typeof meta.issue_identifier).toBe("string");
     expect(typeof meta.repo).toBe("string");
-    expect(typeof meta.session_mode).toBe("string");
     expect(typeof meta.orchestrator_app).toBe("string");
     expect(typeof meta.tenant_id).toBe("string");
     expect(typeof meta.expected_ttl_seconds).toBe("string");
@@ -881,7 +893,7 @@ describe("buildSessionMachineConfig", () => {
     expect(meta.issue_id).toBe(baseInput.issueId);
     expect(meta.issue_identifier).toBe(baseInput.issueIdentifier);
     expect(meta.repo).toBe(`${baseInput.owner}/${baseInput.repo}`);
-    expect(meta.session_mode).toBe("autonomous");
+    expect(meta).not.toHaveProperty("session_mode");
     expect(meta.orchestrator_app).toBe("ai-implement-prod");
     expect(meta.tenant_id).toBe("acme-corp");
     expect(meta.expected_ttl_seconds).toBe("14400");
@@ -1364,6 +1376,28 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
     expect(proc.secrets!.map((s) => s.env_var)).toEqual(["DB", "GLOBAL", MODEL_AUTH_ENV.protectionKey]);
     expect(JSON.stringify(proc.secrets)).not.toContain("OPS_X");
     expect(result.config.env![MODEL_AUTH_ENV.baseUrl]).toBe(MODEL_AUTH_URL);
+  });
+
+  it.each([undefined, ""])("isolates protected bootstrap with missing teamKey (%s)", (teamKey) => {
+    const result = buildSessionMachineConfig(protectedInput({
+      teamKey,
+      teamSecretNames: ["ENG_X", "SAN_Y", "GLOBAL_Z", MODEL_AUTH_ENV.protectionKey],
+      allTeamKeys: ["ENG", "SAN"],
+      flyProcessLevelSecrets: true,
+    }));
+    expect(result.config.processes?.[0]).toEqual({
+      ignore_app_secrets: true,
+      secrets: [{ env_var: "GLOBAL_Z" }, { env_var: MODEL_AUTH_ENV.protectionKey }],
+    });
+    expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBeUndefined();
+  });
+
+  it.each([undefined, ""])("isolates protected bootstrap with missing teamKey (%s) and undefined names", (teamKey) => {
+    const result = buildSessionMachineConfig(protectedInput({ teamKey, flyProcessLevelSecrets: true }));
+    expect(result.config.processes?.[0]).toEqual({
+      ignore_app_secrets: true,
+      secrets: [{ env_var: MODEL_AUTH_ENV.protectionKey }],
+    });
   });
 
   it("still lists the protection key when the secrets listing failed", () => {

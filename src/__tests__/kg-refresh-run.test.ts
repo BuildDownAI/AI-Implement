@@ -2943,6 +2943,63 @@ function devHarnessRunConfig(extra: Partial<RunConfigV1> = {}): string {
   });
 }
 
+describe("runKgRefresh — harness stop boundary", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = testDir("kgrun-until");
+    vi.stubEnv("GITHUB_OWNER", "org");
+    vi.stubEnv("GITHUB_REPO", "kg-repo");
+    vi.stubEnv("GITHUB_TOKEN", "tok");
+    vi.stubEnv("AI_IMPLEMENT_DEP_TOKEN_OVERRIDE", "operator-token");
+    vi.stubEnv("AI_IMPLEMENT_KG_DRY_RUN", "true");
+    for (const key of ["RUN_TOKEN", "RUNNER_CALLBACK_URL", "RUN_PROGRESS_TOKEN", "AI_IMPLEMENT_RUN_CONFIG", "AI_IMPLEMENT_WORKSPACE_MODE"]) {
+      vi.stubEnv(key, "");
+    }
+  });
+
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each(["kg-ingest", "  kg-ingest  ", undefined, "   ", "unknown-step"])(
+    "honors the inclusive boundary %s through the real runner",
+    async (untilStep) => {
+      vi.stubEnv("AI_IMPLEMENT_UNTIL_STEP", untilStep);
+      const clone = vi.fn(async () => ({ workspaceDir: tmpDir }));
+      const ingest = vi.fn(async () => ({ statsFile: null }));
+      const push = vi.fn(async () => ({ snapshotPushed: false, commitSha: null }));
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const result = await runKgRefresh({
+          workspaceDir: tmpDir,
+          reporter: noopReporter,
+          stepsOverride: {
+            clone: { run: clone },
+            dependencyAuth: makeStepModule({ acquired: false }),
+            kgScopeReconcile: makeStepModule(),
+            kgTrackerData: makeStepModule(),
+            kgIngest: { run: ingest },
+            kgSnapshotPush: { run: push },
+          },
+        });
+        if (untilStep === "unknown-step") {
+          expect(result.exitCode).toBe(1);
+          expect(error).toHaveBeenCalledWith(expect.stringContaining('Unknown stopAfterStep "unknown-step" in pipeline "kg-refresh"'));
+          expect(clone).not.toHaveBeenCalled();
+          expect(ingest).not.toHaveBeenCalled();
+          expect(push).not.toHaveBeenCalled();
+        } else {
+          expect(result.exitCode).toBe(0);
+          expect(clone).toHaveBeenCalledTimes(1);
+          expect(ingest).toHaveBeenCalledTimes(1);
+          expect(push).toHaveBeenCalledTimes(untilStep?.trim() ? 0 : 1);
+        }
+      } finally {
+        error.mockRestore();
+      }
+    },
+  );
+});
+
 describe("runKgRefresh", () => {
   let tmpDir: string;
   let originalEnv: NodeJS.ProcessEnv;
