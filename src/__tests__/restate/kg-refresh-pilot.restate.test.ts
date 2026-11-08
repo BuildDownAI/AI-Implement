@@ -643,7 +643,6 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
       get flySessionsApp() { return getFlySessionsConfig().app; },
       get flySessionsRegion() { return getFlySessionsConfig().region; },
       localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
-      anthropicApiKey: null, claudeOAuthToken: null,
     };
     const fakeFly = {
       getMachine: async () => { throw new Error("unexpected getMachine"); },

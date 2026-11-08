@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { splitLocalRunnerEnv } from "../local-docker.js";
+import { MODEL_CREDENTIAL_KEYS, MODEL_SESSION_KEYS, PROTECTED_BOOTSTRAP_KEYS, PROTECTED_BOOTSTRAP_PREFIXES } from "../pipeline/process-env.js";
+import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
 import { decodeRunConfig } from "../run-config.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 
@@ -667,6 +669,11 @@ describe("startDevRun — kg-refresh phase", () => {
   it.each([false, true])("omits model credentials even with explicit env overrides=%s", async (overrides) => {
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test");
     const modelEnv = {
+      ...Object.fromEntries([
+        ...MODEL_CREDENTIAL_KEYS, ...MODEL_SESSION_KEYS, ...PROTECTED_BOOTSTRAP_KEYS,
+        ...Object.values(MODEL_AUTH_ENV),
+        ...PROTECTED_BOOTSTRAP_PREFIXES.map((prefix) => `${prefix}SYNTHETIC_SECRET`),
+      ].flatMap((key) => [[key, "synthetic-nonempty"], [key.toLowerCase(), "synthetic-lowercase"]])),
       ANTHROPIC_API_KEY: "explicit-key",
       CLAUDE_CODE_OAUTH_TOKEN: "explicit-oauth",
       CLAUDE_CODE_USE_BEDROCK: "1",
@@ -674,15 +681,21 @@ describe("startDevRun — kg-refresh phase", () => {
     };
     await startDevRun({
       workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json",
-      anthropicApiKey: "option-key", claudeOAuthToken: "option-oauth",
-      ...(overrides ? { env: modelEnv } : {}),
+      anthropicApiKey: "option-key", claudeOAuthToken: "option-oauth", githubToken: "github-token",
+      ...(overrides ? { env: { ...modelEnv, RUN_TOKEN: "run-token", RUN_PROGRESS_TOKEN: "progress-token", RUN_PUBLICATION_TOKEN: "publication-token" } } : {}),
     });
     const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
-    for (const key of Object.keys(modelEnv)) {
+    for (const key of Object.keys(modelEnv).filter((key) => key !== "AI_IMPLEMENT_RUN_CONFIG")) {
       expect(opts.publicEnv).not.toHaveProperty(key);
       expect(opts.secretEnv).not.toHaveProperty(key);
     }
-    expect({ ...opts.publicEnv, ...opts.secretEnv }["AI_IMPLEMENT_DEP_TOKEN_OVERRIDE"]).toBe("ghs-operator-token");
+    const allEnv = { ...opts.publicEnv, ...opts.secretEnv };
+    expect(decodeRunConfig(allEnv.AI_IMPLEMENT_RUN_CONFIG!).runnerPhase).toBe("kg-refresh");
+    expect(allEnv["AI_IMPLEMENT_DEP_TOKEN_OVERRIDE"]).toBe("ghs-operator-token");
+    expect(allEnv["GITHUB_TOKEN"]).toBe("github-token");
+    if (overrides) {
+      expect(allEnv).toMatchObject({ RUN_TOKEN: "run-token", RUN_PROGRESS_TOKEN: "progress-token", RUN_PUBLICATION_TOKEN: "publication-token" });
+    }
   });
 
   it("sets RUNNER_PHASE=kg-refresh", async () => {
