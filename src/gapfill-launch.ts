@@ -1,7 +1,9 @@
+import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
+import type { RunCredentialsV1 } from "./run-config.js";
 import type { RepoMapping } from "./config.js";
-import { managedRunConfigFields, type ManagedDispatchDecision } from "./managed-dispatch-auth.js";
+import { ghaManagedCredentials, managedRunConfigFields, type ManagedDispatchDecision } from "./managed-dispatch-auth.js";
 import { getFlySecretsMinVersion, getFlyProcessLevelSecrets } from "./runner-mode.js";
-import { capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv } from "./github.js";
+import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, type DispatchResult } from "./github.js";
 import { buildRunConfig, encodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, guestSize } from "./fly-machines.js";
@@ -157,4 +159,118 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
   input.onBeforeLaunch(guestSize(machineConfig));
   const machine = await createMachine(flyToken, flyApp, machineConfig);
   return { machine, machineNonce, resolvedImage };
+}
+
+
+type ContractProbeResult = WorkflowContract | WorkflowCapabilities;
+
+export interface GhaGapfillDependencies {
+  resolveRunnerImage(mapping: RepoMapping, ghToken: string): Promise<string | undefined>;
+  checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string; ref: string }): Promise<ContractProbeResult>;
+  getTrustedCredentials?(item: { owner: string; repo: string; prNumber: number }): RunCredentialsV1 | undefined;
+  dispatch(token: string, mapping: RepoMapping, inputs: Record<string, string | undefined>, opts?: { returnRunDetails?: boolean }): Promise<DispatchResult>;
+}
+
+export interface PrepareGhaGapfillLaunchArgs extends Omit<GhaGapfillDependencies, "dispatch"> {
+  mapping: RepoMapping;
+  issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null };
+  item: { owner: string; repo: string; prNumber: number };
+  ghToken: string;
+  decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
+  runnerCallbackBaseUrl: string | null;
+  runnerCallbackUrl: string;
+  runToken: string;
+  runProgressToken: string;
+  runPublicationToken?: string;
+  commentInstruction?: string;
+}
+
+export interface GhaGapfillLaunch {
+  runnerImage: string | undefined;
+  contract: WorkflowContract;
+  inputs: Record<string, string | undefined>;
+}
+
+function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
+  return typeof result === "string"
+    ? { contract: result, supportsRunPublicationToken: false, supportsAttemptCorrelation: false }
+    : result;
+}
+
+/** Preparation only: every throw is a definitive non-launch; the caller owns settlement. */
+export async function prepareGhaGapfillLaunch(args: PrepareGhaGapfillLaunchArgs): Promise<GhaGapfillLaunch> {
+  const { mapping, issue: prLog, item, ghToken, decision: ghaDecision,
+    runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, commentInstruction } = args;
+  const gapFillIssue = {
+    id: prLog.issueId,
+    identifier: prLog.issueIdentifier ?? prLog.issueId,
+    title: prLog.issueTitle ?? prLog.issueId,
+    description: prLog.issueTitle ?? prLog.issueId,
+  };
+  const runnerImage = await args.resolveRunnerImage(mapping, ghToken);
+  const capabilities = normalizeContractProbeResult(await args.checkContract({
+    owner: mapping.owner,
+    repo: mapping.repo,
+    workflowFile: mapping.workflowFile,
+    token: ghToken,
+    ref: mapping.defaultBranch,
+  }));
+  const contract = capabilities.contract;
+  const suppliedCredentials = args.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
+  const managedCredentials = ghaManagedCredentials(ghaDecision, args.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
+  const trustedCredentials = managedCredentials ? { ...suppliedCredentials, ...managedCredentials } : suppliedCredentials;
+  assertPrivateTransportForCredentials(
+    trustedCredentials, capabilities,
+    `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+  );
+  assertExecutionPolicyCapability(
+    trustedCredentials, capabilities,
+    `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
+  );
+  // The mint is unconditional; an old workflow template gets no publication input.
+  const ghaPublicationToken = capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
+    ? runPublicationToken
+    : undefined;
+
+  const inputs = (contract === "envelope"
+    ? buildEnvelopeDispatchInputs(mapping, gapFillIssue, {
+        runnerPhase: "gap-analysis",
+        prNumber: String(item.prNumber),
+        commentInstruction,
+        runnerCallbackUrl: runnerCallbackUrl || undefined,
+        runToken,
+        runProgressToken,
+        runPublicationToken: ghaPublicationToken,
+        privateTransport: capabilities.supportsPrivateRunConfig === true,
+        credentials: trustedCredentials,
+        ...managedRunConfigFields(ghaDecision),
+        runnerImage,
+        retryPolicy: getRetryPolicy(),
+      })
+    : {
+        issue_id: prLog.issueId,
+        issue_identifier: prLog.issueIdentifier ?? prLog.issueId,
+        issue_title: prLog.issueTitle ?? prLog.issueId,
+        issue_description: prLog.issueTitle ?? prLog.issueId,
+        pr_number: String(item.prNumber),
+        runner_phase: "gap-analysis" as const,
+        ...providerDispatchFields(mapping),
+        ...capDispatchFields(mapping),
+        ...skillsRepoDispatchFields(mapping),
+        runner_callback_url: runnerCallbackUrl,
+        run_token: runToken,
+        run_progress_token: runProgressToken,
+        ...(commentInstruction ? { comment_instruction: commentInstruction } : {}),
+        ...(runnerImage ? { runner_image: runnerImage } : {}),
+      }) as Record<string, string | undefined>;
+  return { runnerImage, contract, inputs };
+}
+
+/** Forward the proven launch unchanged; admission and persistence belong to the caller. */
+export function dispatchGhaGapfill(args: Pick<GhaGapfillDependencies, "dispatch"> & {
+  ghToken: string;
+  mapping: RepoMapping;
+  inputs: Record<string, string | undefined>;
+}): Promise<DispatchResult> {
+  return args.dispatch(args.ghToken, args.mapping, args.inputs, { returnRunDetails: true });
 }

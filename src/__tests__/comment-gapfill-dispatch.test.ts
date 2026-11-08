@@ -2441,3 +2441,15 @@ describe("buildCommentGapfillInstruction", () => {
     expect(text).toContain("2 more open findings were left out of this run");
   });
 });
+
+it("dispatchGhaGapfill forwards inputs and returns the dispatch result unchanged", async () => {
+  const { dispatchGhaGapfill } = await import("../gapfill-launch.js");
+  const mapping = makeMapping();
+  const inputs = { run_config: "opaque-payload", run_token: "" };
+  const result = { success: false as const, status: 422, outcome: "rejected" as const };
+  const dispatch = vi.fn<DrainInput["dispatch"]>().mockResolvedValue(result);
+
+  expect(await dispatchGhaGapfill({ ghToken: "github-token", mapping, inputs, dispatch })).toBe(result);
+  expect(dispatch).toHaveBeenCalledExactlyOnceWith("github-token", mapping, inputs, { returnRunDetails: true });
+  expect(dispatch.mock.calls[0]![2]).toBe(inputs);
+});
