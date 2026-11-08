@@ -1,10 +1,10 @@
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { makeContext } from "./helpers/builders.js";
 import { testDir } from "./helpers/test-dir.js";
 
 function fixture({ failingCi = "", pendingReview = "", issueId = "filesystem:SAN2:SAN2-001" } = {}) {
-  let selectedReviewers = false;
   const ghSpawn = vi.fn((args: string[]) => {
     if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
     if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42") {
@@ -20,17 +20,15 @@ function fixture({ failingCi = "", pendingReview = "", issueId = "filesystem:SAN
   });
   const invoke = vi.fn(async () => ({
     stdout: "", exitCode: 0, tokensUsed: 100,
-    structuredOutput: selectedReviewers
-      ? { approved: true, findings: [] }
-      : { approved: true, blocking_issues: [], feedback: "No issues found.", score: 9, progress_delta: 0 },
+    structuredOutput: { approved: true, findings: [] },
     terminalStatus: { subtype: "success", isError: false },
     telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 10, costUsd: null, tokensIn: 1, tokensOut: 1 },
   }));
   const ctx = makeContext({ issueId }, { invoke });
   const sleep = vi.fn(async () => {});
   const run = (extra: Record<string, unknown> = {}) => {
-    selectedReviewers = extra.reviewers !== undefined;
     return postPushReviewStep.run(ctx, {
+      reviewers: DEFAULT_REVIEWER_SELECTION,
       prNumber: "42", workspaceDir: testDir("filesystem-review"), maxIterations: 1,
       ghSpawn, gitSpawn: () => ({ stdout: "", exitCode: 0 }), sleep,
       trustedReviewerDefinitions: new Map(["gap-analysis", "code-review"].map(id => [
@@ -47,7 +45,7 @@ describe("filesystem external review opt-in", () => {
     const { run, ghSpawn, sleep, invoke } = fixture();
     const result = await run();
     expect(result.approved).toBe(true);
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
     expect(sleep).not.toHaveBeenCalled();
     expect(ghSpawn.mock.calls.some(([args]) => args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100"))).toBe(false);
   });
