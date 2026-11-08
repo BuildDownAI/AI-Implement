@@ -24,13 +24,23 @@ export interface AdoptionResult {
   stages: Record<StageName, { model: string; source: string }>;
 }
 
+// Only inputs used for repository models and dispatch/readiness belong here.
+// Never include arbitrary mapping environment values or expose this fingerprint.
+function adoptionInputsFingerprint(mapping: RepoMapping | undefined, runnerMode: RunnerMode): string {
+  return JSON.stringify([runnerMode, mapping ? [
+    mapping.owner, mapping.repo, mapping.defaultBranch, mapping.executionMode,
+    mapping.extraEnv?.CLAUDE_MODEL, mapping.workflowFile,
+    mapping.planningEnabled, mapping.planningWorkflowFile,
+  ] : null]);
+}
+
 /** Operator-driven opt-in. No credentials, profiles, or dispatch grants are written. */
 export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: string; dryRun: boolean }): Promise<AdoptionResult[]> {
   if (deps.getDefaults()?.config.mode !== "configured") throw new Error("run adopt-env first");
   const mappings = deps.getMappings();
   if (options.projectKey && !Object.hasOwn(mappings, options.projectKey)) throw new Error("unknown project");
   const results: AdoptionResult[] = [];
-  for (const [projectKey, mapping] of Object.entries(mappings)) {
+  for (const [projectKey, initialMapping] of Object.entries(mappings)) {
     if (options.projectKey && options.projectKey !== projectKey) continue;
     // Guard the defaults used to omit redundant overrides as well as the project row.
     const expectedInputs = deps.fingerprint(projectKey);
@@ -50,7 +60,10 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
       }
       continue;
     }
+    // Isolate the candidate from in-place mapping edits during asynchronous reads.
+    const mapping = { ...initialMapping, extraEnv: { ...initialMapping.extraEnv } };
     const runnerMode = deps.runnerMode();
+    const expectedAdoptionInputs = adoptionInputsFingerprint(mapping, runnerMode);
     const path = resolveExecutionPath(runnerMode, mapping.executionMode);
     const backends = path === "both" ? ["github-actions", "fly-machines"] as const : [path];
     const planningBackend = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
@@ -108,6 +121,13 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
       }
     } catch { result.outcome = "readiness_unavailable"; }
     if (result.outcome) continue;
+    // No await between revalidation and the synchronous guarded write. Dry-run
+    // reports the same stale-input outcome without calling the writer.
+    if (deps.fingerprint(projectKey) !== expectedInputs
+      || adoptionInputsFingerprint(deps.getMappings()[projectKey], deps.runnerMode()) !== expectedAdoptionInputs) {
+      result.outcome = "inputs_changed";
+      continue;
+    }
     if (!options.dryRun) {
       try { deps.write(projectKey, candidate, expectedInputs); }
       catch (error) {

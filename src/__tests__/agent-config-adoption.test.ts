@@ -135,6 +135,46 @@ describe("project adoption", () => {
     expect(write).toHaveBeenLastCalledWith("B", { version: 1, mode: "configured", stages: carried }, JSON.stringify(defaults));
     expect(deps.inspectReadiness).toHaveBeenLastCalledWith(expect.objectContaining({ projectKey: "B" }), expect.objectContaining({ stages: carried }));
   });
+  describe.each([false, true])("concurrent adoption inputs (dryRun=%s)", dryRun => {
+    it.each(["reads", "readiness"] as const)("rejects changes during deferred %s", async phase => {
+      const mutations: Array<(mapping: RepoMapping, deps: AdoptionDeps, mappings: Record<string, RepoMapping>) => void> = [
+        mapping => { mapping.owner = "other"; },
+        mapping => { mapping.repo = "other"; },
+        mapping => { mapping.defaultBranch = "other"; },
+        mapping => { mapping.executionMode = "github-actions"; },
+        mapping => { mapping.extraEnv.CLAUDE_MODEL = "changed"; },
+        mapping => { delete mapping.extraEnv.CLAUDE_MODEL; },
+        mapping => { mapping.workflowFile = "other.yml"; },
+        mapping => { mapping.planningEnabled = true; },
+        mapping => { mapping.planningWorkflowFile = "other.yml"; },
+        (_mapping, deps) => { deps.runnerMode = () => "shadow"; },
+        (_mapping, _deps, mappings) => { delete mappings.A; },
+        (_mapping, deps) => { deps.fingerprint = () => "changed"; },
+      ];
+      for (const mutate of mutations) {
+        const { deps, write } = fixture({ "WORKFLOW.md": "---\nmodel: workflow\n---" });
+        const mapping = { ...deps.getMappings().A, extraEnv: { CLAUDE_MODEL: "mapping-model" } };
+        const mappings = { A: mapping };
+        deps.getMappings = () => mappings;
+        let release!: () => void;
+        let started!: () => void;
+        const waiting = new Promise<void>(resolve => { started = resolve; });
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const readFile = deps.readFile;
+        if (phase === "reads") {
+          deps.readFile = async (mapping, path) => { started(); await gate; return readFile(mapping, path); };
+        } else {
+          deps.inspectReadiness = async () => { started(); await gate; return { status: "ready", profiles: [] }; };
+        }
+        const pending = run(deps, dryRun);
+        await waiting;
+        mutate(mapping, deps, mappings);
+        release();
+        expect((await pending)[0].outcome).toBe("inputs_changed");
+        expect(write).not.toHaveBeenCalled();
+      }
+    });
+  });
   it("reads default-branch files through the GitHub reader", async () => {
     const github = fakeFetch({
       "GET /repos/owner/repo/contents/.ai-implement/config.yml": { json: { type: "file", encoding: "base64", content: Buffer.from("models:\n  review: repo-review").toString("base64") } },
