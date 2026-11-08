@@ -168,6 +168,13 @@ resolve_envelope_field() {
 
 # Resolve the phase before provider validation, preserving env > envelope > default.
 resolve_runner_phase() {
+  # Only legacy runs accept a team phase alias. Consume it before filling defaults,
+  # so an empty alias still falls back to the envelope and cannot drift at remap.
+  local phase_alias="${AI_IMPLEMENT_TEAM_SECRET_PREFIX:-}RUNNER_PHASE"
+  if [ "${CONFIGURED:-0}" != "1" ] && [ -n "${AI_IMPLEMENT_TEAM_SECRET_PREFIX:-}" ] && [ "${!phase_alias+x}" = x ]; then
+    RUNNER_PHASE="${!phase_alias}"
+    unset "$phase_alias"
+  fi
   RUNNER_PHASE_SOURCE="env"
   [ -z "${RUNNER_PHASE:-}" ] && RUNNER_PHASE_SOURCE="default"
   resolve_envelope_field RUNNER_PHASE runnerPhase

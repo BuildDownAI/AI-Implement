@@ -80,6 +80,24 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
   // to it even though it is visible to later commands in the same shell.
   const RESET = "unset AI_IMPLEMENT_RUN_CONFIG RUNNER_PHASE RUNNER_CALLBACK_URL";
 
+  it.each([
+    ["legacy", "kg-refresh", "planning", "kg-refresh", "env"],
+    ["legacy", "", "planning", "planning", "envelope"],
+    ["legacy", "", "", "implementation", "default"],
+    ["configured", "kg-refresh", "planning", "review-fix", "env"],
+  ])("resolves %s phase aliases before remapping (alias=%s envelope=%s)", (mode, alias, envelopePhase, phase, source) => {
+    const envelope = encodeEnvelope({ runnerPhase: envelopePhase });
+    const result = runBash(
+      `${RESET}; source session/lib.sh; CONFIGURED=${mode === "configured" ? 1 : 0};
+export AI_IMPLEMENT_TEAM_SECRET_PREFIX=SAN_ SAN_RUNNER_PHASE='${alias}' RUNNER_PHASE=review-fix AI_IMPLEMENT_RUN_CONFIG='${envelope}';
+resolve_runner_phase; remap_team_secrets;
+echo "FINAL=$RUNNER_PHASE:$RUNNER_PHASE_SOURCE"; echo "ALIAS=\${SAN_RUNNER_PHASE-unset}"`,
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`FINAL=${phase}:${source}`);
+    expect(result.stdout).toContain("ALIAS=unset");
+  });
+
   it("env wins over the envelope (dev-harness guard: RUNNER_PHASE=full survives runnerPhase:implementation)", () => {
     const envelope = encodeEnvelope({ runnerPhase: "implementation" });
     const result = runBash(

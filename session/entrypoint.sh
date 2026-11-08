@@ -121,6 +121,7 @@ chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
 # ── 5.5. Remap per-team Fly secrets ─────────────────────────────────────────
 remap_team_secrets
+[ "$CONFIGURED" = "1" ] || [ "$RUNNER_PHASE" != "kg-refresh" ] || unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_USE_BEDROCK AWS_BEDROCK_ROLE_ARN
 
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
 export WORKSPACE_DIR

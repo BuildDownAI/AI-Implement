@@ -843,6 +843,35 @@ printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fa
   const legacyIssue = { ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" };
   const modelVars = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "AWS_BEDROCK_ROLE_ARN"];
 
+  it.each(["anthropic", "bedrock"])("phase alias cannot deliver model credentials to KG (%s)", (provider) => {
+    const r = run({
+      ...legacyIssue, RUNNER_PHASE: "implementation", SAN_RUNNER_PHASE: "kg-refresh", PROVIDER: provider,
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      ...Object.fromEntries(modelVars.map((name) => [name, "synthetic-repro-key"])),
+      ...Object.fromEntries(modelVars.map((name) => [`SAN_${name}`, "synthetic-alias-key"])),
+    });
+    expect(r.result.status).toBe(0);
+    const handoff = r.sections.find(s => s.startsWith("dbus-run-session ")) ?? "";
+    expect(handoff.includes("/app/dist/pipeline/kg-refresh-run.js")).toBe(true);
+    for (const name of modelVars) expect(new RegExp(`^(SAN_)?${name}=`, "m").test(handoff)).toBe(false);
+    expect(r.output.match(/kg-refresh: no model credential required/g)).toHaveLength(1);
+    for (const value of ["synthetic-repro-key", "synthetic-alias-key"]) expect(r.output.includes(value)).toBe(false);
+  });
+
+  it.each(["implementation", "planning", "review-fix"])("reverse KG alias validates %s before handoff", (phase) => {
+    const base = { ...legacyIssue, RUNNER_PHASE: "kg-refresh", SAN_RUNNER_PHASE: phase, AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_" };
+    const missing = run(base);
+    expect(missing.result.status).not.toBe(0);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.children).toBe("");
+    for (const name of modelVars.slice(0, 2)) {
+      const ok = run({ ...base, [name]: "synthetic-reverse-key" });
+      expect(ok.result.status).toBe(0);
+      expect(ok.output).toContain(`phase=${phase}, source=env`);
+      expect(ok.output.includes("synthetic-reverse-key")).toBe(false);
+    }
+  });
+
   it.each(["anthropic", "bedrock"])("KG refresh bypasses %s validation and strips model credentials, including team aliases", (provider) => {
     for (const credentials of [{}, Object.fromEntries(modelVars.map((name) => [name, "sentinel-model"]))]) {
       const { result, sections, output } = run({
