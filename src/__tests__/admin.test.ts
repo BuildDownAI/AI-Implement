@@ -6513,7 +6513,6 @@ describe("model accounts and stage configuration (AII-962)", () => {
       agentConfig: {
         inspectReadiness: async () => ({ status: "ready", profiles: [] }),
         credentials: { sessionStore: { readPlanRecord } as never, resolveProtectedSecret: () => null },
-        sessionSnapshot: (id) => (id === "cl-sub" ? { profileId: id, dispatchId: "d", generation: 1, state: "recovery_required", heartbeatAt: null } : undefined),
       },
     });
     const list = async (readPlanRecord: () => unknown) => (await call("/api/model-accounts", "GET", t, undefined, mk(readPlanRecord))).json.accounts;
@@ -6523,7 +6522,8 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
     accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
     expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
-    expect(find(accts, "cl-sub").account.sessionRecovery).toEqual({ state: "recovery_required", recoveryRequired: true });
+    expect(find(accts, "cl-sub").account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
+    expect(find(accts, "cl-sub").account).not.toHaveProperty("sessionRecovery");
     expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
     expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
 

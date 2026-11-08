@@ -70,7 +70,6 @@ import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./mode
 import { mintPairingCode, readPairingStatus, PAIRING_OPERATOR } from "./chatgpt-pairing.js";
 import { createModelSessionStore } from "./model-session-store.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
-import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
@@ -608,8 +607,6 @@ export interface AgentConfigAdminDeps {
   inspectReadiness(request: Omit<AgentRunRequest, "dispatchId">, candidate?: StageAgentConfigurationV1): Promise<AgentReadiness>;
   /** Safe credential status inputs; no secret is read through them. */
   credentials: ModelCredentialDeps;
-  /** Ownership snapshot of a `claude-subscription` profile; absent when never reserved. */
-  sessionSnapshot?(profileId: string): OwnershipSnapshot | undefined;
 }
 
 /** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
@@ -4001,17 +3998,10 @@ interface AccountStatusView {
   readiness: AccountReadiness;
   /** Fixed failure code from the credential status projection; never a reference or value. */
   failureCode: string | null;
-  /** `claude-subscription` only. */
-  sessionRecovery?: { state: string; recoveryRequired: boolean } | null;
 }
 
 function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): AccountStatusView {
   const view: AccountStatusView = { readiness: "unknown", failureCode: null };
-  if (profile.authMode === "claude-subscription") {
-    const snap = deps.agentConfig?.sessionSnapshot?.(profile.profileId);
-    view.sessionRecovery = snap ? { state: snap.state, recoveryRequired: snap.state === "recovery_required" } : null;
-    return view;
-  }
   if (!deps.agentConfig) return view;
   let status;
   try {
