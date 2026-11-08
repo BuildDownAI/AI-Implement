@@ -2854,12 +2854,12 @@ describe("admin settings", () => {
     expect(res.statusCode).toBe(503);
   });
 
-  it("GET /api/settings reports source fallback before any Restate read, with env as the runtime value", async () => {
+  it("GET /api/settings reports source fallback before any Restate read, with a null runtime value despite env", async () => {
     process.env.FLY_SESSIONS_APP = "env-app";
     const token = await login("secret");
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
     expect(get.runnerBackendSource).toBe("fallback");
-    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "env-app", source: "fallback" });
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: null, source: "fallback" });
   });
 
 
