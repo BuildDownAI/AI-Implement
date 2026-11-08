@@ -3,8 +3,50 @@ import { generateKeyPairSync } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parse } from "smol-toml";
+import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
-import { PROVISION_ENV_CHECKS, makeIo, provisionPreflight, runProvisionClient, type CommandResult, type ProvisionDependencies } from "../provision-client.js";
+import { HEALTH_WAIT_MS, probeHealth, PROVISION_ENV_CHECKS, makeIo, provisionPreflight, runProvisionClient, type CommandResult, type ProvisionDependencies } from "../provision-client.js";
+
+describe("probeHealth", () => {
+  it("accepts 200 without reading JSON and exports a 15 minute deadline", async () => {
+    fakeFetch({ "GET /": { status: 200, text: "ok" } }).install();
+    expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "serving" });
+    expect(HEALTH_WAIT_MS).toBe(15 * 60_000);
+  });
+
+  it("accepts a 200 with startup states before S1-15 changes the server status contract", async () => {
+    fakeFetch({ "GET /": { status: 200, json: { restate: { sidecar: { state: "starting" }, registration: { state: "not-attempted" } } } } }).install();
+    expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "serving" });
+  });
+
+  it("reads both Restate states from a 503", async () => {
+    fakeFetch({ "GET /": { status: 503, json: { restate: { sidecar: { state: "starting" }, registration: { state: "not-attempted" } } } } }).install();
+    expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "starting", sidecar: "starting", registration: "not-attempted" });
+  });
+
+  it.each([
+    { status: 201 }, { status: 500 }, { status: 503, text: "not JSON" },
+    ...[null, {}, { restate: null }, { restate: { sidecar: null } },
+      { restate: { sidecar: { state: 1 }, registration: { state: "pending" } } },
+      { restate: { sidecar: { state: "ready" }, registration: { state: false } } },
+      { restate: { sidecar: { state: "ready" } } },
+    ].map((json) => ({ status: 503, json })),
+  ])("treats other responses as not answering: %j", async (reply) => {
+    fakeFetch({ "GET /": reply }).install();
+    expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "not-answering" });
+  });
+
+  it("catches fetch errors", async () => {
+    fakeFetch({ "GET /": () => { throw new TypeError("fetch failed"); } }).install();
+    expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "not-answering" });
+  });
+
+  it("bounds the request at ten seconds", async () => {
+    stubAbortTimeout(10_000);
+    fakeFetch({ "GET /": hangUntilAborted }).install();
+    expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "not-answering" });
+  });
+});
 
 const PEM = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 const EXISTING_CLIENT_FILE = '[fly]\napp_name = "orchestrator"\norg = "my-org"\nregion = "lhr"\n';
@@ -144,7 +186,7 @@ async function fakeDeps(options: FakeOptions = {}) {
       return "kg-build-token-sentinel";
     },
     generateSecret: () => `generated-${++generated}-sentinel`,
-    isAnswering: async () => true,
+    probeHealth: async () => ({ kind: "serving" }),
     homeDir: () => dir,
     now: () => time,
     sleep: async (ms) => {
@@ -894,7 +936,7 @@ describe("runProvisionClient", () => {
 
     it("says each minute how long it has waited for the orchestrator, out of 15", async () => {
       const f = await fakeDeps({ answers: { "Wait up to": "yes" } });
-      f.deps.isAnswering = async () => f.time() >= 3 * 60_000;
+      f.deps.probeHealth = async () => ({ kind: f.time() >= 3 * 60_000 ? "serving" : "not-answering" });
       expect(await runProvisionClient(["client"], f.deps)).toBe(0);
       // Each progress line gives the minutes waited and the limit, whatever its wording.
       const minutesWaited = f.stdout().split("\n").filter((line) => /\b15\b/.test(line)).map((line) => line.match(/\d+/)![0]);
@@ -903,18 +945,53 @@ describe("runProvisionClient", () => {
 
     it("waits 15 minutes at most and then fails", async () => {
       const f = await fakeDeps({ answers: { "Wait up to": "yes" } });
-      f.deps.isAnswering = async () => false;
+      f.deps.probeHealth = async () => ({ kind: "not-answering" });
       expect(await runProvisionClient(["client"], f.deps)).toBe(1);
       expect(f.time()).toBe(15 * 60_000);
-      expect(f.stdout()).toMatch(/15 minutes/);
+      expect(f.stdout()).toContain("The orchestrator did not answer within 15 minutes.");
+      expect(f.stdout()).toContain("curl --fail https://ai-implement-client.fly.dev/");
+    });
+
+    it("succeeds immediately on the first serving probe", async () => {
+      const f = await fakeDeps({ answers: { "Wait up to": "yes" } });
+      let attempts = 0;
+      f.deps.probeHealth = async () => { attempts++; return { kind: "serving" }; };
+      expect(await runProvisionClient(["client"], f.deps)).toBe(0);
+      expect(attempts).toBe(1);
+      expect(f.time()).toBe(0);
+      expect(f.stdout()).toContain("The orchestrator is answering.");
+    });
+
+    it("keeps waiting for Restate and reports its states before serving", async () => {
+      const f = await fakeDeps({ answers: { "Wait up to": "yes" } });
+      f.deps.probeHealth = async () => f.time() >= 2 * 60_000
+        ? { kind: "serving" }
+        : { kind: "starting", sidecar: "starting", registration: "pending" };
+      expect(await runProvisionClient(["client"], f.deps)).toBe(0);
+      expect(f.time()).toBe(2 * 60_000);
+      expect(f.stdout()).toContain("Still waiting, 1 of 15 minutes. Restate is not serving (sidecar starting, registration pending).");
+      expect(f.stdout()).toContain("The orchestrator is answering.");
+    });
+
+    it.each([false, true])("uses the latest probe at the deadline (stopped answering: %s)", async (stopped) => {
+      const f = await fakeDeps({ answers: { "Wait up to": "yes" } });
+      f.deps.probeHealth = async () => stopped && f.time() >= 14 * 60_000
+        ? { kind: "not-answering" }
+        : { kind: "starting", sidecar: "ready", registration: "pending" };
+      expect(await runProvisionClient(["client"], f.deps)).toBe(1);
+      expect(f.time()).toBe(HEALTH_WAIT_MS);
+      expect(f.stdout()).toContain(stopped
+        ? "The orchestrator did not answer within 15 minutes."
+        : "The orchestrator answers, but Restate is not serving (sidecar ready, registration pending).");
+      expect(f.stdout()).toContain("curl --fail https://ai-implement-client.fly.dev/");
     });
 
     it("keeps waiting through a request that throws", async () => {
       const f = await fakeDeps({ answers: { "Wait up to": "yes" } });
       let attempts = 0;
-      f.deps.isAnswering = async () => {
+      f.deps.probeHealth = async () => {
         if (++attempts < 3) throw new Error("connection refused");
-        return true;
+        return { kind: "serving" };
       };
       expect(await runProvisionClient(["client"], f.deps)).toBe(0);
       expect(attempts).toBe(3);
