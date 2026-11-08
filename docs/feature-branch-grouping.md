@@ -413,7 +413,7 @@ Feature-branch grouping is supported on **both providers**:
   to self-drive. On a local (`localhost`) orchestrator the callback can't be reached, so
   `Plan-Complete` must be set by hand to test the implementation/grouping path.
 - **Pair the runner image with the orchestrator.** A testing orchestrator should set
-  `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`; otherwise a GitHub Actions
+  `AI_IMPLEMENT_RUNNER_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`; otherwise a GitHub Actions
   run falls back to the `:latest` runner, which may be incompatible with the current
   workflow/entrypoint.
 - **Top-of-tree PR merge method:** any method (merge-commit, squash, rebase) works correctly — the orchestrator detects completion via the PR's merged state, not git ancestry. On orchestrator versions before AII-188 shipped, squash/rebase merges left the feature branch appearing "ahead" of base, causing the PR to be re-opened each poll tick. If running a pre-fix orchestrator, use merge-commit with **Delete branch** checked as a temporary workaround.
