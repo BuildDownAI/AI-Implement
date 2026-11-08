@@ -25,7 +25,7 @@ Applied in order. The queue is only reached when all pass; 👀 is added at enqu
 | Repo has a mapping | `no_mapping` | none |
 | App credentials configured | `no_app_credentials` | none |
 | Installation token | `token_error` | none (no token to post with) |
-| Contract probe (`resolveWorkflowContract`, `failOnTransient`) | `legacy_repo` for a real legacy workflow | none |
+| Contract probe (`resolveWorkflowContract`) | `legacy_repo` for a real legacy workflow | none |
 | Contract probe cannot read the workflow (twice) | `contract_probe_failed` | "could not read this repository's workflow … repost" |
 | Commenter has write/maintain/admin | `insufficient_permission` (also a 404 from the API: not a collaborator) | none |
 | Permission API errors (fetch throw, 5xx, 429, bad JSON; twice) | `permission_check_failed` | "could not check your permission … repost" |
@@ -33,7 +33,7 @@ Applied in order. The queue is only reached when all pass; 👀 is added at enqu
 
 The probe and the permission check each retry once with no sleep (GitHub's delivery timeout is 10 s). GitHub never retries a delivery itself and the redelivery sweep runs only at Restate registration, so the retry-then-reply path is what keeps a transient error from being silent. If posting the reply fails, it is logged and the webhook still answers 200 with the reason.
 
-`probeCapabilities` (`src/workflow-probe.ts`) does not cache a `legacy` result that came from a fetch throw, a non-404 error status, bad JSON or a non-file body. A 404 and a real legacy workflow are cached for 5 minutes. Without `failOnTransient` the probe never throws.
+`resolveWorkflowContract` and `resolveWorkflowCapabilities` (`src/workflow-probe.ts`) always throw `WorkflowProbeTransientError` on a failed read: a fetch throw, a non-404 error status, bad JSON or a non-file body. Failed reads are never cached. A definite legacy answer — a 404 or a file without `run_config` — is cached for 5 minutes. The deprecated `failOnTransient` option is ignored.
 
 ## Queue
 

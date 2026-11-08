@@ -57,17 +57,16 @@ export interface ResolveWorkflowContractInput {
   fetchImpl?: typeof fetch;
   /** Injected for tests. Defaults to `Date.now`. */
   nowMs?: () => number;
-  /** Throw on a transient probe failure (fetch throw, non-404 error status, bad JSON, non-file body)
-   *  instead of answering `legacy`. Default false: callers keep the never-throw behaviour. */
+  /** @deprecated Ignored. Failed reads always throw WorkflowProbeTransientError. */
   failOnTransient?: boolean;
 }
 
-/** Thrown only when `failOnTransient` is set and the probe could not read the workflow. */
+/** Thrown when the probe could not read the workflow. Failed reads are never cached. */
 export class WorkflowProbeTransientError extends Error {}
 
 interface ProbeResult {
   capabilities: WorkflowCapabilities;
-  /** True when `legacy` is a guess from a failed read, not an answer. Never cached. */
+  /** True when the read failed. The resolver throws instead of caching capabilities. */
   transient: boolean;
 }
 
@@ -93,10 +92,7 @@ export async function resolveWorkflowCapabilities(
 
   const { capabilities, transient } = await probeCapabilities(owner, repo, workflowFile, ref, token, fetchImpl);
   if (transient) {
-    if (input.failOnTransient) {
-      throw new WorkflowProbeTransientError(`could not read ${owner}/${repo}/${workflowFile}@${ref}`);
-    }
-    return capabilities;
+    throw new WorkflowProbeTransientError(`could not read ${owner}/${repo}/${workflowFile}@${ref}`);
   }
   cache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, capabilities });
   return capabilities;
@@ -133,7 +129,7 @@ async function probeCapabilities(
       },
     });
   } catch (err) {
-    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: fetch failed (${err instanceof Error ? err.message : String(err)}); assuming legacy contract`);
+    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: fetch failed (${err instanceof Error ? err.message : String(err)}); workflow read failed`);
     return legacy(true);
   }
 
@@ -141,7 +137,7 @@ async function probeCapabilities(
     return legacy();
   }
   if (!res.ok) {
-    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: contents lookup returned HTTP ${res.status}; assuming legacy contract`);
+    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: contents lookup returned HTTP ${res.status}; workflow read failed`);
     return legacy(true);
   }
 
@@ -149,12 +145,12 @@ async function probeCapabilities(
   try {
     body = (await res.json()) as typeof body;
   } catch (err) {
-    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not JSON; assuming legacy contract`);
+    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not JSON; workflow read failed`);
     return legacy(true);
   }
 
-  if (body.type !== "file" || body.encoding !== "base64" || !body.content) {
-    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not a file blob; assuming legacy contract`);
+  if (!body || body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string" || !body.content) {
+    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not a file blob; workflow read failed`);
     return legacy(true);
   }
 
