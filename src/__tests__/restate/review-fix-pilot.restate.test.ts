@@ -103,7 +103,7 @@ const SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES = SUCCESS_NO_RESULT_DEADLINE_MS / 60
 const SHORT_UNKNOWN_LAUNCH_ALERT_MS = 1_000;
 // Leave a partial final backoff so the completion bound detects an uncapped sleep.
 const SHORT_UNKNOWN_LAUNCH_GRACE_MS = 6_500;
-const SHORT_POST_DEADLINE_RECONCILE_MS = 2_000;
+const SHORT_POST_DEADLINE_RECONCILE_MS = 5_000;
 
 function sha(seed: string): string {
   return createHash("sha256").update(seed).digest("hex").slice(0, 40);
@@ -771,30 +771,57 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       return view.status === "ok" ? view.attempt.state : null;
     }, (state) => state === "launch_unresolved", { timeoutMs: 12_000, label: "unknown launch completes" });
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
-    const completedAt = Date.now();
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+    const completedAt = (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(attemptId) as { completed_at: number }).completed_at;
     const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
     const graceBoundary = prepared.deadlineAt + SHORT_UNKNOWN_LAUNCH_GRACE_MS;
     expect(completedAt).toBeGreaterThanOrEqual(graceBoundary);
-    // Allow ingress/polling overhead, but less than the extra 1.5s an uncapped
-    // two-second sleep would add to the partial final backoff.
-    expect(completedAt).toBeLessThan(graceBoundary + 700);
+    // Use the durable outcome timestamp, not when polling/attach observes it.
+    // A five-second uncapped final wait would overshoot by about 3.5s;
+    // allow 2s of durable-call/scheduler overhead while still detecting that bug.
+    expect(completedAt).toBeLessThan(graceBoundary + 2_000);
     const active = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
       .get(attemptId) as { released_at: number | null };
     expect(active.released_at).toBeNull();
     expect(fixture.dispatchCalls).toBe(1);
-    const preDeadline = fixture.lookupTimes.filter((time) => time < prepared.deadlineAt);
+    // Restate's journal records when each timer was scheduled and its requested
+    // wake-up time. RPC/polling latency between observed listRuns calls is not
+    // part of the requested cadence. Appending may shorten the remaining delay,
+    // so require a full tick in each phase, rather than a lower bound on every
+    // journal append. The partial ticks end at the deadline and grace boundary.
+    const sleeps = entries.filter((entry) => entry.entry_type === "Command: Sleep").map((entry) => {
+      const command = JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+      const scheduledAt = Date.parse(String(entry.appended_at));
+      const wakeAt = command.Command.Sleep.wake_up_time;
+      return { scheduledAt, wakeAt, remaining: wakeAt - scheduledAt };
+    });
+    const preDeadline = sleeps.filter((sleep) => sleep.scheduledAt < prepared.deadlineAt);
     expect(preDeadline.length).toBeGreaterThanOrEqual(2);
-    for (let i = 1; i < preDeadline.length; i++) {
-      expect(preDeadline[i]! - preDeadline[i - 1]!).toBeGreaterThanOrEqual(900);
-      expect(preDeadline[i]! - preDeadline[i - 1]!).toBeLessThan(1_500);
-    }
-    const postDeadline = fixture.lookupTimes.filter((time) => time >= prepared.deadlineAt + 100);
+    expect(preDeadline.some((sleep) => sleep.remaining >= 900)).toBe(true);
+    for (const sleep of preDeadline) expect(sleep.remaining).toBeLessThanOrEqual(1_100);
+    const postDeadline = sleeps.filter((sleep) => sleep.scheduledAt >= prepared.deadlineAt);
     expect(postDeadline.length).toBeGreaterThanOrEqual(2);
-    for (let i = 1; i < postDeadline.length; i++) {
-      expect(postDeadline[i]! - postDeadline[i - 1]!).toBeGreaterThanOrEqual(1_800);
-    }
+    expect(postDeadline.some((sleep) => sleep.remaining >= SHORT_POST_DEADLINE_RECONCILE_MS - 100)).toBe(true);
+    for (const sleep of postDeadline) expect(sleep.remaining).toBeLessThanOrEqual(SHORT_POST_DEADLINE_RECONCILE_MS + 100);
+    const finalSleep = postDeadline.at(-1)!;
+    expect(finalSleep.wakeAt).toBeGreaterThanOrEqual(graceBoundary);
+    expect(finalSleep.wakeAt).toBeLessThan(graceBoundary + 2_000);
+    expect(finalSleep.remaining).toBeLessThan(SHORT_POST_DEADLINE_RECONCILE_MS - 2_000);
+    // Keep the external lookup evidence too: waits actually space the searches
+    // out, and neither phase degenerates into a busy loop.
+    const preLookups = fixture.lookupTimes.filter((time) => time < prepared.deadlineAt);
+    expect(preLookups.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < preLookups.length; i++) expect(preLookups[i]! - preLookups[i - 1]!).toBeGreaterThanOrEqual(900);
+    // A lookup may begin just before the deadline and finish after it. Count
+    // the backed-off gap itself instead of assigning that lookup to a phase
+    // by its external observation time.
+    expect(fixture.lookupTimes.some((time, i, times) =>
+      i > 0 && time - times[i - 1]! >= SHORT_POST_DEADLINE_RECONCILE_MS - 100)).toBe(true);
     const lookups = fixture.lookupTimes.length;
-    await settle(2_200);
+    await settle(SHORT_POST_DEADLINE_RECONCILE_MS + 200);
     expect(fixture.lookupTimes).toHaveLength(lookups);
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
     const facade = createReviewFixAdminFacade(sqliteStore, { reconcile: async () => ({ status: "unknown" }) }, createReviewFixIngressClient(env.baseUrl()));
@@ -813,8 +840,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       a.attemptId === attemptId && a.reason.includes("launch identity still unresolved"))).toBe(true);
   }, 30_000);
 
-  it.each(["cancel", "closed", "merged"] as const)("%s ends an unknown launch during its backed-off wait", async (event) => {
-    const env = envFor(VARIANTS[0]![0]);
+  it.each(VARIANTS.flatMap(([label]) => (["cancel", "closed", "merged"] as const).map((event) => ({ label, event }))))("$event ends an unknown launch during its backed-off wait ($label)", async ({ label, event }) => {
+    const env = envFor(label);
     const fixture = freshScenario(`unknown-${event}`);
     fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
     fixture.dispatchImpl = async () => { fixture.dispatchCalls++; throw new Error("lost launch response"); };
