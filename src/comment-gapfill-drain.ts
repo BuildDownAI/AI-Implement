@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
@@ -16,17 +15,16 @@ import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
 import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
-import { buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, type DispatchResult } from "./github.js";
+import { getPullRequestState, type DispatchResult } from "./github.js";
 import type { RunCredentialsV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
-import { dispatchFlyGapfill } from "./gapfill-launch.js";
+import { dispatchFlyGapfill, prepareGhaGapfillLaunch, dispatchGhaGapfill } from "./gapfill-launch.js";
 import { dispatchLocalGapfill } from "./local-gapfill.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { MAX_TASK_FINDINGS, formatTaskFinding, type ReviewFixTaskFinding } from "./review-fix-queue.js";
 import {
   classifyLaunchError,
   ghaLaunchOutcome,
-  ghaManagedCredentials,
   isManagedProject,
   prepareManagedDispatch,
   refusalText,
@@ -328,12 +326,6 @@ function acquireGapfillAdmission(input: {
     humanRequested: input.humanRequested,
     parked: isParked(input.issueId, "gap-analysis"),
   });
-}
-
-function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
-  return typeof result === "string"
-    ? { contract: result, supportsRunPublicationToken: false, supportsAttemptCorrelation: false }
-    : result;
 }
 
 export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput): Promise<void> {
@@ -756,62 +748,22 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         let contract: WorkflowContract;
         let gapFillInputs: Record<string, string | undefined>;
         try {
-          runnerImage = await opts.resolveRunnerImage(mapping, ghToken);
-          const capabilities = normalizeContractProbeResult(await opts.checkContract({
-            owner: mapping.owner,
-            repo: mapping.repo,
-            workflowFile: mapping.workflowFile,
-            token: ghToken,
-            ref: mapping.defaultBranch,
+          ({ runnerImage, contract, inputs: gapFillInputs } = await prepareGhaGapfillLaunch({
+            mapping,
+            issue: prLog,
+            item,
+            ghToken,
+            decision: ghaDecision,
+            runnerCallbackBaseUrl: opts.runnerCallbackBaseUrl,
+            runnerCallbackUrl,
+            runToken,
+            runProgressToken,
+            runPublicationToken,
+            commentInstruction,
+            resolveRunnerImage: opts.resolveRunnerImage,
+            checkContract: opts.checkContract,
+            getTrustedCredentials: opts.getTrustedCredentials,
           }));
-          contract = capabilities.contract;
-          const suppliedCredentials = opts.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
-          const managedCredentials = ghaManagedCredentials(ghaDecision, opts.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
-          const trustedCredentials = managedCredentials ? { ...suppliedCredentials, ...managedCredentials } : suppliedCredentials;
-          assertPrivateTransportForCredentials(
-            trustedCredentials, capabilities,
-            `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
-          );
-          assertExecutionPolicyCapability(
-            trustedCredentials, capabilities,
-            `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`,
-          );
-          // The mint is unconditional; an old workflow template gets no publication input.
-          const ghaPublicationToken = capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
-            ? runPublicationToken
-            : undefined;
-
-          gapFillInputs = (contract === "envelope"
-            ? buildEnvelopeDispatchInputs(mapping, gapFillIssue, {
-                runnerPhase: "gap-analysis",
-                prNumber: String(item.prNumber),
-                commentInstruction,
-                runnerCallbackUrl: runnerCallbackUrl || undefined,
-                runToken,
-                runProgressToken,
-                runPublicationToken: ghaPublicationToken,
-                privateTransport: capabilities.supportsPrivateRunConfig === true,
-                credentials: trustedCredentials,
-                ...managedRunConfigFields(ghaDecision),
-                runnerImage,
-                retryPolicy: getRetryPolicy(),
-              })
-            : {
-                issue_id: prLog.issueId,
-                issue_identifier: prLog.issueIdentifier ?? prLog.issueId,
-                issue_title: prLog.issueTitle ?? prLog.issueId,
-                issue_description: prLog.issueTitle ?? prLog.issueId,
-                pr_number: String(item.prNumber),
-                runner_phase: "gap-analysis" as const,
-                ...providerDispatchFields(mapping),
-                ...capDispatchFields(mapping),
-                ...skillsRepoDispatchFields(mapping),
-                runner_callback_url: runnerCallbackUrl,
-                run_token: runToken,
-                run_progress_token: runProgressToken,
-                ...(commentInstruction ? { comment_instruction: commentInstruction } : {}),
-                ...(runnerImage ? { runner_image: runnerImage } : {}),
-              }) as Record<string, string | undefined>;
         } catch (err) {
           settleManaged(opts, ghaDecision, "rejected");
           releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
@@ -820,7 +772,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 
         let result: Awaited<ReturnType<typeof opts.dispatch>>;
         try {
-          result = await opts.dispatch(ghToken, mapping, gapFillInputs, { returnRunDetails: true });
+          result = await dispatchGhaGapfill({ ghToken, mapping, inputs: gapFillInputs, dispatch: opts.dispatch });
         } catch (err) {
           settleManaged(opts, ghaDecision, "unknown");
           throw err;
