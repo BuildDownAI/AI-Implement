@@ -13,7 +13,8 @@ export interface AdoptionDeps {
   getProject(key: string): { config: StageAgentConfigurationV1 } | null;
   fingerprint(key: string): string;
   runnerMode(): RunnerMode;
-  readFile(mapping: RepoMapping, path: string): Promise<string | null>;
+  readRevision(mapping: RepoMapping): Promise<string | null>;
+  readFile(mapping: RepoMapping, path: string, revision: string): Promise<string | null>;
   inspectReadiness(request: Omit<AgentRunRequest, "dispatchId">, candidate: StageAgentConfigurationV1): Promise<AgentReadiness>;
   write(key: string, candidate: StageAgentConfigurationV1, expectedInputs: string): void;
 }
@@ -68,9 +69,12 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
     const backends = path === "both" ? ["github-actions", "fly-machines"] as const : [path];
     const planningBackend = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
     const candidate: StageAgentConfigurationV1 = { version: 1, mode: "configured", stages: {} };
+    let revision: string | null = null;
     try {
+      revision = await deps.readRevision(mapping);
+      if (!revision || !/^[0-9a-f]{40}$/i.test(revision)) throw new Error("repository unavailable");
       const [config, workflow, planning] = await Promise.all([
-        deps.readFile(mapping, ".ai-implement/config.yml"), deps.readFile(mapping, "WORKFLOW.md"), deps.readFile(mapping, "PLANNING.md"),
+        deps.readFile(mapping, ".ai-implement/config.yml", revision), deps.readFile(mapping, "WORKFLOW.md", revision), deps.readFile(mapping, "PLANNING.md", revision),
       ]);
       let models: Record<string, unknown> = {};
       try {
@@ -121,6 +125,19 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
       }
     } catch { result.outcome = "readiness_unavailable"; }
     if (result.outcome) continue;
+    // A failed discovery retains the explicit model-not-carried fallback. Once
+    // checked, a carried snapshot must never be downgraded or recalculated.
+    if (!result.modelNotCarried) {
+      try {
+        const currentRevision = await deps.readRevision(mapping);
+        if (currentRevision !== null && !/^[0-9a-f]{40}$/i.test(currentRevision)) {
+          result.outcome = "repository_unavailable";
+        } else if (currentRevision !== revision) {
+          result.outcome = "inputs_changed";
+        }
+      } catch { result.outcome = "repository_unavailable"; }
+      if (result.outcome) continue;
+    }
     // No await between revalidation and the synchronous guarded write. Dry-run
     // reports the same stale-input outcome without calling the writer.
     if (deps.fingerprint(projectKey) !== expectedInputs

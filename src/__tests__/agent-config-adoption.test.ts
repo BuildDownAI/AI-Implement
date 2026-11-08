@@ -14,6 +14,7 @@ function fixture(files: Record<string, string | null> = {}) {
     getProject: () => null,
     fingerprint: () => "fingerprint",
     runnerMode: () => "default",
+    readRevision: vi.fn(async () => "a".repeat(40)),
     readFile: vi.fn(async (_mapping, path) => files[path] ?? null),
     inspectReadiness: vi.fn<AdoptionDeps["inspectReadiness"]>(async () => ({ status: "ready", profiles: [] })),
     write,
@@ -23,6 +24,53 @@ function fixture(files: Record<string, string | null> = {}) {
 const run = (deps: AdoptionDeps, dryRun = false) => adoptProjects(deps, { dryRun });
 
 describe("project adoption", () => {
+  describe.each([false, true])("repository snapshot (dryRun=%s)", dryRun => {
+    it.each(["reads", "readiness"])("pins all files and rejects a push during %s", async phase => {
+      const { deps, write } = fixture();
+      let head = "a".repeat(40);
+      deps.readRevision = vi.fn(async () => head);
+      deps.readFile = vi.fn(async () => {
+        if (phase === "reads") head = "b".repeat(40);
+        return "---\nmodel: carried\n---";
+      });
+      deps.inspectReadiness = async () => {
+        if (phase === "readiness") head = "b".repeat(40);
+        return { status: "ready", profiles: [] };
+      };
+      expect((await run(deps, dryRun))[0].outcome).toBe("inputs_changed");
+      expect(deps.readFile).toHaveBeenCalledTimes(3);
+      for (const path of [".ai-implement/config.yml", "WORKFLOW.md", "PLANNING.md"]) {
+        expect(deps.readFile).toHaveBeenCalledWith(expect.anything(), path, "a".repeat(40));
+      }
+      expect(write).not.toHaveBeenCalled();
+    });
+    it.each(["missing", "throws", "malformed"])("refuses a %s final revision without leaking remote details", async failure => {
+      const { deps, write } = fixture({ "WORKFLOW.md": "---\nmodel: carried\n---" });
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      deps.readRevision = vi.fn().mockResolvedValueOnce("a".repeat(40)).mockImplementation(async () => {
+        if (failure === "throws") throw Error("secret-token remote body");
+        return failure === "missing" ? null : "secret-token";
+      });
+      try {
+        const results = await run(deps, dryRun);
+        expect(results[0].outcome).toBe(failure === "missing" ? "inputs_changed" : "repository_unavailable");
+        expect(results[0].modelNotCarried).toBe(false);
+        expect(JSON.stringify(results)).not.toContain("secret-token");
+        expect(log).not.toHaveBeenCalled();
+        expect(write).not.toHaveBeenCalled();
+      } finally { log.mockRestore(); }
+    });
+    it("revalidates synchronous inputs after the final awaited revision read", async () => {
+      const { deps, write } = fixture();
+      let reads = 0;
+      deps.readRevision = async () => {
+        if (++reads === 2) deps.fingerprint = () => "changed";
+        return "a".repeat(40);
+      };
+      expect((await run(deps, dryRun))[0].outcome).toBe("inputs_changed");
+      expect(write).not.toHaveBeenCalled();
+    });
+  });
   it("aborts before touching projects without configured defaults", async () => {
     const { deps, write } = fixture();
     deps.getDefaults = () => null;
@@ -162,7 +210,7 @@ describe("project adoption", () => {
         const gate = new Promise<void>(resolve => { release = resolve; });
         const readFile = deps.readFile;
         if (phase === "reads") {
-          deps.readFile = async (mapping, path) => { started(); await gate; return readFile(mapping, path); };
+          deps.readFile = async (mapping, path, revision) => { started(); await gate; return readFile(mapping, path, revision); };
         } else {
           deps.inspectReadiness = async () => { started(); await gate; return { status: "ready", profiles: [] }; };
         }
@@ -183,9 +231,9 @@ describe("project adoption", () => {
     });
     github.install();
     const { deps } = fixture();
-    deps.readFile = (mapping, path) => getDefaultBranchFileText("test-token", mapping.owner, mapping.repo, path);
+    deps.readFile = (mapping, path, revision) => getDefaultBranchFileText("test-token", mapping.owner, mapping.repo, path, revision);
     expect((await run(deps))[0].stages.review).toEqual({ model: "repo-review", source: ".ai-implement/config.yml" });
-    expect(github.calls.every(call => !call.url.search)).toBe(true);
+    expect(github.calls.every(call => call.url.searchParams.get("ref") === "a".repeat(40))).toBe(true);
   });
   it("uses workflow fallback and independent planning front matter", async () => {
     const { deps, write } = fixture({ "WORKFLOW.md": "---\nmodel: workflow\n---", "PLANNING.md": "---\nmodel: planner\n---", ".ai-implement/config.yml": "models:\n  review: reviewer\n  implement: 42" });
@@ -205,6 +253,18 @@ describe("project adoption", () => {
     const [result] = await run(deps);
     expect(result.modelNotCarried).toBe(true);
     expect(result.outcome).toBe("adopted");
+    expect(write.mock.calls[0][1].stages).toEqual({});
+  });
+  it.each([null, "malformed", "throws"])("keeps initial unreadable-repository fallback (%s)", async revision => {
+    const { deps, write } = fixture();
+    deps.readRevision = async () => {
+      if (revision === "throws") throw Error("private detail");
+      return revision;
+    };
+    const [result] = await run(deps);
+    expect(result.modelNotCarried).toBe(true);
+    expect(result.outcome).toBe("adopted");
+    expect(deps.readFile).not.toHaveBeenCalled();
     expect(write.mock.calls[0][1].stages).toEqual({});
   });
   it.each([false, true])("refuses failed readiness (throws=%s)", async throws => {

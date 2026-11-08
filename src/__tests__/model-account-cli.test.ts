@@ -552,15 +552,21 @@ describe("adopt-projects CLI", () => {
       "WORKFLOW.md": "---\nmodel: branch-implementation\n---\n",
       "PLANNING.md": "---\nmodel: branch-planning\n---\n",
     };
-    const github = fakeFetch(Object.fromEntries(Object.entries(files).map(([path, content]) => [
+    const github = fakeFetch({ "GET /repos/owner/repo/git/ref/heads/release/models": { json: { object: { sha: "a".repeat(40) } } }, ...Object.fromEntries(Object.entries(files).map(([path, content]) => [
       `GET /repos/owner/repo/contents/${path}`,
-      ({ url }: import("./helpers/fake-fetch.js").FetchCall) => ({ json: { type: "file", encoding: "base64", content: Buffer.from(url.searchParams.get("ref") === "release/models" ? content : "---\nmodel: github-default-model\n---\n").toString("base64") } }),
-    ]))).install();
+      ({ url }: import("./helpers/fake-fetch.js").FetchCall) => ({ json: { type: "file", encoding: "base64", content: Buffer.from(url.searchParams.get("ref") === "a".repeat(40) ? content : "---\nmodel: github-default-model\n---\n").toString("base64") } }),
+    ])) }).install();
     try {
       expect(await cli.main(["adopt-projects", "--project", "A"], deps(""))).toBe(0);
       expect(err).toEqual([]);
-      expect(github.calls).toHaveLength(3);
-      expect(github.calls.every(call => call.url.searchParams.get("ref") === "release/models")).toBe(true);
+      expect(github.calls).toHaveLength(5);
+      const revisions = github.calls.filter(call => call.url.pathname.includes("/git/ref/heads/"));
+      expect(revisions.map(call => call.url.pathname)).toEqual(Array(2).fill("/repos/owner/repo/git/ref/heads/release/models"));
+      const contents = github.calls.filter(call => call.url.pathname.includes("/contents/"));
+      expect(contents).toHaveLength(3);
+      expect(contents.every(call => call.url.searchParams.get("ref") === "a".repeat(40))).toBe(true);
+      expect(github.calls[0]).toBe(revisions[0]);
+      expect(github.calls[4]).toBe(revisions[1]);
       expect(accounts.getProjectStageConfig("A")?.config.stages).toEqual({
         planning: { model: "branch-planning" }, implementation: { model: "branch-implementation" }, review: { model: "branch-review" },
       });
@@ -579,6 +585,7 @@ describe("adopt-projects CLI", () => {
       getProject: () => null,
       fingerprint: () => "unchanged",
       runnerMode: () => "default",
+      readRevision: async () => "a".repeat(40),
       readFile: async (_mapping, path) => path === ".ai-implement/config.yml" ? "models:\n  review: reviewer" : null,
       inspectReadiness: async () => ({ status: "ready", profiles: [] }),
       write,
