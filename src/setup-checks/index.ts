@@ -6,6 +6,7 @@
  * `orchestrator-config.ts` holds the orchestrator's own environment and settings checks.
  */
 
+import { getOrchestratorDefaults, getProjectStageConfig } from "../agent-config-store.js";
 import { statSync } from "node:fs";
 import { isAllowlistReadAvailable, getEffectiveAllowlist, listAccessEntries, type AccessEntry, type EffectiveAllowlist } from "../access-entries.js";
 import { getMappings, type RepoMapping } from "../config.js";
@@ -31,6 +32,7 @@ export const SETUP_CHECK_IDS = [
   "env.runner-mode",
   "env.poll-interval",
   "env.breaker-threshold",
+  "model.credentials-adopted",
   "settings.seeded",
   "settings.env-override",
   "settings.allowlist-env",
@@ -99,6 +101,8 @@ export interface SetupCheckContext {
   env: Readonly<Record<string, string | undefined>>;
   /** A raw `settings` row, or null when none exists. */
   readSetting(key: string): string | null;
+  orchestratorDefaults(): ReturnType<typeof getOrchestratorDefaults>;
+  projectStageConfig(key: string): ReturnType<typeof getProjectStageConfig>;
   runnerMode(): RunnerModeStatus;
   flySessions(): FlySessionsConfig;
   mappings(): Record<string, RepoMapping>;
@@ -131,6 +135,8 @@ export function createSetupCheckContext(
     // A database error throws, so the check reports cannot-verify instead of reading a missing row.
     readSetting: (key) =>
       (getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined)?.value ?? null,
+    orchestratorDefaults: getOrchestratorDefaults,
+    projectStageConfig: getProjectStageConfig,
     runnerMode: getRunnerMode,
     flySessions: getFlySessionsConfig,
     mappings: getMappings,

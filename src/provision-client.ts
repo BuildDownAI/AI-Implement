@@ -197,6 +197,8 @@ function envOnlyContext(env: Record<string, string>): SetupCheckContext {
   return {
     env,
     readSetting: unavailable,
+    orchestratorDefaults: unavailable,
+    projectStageConfig: unavailable,
     runnerMode: unavailable,
     flySessions: unavailable,
     mappings: unavailable,
