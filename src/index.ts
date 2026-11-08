@@ -100,7 +100,7 @@ import { initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations, resolvePrMapping } from "./reconcile-merged.js";
 import { resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, getStepsByJobId, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings, getRunnerBackendSource, getFlySessionsConfig, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getRetryPolicy, seedRunnerBackends, refreshRunnerBackendCache } from "./orchestrator-settings.js";
 import { seedSettingsFromEnv } from "./seed-once-settings.js";
 import { handleRunnerReviewPublication, createReviewPublicationIngressClient, handleRunnerPlanningContext, handleRunnerProgress, handleRunnerCycleSummary, handleRunnerResult, resubmitPendingGapFillReviews, ReviewFixIntakeUnavailableError, handleRunnerActivity, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import { CYCLE_SUMMARY_MAX_BYTES } from "./pipeline/cycle-summary.js";
@@ -179,7 +179,7 @@ import { createProductionTrackerExportServices, createTrackerExportIngressClient
 import { MAX_PUBLICATION_BYTES, createPostPushReviewPublication, createProductionPostPushReviewPublicationDependencies } from "./restate/post-push-review-publication.js";
 import { createLateExternalReviewIngressClient, createLateExternalReviewSubmitHook, createProductionLateExternalReviewServices } from "./restate/late-external-review.js";
 import { getRestateStatus, restateCanServe, setRestateStatus } from "./restate/status.js";
-import type { RestateRegistrationStatus } from "./restate/status.js";
+import type { RestateStatus, RestateRegistrationStatus } from "./restate/status.js";
 import { setAdmissionTerminationCheck, setProviderRegistry, setReviewFixAttemptsFacade } from "./restate/tools.js";
 import { callTool, callToolAsSystem } from "./restate/tools-client.js";
 import { makeKgRefresh, migrateLegacyDryRunOutcomes, runKgRefreshPreflight, defaultFetchDefaultBranch, defaultFetchSnapshotCommitSha, defaultMaterialize, defaultMcpToolCall, defaultPersistLastRefresh, defaultLoadLastRefresh } from "./kg-refresh.js";
@@ -471,7 +471,6 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   console.log(`[poll] Starting poll cycle #${cycleId}`);
 
   const timeoutMs = config.pollCycleTimeoutMs;
-
   await refreshRunnerBackendCache();
   // Outside the cycle deadline: the check has its own timeout and never throws. Only bound when the KG composition exists.
   if (kgScheduleBound) {
@@ -4940,36 +4939,6 @@ export interface RestateEndpointWireDeps {
   onRegistered?: () => Promise<void>;
 }
 
-/**
- * Boot-time machine reconciliation must list the app saved in `RunnerBackend/fly-machines`, not the
- * env-then-row fallback. `atBoot()` runs it when the cache already came from Restate; otherwise it
- * defers to `onRegistered()` (after that hook's cache refresh), which runs it at most once.
- */
-export function createBootReconciliation(
-  reconcile: () => Promise<void>,
-  source: () => "restate" | "fallback",
-) {
-  let deferred = false;
-  let done = false;
-  async function run(path: string): Promise<void> {
-    if (done) return;
-    done = true;
-    console.log(`[main] Startup reconciliation running from ${path}`);
-    await reconcile();
-  }
-  return {
-    async atBoot(): Promise<void> {
-      if (source() === "restate") return run("main (runner backend loaded from Restate)");
-      deferred = true;
-      console.log("[main] Runner backend cache is on the fallback; startup reconciliation deferred to Restate registration");
-    },
-    async onRegistered(): Promise<void> {
-      if (!deferred) return;
-      await run("onRegistered (after runner backend refresh)");
-    },
-  };
-}
-
 /** Recover legacy/crashed deploys only after this boot has successfully registered with Restate. */
 export async function releaseUnownedDeployHoldAtBoot(
   client: Pick<SelfDeployClient, "releaseUnownedHold"> = selfDeployClient,
@@ -4991,17 +4960,13 @@ export async function onRestateRegistered(deps: {
   scrub: () => Promise<void>;
   seed: () => Promise<void>;
   refresh: () => Promise<void>;
-  reconcile: () => Promise<void>;
 }): Promise<void> {
-  if (getRestateStatus().registration.state === "registered") {
-    await (deps.releaseHold ?? releaseUnownedDeployHoldAtBoot)();
-    await (deps.armPrices ?? armModelPricesSchedule)();
-  }
+  await (deps.releaseHold ?? releaseUnownedDeployHoldAtBoot)();
+  await (deps.armPrices ?? armModelPricesSchedule)();
   deps.sweep();
   await deps.scrub();
   await deps.seed();
   await deps.refresh();
-  await deps.reconcile();
 }
 
 /** How often a declined registration retries (AII-721) — the old deployment's non-completed invocations are expected to drain on their own; this just keeps checking back. */
@@ -5038,6 +5003,8 @@ export function createRestateRegistrationGate(
   isShuttingDown: () => boolean,
   deps: RestateEndpointWireDeps = { startRestateEndpoint, registerRestateEndpoint },
 ) {
+  let settle!: (result: RestateGateResult) => void;
+  const settled = new Promise<RestateGateResult>(resolve => { settle = resolve; });
   let attempted = false;
   let retryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -5049,6 +5016,7 @@ export function createRestateRegistrationGate(
   }
 
   async function attemptRegistration(label: string): Promise<void> {
+    let hookStarted = false;
     try {
       const result = await deps.registerRestateEndpoint();
       if (isShuttingDown()) return;
@@ -5063,16 +5031,25 @@ export function createRestateRegistrationGate(
         }
       } else {
         clearRetry();
-        await deps.onRegistered?.();
+        if (result.outcome === "unreachable") {
+          settle("unreachable");
+        } else {
+          hookStarted = true;
+          await deps.onRegistered?.();
+          settle("serving");
+        }
       }
     } catch (err) {
       if (isShuttingDown()) return;
       setRestateStatus({ registration: { state: "unreachable" } });
+      clearRetry();
+      settle(hookStarted ? "hook-failed" : "unreachable");
       console.error(`[restate] ${label} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   return {
+    whenSettled: () => settled,
     async attempt(): Promise<void> {
       if (attempted || isShuttingDown()) return;
       attempted = true;
@@ -5085,6 +5062,7 @@ export function createRestateRegistrationGate(
       } catch (err) {
         if (isShuttingDown()) return;
         setRestateStatus({ registration: { state: "unreachable" } });
+        settle("unreachable");
         console.error(`[restate] SDK endpoint failed to start: ${err instanceof Error ? err.message : String(err)}`);
       }
     },
@@ -5095,12 +5073,129 @@ export function createRestateRegistrationGate(
   };
 }
 
+export const RESTATE_BOOT_DEADLINE_MS = 5 * 60_000;
+export type RestateGateResult = "serving" | "unreachable" | "hook-failed";
+
+/** Wait for the registration hook as well as readiness; conflicts may drain beyond the deadline. */
+export async function waitForRestateServing(deps: {
+  status: () => RestateStatus;
+  gate: { whenSettled(): Promise<RestateGateResult> };
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  deadlineMs?: number;
+  isShuttingDown?: () => boolean;
+}): Promise<RestateGateResult | "deadline" | "missing-binary" | "exited" | "shutdown"> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const deadline = now() + (deps.deadlineMs ?? RESTATE_BOOT_DEADLINE_MS);
+  let settled: RestateGateResult | undefined;
+  void deps.gate.whenSettled().then(result => { settled = result; });
+  for (;;) {
+    if (deps.isShuttingDown?.()) return "shutdown";
+    const status = deps.status();
+    if (status.sidecar.state === "missing-binary" || status.sidecar.state === "exited") return status.sidecar.state;
+    if (settled === "hook-failed" || settled === "unreachable") return settled;
+    if (status.sidecar.state === "ready" && settled === "serving") return "serving";
+    if (status.registration.state !== "declined-conflict" && now() >= deadline) return "deadline";
+    await sleep(50);
+  }
+}
+
 /** For testing: stops both sidecars concurrently rather than one after the other, so neither's stopTimeoutMs adds to the other's inside the shutdown budget. */
 export async function stopSidecarsConcurrently(
   sidecar: { stop(): Promise<void> },
   restateSidecar: { stop(): Promise<void> },
 ): Promise<void> {
   await Promise.all([sidecar.stop(), restateSidecar.stop()]);
+}
+
+/** Shared shutdown path for signals and fatal Restate boot outcomes. */
+export function createMainShutdown(deps: {
+  isShuttingDown: () => boolean;
+  markShuttingDown: () => void;
+  stopPolling: () => void;
+  stopRetrying: () => void;
+  recordShutdown: () => void;
+  postShutdownNotice: () => Promise<void>;
+  stopSidecars: () => Promise<void>;
+  closeServer: (done: () => void) => void;
+  closeDb: () => void;
+  exit: (code: number) => void;
+}) {
+  const SHUTDOWN_BUDGET_MS = 10_000;
+  return async (reason: string, exitCode = 0): Promise<void> => {
+    if (deps.isShuttingDown()) {
+      console.log(`[main] Received ${reason} while already shutting down; ignoring`);
+      return;
+    }
+    deps.markShuttingDown();
+    if (exitCode === 0) console.log(`[main] Received ${reason}, shutting down...`);
+    deps.stopPolling();
+    deps.stopRetrying();
+
+    // Arm before awaiting: a hanging notice, child, or HTTP connection cannot prevent exit.
+    const forcedExit = setTimeout(() => {
+      console.error(`[main] Forced shutdown after timeout`);
+      deps.closeDb();
+      deps.exit(1);
+    }, SHUTDOWN_BUDGET_MS);
+    forcedExit.unref();
+
+    if (exitCode === 0) {
+      deps.recordShutdown();
+      await Promise.race([
+        deps.postShutdownNotice(),
+        new Promise(resolve => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
+      ]);
+    }
+    await deps.stopSidecars();
+    deps.closeServer(() => {
+      clearTimeout(forcedExit);
+      deps.closeDb();
+      console.log(`[main] Shutdown complete`);
+      deps.exit(exitCode);
+    });
+  };
+}
+
+/** The production boot sequence, with effects injected for ordering and shutdown tests. */
+export async function runMainBoot(deps: {
+  registerSignal: (signal: "SIGTERM" | "SIGINT", handler: () => void) => void;
+  startServer: () => void;
+  wait: () => ReturnType<typeof waitForRestateServing>;
+  isShuttingDown: () => boolean;
+  shutdown: (reason: string, exitCode?: number) => Promise<void>;
+  logFly: () => void;
+  refreshCache: () => Promise<void>;
+  reconcile: () => Promise<void>;
+  postBootNotice: () => void;
+  poll: () => Promise<void>;
+  startInterval: () => void;
+  now?: () => number;
+}): Promise<void> {
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    deps.registerSignal(signal, () => { void deps.shutdown(signal); });
+  }
+  deps.startServer();
+  const now = deps.now ?? Date.now;
+  const started = now();
+  const result = await deps.wait();
+  if (deps.isShuttingDown() || result === "shutdown") return;
+  if (result !== "serving") {
+    console.error(`[main] Restate boot failed: ${result}`);
+    await deps.shutdown(`Restate ${result}`, 1);
+    return;
+  }
+  console.log(`[main] Restate serving after ${now() - started} ms`);
+  deps.logFly();
+  await deps.refreshCache();
+  if (deps.isShuttingDown()) return;
+  await deps.reconcile();
+  if (deps.isShuttingDown()) return;
+  deps.postBootNotice();
+  await deps.poll();
+  if (deps.isShuttingDown()) return;
+  deps.startInterval();
 }
 
 // ---------- Main ----------
@@ -5141,10 +5236,7 @@ async function main(): Promise<void> {
   const sidecar = new KgSidecar();
   await sidecar.start();
 
-  // Restate sidecar (AII-627, ADR 023): a second child process, started the same way and
-  // just as non-fatal on failure. A missing binary, an early exit, or a failed registration
-  // logs one warning and boot continues; the kg-refresh trigger seam (AII-683) answers 503
-  // restate-unavailable while no successful registration has completed.
+  // Restate is required: HTTP routes open below, but dispatch waits for registration and its hook.
   const restateSidecar = new RestateSidecar();
   await restateSidecar.start();
 
@@ -5302,22 +5394,17 @@ async function main(): Promise<void> {
     // Only the notification/outcome copy carries diagnostic text; the durable record stays stable.
     onOutcome: createSelfDeployOutcomeHandler(config),
   })];
-  const bootReconciliation = createBootReconciliation(
-    () => startupReconciliation(config, registry),
-    () => getRunnerBackendSource(),
-  );
   const hydrateSetupChecks = createSetupChecksHydration();
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
-      if (getRestateStatus().registration.state === "registered") await hydrateSetupChecks();
+      await hydrateSetupChecks();
       await onRestateRegistered({
         sweep: () => sweepOnRegistered(config),
         scrub: async () => { await scrubOperatorLegacyTokens(); },
         seed: seedRunnerBackends,
         refresh: refreshRunnerBackendCache,
-        reconcile: () => bootReconciliation.onRegistered(),
       });
     },
   });
@@ -5354,82 +5441,56 @@ async function main(): Promise<void> {
     console.log(`[main] Local Docker runner image: ${config.localRunnerImage}`);
   }
 
-  // Check if Fly config is needed
-  const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");
-  if (hasFlyMappings) {
-    if (!config.flySessionsToken || !config.flySessionsApp) {
-      console.warn("[main] WARNING: fly-machines mappings exist but FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP is not set");
-    } else {
-      console.log(`[main] Fly sessions app: ${config.flySessionsApp}`);
-      console.log(`[main] Session image: ${config.sessionImage}`);
-    }
-  }
+  let interval: ReturnType<typeof setInterval> | null = null;
 
-  const server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic);
+  const shutdown = createMainShutdown({
+    isShuttingDown: () => shuttingDown,
+    markShuttingDown: () => { shuttingDown = true; },
+    stopPolling: () => { if (interval !== null) clearInterval(interval); },
+    stopRetrying: () => restateRegistration.stopRetrying(),
+    recordShutdown,
+    postShutdownNotice: () => postShutdownNotice(config),
+    stopSidecars: () => stopSidecarsConcurrently(sidecar, restateSidecar),
+    closeServer: done => { server.close(done); },
+    closeDb,
+    exit: code => { process.exit(code); },
+  });
 
-  // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
-  // Every write postBootNotice makes — LAST_IMAGE_REF_KEY and LAST_SHUTDOWN_AT_KEY — happens
-  // synchronously before its first await, so nothing is lost if the webhook never answers. Keep it
-  // that way: a write moved below an await here stops persisting silently and misclassifies every later boot.
-  void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
-    ? { probe: remainingMs => probeWithTimeout(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
-    : undefined);
-
-  // Reconcile machines from any previous run before starting the poll loop
-  await refreshRunnerBackendCache();
-  await bootReconciliation.atBoot();
-
-  // Run first poll immediately
-  await poll(config, registry);
-
-  // Schedule subsequent polls
-  const interval = setInterval(() => {
-    poll(config, registry);
-  }, config.pollIntervalMs);
-
-  // total amount of time allotted for a graceful shutdown, otherwise the shutdown is forced
-  const SHUTDOWN_BUDGET_MS = 10_000; // 10s
-  // `shuttingDown` is declared at the top of main() (see comment there) so the Restate
-  // late-readiness continuation can read it too. The latch needs no reset: the forced-exit
-  // timer below is armed before any await, so the process always dies.
-  const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
-    if (shuttingDown) {
-      console.log(`[main] Received ${signal} while already shutting down; ignoring`);
-      return;
-    }
-    shuttingDown = true;
-    console.log(`[main] Received ${signal}, shutting down...`);
-    clearInterval(interval);
-    restateRegistration.stopRetrying();
-
-    // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
-    setTimeout(() => {
-      console.error(`[main] Forced shutdown after timeout`);
-      closeDb();
-      process.exit(1);
-    }, SHUTDOWN_BUDGET_MS).unref();
-
-    // Written before closeDb() so the next boot can measure how long we were gone.
-    recordShutdown();
-    await Promise.race([
-      postShutdownNotice(config),
-      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
-    ]);
-
-    // Concurrent: each sidecar's own stopTimeoutMs must not add to the other's inside the
-    // shutdown budget above (AII-807 — was sequential, which could exceed SHUTDOWN_BUDGET_MS
-    // and hit the forced-exit path instead of a clean shutdown).
-    await stopSidecarsConcurrently(sidecar, restateSidecar);
-
-    server.close(() => {
-      closeDb();
-      console.log(`[main] Shutdown complete`);
-      process.exit(0);
-    });
-  };
-
-  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
-  process.on("SIGINT", () => { void shutdown("SIGINT"); });
+  let server: ReturnType<typeof startServer>;
+  await runMainBoot({
+    registerSignal: (signal, handler) => { process.on(signal, handler); },
+    startServer: () => { server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic); },
+    wait: () => waitForRestateServing({
+      status: getRestateStatus,
+      gate: restateRegistration,
+      isShuttingDown: () => shuttingDown,
+    }),
+    isShuttingDown: () => shuttingDown,
+    shutdown,
+    logFly: () => {
+      // Check if Fly config is needed
+      const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");
+      if (hasFlyMappings) {
+        if (!config.flySessionsToken || !config.flySessionsApp) {
+          console.warn("[main] WARNING: fly-machines mappings exist but FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP is not set");
+        } else {
+          console.log(`[main] Fly sessions app: ${config.flySessionsApp}`);
+          console.log(`[main] Session image: ${config.sessionImage}`);
+        }
+      }
+    },
+    refreshCache: refreshRunnerBackendCache,
+    reconcile: () => startupReconciliation(config, registry),
+    // Notice settings writes happen synchronously before its first await.
+    // A hanging webhook must not delay the first poll.
+    postBootNotice: () => { void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
+      ? { probe: remainingMs => probeWithTimeout(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
+      : undefined); },
+    poll: () => poll(config, registry),
+    startInterval: () => {
+      interval = setInterval(() => { void poll(config, registry); }, config.pollIntervalMs);
+    },
+  });
 }
 
 // True only when this file is the process entrypoint (`tsx src/index.ts`, `node dist/index.js`).

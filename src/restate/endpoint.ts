@@ -231,8 +231,9 @@ export async function queryNonCompletedInvocations(
  * replacement with active invocations could strand their journals. The deploy
  * interlock normally drains them first; a caller that finds registration
  * declined should retry on a timer (createRestateRegistrationGate, src/index.ts).
- * Every path is logged once. Boot never fails on the result: the kg-refresh trigger seam
- * (AII-683) answers 503 restate-unavailable while no successful registration has completed.
+ * Every path is logged once. Boot waits for successful registration and its hook;
+ * unreachable is fatal, while declined conflicts retry. Per-call checks still answer
+ * 503 restate-unavailable during the boot wait and runtime transients.
  */
 export async function register(deps: RegisterDeps = {}): Promise<RestateRegisterResult> {
   const adminBaseUrl = deps.adminBaseUrl ?? RESTATE_ADMIN_BASE_URL;
