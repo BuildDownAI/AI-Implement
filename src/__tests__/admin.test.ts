@@ -6797,6 +6797,10 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const t = await seed();
       const store = modules.agentConfigStore;
       await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+        enabled: false, stages: { review: { model: "previous-model" } },
+      })).status).toBe(200);
+      const previousConfig = store.getProjectStageConfig("APP");
       const revs = count("stage_agent_config_revisions");
       const inspect = vi.fn(async () => ready
         ? { status: "ready", profiles: [] }
@@ -6813,7 +6817,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
         expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
       } else {
         expect(r.json.code).toBe("runner_incompatible");
-        expect(store.getProjectStageConfig("APP")).toBeNull();
+        expect(store.getProjectStageConfig("APP")).toEqual(previousConfig);
         expect(count("stage_agent_config_revisions")).toBe(revs);
       }
     });
