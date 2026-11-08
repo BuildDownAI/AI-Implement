@@ -1,3 +1,4 @@
+import { createImplementationGapfillDependencies } from "./implementation-run-gapfill.js";
 import { modelPricesResponseSchema } from "./model-prices.js";
 import type { RunModelPrices } from "../run-config.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -499,9 +500,11 @@ export function createProductionImplementationRunServices(input: ImplementationR
     return held;
   }
 
+  const gapfill = createImplementationGapfillDependencies(input, getMapping);
+  const findExistingRun = createImplementationFindExistingRun({ getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: config.flySessionsApp }) });
   const deps: ImplementationRunDependencies = {
-    reserve,
-    findExistingRun: createImplementationFindExistingRun({ getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: config.flySessionsApp }) }),
+    reserve: (run) => run.gapFill ? gapfill.reserve(run) : reserve(run),
+    findExistingRun: (run, at) => run.gapFill ? gapfill.findExistingRun(run, at) : findExistingRun(run, at),
     readModelPrices: async () => {
       const response = await fetch(`${RESTATE_INGRESS_BASE_URL}/ModelPrices/builddown/current`, { method: "POST", headers: { "content-type": "application/json" }, body: "null", signal: AbortSignal.timeout(1000) });
       if (!response.ok) return undefined;
@@ -510,7 +513,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       if (!parsed.success || (body.fetchedAt !== null && typeof body.fetchedAt !== "number")) return undefined;
       return { prices: parsed.data.prices, fetchedAt: body.fetchedAt };
     },
-    launch,
+    launch: (run, prices) => run.gapFill ? gapfill.launch(run, prices) : launch(run, prices),
     readStatus,
     stop,
     finishJob,

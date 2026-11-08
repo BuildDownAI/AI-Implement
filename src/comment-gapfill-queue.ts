@@ -61,6 +61,11 @@ export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number
   return row.id;
 }
 
+export function getCommentGapfillItem(id: number): CommentGapfillQueueItem | null {
+  const row = getDb().prepare("SELECT * FROM comment_gapfill_queue WHERE id = ?").get(id) as CommentGapfillQueueRow | undefined;
+  return row ? mapRow(row) : null;
+}
+
 export function claimPendingCommentGapfills(limit = 20): CommentGapfillQueueItem[] {
   const rows = getDb()
     .prepare("SELECT * FROM comment_gapfill_queue WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT ?")

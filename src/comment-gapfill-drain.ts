@@ -84,8 +84,8 @@ export function buildCommentGapfillInstruction(
 }
 
 /** Row fields for tracker kind and issue URL; a lookup failure never blocks the job row. */
-async function gapfillAccounting(
-  opts: DrainCommentGapfillsInput,
+export async function gapfillAccounting(
+  opts: Pick<DrainCommentGapfillsInput, "trackerAccounting">,
   mapping: RepoMapping,
   issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null },
 ): Promise<TrackerAccounting> {
@@ -148,8 +148,8 @@ function releaseGapfillAdmission(admission: GapfillAdmission): void {
  * touching the runtime. Any non-launch decision releases the admission, fails the item on `refuse`
  * (and leaves it pending otherwise), and resolves to null so the caller `continue`s.
  */
-async function resolveManagedDecision(
-  opts: DrainCommentGapfillsInput,
+export async function resolveManagedDecision(
+  opts: Pick<DrainCommentGapfillsInput, "modelAuthRuntime">,
   item: { id: number },
   req: { dispatchId: string; projectKey: string; backend: "local-docker" | "fly-machines" | "github-actions"; owner: string; repo: string; workflowFile: string },
   admission: GapfillAdmission,
