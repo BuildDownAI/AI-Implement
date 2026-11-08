@@ -24,6 +24,12 @@ The Fly sessions app and region were an env var, else a `settings` row, read by 
 
 **6. Outage rule: serve the last value read.** `getFlySessionsConfig()` stays synchronous and reads a process cache. `refreshRunnerBackendCache()` reads the object through the ingress client at boot and once per poll cycle (3 s timeout). On success it replaces the cache; on failure it keeps the last value and logs once per outage. Before the first successful read, and while the object is empty, the cache is not used and the old env-then-row rule applies, so a boot with Restate down still dispatches. The Settings page reports which applies: `restate` or `fallback`.
 
+## Amendment — 2026-11-08 (AII-1742): cache-only app and region
+
+Re-checking §6 under standing rule 3: its pre-read env-then-row rule existed so a boot with Restate down could still dispatch. AII-1741 now holds dispatch until the registration hook has seeded and refreshed, so that reason no longer holds. The pre-read rule is removed: app and region always come from the cache, initially null, and a successful empty-object read loads null values. Environment variables and legacy rows remain boot seed inputs only; a later variable applies through the seed only at a boot where the object is empty. The token remains env-only.
+
+The serve-last-value outage rule stays: a thrown read preserves the cache and logs once per outage, re-armed by any successful read, including null. Before any successful read the warning says `nothing loaded yet`. The source label remains `fallback` until a successful read and `restate` afterward, including an empty read. If a boot seed fails and the object remains empty after refresh, Fly dispatch skips until a boot seeds it; the seed failure log names this outcome.
+
 ## What GitHub Actions does not let us control
 
 The `github-actions` schema is empty because the orchestrator cannot set these through the dispatch: runner size (the repo's `AI_IMPLEMENT_RUNNER_LABEL` Actions variable picks `runs-on`), machine lifecycle (GitHub creates and destroys the runner), and anything beyond the 10 inputs a `workflow_dispatch` accepts. A future setting joins the schema only if the orchestrator can enforce it.
