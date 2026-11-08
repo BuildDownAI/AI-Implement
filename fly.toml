@@ -22,8 +22,8 @@ kill_timeout = 15
   destination = "/data"
 
 # Restart the machine when the orchestrator exits non-zero. Boot exits 1 when the
-# Restate sidecar cannot serve (ADR 023 amendment). Limit automatic restarts to
-# 10 in a row; proxy auto-start can still start the machine on incoming traffic.
+# Restate sidecar cannot serve (ADR 023 amendment); after 10 failed restarts in a
+# row the machine stays stopped, so a broken Restate is seen, not hidden by a loop.
 [[restart]]
   policy = "on-failure"
   retries = 10
