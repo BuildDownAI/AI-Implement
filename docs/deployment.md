@@ -362,12 +362,14 @@ To repair a degraded image, re-deploy with `--no-cache` and a working `--build-s
 
 ## The health body (`GET /`)
 
-`GET /` needs no authentication and always answers 200 while the process serves HTTP
-(`src/index.ts`). Monitors read it; it carries no secret.
+`GET /` needs no authentication and answers HTTP 200 with `status: "ok"` only when
+Restate is `ready` and `registered`; otherwise it answers HTTP 503 with
+`status: "unavailable"` (`src/index.ts`). Both responses retain every diagnostic
+body field. Monitors should read the diagnostic body even on 503; it carries no secret.
 
 | Field | Meaning |
 |---|---|
-| `status` | Always `"ok"` |
+| `status` | `"ok"` when Restate is `ready` and `registered`; otherwise `"unavailable"` |
 | `sourceCommit` | Full `AI_IMPLEMENT_SOURCE_COMMIT` build stamp, or `null` when unset |
 | `polls` | Poll cycles since boot |
 | `lastPollStartedAt`, `lastPollFinishedAt` | ISO times, or `null` before the first poll |
@@ -385,7 +387,8 @@ projects. An access code, complete SSO path with an admin address, or BuildDown
 with its redirect URL ends bootstrap mode; an unreadable allowlist also keeps it
 off. The count comes from the last known run, restored after Restate registration;
 bootstrap ids are checked locally on each request. `GET /` never calls Restate or
-any other network service, so it continues answering during their outages.
+any other network service, so it continues returning diagnostics during their
+outages, with HTTP 503 while Restate cannot serve.
 
 A healthy orchestrator shows `restate.sidecar.state: "ready"`,
 `restate.registration.state: "registered"`, and a recent `lastPollFinishedAt`.
