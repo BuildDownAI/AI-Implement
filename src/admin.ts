@@ -4014,7 +4014,14 @@ function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): Acco
   }
   view.failureCode = status.failure?.code ?? null;
   if (status.usable) {
-    view.readiness = "ready";
+    // Reference status does not inspect protected values. Row presence is safe
+    // metadata, not proof that the provider will accept the setup-token.
+    if (profile.authMode === "claude-subscription" && !credentialView(profile).credentialSet) {
+      view.readiness = "missing";
+      view.failureCode = "secret_unavailable";
+    } else {
+      view.readiness = "ready";
+    }
   } else if (status.failure?.code === "session_unavailable") {
     view.readiness = status.failure.category === "authentication_required" ? "sign-in required" : "refresh failed (transient)";
   } else if (status.failure?.code === "reference_missing" || status.referenceConfigured === false) {
@@ -4050,11 +4057,11 @@ function credentialView(p: AccountProfileProjection): { credentialSet: boolean; 
   }
 }
 
-const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key"];
+const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key", "claude-subscription"];
 
 const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   invalid_ref: "the reference is not a valid model-account reference",
-  invalid_value: "the value is not a valid API key",
+  invalid_value: "the value is not a valid credential",
   key_unavailable: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it",
   row_missing: "could not write the credential",
   decrypt_failed: "could not write the credential",
@@ -4143,7 +4150,7 @@ async function handleModelAccountCredential(
     return;
   }
   if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
-    json(res, 400, { error: "only openai-api-key and anthropic-api-key profiles take a browser credential" });
+    json(res, 400, { error: "only openai-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
     return;
   }
   const existingRef = lookupCredentialReference(profileId, head.revision);

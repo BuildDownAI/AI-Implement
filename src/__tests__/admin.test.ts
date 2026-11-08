@@ -6968,6 +6968,39 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(logs.join("\n")).not.toContain(KEY);
     });
 
+    it.each([undefined, "model-account:claude-token"])("saves, replaces and removes a Claude setup-token (ref: %s)", async (credentialRef) => {
+      const token = "sk-ant-oat01-synthetic-setup-token";
+      const t = await seedProfile({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef });
+      const ref = credentialRef ?? "model-account:cl-sub";
+      const deps = readyDeps();
+      const resolveSecret = vi.fn(() => { throw new Error("status must not read a secret"); });
+      deps.agentConfig!.credentials.resolveProtectedSecret = resolveSecret;
+      const read = async () => {
+        const r = await call("/api/model-accounts", "GET", t, undefined, deps);
+        expect(r.raw).not.toContain(token);
+        expect(r.raw).not.toContain(ref);
+        expect(resolveSecret).not.toHaveBeenCalled();
+        return r.json.accounts.find((a: { profileId: string }) => a.profileId === "cl-sub");
+      };
+      expect((await read()).credentialSet).toBe(false);
+      expect((await read()).account).toEqual({ readiness: "missing", failureCode: credentialRef ? "secret_unavailable" : "reference_missing" });
+      const revs = count("model_account_profile_revisions");
+      for (const value of [token, token + "-replacement"]) {
+        const put = await call(url("cl-sub"), "PUT", t, { apiKey: value });
+        expect(put.status).toBe(200);
+        expect(put.raw).not.toContain(token);
+        expect(store().resolve(ref)).toBe(value);
+        const row = await read();
+        expect(row.credentialSet).toBe(true);
+        expect(typeof row.credentialUpdatedAt).toBe("number");
+        expect(row.account.readiness).toBe("ready");
+      }
+      expect(count("model_account_profile_revisions")).toBe(revs + (credentialRef ? 0 : 1));
+      for (let i = 0; i < 2; i++) expect((await call(url("cl-sub"), "DELETE", t)).status).toBe(200);
+      expect(store().resolve(ref)).toBeNull();
+      expect(await read()).toMatchObject({ credentialSet: false, credentialUpdatedAt: null, account: { readiness: "missing", failureCode: "secret_unavailable" } });
+    });
+
     it("derives model-account:<id> and appends one revision for a profile without a ref", async () => {
       const t = adminTok();
       await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: undefined }));
