@@ -101,6 +101,9 @@ const SUCCESS_NO_RESULT_JOB_TIMEOUT_MINUTES = SUCCESS_NO_RESULT_DEADLINE_MS / 60
 // of requiring a real two-minute test. Only one scenario (the uncertain-launch
 // one) ever leaves the reconcile-empty-search loop running long enough to matter.
 const SHORT_UNKNOWN_LAUNCH_ALERT_MS = 1_000;
+// Leave a partial final backoff so the completion bound detects an uncapped sleep.
+const SHORT_UNKNOWN_LAUNCH_GRACE_MS = 6_500;
+const SHORT_POST_DEADLINE_RECONCILE_MS = 2_000;
 
 function sha(seed: string): string {
   return createHash("sha256").update(seed).digest("hex").slice(0, 40);
@@ -150,6 +153,7 @@ interface GithubFixture {
   dispatchImpl: (input: Parameters<ReviewFixWorkerTransport["dispatch"]>[0]) => ReturnType<ReviewFixWorkerTransport["dispatch"]>;
   dispatchCalls: number;
   listRunsVisible: boolean;
+  lookupTimes: number[];
   runId: number | null;
   runAttempt: number;
   runDetail: { status: string; conclusion: string | null; runAttempt: number } | null;
@@ -186,7 +190,7 @@ function freshScenario(prefix: string, opts: { cap?: number; budget?: number; pa
     pending: null, useProductionPending: false, incompleteLoads: [], windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
     reviewProcess: null, blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
     dispatchImpl: () => { throw new Error("unset"); },
-    dispatchCalls: 0, listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
+    dispatchCalls: 0, lookupTimes: [], listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
     cancelCalls: 0, cancelImpl: async () => true,
   };
   fixture.dispatchImpl = async () => {
@@ -305,6 +309,7 @@ const transport: ReviewFixWorkerTransport = {
     return fixture.dispatchImpl(input);
   },
   async listRuns(input) {
+    findFixture(`${input.owner}/${input.repo}`).lookupTimes.push(Date.now());
     return [...runIndex.entries()]
       .filter(([, fixture]) => fixture.listRunsVisible && fixture.attemptId !== null
         && fixture.scope.repository === `${input.owner}/${input.repo}`)
@@ -415,6 +420,8 @@ const pr = createReviewFixPR({
 const attemptWorkflow = createReviewFixAttempt({
   store: attemptStore, worker, finalizer, notifyPrOnCompletion: true,
   unknownLaunchAlertMs: SHORT_UNKNOWN_LAUNCH_ALERT_MS,
+  unknownLaunchGraceMs: SHORT_UNKNOWN_LAUNCH_GRACE_MS,
+  postDeadlineReconcileIntervalMs: SHORT_POST_DEADLINE_RECONCILE_MS,
   alert: async (attemptId, reason) => { alerts.push({ attemptId, reason }); },
   loadApprovalEvidence: async (attempt, _result) => {
     const currentPrHeadSha = (await github.getPrHeadSha(attempt.scope)) ?? "";
@@ -733,11 +740,11 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     expect(fixture.dispatchCalls).toBe(1);
   }, 25_000);
 
-  it.each(VARIANTS.map(([label]) => label))("an uncertain launch with an empty reconcile search retains occupancy past its deadline and never redispatches (%s)", async (label) => {
+  it.each(VARIANTS.map(([label]) => label))("an uncertain launch with an empty reconcile search ends, retains occupancy, and never redispatches (%s)", async (label) => {
     const env = envFor(label);
     const fixture = freshScenario("uncertain-launch");
     fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
-    fixture.dispatchImpl = async () => { throw new Error("network dropped before the accept/reject was observed"); };
+    fixture.dispatchImpl = async () => { fixture.dispatchCalls++; throw new Error("network dropped before the accept/reject was observed"); };
     fixture.listRunsVisible = false; // an exact reconcile search can never find this dispatch
     fixture.pending = { taskText: "Fix 1 finding version", findings: [{ findingKey: "f1", version: 1 }] };
     const before = alerts.length;
@@ -758,12 +765,76 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       Boolean,
       { timeoutMs: SHORT_DEADLINE_MS + 10_000, label: "the launch-identity-unresolved alert" },
     );
-    const active = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`).get(attemptId) as { released_at: number | null } | undefined;
-    expect(active?.released_at).toBeNull();
-    expect(fixture.dispatchCalls).toBe(0); // launch() never even recorded a successful attempt count here — dispatch always threw
+    await eventually(async () => {
+      const facade = createReviewFixAdminFacade(sqliteStore, { reconcile: async () => ({ status: "unknown" }) }, createReviewFixIngressClient(env.baseUrl()));
+      const view = await facade.getAttempt(attemptId, { role: "admin", email: "operator@example.com" });
+      return view.status === "ok" ? view.attempt.state : null;
+    }, (state) => state === "launch_unresolved", { timeoutMs: 12_000, label: "unknown launch completes" });
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
+    const completedAt = Date.now();
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const graceBoundary = prepared.deadlineAt + SHORT_UNKNOWN_LAUNCH_GRACE_MS;
+    expect(completedAt).toBeGreaterThanOrEqual(graceBoundary);
+    // Allow ingress/polling overhead, but less than the extra 1.5s an uncapped
+    // two-second sleep would add to the partial final backoff.
+    expect(completedAt).toBeLessThan(graceBoundary + 700);
+    const active = getDb().prepare(`SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?`)
+      .get(attemptId) as { released_at: number | null };
+    expect(active.released_at).toBeNull();
+    expect(fixture.dispatchCalls).toBe(1);
+    const preDeadline = fixture.lookupTimes.filter((time) => time < prepared.deadlineAt);
+    expect(preDeadline.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < preDeadline.length; i++) {
+      expect(preDeadline[i]! - preDeadline[i - 1]!).toBeGreaterThanOrEqual(900);
+      expect(preDeadline[i]! - preDeadline[i - 1]!).toBeLessThan(1_500);
+    }
+    const postDeadline = fixture.lookupTimes.filter((time) => time >= prepared.deadlineAt + 100);
+    expect(postDeadline.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < postDeadline.length; i++) {
+      expect(postDeadline[i]! - postDeadline[i - 1]!).toBeGreaterThanOrEqual(1_800);
+    }
+    const lookups = fixture.lookupTimes.length;
+    await settle(2_200);
+    expect(fixture.lookupTimes).toHaveLength(lookups);
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
+    const facade = createReviewFixAdminFacade(sqliteStore, { reconcile: async () => ({ status: "unknown" }) }, createReviewFixIngressClient(env.baseUrl()));
+    const view = await facade.getAttempt(attemptId, { role: "admin", email: "operator@example.com" });
+    expect(view).toMatchObject({ status: "ok", attempt: { state: "launch_unresolved", terminationConfirmed: false } });
+    expect(await sqliteStore.hasCurrentAuthority(attemptId)).toBe(false);
+    const outcomeBefore = await sqliteStore.getRecordedOutcome(attemptId);
+    const late = await callWorkflow<ResultIntakeOutcome>(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", {
+      version: 1, attemptId, ...prepared.scope, deadlineAt: prepared.deadlineAt,
+      githubRunId: 999_999, githubRunAttempt: 1, outputCommit: fixture.headSha,
+    });
+    expect(late.status).toBe("stale");
+    expect(await sqliteStore.getRecordedOutcome(attemptId)).toEqual(outcomeBefore);
+    expect(fixture.commentPosts).toBe(0);
     expect(alerts.slice(before).some((a) =>
       a.attemptId === attemptId && a.reason.includes("launch identity still unresolved"))).toBe(true);
   }, 30_000);
+
+  it.each(["cancel", "closed", "merged"] as const)("%s ends an unknown launch during its backed-off wait", async (event) => {
+    const env = envFor(VARIANTS[0]![0]);
+    const fixture = freshScenario(`unknown-${event}`);
+    fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
+    fixture.dispatchImpl = async () => { fixture.dispatchCalls++; throw new Error("lost launch response"); };
+    await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+    const attemptId = fixture.attemptId!;
+    await eventually(() => sqliteStore.hasCurrentAuthority(attemptId), (authority) => !authority,
+      { timeoutMs: 6_000, label: "deadline revokes unknown launch" });
+    if (event === "cancel") {
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+    } else {
+      fixture.open = false;
+      fixture.merged = event === "merged";
+      expect(await queueReviewFixCancellationForClosedPr(fixture.scope.repository, fixture.scope.prNumber,
+        createReviewFixIngressClient(env.baseUrl()))).toBe(true);
+    }
+    await eventually(async () => (await sqliteStore.getRecordedOutcome(attemptId))?.terminal.status,
+      (status) => status === "launch_unresolved", { timeoutMs: 1_500, label: "cancel interrupts backoff" });
+    expect(fixture.dispatchCalls).toBe(1);
+    expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
+  }, 15_000);
 
   it.each(VARIANTS.map(([label]) => label))("a definitively rejected launch records failure, releases capacity, and retains budget history (%s)", async (label) => {
     const env = envFor(label);
