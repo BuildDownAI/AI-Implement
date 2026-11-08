@@ -19,6 +19,7 @@ import { makeJob } from "../helpers/builders.js";
 import { finishImplementationJob } from "../../restate/implementation-run-finish.js";
 import {
   createImplementationRunWorkflow,
+  implementationRunInputSchema,
   type ImplementationFinishOutcome,
   type ImplementationLaunchResult,
   type ImplementationRunDependencies,
@@ -200,6 +201,44 @@ function seedUsage(dispatchId: string, tokens = 12, cost = 1, items = [1, 2]) {
 const storedRows = (dispatchId: string) => getDb().prepare(
   "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
 ).all(dispatchId);
+
+describe("ImplementationRun input schema", () => {
+  const input = {
+    dispatchId: "implementation-schema", teamKey: "ENG", issueId: "issue-schema", issueIdentifier: "ENG-1",
+    launchContext: {}, maxJobMinutes: 90, backend: "github-actions",
+  };
+  const gapFill = {
+    queueItemId: 1, repository: "owner/repo", installationId: "installation-1",
+    prNumber: 2, prDispatchBudget: 0, humanRequested: false,
+  };
+
+  it("preserves an input without gapFill and the launchContext default", () => {
+    const parsed = implementationRunInputSchema.parse(input);
+    expect(parsed).toEqual(input);
+    expect(parsed).not.toHaveProperty("gapFill");
+    const { launchContext: _launchContext, ...withoutLaunchContext } = input;
+    expect(implementationRunInputSchema.parse(withoutLaunchContext)).toEqual(input);
+  });
+
+  it("preserves all six gapFill fields, including zero budget and false humanRequested", () => {
+    expect(implementationRunInputSchema.parse({ ...input, gapFill })).toEqual({ ...input, gapFill });
+  });
+
+  it.each([
+    { extra: true },
+    { repository: "repo" }, { repository: "/repo" }, { repository: "owner/" }, { repository: "owner/repo/extra" },
+    { queueItemId: 0 }, { queueItemId: -1 }, { queueItemId: 1.5 },
+    { prNumber: 0 }, { prNumber: -1 }, { prNumber: 1.5 },
+    { prDispatchBudget: -1 }, { prDispatchBudget: 0.5 },
+    { installationId: "" }, { humanRequested: "false" },
+  ])("rejects an invalid gapFill part: %j", (invalid) => {
+    expect(implementationRunInputSchema.safeParse({ ...input, gapFill: { ...gapFill, ...invalid } }).success).toBe(false);
+  });
+
+  it("continues to reject extra outer keys", () => {
+    expect(implementationRunInputSchema.safeParse({ ...input, gapFill, extra: true }).success).toBe(false);
+  });
+});
 
 describe("ImplementationRun durable workflow", () => {
   let slow: Map<string, RestateEnvironment>;

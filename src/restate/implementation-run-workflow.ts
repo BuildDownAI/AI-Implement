@@ -54,6 +54,14 @@ export const implementationRunInputSchema = z.object({
    *  and read once at dispatch. The workflow never reads the setting: replay must see one value (ADR 045). */
   maxJobMinutes: z.number().int().positive(),
   backend: z.enum(["github-actions", "fly-machines", "local-docker"]),
+  gapFill: z.object({
+    queueItemId: z.number().int().positive(),
+    repository: z.string().regex(/^[^/]+\/[^/]+$/),
+    installationId: z.string().min(1),
+    prNumber: z.number().int().positive(),
+    prDispatchBudget: z.number().int().nonnegative(),
+    humanRequested: z.boolean(),
+  }).strict().optional(),
 }).strict();
 
 export type ImplementationRunInput = z.infer<typeof implementationRunInputSchema>;
