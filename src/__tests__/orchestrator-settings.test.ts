@@ -3,6 +3,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as SeedOnceSettingsModule from "../seed-once-settings.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import { testDb } from "./helpers/test-db.js";
+import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 
 let dedup: typeof DedupModule;
 let settings: typeof OrchestratorSettingsModule;
@@ -352,12 +353,79 @@ describe("RunnerBackend cache (AII-1243)", () => {
     expect(sendSeed).toHaveBeenCalledWith("github-actions", {}, "seed:runner-backend:github-actions");
   });
 
-  it("skips the fly-machines seed when nothing is configured, and survives a failed send", async () => {
-    const sendSeed = vi.fn(async (_backend: string, _state: Record<string, unknown>, _key: string) => undefined);
+  it("waits for each seed handler to finish in backend order", async () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    let resolveFly!: () => void;
+    let resolveGithub!: () => void;
+    const fly = new Promise<void>((resolve) => { resolveFly = resolve; });
+    const github = new Promise<void>((resolve) => { resolveGithub = resolve; });
+    const sendSeed = vi.fn((backend: string) => backend === "fly-machines" ? fly : github);
+    let completed = false;
+    const seeding = settings.seedRunnerBackends({ sendSeed }).then(() => { completed = true; });
+
+    await Promise.resolve();
+    expect(sendSeed.mock.calls).toEqual([["fly-machines", { app: "env-app", region: null }, "seed:runner-backend:fly-machines"]]);
+    expect(completed).toBe(false);
+
+    resolveFly();
+    await vi.waitFor(() => expect(sendSeed).toHaveBeenCalledTimes(2));
+    expect(sendSeed).toHaveBeenLastCalledWith("github-actions", {}, "seed:runner-backend:github-actions");
+    expect(completed).toBe(false);
+
+    resolveGithub();
+    await seeding;
+    expect(completed).toBe(true);
+  });
+
+  it.each([
+    ["FLY_SESSIONS_APP", { app: "configured", region: null }],
+    ["FLY_SESSIONS_REGION", { app: null, region: "configured" }],
+  ] as const)("seeds fly-machines when only %s is set", async (key, state) => {
+    process.env[key] = "configured";
+    const sendSeed = vi.fn(async () => undefined);
     await settings.seedRunnerBackends({ sendSeed });
-    expect(sendSeed.mock.calls.map((c) => c[0])).toEqual(["github-actions"]);
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
-    await expect(settings.seedRunnerBackends({ sendSeed: async () => { throw new Error("down"); } })).resolves.toBeUndefined();
+    expect(sendSeed).toHaveBeenCalledWith("fly-machines", state, "seed:runner-backend:fly-machines");
+    expect(sendSeed).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips the fly-machines seed when nothing is configured", async () => {
+    const sendSeed = vi.fn(async () => undefined);
+    await settings.seedRunnerBackends({ sendSeed });
+    expect(sendSeed.mock.calls).toEqual([["github-actions", {}, "seed:runner-backend:github-actions"]]);
+  });
+
+  it.each([false, true])("bounds the production seed wait and resolves on timeout (Fly configured: %s)", async (flyConfigured) => {
+    if (flyConfigured) process.env.FLY_SESSIONS_APP = "env-app";
+    const backend = flyConfigured ? "fly-machines" : "github-actions";
+    const timeout = stubAbortTimeout(3_000);
+    const api = fakeFetch({ [`POST /RunnerBackend/${backend}/seed`]: hangUntilAborted }).install();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const seeding = settings.seedRunnerBackends();
+    expect(timeout).toHaveBeenCalledExactlyOnceWith(3_000);
+    await expect(seeding).resolves.toBeUndefined();
+
+    expect(api.calls).toHaveLength(1);
+    expect(api.calls[0].headers.get("idempotency-key")).toBe(`seed:runner-backend:${backend}`);
+    expect(JSON.parse(api.calls[0].body)).toEqual(flyConfigured ? { app: "env-app", region: null } : {});
+    expect(api.calls[0].signal?.aborted).toBe(true);
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      "[runner-backend] could not seed RunnerBackend; the env vars and settings rows keep serving: The operation was aborted due to timeout",
+    );
+  });
+
+  it.each([false, true])("logs a failed seed once and resolves (Fly configured: %s)", async (flyConfigured) => {
+    if (flyConfigured) process.env.FLY_SESSIONS_APP = "env-app";
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sendSeed = vi.fn(async () => { throw new Error("down"); });
+    await expect(settings.seedRunnerBackends({ sendSeed })).resolves.toBeUndefined();
+    expect(sendSeed).toHaveBeenCalledTimes(1);
+    expect(sendSeed).toHaveBeenCalledWith(
+      flyConfigured ? "fly-machines" : "github-actions",
+      flyConfigured ? { app: "env-app", region: null } : {},
+      `seed:runner-backend:${flyConfigured ? "fly-machines" : "github-actions"}`,
+    );
+    expect(error).toHaveBeenCalledExactlyOnceWith("[runner-backend] could not seed RunnerBackend; the env vars and settings rows keep serving: down");
   });
 });
 
