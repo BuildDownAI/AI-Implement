@@ -125,14 +125,14 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
+      // KG uses env/run tokens, so exclude every app secret, regardless of the global kill switch.
+      flyProcessLevelSecrets: true,
+      teamSecretNames: [],
       cpuKind: input.machine.cpuKind,
       cpus: input.machine.cpus,
       memoryMb: input.machine.memoryMb,
       region: config.flySessionsRegion ?? undefined,
-      // KG runners receive no Fly app secrets, including the model protection key.
-      flyProcessLevelSecrets: true,
       teamKey: "kg-refresh",
-      teamSecretNames: [],
       purpose: "durable-runner",
       pipeline: "kg-refresh",
       dispatchId: input.dispatchId,
