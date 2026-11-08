@@ -3,6 +3,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as SeedOnceSettingsModule from "../seed-once-settings.js";
 import type * as OrchestratorSettingsModule from "../orchestrator-settings.js";
 import { testDb } from "./helpers/test-db.js";
+import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 
 let dedup: typeof DedupModule;
 let settings: typeof OrchestratorSettingsModule;
@@ -391,6 +392,26 @@ describe("RunnerBackend cache (AII-1243)", () => {
     const sendSeed = vi.fn(async () => undefined);
     await settings.seedRunnerBackends({ sendSeed });
     expect(sendSeed.mock.calls).toEqual([["github-actions", {}, "seed:runner-backend:github-actions"]]);
+  });
+
+  it.each([false, true])("bounds the production seed wait and resolves on timeout (Fly configured: %s)", async (flyConfigured) => {
+    if (flyConfigured) process.env.FLY_SESSIONS_APP = "env-app";
+    const backend = flyConfigured ? "fly-machines" : "github-actions";
+    const timeout = stubAbortTimeout(3_000);
+    const api = fakeFetch({ [`POST /RunnerBackend/${backend}/seed`]: hangUntilAborted }).install();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const seeding = settings.seedRunnerBackends();
+    expect(timeout).toHaveBeenCalledExactlyOnceWith(3_000);
+    await expect(seeding).resolves.toBeUndefined();
+
+    expect(api.calls).toHaveLength(1);
+    expect(api.calls[0].headers.get("idempotency-key")).toBe(`seed:runner-backend:${backend}`);
+    expect(JSON.parse(api.calls[0].body)).toEqual(flyConfigured ? { app: "env-app", region: null } : {});
+    expect(api.calls[0].signal?.aborted).toBe(true);
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      "[runner-backend] could not seed RunnerBackend; the env vars and settings rows keep serving: The operation was aborted due to timeout",
+    );
   });
 
   it.each([false, true])("logs a failed seed once and resolves (Fly configured: %s)", async (flyConfigured) => {

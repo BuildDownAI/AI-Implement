@@ -131,6 +131,9 @@ export function resetRunnerBackendCache(): void {
 /** Bounds the per-poll read so a down Restate cannot eat the poll cycle's budget. */
 const RUNNER_BACKEND_READ_TIMEOUT_MS = 3_000;
 
+/** Bounds the boot caller wait without cancelling the durable seed invocation. */
+const RUNNER_BACKEND_SEED_TIMEOUT_MS = 3_000;
+
 export interface RunnerBackendCacheDeps {
   /** Reads `RunnerBackend/fly-machines`; null when the object holds nothing. Throws when Restate is unreachable. */
   readFlyMachines?: () => Promise<{ app?: string | null; region?: string | null } | null>;
@@ -176,13 +179,14 @@ export interface RunnerBackendSeedDeps {
  * into `RunnerBackend/fly-machines`, and `{}` into `github-actions`. `seed` writes only when the object
  * is empty, so after the first boot the env vars and rows are inert. With nothing configured the
  * fly-machines seed is skipped, leaving the object empty so a later env var still applies via the
- * fallback. A failed call logs and returns; the next boot retries.
+ * fallback. Each call awaits handler completion with a 3-second caller timeout; a failure logs
+ * and returns so registration can continue. The durable seed is not cancelled; the next boot retries.
  */
 export async function seedRunnerBackends(deps: RunnerBackendSeedDeps = {}): Promise<void> {
   const sendSeed = deps.sendSeed ?? (async (backend, state, key) => {
     const ingress = restateClients.connect({ url: RESTATE_INGRESS_BASE_URL });
     await ingress.objectClient<RunnerBackendDefinition>({ name: "RunnerBackend" }, backend)
-      .seed(state, restateClients.rpc.opts({ idempotencyKey: key }));
+      .seed(state, restateClients.rpc.opts({ idempotencyKey: key, timeout: RUNNER_BACKEND_SEED_TIMEOUT_MS }));
   });
   const rows = getOrchestratorSettings();
   const app = process.env.FLY_SESSIONS_APP || rows.flySessionsApp || null;
