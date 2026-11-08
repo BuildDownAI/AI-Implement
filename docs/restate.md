@@ -196,7 +196,7 @@ Expect the ingress, admin, fabric, and SDK-endpoint ports (8081, 9070, 5122, 908
 
 `npm run dev` spawns the Restate sidecar the same way boot does, with its data directory under `./restate` (see `CLAUDE.md` § Running locally). `npm run dev:run`'s mounted-workspace harness does not start it — that path exercises one runner container against a target-repo checkout, not the orchestrator process.
 
-`restate-server` creates `<RESTATE_DATA_DIR>/<hostname>/ingress.sock`, `admin.sock`, and `fabric.sock`, and macOS caps a unix-socket path at 104 bytes. A checkout under a long path trips this at boot — `restate-server` exits with `RT0004 … failed binding on unix-socket file … path must be shorter than 104 bytes` — and the orchestrator logs the one `[restate]` warning and continues degraded, same as any other sidecar-start failure. On macOS, set `RESTATE_DATA_DIR` to a short path (for example `/tmp/restate-dev`) when the checkout path is long; the default `./restate` is fine for a checkout under `~/gitRepos/<repo>`.
+The sidecar automatically selects TCP listeners on macOS, regardless of checkout or data-directory path length, and on other platforms when the resolved absolute `<dataDir>/<hostname>/ingress.sock` path exceeds 100 UTF-8 bytes. Long checkout paths therefore need no `RESTATE_DATA_DIR` workaround. `RESTATE_DATA_DIR` still controls where the embedded store lives; see § "Boot sequence" for listen-mode selection and reason logging.
 
 ## The Operator object
 
