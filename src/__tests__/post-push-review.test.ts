@@ -311,23 +311,30 @@ describe("postPushReviewStep", () => {
     }
   });
 
-  it("pins today's legacy reviewer behavior when no reviewer selection is supplied (F6)", async () => {
-    const invoke = vi.fn(async () => structuredReviewResult({
-      approved: true, blocking_issues: [], score: 95, progress_delta: 100, feedback: "Legacy approval",
+  it("runs the default reviewers when no reviewer selection is supplied", async () => {
+    const invoke = vi.fn(async (_input: Parameters<LLMExecutor["invoke"]>[0]) => structuredReviewResult({
+      approved: true, findings: [], summary: "Default approval", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }],
     }));
     const report = vi.fn(async (_row: any) => undefined);
     const out = await runReview(makeCtx(invoke), {
       prNumber: "42", workspaceDir, maxIterations: 1, reviewProviders: [],
-      reviewers: undefined, // Deliberately bypass the production default until F6 removes the fallback.
+      reviewers: undefined, // Bypass the helper default to exercise the step fallback.
       ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
       gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
     }, { report });
     expect(out.approved).toBe(true);
-    expect(invoke).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      stage: "post-push-review/review-1",
-      jsonSchema: expect.objectContaining({ required: ["approved", "blocking_issues", "score", "progress_delta", "feedback"] }),
-    }));
-    expect(report).toHaveBeenCalledWith(expect.objectContaining({ id: "post-push-review.1", status: "passed" }));
+    expect(invoke.mock.calls.map(([input]) => input.stage)).toEqual([
+      "post-push-review/gap-analysis-review-1",
+      "post-push-review/code-review-review-1",
+    ]);
+    for (const [index, reviewer] of DEFAULT_REVIEWER_SELECTION.entries()) {
+      expect(report).toHaveBeenCalledWith(expect.objectContaining({
+        id: `post-push-review.1.reviewer.${index}.trusted.${reviewer.id}`,
+        status: "passed",
+        inputs: expect.objectContaining({ reviewerId: reviewer.id }),
+        outputs: expect.objectContaining({ summary: "Default approval" }),
+      }));
+    }
   });
 
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {
