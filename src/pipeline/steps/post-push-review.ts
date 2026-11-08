@@ -4,12 +4,12 @@ import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { ReviewerSelection } from "../../config.js";
+import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary, formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
-import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
+import type { ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
 import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
 import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
 import { summaryLine } from "../claude-stream.js";
@@ -51,7 +51,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   reviewProviders?: string[];
   /** Check-run names that identify the external review provider. Defaults to the Claude Code Review check. */
   reviewCheckNames?: string[];
-  /** Project reviewer selections from trusted run_config. Absent keeps direct-call legacy behavior. */
+  /** Project reviewer selections from trusted run_config. Absent uses DEFAULT_REVIEWER_SELECTION. */
   reviewers?: ReviewerSelection[];
   /** Project review process from trusted run_config: which check/app pairs, verdict reader, and authors gate the PR. */
   reviewProcess?: ReviewProcessId;
@@ -1258,7 +1258,6 @@ function addExtraCost(a: number | null, b: number | null | undefined): number | 
 interface SelectedReviewer {
   selection: ReviewerSelection;
   definition: ReviewerDefinition;
-  legacy?: boolean;
   optional?: boolean;
   provenance?: InternalReviewerProvenance;
 }
@@ -1273,7 +1272,6 @@ interface SelectedReviewerPassResult {
   feedback: string;
   findings: PostPushReviewLedgerFinding[];
   incompleteReviews: IncompleteReviewerResult[];
-  telemetry?: RunTelemetry;
   costUsd: number | null;
   failure?: FailureRecord;
   terminationReason?: PostPushReviewTerminationReason;
@@ -1590,13 +1588,11 @@ ${feedback}
 }
 
 function reviewerReportId(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
-  if (reviewer.legacy) return `post-push-review.${iteration}`;
   const id = reviewer.selection.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || "reviewer";
   return `post-push-review.${iteration}.reviewer.${reviewerIndex}.${reviewer.provenance ?? "trusted"}.${id}`;
 }
 
 function reviewerStage(iteration: number, reviewerIndex: number, reviewer: SelectedReviewer): string {
-  if (reviewer.legacy) return `post-push-review/review-${iteration}`;
   const id = reviewer.selection.id.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || "reviewer";
   if (reviewer.provenance === "branch") {
     return `post-push-review/branch-advisory-${reviewerIndex}-${id}-review-${iteration}`;
@@ -1627,23 +1623,11 @@ function reviewerGates(selection: ReviewerSelection, provenance?: InternalReview
 }
 
 function parsePartialReviewerVerdict(
-  legacy: boolean | undefined,
   value: unknown,
   schema: ReviewerDefinition["outputSchema"],
 ): ReviewerVerdict | null {
   if (value === undefined) return null;
   try {
-    if (legacy) {
-      const legacyVerdict = parseReviewVerdict(value);
-      return {
-        approved: false,
-        findings: legacyVerdict.blockingIssues.map((issue) => {
-          const reviewIssue = issueFromVerdictIssue(issue);
-          return { severity: "blocking", body: postPushIssueText(reviewIssue) };
-        }),
-        summary: legacyVerdict.feedback || "Partial legacy reviewer output was returned before the review completed.",
-      };
-    }
     return { ...parseReviewerDefinitionVerdict(value, schema), approved: false };
   } catch {
     return null;
@@ -1665,7 +1649,6 @@ async function runSelectedInternalReviewers(params: {
   const findings: PostPushReviewLedgerFinding[] = [];
   const feedbackParts: string[] = [];
   let approved = true;
-  let aggregateTelemetry: RunTelemetry | undefined;
   let costUsd: number | null = null;
   const incompleteReviews: IncompleteReviewerResult[] = [];
   let firstGatingFailure: FailureRecord | undefined;
@@ -1675,7 +1658,7 @@ async function runSelectedInternalReviewers(params: {
   const reviewSelection = params.context.data.agentConfig?.stages.review;
   const isTimeBudget = reviewSelection?.agent === "codex";
   for (const [reviewerIndex, reviewer] of params.reviewers.entries()) {
-    const { selection, definition, legacy, provenance } = reviewer;
+    const { selection, definition, provenance } = reviewer;
     const reviewerId = selection.id;
     const label = reviewerFeedbackLabel(reviewerId, provenance);
     const reportId = reviewerReportId(params.iteration, reviewerIndex, reviewer);
@@ -1684,9 +1667,7 @@ async function runSelectedInternalReviewers(params: {
     const reviewBudgetLabel = reviewSelection?.agent === "codex"
       ? safeLimitLabel({ kind: "timeout_ms", value: reviewSelection.invocationTimeoutMs })
       : `${maxTurns} turns`;
-    const reportInputs = legacy
-      ? { iteration: params.iteration, prNumber: params.prNumber, maxTurns }
-      : { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted", gates: reviewerGates(selection, provenance), maxTurns };
+    const reportInputs = { iteration: params.iteration, prNumber: params.prNumber, reviewerId, reviewerProvenance: provenance ?? "trusted", gates: reviewerGates(selection, provenance), maxTurns };
     const reportIncompleteFailure = async (
       feedback: string,
       telemetry?: RunTelemetry,
@@ -1810,7 +1791,6 @@ async function runSelectedInternalReviewers(params: {
     }
     if (invocationThrew) continue;
     costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
-    if (legacy) aggregateTelemetry = reviewResult.telemetry;
 
     if (reviewStageClassified && reviewStageClassified.category === "transient") {
       const failure = { ...reviewStageClassified, stage: "post-push-review", code: "PROVIDER_UNAVAILABLE" as const, retryable: false };
@@ -1831,7 +1811,7 @@ async function runSelectedInternalReviewers(params: {
         retryable: false,
         reviewMaxTurns: maxTurns,
       };
-      const partialVerdict = parsePartialReviewerVerdict(legacy, reviewResult.structuredOutput, definition.outputSchema);
+      const partialVerdict = parsePartialReviewerVerdict(reviewResult.structuredOutput, definition.outputSchema);
       const partialReport = partialVerdict
         ? `\n\n${reviewerEvidenceReport(label, partialVerdict, true)}`
         : "\n\nNo usable partial structured review evidence was returned before the cap.";
@@ -1862,77 +1842,49 @@ async function runSelectedInternalReviewers(params: {
     }
 
     if (reviewResult.structuredOutput === undefined) {
-      const feedback = compactErrorMessage(legacy
-        ? `The reviewer returned no result that AI-Implement can read. Reviewer output: ${reviewResult.stdout || "(empty stdout)"}`
-        : `The reviewer ${label} returned no result that AI-Implement can read. Reviewer output: ${reviewResult.stdout || "(empty stdout)"}`);
+      const feedback = compactErrorMessage(`The reviewer ${label} returned no result that AI-Implement can read. Reviewer output: ${reviewResult.stdout || "(empty stdout)"}`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
       await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
       continue;
     }
 
     let verdict: ReviewerVerdict;
-    let reviewerFeedback = "";
     try {
-      if (legacy) {
-        const legacyVerdict = parseReviewVerdict(reviewResult.structuredOutput);
-        reviewerFeedback = legacyVerdict.feedback;
-        const legacyFindings = legacyVerdict.blockingIssues.map((issue) => {
-          const reviewIssue = issueFromVerdictIssue(issue);
-          return {
-            source: "ai-implement-internal" as const,
-            reviewerId,
-            ...(provenance ? { reviewerProvenance: provenance } : {}),
-            severity: "blocking" as const,
-            body: postPushIssueText(reviewIssue),
-            issue: reviewIssue,
-          };
-        });
-        verdict = {
-          approved: legacyVerdict.approved,
-          findings: legacyFindings.map((finding) => ({ severity: finding.severity, body: finding.body })),
-        };
-        findings.push(...legacyFindings);
-      } else {
-        verdict = parseReviewerDefinitionVerdict(reviewResult.structuredOutput, definition.outputSchema);
-      }
+      verdict = parseReviewerDefinitionVerdict(reviewResult.structuredOutput, definition.outputSchema);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      const feedback = compactErrorMessage(legacy
-        ? `Reviewer returned invalid structured review output: ${reason}.`
-        : `Reviewer ${label} returned invalid structured review output: ${reason}.`);
+      const feedback = compactErrorMessage(`Reviewer ${label} returned invalid structured review output: ${reason}.`);
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
       await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
       continue;
     }
 
-    if (!legacy && verdict.findings.length === 0 && verdict.approved === false) {
+    if (verdict.findings.length === 0 && verdict.approved === false) {
       const feedback = `Reviewer ${label} returned approved=false without findings[].`;
       if (reviewerGates(selection, provenance) && !firstTerminationReason) firstTerminationReason = "invalid_review";
       await reportIncompleteFailure(feedback, reviewResult.telemetry, {}, reviewStartedAt, reviewEndedAt);
       continue;
     }
 
-    const reviewerFindings = legacy ? [] : verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding, provenance));
+    const reviewerFindings = verdict.findings.map((finding) => reviewerFindingToLedgerFinding(reviewerId, finding, provenance));
     findings.push(...reviewerFindings);
     if (selection.gates && provenance !== "branch") {
       // A minor-only negative verdict is advisory; an empty negative verdict still fails closed.
       approved = approved && (verdict.approved || verdict.findings.length > 0)
         && !verdict.findings.some((finding) => finding.severity !== "minor");
     }
-    feedbackParts.push(legacy && reviewerFeedback ? reviewerFeedback : reviewerEvidenceReport(label, verdict));
-    if (!legacy) {
-      await params.reporter.report({
-        id: reportId,
-        type: "custom",
-        status: "passed",
-        started_at: reviewStartedAt,
-        ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
-        inputs: reportInputs,
-        outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
-        logs_url: null,
-      });
-    }
+    feedbackParts.push(reviewerEvidenceReport(label, verdict));
+    await params.reporter.report({
+      id: reportId,
+      type: "custom",
+      status: "passed",
+      started_at: reviewStartedAt,
+      ended_at: reviewEndedAt,
+      parent_step_id: "post-push-review",
+      inputs: reportInputs,
+      outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
+      logs_url: null,
+    });
   }
 
   return {
@@ -1940,7 +1892,6 @@ async function runSelectedInternalReviewers(params: {
     feedback: feedbackParts.join("\n\n"),
     findings,
     incompleteReviews,
-    telemetry: aggregateTelemetry,
     costUsd,
     ...(firstGatingFailure ? { failure: firstGatingFailure } : {}),
     ...(firstTerminationReason ? { terminationReason: firstTerminationReason } : {}),
@@ -2101,20 +2052,18 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       inputs.trustedReviewerDefinitions,
       inputs.trustedConfigReviewerDefinitions,
     );
-    const configuredReviewerSelection = inputs.reviewers;
-    const selectedReviewerResolution = configuredReviewerSelection !== undefined
-      ? await resolveSelectedInternalReviewers(
-          configuredReviewerSelection,
-          inputs.trustedReviewerDefinitions,
-          configReviewerResolution.trustedDefinitions,
-          configReviewerResolution.branchDefinitions,
-        )
-      : null;
+    const configuredReviewerSelection = inputs.reviewers ?? DEFAULT_REVIEWER_SELECTION;
+    const selectedReviewerResolution = await resolveSelectedInternalReviewers(
+      configuredReviewerSelection,
+      inputs.trustedReviewerDefinitions,
+      configReviewerResolution.trustedDefinitions,
+      configReviewerResolution.branchDefinitions,
+    );
     // A non-default review process gates on its external verdict, so it may run with no internal reviewer.
     const reviewProcess = resolveReviewProcess(inputs.reviewProcess);
     const trustedReviewAuthors = inputs.trustedReviewAuthors ?? [];
-    const externalOnlyReview = reviewProcess.id !== "ai-implement" && configuredReviewerSelection?.length === 0;
-    if (configuredReviewerSelection?.length === 0 && !externalOnlyReview) {
+    const externalOnlyReview = reviewProcess.id !== "ai-implement" && configuredReviewerSelection.length === 0;
+    if (configuredReviewerSelection.length === 0 && !externalOnlyReview) {
       return reportReviewerSelectionFailure(
         reporter,
         ghSpawn,
@@ -2122,17 +2071,17 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         selectionFailureMessage("empty-selection"),
       );
     }
-    if (selectedReviewerResolution && selectedReviewerResolution.unresolvedIds.length > 0) {
+    if (selectedReviewerResolution.unresolvedIds.length > 0) {
       const message = selectionFailureMessage("unresolved", selectedReviewerResolution.unresolvedIds);
       console.warn(`[post-push-review] ${message}`);
       return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message);
     }
-    if (selectedReviewerResolution && selectedReviewerResolution.reviewers.length === 0 && !externalOnlyReview) {
+    if (selectedReviewerResolution.reviewers.length === 0 && !externalOnlyReview) {
       const message = selectionFailureMessage("empty-internal");
       console.warn(`[post-push-review] ${message}`);
       return reportReviewerSelectionFailure(reporter, ghSpawn, prNumber, message);
     }
-    const selectedInternalReviewers = selectedReviewerResolution?.reviewers ?? null;
+    const selectedInternalReviewers = selectedReviewerResolution.reviewers;
 
     while (iteration < maxIterations && !approved) {
       iteration++;
@@ -2144,71 +2093,13 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
 
       const previousFindings = formatReviewHistory(reviewHistory);
-      const legacyReviewPrompt = `You are reviewing the diff for PR #${prNumber} against issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.
-
-Set approved=true only when no code changes are needed. If you find any bug,
-missing requirement, unsafe behavior, test gap, or follow-up that should be
-fixed in this PR, set approved=false and put every actionable item in
-blocking_issues[].
-The orchestrator treats blocking_issues[] as the only internal blocking finding
-list; it will not infer blockers from feedback prose. If something must be
-fixed before merge, it must be present in blocking_issues[].
-Do not set approved=false for future/later-task concerns that are not required
-by this issue; mention those in feedback only.
-
-This is a complete merge-readiness review, not an incremental comment pass.
-Inspect the whole diff before deciding. Do not stop after the first issue.
-Before producing JSON, check requirements coverage, changed API/data contracts,
-error handling, security, regressions, edge cases, and test coverage.
-
-Every blocking_issues[] entry must be self-contained and immediately
-actionable. Use structured objects with title, location, problem, and
-required_fix fields. Include the affected file/function when possible, the
-failing behavior, and the required fix. Do not abbreviate or truncate issue
-details; do not use ellipses. Do not put praise, overall status, or
-optional/future cleanup in blocking_issues[]. Do not write feedback that
-refers to issues "above" unless those issues are explicitly listed in
-blocking_issues[].
-
-Use feedback for a short overall review summary that adds context not already
-present in blocking_issues[]. Do not repeat the blocking_issues[] text
-verbatim in feedback.
-
-On follow-up reviews, first verify every previous issue is fixed, then review
-the entire updated diff again for newly introduced or newly visible blockers.
-If a previous issue remains unresolved, keep it in blocking_issues[] with the
-current reason it is still blocking.
-
-Issue description:
-${context.data.issueDescription}
-
-Previous post-push review findings:
-${previousFindings}
-
-${DIFF_INJECTION_PREAMBLE}
-
-<pr_diff>
-${diffRes.stdout}
-</pr_diff>
-
-Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string", "location": "file/function; omit when unknown", "problem": "full failing behavior", "required_fix": "full required fix"}], "score": int, "progress_delta": int, "feedback": "string"}.`;
-
-      const primaryInternalReviewers = selectedInternalReviewers ?? [{
-        selection: { id: "legacy-post-push-review", gates: true },
-        definition: {
-          id: "legacy-post-push-review",
-          buildPrompt: () => legacyReviewPrompt,
-          outputSchema: REVIEW_VERDICT_JSON_SCHEMA,
-        },
-        legacy: true,
-      }];
       const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.branchDefinitions, selectedInternalReviewers);
       const activeInternalReviewers: SelectedReviewer[] = [
-        ...primaryInternalReviewers,
+        ...selectedInternalReviewers,
         ...advisoryConfigReviewers,
       ];
       const effectiveReviewerPolicy: ReviewerSelection[] = [
-        ...(configuredReviewerSelection ?? primaryInternalReviewers.map((reviewer) => reviewer.selection)),
+        ...configuredReviewerSelection,
         ...advisoryConfigReviewers.map((reviewer) => reviewer.selection),
       ];
       const selectedReviewerResult = await runSelectedInternalReviewers({
@@ -2237,7 +2128,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         stdout: "",
         exitCode: 0,
         tokensUsed: 0,
-        telemetry: selectedInternalReviewers ? undefined : selectedReviewerResult.telemetry,
+        telemetry: undefined,
       } as LLMResult;
 
       // The external review (e.g. Claude Code Review) runs concurrently and finishes
@@ -2250,7 +2141,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const filesystemWithoutExternalReviewer = context.data.issueId?.startsWith("filesystem:")
         && inputs.reviewProviders === undefined
         && !inputs.reviewCheckNames?.length
-        && !configuredReviewerSelection?.some((reviewer) => reviewer.id === CLAUDE_REVIEW_SUMMARY_ID);
+        && !configuredReviewerSelection.some((reviewer) => reviewer.id === CLAUDE_REVIEW_SUMMARY_ID);
       const externalReviewResult = gatingIncompleteReviews.length === 0 && !filesystemWithoutExternalReviewer && shouldCollectExternalReviewFindings(inputs.reviewProviders)
         ? await waitForExternalReviewCompletion(ghSpawn, prNumber, {
             sleep,

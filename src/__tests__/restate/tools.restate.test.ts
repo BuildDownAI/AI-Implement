@@ -673,9 +673,6 @@ describe("orchestratorTools (Restate)", () => {
       id: "fake",
       capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: true, ...capabilities },
       listTools: async () => [],
-      proxyCall: () => {
-        throw new Error("proxyCall is not used by the Restate handlers");
-      },
       callKgTool: async (name, args) => {
         calls.push({ name, args });
         return answer;
