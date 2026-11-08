@@ -277,9 +277,11 @@ export const settingsScript = `
           'Built-in: ' + (prefixes.builtIn || []).join(', ')
           + '  Extra: ' + ((prefixes.effective || []).join(', ') || 'none');
       }
-      const srcText = appInfo.runtimeValue
-        ? ('Active: ' + window.esc(appInfo.runtimeValue) + (data.runnerBackendSource === 'restate' ? ' (source: restate)' : ' (source: fallback \u2014 Restate not read yet; env var or DB row)'))
-        : 'Not configured — add a sessions app name to enable Fly dispatch';
+      const srcText = data.runnerBackendSource === 'not-loaded'
+        ? 'Restate has not answered yet'
+        : appInfo.runtimeValue
+          ? ('Active: ' + window.esc(appInfo.runtimeValue) + ' (source: restate)')
+          : 'Not configured — add a sessions app name to enable Fly dispatch';
       sourceEl.textContent = srcText;
       populateRetryPolicy(data.retryPolicy, data.retryPolicyDefaults);
     } catch (err) {
