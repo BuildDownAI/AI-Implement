@@ -125,6 +125,8 @@ function createDeferred<T>(): Deferred<T> {
 
 /** For testing: override internal I/O without touching the real filesystem, process table, or network. */
 interface RestateSidecarDeps {
+  platform?: NodeJS.Platform;
+  hostname?: string;
   httpGet?: (url: string) => Promise<boolean>;
   spawn?: (cmd: string, args: string[], opts: object) => ChildProcess;
   resolveBinary?: () => string | null;
@@ -167,6 +169,8 @@ export interface RestateSidecarOptions {
  */
 export class RestateSidecar {
   private readonly _dataDir: string;
+  private readonly _platform: NodeJS.Platform;
+  private readonly _hostname: string;
   private readonly _stopTimeoutMs: number;
   private readonly _pollTimeoutMs: number;
   private readonly _pollIntervalMs: number;
@@ -181,6 +185,8 @@ export class RestateSidecar {
 
   constructor(opts?: RestateSidecarOptions, _deps?: RestateSidecarDeps) {
     this._dataDir = opts?.dataDir ?? restateDataDir();
+    this._platform = _deps?.platform ?? process.platform;
+    this._hostname = _deps?.hostname ?? os.hostname();
     this._stopTimeoutMs = opts?.stopTimeoutMs ?? 5_000;
     this._pollTimeoutMs = opts?.pollTimeoutMs ?? 30_000;
     this._pollIntervalMs = opts?.pollIntervalMs ?? 1_000;
@@ -272,6 +278,14 @@ export class RestateSidecar {
       RESTATE_DEFAULT_NUM_PARTITIONS: RESTATE_DEFAULT_NUM_PARTITIONS,
       RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE,
     });
+    // Unix socket limits count bytes, including the absolute base dir and node hostname.
+    const socketPathBytes = Buffer.byteLength(path.join(path.resolve(this._dataDir), this._hostname, "ingress.sock"), "utf8");
+    const tcpReason = this._platform === "darwin" ? "darwin"
+      : socketPathBytes > 100 ? `socket path ${socketPathBytes} bytes` : undefined;
+    if (tcpReason) {
+      childEnv.RESTATE_LISTEN_MODE = "tcp";
+      console.error(`[restate] listen mode tcp (${tcpReason})`);
+    }
     // The address the UI playground calls (AII-1261, ADR 040). Unset leaves the loopback default for local dev.
     const publicBase = process.env.OAUTH_REDIRECT_BASE_URL?.trim().replace(/\/+$/, "");
     if (publicBase) childEnv.RESTATE_INGRESS__ADVERTISED_ADDRESS = `${publicBase}${RESTATE_UI_INGRESS_PREFIX}/`;

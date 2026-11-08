@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn as realSpawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
 import { getRestateStatus, resetRestateStatus, setRestateStatus } from "../restate/status.js";
 import { createRestateRegistrationGate, createBootReconciliation, stopSidecarsConcurrently, onRestateRegistered } from "../index.js";
@@ -163,6 +163,46 @@ describe("readiness polling", () => {
 // ---------------------------------------------------------------------------
 
 describe("spawn configuration", () => {
+  it.each([
+    ["darwin", 100, undefined, "darwin"],
+    ["darwin", 101, "unix", "darwin"],
+    ["linux", 100, undefined, undefined],
+    ["linux", 100, "tcp", undefined],
+    ["linux", 101, "unix", "length"],
+  ] as const)("selects listen mode on %s with a %i-byte socket path", async (platform, bytes, ambientMode, reason) => {
+    vi.stubEnv("TMPDIR", "/tmp");
+    const root = testDir("s");
+    const hostname = "test-host";
+    // Multibyte input distinguishes UTF-8 bytes from character count; pass a relative base dir.
+    const prefix = join(root, "é");
+    const padding = bytes - Buffer.byteLength(join(prefix, hostname, "ingress.sock"));
+    const dataDir = relative(process.cwd(), prefix + "x".repeat(padding));
+    expect(Buffer.byteLength(join(resolve(dataDir), hostname, "ingress.sock"))).toBe(bytes);
+    vi.stubEnv("RESTATE_LISTEN_MODE", ambientMode);
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const script = join(root, "fake-server.sh");
+    writeScript(script, "sleep 60");
+    const spawnSpy = vi.fn(testSpawn);
+    const sidecar = new RestateSidecar(
+      { dataDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { platform, hostname, httpGet: async () => true, spawn: spawnSpy, resolveBinary: () => script },
+    );
+    try {
+      await expect(sidecar.start()).resolves.toBe(true);
+      const opts = spawnSpy.mock.calls[0][2] as { env: NodeJS.ProcessEnv };
+      if (reason) expect(opts.env.RESTATE_LISTEN_MODE).toBe("tcp");
+      else if (ambientMode) expect(opts.env.RESTATE_LISTEN_MODE).toBe(ambientMode);
+      else expect(opts.env).not.toHaveProperty("RESTATE_LISTEN_MODE");
+      const lines = logs.mock.calls.map((args) => args.join(" ")).filter((line) => line.includes("listen mode"));
+      expect(lines).toEqual(reason ? [
+        `[restate] listen mode tcp (${reason === "darwin" ? "darwin" : `socket path ${bytes} bytes`})`,
+      ] : []);
+    } finally {
+      await sidecar.stop();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("binds ingress and admin listeners to 127.0.0.1 via env", async () => {
     const dataDir = testDir("restate-sidecar");
     const script = join(dataDir, "fake-server.sh");
