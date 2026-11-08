@@ -4428,16 +4428,6 @@ async function optInRefusal(projectKey: string, candidate: StageAgentConfigurati
     if (readiness.status === "ready") continue;
     const code = readiness.status === "not-ready" ? readiness.code : "resolution_failed";
     const templateCodes = ["runner_incompatible", "retired_workflow_present", "delivery_unreadable"];
-    if (backend === "github-actions" && code === "delivery_unreadable") {
-      return {
-        status: 409,
-        body: {
-          error: "GitHub Actions opt-in is not supported yet: managed credentials and workflow readiness for GitHub Actions dispatch are not available",
-          code: "unsupported_backend",
-          backend,
-        },
-      };
-    }
     return {
       status: 409,
       body: {
