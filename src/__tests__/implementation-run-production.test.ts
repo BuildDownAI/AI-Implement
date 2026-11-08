@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import { makeJob, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { makeLaunchDecision, makeSnapshot, SENTINEL_BEARER } from "./helpers/fixtures/configured-run.js";
 import { buildRunConfig } from "../run-config.js";
 
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
@@ -53,6 +54,8 @@ vi.mock("../managed-dispatch-auth.js", () => ({
   classifyLaunchError: vi.fn(),
 }));
 
+import { mintLaunchTokens } from "../runner-tokens.js";
+import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { acquireDispatch } from "../dispatch-gate.js";
 import { cancelWorkflowRun, getPullRequestState, getWorkflowRunStatus } from "../github.js";
 import { appendLogIfAbsent, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
@@ -152,7 +155,7 @@ describe("findExistingRun", () => {
 });
 
 describe("production deps", () => {
-  const SENTINELS = ["secret-gh-token", "RUN-TOKEN", "PROGRESS-TOKEN", "PUBLICATION-TOKEN", "SESSION-TOKEN", "MACHINE-NONCE"];
+  const SENTINELS = ["secret-gh-token", "RUN-TOKEN", "PROGRESS-TOKEN", "PUBLICATION-TOKEN", "SESSION-TOKEN", "MACHINE-NONCE", "legacy-api-sentinel", "legacy-oauth-sentinel", SENTINEL_BEARER];
   const issue = { id: "i-1", identifier: "ENG-1", title: "T", scopeKey: "ENG", nativeStatus: "Todo" };
   const provider = {
     findByKey: vi.fn(), issueUrl: vi.fn((i: { identifier: string }) => `https://tracker.test/issue/${i.identifier}`),
@@ -162,7 +165,7 @@ describe("production deps", () => {
 
   function deps(overrides: Partial<ImplementationRunProductionInput> = {}) {
     const input: ImplementationRunProductionInput = {
-      config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://o", runnerTokenSecret: "s" } as never,
+      config: { githubAppId: "1", githubAppPrivateKey: "k", anthropicApiKey: "legacy-api-sentinel", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://o", runnerTokenSecret: "s" } as never,
       getMapping,
       resolveProvider: async () => provider as never,
       resolveRunnerImage: async () => undefined,
@@ -220,6 +223,91 @@ describe("production deps", () => {
       expect(await d.reserve(INPUT)).toBe(true);
       vi.mocked(acquireDispatch).mockReturnValue({ ok: false, reason: "team_capacity", count: 1, cap: 1 } as never);
       expect(await d.reserve(INPUT)).toBe(false);
+    });
+  });
+
+  describe("container eligibility in production preparation", () => {
+    it.each(["fly-machines", "local-docker"] as const)("%s: rejects ineligible current configuration and releases workflow admission", async (backend) => {
+      const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
+      for (const failure of ["bedrock", "no-credentials", ...(backend === "fly-machines" ? ["no-fly-token", "no-fly-app"] : [])]) {
+        vi.clearAllMocks();
+        // Even managed projects cannot launch unsupported Bedrock mappings.
+        vi.mocked(isManagedProject).mockReturnValue(failure === "bedrock");
+        const config = { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null };
+        if (failure === "no-fly-token") config.flySessionsToken = null;
+        if (failure === "no-fly-app") config.flySessionsApp = null;
+        const { d, input } = compose({ config, getMapping: () => ({ ...MAPPING, provider: failure === "bedrock" ? "bedrock" : "anthropic" }) });
+        vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+        // Run the real workflow's rejected-launch path with production reserve/launch/release.
+        // Backend lookup is empty; the context executes journal steps in memory.
+        const workflow = createImplementationRunWorkflow({ ...d, retentionMs: 1000, findExistingRun: async () => null });
+        // The SDK exposes the callable routes at runtime, but its public definition type hides them.
+        const routes = (workflow as unknown as { workflow: {
+          run: (ctx: unknown, input: ImplementationRunInput) => Promise<unknown>;
+        } }).workflow;
+        const journal: unknown[] = [];
+        const ctx = {
+          key: INPUT.dispatchId, set: vi.fn(), console, date: { now: async () => Date.now() },
+          run: async (_name: string, action: () => Promise<unknown>) => {
+            const value = await action(); journal.push(value); return value;
+          },
+        };
+        expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "launch_rejected" });
+        expect(releaseByDispatchId).toHaveBeenCalledWith(INPUT.dispatchId, "launch_rejected");
+        expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
+        expect(input.launchImplementationRun).not.toHaveBeenCalled();
+        expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
+        expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
+        expect(getModelAuthRuntime).not.toHaveBeenCalled();
+        expect(prepareManagedDispatch).not.toHaveBeenCalled();
+        expect(mintLaunchTokens).not.toHaveBeenCalled();
+        expect(appendLogIfAbsent).not.toHaveBeenCalled();
+        expect(markDispatched).not.toHaveBeenCalled();
+        expect(updateJobStatus).not.toHaveBeenCalled();
+        expect(input.postDispatch).not.toHaveBeenCalled();
+        expect(provider.markImplementationFailed).not.toHaveBeenCalled();
+        for (const sentinel of SENTINELS) expect(JSON.stringify([INPUT, journal])).not.toContain(sentinel);
+      }
+    });
+
+    it.each(BACKENDS)("%s: preserves managed, API and OAuth eligibility", async (backend) => {
+      for (const auth of ["managed", "api", "oauth"] as const) {
+        vi.clearAllMocks();
+        vi.mocked(isManagedProject).mockReturnValue(auth === "managed");
+        vi.mocked(prepareManagedDispatch).mockResolvedValue(makeLaunchDecision(makeSnapshot(), backend).decision);
+        const { d } = compose({ config: {
+          ...deps().config,
+          anthropicApiKey: auth === "api" ? "legacy-api-sentinel" : null,
+          claudeOAuthToken: auth === "oauth" ? "legacy-oauth-sentinel" : null,
+        } });
+        const result = await d.launch({ ...INPUT, backend });
+        expect(result).toMatchObject({ outcome: "accepted" });
+        expect(prepareManagedDispatch).toHaveBeenCalledTimes(auth === "managed" ? 1 : 0);
+        for (const sentinel of SENTINELS) expect(JSON.stringify([INPUT, result])).not.toContain(sentinel);
+      }
+    });
+
+    it("GHA keeps allowing Bedrock and credential-free unmanaged configuration without Fly sessions", async () => {
+      const { d } = compose({
+        config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null, flySessionsToken: null, flySessionsApp: null },
+        getMapping: () => ({ ...MAPPING, provider: "bedrock" }),
+      });
+      expect(await d.launch(INPUT)).toEqual({ outcome: "accepted", jobId: "4242" });
+    });
+
+    it.each(["fly-machines", "local-docker"] as const)("%s: managed refusals and holds still use managed preparation without environment credentials", async (backend) => {
+      for (const kind of ["refuse", "hold"] as const) {
+        vi.clearAllMocks();
+        vi.mocked(isManagedProject).mockReturnValue(true);
+        vi.mocked(prepareManagedDispatch).mockResolvedValue({ kind, category: "configuration-error", code: "x" } as never);
+        const { d, input } = compose({ config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null } });
+        expect(await d.launch({ ...INPUT, backend })).toEqual({ outcome: "rejected" });
+        expect(prepareManagedDispatch).toHaveBeenCalledTimes(1);
+        expect(provider.markImplementationFailed).toHaveBeenCalledTimes(kind === "refuse" ? 1 : 0);
+        expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
+        expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
+        expect(mintLaunchTokens).not.toHaveBeenCalled();
+      }
     });
   });
 

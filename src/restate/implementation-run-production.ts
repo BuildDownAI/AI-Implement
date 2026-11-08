@@ -227,6 +227,20 @@ export function createProductionImplementationRunServices(input: ImplementationR
     const admission = readAdmission(run.dispatchId);
     if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
 
+    // The poll routes every implementation here; preserve the Legacy container guards
+    // before preparing managed credentials or minting launch tokens. Ineligible issues stay queued.
+    if (containerBackend(run)) {
+      if (mapping.provider === "bedrock") {
+        throw new Error(`provider=bedrock is not supported on ${run.backend}`);
+      }
+      if (run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
+        throw new Error("FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set");
+      }
+      if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(run.teamKey, run.dispatchId)) {
+        throw new Error("neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set");
+      }
+    }
+
     const managedRuntime = getModelAuthRuntime(config);
     let managedDecision: Prelaunch["managedDecision"] = { kind: "legacy" };
     if (isManagedProject(run.teamKey, run.dispatchId)) {
