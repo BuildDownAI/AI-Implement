@@ -9,7 +9,7 @@ vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
 vi.mock("../comment-gapfill-queue.js", () => ({ CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
 vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
-vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
+vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn() }));
 vi.mock("../github.js", async original => ({ ...await original<object>(), dispatchWorkflow: vi.fn(), getWorkflowRunStatus: vi.fn(async () => null), cancelWorkflowRun: vi.fn(async () => true) }));
 vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
@@ -26,7 +26,7 @@ import { acquireDispatch } from "../dispatch-gate.js";
 import { getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
 import { resolveManagedDecision, buildCommentGapfillInstruction } from "../comment-gapfill-drain.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill } from "../gapfill-launch.js";
-import { appendLogIfAbsent, getJobByDispatchId, updateJobPrUrl, updateJobRunId, suppressStaleNotifications } from "../log.js";
+import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, updateJobPrUrl, updateJobRunId, suppressStaleNotifications } from "../log.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { isParked } from "../dispatch-breaker.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
@@ -51,6 +51,8 @@ beforeEach(() => {
   vi.mocked(prepareGhaGapfillLaunch).mockResolvedValue({ contract: "envelope", runnerImage: undefined, inputs: { token: "TOKEN-SENTINEL" } });
   vi.mocked(dispatchGhaGapfill).mockResolvedValue({ success: true, status: 200, runId: 88 });
   vi.mocked(getJobByDispatchId).mockReturnValue(null);
+  vi.mocked(getLatestDispatchForPr).mockReturnValue(null);
+  vi.mocked(getLatestDispatchForIssueIdentifier).mockReturnValue(null);
   input = { config: { githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "callback", runnerTokenSecret: "secret" }, getMapping: () => mapping,
     resolveProvider: vi.fn(async () => ({})), resolveRunnerImage: vi.fn(), postDispatch: vi.fn(), finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn() } as unknown as ImplementationRunProductionInput;
   createProductionImplementationRunServices(input);
@@ -254,4 +256,20 @@ it("successful managed launch retains the grant", async () => {
   expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
   expect(vi.mocked(prepareGhaGapfillLaunch).mock.calls[0][0].decision).toBe(decision);
   expect(settleLaunch).not.toHaveBeenCalled();
+});
+
+it.each(["PR", "issue identifier"])("gap-fill preserves the title recovered by %s", async source => {
+  const job = makeJob({ issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: "Run a GitHub Actions gap-fill inside ImplementationRun" });
+  if (source === "PR") vi.mocked(getLatestDispatchForPr).mockReturnValueOnce(job);
+  else vi.mocked(getLatestDispatchForIssueIdentifier).mockReturnValueOnce(job);
+  await d.launch(run);
+  const issue = { issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: job.issueTitle };
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({ issue }));
+  expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining(issue));
+  expect(getLatestDispatchForPr).toHaveBeenCalledExactlyOnceWith("Org", "repo", 42);
+  if (source === "issue identifier") expect(getLatestDispatchForIssueIdentifier).toHaveBeenCalledExactlyOnceWith("Org", "repo", "ENG-1");
+});
+it("missing title retains the shared launch helper's issue-id fallback", async () => {
+  await d.launch(run);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({ issue: { issueId: run.issueId, issueIdentifier: run.issueIdentifier } }));
 });

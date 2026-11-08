@@ -8,7 +8,7 @@ import { isParked } from "../dispatch-breaker.js";
 import { CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
 import { buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { appendLogIfAbsent, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, updateJobRunId, suppressStaleNotifications } from "../log.js";
+import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, updateJobRunId, suppressStaleNotifications } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
 import { defaultFetchSignal, dispatchWorkflow } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
@@ -66,12 +66,17 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       let prepared: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;
       let ghToken: string;
       let mapping: RepoMapping;
-      const issue = { issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: run.issueIdentifier };
+      const issue: { issueId: string; issueIdentifier: string; issueTitle?: string } = { issueId: run.issueId, issueIdentifier: run.issueIdentifier };
       try {
         if (run.backend !== "github-actions") throw new Error("gap-fill backend not wired");
         mapping = mappingFor(run);
         const item = getCommentGapfillItem(gap.queueItemId);
         if (!item) throw new Error(`gap-fill queue item ${gap.queueItemId} not found`);
+        // The input carries identity only. Recover the same title the comment drain
+        // uses, including PRs whose original dispatch has no PR URL recorded yet.
+        const prLog = getLatestDispatchForPr(item.owner, item.repo, gap.prNumber)
+          ?? getLatestDispatchForIssueIdentifier(item.owner, item.repo, run.issueIdentifier);
+        if (prLog?.issueId === run.issueId) issue.issueTitle = prLog.issueTitle ?? undefined;
         const admission = read(run.dispatchId);
         if (!admission || admission.releasedAt !== null) throw new Error("no active gap-fill reservation");
         const resolved = await resolveManagedDecision({ modelAuthRuntime: runtime }, item,
