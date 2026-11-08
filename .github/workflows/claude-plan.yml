@@ -1,4 +1,4 @@
-# Synced to target repos by sync-workflow.yml.
+# Synced to target repos by the orchestrator's workflow sync.
 # ai-implement-capability: private-run-config-v1
 # ai-implement-capability: stage-agent-config-v1
 # ai-implement-capability: stage-agent-launch-context-v1

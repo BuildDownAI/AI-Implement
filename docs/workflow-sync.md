@@ -43,9 +43,9 @@ A mapping's `workflowFile` and `planningWorkflowFile` must each be a bare file n
 
 `classifySyncError` maps a failure to one of `app-not-installed`, `repo-not-found`, `permission-denied`, `clock-skew-suspected`, or `unknown`, each with an operator message. The App needs Contents, Pull requests, and **Workflows** write on the target repo; a missing Workflows permission surfaces as `permission-denied` on the `.github/workflows/` write. An invalid `workflowFile`/`planningWorkflowFile` name (see above) throws a plain `Error`, which `classifySyncError` reports as `unknown` with the message passed through verbatim.
 
-## Bulk fallback
+## Distribution path
 
-`.github/workflows/sync-workflow.yml` in this repo is a manual GitHub Actions fallback that syncs templates to a named `target_repo`. Normal distribution is the orchestrator path above.
+Orchestrator workflow sync is the only distribution path. Use the **Sync workflows** row action, `POST /api/mappings/:teamKey/sync-workflows`, or MCP `trigger_workflow_sync` for each mapping. There is no manual GitHub Actions bulk fallback.
 
 ## Template capability markers
 
