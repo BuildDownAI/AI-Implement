@@ -253,6 +253,59 @@ export interface WorkerExecutionIdentity {
   readonly githubRunAttempt: number;
 }
 
+/** Backend-neutral identity; omitted backends preserve legacy GitHub journal values. */
+export type ExecutionIdentity =
+  | { readonly backend?: "github-actions"; readonly githubRunId: number; readonly githubRunAttempt: number }
+  | { readonly backend: "fly-machines" | "local-docker"; readonly runRef: string };
+
+/** Normalize even unvalidated journal replays, which may predate the backend tag. */
+export function normalizeExecutionIdentity(identity: ExecutionIdentity): Required<ExecutionIdentity> {
+  switch (identity.backend) {
+    case "fly-machines":
+    case "local-docker":
+      return { backend: identity.backend, runRef: identity.runRef };
+    default:
+      return { backend: "github-actions", githubRunId: identity.githubRunId, githubRunAttempt: identity.githubRunAttempt };
+  }
+}
+
+export function validateExecutionIdentity(raw: unknown): ValidationResult<ExecutionIdentity> {
+  if (!isPlainObject(raw)) return err("execution identity must be an object");
+  switch (raw.backend) {
+    case undefined:
+    case "github-actions": {
+      const identity = validateWorkerExecutionIdentity(raw);
+      if (!identity.ok) return identity;
+      return ok(normalizeExecutionIdentity(identity.value));
+    }
+    case "fly-machines":
+    case "local-docker": {
+      const runRef = validateNonEmptyString(raw.runRef, "runRef", 128);
+      if (!runRef.ok) return runRef;
+      return ok({ backend: raw.backend, runRef: runRef.value });
+    }
+    default:
+      return err(`unsupported execution backend: ${JSON.stringify(raw.backend)}`);
+  }
+}
+
+export function sameExecution(a: ExecutionIdentity, b: ExecutionIdentity): boolean {
+  const left = normalizeExecutionIdentity(a);
+  const right = normalizeExecutionIdentity(b);
+  if (left.backend === "github-actions") {
+    return right.backend === "github-actions"
+      && left.githubRunId === right.githubRunId && left.githubRunAttempt === right.githubRunAttempt;
+  }
+  return right.backend !== "github-actions" && left.backend === right.backend && left.runRef === right.runRef;
+}
+
+/** Machine result matching is deferred until the result contract carries machine evidence. */
+export function resultMatchesExecution(result: ReviewFixResultMetadataV1, execution: ExecutionIdentity): boolean {
+  const identity = normalizeExecutionIdentity(execution);
+  return identity.backend === "github-actions"
+    && result.githubRunId === identity.githubRunId && result.githubRunAttempt === identity.githubRunAttempt;
+}
+
 function validateWorkerExecutionIdentity(raw: unknown): ValidationResult<WorkerExecutionIdentity> {
   if (!isPlainObject(raw)) return err("execution identity must be an object");
   const githubRunId = validatePositiveInt(raw.githubRunId, "githubRunId");
