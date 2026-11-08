@@ -73,7 +73,7 @@ Limits of rollback: capability probe results are cached for 5 minutes (`CACHE_TT
 | New | Old (no `private-run-config-v1`) | Legacy inputs; supplied private credentials make the dispatch fail, never a silent downgrade |
 | New | New | Private envelope; bearers in `credentials`, no top-level token inputs |
 
-The optional-input 422 retry (`ENVELOPE_OPTIONAL_INPUTS`) makes at most two requests and never strips `run_config` or token inputs.
+The optional-input 422 retry (`ENVELOPE_OPTIONAL_INPUTS`) exists only for templates predating AII-656: an unmanaged dispatch with non-empty `run_config` may remove only a present `issue_identifier` named exactly in the rejection. It makes at most two requests and never strips `run_config`, token inputs, or any other input; managed dispatches never strip inputs. Remove this compatibility retry after main is updated and every fleet re-syncs.
 
 ## Evidence
 
