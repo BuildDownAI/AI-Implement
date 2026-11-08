@@ -20,3 +20,11 @@ kill_timeout = 15
 [mounts]
   source = "dedup_data"
   destination = "/data"
+
+# Restart the machine when the orchestrator exits non-zero. Boot exits 1 when the
+# Restate sidecar cannot serve (ADR 023 amendment); policy restarts stop after 10
+# failures in a row. Proxy auto-start remains enabled and can start a stopped
+# machine on incoming traffic, so this retry cap does not guarantee it stays stopped.
+[[restart]]
+  policy = "on-failure"
+  retries = 10

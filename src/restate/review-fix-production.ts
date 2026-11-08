@@ -16,7 +16,7 @@ import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
 import { inspectPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
-import { GithubReviewFixWorker, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
+import { GithubReviewFixWorker, ManagedReviewFixLaunchRefusedError, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
 import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDisposition } from "../review-fix-ports.js";
 import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
@@ -121,10 +121,6 @@ async function decideAdmission(
   if (readiness.status === "legacy") return { verdict: "configuration_error", reason: "no_stage_configuration" };
   if (readiness.status === "not-ready") {
     return { verdict: DEFERRED_READINESS_CODES.has(readiness.code) ? "defer" : "configuration_error", reason: readiness.code };
-  }
-  // Launch preparation refuses a Claude subscription stage on managed projects; fail the row now rather than at launch.
-  if (readiness.profiles.some((profile) => profile.authMode === "claude-subscription")) {
-    return { verdict: "configuration_error", reason: "claude_subscription_unsupported" };
   }
   return { verdict: "admit", reason: "managed" };
 }
@@ -306,6 +302,7 @@ export function createProductionReviewFixWorker(
       }
       const decision = await prepareManagedDispatch({ dispatchId: plan.attemptId, projectKey,
         backend: "github-actions", owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, runtime);
+      if (decision.kind === "refuse") throw new ManagedReviewFixLaunchRefusedError("review-fix managed preparation refused");
       if (decision.kind !== "launch") throw new Error("review-fix managed preparation unavailable");
       try {
         const managedCredentials = ghaManagedCredentials(decision, config.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });

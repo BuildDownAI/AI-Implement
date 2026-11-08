@@ -54,10 +54,10 @@ describe("review-fix admission and model authentication", () => {
     expect(inspectAgentReadiness).not.toHaveBeenCalled();
   });
 
-  it("admits a managed project only when readiness is ready", async () => {
+  it.each(["codex-subscription", "claude-subscription"])("admits a managed %s project when readiness is ready", async (authMode) => {
     getMappings.mockReturnValue({ k: mapping });
     isManagedProject.mockReturnValue(true);
-    inspectAgentReadiness.mockResolvedValue({ status: "ready", profiles: [{ authMode: "codex-subscription" }] });
+    inspectAgentReadiness.mockResolvedValue({ status: "ready", profiles: [{ authMode }] });
     expect(await canAdmit(scope, config, runtime)).toBe("admit");
     expect(inspectAgentReadiness).toHaveBeenCalledTimes(1);
   });
@@ -73,14 +73,12 @@ describe("review-fix admission and model authentication", () => {
     expect(await canAdmit(scope, config, runtime)).toBe(verdict);
   });
 
-  it("defers when readiness throws and refuses legacy-resolving or Claude subscription selections", async () => {
+  it("defers when readiness throws and refuses legacy-resolving selections", async () => {
     getMappings.mockReturnValue({ k: mapping });
     isManagedProject.mockReturnValue(true);
     inspectAgentReadiness.mockRejectedValueOnce(new Error("boom"));
     expect(await canAdmit(scope, config, runtime)).toBe("defer");
     inspectAgentReadiness.mockResolvedValueOnce({ status: "legacy" });
-    expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
-    inspectAgentReadiness.mockResolvedValueOnce({ status: "ready", profiles: [{ authMode: "claude-subscription" }] });
     expect(await canAdmit(scope, config, runtime)).toBe("configuration_error");
   });
 

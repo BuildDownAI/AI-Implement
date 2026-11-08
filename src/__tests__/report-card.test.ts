@@ -132,6 +132,42 @@ describe("getIssueReportCard", () => {
     expect(before.map(row => (row as { usage_json: string }).usage_json)).toEqual(usages.map(usage => JSON.stringify(usage)));
   });
 
+  describe("review-fix rounds", () => {
+    it.each([
+      { legacy: 0, restate: 2, expected: 2 },
+      { legacy: 1, restate: 1, expected: 2 },
+      { legacy: 2, restate: 0, expected: 2 },
+      { legacy: 0, restate: 0, expected: 0 },
+      { legacy: 2, restate: 3, expected: 5 },
+    ])("counts $legacy Legacy dispatches and $restate Restate attempts as $expected rounds", ({ legacy, restate, expected }) => {
+      insertDispatch({ issueIdentifier: "AII-ROUNDS" });
+      const db = dedup.getDb();
+      const queue = db.prepare(`INSERT INTO review_fix_queue
+        (issue_id, issue_identifier, repo, pr_number, reason, created_at, updated_at)
+        VALUES ('issue-rounds', ?, 'org/repo', ?, 'review', 1, 1)`);
+      const queueId = Number(queue.run("AII-ROUNDS", 1).lastInsertRowid);
+      const otherQueueId = Number(queue.run("AII-OTHER", 2).lastInsertRowid);
+      const dispatch = db.prepare(`INSERT INTO review_fix_dispatches
+        (queue_id, dispatch_id, repo, pr_number, created_at)
+        VALUES (?, ?, 'org/repo', 1, 1)`);
+      for (let i = 0; i < legacy; i++) dispatch.run(queueId, `legacy-${i}`);
+      const attempt = db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+         issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES (?, ?, 'mapping', '1', 'org/repo', 1, 'linear', 'issue-rounds', 'restate', 'created', 1, 2, ?, '[]')`);
+      const snapshots = [
+        ...Array.from({ length: restate }, () => ({ taskText: "Fix review", queueCursor: { queueId, eventId: 1 } })),
+        { taskText: "Fix review", queueCursor: null },
+        { taskText: "Fix review" },
+        { taskText: "Fix review", queueCursor: { queueId: otherQueueId, eventId: 2 } },
+        { taskText: "Fix review", queueCursor: { queueId: otherQueueId + 1, eventId: 3 } },
+      ];
+      snapshots.forEach((snapshot, i) => attempt.run(`attempt-${i}`, `restate-${i}`, JSON.stringify(snapshot)));
+
+      expect(rc.getIssueReportCard("AII-ROUNDS")!.reviewFixRounds).toBe(expected);
+    });
+  });
+
   it("returns null for unknown identifier", () => {
     expect(rc.getIssueReportCard("AII-999")).toBeNull();
   });

@@ -67,3 +67,11 @@ Rule 8 required the review-fix pilot's live restart recovery and one week of ope
 **What does not change.** SQLite stays the read model that the admin pages, `/api/token`, the runner callbacks, and the reaper use. Decision 5's "SQLite remains authoritative for business run history; the Restate journal provides execution diagnostics" is amended: the journal is the record and SQLite is the read model built from it. ADR 017 point 2 is narrowed the same way.
 
 **First applied to** kg-refresh (AII-1150): steps `resolve`, `reserve`, `nonce-N`, `dispatch-N`, `record-dispatch-N`, `record-reconcile-N`, `close-row`, `persist`. `PlanningRun` and `ReviewFixAttempt` are re-checked against this rule when they are next touched (`docs/standing-rules.md` rule 3); this amendment does not change them. The recipe is [restate.md](../restate.md) § "Journal projections", and the tests are [restate-testing.md](../restate-testing.md) § "Testing a journal projection (two tiers)".
+
+## Amendment (2026-11-07): complete the scheduled delete slices
+
+**Decision.** The operator requires Restate to own review fix, planning and implementation on every backend. Rule 6's delete slices for review fix, planning and implementation are scheduled in [Gates, Not Inspectors](https://linear.app/eudoxus/project/gates-not-inspectors-85011c2b1f67) Stages 2 and 3. The Legacy lifecycle glue is being removed; this amendment records the schedule, not completed deletion.
+
+Stage 2 cuts review fix over on GitHub Actions, Fly Machines and local Docker. Stage 3 deletes the Legacy review-fix drain and `reviewFixLifecycle` switch; first-time implementation switches in [AII-1555](https://linear.app/eudoxus/issue/AII-1555/send-every-implementation-dispatch-to-implementationrun), and gap-fill switches separately in [AII-1554](https://linear.app/eudoxus/issue/AII-1554). After both cutovers, AII-1555 Part 2 is the scheduled Stage 3 delete slice for the legacy implementation lifecycle. This supersedes rule 1's local Docker exclusion and the optional Legacy fallback in the original alternatives; it does not reopen the evaluation gates already amended on 2026-09-28 and 2026-10-01.
+
+**Rollback.** Revert this documentation amendment.

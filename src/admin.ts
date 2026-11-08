@@ -2922,14 +2922,12 @@ function flySettingsView(): Record<string, unknown> {
       runtimeValue: fly.app,
       dbValue: dbSettings.flySessionsApp,
       envValue: envApp,
-      overriddenByEnv: source === "fallback" && envApp !== null,
       source,
     },
     flySessionsRegion: {
       runtimeValue: fly.region,
       dbValue: dbSettings.flySessionsRegion,
       envValue: envRegion,
-      overriddenByEnv: source === "fallback" && envRegion !== null,
       source,
     },
   };
@@ -4001,17 +3999,10 @@ interface AccountStatusView {
   readiness: AccountReadiness;
   /** Fixed failure code from the credential status projection; never a reference or value. */
   failureCode: string | null;
-  /** `claude-subscription` only. */
-  sessionRecovery?: { state: string; recoveryRequired: boolean } | null;
 }
 
 function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): AccountStatusView {
   const view: AccountStatusView = { readiness: "unknown", failureCode: null };
-  if (profile.authMode === "claude-subscription") {
-    const snap = deps.agentConfig?.sessionSnapshot?.(profile.profileId);
-    view.sessionRecovery = snap ? { state: snap.state, recoveryRequired: snap.state === "recovery_required" } : null;
-    return view;
-  }
   if (!deps.agentConfig) return view;
   let status;
   try {
@@ -4060,7 +4051,7 @@ function credentialView(p: AccountProfileProjection): { credentialSet: boolean; 
   }
 }
 
-const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key"];
+const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key", "claude-subscription"];
 
 const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   invalid_ref: "the reference is not a valid model-account reference",
@@ -4153,7 +4144,7 @@ async function handleModelAccountCredential(
     return;
   }
   if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
-    json(res, 400, { error: "only openai-api-key and anthropic-api-key profiles take a browser credential" });
+    json(res, 400, { error: "only openai-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
     return;
   }
   const existingRef = lookupCredentialReference(profileId, head.revision);
@@ -4400,13 +4391,7 @@ interface OptInRefusal {
 async function optInRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<OptInRefusal | null> {
   const mapping = getMappings()[projectKey]!;
   try {
-    const { resolution } = resolveCandidateProjectStageConfig(projectKey, candidate);
-    if (resolution.mode === "configured" && STAGE_NAMES.some((s) => resolution.profiles[s].authMode === "claude-subscription")) {
-      return {
-        status: 422,
-        body: { error: "Claude subscription execution cannot be enabled from this API", code: "claude_subscription_unsupported" },
-      };
-    }
+    resolveCandidateProjectStageConfig(projectKey, candidate);
   } catch {
     return { status: 422, body: { error: "stage configuration does not resolve", code: "resolution_failed" } };
   }
@@ -4428,16 +4413,6 @@ async function optInRefusal(projectKey: string, candidate: StageAgentConfigurati
     if (readiness.status === "ready") continue;
     const code = readiness.status === "not-ready" ? readiness.code : "resolution_failed";
     const templateCodes = ["runner_incompatible", "retired_workflow_present", "delivery_unreadable"];
-    if (backend === "github-actions" && code === "delivery_unreadable") {
-      return {
-        status: 409,
-        body: {
-          error: "GitHub Actions opt-in is not supported yet: managed credentials and workflow readiness for GitHub Actions dispatch are not available",
-          code: "unsupported_backend",
-          backend,
-        },
-      };
-    }
     return {
       status: 409,
       body: {

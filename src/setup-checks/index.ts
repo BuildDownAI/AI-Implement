@@ -10,7 +10,7 @@ import { statSync } from "node:fs";
 import { isAllowlistReadAvailable, getEffectiveAllowlist, listAccessEntries, type AccessEntry, type EffectiveAllowlist } from "../access-entries.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getDatabasePath, getDb, type DatabasePath } from "../dedup.js";
-import { getFlySessionsConfig, type FlySessionsConfig } from "../orchestrator-settings.js";
+import { getRunnerBackendSource, getFlySessionsConfig, type FlySessionsConfig } from "../orchestrator-settings.js";
 import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
 import type { TicketingProvider, TrackerSetupFacts } from "../providers/types.js";
 import { getRunnerMode, type RunnerModeStatus } from "../runner-mode.js";
@@ -101,6 +101,7 @@ export interface SetupCheckContext {
   readSetting(key: string): string | null;
   runnerMode(): RunnerModeStatus;
   flySessions(): FlySessionsConfig;
+  runnerBackendSource(): "restate" | "not-loaded";
   mappings(): Record<string, RepoMapping>;
   storedAccessEntries(): AccessEntry[];
   effectiveAllowlist(): EffectiveAllowlist | null;
@@ -133,6 +134,7 @@ export function createSetupCheckContext(
       (getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined)?.value ?? null,
     runnerMode: getRunnerMode,
     flySessions: getFlySessionsConfig,
+    runnerBackendSource: getRunnerBackendSource,
     mappings: getMappings,
     storedAccessEntries: listAccessEntries,
     effectiveAllowlist: getEffectiveAllowlist,
