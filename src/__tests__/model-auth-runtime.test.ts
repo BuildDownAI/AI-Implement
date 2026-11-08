@@ -300,6 +300,26 @@ describe("prepareAgentRun with the runtime deps", () => {
     expect(JSON.stringify(logs)).not.toContain(token);
   });
 
+  it("leaves historical Claude ownership untouched and never reads session state", async () => {
+    claudeProfile();
+    const rt = runtime();
+    expect(modules.protectedSecrets.createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } })
+      .write("model-account:sub", "SENTINEL-CLAUDE-SETUP").ok).toBe(true);
+    expect(rt.ownership.reserve({ dispatchId: "historical", profiles: [{ profileId: "sub", authMode: "subscription" }] }).status)
+      .toBe("reserved");
+    const rows = () => dedup.getDb().prepare("SELECT * FROM model_profile_reservations").all();
+    const before = rows();
+    const read = vi.spyOn(rt.sessionStore, "read");
+    const deps = rt.preparationDeps({ owner: "acme", repo: "ready-repo", projectKey: "AII" });
+    for (const dispatchId of ["d1", "d2", "d1"]) {
+      const result = await prep.prepareAgentRun({ ...request(), dispatchId }, deps);
+      expect(result).toMatchObject({ status: "ready", reservations: [] });
+    }
+    expect(read).not.toHaveBeenCalled();
+    expect(rows()).toEqual(before);
+    expect(count("model_credential_grants")).toBe(2);
+  });
+
   it.each(["absent", "decrypt_failed", "key_unavailable"] as const)(
     "requires authentication with a fixed code when Claude secret is %s", async (failure) => {
       claudeProfile();
