@@ -6523,7 +6523,8 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
     accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
     expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
-    expect(find(accts, "cl-sub").account.sessionRecovery).toEqual({ state: "recovery_required", recoveryRequired: true });
+    expect(find(accts, "cl-sub").account).toEqual({ readiness: "ready", failureCode: null });
+    expect(JSON.stringify(accts)).not.toContain("sessionRecovery");
     expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
     expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
 
@@ -6815,6 +6816,9 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(store.getProjectOptIn("APP")).toBe(ready);
       if (ready) {
         expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
+        const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, readyDeps());
+        expect(resolved.json.stages.review.account).toEqual({ readiness: "ready", failureCode: null });
+        expect(resolved.raw).not.toContain("sessionRecovery");
       } else {
         expect(r.json.code).toBe("runner_incompatible");
         expect(store.getProjectStageConfig("APP")).toEqual(previousConfig);
@@ -6971,10 +6975,14 @@ describe("model accounts and stage configuration (AII-962)", () => {
       return t;
     }
 
-    it("round-trips a key like secret-import, never leaks it, and DELETE removes it", async () => {
+    it.each([
+      { agent: "codex", provider: "openai", authMode: "openai-api-key" },
+      { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+      { agent: "claude", provider: "anthropic", authMode: "claude-subscription" },
+    ])("round-trips $authMode like secret-import, never leaks it, and DELETE removes it", async (mode) => {
       const logs: string[] = [];
       for (const m of ["log", "info", "warn", "error"] as const) vi.spyOn(console, m).mockImplementation((...a) => { logs.push(a.join(" ")); });
-      const t = await seedProfile();
+      const t = await seedProfile(mode);
       const revs = count("model_account_profile_revisions");
       const put = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
       expect(put.status).toBe(200);
@@ -6986,9 +6994,16 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const row = list.json.accounts.find((a: { profileId: string }) => a.profileId === "oai-1");
       expect(row.credentialSet).toBe(true);
       expect(typeof row.credentialUpdatedAt).toBe("number");
+      expect(row.account).toEqual({ readiness: "unknown", failureCode: null });
+      expect(list.raw).not.toContain("sessionRecovery");
+      const withDeps = await call("/api/model-accounts", "GET", t, undefined, readyDeps());
+      expect(withDeps.json.accounts[0].account).toEqual({ readiness: "ready", failureCode: null });
+      expect(withDeps.raw).not.toContain(KEY);
       expect(list.raw).not.toContain(KEY);
       expect(list.raw).not.toContain(REF);
       const del = await call(url("oai-1"), "DELETE", t);
+      expect(del.status).toBe(200);
+      expect(del.raw).not.toContain(KEY);
       expect(del.json).toEqual({ ref: REF, result: "removed" });
       expect(store().resolve(REF)).toBeNull();
       expect(count("model_protected_secrets")).toBe(0);
@@ -6998,6 +7013,25 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(after.credentialUpdatedAt).toBeNull();
       expect(logs.filter((l) => l.includes("[admin] model-account credential"))).toHaveLength(3);
       expect(logs.join("\n")).not.toContain(KEY);
+    });
+
+    it("redacts a Claude setup-token when the protected store fails", async () => {
+      const logs: string[] = [];
+      for (const m of ["log", "info", "warn", "error", "debug"] as const) vi.spyOn(console, m).mockImplementation((...a) => { logs.push(a.join(" ")); });
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "claude-subscription" });
+      // Make SQLite's raw error contain the token, proving that it is redacted.
+      dedup.getDb().exec(`CREATE TRIGGER fail_credential_write BEFORE INSERT ON model_protected_secrets
+        BEGIN SELECT RAISE(ABORT, '${KEY}'); END`);
+      try {
+        const failed = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+        expect(failed.status).toBe(500);
+        expect(failed.json).toEqual({ error: "could not write the credential" });
+        expect(failed.raw).not.toContain(KEY);
+        expect(logs.join("\n")).not.toContain(KEY);
+        expect(count("model_protected_secrets")).toBe(0);
+      } finally {
+        dedup.getDb().exec("DROP TRIGGER fail_credential_write");
+      }
     });
 
     it("derives model-account:<id> and appends one revision for a profile without a ref", async () => {
@@ -7032,6 +7066,9 @@ describe("model accounts and stage configuration (AII-962)", () => {
         ["oai-1", {}, 400],
         ["oai-1", { apiKey: KEY, extra: 1 }, 400],
       ];
+      for (const id of ["plan-1", "bed"]) {
+        expect((await call(url(id), "DELETE", t)).status).toBe(400);
+      }
       for (const [id, body, status] of cases) {
         const r = await call(url(id), "PUT", t, body);
         expect(r.status, id).toBe(status);
@@ -7090,8 +7127,8 @@ describe("model accounts and stage configuration (AII-962)", () => {
       spy.mockRestore();
     });
 
-    it("refuses a non-admin with every page granted", async () => {
-      await seedProfile();
+    it.each(["openai-api-key", "claude-subscription"])("refuses a non-admin with every page granted for %s", async (authMode) => {
+      await seedProfile(authMode === "claude-subscription" ? { agent: "claude", provider: "anthropic", authMode } : {});
       accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
       const u = userTok();
       expect((await call(url("oai-1"), "PUT", u, { apiKey: KEY })).status).toBe(403);

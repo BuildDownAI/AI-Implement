@@ -4001,17 +4001,10 @@ interface AccountStatusView {
   readiness: AccountReadiness;
   /** Fixed failure code from the credential status projection; never a reference or value. */
   failureCode: string | null;
-  /** `claude-subscription` only. */
-  sessionRecovery?: { state: string; recoveryRequired: boolean } | null;
 }
 
 function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): AccountStatusView {
   const view: AccountStatusView = { readiness: "unknown", failureCode: null };
-  if (profile.authMode === "claude-subscription") {
-    const snap = deps.agentConfig?.sessionSnapshot?.(profile.profileId);
-    view.sessionRecovery = snap ? { state: snap.state, recoveryRequired: snap.state === "recovery_required" } : null;
-    return view;
-  }
   if (!deps.agentConfig) return view;
   let status;
   try {
@@ -4060,7 +4053,7 @@ function credentialView(p: AccountProfileProjection): { credentialSet: boolean; 
   }
 }
 
-const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key"];
+const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key", "claude-subscription"];
 
 const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   invalid_ref: "the reference is not a valid model-account reference",
@@ -4153,7 +4146,7 @@ async function handleModelAccountCredential(
     return;
   }
   if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
-    json(res, 400, { error: "only openai-api-key and anthropic-api-key profiles take a browser credential" });
+    json(res, 400, { error: "only openai-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
     return;
   }
   const existingRef = lookupCredentialReference(profileId, head.revision);
