@@ -209,6 +209,23 @@ export function createProductionImplementationRunServices(input: ImplementationR
     managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
   };
 
+  /** Pure eligibility for a new launch; never evidence that an earlier launch is absent. */
+  function containerIneligibility(run: ImplementationRunInput, mapping: RepoMapping): string | null {
+    if (containerBackend(run)) {
+      if (mapping.provider === "bedrock") {
+        return `provider=bedrock is not supported on ${run.backend}`;
+      }
+      if (run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
+        return "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set";
+      }
+      if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(run.teamKey, run.dispatchId)) {
+        return "neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set";
+      }
+    }
+
+    return null;
+  }
+
   /** Everything before the launch call. A throw is a definitive non-launch; the managed grant is revoked here
    *  for a decision taken, and the workflow releases the reservation on `rejected`. */
   async function prepare(run: ImplementationRunInput): Promise<Prelaunch> {
@@ -227,19 +244,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
     const admission = readAdmission(run.dispatchId);
     if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
 
-    // The poll routes every implementation here; preserve the Legacy container guards
-    // before preparing managed credentials or minting launch tokens. Ineligible issues stay queued.
-    if (containerBackend(run)) {
-      if (mapping.provider === "bedrock") {
-        throw new Error(`provider=bedrock is not supported on ${run.backend}`);
-      }
-      if (run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
-        throw new Error("FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set");
-      }
-      if (!config.anthropicApiKey && !config.claudeOAuthToken && !isManagedProject(run.teamKey, run.dispatchId)) {
-        throw new Error("neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set");
-      }
-    }
+    const ineligible = containerIneligibility(run, mapping);
+    if (ineligible) throw new Error(ineligible);
 
     const managedRuntime = getModelAuthRuntime(config);
     let managedDecision: Prelaunch["managedDecision"] = { kind: "legacy" };
@@ -505,6 +511,16 @@ export function createProductionImplementationRunServices(input: ImplementationR
    *  when a step retry follows a committed reservation, so a retry never takes a second one. */
   async function reserve(run: ImplementationRunInput): Promise<boolean> {
     const mapping = requireMapping(getMapping, run.teamKey);
+    // No admission and no job means this workflow has not entered dispatch yet. Once either
+    // exists, config changes cannot prove absence: keep reconciliation (and backend read failures)
+    // intact, including on a retry of a committed-but-not-journaled reservation.
+    if (!readAdmission(run.dispatchId) && !getJobByDispatchId(run.dispatchId)) {
+      const ineligible = containerIneligibility(run, mapping);
+      if (ineligible) {
+        console.log(`[implementation-run] skipped dispatch=${run.dispatchId} issue=${run.issueIdentifier}: ${ineligible}`);
+        return false;
+      }
+    }
     const held = acquireDispatch({
       dispatchId: run.dispatchId,
       issueId: run.issueId,

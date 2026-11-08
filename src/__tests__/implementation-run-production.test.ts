@@ -227,20 +227,21 @@ describe("production deps", () => {
   });
 
   describe("container eligibility in production preparation", () => {
-    it.each(["fly-machines", "local-docker"] as const)("%s: rejects ineligible current configuration and releases workflow admission", async (backend) => {
+    it.each(["fly-machines", "local-docker"] as const)("%s: skips ineligible first dispatch before production backend reconciliation", async (backend) => {
       const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
       for (const failure of ["bedrock", "no-credentials", ...(backend === "fly-machines" ? ["no-fly-token", "no-fly-app"] : [])]) {
         vi.clearAllMocks();
+        vi.mocked(readAdmission).mockReturnValue(null);
         // Even managed projects cannot launch unsupported Bedrock mappings.
         vi.mocked(isManagedProject).mockReturnValue(failure === "bedrock");
-        const config = { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null };
+        const config = { ...deps().config,
+          anthropicApiKey: failure.startsWith("no-fly-") ? "legacy-api-sentinel" : null, claudeOAuthToken: null };
         if (failure === "no-fly-token") config.flySessionsToken = null;
         if (failure === "no-fly-app") config.flySessionsApp = null;
         const { d, input } = compose({ config, getMapping: () => ({ ...MAPPING, provider: failure === "bedrock" ? "bedrock" : "anthropic" }) });
         vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
-        // Run the real workflow's rejected-launch path with production reserve/launch/release.
-        // Backend lookup is empty; the context executes journal steps in memory.
-        const workflow = createImplementationRunWorkflow({ ...d, retentionMs: 1000, findExistingRun: async () => null });
+        // Keep the production finder: a first dispatch must skip before any backend read.
+        const workflow = createImplementationRunWorkflow({ ...d, retentionMs: 1000 });
         // The SDK exposes the callable routes at runtime, but its public definition type hides them.
         const routes = (workflow as unknown as { workflow: {
           run: (ctx: unknown, input: ImplementationRunInput) => Promise<unknown>;
@@ -252,8 +253,10 @@ describe("production deps", () => {
             const value = await action(); journal.push(value); return value;
           },
         };
-        expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "launch_rejected" });
-        expect(releaseByDispatchId).toHaveBeenCalledWith(INPUT.dispatchId, "launch_rejected");
+        expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "refused" });
+        expect(acquireDispatch).not.toHaveBeenCalled();
+        expect(releaseByDispatchId).not.toHaveBeenCalled();
+        expect(listMachines).not.toHaveBeenCalled();
         expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
         expect(input.launchImplementationRun).not.toHaveBeenCalled();
         expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
@@ -270,6 +273,60 @@ describe("production deps", () => {
       }
     });
 
+    it.each(["fly-machines", "local-docker"] as const)("%s: workflow adopts a recorded run after configuration becomes ineligible", async (backend) => {
+      const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
+      vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "prior-run" }));
+      // Even without admission evidence, a recorded job must prevent the first-dispatch shortcut.
+      vi.mocked(readAdmission).mockReturnValue(null);
+      vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+      const { d, input } = compose({
+        config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null, flySessionsToken: null, flySessionsApp: null },
+        getMapping: () => ({ ...MAPPING, provider: "bedrock" }),
+      });
+      const readStatus = vi.fn().mockResolvedValue("ended");
+      const workflow = createImplementationRunWorkflow({
+        ...d, readModelPrices: undefined, retentionMs: 1000, readStatus,
+        finishJob: async () => ({}), cleanup: async () => {}, onOutcome: async () => {},
+      });
+      const routes = (workflow as unknown as { workflow: {
+        run: (ctx: unknown, input: ImplementationRunInput) => Promise<unknown>;
+      } }).workflow;
+      const ctx = {
+        key: INPUT.dispatchId, set: vi.fn(), console, date: { now: async () => Date.now() },
+        run: async (_name: string, action: () => Promise<unknown>) => action(),
+        promise: () => ({ get: () => ({ map: () => new Promise(() => {}) }) }),
+      };
+      expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "finalized" });
+      expect(readStatus).toHaveBeenCalledWith({ ...INPUT, backend }, "prior-run");
+      expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
+      expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
+      expect(listMachines).not.toHaveBeenCalled();
+    });
+
+    it.each(["missing-config", "backend-error", "found"] as const)("Fly recovery with admission and no job: %s remains fail-closed", async (scenario) => {
+      vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+      const { d } = compose({
+        config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null,
+          ...(scenario === "missing-config" ? { flySessionsToken: null } : {}) },
+        getMapping: () => ({ ...MAPPING, provider: "bedrock" }),
+      });
+      const run = { ...INPUT, backend: "fly-machines" as const };
+      expect(await d.reserve(run)).toBe(true);
+      if (scenario === "missing-config") {
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow(/FLY_SESSIONS/);
+      } else if (scenario === "backend-error") {
+        vi.mocked(listMachines).mockRejectedValueOnce(new Error("backend unavailable"));
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("backend unavailable");
+      } else {
+        vi.mocked(listMachines).mockResolvedValueOnce([{
+          id: "unacknowledged-run", name: implementationFlyMachineName(INPUT.issueIdentifier),
+          created_at: new Date(DISPATCHED_AT).toISOString(),
+        }] as never);
+        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBe("unacknowledged-run");
+      }
+      expect(releaseByDispatchId).not.toHaveBeenCalled();
+    });
+
     it.each(BACKENDS)("%s: preserves managed, API and OAuth eligibility", async (backend) => {
       for (const auth of ["managed", "api", "oauth"] as const) {
         vi.clearAllMocks();
@@ -280,6 +337,9 @@ describe("production deps", () => {
           anthropicApiKey: auth === "api" ? "legacy-api-sentinel" : null,
           claudeOAuthToken: auth === "oauth" ? "legacy-oauth-sentinel" : null,
         } });
+        vi.mocked(readAdmission).mockReturnValueOnce(null);
+        vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+        expect(await d.reserve({ ...INPUT, backend })).toBe(true);
         const result = await d.launch({ ...INPUT, backend });
         expect(result).toMatchObject({ outcome: "accepted" });
         expect(prepareManagedDispatch).toHaveBeenCalledTimes(auth === "managed" ? 1 : 0);
