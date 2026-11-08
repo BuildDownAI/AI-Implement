@@ -62,9 +62,9 @@ The operator decided on 2026-11-07 that Restate is a hard dependency, supersedin
 
 Its reason no longer holds because kg-refresh, the MCP tools service, the refresh authority, PlanningRun, review fix, self-deploy and `RunnerBackend` now run on Restate (standing rule 3).
 
-Only Restate changes: the KG sidecar remains non-fatal. The following tables define the contract implemented by S1-10 and S1-14.
+Only Restate changes: the KG sidecar remains non-fatal. The following tables define the contract that S1-10 and S1-14 will implement. This amendment records the required behavior ahead of those code changes on the same feature branch; it does not claim that they are complete. Until they land, boot continues after Restate startup or registration failure, as described in [docs/restate.md § Boot sequence](../restate.md#boot-sequence).
 
-Boot (implemented by S1-10):
+Boot (to be implemented by S1-10):
 
 | sidecar.state | registration.state | Outcome |
 | -- | -- | -- |
@@ -81,7 +81,7 @@ Boot (implemented by S1-10):
 | ready | declined-conflict | keep waiting with no deadline; the 60 s retry continues; the poll loop stays held |
 | any | SIGTERM or SIGINT during the wait | normal shutdown, exit 0; the poll never starts |
 
-After boot (implemented by S1-14):
+After boot (to be implemented by S1-14):
 
 | Event | Outcome |
 | -- | -- |
