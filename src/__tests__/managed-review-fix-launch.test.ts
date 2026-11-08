@@ -295,7 +295,7 @@ describe("production managed GHA review-fix launch", () => {
   it("does not dispatch a disabled account", async () => {
     profiles.retireAccountProfile("cdx");
     const { worker, plan } = await launch();
-    expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
+    expect(await worker.launch(plan)).toEqual({ status: "unknown" });
     expect(sent).toHaveLength(0);
     expect(count("model_credential_grants")).toBe(0);
   });
@@ -371,7 +371,7 @@ describe("production managed GHA review-fix launch", () => {
     profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage(), review: stage(),
       implementation: { ...stage("sub"), agent: "claude", provider: "anthropic" } } });
     const { worker, plan } = await launch();
-    expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
+    expect(await worker.launch(plan)).toEqual({ status: "unknown" });
     expect(count("model_credential_grants")).toBe(0);
     expect(sent).toHaveLength(0);
   });
@@ -526,7 +526,7 @@ describe("production managed GHA review-fix launch", () => {
       expect(snapshot.stages.implementation.accountProfileId).toBe("capi");
     });
 
-    it("admits a ready managed Claude subscription stage, then rejects launch without dispatch or grants", async () => {
+    it("admits a ready managed Claude subscription stage, then leaves launch unknown without dispatch or grants", async () => {
       profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
         authMode: "claude-subscription", });
       profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
@@ -535,7 +535,7 @@ describe("production managed GHA review-fix launch", () => {
       } });
       expect(await admit()).toBe("admit");
       const { worker, plan } = await launch();
-      expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
+      expect(await worker.launch(plan)).toEqual({ status: "unknown" });
       expect(sent).toHaveLength(0);
       expect(count("run_agent_config_snapshots")).toBe(0);
       expect(count("model_credential_grants")).toBe(0);
