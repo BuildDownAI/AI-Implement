@@ -5123,7 +5123,7 @@ export function createMainShutdown(deps: {
   exit: (code: number) => void;
 }) {
   const SHUTDOWN_BUDGET_MS = 10_000;
-  return async (reason: string, exitCode = 0): Promise<void> => {
+  return async (reason: string, exitCode = 0, notify = exitCode === 0): Promise<void> => {
     if (deps.isShuttingDown()) {
       console.log(`[main] Received ${reason} while already shutting down; ignoring`);
       return;
@@ -5141,7 +5141,7 @@ export function createMainShutdown(deps: {
     }, SHUTDOWN_BUDGET_MS);
     forcedExit.unref();
 
-    if (exitCode === 0) {
+    if (notify) {
       deps.recordShutdown();
       await Promise.race([
         deps.postShutdownNotice(),
@@ -5158,6 +5158,19 @@ export function createMainShutdown(deps: {
   };
 }
 
+/** Arm only after boot serves: early exits remain fatal boot outcomes. */
+export function createRestateExitHandler() {
+  let shutdown: ReturnType<typeof createMainShutdown> | undefined;
+  return {
+    arm: (handler: ReturnType<typeof createMainShutdown>): void => { shutdown = handler; },
+    onUnexpectedExit: ({ code }: { code: number | null; signal: string | null }): void => {
+      if (!shutdown) return;
+      console.error(`[main] Restate sidecar exited (code=${code ?? "null"}); shutting down`);
+      void shutdown("restate-exited", 1, true);
+    },
+  };
+}
+
 /** The production boot sequence, with effects injected for ordering and shutdown tests. */
 export async function runMainBoot(deps: {
   registerSignal: (signal: "SIGTERM" | "SIGINT", handler: () => void) => void;
@@ -5165,6 +5178,7 @@ export async function runMainBoot(deps: {
   wait: () => ReturnType<typeof waitForRestateServing>;
   isShuttingDown: () => boolean;
   shutdown: (reason: string, exitCode?: number) => Promise<void>;
+  onServing?: () => void;
   logFly: () => void;
   refreshCache: () => Promise<void>;
   reconcile: () => Promise<void>;
@@ -5186,6 +5200,7 @@ export async function runMainBoot(deps: {
     await deps.shutdown(`Restate ${result}`, 1);
     return;
   }
+  deps.onServing?.();
   console.log(`[main] Restate serving after ${now() - started} ms`);
   deps.logFly();
   await deps.refreshCache();
@@ -5237,7 +5252,8 @@ async function main(): Promise<void> {
   await sidecar.start();
 
   // Restate is required: HTTP routes open below, but dispatch waits for registration and its hook.
-  const restateSidecar = new RestateSidecar();
+  const restateExit = createRestateExitHandler();
+  const restateSidecar = new RestateSidecar({ onUnexpectedExit: restateExit.onUnexpectedExit });
   await restateSidecar.start();
 
   const config = loadConfig();
@@ -5467,6 +5483,7 @@ async function main(): Promise<void> {
     }),
     isShuttingDown: () => shuttingDown,
     shutdown,
+    onServing: () => restateExit.arm(shutdown),
     logFly: () => {
       // Check if Fly config is needed
       const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");
