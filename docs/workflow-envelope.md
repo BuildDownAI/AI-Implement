@@ -260,7 +260,7 @@ Every GHA writer (implementation, planning, the legacy index.ts review-fix write
 | Writer | Reader | Transport |
 |---|---|---|
 | new | new (`supportsPrivateRunConfig === true`) | Bearers in `run_config.credentials` (`encodeTrustedRunConfig`); `run_token` is `""`; no `run_progress_token` / `run_publication_token` inputs |
-| new | old (envelope without the marker, or probe `false`/failed) | Generic `encodeRunConfig` envelope plus masked top-level tokens |
+| new | old (envelope without the marker, or capability `false`) | Generic `encodeRunConfig` envelope plus masked top-level tokens |
 | new | legacy contract | Legacy per-field inputs plus top-level tokens |
 | old | new | Reader falls back to the top-level `run_*` inputs when no `credentials` namespace exists |
 
@@ -323,15 +323,15 @@ Before every dispatch the orchestrator calls `resolveWorkflowCapabilities` (`src
 1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from `ref` — the branch the actual `workflow_dispatch` will target, so the contract check agrees with the dispatch it gates. Every current call site passes `mapping.defaultBranch` for both the probe's `ref` and the dispatch's own `ref` (`dispatchWorkflow` always dispatches against `mapping.defaultBranch`, even for a feature-branch child whose run then checks out a different branch via `run_config.baseBranch`), so in practice this reads as "the default branch" — but the parameter, not a hardcoded branch, is what the probe and the dispatch actually agree on.
 2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs: `run_publication_token` (`RUN_PUBLICATION_TOKEN_RE`) and, identically, `run_attempt_token` (`RUN_ATTEMPT_TOKEN_RE`) — see "Attempt correlation" below.
 3. Returns the envelope/legacy contract plus both capability bits, `supportsRunPublicationToken` and `supportsAttemptCorrelation`. Publication credentials are minted and dispatched only when the target explicitly advertises support; the same principle applies to attempt correlation once a consumer sends it.
-4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` with both capability bits `false`, and logs a warning — fail-safe.
+4. A definite read — a 404 or a file without `run_config` — returns `"legacy"` with all capability bits `false`. A failed read (fetch throw, non-404 error status, malformed JSON, or a body that is not a base64 file blob) logs a warning and throws `WorkflowProbeTransientError`. Failed reads are not cached. The deprecated `failOnTransient` option is ignored; this behavior applies to every caller, including the contract-only wrapper.
 
-Results are cached in-process per `owner/repo/workflowFile/ref` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`) — `WorkflowCapabilities` as a whole is the cached value, so `supportsAttemptCorrelation` shares the same cache entry, key, and TTL as the contract and `supportsRunPublicationToken`; there is no separate probe or cache for it. A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
+Successful results, including definite legacy answers, are cached in-process per `owner/repo/workflowFile/ref` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`) — `WorkflowCapabilities` as a whole is the cached value, so `supportsAttemptCorrelation` shares the same cache entry, key, and TTL as the contract and `supportsRunPublicationToken`; there is no separate probe or cache for it. A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
 
 ---
 
 ## Attempt correlation: `supportsAttemptCorrelation` and `run_attempt_token`
 
-`WorkflowCapabilities` carries a `supportsAttemptCorrelation` bit, detected the same way as `supportsRunPublicationToken`: the probe regex-matches a `run_attempt_token:` input declaration in the fetched YAML; it does not parse the YAML structure. The bit is `true` only when the contract itself resolved to `"envelope"` and the regex matched; a `"legacy"` result (or any probe failure) forces it `false` regardless of what the YAML contains.
+`WorkflowCapabilities` carries a `supportsAttemptCorrelation` bit, detected the same way as `supportsRunPublicationToken`: the probe regex-matches a `run_attempt_token:` input declaration in the fetched YAML; it does not parse the YAML structure. The bit is `true` only when the contract itself resolved to `"envelope"` and the regex matched; a `"legacy"` result forces it `false` regardless of what the YAML contains. A probe failure throws instead of returning capability bits.
 
 The implementation template now declares the optional, secret-free `run_attempt_token` input (AII-782), and its synced `.github/workflows/claude-implement.yml` copy is identical. A target repo must re-sync the template before its probe can advertise support; until then that target still reports `supportsAttemptCorrelation: false`. Re-sync is part of the later manual pilot, not this source change. The five-minute probe cache applies after re-sync.
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  WorkflowProbeTransientError,
   resolveWorkflowContract,
   resolveWorkflowCapabilities,
   __clearWorkflowProbeCacheForTests,
@@ -151,19 +152,18 @@ describe("resolveWorkflowContract", () => {
     });
   });
 
-  it("returns legacy when fetch throws without rethrowing", async () => {
+  it("propagates the typed probe error when fetch throws", async () => {
     const github = contents(() => {
       throw new Error("net");
     });
-    const mode = await resolveWorkflowContract({
+    await expect(resolveWorkflowContract({
       owner: "o",
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
       ref: "main",
       fetchImpl: github.fetch,
-    });
-    expect(mode).toBe("legacy");
+    })).rejects.toThrow(WorkflowProbeTransientError);
   });
 
   it("caches the result within TTL — second call performs zero extra fetches", async () => {
@@ -244,17 +244,16 @@ describe("resolveWorkflowContract", () => {
     expect(githubB.calls).toHaveLength(1);
   });
 
-  it("returns legacy when response encoding is not base64", async () => {
+  it("throws the typed probe error when response encoding is not base64", async () => {
     const github = contents({ json: { type: "file", encoding: "utf-8", content: ENVELOPE_YML } });
-    const mode = await resolveWorkflowContract({
+    await expect(resolveWorkflowContract({
       owner: "o",
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
       ref: "main",
       fetchImpl: github.fetch,
-    });
-    expect(mode).toBe("legacy");
+    })).rejects.toThrow(WorkflowProbeTransientError);
   });
 
   it("does not classify run_config mentioned only in a YAML comment as envelope", async () => {
@@ -451,10 +450,10 @@ describe("resolveWorkflowCapabilities — supportsPrivateRunConfig", () => {
     expect((await probe(contents(githubFile(MARKER + LEGACY_YML), "w.yml"))).supportsPrivateRunConfig).toBe(false);
   });
 
-  it("is false for 404 and fetch errors", async () => {
+  it("is false for 404 and throws for fetch errors", async () => {
     expect((await probe(contents(githubError(404, "Not Found"), "w.yml"))).supportsPrivateRunConfig).toBe(false);
     __clearWorkflowProbeCacheForTests();
-    expect((await probe(contents(() => { throw new Error("boom"); }, "w.yml"))).supportsPrivateRunConfig).toBe(false);
+    await expect(probe(contents(() => { throw new Error("boom"); }, "w.yml"))).rejects.toThrow(WorkflowProbeTransientError);
   });
 
   it("does not imply stage-agent support from the private-envelope marker", async () => {
@@ -473,31 +472,40 @@ describe("transient probe failures (AII-1292)", () => {
     ["fetch throw", () => contents(() => { throw new Error("net"); })],
     ["HTTP 500", () => contents(githubError(500, "Server Error"))],
     ["bad JSON", () => contents({ text: "<html>upstream error</html>" })],
+    ["null body", () => contents({ text: "null" })],
+    ["missing content", () => contents({ json: { type: "file", encoding: "base64" } })],
+    ["non-string content", () => contents({ json: { type: "file", encoding: "base64", content: 42 } })],
     ["non-file body", () => contents({ json: [{ type: "file", name: "claude-implement.yml" }] })],
   ];
 
-  it.each(transient)("%s is not cached and never throws by default", async (_n, make) => {
-    const github = make();
-    const first = await resolveWorkflowCapabilities({ ...base, fetchImpl: github.fetch });
-    await resolveWorkflowCapabilities({ ...base, fetchImpl: github.fetch });
-    expect(first.contract).toBe("legacy");
-    expect(github.calls).toHaveLength(2);
-  });
+  describe.each([undefined, true, false])("failOnTransient=%s", (failOnTransient) => {
+    const option = failOnTransient === undefined ? {} : { failOnTransient };
 
-  it.each(transient)("%s throws with failOnTransient", async (_n, make) => {
-    await expect(resolveWorkflowCapabilities({ ...base, fetchImpl: make().fetch, failOnTransient: true })).rejects.toThrow();
-  });
+    it.each(transient)("%s throws the typed error and is not cached", async (_n, make) => {
+      const github = make();
+      const input = { ...base, ...option, fetchImpl: github.fetch };
+      await expect(resolveWorkflowCapabilities(input)).rejects.toThrow(WorkflowProbeTransientError);
+      await expect(resolveWorkflowCapabilities(input)).rejects.toThrow(WorkflowProbeTransientError);
+      expect(github.calls).toHaveLength(2);
+    });
 
-  it("a 404 and a real legacy workflow stay cached and do not throw with failOnTransient", async () => {
-    const notFound = contents(githubError(404, "Not Found"));
-    expect(await resolveWorkflowContract({ ...base, fetchImpl: notFound.fetch, failOnTransient: true })).toBe("legacy");
-    await resolveWorkflowContract({ ...base, fetchImpl: notFound.fetch, failOnTransient: true });
-    expect(notFound.calls).toHaveLength(1);
-
-    __clearWorkflowProbeCacheForTests();
-    const legacy = contents(githubFile(LEGACY_YML));
-    expect(await resolveWorkflowContract({ ...base, fetchImpl: legacy.fetch, failOnTransient: true })).toBe("legacy");
-    await resolveWorkflowContract({ ...base, fetchImpl: legacy.fetch });
-    expect(legacy.calls).toHaveLength(1);
+    it.each([
+      ["404", githubError(404, "Not Found")],
+      ["file without run_config", githubFile(LEGACY_YML)],
+    ] as const)("%s returns cached legacy capabilities", async (_n, reply) => {
+      const github = contents(reply);
+      const input = { ...base, ...option, fetchImpl: github.fetch };
+      const first = await resolveWorkflowCapabilities(input);
+      expect(first).toEqual({
+        contract: "legacy",
+        supportsRunPublicationToken: false,
+        supportsAttemptCorrelation: false,
+        supportsPrivateRunConfig: false,
+        supportsExecutionPolicy: false,
+        supportsStageAgentConfig: false,
+      });
+      expect(await resolveWorkflowCapabilities(input)).toEqual(first);
+      expect(github.calls).toHaveLength(1);
+    });
   });
 });
