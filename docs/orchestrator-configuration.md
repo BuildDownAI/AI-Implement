@@ -166,8 +166,6 @@ To change the values after the object is seeded, save them on `/admin#settings` 
 
 `GET /api/settings` reports `runnerBackendSource` (`restate` after any successful read, including an empty object, or `not-loaded` before one), and for each value its runtime, row and environment values. Boot reconciliation of session machines runs in `main()` after the registration hook (including its awaited seed and refresh) finishes and main refreshes the cache again. There is no deferred reconciliation.
 
-For AII-1747 / PR #1481, external control-plane readership of this endpoint is still unconfirmed. Keep the PR draft until the operator records confirmation on the PR that the control plane does not consume this API. If a consumer exists, resolve and record its compatibility with `not-loaded` (replacing `fallback`) and the removal of `flySessionsApp.overriddenByEnv` and `flySessionsRegion.overriddenByEnv` before marking the PR ready. A repository reader census cannot establish whether an external consumer exists.
-
 ## Numeric tuning values
 
 The numeric variables are parsed by four different expressions, and a blank or non-numeric value means something different under each. The timer limits below are Node 24's, the pinned major; re-check them when the pin moves.
