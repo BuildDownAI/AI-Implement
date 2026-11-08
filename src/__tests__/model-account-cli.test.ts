@@ -505,3 +505,32 @@ describe("adopt-env", () => {
     expect(err.join("\n")).not.toContain(TOKEN);
   });
 });
+
+describe("adopt-projects CLI", () => {
+  it("filters projects, previews without writes and prints every model source", async () => {
+    const write = vi.fn();
+    const mapping = { owner: "owner", repo: "repo", workflowFile: "implement.yml", executionMode: "fly-machines" } as import("../config.js").RepoMapping;
+    const input = deps("");
+    input.adoption = () => ({
+      getDefaults: () => ({ config: { version: 1, mode: "configured", stages: { planning: { model: "default" }, implementation: { model: "default" }, review: { model: "default" } } } }),
+      getMappings: () => ({ A: mapping, B: mapping }),
+      getProject: () => null,
+      fingerprint: () => "unchanged",
+      runnerMode: () => "default",
+      readFile: async (_mapping, path) => path === ".ai-implement/config.yml" ? "models:\n  review: reviewer" : null,
+      inspectReadiness: async () => ({ status: "ready", profiles: [] }),
+      write,
+    });
+    expect(await cli.main(["adopt-projects", "--project", "B", "--dry-run"], input)).toBe(0);
+    expect(write).not.toHaveBeenCalled();
+    expect(out).toEqual([`B: would adopt; planning=${DEFAULT_MODEL} (DEFAULT_MODEL); implementation=${DEFAULT_MODEL} (DEFAULT_MODEL); review=reviewer (.ai-implement/config.yml)`]);
+  });
+  it.each([["--unknown"], ["--project"], ["--dry-run", "--dry-run"], ["--project", "A", "--project", "B"]])("rejects invalid options %j", async (...args) => {
+    expect(await cli.main(["adopt-projects", ...args], deps(""))).toBe(2);
+    expect(err.join("\n")).toContain("usage:");
+  });
+  it("reports the defaults prerequisite", async () => {
+    expect(await cli.main(["adopt-projects"], deps(""))).toBe(1);
+    expect(err).toContain("adopt-projects failed: run adopt-env first");
+  });
+});

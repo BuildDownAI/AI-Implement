@@ -1,3 +1,11 @@
+import { adoptProjects, type AdoptionDeps } from "./agent-config-adoption.js";
+import { getProjectStageConfig, readStageInputsFingerprint, setProjectStageConfig } from "./agent-config-store.js";
+import { getMappings } from "./config.js";
+import { getRunnerMode } from "./runner-mode.js";
+import { getDefaultBranchFileText } from "./github.js";
+import { getScopedInstallationToken } from "./github-app-auth.js";
+import { createAgentConfigAdminDeps } from "./model-auth-runtime.js";
+import { resolveDefaultRunnerImage } from "./repo-image.js";
 /**
  * Operator command for hosted model accounts: `node dist/model-account-cli.js <command> ...`, run on the
  * orchestrator machine (for example through `fly ssh console`). ChatGPT plan commands: `chatgpt-import`,
@@ -30,9 +38,10 @@ const OPERATOR = "model-account-cli";
 const USAGE =
   "usage: model-account-cli <chatgpt-import|chatgpt-status|chatgpt-logout> --profile <id>   (import reads the record JSON from stdin)\n" +
   "       model-account-cli <secret-import|secret-delete> --ref model-account:<name>   (import reads the API key or Bedrock JSON from stdin)\n" +
-  "       model-account-cli adopt-env";
+  "       model-account-cli adopt-env\n       model-account-cli adopt-projects [--project <key>] [--dry-run]";
 
 export interface CliDeps {
+  adoption?: () => AdoptionDeps;
   store: () => ModelSessionStore;
   /** Returns the orchestrator's host id, creating it on first use. */
   hostId: () => string;
@@ -255,6 +264,24 @@ const COMMANDS: Record<string, (profileId: string, deps: CliDeps) => Promise<voi
 
 export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promise<number> {
   const [command, ...rest] = argv;
+  if (command === "adopt-projects") {
+    let projectKey: string | undefined;
+    let dryRun = false;
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--dry-run" && !dryRun) dryRun = true;
+      else if (rest[i] === "--project" && !projectKey && rest[i + 1] && !rest[i + 1]!.startsWith("--")) projectKey = rest[++i];
+      else { deps.stderr(USAGE); return 2; }
+    }
+    try {
+      const results = await adoptProjects(deps.adoption?.() ?? productionAdoptionDeps(deps), { projectKey, dryRun });
+      for (const result of results) deps.stdout(`${result.projectKey}: ${result.outcome}${result.modelNotCarried ? "; model not carried" : ""}; ${STAGE_NAMES.map(stage => `${stage}=${result.stages[stage].model} (${result.stages[stage].source})`).join("; ")}`);
+      return 0;
+    } catch (error) {
+      const message = error instanceof Error && ["run adopt-env first", "unknown project"].includes(error.message) ? error.message : "unexpected failure";
+      deps.stderr(`adopt-projects failed: ${message}`);
+      return 1;
+    }
+  }
   if (command === "adopt-env") {
     if (rest.length) { deps.stderr(USAGE); return 2; }
     try { adoptEnv(deps); return 0; }
@@ -321,4 +348,22 @@ export function defaultDeps(): CliDeps {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   main(process.argv.slice(2)).then((code) => process.exit(code));
+}
+
+function productionAdoptionDeps(deps: CliDeps): AdoptionDeps {
+  return {
+    getDefaults: getOrchestratorDefaults,
+    getMappings,
+    getProject: getProjectStageConfig,
+    fingerprint: readStageInputsFingerprint,
+    runnerMode: () => getRunnerMode().mode,
+    async readFile(mapping, path) {
+      const scoped = await getScopedInstallationToken(deps.env.GITHUB_APP_ID ?? "", (deps.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"), mapping.owner, { repositories: [mapping.repo] });
+      return getDefaultBranchFileText(scoped.token, mapping.owner, mapping.repo, path);
+    },
+    inspectReadiness(request, candidate) {
+      return createAgentConfigAdminDeps({ githubAppId: deps.env.GITHUB_APP_ID ?? "", githubAppPrivateKey: (deps.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"), sessionImage: resolveDefaultRunnerImage(deps.env).image }).inspectReadiness(request, candidate);
+    },
+    write: (key, candidate, fingerprint) => { setProjectStageConfig(key, candidate, OPERATOR, fingerprint); },
+  };
 }

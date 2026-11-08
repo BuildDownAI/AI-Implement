@@ -178,3 +178,18 @@ is `configured`, and all three stages name the adopted profile. Projects still
 need their own explicit opt-in. To roll back, revert the defaults and delete the
 profile on Models & providers; remove its encrypted credential with `secret-delete`
 if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it.
+
+## Adopting existing projects
+
+Existing projects remain legacy until an operator runs `adopt-projects`:
+
+```bash
+npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --dry-run
+npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --project PROJECT_KEY
+```
+
+Run `adopt-env` first to establish configured defaults. Each project line reports the outcome and each stage's model and source. Adoption reads `.ai-implement/config.yml`, `WORKFLOW.md` and `PLANNING.md` from the repository's default branch. Implementation and review prefer `models.implement` / `models.review` over WORKFLOW front matter; planning uses PLANNING front matter. Stages without a repository model retain the legacy `DEFAULT_MODEL` fallback (shown as `DEFAULT_MODEL` in the report). Each effective legacy model becomes a stage override when it differs from configured defaults; matching models need no override. If repository reads fail, the report says “model not carried” and all stages inherit defaults.
+
+Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and explicit legacy opt-outs are skipped. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
+
+After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, write an explicit legacy row on the project's **Agents** tab; future adoption runs preserve that opt-out.
