@@ -100,24 +100,17 @@ export interface DispatchResult {
 }
 
 /**
- * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
- * newer template drops, because their values now ride inside `run_config` instead.
- * Envelope builders omit the phase and callback URL inputs; KG dispatches still send
- * the display-only `issue_identifier`. `postWorkflowDispatch` strips whichever of these a 422 names and
- * retries — **at most once**, regardless of what the retry's own response says — so the
- * orchestrator can serve both template generations until every target repo has re-synced.
- * `issue_identifier` joined this list for the same reason (AII-656): on the envelope contract
- * it is a display-only duplicate of `run_config.issue.identifier`, so a target repo that hasn't
- * re-synced can drop it without losing anything; the `run_config` guard below keeps it
- * authoritative on the legacy contract, where no duplicate exists.
+ * Display-only input missing from templates predating AII-656. Its value also lives in
+ * run_config.issue.identifier, so unmanaged envelope dispatches can omit it on one retry.
+ * Remove this compatibility retry after main is updated and every fleet re-syncs.
  */
-export const ENVELOPE_OPTIONAL_INPUTS = ["runner_phase", "runner_callback_url", "issue_identifier"] as const;
+export const ENVELOPE_OPTIONAL_INPUTS = ["issue_identifier"] as const;
 
 /**
  * Extracts the quoted input names from a GitHub "unexpected inputs" rejection so the caller can
  * match them exactly — never by substring — against `ENVELOPE_OPTIONAL_INPUTS`. GitHub returns
- * either the bare text `Unexpected inputs provided: ["runner_phase"]` or a JSON envelope
- * `{"message":"Unexpected inputs provided: [\"runner_phase\"]","documentation_url":"..."}`; in
+ * either the bare text `Unexpected inputs provided: ["issue_identifier"]` or a JSON envelope
+ * `{"message":"Unexpected inputs provided: [\"issue_identifier\"]","documentation_url":"..."}`; in
  * the JSON case the message's escaped quotes must be decoded before scanning for quoted tokens,
  * or every extracted name would carry a trailing backslash and never match. `JSON.parse` handles
  * that decoding; the raw-text case is left as-is when parsing fails (it isn't JSON to begin with).
@@ -508,7 +501,7 @@ export function buildEnvelopeDispatchInputs(
     run_config: credentials !== undefined ? encodeTrustedRunConfig(runConfig) : encodeRunConfig(runConfig),
     // Display-only duplicate: run-name: is evaluated before any step runs, so it cannot
     // decode run_config. The shared 422 retry (ENVELOPE_OPTIONAL_INPUTS) strips this on a
-    // template that predates the declaration.
+    // template that predates AII-656; remove the retry after main updates and every fleet re-syncs.
     issue_identifier: issue.identifier,
     // Private transport: bearers live only in run_config.credentials; "" keeps the (required)
     // top-level input present for readers that predate the private namespace.
@@ -539,25 +532,15 @@ function isManagedRunConfig(encoded: string): boolean {
 }
 
 /**
- * Posts a `workflow_dispatch`, with a bounded strip-and-retry for older templates: **at most
- * two requests, ever.** On a 422 whose body matches `/unexpected inputs/i` and names — by exact
- * match, never substring — at least one `ENVELOPE_OPTIONAL_INPUTS` member that is present in
- * `inputs`, and only when `inputs.run_config` is a non-empty string, it strips exactly the named
- * members and posts once more. Whatever that second request returns — success, a different 422,
- * the same 422 again — is returned as-is; there is no third request. A target repo whose 422
- * keeps naming a *different* declared-but-unhandled input across requests would otherwise chain
- * indefinitely, since each response only proves what the target rejected on that specific
- * payload, not what it will accept next.
+ * Posts a `workflow_dispatch` with one compatibility retry for templates predating AII-656.
+ * An unmanaged dispatch with non-empty run_config may remove only a present issue_identifier
+ * named exactly in a 422 "unexpected inputs" rejection. Other rejected names remain intact.
+ * The identifier is a display-only duplicate on the envelope contract; without run_config it
+ * is authoritative issue data and must stay. Managed envelopes never strip any input.
  *
- * The `run_config` guard matters: on the legacy contract `runner_phase`/`runner_callback_url`
- * are authoritative issue data, not compatibility duplicates, so stripping them there would run
- * a gap-fill as an implementation. The guard requires a non-empty string — `run_config: ""`
- * must not count as "envelope present" and authorize a strip.
- *
- * Name matching is exact against the quoted tokens in the rejection body (via
- * `extractUnexpectedInputNames`), not `body.includes(name)` — a rejection naming
- * `runner_phase_extra` or `extra_runner_callback_url` must not be mistaken for a match on
- * `runner_phase` or `runner_callback_url`.
+ * Name matching parses quoted tokens in raw-text or JSON errors, so issue_identifier_extra
+ * cannot match issue_identifier. The second response is returned unconditionally, even on
+ * another 422: at most two requests. Remove the retry after main updates and every fleet re-syncs.
  */
 export async function postWorkflowDispatch(opts: {
   token: string;
