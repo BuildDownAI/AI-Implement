@@ -1357,9 +1357,6 @@ export type PlanningDispatchContext = {
    *  resolvedPlanningBranch, which may instead resolve to the feature-branch chain
    *  target or fall back to the mapping default. */
   planningFieldValue: string | null;
-  /** Typed trusted-preparation seam (AII-958): private credentials for the planning run. Planning
-   *  never receives publication authority; requires supportsPrivateRunConfig or fails pre-launch. */
-  trustedCredentials?: RunCredentialsV1;
 };
 
 /**
@@ -1470,8 +1467,8 @@ export async function dispatchPlanning(
 ): Promise<void> {
   const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
 
-  // Pilot lifecycle: the PlanningRun workflow owns the reservation and launches the run.
-  if (resolveReviewFixLifecycle(mapping) === "restate") {
+  // GitHub Actions always uses PlanningRun; container backends retain the lifecycle switch.
+  if (execPath === "github-actions" || resolveReviewFixLifecycle(mapping) === "restate") {
     if (!restateCanServe()) {
       console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
       return;
@@ -1515,45 +1512,6 @@ export async function dispatchPlanning(
     });
     return;
   }
-
-  // ---------- GHA path (also handles shadow → GHA-only via resolvePlanningExecutionPath) ----------
-  // Final admission authority — see the matching comment in dispatchGitHubActions.
-  const dispatchId = crypto.randomUUID();
-  const planningAdmission = acquireDispatch({
-    dispatchId,
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    kind: "planning",
-    teamKey: issue.scopeKey,
-    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-    backend: "github-actions",
-  });
-  if (!planningAdmission.ok) return;
-
-  // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
-  // here is by construction a definitive non-launch — see the matching comment in
-  // dispatchGitHubActions.
-  const launch = await preparePlanningLaunch({
-    config, provider, issue, mapping, dispatchId, resolvedPlanningBranch,
-    trustedCredentials: ctx.trustedCredentials,
-    resolveRunnerImage: resolveDispatchRunnerImage,
-    fireBreakerTrip,
-  }).catch((err) => {
-    planningAdmission.release("launch_rejected");
-    throw err;
-  });
-
-  const launched = await launchPlanningRun({
-    ...launch,
-    config, provider, issue, mapping, dispatchId,
-    admissionGeneration: planningAdmission.admissionGeneration,
-    planningFieldValue,
-    fireBreakerTrip,
-    onRejected: () => planningAdmission.release("launch_rejected"),
-  });
-  if (launched.outcome !== "accepted") return;
-
-  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${launch.runnerImage ?? "workflow-default"})`);
 }
 
 // ---------- Shared session-dispatch core ----------
@@ -5349,7 +5307,7 @@ async function main(): Promise<void> {
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
-  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for a project on the Restate lifecycle.
+  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every GitHub Actions run and container projects on the Restate lifecycle.
   const planningRunServices = createProductionPlanningRunServices({
     config,
     resolveProvider: (mapping) => registry.forMapping(mapping),
