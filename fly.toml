@@ -20,3 +20,10 @@ kill_timeout = 15
 [mounts]
   source = "dedup_data"
   destination = "/data"
+
+# Restart the machine when the orchestrator exits non-zero. Boot exits 1 when the
+# Restate sidecar cannot serve (ADR 023 amendment); after 10 failed restarts in a
+# row the machine stays stopped, so a broken Restate is seen, not hidden by a loop.
+[[restart]]
+  policy = "on-failure"
+  retries = 10
