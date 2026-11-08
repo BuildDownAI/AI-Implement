@@ -3,6 +3,7 @@
  * no guessed URL can move another scope. Actions preserve the exact owner and
  * never free capacity without the workflow's backend-terminal confirmation. */
 import type { ReviewFixAttemptsFacade, ReviewFixAttemptCaller, ReviewFixAttemptCycleSummary } from "./admin.js";
+import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import { getDb } from "./dedup.js";
 import { getInvocationAttribution } from "./log.js";
 import { getReviewFixActivityGaps, isReviewFixEvidenceTombstoned,
@@ -15,6 +16,7 @@ import type { ReviewFixImmutableOutcome, ReviewFixWorkerPort } from "./review-fi
 interface AttemptRow {
   attempt_id: string; dispatch_id: string; installation_id: string; repository: string; pr_number: number;
   owner: string; state: string; deadline_at: number; authority_revoked_at: number | null;
+  execution_backend: DispatchAdmissionBackend;
   github_run_id: number | null; github_run_attempt: number | null;
   task_snapshot_json: string; finding_versions_json: string;
   terminal_outcome_json: string | null; result_conflict_at: number | null;
