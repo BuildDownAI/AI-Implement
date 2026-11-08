@@ -104,3 +104,11 @@ GET / (operator decision D6, AII-1750):
 | ready | unreachable | 503 | unavailable (the process is exiting per S1-10) |
 | exited | any | 503 | unavailable |
 | missing-binary | not-attempted | 503 | unavailable |
+
+### Current implementation status (2026-11-08, Stage 1)
+
+The Stage 1 runtime changes described prospectively in the November 7 amendment are now implemented. Boot waits for Restate readiness, successful registration, and completion of the registered hook, including the awaited `RunnerBackend` seed. Startup, registration, hook, and boot-deadline failures exit 1; `declined-conflict` continues waiting and retrying without a deadline. An unexpected sidecar exit after boot shuts down the orchestrator with exit 1, while intentional stop/restart teardown is suppressed. `GET /` returns 503 with `status: "unavailable"` whenever Restate cannot serve. The KG sidecar remains non-fatal. See [the current boot and health documentation](../restate.md#boot-sequence).
+
+GitHub Actions planning now always enters `PlanningRun`, regardless of project lifecycle, and refuses dispatch while Restate is unavailable. Fly/local planning retains its lifecycle switch pending AII-1771. Stage 2 ownership changes in ADR 031, 030, and 018 remain prospective. AII-1756 provides protected setup-token storage/API only; Track D supplies the consumer/UI work, and this stage establishes neither live adoption nor a complete credential-flow proof.
+
+The dated decision and prospective tables above remain the historical record; this implementation note does not establish deployed Fly restart policy or health.
