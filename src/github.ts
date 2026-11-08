@@ -31,10 +31,8 @@ export interface DispatchInputs {
   base_branch?: string;
   /**
    * Explicit callback phase reported by the runner. In envelope mode rides inside run_config.
-   * `"kg-refresh"` is the GHA-backed kg-refresh dispatch (`createKgRefreshDispatch`),
-   * the one dispatch site that still sends this input top-level under the envelope contract.
    */
-  runner_phase?: "implementation" | "gap-analysis" | "kg-refresh";
+  runner_phase?: "implementation" | "gap-analysis";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
@@ -103,10 +101,9 @@ export interface DispatchResult {
 
 /**
  * `workflow_dispatch` inputs that an older synced `claude-implement.yml` still declares but a
- * newer template drops, because their values now ride inside `run_config` instead. Only the
- * kg-refresh GHA dispatch (`createKgRefreshDispatch`) still sends these
- * top-level — every other dispatch site already builds inputs via `buildEnvelopeDispatchInputs`,
- * which never sets them. `postWorkflowDispatch` strips whichever of these a 422 names and
+ * newer template drops, because their values now ride inside `run_config` instead.
+ * Envelope builders omit the phase and callback URL inputs; KG dispatches still send
+ * the display-only `issue_identifier`. `postWorkflowDispatch` strips whichever of these a 422 names and
  * retries — **at most once**, regardless of what the retry's own response says — so the
  * orchestrator can serve both template generations until every target repo has re-synced.
  * `issue_identifier` joined this list for the same reason (AII-656): on the envelope contract
@@ -958,10 +955,9 @@ export async function findWorkflowRunId(
 /**
  * Builds the `workflow_dispatch` inputs for a GHA-backed kg-refresh run, for use with
  * `postWorkflowDispatch`. The envelope's `runnerCallbackUrl` is the bare base URL (AII-548);
- * `runner_phase` selects the kg-refresh entry in the shared claude-implement.yml template
- * (AII-556) — it, `runner_callback_url`, and `issue_identifier` are members of
- * `ENVELOPE_OPTIONAL_INPUTS` and are stripped by the poster on a 422 from a target repo that no
- * longer declares them. `issueIdentifier` is the decoded run_config's `issue.identifier` — the
+ * the phase and callback URL travel only in run_config. The optional top-level
+ * `issue_identifier` can be stripped by the poster on a 422 from older templates.
+ * `issueIdentifier` is the decoded run_config's `issue.identifier` — the
  * caller (`createKgRefreshDispatch`) decodes run_config once and
  * threads `issue.identifier` through here.
  */
@@ -971,8 +967,6 @@ export function buildKgRefreshGhaDispatchBody(opts: {
   runProgressToken: string;
   runPublicationToken?: string;
   runnerImage: string | undefined;
-  runnerCallbackUrl?: string | undefined;
-  runnerPhase?: DispatchInputs["runner_phase"];
   jobTimeoutMinutes?: string;
   issueIdentifier?: string;
 }): DispatchInputs {
@@ -981,10 +975,8 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     run_token: opts.runToken,
     run_progress_token: opts.runProgressToken,
     ...(opts.runPublicationToken !== undefined ? { run_publication_token: opts.runPublicationToken } : {}),
-    ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
     ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
     ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
-    ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
     ...(opts.issueIdentifier ? { issue_identifier: opts.issueIdentifier } : {}),
   };
 }
