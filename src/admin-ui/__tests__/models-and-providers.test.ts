@@ -109,6 +109,7 @@ describe("Claude subscription credentials", () => {
     const api = vi.fn(async (path: string, options?: { method?: string; body?: string }) => {
       if (path === `/api/model-accounts/${encodeURIComponent(profileId)}/credential`) {
         accounts[0].credentialSet = options?.method === "PUT";
+        accounts[0].account.readiness = options?.method === "PUT" ? "ready" : "missing";
       }
       return {
         ok: true,
@@ -142,6 +143,7 @@ describe("Claude subscription credentials", () => {
       if (admin) {
         const input = rows[0].querySelector<HTMLInputElement>("input")!;
         expect(input.value).toBe("");
+        expect(input.placeholder).toBe("setup-token");
         expect(input.getAttribute("data-key-for")).toBe(profileId);
         expect(rows[0].querySelector('[data-act="set-key"]')?.getAttribute("data-profile")).toBe(profileId);
         expect(rows[0].querySelector('[data-act="remove-key"]')?.textContent).toBe("Remove key");
@@ -164,6 +166,7 @@ describe("Claude subscription credentials", () => {
         await vi.waitFor(() => {
           expect(api).toHaveBeenCalledWith(credentialUrl, { method: "DELETE" });
           expect(win.document.querySelector("#mp-account-rows tr td:last-child .badge")?.textContent).toBe("not set");
+          expect(win.document.querySelectorAll("#mp-account-rows tr td")[6].textContent).toBe("missing");
         });
         expect(win.document.body.innerHTML).not.toContain("unsubmitted-token");
       }

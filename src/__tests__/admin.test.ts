@@ -6513,7 +6513,6 @@ describe("model accounts and stage configuration (AII-962)", () => {
       agentConfig: {
         inspectReadiness: async () => ({ status: "ready", profiles: [] }),
         credentials: { sessionStore: { readPlanRecord } as never, resolveProtectedSecret: () => null },
-        sessionSnapshot: (id) => (id === "cl-sub" ? { profileId: id, dispatchId: "d", generation: 1, state: "recovery_required", heartbeatAt: null } : undefined),
       },
     });
     const list = async (readPlanRecord: () => unknown) => (await call("/api/model-accounts", "GET", t, undefined, mk(readPlanRecord))).json.accounts;
@@ -6523,8 +6522,8 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
     accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
     expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
-    expect(find(accts, "cl-sub").account.readiness).toBe("missing");
-    expect(find(accts, "cl-sub").account.sessionRecovery).toEqual({ state: "recovery_required", recoveryRequired: true });
+    expect(find(accts, "cl-sub").account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
+    expect(find(accts, "cl-sub").account).not.toHaveProperty("sessionRecovery");
     expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
     expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
 
@@ -6974,14 +6973,17 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const t = await seedProfile({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef });
       const ref = credentialRef ?? "model-account:cl-sub";
       const deps = readyDeps();
+      const resolveSecret = vi.fn(() => { throw new Error("status must not read a secret"); });
+      deps.agentConfig!.credentials.resolveProtectedSecret = resolveSecret;
       const read = async () => {
         const r = await call("/api/model-accounts", "GET", t, undefined, deps);
         expect(r.raw).not.toContain(token);
         expect(r.raw).not.toContain(ref);
+        expect(resolveSecret).not.toHaveBeenCalled();
         return r.json.accounts.find((a: { profileId: string }) => a.profileId === "cl-sub");
       };
       expect((await read()).credentialSet).toBe(false);
-      if (!credentialRef) expect((await read()).account.readiness).toBe("missing");
+      expect((await read()).account).toEqual({ readiness: "missing", failureCode: credentialRef ? "secret_unavailable" : "reference_missing" });
       const revs = count("model_account_profile_revisions");
       for (const value of [token, token + "-replacement"]) {
         const put = await call(url("cl-sub"), "PUT", t, { apiKey: value });
@@ -6996,7 +6998,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(count("model_account_profile_revisions")).toBe(revs + (credentialRef ? 0 : 1));
       for (let i = 0; i < 2; i++) expect((await call(url("cl-sub"), "DELETE", t)).status).toBe(200);
       expect(store().resolve(ref)).toBeNull();
-      expect(await read()).toMatchObject({ credentialSet: false, credentialUpdatedAt: null });
+      expect(await read()).toMatchObject({ credentialSet: false, credentialUpdatedAt: null, account: { readiness: "missing", failureCode: "secret_unavailable" } });
     });
 
     it("derives model-account:<id> and appends one revision for a profile without a ref", async () => {

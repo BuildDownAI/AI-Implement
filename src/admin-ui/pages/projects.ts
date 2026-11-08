@@ -892,10 +892,6 @@ export const projectsScript = `
       var acct = a.account || {};
       var line = a.identity + ' (' + a.profileId + ') · ' + a.agent + '/' + a.provider + ' · ' + a.authMode + ' · readiness: ' + agText(acct.readiness || 'unknown');
       if (acct.failureCode) line += ' (' + acct.failureCode + ')';
-      if (a.authMode === 'claude-subscription') {
-        var rec = acct.sessionRecovery;
-        line += ' · session recovery: ' + (rec ? rec.state + (rec.recoveryRequired ? ', recovery required' : '') : 'none') + ' · cannot be enabled from here';
-      }
       return '<div class="field-hint" data-ag-profile="' + window.escAttr(a.profileId) + '">' + window.esc(line) + '</div>';
     }).join('');
   }

@@ -289,7 +289,7 @@ export const modelsAndProvidersScript = `(function () {
         const pid = window.escAttr(a.profileId);
         keyCell = '<span class="badge ' + (a.credentialSet ? 'success' : 'neutral') + '">' + (a.credentialSet ? 'set' : 'not set') + '</span>' +
           (mpCanEdit()
-            ? '<div style="display:flex;gap:4px;margin-top:4px"><input class="input" type="password" autocomplete="off" data-key-for="' + pid + '" placeholder="API key">' +
+            ? '<div style="display:flex;gap:4px;margin-top:4px"><input class="input" type="password" autocomplete="off" data-key-for="' + pid + '" placeholder="' + (a.authMode === 'claude-subscription' ? 'setup-token' : 'API key') + '">' +
               '<button class="btn btn-sm" data-act="set-key" data-profile="' + pid + '">Set key</button>' +
               '<button class="btn btn-sm" data-act="remove-key" data-profile="' + pid + '">Remove key</button></div>'
             : '');
