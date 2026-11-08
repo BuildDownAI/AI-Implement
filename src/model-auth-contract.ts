@@ -193,7 +193,7 @@ export function isSubscriptionAuthMode(mode: AccountAuthMode): boolean {
   return SUBSCRIPTION_AUTH_MODES.includes(mode);
 }
 
-/** The one secret kind a checkout may carry for the mode. A codex-subscription secret is always an access token. */
+/** Default checkout secret kind; Claude subscription also accepts a setup-token. */
 export function expectedSecretKind(authMode: AccountAuthMode): ModelAuthSecret["kind"] {
   switch (authMode) {
     case "bedrock":
@@ -534,11 +534,18 @@ export interface ChatGptAccessTokenSecret {
   readonly expiresAt: number;
 }
 
+/** Claude setup-token for subscription CLI authentication. Secret-bearing. */
+export interface ClaudeOauthTokenSecret {
+  readonly kind: "claude-oauth-token";
+  readonly token: string;
+}
+
 export type ModelAuthSecret =
   | ApiCredentialSecret
   | AwsBedrockSecret
   | SessionStateSecret
-  | ChatGptAccessTokenSecret;
+  | ChatGptAccessTokenSecret
+  | ClaudeOauthTokenSecret;
 
 /** Strict shape check; errors name fields only, never values. */
 function parseChatGptAccessTokenSecret(s: Record<string, unknown>): ValidationResult<ChatGptAccessTokenSecret> {
@@ -624,6 +631,16 @@ export function parseModelAuthCheckoutResponse(raw: unknown): ValidationResult<M
   if (reservesModelAccount(authMode.value)) {
     const gen = validatePositiveInt(r.ownerGeneration, "ownerGeneration");
     if (!gen.ok) return gen;
+    if (authMode.value === "claude-subscription" && s.kind === "claude-oauth-token") {
+      const keys = rejectUnknownKeys(s, ["kind", "token"], "checkout secret");
+      if (!keys.ok) return keys;
+      const token = validateBoundedSecret(s.token, "token", MAX_API_CREDENTIAL_LENGTH);
+      if (!token.ok) return token;
+      return ok({
+        version: 1, ok: true, profileId: profileId.value, authMode: authMode.value,
+        ownerGeneration: gen.value, secret: { kind: "claude-oauth-token", token: token.value },
+      });
+    }
     const su = rejectUnknownKeys(s, ["kind", "sessionData", "stateSequence"], "checkout secret");
     if (!su.ok) return su;
     if (s.kind !== "session") return err("checkout secret kind must be 'session' for subscription modes");

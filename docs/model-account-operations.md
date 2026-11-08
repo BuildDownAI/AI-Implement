@@ -143,10 +143,10 @@ These lines appear only for hosted credentials, so an empty search does not mean
 
 ## Claude subscription accounts
 
-[ADR 049](adr/049-claude-subscription-profiles-hold-a-setup-token.md) records the 2026-11-07 operator decision: a managed `claude-subscription` profile holds the long-lived value produced by `claude setup-token`. Managed checkout support is forthcoming; importing the token does not yet make the profile usable for managed runs.
+[ADR 049](adr/049-claude-subscription-profiles-hold-a-setup-token.md) records the 2026-11-07 operator decision: a managed `claude-subscription` profile holds the long-lived value produced by `claude setup-token`. The runner checkout reader accepts both setup-token and session secrets; orchestrator delivery of setup-tokens is deferred to D4, so importing the token does not yet make the profile usable for managed runs.
 
 Import the token on the orchestrator with `node dist/model-account-cli.js secret-import --ref model-account:<name>`. Supply the token value on stdin, never in argv. Use the profile's credential reference; the default is `model-account:<name>`. This uses the existing protected-secret store in `model_protected_secrets`, with the same protection and rotation requirements as [API credentials](#api-credentials).
 
 A write-only credential field on **Models & providers** will allow an admin to set or replace the profile's setup-token without reading it back. That field comes with D6; it is not available for Claude subscription profiles yet.
 
-The decided checkout shape is `{ kind: "claude-oauth-token", token }`, delivered to the runner as `CLAUDE_CODE_OAUTH_TOKEN`. There is no refresh, reservation, or owner generation, and concurrent runs on one profile are allowed. Local `local-login` subscription runs retain the `session` kind and `authDir`.
+The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token }`, delivered to the runner as `CLAUDE_CODE_OAUTH_TOKEN`. The reader currently retains the existing checkout envelope and owner-generation requirements. D4 will enable orchestrator delivery and remove reservation and owner-generation requirements; setup-tokens need no refresh. Local `local-login` subscription runs retain the `session` kind and `authDir`.
