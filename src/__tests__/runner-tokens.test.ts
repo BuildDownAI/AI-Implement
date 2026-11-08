@@ -400,6 +400,69 @@ function resignPilotClaims(token: string, changes: Record<string, unknown>): str
 }
 
 describe("prepared review-fix credentials", () => {
+  describe.each(["github-actions", "fly", "local"])("publication scope for %s", (backend) => {
+    function prepare() {
+      const now = Date.now();
+      seedPreparedPilotAttempt(now + 1000);
+      dedup.getDb().prepare(`UPDATE review_fix_attempts SET state = 'launch_intent',
+        execution_backend = ?, execution_ref = 'machine-1', github_run_id = 123,
+        github_run_attempt = 2 WHERE attempt_id = ?`).run(backend, PILOT_ATTEMPT);
+      const { token } = runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "result", secret: SECRET,
+      });
+      return { now, token };
+    }
+
+    it.each([
+      { name: "matching IDs", githubRunId: 123, githubRunAttempt: 2 },
+      { name: "absent IDs", githubRunId: undefined, githubRunAttempt: undefined },
+      { name: "different run ID", githubRunId: 999, githubRunAttempt: 2 },
+      { name: "different attempt", githubRunId: 123, githubRunAttempt: 3 },
+      { name: "nonpositive IDs", githubRunId: 0, githubRunAttempt: 0 },
+    ])("checks $name against the stored backend", ({ githubRunId, githubRunAttempt }) => {
+      const { token } = prepare();
+      const result = runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "acme/app", githubRunId, githubRunAttempt },
+      });
+      expect(result).toMatchObject(backend !== "github-actions" || (githubRunId === 123 && githubRunAttempt === 2)
+        ? { ok: true } : { ok: false, reason: "wrong_scope" });
+    });
+
+    it("rejects an unbound execution", () => {
+      const { token } = prepare();
+      dedup.getDb().prepare(`UPDATE review_fix_attempts SET execution_ref = NULL,
+        github_run_id = NULL, github_run_attempt = NULL WHERE attempt_id = ?`).run(PILOT_ATTEMPT);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "acme/app" },
+      })).toMatchObject({ ok: false, reason: "wrong_scope" });
+    });
+
+    it("rejects a repository mismatch", () => {
+      const { token } = prepare();
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "other/repo", githubRunId: 123, githubRunAttempt: 2 },
+      })).toMatchObject({ ok: false, reason: "wrong_scope" });
+    });
+
+    it.each([1000, 1001])("refuses publication at deadline + %i ms from preparation", (elapsed) => {
+      const { now, token } = prepare();
+      vi.spyOn(Date, "now").mockReturnValue(now + elapsed);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 },
+      })).toMatchObject({ ok: false, reason: "revoked" });
+    });
+
+    it.each(["state = 'completed'", "terminal_outcome_json = '{}'", "completed_at = 1"])(
+      "refuses ended authority: %s", (assignment) => {
+        const { token } = prepare();
+        dedup.getDb().prepare(`UPDATE review_fix_attempts SET ${assignment} WHERE attempt_id = ?`).run(PILOT_ATTEMPT);
+        expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+          publicationExecution: { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 },
+        })).toMatchObject({ ok: false, reason: "revoked" });
+      },
+    );
+  });
+
   it("permits publication only for the bound live execution, then rejects revocation and termination", () => {
     seedPreparedPilotAttempt();
     const db = dedup.getDb();
