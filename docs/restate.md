@@ -88,6 +88,8 @@ An unattended Restate exit or error after serving logs `[main] Restate sidecar e
 
 ### Health surfaces (AII-807)
 
+`GET /` returns HTTP 200 with top-level `status: "ok"` only when `restateCanServe` is true: the sidecar is `ready` and registration is `registered`. Otherwise it returns HTTP 503 with `status: "unavailable"`. All other body fields are unchanged; the response still includes local diagnostics. Inspect both the status code and body with `curl -i http://localhost:8080/`.
+
 `GET /` (`src/index.ts`) and `get_tenant_health` (`src/restate/tools.ts`, over `/mcp`) both add a `restate` field, `getRestateStatus()` read verbatim — one source of truth (`src/restate/status.ts`), so the two surfaces cannot drift under a flapping sidecar the way two independently-tracked copies could. The shape:
 
 ```json
@@ -115,7 +117,7 @@ An unattended Restate exit or error after serving logs `[main] Restate sidecar e
 
 Both `sidecar` and `registration` are independent — a `registration.state` other than `not-attempted` implies `sidecar.state` was `ready` at some point, but the reverse is not guaranteed (the gate could still be mid-`attempt()`, or shutdown could have won the race first).
 
-While `registration.state` is not `registered` (the boot window and `declined-conflict`), tool calls answer 503 `restate-unavailable` (§ "Register the SDK endpoint without `force`"), including `get_tenant_health`; `GET /` is the health surface during that window.
+While `registration.state` is not `registered` (the boot window and `declined-conflict`), tool calls answer 503 `restate-unavailable` (§ "Register the SDK endpoint without `force`"), including `get_tenant_health`; `GET /` still returns local diagnostics during that window, with HTTP 503 and `status: "unavailable"`.
 
 ### Ports and paths — all loopback, all constants
 
