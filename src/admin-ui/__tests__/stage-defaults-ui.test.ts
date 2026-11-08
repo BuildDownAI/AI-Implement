@@ -57,15 +57,15 @@ describe("models page stage defaults", () => {
   beforeEach(() => { w.__pwn = undefined; });
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
-  it("renders sentinels as text and never shows credential fields", async () => {
+  it("renders sentinels as text and never shows saved credential values", async () => {
     await bootModels();
     expect(document.querySelector("img")).toBeNull();
     expect(document.body.textContent).toContain(SENT);
     for (const secret of ["SECRET-REF", "SECRET-TOKEN", "SECRET-STATE"]) expect(document.body.innerHTML).not.toContain(secret);
-    expect(document.querySelector('input[type="password"]')).toBeNull();
+    expect(document.querySelector<HTMLInputElement>('input[type="password"]')?.value).toBe("");
   });
 
-  it("labels ChatGPT plan and statuses, with recovery only for Claude subscription", async () => {
+  it("labels ChatGPT plan and shared readiness without recovery state", async () => {
     await bootModels();
     const rows = Array.from(document.querySelectorAll("#mp-account-rows tr"));
     const gpt = rows[1].textContent!;
@@ -75,7 +75,8 @@ describe("models page stage defaults", () => {
     expect(gpt).not.toContain("codex-subscription");
     expect(gpt).not.toContain("recovery");
     expect(gpt).not.toContain("busy");
-    expect(rows[0].textContent).toContain("recovery_required");
+    expect(rows[0].textContent).toContain("unknown");
+    expect(rows[0].textContent).not.toContain("recovery");
     expect(rows[2].textContent).toContain("node dist/chatgpt-plan-login.js login");
     expect(rows[2].textContent).toContain("chatgpt-import");
     expect(rows[3].textContent).toContain("chatgpt-import");

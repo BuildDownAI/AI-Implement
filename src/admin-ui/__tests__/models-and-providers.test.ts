@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { JSDOM } from "jsdom";
+import { describe, expect, it, vi } from "vitest";
 import { modelsAndProvidersHtml, modelsAndProvidersScript } from "../pages/models-and-providers.js";
 
 describe("models-and-providers page", () => {
@@ -80,5 +81,68 @@ describe("models-and-providers page", () => {
     expect(fn).toContain("inp.value = typed[id]");
     expect(fn).toContain(".focus()");
     expect(modelsAndProvidersScript).not.toMatch(/(localStorage|sessionStorage)/);
+  });
+});
+
+
+describe("Claude subscription credentials", () => {
+  it.each([true, false])("renders credential badges and readiness (admin=%s)", async (admin) => {
+    const dom = new JSDOM(modelsAndProvidersHtml, { runScripts: "outside-only" });
+    const win = dom.window;
+    const profileId = `claude"'<img src=x>&`;
+    const accounts = [true, false].map((credentialSet, i) => ({
+      profileId: i === 0 ? profileId : "claude-empty",
+      identity: "Claude subscription",
+      agent: "claude",
+      provider: "anthropic",
+      authMode: "claude-subscription",
+      profileStatus: "active",
+      credentialSet,
+      account: {
+        readiness: i === 0 ? "ready" : undefined,
+        sessionRecovery: { state: "legacy-recovery-state", recoveryRequired: true },
+      },
+    }));
+    win.isAdmin = () => admin;
+    win.registerPage = () => {};
+    win.esc = win.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+    win.api = async (path: string) => ({
+      ok: true,
+      json: async () => path === "/api/model-accounts" ? { accounts }
+        : path === "/api/agent-defaults" ? { mode: "legacy", stages: {} } : {},
+    });
+    try {
+      win.eval(modelsAndProvidersScript);
+      await win.loadModelsAndProviders();
+      await vi.waitFor(() => expect(win.document.querySelectorAll("#mp-account-rows tr")).toHaveLength(2));
+      const rows = win.document.querySelectorAll<HTMLTableRowElement>("#mp-account-rows tr");
+      const headers = rows[0].closest("table")!.querySelectorAll("th");
+      expect(Array.from(headers, h => h.textContent)).not.toContain("Busy / recovery");
+      for (const [i, row] of Array.from(rows).entries()) {
+        expect(row.cells).toHaveLength(headers.length);
+        expect(row.cells[6].textContent).toBe(i === 0 ? "ready" : "unknown");
+        expect(row.cells[7].querySelector(".badge")?.textContent).toBe(i === 0 ? "set" : "not set");
+        expect(row.textContent).not.toMatch(/legacy-recovery-state|recovery required|idle/);
+        expect(row.querySelectorAll("input[type=password]")).toHaveLength(admin ? 1 : 0);
+        expect(row.querySelectorAll("button[data-act]")).toHaveLength(admin ? 2 : 0);
+      }
+      expect(rows[0].cells[0].textContent).toBe(profileId);
+      expect(rows[0].querySelector("img")).toBeNull();
+      if (admin) {
+        const input = rows[0].querySelector<HTMLInputElement>("input")!;
+        expect(input.value).toBe("");
+        expect(input.getAttribute("data-key-for")).toBe(profileId);
+        expect(rows[0].querySelector('[data-act="set-key"]')?.getAttribute("data-profile")).toBe(profileId);
+        expect(rows[0].querySelector('[data-act="remove-key"]')?.textContent).toBe("Remove key");
+        input.value = "unsubmitted-token";
+        input.focus();
+        await win.loadModelsAndProviders();
+        await vi.waitFor(() => expect(win.document.querySelector("#mp-account-rows input")).not.toBe(input));
+        expect(win.document.querySelector<HTMLInputElement>("#mp-account-rows input")?.value).toBe("unsubmitted-token");
+        expect(win.document.activeElement?.getAttribute("data-key-for")).toBe(profileId);
+      }
+    } finally {
+      win.close();
+    }
   });
 });
