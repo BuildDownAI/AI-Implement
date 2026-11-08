@@ -14,6 +14,11 @@ describe("probeHealth", () => {
     expect(HEALTH_WAIT_MS).toBe(15 * 60_000);
   });
 
+  it("accepts a 200 with startup states before S1-15 changes the server status contract", async () => {
+    fakeFetch({ "GET /": { status: 200, json: { restate: { sidecar: { state: "starting" }, registration: { state: "not-attempted" } } } } }).install();
+    expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "serving" });
+  });
+
   it("reads both Restate states from a 503", async () => {
     fakeFetch({ "GET /": { status: 503, json: { restate: { sidecar: { state: "starting" }, registration: { state: "not-attempted" } } } } }).install();
     expect(await probeHealth("https://orchestrator.fly.dev/")).toEqual({ kind: "starting", sidecar: "starting", registration: "not-attempted" });
