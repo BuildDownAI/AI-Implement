@@ -220,11 +220,17 @@ async function postDispatchOnce(
     return parseDispatchRunDetails(res, owner, repo);
   }
 
-  const body = await res.text();
   // A definite 4xx application rejection is "rejected" — safe to treat as "did not happen".
   // Anything else (5xx, or an unrecognised status) is "unknown": GitHub may have started the
   // run before failing to report it cleanly.
   const outcome: DispatchOutcome = res.status >= 400 && res.status < 500 ? "rejected" : "unknown";
+  let body: string;
+  try {
+    body = await res.text();
+  } catch {
+    // Headers still establish the outcome. An unreadable body cannot justify a retry.
+    return { success: false, status: res.status, error: "Failed to read dispatch response body", outcome };
+  }
   return { success: false, status: res.status, error: body, outcome };
 }
 

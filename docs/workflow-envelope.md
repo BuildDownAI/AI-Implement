@@ -84,6 +84,8 @@ export interface DispatchResult {
 | `5xx`, or any other unrecognised status | `unknown` | absent | GitHub may have started the run before failing to report it cleanly; not safe to assume either accepted or rejected. |
 | transport failure (`fetch` throws) | `unknown` | absent | Returns `success: false`, `status: 0` and the error message without throwing. The response may have been lost after GitHub started the run. |
 
+If reading an error response body fails after headers arrive, the poster preserves the HTTP status and its `rejected`/`unknown` outcome, returns a body-read error message, and does not retry.
+
 The three-way split matters to a caller trying to avoid a duplicate dispatch: `rejected` is safe to retry (GitHub is certain nothing started), `accepted` needs no retry, and `unknown` is neither — a transport failure or 5xx must not be blindly retried, because GitHub may have already started the run.
 
 Every call receives the same outcome classification, including calls without options. Transport failures resolve to `{ success: false, status: 0, outcome: "unknown", error }` and must not trigger a blind retry. All production dispatch paths already requested run details before this became unconditional.

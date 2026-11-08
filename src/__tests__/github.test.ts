@@ -233,6 +233,34 @@ describe("postWorkflowDispatch — run details", () => {
     expect(fake.calls).toHaveLength(1);
   });
 
+  it.each([
+    { status: 422, outcome: "rejected" },
+    { status: 500, outcome: "unknown" },
+    { status: 503, outcome: "unknown" },
+  ])("a failed $status body stream preserves $outcome without retrying or throwing", async ({ status, outcome }) => {
+    const fake = fakeFetch({
+      [DISPATCHES]: () => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('Unexpected inputs provided: ["issue_identifier"]'));
+          },
+          pull(controller) {
+            controller.error(new Error('Unexpected inputs provided: ["issue_identifier"]'));
+          },
+        });
+        return new Response(body, { status });
+      },
+    }).install();
+
+    expect(await postWorkflowDispatch({
+      ...baseOpts,
+      inputs: { ...baseOpts.inputs, issue_identifier: "TEST-1" },
+    })).toEqual({
+      success: false, status, outcome, error: "Failed to read dispatch response body",
+    });
+    expect(fake.calls).toHaveLength(1);
+  });
+
   it("an unparseable 200 body → unknown, not accepted", async () => {
     fakeFetch({ [DISPATCHES]: { status: 200, text: "not json" } }).install();
 
