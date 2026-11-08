@@ -50,6 +50,10 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
       }
       continue;
     }
+    const runnerMode = deps.runnerMode();
+    const path = resolveExecutionPath(runnerMode, mapping.executionMode);
+    const backends = path === "both" ? ["github-actions", "fly-machines"] as const : [path];
+    const planningBackend = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
     const candidate: StageAgentConfigurationV1 = { version: 1, mode: "configured", stages: {} };
     try {
       const [config, workflow, planning] = await Promise.all([
@@ -65,12 +69,23 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
       for (const stage of STAGE_NAMES) {
         const configured = models[stage === "implementation" ? "implement" : stage];
         const repoModel = stage !== "planning" && typeof configured === "string" && configured.trim() ? configured.trim() : undefined;
-        const selectedModel = stage === "planning" ? planningModel : repoModel ?? workflowModel;
-        const model = selectedModel?.trim() || DEFAULT_MODEL;
-        stages[stage] = {
-          model,
-          source: selectedModel?.trim() ? stage === "planning" ? "PLANNING.md" : repoModel ? ".ai-implement/config.yml" : "WORKFLOW.md" : "DEFAULT_MODEL",
-        };
+        // Mapping Extra Env reaches Fly/local containers, but not legacy GHA.
+        // Repo stage inputs in feedback-loop beat run-autonomous's context model.
+        const selections = (stage === "planning" ? [planningBackend] : backends).map(backend => {
+          const envModel = backend !== "github-actions" ? mapping.extraEnv?.CLAUDE_MODEL?.trim() || undefined : undefined;
+          const fileModel = stage === "planning" ? planningModel : workflowModel;
+          const selected = repoModel ?? envModel ?? fileModel;
+          return {
+            backend, model: selected?.trim() || DEFAULT_MODEL,
+            source: repoModel ? ".ai-implement/config.yml" : envModel ? "mapping.extraEnv.CLAUDE_MODEL" : fileModel?.trim() ? stage === "planning" ? "PLANNING.md" : "WORKFLOW.md" : "DEFAULT_MODEL",
+          };
+        });
+        const { model, source } = selections[0];
+        if (selections.some(selection => selection.model !== model)) {
+          result.outcome = `model_conflict: ${stage}; ${selections.map(selection => `${selection.backend}=${selection.model} (${selection.source})`).join("; ")}`;
+          break;
+        }
+        stages[stage] = { model, source };
         // Preserve the legacy effective model without redundant project overrides.
         if (model !== defaults.stages?.[stage]?.model) candidate.stages![stage] = { model };
       }
@@ -78,9 +93,7 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
       result.modelNotCarried = true;
       candidate.stages = {};
     }
-    const runnerMode = deps.runnerMode();
-    const path = resolveExecutionPath(runnerMode, mapping.executionMode);
-    const backends = path === "both" ? ["github-actions", "fly-machines"] as const : [path];
+    if (result.outcome) continue;
     const checks = backends.map(backend => ({ backend, workflowFile: mapping.workflowFile }));
     if (mapping.planningEnabled) {
       checks.push({ backend: resolvePlanningExecutionPath(runnerMode, mapping.executionMode), workflowFile: mapping.planningWorkflowFile });

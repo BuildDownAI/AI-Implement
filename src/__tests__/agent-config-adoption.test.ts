@@ -64,6 +64,45 @@ describe("project adoption", () => {
     if (dryRun) expect(write).not.toHaveBeenCalled();
     else expect(write).toHaveBeenCalledWith("A", candidate, "fingerprint");
   });
+  it.each(["fly", "local", "gha", "shadow"] as const)("preserves observable mapping models on %s", async mode => {
+    const { deps, write } = fixture({
+      ".ai-implement/config.yml": "models:\n  review: reviewer\n  implement: implementer",
+      "WORKFLOW.md": "---\nmodel: workflow\n---",
+      "PLANNING.md": "---\nmodel: planner\n---",
+    });
+    const mapping = deps.getMappings().A;
+    deps.getMappings = () => ({ A: { ...mapping, extraEnv: { CLAUDE_MODEL: " mapping-model " } } });
+    deps.runnerMode = () => mode;
+    const [result] = await run(deps);
+    expect(result.stages.implementation).toEqual({ model: "implementer", source: ".ai-implement/config.yml" });
+    expect(result.stages.review).toEqual({ model: "reviewer", source: ".ai-implement/config.yml" });
+    const usesMapping = mode === "fly" || mode === "local";
+    expect(result.stages.planning).toEqual({ model: usesMapping ? "mapping-model" : "planner", source: usesMapping ? "mapping.extraEnv.CLAUDE_MODEL" : "PLANNING.md" });
+    expect(deps.inspectReadiness).toHaveBeenCalledWith(expect.anything(), write.mock.calls[0][1]);
+  });
+  it.each(["fly", "local", "gha"] as const)("uses mapping before workflow only on container backends (%s)", async mode => {
+    const { deps, write } = fixture({ "WORKFLOW.md": "---\nmodel: workflow\n---" });
+    const mapping = deps.getMappings().A;
+    deps.getMappings = () => ({ A: { ...mapping, extraEnv: { CLAUDE_MODEL: "mapping-model" } } });
+    deps.runnerMode = () => mode;
+    const [result] = await run(deps);
+    for (const stage of ["implementation", "review"] as const) {
+      expect(result.stages[stage]).toEqual({ model: mode === "gha" ? "workflow" : "mapping-model", source: mode === "gha" ? "WORKFLOW.md" : "mapping.extraEnv.CLAUDE_MODEL" });
+      expect(write.mock.calls[0][1].stages[stage].model).toBe(result.stages[stage].model);
+    }
+  });
+  it.each([false, true])("refuses shadow model conflicts without readiness or writes (dryRun=%s)", async dryRun => {
+    const { deps, write } = fixture({ ".ai-implement/config.yml": "models:\n  review: reviewer" });
+    const mapping = deps.getMappings().A;
+    deps.getMappings = () => ({ A: { ...mapping, extraEnv: { CLAUDE_MODEL: "mapping-model" } } });
+    deps.runnerMode = () => "shadow";
+    const [result] = await run(deps, dryRun);
+    expect(result.outcome).toContain("model_conflict: implementation");
+    expect(result.outcome).toContain("github-actions=");
+    expect(result.outcome).toContain("fly-machines=mapping-model (mapping.extraEnv.CLAUDE_MODEL)");
+    expect(write).not.toHaveBeenCalled();
+    expect(deps.inspectReadiness).not.toHaveBeenCalled();
+  });
   it("omits repository overrides that already match configured defaults", async () => {
     const { deps, write } = fixture({ "PLANNING.md": `---\nmodel: ${DEFAULT_MODEL}\n---` });
     expect((await run(deps))[0].stages.planning).toEqual({ model: DEFAULT_MODEL, source: "PLANNING.md" });
