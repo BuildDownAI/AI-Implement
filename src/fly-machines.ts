@@ -851,41 +851,31 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
 
   // Secret isolation — two modes:
   //
-  // Flag OFF (default): entrypoint-filter mode (AII-488).
-  //   Classic Fly app secrets are app-wide; every machine receives every classic secret.
-  //   The Machines API processes[].secrets env_var remap applies only to the non-GA
-  //   named-secrets feature and has no effect on classic secrets (confirmed 2026-09-03,
-  //   probe SAN-22; see https://fly.io/docs/machines/api/machines-resource/).
-  //   Two env vars tell the runner entrypoint (remap_team_secrets in session/lib.sh) what to do:
-  //     AI_IMPLEMENT_TEAM_SECRET_PREFIX: own-team prefix; entrypoint remaps prefixed vars to bare form.
-  //     AI_IMPLEMENT_FOREIGN_SECRET_NAMES: comma-joined foreign names; entrypoint unsets these.
-  //   Global secrets (no team prefix) pass through unchanged.
+  // Flag ON: use process-level isolation whenever the names list is defined (including
+  // an empty list) or the bootstrap is protected. ignore_app_secrets=true with an
+  // explicit allowlist keeps excluded classic app secrets outside the machine.
+  // With a team key, remap own-team names to bare names and exclude foreign names
+  // identified by allTeamKeys. Without a team key there is no own prefix: exclude
+  // every known team-prefixed name, intentionally withholding own-team secrets too.
+  // Global names pass through. Always omit the protection key from that passthrough;
+  // list it explicitly only for protected bootstraps, even if names are undefined.
+  // Unprotected runs with undefined names still omit the processes block.
   //
-  // Flag ON (FLY_PROCESS_LEVEL_SECRETS): process-level secrets mode (AII-491 spike).
-  //   Populates processes[0].ignore_app_secrets=true so the machine receives only the
-  //   explicitly listed secrets — keeping foreign secrets out at the Fly boundary, not inside
-  //   the machine. The entrypoint remap/filter logic remains but is a no-op: it sees bare names
-  //   and finds nothing to unset.
-  //   Spike outcomes (recorded on AII-491):
-  //     - QA_PROBE present, SAN_QA_PROBE and AII_PROBE_FOREIGN absent → Fly honours the list. ✅
-  //     - SAN_QA_PROBE and AII_PROBE_FOREIGN present → processes not applied; add explicit entrypoint.
-  //     - Nothing present → ignore_app_secrets applied but secrets list did not resolve; turn flag off.
-  // Note: a falsy teamKey (e.g. Jira issues with an empty scopeKey) falls through both branches,
-  // so the machine receives all classic app secrets regardless of the flag. This matches flag-off
-  // behaviour for the same case and is not a regression, but the flag does not close this gap.
-  // Protected mode with the flag on also takes the process-level branch (AII-1388): the protection key is
-  // listed explicitly, even when the secrets listing failed, because the fail-closed empty list would
-  // otherwise withhold it. With the flag off, protected mode keeps the entrypoint-filter branch.
-  // Non-protected configs never expose the key: process-level mode omits it, entrypoint-filter mode
-  // lists it among the foreign names.
+  // Flag OFF: entrypoint-filter rollback mode (AII-488). Classic app secrets are
+  // app-wide. With a team key and non-empty names, AI_IMPLEMENT_TEAM_SECRET_PREFIX
+  // tells remap_team_secrets in session/lib.sh to remap own names, and
+  // AI_IMPLEMENT_FOREIGN_SECRET_NAMES tells it to unset known foreign names and,
+  // for unprotected runs, the protection key. Globals pass through unchanged.
+  // With no team key the entrypoint returns early: every app secret remains
+  // available, including the protection key. Fixing that requires a runner change.
   const protectionKeyName = MODEL_AUTH_ENV.protectionKey;
-  if (input.flyProcessLevelSecrets && input.teamKey && (protectedBootstrap || input.teamSecretNames !== undefined)) {
-    const ownPrefix = `${input.teamKey.toUpperCase()}_`;
+  if (input.flyProcessLevelSecrets && (protectedBootstrap || input.teamSecretNames !== undefined)) {
+    const ownPrefix = input.teamKey ? `${input.teamKey.toUpperCase()}_` : undefined;
     const allPrefixes = (input.allTeamKeys ?? []).map((k) => `${k.toUpperCase()}_`);
     const processSecrets: MachineSecret[] = [];
     for (const name of input.teamSecretNames ?? []) {
       if (name === protectionKeyName) continue;
-      if (name.startsWith(ownPrefix)) {
+      if (ownPrefix && name.startsWith(ownPrefix)) {
         // Own-team secret: remap from prefixed stored name to bare env var
         processSecrets.push({ env_var: name.slice(ownPrefix.length), name });
       } else if (allPrefixes.some((p) => name.startsWith(p))) {

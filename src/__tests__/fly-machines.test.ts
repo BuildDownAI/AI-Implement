@@ -790,15 +790,34 @@ describe("buildSessionMachineConfig", () => {
       expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBe("QA_PROBE");
     });
 
-    it("flag on: no teamKey → no processes", () => {
+    it.each([undefined, ""])("flag on: missing teamKey (%s) excludes all known team secrets", (teamKey) => {
       const result = buildSessionMachineConfig({
         ...baseInput,
-        teamSecretNames: ["NPM_TOKEN"],
-        allTeamKeys: ["ENG"],
+        teamKey,
+        teamSecretNames: ["ENG_X", "SAN_Y", "GLOBAL_Z", MODEL_AUTH_ENV.protectionKey],
+        allTeamKeys: ["ENG", "SAN"],
         flyProcessLevelSecrets: true,
       });
-      expect(result.config.processes).toBeUndefined();
+      expect(result.config.processes?.[0]).toEqual({
+        ignore_app_secrets: true,
+        secrets: [{ env_var: "GLOBAL_Z" }],
+      });
       expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBeUndefined();
+    });
+
+    it.each([undefined, ""])("flag on: missing teamKey (%s) with empty names fails closed", (teamKey) => {
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        teamKey,
+        teamSecretNames: [],
+        flyProcessLevelSecrets: true,
+      });
+      expect(result.config.processes?.[0]).toEqual({ ignore_app_secrets: true, secrets: [] });
+    });
+
+    it("flag on: no teamKey and undefined names without protection leaves processes unset", () => {
+      const result = buildSessionMachineConfig({ ...baseInput, flyProcessLevelSecrets: true });
+      expect(result.config.processes).toBeUndefined();
     });
 
     it("flag on: own-team secrets only, no globals", () => {
@@ -1364,6 +1383,28 @@ describe("buildSessionMachineConfig — protected model bootstrap (AII-500)", ()
     expect(proc.secrets!.map((s) => s.env_var)).toEqual(["DB", "GLOBAL", MODEL_AUTH_ENV.protectionKey]);
     expect(JSON.stringify(proc.secrets)).not.toContain("OPS_X");
     expect(result.config.env![MODEL_AUTH_ENV.baseUrl]).toBe(MODEL_AUTH_URL);
+  });
+
+  it.each([undefined, ""])("isolates protected bootstrap with missing teamKey (%s)", (teamKey) => {
+    const result = buildSessionMachineConfig(protectedInput({
+      teamKey,
+      teamSecretNames: ["ENG_X", "SAN_Y", "GLOBAL_Z", MODEL_AUTH_ENV.protectionKey],
+      allTeamKeys: ["ENG", "SAN"],
+      flyProcessLevelSecrets: true,
+    }));
+    expect(result.config.processes?.[0]).toEqual({
+      ignore_app_secrets: true,
+      secrets: [{ env_var: "GLOBAL_Z" }, { env_var: MODEL_AUTH_ENV.protectionKey }],
+    });
+    expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBeUndefined();
+  });
+
+  it.each([undefined, ""])("isolates protected bootstrap with missing teamKey (%s) and undefined names", (teamKey) => {
+    const result = buildSessionMachineConfig(protectedInput({ teamKey, flyProcessLevelSecrets: true }));
+    expect(result.config.processes?.[0]).toEqual({
+      ignore_app_secrets: true,
+      secrets: [{ env_var: MODEL_AUTH_ENV.protectionKey }],
+    });
   });
 
   it("still lists the protection key when the secrets listing failed", () => {
