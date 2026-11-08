@@ -51,6 +51,9 @@ vi.mock("../../restate/kg-refresh-workflow.js", async (importOriginal) => {
   };
 });
 
+import { __clearWorkflowProbeCacheForTests, resolveWorkflowCapabilities } from "../../workflow-probe.js";
+import { fakeFetch, type FakeFetch } from "../helpers/fake-fetch.js";
+import { githubFile } from "../helpers/replies/github.js";
 import { getDb } from "../../dedup.js";
 import { getFlySessionsConfig, setOrchestratorSetting } from "../../orchestrator-settings.js";
 import { initMappingsTable } from "../../config.js";
@@ -77,6 +80,14 @@ const SECRET = "kg-pilot-test-secret";
 const WATCH_INTERVAL_MS = 300;
 const UNROUTABLE_INGRESS = "http://127.0.0.1:59999";
 const ENVELOPE_WORKFLOW_YAML = "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        type: string\n";
+
+let workflowContents: FakeFetch;
+beforeEach(() => {
+  __clearWorkflowProbeCacheForTests();
+  workflowContents = fakeFetch({
+    "GET /repos/TestOrg/test-kg-source/contents/.github/workflows/claude-implement.yml": [githubFile(ENVELOPE_WORKFLOW_YAML)],
+  });
+});
 
 const SUCCESS_REPORT: Partial<RunnerResultBody> = {
   outcome: "success", snapshotPr: 42, snapshotCommit: "deadbeef1234", snapshotBranch: "kg-refresh/snapshot-42",
@@ -208,6 +219,7 @@ function ensureCompose(): void {
     getInstallationToken: async () => "tok",
     getScopedInstallationToken: async () => makeScopedInstallationToken({ token: "scoped-tok" }),
     resolveRunnerImage: async () => undefined,
+    resolveWorkflowCapabilities: (opts) => resolveWorkflowCapabilities({ ...opts, fetchImpl: workflowContents.fetch }),
     postWorkflowDispatch: ((opts: { inputs: Record<string, string | undefined> }) => sim.postWorkflowDispatch(opts)) as never,
     keptMachineFly: () => { throw new Error("the Fly sender must not run on the GHA path"); },
     startLocalRunnerContainer: async () => { throw new Error("the local Docker sender must not run on the GHA path"); },
@@ -357,6 +369,9 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(settingCount("kg_refresh_last_refresh")).toBe(1);
     expect(mergeCalls).toBe(1);
     expect(gh.dispatches).toHaveLength(1);
+    expect(gh.dispatches[0].run_config).toBeTruthy();
+    expect(workflowContents.calls).toHaveLength(1);
+    expect(workflowContents.calls[0].url.searchParams.get("ref")).toBe("main");
     const status = await asSystem(env)("get_kg_status", {});
     if (status.status !== "ok") throw new Error("get_kg_status unavailable");
     expect(JSON.parse(status.content[0].text)).toMatchObject({ stage: "serving", running: false });

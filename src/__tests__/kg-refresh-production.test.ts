@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { __clearWorkflowProbeCacheForTests } from "../workflow-probe.js";
+import { __clearWorkflowProbeCacheForTests, WorkflowProbeTransientError, resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { makeAppConfig, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, type Reply, type Routes } from "./helpers/fake-fetch.js";
 import { githubFile } from "./helpers/replies/github.js";
@@ -532,6 +532,17 @@ describe("row projections (real log.ts, scratch database)", () => {
 });
 
 describe("GHA dispatch wrapper", () => {
+  it("does not POST after failed workflow reads, and retries the read on the next dispatch", async () => {
+    const github = fakeFetch({ [WORKFLOW_FILE]: [{ status: 401 }, { status: 401 }] });
+    const dispatch = createKgRefreshDispatch(makeInput({
+      resolveWorkflowCapabilities: (opts) => resolveWorkflowCapabilities({ ...opts, fetchImpl: github.fetch }),
+    }));
+    await expect(dispatch(dispatchInput)).rejects.toThrow(WorkflowProbeTransientError);
+    await expect(dispatch(dispatchInput)).rejects.toThrow(WorkflowProbeTransientError);
+    expect(github.calls).toHaveLength(2);
+    expect(postWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
   it("reports an unknown job id, not an empty string, when the dispatch result has no runId", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: false, status: 0, error: "boom", outcome: "unknown" });
     const result = await createKgRefreshDispatch(makeInput())(dispatchInput);
