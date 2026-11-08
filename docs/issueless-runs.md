@@ -126,13 +126,14 @@ The kg-refresh runner reads `AI_IMPLEMENT_LOG_LEVEL` the same way the implement 
 
 If the dispatch `ctx.run` throws (for example a resolved backend that is not configured, such as `fly-machines` with no sessions app), it retries up to three times; when the retries are exhausted the workflow's catch path records the run as failed with `failureCode: "workflow_error"` and releases the marker, so the operator can retry at once.
 
-**The KG source repo also needs the runner secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
+A KG refresh carries no model credential on any backend. A model secret (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) on the KG source repo is unused; the GitHub Actions template passes repo secrets, but the runner unsets model credentials for kg-refresh. Fly machines and local Docker containers receive neither model variable.
+
+**The KG source repo still needs the GitHub App secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
 
 | Secret | Purpose |
 |---|---|
 | `AI_IMPLEMENT_APP_ID` | GitHub App numeric ID |
 | `AI_IMPLEMENT_PRIVATE_KEY` | GitHub App PEM private key |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code OAuth token (preferred) — or `ANTHROPIC_API_KEY` |
 
 Optional variables: `AI_IMPLEMENT_RUNNER_LABEL`. `AI_IMPLEMENT_RUNNER_IMAGE` is no longer needed on the KG source repo when the orchestrator is pinned to a specific image — the orchestrator now forwards `runner_image` in the dispatch, so the workflow receives the correct image without a repo-level variable. Leaving an existing `AI_IMPLEMENT_RUNNER_IMAGE` in place is safe (the orchestrator's forwarded value takes precedence when set). Verify with `gh secret list --repo <owner>/<kg-repo>` (names only). Observed live 2026-09-05: the workflow file was added and dispatch would have succeeded, but the repo carried no secrets.
 
