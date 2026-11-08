@@ -9,7 +9,7 @@ const w = window as unknown as W;
 const SENT = '<img src=x onerror="window.__pwn=1">';
 
 const ACCOUNTS = [
-  { profileId: "p-claude", identity: SENT, agent: "claude", provider: "anthropic", authMode: "claude-subscription", profileStatus: "active", credentialRef: "SECRET-REF", token: "SECRET-TOKEN", sessionState: "SECRET-STATE", account: { readiness: "unknown", failureCode: null, sessionRecovery: { state: "recovery_required", recoveryRequired: true } } },
+  { profileId: "p-claude", identity: SENT, agent: "claude", provider: "anthropic", authMode: "claude-subscription", profileStatus: "active", credentialRef: "SECRET-REF", token: "SECRET-TOKEN", sessionState: "SECRET-STATE", account: { readiness: "ready", failureCode: null, sessionRecovery: { state: "recovery_required", recoveryRequired: true } } },
   { profileId: "p-gpt", identity: "gpt", agent: "codex", provider: "openai", authMode: "codex-subscription", profileStatus: "active", account: { readiness: "refresh failed (transient)", failureCode: "x", sessionRecovery: { state: "busy", recoveryRequired: true } } },
   { profileId: "p-gpt2", identity: "gpt2", agent: "codex", provider: "openai", authMode: "codex-subscription", profileStatus: "active", account: { readiness: "sign-in required", failureCode: null } },
   { profileId: "p-gpt3", identity: "gpt3", agent: "codex", provider: "openai", authMode: "codex-subscription", profileStatus: "active", account: { readiness: "missing", failureCode: null } },
@@ -75,7 +75,7 @@ describe("models page stage defaults", () => {
     expect(gpt).not.toContain("codex-subscription");
     expect(gpt).not.toContain("recovery");
     expect(gpt).not.toContain("busy");
-    expect(rows[0].textContent).toContain("unknown");
+    expect(rows[0].textContent).toContain("ready");
     expect(rows[0].textContent).not.toContain("recovery");
     expect(rows[2].textContent).toContain("node dist/chatgpt-plan-login.js login");
     expect(rows[2].textContent).toContain("chatgpt-import");

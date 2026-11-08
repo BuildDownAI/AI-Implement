@@ -4010,7 +4010,6 @@ function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): Acco
   if (profile.authMode === "claude-subscription") {
     const snap = deps.agentConfig?.sessionSnapshot?.(profile.profileId);
     view.sessionRecovery = snap ? { state: snap.state, recoveryRequired: snap.state === "recovery_required" } : null;
-    return view;
   }
   if (!deps.agentConfig) return view;
   let status;
@@ -4060,11 +4059,11 @@ function credentialView(p: AccountProfileProjection): { credentialSet: boolean; 
   }
 }
 
-const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key"];
+const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key", "claude-subscription"];
 
 const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   invalid_ref: "the reference is not a valid model-account reference",
-  invalid_value: "the value is not a valid API key",
+  invalid_value: "the value is not a valid credential",
   key_unavailable: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it",
   row_missing: "could not write the credential",
   decrypt_failed: "could not write the credential",
@@ -4153,7 +4152,7 @@ async function handleModelAccountCredential(
     return;
   }
   if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
-    json(res, 400, { error: "only openai-api-key and anthropic-api-key profiles take a browser credential" });
+    json(res, 400, { error: "only openai-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
     return;
   }
   const existingRef = lookupCredentialReference(profileId, head.revision);

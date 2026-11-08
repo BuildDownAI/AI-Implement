@@ -147,7 +147,7 @@ These lines appear only for hosted credentials, so an empty search does not mean
 
 Import the token on the orchestrator with `node dist/model-account-cli.js secret-import --ref model-account:<name>`. Supply the token value on stdin, never in argv. Use the profile's configured `credentialRef` (for example, `model-account:<name>`); importing a secret does not configure that reference. This uses the existing protected-secret store in `model_protected_secrets`, with the same protection and rotation requirements as [API credentials](#api-credentials).
 
-A write-only credential field on **Models & providers** will allow an admin to set or replace the profile's setup-token without reading it back. That field comes with D6; it is not available for Claude subscription profiles yet.
+Admins can set, replace or remove the profile's setup-token using the write-only **Set key** / **Remove key** controls on **Models & providers**. The set/not-set badge reports whether a protected credential is stored; saved tokens are never read back into the field.
 
 The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token }`, delivered to the runner as `CLAUDE_CODE_OAUTH_TOKEN`. Managed checkout requires no owner generation; setup-tokens need no refresh. Missing secrets, decryption failures and an unset `RUNNER_TOKEN_SECRET` prepare as `authentication-required` with the fixed code `session_unavailable`. Local `local-login` subscription runs retain the `session` kind and `authDir`.
 

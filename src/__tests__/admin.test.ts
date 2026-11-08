@@ -6523,6 +6523,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
     accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
     expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
+    expect(find(accts, "cl-sub").account.readiness).toBe("missing");
     expect(find(accts, "cl-sub").account.sessionRecovery).toEqual({ state: "recovery_required", recoveryRequired: true });
     expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
     expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
@@ -6966,6 +6967,36 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(after.credentialUpdatedAt).toBeNull();
       expect(logs.filter((l) => l.includes("[admin] model-account credential"))).toHaveLength(3);
       expect(logs.join("\n")).not.toContain(KEY);
+    });
+
+    it.each([undefined, "model-account:claude-token"])("saves, replaces and removes a Claude setup-token (ref: %s)", async (credentialRef) => {
+      const token = "sk-ant-oat01-synthetic-setup-token";
+      const t = await seedProfile({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef });
+      const ref = credentialRef ?? "model-account:cl-sub";
+      const deps = readyDeps();
+      const read = async () => {
+        const r = await call("/api/model-accounts", "GET", t, undefined, deps);
+        expect(r.raw).not.toContain(token);
+        expect(r.raw).not.toContain(ref);
+        return r.json.accounts.find((a: { profileId: string }) => a.profileId === "cl-sub");
+      };
+      expect((await read()).credentialSet).toBe(false);
+      if (!credentialRef) expect((await read()).account.readiness).toBe("missing");
+      const revs = count("model_account_profile_revisions");
+      for (const value of [token, token + "-replacement"]) {
+        const put = await call(url("cl-sub"), "PUT", t, { apiKey: value });
+        expect(put.status).toBe(200);
+        expect(put.raw).not.toContain(token);
+        expect(store().resolve(ref)).toBe(value);
+        const row = await read();
+        expect(row.credentialSet).toBe(true);
+        expect(typeof row.credentialUpdatedAt).toBe("number");
+        expect(row.account.readiness).toBe("ready");
+      }
+      expect(count("model_account_profile_revisions")).toBe(revs + (credentialRef ? 0 : 1));
+      for (let i = 0; i < 2; i++) expect((await call(url("cl-sub"), "DELETE", t)).status).toBe(200);
+      expect(store().resolve(ref)).toBeNull();
+      expect(await read()).toMatchObject({ credentialSet: false, credentialUpdatedAt: null });
     });
 
     it("derives model-account:<id> and appends one revision for a profile without a ref", async () => {
