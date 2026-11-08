@@ -2792,9 +2792,12 @@ describe("handleRunnerResult — gap-analysis", () => {
 
   it.each([
     ["restate", "restate", true],
-    ["legacy", "legacy", false],
+    ["legacy", "legacy", true],
+    ["NULL", null, true],
+    ["a body with no externalReviewPending (NULL)", null, false],
+    ["a body with no externalReviewPending (legacy)", "legacy", false],
     ["a body with no externalReviewPending", "restate", false],
-  ] as const)("a gap-analysis success submits with the pushed headSha only for a restate mapping and a reported head: %s (AII-1484)", async (name, lifecycle, withHead) => {
+  ] as const)("a gap-analysis success pins and submits the reported head for every lifecycle: %s (AII-1734)", async (name, lifecycle, withHead) => {
     const config = await import("../config.js");
     config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo", reviewFixLifecycle: lifecycle }));
     const pushed = "0123456789abcdef0123456789abcdef01234567";
@@ -2804,7 +2807,10 @@ describe("handleRunnerResult — gap-analysis", () => {
     });
     const jobId = log.appendLog(makeAppendLogEntry({ issueId: `i-head-${name}`, issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
-    const hook = vi.fn(async () => {});
+    let headAtSubmission: string | null | undefined;
+    const hook = vi.fn(async () => {
+      headAtSubmission = log.getJobById(jobId)?.lateReviewHeadSha;
+    });
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
@@ -2816,6 +2822,7 @@ describe("handleRunnerResult — gap-analysis", () => {
 
     expect(res.status).toBe(200);
     expect(hook).toHaveBeenCalledTimes(1);
+    expect(headAtSubmission).toBe(withHead ? pushed : null);
     expect(hook).toHaveBeenCalledWith({
       dispatchId, owner: "org", repo: "repo", prNumber: 12, prUrl: "https://github.com/org/repo/pull/12", gapFill: true, rowId: jobId,
       ...(withHead ? { headSha: pushed } : {}),
@@ -2864,12 +2871,13 @@ describe("handleRunnerResult — gap-analysis", () => {
       log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
-        body: { phase: "gap-analysis", outcome: "success", comments: [] },
+        body: { phase: "gap-analysis", outcome: "success", comments: [], externalReviewPending: { headSha: "0123456789abcdef0123456789abcdef01234567" } },
         secret: SECRET,
         resolveProvider: makeResolve(new FakeProvider()),
         ...(hook ? { submitLateExternalReview: hook as never } : {}),
       });
       expect(res.status).toBe(200);
+      if (!hook) expect(log.getJobById(jobId)?.lateReviewHeadSha).toBeNull();
       expect(log.getJobByDispatchId(dispatchId)?.approved).toBe(false);
     }
   });

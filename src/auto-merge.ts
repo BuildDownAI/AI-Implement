@@ -1,4 +1,4 @@
-import { resolveReviewFixLifecycle, type RepoMapping } from "./config.js";
+import type { RepoMapping } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import {
   listOpenPullRequests, getPrReadiness, mergePullRequest, mergeBranch,
@@ -151,9 +151,7 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
           await deps.notify(`Auto-merged child PR #${pr.number} into \`${pr.base}\` (${owner}/${repo})`).catch(() => {});
         }
         // After the child merge, not before: moving the base first can make the child look blocked.
-        if (resolveReviewFixLifecycle(mapping) === "restate") {
-          await syncDefaultIntoFeature(token, mapping, pr.base, deps);
-        }
+        await syncDefaultIntoFeature(token, mapping, pr.base, deps);
       } else {
         const kind = classifyStalledChild(result);
         if (kind === "conflict") {
