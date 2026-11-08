@@ -75,6 +75,52 @@ function admissionRequest(overrides: Partial<ReviewFixAdmissionRequest> = {}): R
   };
 }
 
+describe("execution backend admission", () => {
+  it.each([
+    ["default", "github-actions", "github-actions"],
+    ["default", "fly-machines", "fly-machines"],
+    ["gha", "fly-machines", "github-actions"],
+    ["fly", "github-actions", "fly-machines"],
+    ["local", "github-actions", "local-docker"],
+    ["shadow", "fly-machines", "github-actions"],
+  ] as const)("resolves %s with mapping %s to %s", async (mode, executionMode, backend) => {
+    const previousMode = process.env.RUNNER_MODE;
+    onTestFinished(() => {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    });
+    process.env.RUNNER_MODE = mode;
+    seedMapping({ executionMode });
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    expect(admitted.attempt).toHaveProperty("executionBackend", backend);
+    const db = dedup.getDb();
+    expect(db.prepare("SELECT execution_backend FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(admitted.attempt.attemptId)).toEqual({ execution_backend: backend });
+    expect(db.prepare("SELECT backend FROM dispatch_admissions WHERE dispatch_id = ?")
+      .get(admitted.attempt.attemptId)).toEqual({ backend });
+
+    dedup.closeDb();
+    const restarted = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await restarted.getPreparedAttempt(admitted.attempt.attemptId)).toEqual(admitted.attempt);
+    process.env.RUNNER_MODE = mode === "fly" ? "gha" : "fly";
+    seedMapping({ executionMode: executionMode === "github-actions" ? "fly-machines" : "github-actions" });
+    expect(await restarted.admit(admissionRequest())).toEqual(admitted);
+    expect(dedup.getDb().prepare("SELECT COUNT(*) AS count FROM dispatch_admissions").get()).toEqual({ count: 1 });
+  });
+
+  it("loads a legacy row that omitted the backend as GitHub Actions", async () => {
+    dedup.getDb().prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+      VALUES ('legacy', 'legacy', 'AII', ?, ?, ?, 'pr', 'legacy', 'legacy', 'prepared', 1, 2, ?, '[]')`)
+      .run(String(SCOPE.installationId), SCOPE.repository, SCOPE.prNumber, JSON.stringify({ taskText: "legacy" }));
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await store.getPreparedAttempt("legacy")).toHaveProperty("executionBackend", "github-actions");
+  });
+});
+
 describe("deploy drain admission barrier", () => {
   it("defers new attempts under the hold while preserving idempotent prepared replays", async () => {
     seedMapping();

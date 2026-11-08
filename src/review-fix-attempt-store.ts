@@ -42,6 +42,7 @@
  * `ReviewFixFinalizerPort.applyApproval` needs — those remain out of scope here.
  */
 import { createHash } from "node:crypto";
+import { getRunnerMode, resolvePlanningExecutionPath } from "./runner-mode.js";
 import { getDb } from "./dedup.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { isParked } from "./dispatch-breaker.js";
@@ -89,6 +90,7 @@ interface AttemptRow {
   state: string;
   created_at: number;
   deadline_at: number;
+  execution_backend: PreparedReviewFixAttempt["executionBackend"];
   authority_revoked_at: number | null;
   github_run_id: number | null;
   github_run_attempt: number | null;
@@ -162,6 +164,7 @@ function toPrepared(row: AttemptRow): PreparedReviewFixAttempt {
     findings: JSON.parse(row.finding_versions_json),
     owner: row.owner,
     deadlineAt: row.deadline_at,
+    executionBackend: row.execution_backend ?? "github-actions",
   };
 }
 
@@ -230,6 +233,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         return { status: "deferred", reason: "paused" };
       }
       const { teamKey, mapping } = mappingEntry;
+      const executionBackend = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
 
       const now = Date.now();
       const issueId = `${request.scope.repository}#${request.scope.prNumber}`;
@@ -249,7 +253,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
             prNumber: request.scope.prNumber,
           },
           kind: "gap-fill",
-          backend: "github-actions",
+          backend: executionBackend,
           lifecycleOwner: { kind: "restate", attemptId: dispatchId },
           cap: mapping.maxInProgressAiIssues,
           prDispatchBudget: resolvePrDispatchBudget(mapping),
@@ -260,11 +264,11 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
             INSERT INTO review_fix_attempts
               (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
                issue_scope, issue_id, owner, state, created_at, deadline_at,
-               task_snapshot_json, finding_versions_json)
+               task_snapshot_json, finding_versions_json, execution_backend)
             VALUES
               (@attemptId, @dispatchId, @mappingKey, @installationId, @repository, @prNumber,
                'pr', @issueId, @owner, 'prepared', @createdAt, @deadlineAt,
-               @taskSnapshotJson, @findingVersionsJson)
+               @taskSnapshotJson, @findingVersionsJson, @executionBackend)
           `).run({
             attemptId: dispatchId,
             dispatchId,
@@ -278,6 +282,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
             deadlineAt,
             taskSnapshotJson,
             findingVersionsJson,
+            executionBackend,
           });
           return undefined;
         },
