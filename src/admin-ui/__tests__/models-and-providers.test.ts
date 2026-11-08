@@ -106,13 +106,24 @@ describe("Claude subscription credentials", () => {
     win.isAdmin = () => admin;
     win.registerPage = () => {};
     win.esc = win.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
-    win.api = async (path: string) => ({
-      ok: true,
-      json: async () => path === "/api/model-accounts" ? { accounts }
-        : path === "/api/agent-defaults" ? { mode: "legacy", stages: {} } : {},
+    const api = vi.fn(async (path: string, options?: { method?: string; body?: string }) => {
+      if (path === `/api/model-accounts/${encodeURIComponent(profileId)}/credential`) {
+        accounts[0].credentialSet = options?.method === "PUT";
+      }
+      return {
+        ok: true,
+        json: async () => path === "/api/model-accounts" ? { accounts }
+          : path === "/api/agent-defaults" ? { mode: "legacy", stages: {} } : {},
+      };
     });
+    win.api = api;
     try {
+      // Attach the real delegated click handlers without starting the polling timer.
+      let activate = () => {};
+      win.registerPage = (_route: string, callback: () => void) => { activate = callback; };
+      win.setInterval = (() => 0) as typeof win.setInterval;
       win.eval(modelsAndProvidersScript);
+      activate();
       await win.loadModelsAndProviders();
       await vi.waitFor(() => expect(win.document.querySelectorAll("#mp-account-rows tr")).toHaveLength(2));
       const rows = win.document.querySelectorAll<HTMLTableRowElement>("#mp-account-rows tr");
@@ -140,6 +151,21 @@ describe("Claude subscription credentials", () => {
         await vi.waitFor(() => expect(win.document.querySelector("#mp-account-rows input")).not.toBe(input));
         expect(win.document.querySelector<HTMLInputElement>("#mp-account-rows input")?.value).toBe("unsubmitted-token");
         expect(win.document.activeElement?.getAttribute("data-key-for")).toBe(profileId);
+
+        const credentialUrl = `/api/model-accounts/${encodeURIComponent(profileId)}/credential`;
+        win.document.querySelector<HTMLButtonElement>('[data-act="set-key"]')!.click();
+        await vi.waitFor(() => {
+          expect(api).toHaveBeenCalledWith(credentialUrl, {
+            method: "PUT", body: JSON.stringify({ apiKey: "unsubmitted-token" }),
+          });
+          expect(win.document.querySelector<HTMLInputElement>("#mp-account-rows input")?.value).toBe("");
+        });
+        win.document.querySelector<HTMLButtonElement>('[data-act="remove-key"]')!.click();
+        await vi.waitFor(() => {
+          expect(api).toHaveBeenCalledWith(credentialUrl, { method: "DELETE" });
+          expect(win.document.querySelector("#mp-account-rows tr td:last-child .badge")?.textContent).toBe("not set");
+        });
+        expect(win.document.body.innerHTML).not.toContain("unsubmitted-token");
       }
     } finally {
       win.close();
