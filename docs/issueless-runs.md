@@ -128,6 +128,16 @@ If the dispatch `ctx.run` throws (for example a resolved backend that is not con
 
 A KG refresh carries no model credential on any backend. A model secret (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) on the KG source repo is unused; the GitHub Actions template passes repo secrets, but the runner unsets model credentials for kg-refresh. Fly machines and local Docker containers receive neither model variable.
 
+Before releasing credential-free KG dispatch, validate the paired runner image on a Docker-capable host. Build this revision with `npm run build:runner:local`, then capture its immutable ID with `docker image inspect --format '{{.Id}}' ai-implement-runner:local`. Run the following with the intended KG source checkout and tracker export, replacing `<image-id>` with that ID:
+
+```sh
+env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_USE_BEDROCK -u AWS_BEDROCK_ROLE_ARN \
+  npm run dev:run -- --workspace /path/to/kg-source --tracker-data /path/to/tracker-export.json \
+  --image <image-id> --phase kg-refresh --until kg-ingest
+```
+
+Record the source revision, exact command, immutable image ID, and successful completion through `kg-ingest` in the PR. An older runner image can still require model credentials; a mutable image tag or mocked launch test does not establish compatibility.
+
 **The KG source repo still needs the GitHub App secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
 
 | Secret | Purpose |
