@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createKgRefreshSenders, type KgRefreshSendInput, type KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
 import { syncRowToMachineNonce, type KeptMachineFly } from "../restate/kg-refresh-production.js";
+import { buildLocalRunnerEnv, type LocalRunnerInput } from "../local-docker.js";
 import type { CreateMachineOpts, Machine } from "../fly-machines.js";
 import { buildKgRefreshRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
 import { makeAppConfig, makeScopedInstallationToken } from "./helpers/builders.js";
@@ -52,6 +53,7 @@ function makeDeps(overrides: Partial<KgRefreshSenderDeps> = {}, configOverrides:
       githubAppId: "1", githubAppPrivateKey: "key", flySessionsToken: "fly-token", flySessionsApp: "fly-app",
       flySessionsRegion: "iad", localRunnerImage: "local:img", runnerCallbackBaseUrl: CALLBACK_BASE,
       sessionImage: "img", kgSourceRepo: "acme/kg",
+      anthropicApiKey: "configured-api-key", claudeOAuthToken: "configured-oauth-token",
       ...configOverrides,
     }),
     getInstallationToken: vi.fn(async () => "gh-secret-token"),
@@ -81,6 +83,9 @@ describe("fly-machines sender", () => {
     const result = await createKgRefreshSenders(deps)["fly-machines"](makeInput());
     expect(created).toHaveLength(1);
     const cfg = created[0]!.config as unknown as { env: Record<string, string>; guest: Record<string, unknown>; metadata: Record<string, string> };
+    expect(cfg.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(cfg.env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(created[0]!.config.processes).toEqual([{ ignore_app_secrets: true, secrets: [] }]);
     expect(cfg.env.MACHINE_NONCE).toBe(NONCE);
     expect(cfg.env.ISSUE_IDENTIFIER).toBe(IDENTIFIER);
     expect(cfg.env.RUN_TOKEN).toBe("run-tok");
@@ -172,6 +177,9 @@ describe("local-docker sender", () => {
     const { deps } = makeDeps();
     const result = await createKgRefreshSenders(deps)["local-docker"](makeInput());
     const arg = (deps.startLocalRunnerContainer as ReturnType<typeof vi.fn>).mock.calls[0]![0] as Record<string, unknown>;
+    const env = buildLocalRunnerEnv(arg as unknown as LocalRunnerInput);
+    expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
     expect(arg.machineNonce).toBe(NONCE);
     expect(arg.issueIdentifier).toBe(IDENTIFIER);
     expect(arg.defaultBranch).toBe("trunk");

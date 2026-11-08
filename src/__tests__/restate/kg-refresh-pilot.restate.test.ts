@@ -643,7 +643,6 @@ describe("Restate kg-refresh pilot: Fly sessions settings are live", () => {
       get flySessionsApp() { return getFlySessionsConfig().app; },
       get flySessionsRegion() { return getFlySessionsConfig().region; },
       localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
-      anthropicApiKey: null, claudeOAuthToken: null,
     };
     const fakeFly = {
       getMachine: async () => { throw new Error("unexpected getMachine"); },
@@ -726,7 +725,6 @@ describe("Restate kg-refresh pilot: launch tokens reach the machine senders and 
         runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
         flySessionsToken: "fly-test-token", flySessionsApp: "tokens-app", flySessionsRegion: null,
         localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
-        anthropicApiKey: null, claudeOAuthToken: null,
       },
       keptMachineFly: (() => fakeFly) as never,
       startLocalRunnerContainer: (async (opts: { runToken?: string; runProgressToken?: string; runPublicationToken?: string; machineNonce: string; orchestratorUrl: string }) => {
@@ -840,7 +838,6 @@ describe("Restate kg-refresh pilot: the runner image check (AII-1323)", () => {
         runnerImageExplicit: false, runnerCallbackBaseUrl: "https://orchestrator.test", runnerTokenSecret: SECRET,
         flySessionsToken: "fly-test-token", flySessionsApp: "image-app", flySessionsRegion: null,
         localRunnerImage: "local:img", localRunnerOrchestratorUrl: null, healthPort: 8080,
-        anthropicApiKey: null, claudeOAuthToken: null,
       },
       // The real check, as production wires it.
       resolveRunnerImage: resolveRunnerImageForDispatch,
