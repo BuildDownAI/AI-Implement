@@ -68,14 +68,14 @@ describe("handlePublicationTokenRequest", () => {
       (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository,
        pr_number, lifecycle_owner, phase, backend, created_at)
       VALUES (?, 'AII', 'pr', 'acme/app#42', '7', 'acme/app', 42, ?,
-              'implementation', 'fly', ?)`)
+              'implementation', 'fly-machines', ?)`)
       .run(attemptId, `restate:${attemptId}`, Date.now());
     db.prepare(`INSERT INTO review_fix_attempts
       (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
        issue_scope, issue_id, owner, state, created_at, deadline_at,
        execution_backend, execution_ref, task_snapshot_json, finding_versions_json)
       VALUES (?, ?, 'AII', '7', 'acme/app', 42, 'pr', 'acme/app#42', ?,
-              'launch_intent', ?, ?, 'fly', 'machine-1', '{}', '[]')`)
+              'launch_intent', ?, ?, 'fly-machines', 'machine-1', '{}', '[]')`)
       .run(attemptId, attemptId, attemptId, Date.now(), Date.now() + 60_000);
     const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: SECRET });
     const result = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "result", secret: SECRET });

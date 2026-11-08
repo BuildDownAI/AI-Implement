@@ -400,7 +400,7 @@ function resignPilotClaims(token: string, changes: Record<string, unknown>): str
 }
 
 describe("prepared review-fix credentials", () => {
-  describe.each(["github-actions", "fly", "local"])("publication scope for %s", (backend) => {
+  describe.each(["github-actions", "fly-machines", "local-docker"])("publication scope for %s", (backend) => {
     function prepare() {
       const now = Date.now();
       seedPreparedPilotAttempt(now + 1000);

@@ -375,7 +375,7 @@ export function verifyPreparedReviewFixToken(
           && Number.isSafeInteger(execution.githubRunAttempt) && (execution.githubRunAttempt ?? 0) > 0
           && attempt.github_run_id === execution.githubRunId
           && attempt.github_run_attempt === execution.githubRunAttempt
-        : (attempt.execution_backend === "fly" || attempt.execution_backend === "local")
+        : (attempt.execution_backend === "fly-machines" || attempt.execution_backend === "local-docker")
           && attempt.execution_ref !== null;
       if (attempt.repository !== execution.repository || !executionMatches) {
         return { ok: false, reason: "wrong_scope", claims };
