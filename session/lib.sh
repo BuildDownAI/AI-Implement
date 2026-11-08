@@ -166,6 +166,16 @@ resolve_envelope_field() {
   fi
 }
 
+# Resolve the phase before provider validation, preserving env > envelope > default.
+resolve_runner_phase() {
+  RUNNER_PHASE_SOURCE="env"
+  [ -z "${RUNNER_PHASE:-}" ] && RUNNER_PHASE_SOURCE="default"
+  resolve_envelope_field RUNNER_PHASE runnerPhase
+  [ "$RUNNER_PHASE_SOURCE" = "default" ] && [ -n "${RUNNER_PHASE:-}" ] && RUNNER_PHASE_SOURCE="envelope"
+  RUNNER_PHASE="${RUNNER_PHASE:-implementation}"
+  export RUNNER_PHASE
+}
+
 # Classify AI_IMPLEMENT_RUN_CONFIG for model-auth bootstrap. Prints exactly one fixed word:
 #   legacy      no envelope, or a trusted-decodable envelope with neither a resolved agentConfig
 #               nor a credentials.modelAuthGrant (a callback/publication-only credentials
@@ -271,6 +281,10 @@ _remap_is_reserved() {
     ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
     RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
   esac
+  # Legacy KG runs must not restore model routing variables after credential cleanup.
+  if [ "${CONFIGURED:-0}" != "1" ] && [ "${RUNNER_PHASE:-}" = "kg-refresh" ]; then
+    case "$1" in CLAUDE_CODE_USE_BEDROCK|AWS_BEDROCK_ROLE_ARN) return 0 ;; esac
+  fi
   # Configured (opted-in) runs also reserve every model credential, session/auth-directory,
   # provider-routing and node preload/module-path name. Legacy runs keep the narrower list above on purpose.
   if [ "${CONFIGURED:-0}" = "1" ]; then
