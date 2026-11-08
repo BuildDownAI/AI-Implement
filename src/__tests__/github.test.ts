@@ -23,7 +23,7 @@ describe("dispatchWorkflow", () => {
     const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
 
     const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
-    expect(result).toEqual({ success: true, status: 204 });
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
 
     expect(fake.calls[0].url.href).toBe("https://api.github.com/repos/test-org/test-repo/actions/workflows/claude-implement.yml/dispatches");
     const body = JSON.parse(fake.calls[0].body);
@@ -35,7 +35,7 @@ describe("dispatchWorkflow", () => {
   it("returns success on 200 response", async () => {
     fakeFetch({ [DISPATCHES]: { status: 200 } }).install();
     const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
-    expect(result).toEqual({ success: true, status: 200 });
+    expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
   });
 
   it("returns failure with error body on non-success status", async () => {
@@ -114,7 +114,7 @@ describe("dispatchWorkflow", () => {
 
 // ---------- postWorkflowDispatch — returnRunDetails (AII-778) ----------
 
-describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
+describe("postWorkflowDispatch — run details", () => {
   const DISPATCHES = "POST /repos/acme/widgets/actions/workflows/claude-implement.yml/dispatches";
 
   const baseOpts = {
@@ -126,24 +126,13 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
     inputs: { run_config: "cfg", run_token: "rt" },
   };
 
-  it("sends return_run_details: true in the POST body when opted in", async () => {
+  it.each([undefined, true, false])("always requests run details with returnRunDetails=%s", async (returnRunDetails) => {
     const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
+    const opts = returnRunDetails === undefined ? baseOpts : { ...baseOpts, returnRunDetails };
 
-    await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
-
-    const body = JSON.parse(fake.calls[0].body);
-    expect(body.return_run_details).toBe(true);
-  });
-
-  it("omits return_run_details from the POST body when not opted in (legacy byte-for-byte)", async () => {
-    const fake = fakeFetch({ [DISPATCHES]: { status: 204 } }).install();
-
-    const result = await postWorkflowDispatch(baseOpts);
-
-    const body = JSON.parse(fake.calls[0].body);
-    expect("return_run_details" in body).toBe(false);
-    expect(result).toEqual({ success: true, status: 204 });
-    expect("outcome" in result).toBe(false);
+    expect(await postWorkflowDispatch(opts)).toEqual({ success: true, status: 204, outcome: "accepted" });
+    expect(fake.calls).toHaveLength(1);
+    expect(JSON.parse(fake.calls[0].body).return_run_details).toBe(true);
   });
 
   it("200 with valid run details for the requested repo → accepted with exact identity", async () => {
@@ -222,32 +211,54 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
     expect("runUrl" in result).toBe(false);
   });
 
-  it("a definite 422/404 application rejection → rejected", async () => {
-    fakeFetch({ [DISPATCHES]: { status: 422, text: "Unprocessable Entity" } }).install();
+  it.each([400, 404, 422, 429])("a definite %s application rejection → rejected", async (status) => {
+    fakeFetch({ [DISPATCHES]: { status, text: "Unprocessable Entity" } }).install();
 
-    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
+    const result = await postWorkflowDispatch(baseOpts);
 
     expect(result).toEqual({
       success: false,
-      status: 422,
+      status,
       error: "Unprocessable Entity",
       outcome: "rejected",
     });
   });
 
-  it("a transport failure (thrown fetch) → unknown, without throwing", async () => {
-    fakeFetch({ [DISPATCHES]: () => { throw new Error("network reset"); } }).install();
+  it("a transport failure without options returns unknown without retrying or throwing", async () => {
+    const fake = fakeFetch({ [DISPATCHES]: () => { throw new Error("network reset"); } }).install();
 
-    const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
-
-    expect(result.success).toBe(false);
-    expect(result.outcome).toBe("unknown");
+    expect(await postWorkflowDispatch(baseOpts)).toEqual({
+      success: false, status: 0, outcome: "unknown", error: "network reset",
+    });
+    expect(fake.calls).toHaveLength(1);
   });
 
-  it("legacy (non-opted-in) throws on a transport failure, unchanged", async () => {
-    fakeFetch({ [DISPATCHES]: () => { throw new Error("network reset"); } }).install();
+  it.each([
+    { status: 422, outcome: "rejected" },
+    { status: 500, outcome: "unknown" },
+    { status: 503, outcome: "unknown" },
+  ])("a failed $status body stream preserves $outcome without retrying or throwing", async ({ status, outcome }) => {
+    const fake = fakeFetch({
+      [DISPATCHES]: () => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('Unexpected inputs provided: ["issue_identifier"]'));
+          },
+          pull(controller) {
+            controller.error(new Error('Unexpected inputs provided: ["issue_identifier"]'));
+          },
+        });
+        return new Response(body, { status });
+      },
+    }).install();
 
-    await expect(postWorkflowDispatch(baseOpts)).rejects.toThrow("network reset");
+    expect(await postWorkflowDispatch({
+      ...baseOpts,
+      inputs: { ...baseOpts.inputs, issue_identifier: "TEST-1" },
+    })).toEqual({
+      success: false, status, outcome, error: "Failed to read dispatch response body",
+    });
+    expect(fake.calls).toHaveLength(1);
   });
 
   it("an unparseable 200 body → unknown, not accepted", async () => {
@@ -259,14 +270,14 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
     expect("runId" in result).toBe(false);
   });
 
-  it("a 5xx (ambiguous server outcome) → unknown, not rejected", async () => {
-    fakeFetch({ [DISPATCHES]: { status: 503, text: "Service Unavailable" } }).install();
+  it.each([201, 302, 500, 503])("an ambiguous status %s → unknown", async (status) => {
+    fakeFetch({ [DISPATCHES]: { status, text: "Service Unavailable" } }).install();
 
     const result = await postWorkflowDispatch({ ...baseOpts, returnRunDetails: true });
 
     expect(result).toEqual({
       success: false,
-      status: 503,
+      status,
       error: "Service Unavailable",
       outcome: "unknown",
     });
@@ -310,7 +321,7 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
     expect(result).toEqual({ success: true, status: 200, outcome: "unknown" });
   });
 
-  it("still performs the existing 422 strip-and-retry when returnRunDetails is also requested", async () => {
+  it("preserves the issue_identifier-only 422 retry without options", async () => {
     const fake = fakeFetch({
       [DISPATCHES]: [
         { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' },
@@ -321,10 +332,10 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
     const result = await postWorkflowDispatch({
       ...baseOpts,
       inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
-      returnRunDetails: true,
     });
 
     expect(fake.calls).toHaveLength(2);
+    expect(JSON.parse(fake.calls[0].body).return_run_details).toBe(true);
     const secondBody = JSON.parse(fake.calls[1].body);
     expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect(secondBody.return_run_details).toBe(true);
@@ -342,14 +353,15 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
     expect(fake.calls).toHaveLength(1);
   });
 
-  it("dispatchWorkflow (used by index.ts and comment-gapfill-drain.ts) never opts into returnRunDetails", async () => {
+  it.each([undefined, true, false])("dispatchWorkflow always requests run details with returnRunDetails=%s", async (returnRunDetails) => {
     const fake = fakeFetch({ "POST /repos/test-org/test-repo/actions/workflows/claude-implement.yml/dispatches": { status: 204 } }).install();
 
-    const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs);
+    const result = await dispatchWorkflow("gh-token", mockMapping, mockInputs,
+      returnRunDetails === undefined ? undefined : { returnRunDetails });
 
     const body = JSON.parse(fake.calls[0].body);
-    expect("return_run_details" in body).toBe(false);
-    expect(result).toEqual({ success: true, status: 204 });
+    expect(body.return_run_details).toBe(true);
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
   });
 });
 

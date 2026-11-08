@@ -803,7 +803,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     const secondBody = JSON.parse(github.calls[1].body);
     expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("cfg");
-    expect(result).toEqual({ success: true, status: 204 });
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
   });
 
   it("strips issue_identifier alone when the 422 names it on the envelope contract", async () => {
@@ -822,7 +822,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     const secondBody = JSON.parse(github.calls[1].body);
     expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("cfg");
-    expect(result).toEqual({ success: true, status: 204 });
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
   });
 
   it("does not retry on the legacy contract (no run_config) when the 422 names issue_identifier", async () => {
@@ -865,7 +865,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       },
     });
     expect(github.calls).toHaveLength(1);
-    expect(result).toEqual({ success: false, status: 422, error });
+    expect(result).toEqual({ success: false, status: 422, outcome: "rejected", error });
   });
 
   it.each([
@@ -878,7 +878,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       workflowFile: "claude-implement.yml", ref: "main", inputs,
     });
     expect(github.calls).toHaveLength(1);
-    expect(result).toEqual({ success: false, status: 422, error });
+    expect(result).toEqual({ success: false, status: 422, outcome: "rejected", error });
   });
 
   it("does not retry when the 422 names an input outside ENVELOPE_OPTIONAL_INPUTS", async () => {
@@ -894,7 +894,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     });
 
     expect(github.calls).toHaveLength(1);
-    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["base_branch"]' });
+    expect(result).toEqual({ success: false, status: 422, outcome: "rejected", error: 'Unexpected inputs provided: ["base_branch"]' });
   });
 
   it("does not retry on the legacy contract (no run_config), even when the 422 names runner_phase", async () => {
@@ -972,6 +972,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(result).toEqual({
       success: false,
       status: 422,
+      outcome: "rejected",
       error: 'Unexpected inputs provided: ["runner_callback_url"]',
     });
   });
@@ -989,7 +990,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     });
 
     expect(github.calls).toHaveLength(1);
-    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["issue_identifier_extra"]' });
+    expect(result).toEqual({ success: false, status: 422, outcome: "rejected", error: 'Unexpected inputs provided: ["issue_identifier_extra"]' });
   });
 
   it("does not strip on a suffix collision (rejected name is a superstring of an optional input)", async () => {
@@ -1012,6 +1013,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(result).toEqual({
       success: false,
       status: 422,
+      outcome: "rejected",
       error: 'Unexpected inputs provided: ["extra_issue_identifier"]',
     });
   });
@@ -1065,7 +1067,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     const secondBody = JSON.parse(github.calls[1].body);
     expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect("runner_callback_url" in secondBody.inputs).toBe(true);
-    expect(result).toEqual({ success: true, status: 204 });
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
   });
 
   it("matches the unexpected-inputs marker case-insensitively", async () => {
@@ -1116,7 +1118,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     });
 
     expect(github.calls).toHaveLength(1);
-    expect(result).toEqual({ success: false, status: 500, error: "Internal Server Error" });
+    expect(result).toEqual({ success: false, status: 500, outcome: "unknown", error: "Internal Server Error" });
   });
 
   it("the kg-refresh dispatch path (buildKgRefreshGhaDispatchBody + postWorkflowDispatch) retries on 422", async () => {
@@ -1153,7 +1155,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(secondBody.inputs.run_config).toBe("b64cfg");
     expect(secondBody.inputs.job_timeout_minutes).toBe("240");
     expect(secondBody.inputs).not.toHaveProperty("issue_identifier");
-    expect(result).toEqual({ success: true, status: 204 });
+    expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
   });
 });
 

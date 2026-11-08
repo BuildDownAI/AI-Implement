@@ -58,12 +58,7 @@ Both `dispatchWorkflow` and KG dispatches use this shared poster. It sends at mo
 
 ## Dispatch outcomes and `returnRunDetails`
 
-`postDispatchOnce`, the function inside `postWorkflowDispatch`/`dispatchWorkflow` that actually posts one `workflow_dispatch` request, accepts an opt-in `returnRunDetails?: boolean` option (AII-778, default off). The Restate review-fix worker opts in; ordinary `dispatchWorkflow` callers retain the existing response contract.
-
-Setting `returnRunDetails: true`:
-
-- Adds `return_run_details: true` to the POST body sent to GitHub's `workflow_dispatch` endpoint.
-- Populates a new `outcome: DispatchOutcome` field on `DispatchResult`, and — only when the response is a repo-validated `200` — `runId`/`runUrl`.
+`postDispatchOnce`, the function inside `postWorkflowDispatch`/`dispatchWorkflow` that posts one `workflow_dispatch` request, always sends `return_run_details: true` and populates `outcome: DispatchOutcome`. A repo-validated `200` also supplies `runId`/`runUrl`. Both public APIs still accept `returnRunDetails?: boolean` as a deprecated, ignored option; omitted, true and false values behave identically.
 
 ```typescript
 export type DispatchOutcome = "accepted" | "rejected" | "unknown";
@@ -72,7 +67,7 @@ export interface DispatchResult {
   success: boolean;
   status: number;
   error?: string;
-  outcome?: DispatchOutcome;   // only set when returnRunDetails: true
+  outcome?: DispatchOutcome;   // always populated by the shared poster
   runId?: number;              // only set for a repo-validated 200
   runUrl?: string;             // only set for a repo-validated 200
 }
@@ -87,13 +82,15 @@ export interface DispatchResult {
 | `200`, unparseable or repo-mismatched body | `unknown` | absent | Same reasoning as above, on the failing side. |
 | `4xx` | `rejected` | absent | A definite application-level refusal — safe to treat as "did not happen." |
 | `5xx`, or any other unrecognised status | `unknown` | absent | GitHub may have started the run before failing to report it cleanly; not safe to assume either accepted or rejected. |
-| transport failure (`fetch` throws) | `unknown` (only if `returnRunDetails: true`) | absent | See legacy behavior below — the identical failure is a thrown error for a caller that did not opt in. |
+| transport failure (`fetch` throws) | `unknown` | absent | Returns `success: false`, `status: 0` and the error message without throwing. The response may have been lost after GitHub started the run. |
+
+If reading an error response body fails after headers arrive, the poster preserves the HTTP status and its `rejected`/`unknown` outcome, returns a body-read error message, and does not retry.
 
 The three-way split matters to a caller trying to avoid a duplicate dispatch: `rejected` is safe to retry (GitHub is certain nothing started), `accepted` needs no retry, and `unknown` is neither — a transport failure or 5xx must not be blindly retried, because GitHub may have already started the run.
 
-**Legacy callers are unchanged, byte-for-byte.** A caller that does not pass `returnRunDetails` gets exactly the pre-AII-778 `DispatchResult` shape (`success`/`status`/`error`, no `outcome`/`runId`/`runUrl`) and the pre-AII-778 throw-on-transport-failure behavior: `postDispatchOnce` only catches and converts a `fetch` rejection into `{ outcome: "unknown", ... }` when `returnRunDetails` is set; otherwise the rejection propagates exactly as it always did. This is deliberate (AII-778's compatibility constraint) — opting in to run-detail reporting must never change behavior for a caller that didn't ask for it.
+Every call receives the same outcome classification, including calls without options. Transport failures resolve to `{ success: false, status: 0, outcome: "unknown", error }` and must not trigger a blind retry. All production dispatch paths already requested run details before this became unconditional.
 
-**`findWorkflowRunId` stays, but only as legacy identity — the pilot must not treat it as exact.** The existing post-dispatch heuristic (`src/github.ts`) scans the workflow's recent-runs list for a run created at or after the dispatch time, on the expected branch, optionally disambiguated by `display_title` against `issueIdentifier` — because `workflow_dispatch` alone never returns a run id, this scan is how every legacy (non-pilot) caller resolves one today, and `returnRunDetails` changes nothing there: a legacy caller doesn't pass it and keeps using the heuristic exactly as before.
+**`findWorkflowRunId` stays as a heuristic fallback — the pilot must not treat it as exact.** The existing post-dispatch heuristic (`src/github.ts`) scans recent workflow runs created at or after dispatch time on the expected branch, optionally disambiguating `display_title` against `issueIdentifier`. It still serves `204` responses, bodies without validated run identity, and jobs written before this change. Its callers and behavior are unchanged.
 
 The Restate review-fix pilot is held to a stricter rule: a title/time-window match is never exact execution identity, so the pilot must not fall back to `findWorkflowRunId` to manufacture one. A `200` with a validated body (`runId`/`runUrl`) *is* exact identity, and needs no heuristic. A `204` — the common case — is accepted but carries no identity at all; that is not a signal to guess via the heuristic, and it is not a signal to blindly repeat the POST (GitHub may have already started the run, and a second dispatch would duplicate it). Instead the pilot holds the attempt's occupancy and reconciles by exact attempt/execution identity — correlating the run that reports back against `run_config.reviewFix.attemptId` — until that resolves or the attempt's `deadlineAt` passes. This constraint is specific to the pilot; every other dispatch/monitor path (gap-analysis, planning, `src/monitor-gha.ts`, the GHA polling in `src/index.ts`) is unaffected and keeps resolving run identity via the heuristic as before.
 
