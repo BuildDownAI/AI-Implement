@@ -39,6 +39,7 @@ export interface LocalRunnerInput {
   githubToken: string;
   sessionToken: string;
   machineNonce: string;
+  /** @deprecated Ignored; session mode is no longer sent to runners. */
   sessionMode?: string;
   phase?: "implementation" | "planning" | "kg-refresh";
   orchestratorUrl?: string;
@@ -123,7 +124,6 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
     GITHUB_TOKEN: input.githubToken,
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
-    SESSION_MODE: input.sessionMode ?? "autonomous",
     RUNNER_PHASE: input.phase ?? "implementation",
   };
 

@@ -721,6 +721,7 @@ export interface SessionMachineInput {
   githubToken: string;
   sessionToken: string;
   machineNonce: string;
+  /** @deprecated Ignored; session mode is no longer sent to runners. */
   sessionMode?: string;
   phase?: "implementation" | "planning" | "kg-refresh";
   region?: string;
@@ -779,7 +780,6 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     GITHUB_TOKEN: input.githubToken,
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
-    SESSION_MODE: input.sessionMode ?? "autonomous",
     RUNNER_PHASE: input.phase ?? "implementation",
   };
 
@@ -842,7 +842,6 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
       issue_id: input.issueId,
       issue_identifier: input.issueIdentifier,
       repo: `${input.owner}/${input.repo}`,
-      session_mode: input.sessionMode ?? "autonomous",
       ...(input.orchestratorApp ? { orchestrator_app: input.orchestratorApp } : {}),
       ...(input.tenantId ? { tenant_id: input.tenantId } : {}),
       ...(input.expectedTtlSeconds !== undefined ? { expected_ttl_seconds: String(input.expectedTtlSeconds) } : {}),

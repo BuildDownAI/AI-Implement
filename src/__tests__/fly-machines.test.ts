@@ -389,7 +389,7 @@ describe("buildSessionMachineConfig", () => {
     // The App private key must never reach a runner — only the short-lived install token.
     expect(env.GITHUB_APP_ID).toBeUndefined();
     expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
-    expect(env.SESSION_MODE).toBe("autonomous");
+    expect(env).not.toHaveProperty("SESSION_MODE");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
   });
 
@@ -435,15 +435,15 @@ describe("buildSessionMachineConfig", () => {
     expect(result.region).toBe("iad");
   });
 
-  it("passes sessionMode through to env", () => {
-    const result = buildSessionMachineConfig({ ...baseInput, sessionMode: "hybrid" });
-    expect(result.config.env!.SESSION_MODE).toBe("hybrid");
-  });
-
-  it("defaults sessionMode to autonomous", () => {
-    const result = buildSessionMachineConfig(baseInput);
-    expect(result.config.env!.SESSION_MODE).toBe("autonomous");
-  });
+  it.each([undefined, "autonomous", "hybrid", "shadow", ""])(
+    "ignores deprecated sessionMode %j",
+    (sessionMode) => {
+      const result = buildSessionMachineConfig({ ...baseInput, sessionMode });
+      expect(result).toEqual(buildSessionMachineConfig(baseInput));
+      expect(result.config.env).not.toHaveProperty("SESSION_MODE");
+      expect(result.config.metadata).not.toHaveProperty("session_mode");
+    },
+  );
 
   it("defaults RUNNER_PHASE to implementation", () => {
     const result = buildSessionMachineConfig(baseInput);
@@ -468,7 +468,6 @@ describe("buildSessionMachineConfig", () => {
       issue_id: "uuid-123",
       issue_identifier: "ENG-42",
       repo: "test-org/test-repo",
-      session_mode: "autonomous",
     });
   });
 
@@ -482,11 +481,6 @@ describe("buildSessionMachineConfig", () => {
     expect(metadata.purpose).toBe("session");
     expect(metadata).not.toHaveProperty("pipeline");
     expect(metadata).not.toHaveProperty("dispatch_id");
-  });
-
-  it("includes session_mode in metadata", () => {
-    const result = buildSessionMachineConfig({ ...baseInput, sessionMode: "shadow" });
-    expect(result.config.metadata!.session_mode).toBe("shadow");
   });
 
   it("includes orchestrator_app in metadata when provided", () => {
@@ -626,14 +620,14 @@ describe("buildSessionMachineConfig", () => {
   it("extraEnv overrides standard env vars when keys collide", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
-      extraEnv: { SESSION_MODE: "overridden" },
+      extraEnv: { ISSUE_ID: "overridden" },
     });
-    expect(result.config.env!.SESSION_MODE).toBe("overridden");
+    expect(result.config.env!.ISSUE_ID).toBe("overridden");
   });
 
   it("omitting extraEnv leaves standard env vars unchanged", () => {
     const result = buildSessionMachineConfig(baseInput);
-    expect(result.config.env!.SESSION_MODE).toBe("autonomous");
+    expect(result.config.env!.ISSUE_ID).toBe(baseInput.issueId);
     expect(result.config.env!.DEDUP_DB_PATH).toBeUndefined();
   });
 
@@ -892,7 +886,6 @@ describe("buildSessionMachineConfig", () => {
     expect(typeof meta.issue_id).toBe("string");
     expect(typeof meta.issue_identifier).toBe("string");
     expect(typeof meta.repo).toBe("string");
-    expect(typeof meta.session_mode).toBe("string");
     expect(typeof meta.orchestrator_app).toBe("string");
     expect(typeof meta.tenant_id).toBe("string");
     expect(typeof meta.expected_ttl_seconds).toBe("string");
@@ -900,7 +893,7 @@ describe("buildSessionMachineConfig", () => {
     expect(meta.issue_id).toBe(baseInput.issueId);
     expect(meta.issue_identifier).toBe(baseInput.issueIdentifier);
     expect(meta.repo).toBe(`${baseInput.owner}/${baseInput.repo}`);
-    expect(meta.session_mode).toBe("autonomous");
+    expect(meta).not.toHaveProperty("session_mode");
     expect(meta.orchestrator_app).toBe("ai-implement-prod");
     expect(meta.tenant_id).toBe("acme-corp");
     expect(meta.expected_ttl_seconds).toBe("14400");

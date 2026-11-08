@@ -469,8 +469,7 @@ describe("opted-out Fly implementation", () => {
 });
 
 // Fixtures captured by running these dispatches against the pre-AII-1389 `src/index.ts`; the per-run random
-// values (session token, nonce, run tokens) are replaced by placeholders before comparing. SESSION_MODE and
-// session_mode carry the mapping's session mode through unchanged.
+// values (session token, nonce, run tokens) are replaced by placeholders before comparing.
 const LEGACY_FLY_BODY = {
   "name": "session-aii-1389",
   "region": "iad",
@@ -487,7 +486,6 @@ const LEGACY_FLY_BODY = {
       "GITHUB_TOKEN": "scoped-token",
       "SESSION_TOKEN": "<SESSION_TOKEN>",
       "MACHINE_NONCE": "<MACHINE_NONCE>",
-      "SESSION_MODE": "autonomous",
       "RUNNER_PHASE": "implementation",
       "ANTHROPIC_API_KEY": "sk-ant-synthetic",
       "ORCHESTRATOR_URL": "https://orch.example",
@@ -512,7 +510,6 @@ const LEGACY_FLY_BODY = {
       "issue_id": "issue-1389",
       "issue_identifier": "AII-1389",
       "repo": "acme/app",
-      "session_mode": "autonomous",
       "expected_ttl_seconds": "14400"
     },
     "processes": [
