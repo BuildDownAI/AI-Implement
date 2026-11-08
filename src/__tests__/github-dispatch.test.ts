@@ -762,15 +762,15 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     return fakeFetch({ [`POST /repos/acme/${repo}/actions/workflows/claude-implement.yml/dispatches` as const]: replies }).install();
   }
 
-  it("exposes exactly runner_phase, runner_callback_url, and issue_identifier as the optional-input list", () => {
-    expect(ENVELOPE_OPTIONAL_INPUTS).toEqual(["runner_phase", "runner_callback_url", "issue_identifier"]);
+  it("exposes only issue_identifier as the optional-input list", () => {
+    expect(ENVELOPE_OPTIONAL_INPUTS).toEqual(["issue_identifier"]);
   });
 
   it.each([
     ["agentConfig", { agentConfig: { v: 1 } }],
     ["credentials.modelAuthGrant", { credentials: { version: 1, modelAuthGrant: {} } }],
   ])("does not downgrade a managed run (%s) on a rejected input", async (_name, extra) => {
-    const github = dispatches("r", githubError(422, 'Unexpected inputs provided: ["runner_phase"]'));
+    const github = dispatches("r", githubError(422, 'Unexpected inputs provided: ["issue_identifier"]'));
     const runConfig = Buffer.from(JSON.stringify({ v: 1, ...extra }), "utf-8").toString("base64");
 
     const result = await postWorkflowDispatch({
@@ -779,7 +779,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: runConfig, run_token: "", runner_phase: "implementation" },
+      inputs: { run_config: runConfig, run_token: "", issue_identifier: "AII-656" },
     });
 
     expect(github.calls).toHaveLength(1);
@@ -788,7 +788,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   });
 
   it("strips a single optional input named in the 422 body and retries once", async () => {
-    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' }, { status: 204 });
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' }, { status: 204 });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -796,12 +796,12 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
     });
 
     expect(github.calls).toHaveLength(2);
     const secondBody = JSON.parse(github.calls[1].body);
-    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("cfg");
     expect(result).toEqual({ success: true, status: 204 });
   });
@@ -849,32 +849,36 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(result.success).toBe(false);
   });
 
-  it("strips both runner_phase and runner_callback_url when the 422 names both", async () => {
-    const github = dispatches(
-      "kg-repo",
-      { status: 422, text: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]' },
-      { status: 204 },
-    );
-
+  it.each([
+    '["runner_phase"]',
+    '["runner_callback_url"]',
+    '["runner_phase", "runner_callback_url"]',
+  ])("returns the first 422 without retrying for retired inputs %s", async (names) => {
+    const error = `Unexpected inputs provided: ${names}`;
+    const github = dispatches("kg-repo", { status: 422, text: error });
     const result = await postWorkflowDispatch({
-      token: "tok",
-      owner: "acme",
-      repo: "kg-repo",
-      workflowFile: "claude-implement.yml",
-      ref: "main",
+      token: "tok", owner: "acme", repo: "kg-repo",
+      workflowFile: "claude-implement.yml", ref: "main",
       inputs: {
-        run_config: "cfg",
-        run_token: "rt",
-        runner_phase: "implementation",
-        runner_callback_url: "https://orch.example",
+        run_config: "cfg", run_token: "rt", issue_identifier: "AII-656",
+        runner_phase: "implementation", runner_callback_url: "https://orch.example",
       },
     });
+    expect(github.calls).toHaveLength(1);
+    expect(result).toEqual({ success: false, status: 422, error });
+  });
 
-    expect(github.calls).toHaveLength(2);
-    const secondBody = JSON.parse(github.calls[1].body);
-    expect("runner_phase" in secondBody.inputs).toBe(false);
-    expect("runner_callback_url" in secondBody.inputs).toBe(false);
-    expect(result.success).toBe(true);
+  it.each([
+    [{ run_config: "cfg", run_token: "rt" }, 'Unexpected inputs provided: ["issue_identifier"]'],
+    [{ run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" }, 'Validation failed: ["issue_identifier"]'],
+  ])("does not retry without a present optional input or unexpected-inputs marker", async (inputs, error) => {
+    const github = dispatches("kg-repo", { status: 422, text: error });
+    const result = await postWorkflowDispatch({
+      token: "tok", owner: "acme", repo: "kg-repo",
+      workflowFile: "claude-implement.yml", ref: "main", inputs,
+    });
+    expect(github.calls).toHaveLength(1);
+    expect(result).toEqual({ success: false, status: 422, error });
   });
 
   it("does not retry when the 422 names an input outside ENVELOPE_OPTIONAL_INPUTS", async () => {
@@ -920,8 +924,8 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   it("a retry that 422s again returns failure with exactly 2 fetches (no loop)", async () => {
     const github = dispatches(
       "kg-repo",
-      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
-      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' },
     );
 
     const result = await postWorkflowDispatch({
@@ -930,7 +934,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
     });
 
     expect(github.calls).toHaveLength(2);
@@ -938,14 +942,12 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(result.status).toBe(422);
   });
 
-  it("a second 422 naming a *different* optional input still returns failure with exactly 2 fetches (no third request)", async () => {
-    // Reproduces the bug the "repeats the already-removed name" test above cannot catch:
-    // the first 422 names runner_phase, the retry's own 422 names the *other* optional input,
-    // runner_callback_url (still present in the stripped payload). The retry must be returned
-    // as failure unconditionally rather than triggering a third request.
+  it("a second 422 naming a different unknown input still returns failure with exactly 2 fetches (no third request)", async () => {
+    // A second rejection must be returned unconditionally, even if it names another input.
+    // The first 422 names issue_identifier; the second names the retained runner_callback_url.
     const github = dispatches(
       "kg-repo",
-      { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' },
       { status: 422, text: 'Unexpected inputs provided: ["runner_callback_url"]' },
     );
 
@@ -958,14 +960,14 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: {
         run_config: "cfg",
         run_token: "rt",
-        runner_phase: "implementation",
+        issue_identifier: "AII-656",
         runner_callback_url: "https://orch.example",
       },
     });
 
     expect(github.calls).toHaveLength(2);
     const secondBody = JSON.parse(github.calls[1].body);
-    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect("runner_callback_url" in secondBody.inputs).toBe(true);
     expect(result).toEqual({
       success: false,
@@ -975,7 +977,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   });
 
   it("does not strip on a prefix collision (rejected name is a superstring of an optional input)", async () => {
-    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase_extra"]' });
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["issue_identifier_extra"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -983,15 +985,15 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
     });
 
     expect(github.calls).toHaveLength(1);
-    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["runner_phase_extra"]' });
+    expect(result).toEqual({ success: false, status: 422, error: 'Unexpected inputs provided: ["issue_identifier_extra"]' });
   });
 
   it("does not strip on a suffix collision (rejected name is a superstring of an optional input)", async () => {
-    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["extra_runner_callback_url"]' });
+    const github = dispatches("kg-repo", { status: 422, text: 'Unexpected inputs provided: ["extra_issue_identifier"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1002,7 +1004,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: {
         run_config: "cfg",
         run_token: "rt",
-        runner_callback_url: "https://orch.example",
+        issue_identifier: "AII-656",
       },
     });
 
@@ -1010,7 +1012,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect(result).toEqual({
       success: false,
       status: 422,
-      error: 'Unexpected inputs provided: ["extra_runner_callback_url"]',
+      error: 'Unexpected inputs provided: ["extra_issue_identifier"]',
     });
   });
 
@@ -1027,18 +1029,20 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656", runner_phase: "implementation", base_branch: "main" },
     });
 
     expect(github.calls).toHaveLength(2);
     const secondBody = JSON.parse(github.calls[1].body);
-    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("issue_identifier" in secondBody.inputs).toBe(false);
+    expect(secondBody.inputs.runner_phase).toBe("implementation");
+    expect(secondBody.inputs.base_branch).toBe("main");
     expect(result.success).toBe(true);
   });
 
   it("parses GitHub's actual JSON error response (escaped quotes in the message field)", async () => {
     const ghJsonBody = JSON.stringify({
-      message: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]',
+      message: 'Unexpected inputs provided: ["issue_identifier", "runner_callback_url"]',
       documentation_url: "https://docs.github.com/rest/actions/workflows#create-a-workflow-dispatch-event",
     });
     const github = dispatches("kg-repo", { status: 422, text: ghJsonBody }, { status: 204 });
@@ -1052,20 +1056,20 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: {
         run_config: "cfg",
         run_token: "rt",
-        runner_phase: "implementation",
+        issue_identifier: "AII-656",
         runner_callback_url: "https://orch.example",
       },
     });
 
     expect(github.calls).toHaveLength(2);
     const secondBody = JSON.parse(github.calls[1].body);
-    expect("runner_phase" in secondBody.inputs).toBe(false);
-    expect("runner_callback_url" in secondBody.inputs).toBe(false);
+    expect("issue_identifier" in secondBody.inputs).toBe(false);
+    expect("runner_callback_url" in secondBody.inputs).toBe(true);
     expect(result).toEqual({ success: true, status: 204 });
   });
 
   it("matches the unexpected-inputs marker case-insensitively", async () => {
-    const github = dispatches("kg-repo", { status: 422, text: 'UNEXPECTED INPUTS PROVIDED: ["runner_phase"]' }, { status: 204 });
+    const github = dispatches("kg-repo", { status: 422, text: 'UNEXPECTED INPUTS PROVIDED: ["issue_identifier"]' }, { status: 204 });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1073,7 +1077,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
     });
 
     expect(github.calls).toHaveLength(2);
@@ -1082,9 +1086,9 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
 
   it("does not retry when run_config is an empty string (legacy-shaped envelope guard)", async () => {
     // run_config: "" must not satisfy the envelope guard — an empty string is falsy data,
-    // not evidence the caller is on the envelope contract, and runner_phase must stay
+    // not evidence the caller is on the envelope contract, and issue_identifier must stay
     // authoritative for whatever contract actually sent an empty run_config.
-    const github = dispatches("legacy-ish-repo", { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' });
+    const github = dispatches("legacy-ish-repo", { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' });
 
     const result = await postWorkflowDispatch({
       token: "tok",
@@ -1092,7 +1096,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "legacy-ish-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "", run_token: "rt", issue_identifier: "AII-656" },
     });
 
     expect(github.calls).toHaveLength(1);
@@ -1108,7 +1112,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
     });
 
     expect(github.calls).toHaveLength(1);
@@ -1315,8 +1319,8 @@ describe("managed credentials on the GitHub Actions envelope (AII-1420)", () => 
   });
 
   it("never strips and retries a managed 422 naming an optional input, and the failure carries no bearer", async () => {
-    const github = refusedDispatch("runner_phase");
-    const inputs = { ...managedInputs(), runner_phase: "implementation" as const };
+    const github = refusedDispatch("issue_identifier");
+    const inputs = { ...managedInputs(), issue_identifier: "AII-656" };
     const result = await postWorkflowDispatch({ token: "tok", owner: "o", repo: "r", workflowFile: "claude-implement.yml", ref: "main", inputs });
     expect(github.calls).toHaveLength(1);
     expect(result.success).toBe(false);

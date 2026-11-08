@@ -235,7 +235,7 @@ The App also needs **Checks: read**. Without it, every check-runs read (post-pus
 
 The target repo's "Allow GitHub Actions to create and approve pull requests" toggle is **not** a prerequisite, despite older instructions saying so. Every synced workflow opens PRs with a **GitHub App token**, while that toggle governs the default `github-actions[bot]` actor — a different identity. Leaving it on is harmless; the real prerequisite is the App installed with contents, pull-requests, workflows, and checks permissions.
 
-`.github/workflows/sync-workflow.yml` remains a manual bulk fallback, but normal distribution happens from the orchestrator.
+Workflow template distribution runs only through the orchestrator; use the mapping’s **Sync workflows** action to enqueue a sync.
 
 ## Workflow templates
 

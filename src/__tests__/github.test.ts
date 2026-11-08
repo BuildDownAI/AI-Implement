@@ -313,20 +313,20 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
   it("still performs the existing 422 strip-and-retry when returnRunDetails is also requested", async () => {
     const fake = fakeFetch({
       [DISPATCHES]: [
-        { status: 422, text: 'Unexpected inputs provided: ["runner_phase"]' },
+        { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' },
         { status: 204 },
       ],
     }).install();
 
     const result = await postWorkflowDispatch({
       ...baseOpts,
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
+      inputs: { run_config: "cfg", run_token: "rt", issue_identifier: "AII-656" },
       returnRunDetails: true,
     });
 
     expect(fake.calls).toHaveLength(2);
     const secondBody = JSON.parse(fake.calls[1].body);
-    expect("runner_phase" in secondBody.inputs).toBe(false);
+    expect("issue_identifier" in secondBody.inputs).toBe(false);
     expect(secondBody.return_run_details).toBe(true);
     expect(result).toEqual({ success: true, status: 204, outcome: "accepted" });
   });

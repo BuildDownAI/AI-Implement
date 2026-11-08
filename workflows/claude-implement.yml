@@ -1,4 +1,4 @@
-# Synced to target repos by sync-workflow.yml.
+# Synced to target repos by the orchestrator's workflow sync.
 # ai-implement-capability: private-run-config-v1
 # ai-implement-capability: stage-agent-config-v1
 # ai-implement-capability: stage-agent-launch-context-v1
@@ -29,9 +29,6 @@
 #   AI_IMPLEMENT_FORWARDED_ENV above. When NPM_TOKEN and the registry are both present the
 #   runner writes a per-run npm user config for the install command only, then removes it —
 #   no target-repo .npmrc needed, and the token never reaches the model process.
-#
-# Required repo setting:
-#   Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests" → ENABLED
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
