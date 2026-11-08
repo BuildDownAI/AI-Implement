@@ -4,8 +4,8 @@ import { EventEmitter } from "node:events";
 import { writeFileSync, chmodSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { RestateSidecar, restateDataDir, ensureRequestIdentityKey, identityKeyFromPem, RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BIND_ADDRESS } from "../restate/server.js";
-import { getRestateStatus, resetRestateStatus, setRestateStatus } from "../restate/status.js";
-import { createRestateRegistrationGate, createBootReconciliation, stopSidecarsConcurrently, onRestateRegistered } from "../index.js";
+import { getRestateStatus, resetRestateStatus } from "../restate/status.js";
+import { createRestateRegistrationGate, createMainShutdown, runMainBoot, waitForRestateServing, RESTATE_BOOT_DEADLINE_MS, stopSidecarsConcurrently, onRestateRegistered } from "../index.js";
 import { testDir } from "./helpers/test-dir.js";
 
 // ---------------------------------------------------------------------------
@@ -799,6 +799,7 @@ describe("createRestateRegistrationGate", () => {
     await gate.attempt();
 
     expect(getRestateStatus().registration).toEqual({ state: "unreachable" });
+    expect(await gate.whenSettled()).toBe("unreachable");
   });
 
   // -------------------------------------------------------------------------
@@ -821,11 +822,15 @@ describe("createRestateRegistrationGate", () => {
         registerRestateEndpoint,
       });
 
+      const settled = vi.fn();
+      void gate.whenSettled().then(settled);
       await gate.attempt();
       expect(registerRestateEndpoint).toHaveBeenCalledTimes(1);
       expect(getRestateStatus().registration).toEqual({ state: "declined-conflict" });
+      expect(settled).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(settled).toHaveBeenCalledWith("serving");
       expect(registerRestateEndpoint).toHaveBeenCalledTimes(2);
       expect(getRestateStatus().registration).toEqual({ state: "registered" });
 
@@ -1082,37 +1087,215 @@ describe("request identity key", () => {
   });
 });
 
-describe("createBootReconciliation (AII-1271)", () => {
-  it("runs in main() when the cache came from Restate, and not again from onRegistered", async () => {
-    const reconcile = vi.fn(async () => {});
-    const boot = createBootReconciliation(reconcile, () => "restate");
-    await boot.atBoot();
-    expect(reconcile).toHaveBeenCalledTimes(1);
-    await boot.onRegistered();
-    expect(reconcile).toHaveBeenCalledTimes(1);
+describe("model price schedule boot hook", () => {
+  it("arms prices when the successful-registration hook runs", async () => {
+    const armPrices = vi.fn(async () => {});
+    const step = async () => {};
+    const deps = { armPrices, releaseHold: step, sweep: () => {}, scrub: step, seed: step, refresh: step };
+    await onRestateRegistered(deps);
+    expect(armPrices).toHaveBeenCalledOnce();
+  });
+});
+
+describe("waitForRestateServing", () => {
+  it("allows late readiness within the provisioning health budget", async () => {
+    const { HEALTH_WAIT_MS } = await import("../provision-client.js");
+    expect(RESTATE_BOOT_DEADLINE_MS).toBe(300_000);
+    expect(RESTATE_BOOT_DEADLINE_MS).toBeGreaterThan(30_000);
+    expect(RESTATE_BOOT_DEADLINE_MS).toBeLessThan(HEALTH_WAIT_MS);
   });
 
-  it("on the fallback skips main() and runs once from onRegistered, even if it fires again", async () => {
-    const reconcile = vi.fn(async () => {});
-    const boot = createBootReconciliation(reconcile, () => "fallback");
-    await boot.atBoot();
-    expect(reconcile).not.toHaveBeenCalled();
-    await boot.onRegistered();
-    await boot.onRegistered();
-    expect(reconcile).toHaveBeenCalledTimes(1);
+  it.each([
+    ["missing-binary", "not-attempted", undefined, "missing-binary"],
+    ["exited", "registered", "serving", "exited"],
+    ["exited", "registered", undefined, "exited"],
+    ["ready", "unreachable", "unreachable", "unreachable"],
+    ["ready", "unreachable", "hook-failed", "hook-failed"],
+    ["ready", "registered", "serving", "serving"],
+    ["ready", "registered", undefined, "deadline"],
+    ["ready", "not-attempted", undefined, "deadline"],
+    ["starting", "not-attempted", undefined, "deadline"],
+    ["timeout", "not-attempted", undefined, "deadline"],
+  ] as const)("%s / %s / %s yields %s", async (sidecar, registration, settlement, expected) => {
+    let time = 0;
+    const result = await waitForRestateServing({
+      status: () => ({ sidecar: sidecar === "exited" ? { state: sidecar, code: 1, signal: null } : { state: sidecar }, registration: { state: registration } }),
+      gate: { whenSettled: () => settlement ? Promise.resolve(settlement) : new Promise(() => {}) },
+      now: () => time,
+      deadlineMs: 100,
+      sleep: async () => { time += 50; },
+    });
+    expect(result).toBe(expected);
+    if (expected === "deadline") expect(time).toBe(100);
+  });
+
+  it("keeps a declined conflict waiting beyond the deadline, then accepts recovery", async () => {
+    let time = 0;
+    let finish!: (value: "serving") => void;
+    const settled = new Promise<"serving">(resolve => { finish = resolve; });
+    const result = await waitForRestateServing({
+      status: () => ({ sidecar: { state: "ready" }, registration: { state: time < 200 ? "declined-conflict" : "registered" } }),
+      gate: { whenSettled: () => settled }, now: () => time, deadlineMs: 100,
+      sleep: async () => { time += 50; if (time === 200) finish("serving"); },
+    });
+    expect(result).toBe("serving");
+    expect(time).toBe(200);
+  });
+
+  it("accepts readiness after the sidecar's initial timeout", async () => {
+    let time = 0;
+    let finish!: (value: "serving") => void;
+    const settled = new Promise<"serving">(resolve => { finish = resolve; });
+    expect(await waitForRestateServing({
+      status: () => ({ sidecar: { state: time < 40_000 ? "timeout" : "ready" }, registration: { state: time < 40_000 ? "not-attempted" : "registered" } }),
+      gate: { whenSettled: () => settled }, now: () => time,
+      sleep: async () => { time += 10_000; if (time === 40_000) finish("serving"); },
+    })).toBe("serving");
+  });
+
+  it.each(["SIGTERM", "SIGINT"])("%s interrupts the wait before boot can continue", async () => {
+    let stopped = false;
+    expect(await waitForRestateServing({
+      status: getRestateStatus, gate: { whenSettled: () => new Promise(() => {}) },
+      isShuttingDown: () => stopped, sleep: async () => { stopped = true; },
+    })).toBe("shutdown");
+  });
+});
+
+describe("registration hook settlement", () => {
+  it("never invokes the hook for unreachable registration", async () => {
+    const onRegistered = vi.fn(async () => {});
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => {}, registerRestateEndpoint: async () => ({ outcome: "unreachable" }), onRegistered,
+    });
+    await gate.attempt();
+    expect(await gate.whenSettled()).toBe("unreachable");
+    expect(onRegistered).not.toHaveBeenCalled();
+  });
+
+  it("settles only after sweep, scrub, seed and refresh finish, before reconciliation and polling", async () => {
+    const calls: string[] = [];
+    let finishSeed!: () => void;
+    const seed = new Promise<void>(resolve => { finishSeed = resolve; });
+    const step = (name: string) => async () => { calls.push(name); };
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: step("endpoint"), registerRestateEndpoint: async () => ({ outcome: "registered-no-force" }),
+      onRegistered: () => onRestateRegistered({
+        releaseHold: step("hold"), armPrices: step("prices"), sweep: () => { calls.push("sweep"); },
+        scrub: step("scrub"), seed: async () => { await seed; calls.push("seed"); }, refresh: step("refresh"),
+      }),
+    });
+    const attempt = gate.attempt();
+    const boot = runMainBoot({
+      registerSignal: () => {}, startServer: () => { calls.push("server"); },
+      wait: () => waitForRestateServing({ status: () => ({ ...getRestateStatus(), sidecar: { state: "ready" } }), gate }),
+      isShuttingDown: () => false, shutdown: async () => {},
+      logFly: () => { calls.push("Fly logs"); }, refreshCache: step("cache"),
+      reconcile: step("reconciliation"), postBootNotice: () => { calls.push("notice"); },
+      poll: step("poll"), startInterval: () => { calls.push("interval"); },
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(calls).toEqual(["endpoint", "server", "hold", "prices", "sweep", "scrub"]);
+    finishSeed();
+    await attempt;
+    await boot;
+    expect(calls).toEqual(["endpoint", "server", "hold", "prices", "sweep", "scrub", "seed", "refresh", "Fly logs", "cache", "reconciliation", "notice", "poll", "interval"]);
+  });
+
+  it("distinguishes a thrown hook from an endpoint failure", async () => {
+    const gate = createRestateRegistrationGate(() => false, {
+      startRestateEndpoint: async () => {}, registerRestateEndpoint: async () => ({ outcome: "registered-no-force" }),
+      onRegistered: async () => { throw new Error("hook failed"); },
+    });
+    await gate.attempt();
+    expect(await gate.whenSettled()).toBe("hook-failed");
+    expect(getRestateStatus().registration.state).toBe("unreachable");
   });
 });
 
 
-describe("model price schedule boot hook", () => {
-  it("arms prices only after successful registration", async () => {
-    const armPrices = vi.fn(async () => {});
-    const step = async () => {};
-    const deps = { armPrices, releaseHold: step, sweep: () => {}, scrub: step, seed: step, refresh: step, reconcile: step };
-    await onRestateRegistered(deps);
-    expect(armPrices).not.toHaveBeenCalled();
-    setRestateStatus({ registration: { state: "registered" } });
-    await onRestateRegistered(deps);
-    expect(armPrices).toHaveBeenCalledOnce();
+describe("main shutdown during Restate boot", () => {
+  function fixture() {
+    let shuttingDown = false;
+    const kg = { stop: vi.fn(async () => {}) };
+    const restate = { stop: vi.fn(async () => {}) };
+    const closeServer = vi.fn((done: () => void) => { done(); });
+    const exit = vi.fn();
+    const postShutdownNotice = vi.fn(async () => {});
+    const recordShutdown = vi.fn();
+    const shutdown = createMainShutdown({
+      isShuttingDown: () => shuttingDown, markShuttingDown: () => { shuttingDown = true; },
+      stopPolling: vi.fn(), stopRetrying: vi.fn(), recordShutdown, postShutdownNotice,
+      stopSidecars: () => stopSidecarsConcurrently(kg, restate),
+      closeServer, closeDb: vi.fn(), exit,
+    });
+    const signals = new Map<string, () => void>();
+    const postBootNotice = vi.fn();
+    const poll = vi.fn(async () => {});
+    const logFly = vi.fn();
+    const refreshCache = vi.fn(async () => {});
+    const reconcile = vi.fn(async () => {});
+    const startInterval = vi.fn();
+    const startServer = vi.fn();
+    const boot = (wait: () => ReturnType<typeof waitForRestateServing>) => runMainBoot({
+      registerSignal: (signal, handler) => { signals.set(signal, handler); },
+      startServer, wait, isShuttingDown: () => shuttingDown, shutdown,
+      postBootNotice, poll, logFly, refreshCache, reconcile, startInterval,
+    });
+    return { kg, restate, closeServer, exit, postShutdownNotice, recordShutdown, shutdown,
+      boot, signals, postBootNotice, poll, logFly, refreshCache, reconcile, startInterval, startServer,
+      isShuttingDown: () => shuttingDown };
+
+  }
+
+  it.each(["missing-binary", "exited", "unreachable", "hook-failed", "deadline"] as const)("fatal %s stops both children, closes HTTP and exits 1 without notice writes", async reason => {
+    const f = fixture();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    // A pending KG stop must not prevent Restate stop from starting.
+    let releaseKg!: () => void;
+    f.kg.stop.mockImplementation(() => new Promise<void>(resolve => { releaseKg = resolve; }));
+    const boot = f.boot(async () => reason);
+    await vi.waitFor(() => { expect(f.restate.stop).toHaveBeenCalledOnce(); });
+    expect(f.closeServer).not.toHaveBeenCalled();
+    releaseKg();
+    await boot;
+    expect(errors.mock.calls).toEqual([[`[main] Restate boot failed: ${reason}`]]);
+    errors.mockRestore();
+    expect(f.startServer).toHaveBeenCalledOnce();
+    expect(f.postBootNotice).not.toHaveBeenCalled();
+    expect(f.poll).not.toHaveBeenCalled();
+    expect(f.startInterval).not.toHaveBeenCalled();
+    expect(f.logFly).not.toHaveBeenCalled();
+    expect(f.refreshCache).not.toHaveBeenCalled();
+    expect(f.reconcile).not.toHaveBeenCalled();
+    expect(f.kg.stop).toHaveBeenCalledOnce();
+    expect(f.restate.stop).toHaveBeenCalledOnce();
+    expect(f.closeServer).toHaveBeenCalledOnce();
+    expect(f.exit).toHaveBeenCalledWith(1);
+    expect(f.postShutdownNotice).not.toHaveBeenCalled();
+    expect(f.recordShutdown).not.toHaveBeenCalled();
+    expect(f.isShuttingDown()).toBe(true);
+  });
+
+  it.each(["SIGTERM", "SIGINT"])("%s during the wait exits 0 and prevents polling after late hook completion", async signal => {
+    const f = fixture();
+    let settle!: (value: "serving") => void;
+    const settled = new Promise<"serving">(resolve => { settle = resolve; });
+    const boot = f.boot(() => settled);
+    expect(f.startServer).toHaveBeenCalledOnce();
+    f.signals.get(signal)!();
+    await vi.waitFor(() => { expect(f.exit).toHaveBeenCalledWith(0); });
+    settle("serving");
+    await boot;
+    expect(f.postBootNotice).not.toHaveBeenCalled();
+    expect(f.logFly).not.toHaveBeenCalled();
+    expect(f.refreshCache).not.toHaveBeenCalled();
+    expect(f.reconcile).not.toHaveBeenCalled();
+    expect(f.startInterval).not.toHaveBeenCalled();
+    expect(f.exit).toHaveBeenCalledWith(0);
+    expect(f.kg.stop).toHaveBeenCalledOnce();
+    expect(f.restate.stop).toHaveBeenCalledOnce();
+    expect(f.closeServer).toHaveBeenCalledOnce();
+    expect(f.poll).not.toHaveBeenCalled();
   });
 });
