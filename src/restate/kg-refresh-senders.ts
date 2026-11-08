@@ -132,10 +132,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       cpus: input.machine.cpus,
       memoryMb: input.machine.memoryMb,
       region: config.flySessionsRegion ?? undefined,
-      // KG runners receive no Fly app secrets, including the model protection key.
-      flyProcessLevelSecrets: true,
       teamKey: "kg-refresh",
-      teamSecretNames: [],
       purpose: "durable-runner",
       pipeline: "kg-refresh",
       dispatchId: input.dispatchId,

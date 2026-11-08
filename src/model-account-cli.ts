@@ -2,7 +2,7 @@ import { adoptProjects, type AdoptionDeps } from "./agent-config-adoption.js";
 import { getProjectStageConfig, readStageInputsFingerprint, setProjectStageConfig } from "./agent-config-store.js";
 import { getMappings } from "./config.js";
 import { getRunnerMode } from "./runner-mode.js";
-import { getDefaultBranchFileText } from "./github.js";
+import { getBranchSha, getDefaultBranchFileText } from "./github.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import { createAgentConfigAdminDeps } from "./model-auth-runtime.js";
 import { resolveDefaultRunnerImage } from "./repo-image.js";
@@ -359,9 +359,13 @@ function productionAdoptionDeps(deps: CliDeps): AdoptionDeps {
     getProject: getProjectStageConfig,
     fingerprint: readStageInputsFingerprint,
     runnerMode: () => getRunnerMode().mode,
-    async readFile(mapping, path) {
+    async readRevision(mapping) {
       const scoped = await getScopedInstallationToken(deps.env.GITHUB_APP_ID ?? "", (deps.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"), mapping.owner, { repositories: [mapping.repo] });
-      return getDefaultBranchFileText(scoped.token, mapping.owner, mapping.repo, path, mapping.defaultBranch);
+      return getBranchSha(scoped.token, mapping.owner, mapping.repo, mapping.defaultBranch);
+    },
+    async readFile(mapping, path, revision) {
+      const scoped = await getScopedInstallationToken(deps.env.GITHUB_APP_ID ?? "", (deps.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"), mapping.owner, { repositories: [mapping.repo] });
+      return getDefaultBranchFileText(scoped.token, mapping.owner, mapping.repo, path, revision);
     },
     inspectReadiness(request, candidate) {
       return createAgentConfigAdminDeps({ githubAppId: deps.env.GITHUB_APP_ID ?? "", githubAppPrivateKey: (deps.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"), sessionImage: resolveDefaultRunnerImage(deps.env).image }).inspectReadiness(request, candidate);
