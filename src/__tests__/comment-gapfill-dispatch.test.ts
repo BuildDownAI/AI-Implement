@@ -1984,6 +1984,30 @@ describe("drainCommentGapfillQueue — admission (AII-787)", () => {
     expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_log WHERE issue_id = ? AND status = 'dispatch-failed'").get("issue-unknown") as { n: number }).n).toBe(0);
   });
 
+  it("continues after secrets discovery fails and records the requested guest", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    flyMocks.listAppSecrets.mockRejectedValueOnce(new Error("secrets unavailable"));
+
+    // The mocked Fly response has no guest: accounting must use the requested config.
+    await dispatchFlyGapfillAndDecodeReviewers(null, { machineCpus: 4, machineMemoryMb: 8192 });
+
+    expect(warning).toHaveBeenCalledWith(
+      "[comment-gapfill] Failed to fetch app secrets for AII-673, proceeding without team secrets:",
+      expect.any(Error),
+    );
+    const row = dedup.getDb().prepare(
+      "SELECT machine_cpus, machine_memory_mb, pr_url, status FROM dispatch_log WHERE issue_id = ? AND phase = 'gap-analysis'",
+    ).get("issue-10");
+    expect(row).toEqual({
+      machine_cpus: 4,
+      machine_memory_mb: 8192,
+      pr_url: "https://github.com/acme/billing/pull/42",
+      status: "dispatched",
+    });
+    expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    warning.mockRestore();
+  });
+
   it("releases Fly admission if image preparation fails before createMachine", async () => {
     const mapping = makeMapping({ owner: "acme", repo: "billing", executionMode: "fly-machines" });
     seedDispatchLog("issue-fly-prep", "AII-307", "Fly prep", "acme", "billing", 90);
