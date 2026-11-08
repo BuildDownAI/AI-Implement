@@ -85,6 +85,18 @@ function ensureReviewFixEventsColumns(): void {
   }
 }
 
+function ensureReviewFixAttemptsColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(review_fix_attempts)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+  if (!names.has("execution_backend")) {
+    db.exec("ALTER TABLE review_fix_attempts ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'github-actions'");
+  }
+  if (!names.has("execution_ref")) {
+    db.exec("ALTER TABLE review_fix_attempts ADD COLUMN execution_ref TEXT");
+  }
+}
+
 function createRunnerTokensTable(): void {
   if (!db) return;
   db.exec(`
@@ -528,6 +540,8 @@ export function getDb(): Database.Database {
         authority_revoked_at INTEGER,
         github_run_id INTEGER,
         github_run_attempt INTEGER,
+        execution_backend TEXT NOT NULL DEFAULT 'github-actions',
+        execution_ref TEXT,
         task_snapshot_json TEXT NOT NULL,
         finding_versions_json TEXT NOT NULL,
         accepted_result_json TEXT,
@@ -540,6 +554,7 @@ export function getDb(): Database.Database {
         CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
       )
     `);
+    ensureReviewFixAttemptsColumns();
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_attempts_pr_history
       ON review_fix_attempts(installation_id, repository, pr_number, created_at)`);
     // AII-1566: when a record the control plane reads last changed (epoch ms, set by SQLite).
