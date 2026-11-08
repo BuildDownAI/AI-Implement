@@ -94,7 +94,7 @@ for (const file of files) {
       bearer: "AII982-grant-bearer-" + "A".repeat(32),
       bindings: [
         { stage: "planning", profileId: "prof-api", profileRevision: 2, authMode: "openai-api-key" },
-        { stage: "implementation", profileId: "prof-sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 },
+        { stage: "implementation", profileId: "prof-sub", profileRevision: 1, authMode: "claude-subscription" },
       ],
     };
     const codexGrant = {
@@ -219,7 +219,7 @@ for (const file of files) {
         mut(plainGrant, (g) => { g.bindings[0].stage = "deploy"; }),
         mut(plainGrant, (g) => { g.bindings[0].authMode = "oauth"; }),
         mut(plainGrant, (g) => { g.bindings[0].ownerGeneration = 1; }),
-        mut(plainGrant, (g) => { delete g.bindings[1].ownerGeneration; }),
+        mut(plainGrant, (g) => { g.bindings[1].ownerGeneration = 3; }),
         mut(plainGrant, (g) => { g.bindings[1].ownerGeneration = 0; }),
         mut(plainGrant, (g) => { g.bindings[1].ownerGeneration = -1; }),
         mut(plainGrant, (g) => { g.bindings[1].ownerGeneration = 1.5; }),

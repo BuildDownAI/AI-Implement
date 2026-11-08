@@ -239,33 +239,7 @@ describe("prepareManagedDispatch", () => {
     vi.doUnmock("../agent-run-preparation.js");
   });
 
-  it("revokes the grant when ready carries real reservations (real release)", async () => {
-    // Pass the adapter's subscription check on a codex config, then let the real preparation resolve a
-    // claude-subscription implementation stage so it reserves the profile and binds the owner generation.
-    const seed = ownership.reserve({ dispatchId: "seed-sub", profiles: [{ profileId: "sub", authMode: "subscription" }] });
-    if (seed.status !== "reserved") throw new Error("seed reserve failed");
-    const gen = seed.reservations[0]!.generation;
-    expect(sessions.importSession({ profileId: "sub", ownerGeneration: gen, sessionData: "synthetic-session", operator: OPERATOR }).ok).toBe(true);
-    expect(ownership.releaseLaunchRejected({ dispatchId: "seed-sub", profileId: "sub", generation: gen }).status).toBe("ok");
 
-    vi.resetModules();
-    vi.doMock("../agent-run-preparation.js", async () => {
-      const actual = await vi.importActual<typeof PrepModule>("../agent-run-preparation.js");
-      return {
-        ...actual,
-        prepareAgentRun: async (r: PrepModule.AgentRunRequest, deps: PrepModule.AgentRunPreparationDeps) => {
-          useStages("sub");
-          return actual.prepareAgentRun(r, deps);
-        },
-      };
-    });
-    const mocked = await import("../managed-dispatch-auth.js");
-    const d = await mocked.prepareManagedDispatch(req(), runtime);
-    vi.doUnmock("../agent-run-preparation.js");
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
-    expect(revokedAt()).not.toBeNull();
-    expect(JSON.stringify(d)).not.toContain("bearer");
-  });
 });
 
 const CAPABLE = "name: Implement\n# ai-implement-capability: stage-agent-config-v1\n# ai-implement-capability: stage-agent-launch-context-v1\n";

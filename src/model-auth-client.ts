@@ -865,7 +865,7 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       const { secret, ownerGeneration } = await obtainSecret(request, stage);
       if (
         secret.kind !== expectedSecretKind(request.authMode) &&
-        !(request.authMode === "claude-subscription" && secret.kind === "claude-oauth-token")
+        !(options.source.kind === "local" && request.authMode === "claude-subscription" && secret.kind === "session")
       ) fail("credential_source_mismatch", { profileId: request.profileId });
       // A refreshed session with nowhere to go would be silently lost.
       if (
