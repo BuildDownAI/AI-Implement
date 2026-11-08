@@ -42,8 +42,17 @@ describe("buildLocalRunnerEnv", () => {
     expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
     expect(env.ORCHESTRATOR_URL).toBe("http://host.docker.internal:8080");
-    expect(env.SESSION_MODE).toBe("autonomous");
+    expect(env).not.toHaveProperty("SESSION_MODE");
   });
+
+  it.each([undefined, "autonomous", "hybrid", "shadow", ""])(
+    "ignores deprecated sessionMode %j",
+    (sessionMode) => {
+      const env = buildLocalRunnerEnv({ ...baseInput, sessionMode });
+      expect(env).toEqual(buildLocalRunnerEnv(baseInput));
+      expect(env).not.toHaveProperty("SESSION_MODE");
+    },
+  );
 
   it("uses OAuth when provided instead of requiring an Anthropic key", () => {
     const env = buildLocalRunnerEnv({
@@ -69,10 +78,10 @@ describe("buildLocalRunnerEnv", () => {
   it("lets mapping extraEnv override defaults", () => {
     const env = buildLocalRunnerEnv({
       ...baseInput,
-      extraEnv: { SESSION_MODE: "hybrid", CUSTOM_VAR: "ok" },
+      extraEnv: { ISSUE_ID: "override", CUSTOM_VAR: "ok" },
     });
 
-    expect(env.SESSION_MODE).toBe("hybrid");
+    expect(env.ISSUE_ID).toBe("override");
     expect(env.CUSTOM_VAR).toBe("ok");
   });
 
@@ -412,7 +421,6 @@ describe("protected model auth (AII-1390)", () => {
       "-e", "GITHUB_REPO=AI-Implement",
       "-e", "GITHUB_DEFAULT_BRANCH=main",
       "-e", "MACHINE_NONCE=nonce-123",
-      "-e", "SESSION_MODE=autonomous",
       "-e", "RUNNER_PHASE=implementation",
       "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8080",
       "-e", "FOO=bar",

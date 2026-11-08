@@ -2514,10 +2514,6 @@ describe("handleMcpRequest", () => {
         },
         listTools: async () => [],
         callKgTool: async () => ({ ok: true, result: {} }),
-        proxyCall: (_req, res) => {
-          res.writeHead(500);
-          res.end();
-        },
       };
       // AII-711: the capability gate runs inside the kg_* handler, which reads the boot-time
       // singleton; the refusal is a tool result, not a JSON-RPC -32601 envelope.
@@ -2551,10 +2547,6 @@ describe("handleMcpRequest", () => {
         },
         listTools: async () => [],
         callKgTool: async () => ({ ok: true, result: {} }),
-        proxyCall: (_req, res) => {
-          res.writeHead(500);
-          res.end();
-        },
       };
       setKgMemoryProvider(stubProvider);
 
@@ -2584,10 +2576,6 @@ describe("handleMcpRequest", () => {
           stalenessStamp: false,
         },
         listTools: async () => [],
-        proxyCall: (_req, res) => {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ jsonrpc: "2.0", id: 9, result: { content: [] } }));
-        },
         callKgTool: async () => ({ ok: true, result: {} }),
       };
 
@@ -2726,10 +2714,6 @@ describe("handleMcpRequest", () => {
         capabilities: { hybridSearch: true, neighbors: true, path: true, provenance: true, stalenessStamp: false },
         listTools: async () => [],
         callKgTool,
-        proxyCall: (_req, res) => {
-          res.writeHead(500);
-          res.end();
-        },
       };
       setKgMemoryProvider(stubProvider);
 

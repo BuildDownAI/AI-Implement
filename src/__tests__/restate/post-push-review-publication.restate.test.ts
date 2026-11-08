@@ -1,3 +1,4 @@
+import { DEFAULT_REVIEWER_SELECTION } from "../../config.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createPostPushReviewPublication, MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS, publicationMarker, type PostPushReviewPublicationDependencies, type PostPushReviewPublicationInput, type PostPushReviewPublicationResult } from "../../restate/post-push-review-publication.js";
@@ -10,6 +11,10 @@ import { mintRunToken } from "../../runner-tokens.js";
 import { appendLog, initLogTable } from "../../log.js";
 import { makeContext } from "../helpers/builders.js";
 import { testDir } from "../helpers/test-dir.js";
+
+function runReview(...[context, inputs, reporter]: Parameters<typeof postPushReviewStep.run>) {
+  return postPushReviewStep.run(context, { reviewers: DEFAULT_REVIEWER_SELECTION, ...inputs }, reporter);
+}
 
 const TOKEN = "SENTINEL-PUBLICATION-INSTALLATION-TOKEN";
 const SHA = "a".repeat(40);
@@ -95,7 +100,7 @@ describe("PostPushReviewPublication", () => {
         { severity: "minor", body: "Unmapped bug. Preserve this evidence.", path: "src/other.ts", line: 99 },
       ];
       try {
-        await postPushReviewStep.run(makeContext({
+        await runReview(makeContext({
           githubOwner: "o", githubRepo: input.repo, githubToken: "dispatch-token", nonce: "", orchestratorUrl: "",
           callbackUrl, progressToken: token,
         }, { invoke: async () => ({ stdout: "", exitCode: 0, tokensUsed: 1,
