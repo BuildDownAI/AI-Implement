@@ -150,3 +150,31 @@ Import the token on the orchestrator with `node dist/model-account-cli.js secret
 A write-only credential field on **Models & providers** will allow an admin to set or replace the profile's setup-token without reading it back. That field comes with D6; it is not available for Claude subscription profiles yet.
 
 The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token }`, delivered to the runner as `CLAUDE_CODE_OAUTH_TOKEN`. Managed checkout requires no owner generation; setup-tokens need no refresh. Missing secrets, decryption failures and an unset `RUNNER_TOKEN_SECRET` prepare as `authentication-required` with the fixed code `session_unavailable`. Local `local-login` subscription runs retain the `session` kind and `authDir`.
+
+## Adopt an environment credential
+
+On the orchestrator, run `node dist/model-account-cli.js adopt-env` with no arguments.
+It reads `CLAUDE_CODE_OAUTH_TOKEN` first, then `ANTHROPIC_API_KEY`. When both are
+present, the token wins and the command reports that the key was ignored. Bedrock
+is outside this migration. `RUNNER_TOKEN_SECRET` must be set before adoption can write.
+
+The command creates `adopted-env-claude-subscription` or
+`adopted-env-anthropic-api-key`, stores the value encrypted at the matching
+`model-account:<profile-id>` reference, and configures planning, implementation
+and review with that profile, agent `claude`, provider `anthropic` and the built-in
+`DEFAULT_MODEL`. Each stage uses 90 minutes because configured stages require a
+timeout. It creates no project grants and opts no project into configured runs.
+
+Output lists each stage and profile id, never the credential. Existing configured
+defaults are a no-op, including when the environment no longer has the credential;
+the output reports their existing profile ids. A legacy defaults row is replaced
+with a configured revision. An active compatible adopted profile is reused without
+another profile revision; a disabled or archived adopted profile is refused, including
+when existing defaults reference it. Identifier or reference collisions fail without
+changes. Adoption writes are atomic.
+
+Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode`
+is `configured`, and all three stages name the adopted profile. Projects still
+need their own explicit opt-in. To roll back, revert the defaults and delete the
+profile on Models & providers; remove its encrypted credential with `secret-delete`
+if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it.

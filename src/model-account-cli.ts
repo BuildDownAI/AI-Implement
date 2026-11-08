@@ -3,14 +3,16 @@
  * orchestrator machine (for example through `fly ssh console`). ChatGPT plan commands: `chatgpt-import`,
  * `chatgpt-status`, `chatgpt-logout`, each with `--profile <id>`. API credential commands: `secret-import` and
  * `secret-delete`, each with `--ref model-account:<name>`, over the encrypted store in model-protected-secrets.ts.
- * Claude subscription commands arrive with AII-963; add them to `COMMANDS`.
+ * `adopt-env` migrates the ambient Claude credential and configures defaults without opting projects in.
  *
  * Trust boundary: the operator shell on this machine to the protected session store. The record enters only through
  * stdin (never argv). No token reaches stdout, stderr, or an error message; failures print fixed text.
  */
+import { STAGE_NAMES, type StageAgentConfigurationV1 } from "./agent-config.js";
+import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAccountProfile } from "./agent-config-store.js";
+import { getAccountProfile, getOrchestratorDefaults, saveAccountProfileRevision, setOrchestratorDefaults, storedMetadataCredentialResolver } from "./agent-config-store.js";
 import type { AccountProfileProjection } from "./agent-config-store.js";
 import { revoke } from "./chatgpt-plan-login.js";
 import { HOST_ID_KEY, SafeError, importChatGptRecord, latestPlanSequence, orchestratorHostId } from "./chatgpt-pairing.js";
@@ -27,7 +29,8 @@ export { HOST_ID_KEY, latestPlanSequence, orchestratorHostId };
 const OPERATOR = "model-account-cli";
 const USAGE =
   "usage: model-account-cli <chatgpt-import|chatgpt-status|chatgpt-logout> --profile <id>   (import reads the record JSON from stdin)\n" +
-  "       model-account-cli <secret-import|secret-delete> --ref model-account:<name>   (import reads the API key or Bedrock JSON from stdin)";
+  "       model-account-cli <secret-import|secret-delete> --ref model-account:<name>   (import reads the API key or Bedrock JSON from stdin)\n" +
+  "       model-account-cli adopt-env";
 
 export interface CliDeps {
   store: () => ModelSessionStore;
@@ -183,6 +186,62 @@ async function secretDelete(ref: string, deps: CliDeps): Promise<void> {
   deps.stdout(`ref=${ref} secret-delete ok`);
 }
 
+/** Fixed identifiers make retries reuse the adopted profile rather than minting accounts. */
+const ADOPTED_IDS = ["adopted-env-claude-subscription", "adopted-env-anthropic-api-key"];
+
+function adoptEnv(deps: CliDeps): void {
+  const config = getDb().transaction((): StageAgentConfigurationV1 => {
+    const existing = getOrchestratorDefaults();
+    if (existing?.config.mode === "configured") {
+      for (const stage of STAGE_NAMES) {
+        const id = existing.config.stages?.[stage]?.accountProfileId;
+        if (id && ADOPTED_IDS.includes(id) && getAccountProfile(id)?.status !== "active") {
+          throw new CliError("adopted profile is disabled");
+        }
+      }
+      deps.stdout("adopt-env defaults already configured; no changes");
+      return existing.config;
+    }
+    if (!deps.env.RUNNER_TOKEN_SECRET) throw new CliError(SECRET_FAILURES.key_unavailable);
+    const token = deps.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const key = deps.env.ANTHROPIC_API_KEY;
+    const value = token || key;
+    if (!value) throw new CliError("no model credential in the environment");
+    const authMode = token ? "claude-subscription" : "anthropic-api-key";
+    const profileId = `adopted-env-${authMode}`;
+    const ref = `model-account:${profileId}`;
+    const profile = getAccountProfile(profileId);
+    if (profile && profile.status !== "active") throw new CliError("adopted profile is disabled");
+    if (profile && (profile.agent !== "claude" || profile.provider !== "anthropic" || profile.authMode !== authMode ||
+        storedMetadataCredentialResolver.lookup(profileId, profile.revision) !== ref)) {
+      throw new CliError("adopted profile identifier is already in use");
+    }
+    // Do not overwrite a reference owned by another profile or an orphaned import.
+    const owners = getDb().prepare("SELECT profile_id, metadata_json FROM model_account_profile_revisions").all() as Array<{ profile_id: string; metadata_json: string }>;
+    if (owners.some(row => row.profile_id !== profileId && JSON.parse(row.metadata_json).credentialRef === ref) ||
+        (!profile && getDb().prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(ref))) {
+      throw new CliError("adopted credential reference is already in use");
+    }
+    if (!profile) saveAccountProfileRevision({
+      profileId, identity: "Adopted environment credential", revision: 1,
+      agent: "claude", provider: "anthropic", authMode, metadata: { credentialRef: ref },
+    });
+    const secrets = deps.secrets();
+    if (!profile || secrets.open(ref).ok === false) {
+      const result = secrets.write(ref, value);
+      if (!result.ok) throw new CliError(SECRET_FAILURES[result.code]);
+    }
+    const stage = { agent: "claude" as const, provider: "anthropic" as const, model: DEFAULT_MODEL,
+      accountProfileId: profileId, invocationTimeoutMs: 90 * 60 * 1000 };
+    const defaults: StageAgentConfigurationV1 = { version: 1, mode: "configured",
+      stages: { planning: stage, implementation: stage, review: stage } };
+    setOrchestratorDefaults(defaults, OPERATOR);
+    if (token && key) deps.stdout("ANTHROPIC_API_KEY ignored; CLAUDE_CODE_OAUTH_TOKEN takes precedence");
+    return defaults;
+  }).immediate();
+  for (const stage of STAGE_NAMES) deps.stdout(`${stage}: ${JSON.stringify(config.stages?.[stage])}`);
+}
+
 const SECRET_COMMANDS: Record<string, (ref: string, deps: CliDeps) => Promise<void>> = {
   "secret-import": secretImport,
   "secret-delete": secretDelete,
@@ -196,6 +255,14 @@ const COMMANDS: Record<string, (profileId: string, deps: CliDeps) => Promise<voi
 
 export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promise<number> {
   const [command, ...rest] = argv;
+  if (command === "adopt-env") {
+    if (rest.length) { deps.stderr(USAGE); return 2; }
+    try { adoptEnv(deps); return 0; }
+    catch (error) {
+      deps.stderr(`adopt-env failed: ${error instanceof CliError ? error.message : "unexpected failure"}`);
+      return 1;
+    }
+  }
   const secretRun = command ? SECRET_COMMANDS[command] : undefined;
   if (secretRun) {
     // Only `--ref <ref>` is accepted, so a value can never ride on argv; an invalid ref is never echoed.
