@@ -24,7 +24,7 @@ import { getAccountProfile, getOrchestratorDefaults, saveAccountProfileRevision,
 import type { AccountProfileProjection } from "./agent-config-store.js";
 import { revoke } from "./chatgpt-plan-login.js";
 import { HOST_ID_KEY, SafeError, importChatGptRecord, latestPlanSequence, orchestratorHostId } from "./chatgpt-pairing.js";
-import { getDb } from "./dedup.js";
+import { getDb, useReadOnlyDb } from "./dedup.js";
 import { createModelProtectedSecrets } from "./model-protected-secrets.js";
 import type { ModelProtectedSecrets, ProtectedSecretFailure } from "./model-protected-secrets.js";
 import { MODEL_ACCOUNT_REF_PATTERN } from "./model-credentials.js";
@@ -273,7 +273,9 @@ export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promi
       else { deps.stderr(USAGE); return 2; }
     }
     try {
-      const results = await adoptProjects(deps.adoption?.() ?? productionAdoptionDeps(deps), { projectKey, dryRun });
+      const adoption = deps.adoption?.();
+      if (dryRun && !adoption) useReadOnlyDb();
+      const results = await adoptProjects(adoption ?? productionAdoptionDeps(deps), { projectKey, dryRun });
       for (const result of results) deps.stdout(`${result.projectKey}: ${result.outcome}${result.modelNotCarried ? "; model not carried" : ""}; ${STAGE_NAMES.map(stage => `${stage}=${result.stages[stage].model} (${result.stages[stage].source})`).join("; ")}`);
       return 0;
     } catch (error) {

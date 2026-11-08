@@ -140,6 +140,21 @@ describe("project adoption", () => {
     deps.write = () => { throw new StaleStageInputsError(); };
     expect((await run(deps))[0].outcome).toBe("inputs_changed");
   });
+  it.each([
+    ["default", "github-actions", "github-actions"],
+    ["default", "fly-machines", "fly-machines"],
+    ["shadow", "fly-machines", "github-actions"],
+    ["local", "github-actions", "local-docker"],
+  ] as const)("checks planning readiness on %s / %s", async (mode, executionMode, planningBackend) => {
+    const { deps, write } = fixture();
+    deps.runnerMode = () => mode;
+    deps.getMappings = () => ({ A: { owner: "owner", repo: "repo", workflowFile: "implement.yml", planningEnabled: true, planningWorkflowFile: "plan.yml", executionMode } as RepoMapping });
+    deps.inspectReadiness = vi.fn<AdoptionDeps["inspectReadiness"]>(async request =>
+      request.workflowFile === "plan.yml" ? { status: "not-ready", code: "runner_incompatible" } : { status: "ready", profiles: [] });
+    expect((await run(deps))[0].outcome).toBe("runner_incompatible");
+    expect(deps.inspectReadiness).toHaveBeenLastCalledWith(expect.objectContaining({ backend: planningBackend, workflowFile: "plan.yml" }), expect.anything());
+    expect(write).not.toHaveBeenCalled();
+  });
   it("checks both shadow backends", async () => {
     const { deps, write } = fixture();
     deps.runnerMode = () => "shadow";

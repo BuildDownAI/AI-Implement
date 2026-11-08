@@ -507,6 +507,34 @@ describe("adopt-env", () => {
 });
 
 describe("adopt-projects CLI", () => {
+  it("opens production dry-run read-only before startup cleanup or migrations", async () => {
+    const stage = { agent: "claude" as const, provider: "anthropic" as const, model: DEFAULT_MODEL, accountProfileId: "active", invocationTimeoutMs: 60000 };
+    accounts.saveAccountProfileRevision({ profileId: "active", identity: "Active", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+    accounts.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
+    const db = dedup.getDb();
+    db.exec("INSERT INTO admin_sessions (token, expires_at) VALUES ('expired', 1)");
+    db.exec("INSERT INTO oauth_transactions (state, provider, code_verifier, nonce, redirect_to, created_at, expires_at) VALUES ('expired', 'test', 'verifier', 'nonce', '/', 1, 1)");
+    // A normal first open recreates this index, exposing schema writes as well as cleanup.
+    db.exec("DROP INDEX idx_runner_tokens_issue");
+    const snapshot = (connection: ReturnType<typeof dedup.getDb>) => {
+      const schema = connection.prepare("SELECT * FROM sqlite_master ORDER BY name").all();
+      const tables = connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[];
+      return { schema, data: tables.map(({ name }) => connection.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}" ORDER BY rowid`).all()) };
+    };
+    const before = snapshot(db);
+    dedup.closeDb();
+    vi.resetModules();
+    dedup = await import("../dedup.js");
+    cli = await import("../model-account-cli.js");
+    try {
+      expect(await cli.main(["adopt-projects", "--dry-run"], deps(""))).toBe(0);
+      expect(err).toEqual([]);
+      expect(dedup.getDb().readonly).toBe(true);
+      expect(snapshot(dedup.getDb())).toEqual(before);
+    } finally {
+      dedup.closeDb();
+    }
+  });
   it("filters projects, previews without writes and prints every model source", async () => {
     const write = vi.fn();
     const mapping = { owner: "owner", repo: "repo", workflowFile: "implement.yml", executionMode: "fly-machines" } as import("../config.js").RepoMapping;

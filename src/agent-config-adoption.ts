@@ -4,7 +4,7 @@ import type { RepoMapping } from "./config.js";
 import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
 import { StaleStageInputsError } from "./agent-config-store.js";
 import { parseWorkflowMd } from "./workflow-md.js";
-import { resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
+import { resolveExecutionPath, resolvePlanningExecutionPath, type RunnerMode } from "./runner-mode.js";
 import { DEFAULT_MODEL } from "./pipeline/default-model.js";
 
 export interface AdoptionDeps {
@@ -78,11 +78,16 @@ export async function adoptProjects(deps: AdoptionDeps, options: { projectKey?: 
       result.modelNotCarried = true;
       candidate.stages = {};
     }
-    const path = resolveExecutionPath(deps.runnerMode(), mapping.executionMode);
+    const runnerMode = deps.runnerMode();
+    const path = resolveExecutionPath(runnerMode, mapping.executionMode);
     const backends = path === "both" ? ["github-actions", "fly-machines"] as const : [path];
+    const checks = backends.map(backend => ({ backend, workflowFile: mapping.workflowFile }));
+    if (mapping.planningEnabled) {
+      checks.push({ backend: resolvePlanningExecutionPath(runnerMode, mapping.executionMode), workflowFile: mapping.planningWorkflowFile });
+    }
     try {
-      for (const backend of backends) {
-        const readiness = await deps.inspectReadiness({ projectKey, backend, workflowRepository: `${mapping.owner}/${mapping.repo}`, workflowFile: mapping.workflowFile }, candidate);
+      for (const check of checks) {
+        const readiness = await deps.inspectReadiness({ projectKey, ...check, workflowRepository: `${mapping.owner}/${mapping.repo}` }, candidate);
         if (readiness.status !== "ready") {
           result.outcome = readiness.status === "not-ready" ? readiness.code : "resolution_failed";
           break;
