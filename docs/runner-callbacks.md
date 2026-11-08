@@ -150,16 +150,17 @@ The planning result callback still marks the planning job complete and still ski
 | State, in check order | Decision | Reserve | Mint |
 | -- | -- | -- | -- |
 | `isManagedProject` false (includes an empty `projectKey`) | `legacy`, `prepareAgentRun` not called | no | no |
-| stored or resolved snapshot selects `claude-subscription` | `refuse` configuration-error `claude_subscription_unsupported` | no | no |
 | `prepareAgentRun` throws | `hold` `preparation_failed` | n/a | n/a |
 | `legacy` | `legacy` | no | no |
 | `ready`, `reused: false`, `reservations: []` | `launch` | no | yes |
 | `ready`, `reused: true` (bootstrap already taken) | `hold` `bootstrap_consumed` | n/a | no |
-| `ready` with a non-empty `reservations` | `releaseRejectedLaunch`, then `refuse` configuration-error `claude_subscription_unsupported` | released | revoked |
+| `ready` with a non-empty `reservations` | `releaseRejectedLaunch`, then `refuse` configuration-error `reserved_account_unsupported` | released | revoked |
 | `queued` | `leave-queued` `profile_busy` | n/a | no |
 | `configuration-error` | `refuse` configuration-error, same code | no | no |
 | `authentication-required` | `refuse` authentication-required, same code | no | no |
 | `recovery-required` | `hold`, same code | n/a | n/a |
+
+Claude subscription profiles follow preparation: a resolvable stored setup-token permits launch without an account reservation (ADR 049); a missing token refuses with authentication-required `session_unavailable`.
 
 The empty-`projectKey` row exists because `prepareAgentRun` rejects an empty key as `invalid_request`, and Jira issues can carry an empty scope key.
 
