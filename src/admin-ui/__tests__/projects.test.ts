@@ -688,12 +688,12 @@ describe("projects page agents tab", () => {
     expect(options).toEqual(expect.arrayContaining(["acct-a", "acct-b"]));
     expect(options).not.toContain("acct-off");
   });
-  it("lists only active, compatible profiles and shows readiness and recovery", async () => {
+  it("lists only active, compatible profiles and shows readiness without retired session recovery", async () => {
     const m = mountAgents({
       accounts: [
         account(),
         account({ profileId: "acct-off", profileStatus: "disabled" }),
-        account({ profileId: "acct-claude", agent: "claude", provider: "anthropic", authMode: "claude-subscription", account: { readiness: "sign-in required", failureCode: "authentication_required", sessionRecovery: { state: "recovery_required", recoveryRequired: true } } }),
+        account({ profileId: "acct-claude", agent: "claude", provider: "anthropic", authMode: "claude-subscription", account: { readiness: "sign-in required", failureCode: "authentication_required" } }),
         account({ profileId: "acct-bad", identity: "<img src=x onerror=alert(1)>", account: { readiness: "missing", failureCode: "x" } }),
       ],
     });
@@ -707,7 +707,9 @@ describe("projects page agents tab", () => {
     expect(panel.querySelector("img")).toBeNull();
     const text = panel.textContent!;
     expect(text).toContain("readiness: sign-in required (authentication_required)");
-    expect(text).toContain("session recovery: recovery_required, recovery required");
+    expect(panel.querySelector('[data-ag-profile="acct-claude"]')!.textContent).toContain("readiness: sign-in required (authentication_required)");
+    expect(text).not.toContain("session recovery");
+    expect(panel.querySelector('[data-ag-profile="acct-off"]')).toBeNull();
     expect(text).toContain("readiness: missing (x)");
   });
 

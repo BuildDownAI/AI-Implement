@@ -119,7 +119,6 @@ export function createAgentConfigAdminDeps(config: RuntimeConfig): AgentConfigAd
   const runtime = getModelAuthRuntime(config);
   return {
     credentials: runtime.credentials,
-    sessionSnapshot: (profileId) => runtime.ownership.snapshot(profileId),
     inspectReadiness(request, candidate) {
       const [owner, repo] = request.workflowRepository.split("/");
       return inspectAgentReadiness(
