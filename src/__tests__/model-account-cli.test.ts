@@ -535,6 +535,40 @@ describe("adopt-projects CLI", () => {
       dedup.closeDb();
     }
   });
+  it("carries models from the configured dispatch branch instead of GitHub's default", async () => {
+    const config = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    const runtime = await import("../model-auth-runtime.js");
+    const stage = { agent: "claude" as const, provider: "anthropic" as const, model: DEFAULT_MODEL, accountProfileId: "active", invocationTimeoutMs: 60000 };
+    accounts.saveAccountProfileRevision({ profileId: "active", identity: "Active", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+    accounts.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
+    const spies = [
+      vi.spyOn(config, "getMappings").mockReturnValue({ A: { owner: "owner", repo: "repo", defaultBranch: "release/models", workflowFile: "implement.yml", executionMode: "fly-machines", planningEnabled: false } as import("../config.js").RepoMapping }),
+      vi.spyOn(auth, "getScopedInstallationToken").mockResolvedValue({ token: "repo-token" } as Awaited<ReturnType<typeof auth.getScopedInstallationToken>>),
+      vi.spyOn(runtime, "createAgentConfigAdminDeps").mockReturnValue({ inspectReadiness: async () => ({ status: "ready", profiles: [] }) } as unknown as ReturnType<typeof runtime.createAgentConfigAdminDeps>),
+    ];
+    const files = {
+      ".ai-implement/config.yml": "models:\n  review: branch-review",
+      "WORKFLOW.md": "---\nmodel: branch-implementation\n---\n",
+      "PLANNING.md": "---\nmodel: branch-planning\n---\n",
+    };
+    const github = fakeFetch(Object.fromEntries(Object.entries(files).map(([path, content]) => [
+      `GET /repos/owner/repo/contents/${path}`,
+      ({ url }: import("./helpers/fake-fetch.js").FetchCall) => ({ json: { type: "file", encoding: "base64", content: Buffer.from(url.searchParams.get("ref") === "release/models" ? content : "---\nmodel: github-default-model\n---\n").toString("base64") } }),
+    ]))).install();
+    try {
+      expect(await cli.main(["adopt-projects", "--project", "A"], deps(""))).toBe(0);
+      expect(err).toEqual([]);
+      expect(github.calls).toHaveLength(3);
+      expect(github.calls.every(call => call.url.searchParams.get("ref") === "release/models")).toBe(true);
+      expect(accounts.getProjectStageConfig("A")?.config.stages).toEqual({
+        planning: { model: "branch-planning" }, implementation: { model: "branch-implementation" }, review: { model: "branch-review" },
+      });
+      expect(out).toEqual(["A: adopted; planning=branch-planning (PLANNING.md); implementation=branch-implementation (WORKFLOW.md); review=branch-review (.ai-implement/config.yml)"]);
+    } finally {
+      spies.forEach(spy => spy.mockRestore());
+    }
+  });
   it("filters projects, previews without writes and prints every model source", async () => {
     const write = vi.fn();
     const mapping = { owner: "owner", repo: "repo", workflowFile: "implement.yml", executionMode: "fly-machines" } as import("../config.js").RepoMapping;

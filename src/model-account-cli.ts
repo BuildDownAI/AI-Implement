@@ -361,7 +361,7 @@ function productionAdoptionDeps(deps: CliDeps): AdoptionDeps {
     runnerMode: () => getRunnerMode().mode,
     async readFile(mapping, path) {
       const scoped = await getScopedInstallationToken(deps.env.GITHUB_APP_ID ?? "", (deps.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"), mapping.owner, { repositories: [mapping.repo] });
-      return getDefaultBranchFileText(scoped.token, mapping.owner, mapping.repo, path);
+      return getDefaultBranchFileText(scoped.token, mapping.owner, mapping.repo, path, mapping.defaultBranch);
     },
     inspectReadiness(request, candidate) {
       return createAgentConfigAdminDeps({ githubAppId: deps.env.GITHUB_APP_ID ?? "", githubAppPrivateKey: (deps.env.GITHUB_APP_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"), sessionImage: resolveDefaultRunnerImage(deps.env).image }).inspectReadiness(request, candidate);
