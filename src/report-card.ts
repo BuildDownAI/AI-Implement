@@ -381,7 +381,14 @@ export function getIssueReportCard(identifier: string, prices: readonly ModelPri
        WHERE rfq.issue_identifier = ?`,
     )
     .get(identifier) as { n: number };
-  const reviewFixRounds = reviewFixRow.n;
+  const restateReviewFixRow = db
+    .prepare(
+      `SELECT COUNT(*) as n FROM review_fix_attempts rfa
+       JOIN review_fix_queue rfq ON json_extract(rfa.task_snapshot_json, '$.queueCursor.queueId') = rfq.id
+       WHERE rfq.issue_identifier = ?`,
+    )
+    .get(identifier) as { n: number };
+  const reviewFixRounds = reviewFixRow.n + restateReviewFixRow.n;
 
   // parked: dedup entry exists with no in-flight run
   const dedupRow = db
