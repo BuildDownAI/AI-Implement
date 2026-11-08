@@ -135,7 +135,7 @@ npm run check-setup    # runs the setup checks read-only against .env and the lo
 
 Only the GitHub App pair is hard-required — `loadConfig` throws without it. Ticketing credentials are not: an absent Linear or Jira configuration logs a warning and skips that provider's mappings, so the orchestrator still boots and serves.
 
-`npm run dev` also spawns the Restate sidecar (`RestateSidecar`, `src/restate/server.ts`) from `node_modules`, with its data under `./restate` — non-fatally, same as the KG sidecar (ADR 023, [docs/restate.md](docs/restate.md)).
+`npm run dev` also spawns the Restate sidecar (`RestateSidecar`, `src/restate/server.ts`) from `node_modules`, with its data under `./restate` — under the required contract, `npm run dev` exits when Restate cannot start or register. S1-10 will implement this boot gate; until then, boot continues on failure. See [docs/restate.md](docs/restate.md#boot-sequence) § Boot sequence and the [ADR 023 amendment](docs/adr/023-run-the-restate-server-as-an-orchestrator-sidecar.md#amendment-2026-11-07-restate-is-a-hard-dependency).
 
 Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`; the code older `.env.example` files shipped, `your-secret-access-code`, is refused at boot).
 

@@ -53,3 +53,39 @@ Use the Restate primitive in place of a hand-built one: the idempotency key in p
 ## Amendment (2026-10-01): request identity is the second control beside loopback binding
 
 The Consequences note above, that none of the three listeners needs authentication while loopback-bound, no longer stands alone. `RestateSidecar` generates an ED25519 key pair under the data directory on first boot and gives the private key to the server; the SDK endpoint receives the public key as `identityKeys` and rejects unsigned requests. `RESTATE_IDENTITY_KEY` supplies the public key when the server is external (test runtimes). The key applies to the whole endpoint. Separately, handlers only other services call (`KgRefresh.run`, `KgRepo.release`/`expire`/`recordDryRunOutcome`) are `ingressPrivate`. A corrupt key is regenerated; an unpreparable key keeps the sidecar down; there is no unsigned mode on the sidecar path. Loopback binding stays. Rollback is a revert. See docs/restate.md § "Request identity".
+
+## Amendment (2026-11-07): Restate is a hard dependency
+
+The operator decided on 2026-11-07 that Restate is a hard dependency, superseding this Decision bullet:
+
+> **Boot never fails on the sidecar's absence.**
+
+Its reason no longer holds because kg-refresh, the MCP tools service, the refresh authority, PlanningRun, review fix, self-deploy and `RunnerBackend` now run on Restate (standing rule 3).
+
+Only Restate changes: the KG sidecar remains non-fatal. The following tables define the contract that S1-10 and S1-14 will implement. This amendment records the required behavior ahead of those code changes on the same feature branch; it does not claim that they are complete. Until they land, boot continues after Restate startup or registration failure, as described in [docs/restate.md § Boot sequence](../restate.md#boot-sequence).
+
+Boot (to be implemented by S1-10):
+
+| sidecar.state | registration.state | Outcome |
+| -- | -- | -- |
+| ready | registered, hook finished | proceed: refresh the runner-backend cache, startupReconciliation, postBootNotice, first poll, poll interval |
+| ready | registered, hook still running | keep waiting |
+| ready | hook threw (the gate's catch sets unreachable) | log, stop both sidecars, close the server, exit 1 |
+| ready | not-attempted (endpoint starting) | keep waiting until the boot deadline |
+| starting | not-attempted | keep waiting until the boot deadline |
+| timeout, before the boot deadline | not-attempted | keep waiting; the background readiness poll can still reach ready |
+| not serving at the boot deadline, and registration is not declined-conflict | any | log, stop both sidecars, close the server, exit 1 |
+| missing-binary | not-attempted | exit 1 at once |
+| exited | any | exit 1 at once |
+| ready | unreachable | exit 1 at once; the hook does not run |
+| ready | declined-conflict | keep waiting with no deadline; the 60 s retry continues; the poll loop stays held |
+| any | SIGTERM or SIGINT during the wait | normal shutdown, exit 0; the poll never starts |
+
+After boot (to be implemented by S1-14):
+
+| Event | Outcome |
+| -- | -- |
+| sidecar child exits or errors, not caused by stop() | shutdown with exit code 1; the machine restarts |
+| sidecar exits because stop() or restart() ran | no action |
+| sidecar exits while a shutdown already runs | ignored |
+| an ingress call times out while the child is alive | unchanged: that call degrades (503 restate-unavailable), no shutdown |
