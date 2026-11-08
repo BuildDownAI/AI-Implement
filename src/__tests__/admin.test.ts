@@ -6753,11 +6753,25 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(store.getProjectOptIn("APP")).toBe(false);
     });
 
-    it("refuses GitHub Actions opt-in as unsupported while workflows are unreadable", async () => {
+    it("refuses unreadable GitHub Actions workflows with the sync action and stores nothing", async () => {
       const t = await seed();
+      const revs = count("stage_agent_config_revisions");
       const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));
       expect(r.status).toBe(409);
-      expect(r.json.code).toBe("unsupported_backend");
+      expect(r.json).toMatchObject({ code: "delivery_unreadable", backend: "github-actions",
+        action: "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows." });
+      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(false);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+    });
+
+    it("enables a ready GitHub Actions project after inspecting readiness", async () => {
+      const t = await seed();
+      const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
+      expect((await optIn(t, inspect)).status).toBe(200);
+      expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions", projectKey: "APP" }), expect.objectContaining({ mode: "configured" }));
+      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(true);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
     });
 
     it("inspects the Fly backend without GHA template checks", async () => {

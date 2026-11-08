@@ -725,7 +725,7 @@ describe("projects page agents tab", () => {
 
   it.each([
     [422, "claude_subscription_unsupported", "Claude subscription"],
-    [409, "unsupported_backend", "GitHub Actions"],
+    [409, "delivery_unreadable", "The workflow files could not be read. Run the workflow sync and try again."],
     [409, "readiness_unavailable", "Readiness could not be checked"],
     [503, "readiness_unavailable", "Readiness could not be checked"],
     [409, "stale_inputs", "refreshed"],
@@ -744,8 +744,8 @@ describe("projects page agents tab", () => {
     expect(err.textContent).not.toContain("raw");
   });
 
-  it("shows the action string for GitHub Actions template codes", async () => {
-    const m = mountAgents({ put: { status: 409, body: { code: "runner_incompatible", action: "Run the existing workflow sync." } } });
+  it.each(["runner_incompatible", "retired_workflow_present", "delivery_unreadable"])("shows the action string for GitHub Actions %s", async (code) => {
+    const m = mountAgents({ put: { status: 409, body: { code, action: "Run the existing workflow sync." } } });
     await open(m);
     const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
     box.checked = true;
