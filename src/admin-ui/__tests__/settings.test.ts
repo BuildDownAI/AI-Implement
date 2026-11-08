@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { settingsHtml, settingsScript } from "../pages/settings.js";
 
 describe("linear pickup label card", () => {
@@ -138,5 +139,48 @@ describe("orchestrator agent defaults card", () => {
     expect(settingsHtml).toContain('id="settings-agent-defaults-error" class="error hidden"');
     expect(settingsHtml).toContain("each project opts in separately");
     expect(settingsHtml).toContain("Changes apply to the next run");
+  });
+});
+
+
+describe("runner backend source line", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it.each([
+    ["not-loaded", "sessions-test", "Restate has not answered yet"],
+    ["not-loaded", null, "Restate has not answered yet"],
+    ["restate", "sessions-test", "Active: sessions-test (source: restate)"],
+    ["restate", null, "Not configured — add a sessions app name to enable Fly dispatch"],
+  ])("renders %s with app %s", async (runnerBackendSource, runtimeValue, expected) => {
+    document.body.innerHTML = settingsHtml;
+    const responses: Record<string, unknown> = {
+      "/api/settings": {
+        runnerBackendSource,
+        flySessionsApp: { runtimeValue },
+        flySessionsRegion: { runtimeValue: null },
+        linearPickupLabel: { value: null, effective: "AI-Implement" },
+        retryPolicyDefaults: {},
+      },
+      "/api/global-secrets": [],
+      "/api/agent-defaults": { configured: false, mode: "legacy", stages: {} },
+    };
+    vi.stubGlobal("api", vi.fn(async (url: string) => {
+      if (!(url in responses)) throw new Error("Unexpected request: " + url);
+      return { ok: true, status: 200, json: async () => responses[url] };
+    }));
+    vi.stubGlobal("esc", (s: string) => s);
+    vi.stubGlobal("isAdmin", () => false);
+    let init = () => {};
+    vi.stubGlobal("registerPage", (_: string, fn: () => void) => { init = fn; });
+    new Function(settingsScript)();
+    init();
+    await vi.waitFor(() => {
+      expect(document.getElementById("settings-sessions-app-source")!.textContent).toBe(expected);
+    });
+  });
+
+  it("removes the retired source wording", () => {
+    expect(settingsScript).not.toContain("source: fallback");
+    expect(settingsScript).not.toContain("Restate not read yet");
   });
 });
