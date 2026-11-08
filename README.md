@@ -418,7 +418,7 @@ session/              Entrypoint scripts for the Fly Machines runner image
 docs/                 Design notes, ADRs
 CONTEXT.md            Domain glossary — the terms the ADRs turn on (developer harness
                       vs. local run, local artifact, task document, demo/managed run)
-.github/workflows/    deploy-clients.yml, sync-workflow.yml, build-runner.yml,
+.github/workflows/    deploy-clients.yml, build-runner.yml,
                       claude-review.yml
 ```
 
