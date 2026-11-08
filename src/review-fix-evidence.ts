@@ -667,6 +667,7 @@ interface AttemptOwnershipRow {
   repository: string;
   prNumber: number;
   githubRunId: number | null;
+  executionRef: string | null;
   resultConflictAt: number | null;
 }
 
@@ -680,9 +681,9 @@ interface AttemptOwnershipRow {
  *    stuck row.
  *  - **result conflict** — `result_conflict_at` is set: a second, disagreeing result was
  *    seen for this attempt and nothing has resolved which one is authoritative.
- *  - **unknown execution** — `github_run_id` is still null. `bindExecution` never ran
+ *  - **unknown execution** — `github_run_id` and `execution_ref` are both still null. `bindExecution` never ran
  *    (or never landed) for this attempt, so the row that recorded activity/a terminal
- *    outcome cannot be tied to the GitHub Actions run that produced it. A `launch_rejected`
+ *    outcome cannot be tied to the execution that produced it. A `launch_rejected`
  *    attempt (never bound, by design — see `restate/review-fix-attempt.ts`) never reaches
  *    this check in practice: it never streams activity or a cycle summary, so it's never a
  *    sweep candidate to begin with.
@@ -695,7 +696,7 @@ function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOw
 
   if (attempt.resultConflictAt !== null) return true;
 
-  if (attempt.githubRunId === null) return true;
+  if (attempt.githubRunId === null && attempt.executionRef === null) return true;
 
   return false;
 }
@@ -742,7 +743,7 @@ export function sweepExpiredReviewFixEvidence(now: number = Date.now()): ReviewF
     const attempt = db
       .prepare(`
         SELECT completed_at as completedAt, dispatch_id as dispatchId, installation_id as installationId,
-               repository, pr_number as prNumber, github_run_id as githubRunId, result_conflict_at as resultConflictAt
+               repository, pr_number as prNumber, github_run_id as githubRunId, execution_ref as executionRef, result_conflict_at as resultConflictAt
         FROM review_fix_attempts WHERE attempt_id = ?
       `)
       .get(attemptId) as AttemptOwnershipRow | undefined;

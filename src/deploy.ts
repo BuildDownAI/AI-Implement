@@ -92,7 +92,7 @@ export function createRestateDrainProbes(excludeInvocationId?: string): RestateD
     oldDeploymentInvocations: () => queryNonCompletedInvocations(fetch, RESTATE_ADMIN_BASE_URL, endpointUri, excludeInvocationId),
     unresolvedLaunches: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
       JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
-      WHERE d.released_at IS NULL AND a.state = 'launch_intent' AND a.github_run_id IS NULL`),
+      WHERE d.released_at IS NULL AND a.state = 'launch_intent' AND (a.github_run_id IS NULL AND a.execution_ref IS NULL)`),
     unresolvedTerminations: async () => count(`SELECT COUNT(*) AS n FROM review_fix_attempts a
       JOIN dispatch_admissions d ON d.dispatch_id = a.dispatch_id
       WHERE d.released_at IS NULL AND a.authority_revoked_at IS NOT NULL AND a.completed_at IS NULL`),
