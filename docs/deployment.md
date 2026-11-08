@@ -324,12 +324,9 @@ To run a target repo against Bedrock instead of the Anthropic API, use the **Git
 
 1. **In the admin UI (`/admin`)**, edit the repo's mapping: set **Provider** to `bedrock` and **AWS Region** to the region hosting your inference profile (e.g. `us-west-2`).
 2. **In the target repo**, add a repository secret `AWS_BEDROCK_ROLE_ARN` — an IAM role trusting the GitHub OIDC provider for that repo, with `bedrock:InvokeModel` on the profiles you need.
-3. **In the target repo**, add two repository *variables* so `/ai-implement` comment-triggered runs route to the same provider:
-   - `AI_IMPLEMENT_PROVIDER` = `bedrock`
-   - `AI_IMPLEMENT_AWS_REGION` = the same region
-4. **In the target repo's `WORKFLOW.md`** (and `PLANNING.md` if planning is enabled), change `model:` to a Bedrock model ID or inference-profile ARN.
+3. **In the target repo's `WORKFLOW.md`** (and `PLANNING.md` if planning is enabled), change `model:` to a Bedrock model ID or inference-profile ARN.
 
-**Step 4 is not optional and nothing enforces it.** The workflows validate that `aws_region` and `AWS_BEDROCK_ROLE_ARN` are present, and fail clearly when they are not — but **nothing validates the model against the provider**. An Anthropic-style ID left in front matter is passed to Bedrock verbatim and fails at Claude invocation time with a provider error rather than a configuration error.
+**Step 3 is not optional and nothing enforces it.** The workflows validate that `aws_region` and `AWS_BEDROCK_ROLE_ARN` are present, and fail clearly when they are not — but **nothing validates the model against the provider**. An Anthropic-style ID left in front matter is passed to Bedrock verbatim and fails at Claude invocation time with a provider error rather than a configuration error.
 
 IAM trust policy shape, scoped to one repo:
 
