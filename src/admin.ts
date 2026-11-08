@@ -4400,13 +4400,7 @@ interface OptInRefusal {
 async function optInRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<OptInRefusal | null> {
   const mapping = getMappings()[projectKey]!;
   try {
-    const { resolution } = resolveCandidateProjectStageConfig(projectKey, candidate);
-    if (resolution.mode === "configured" && STAGE_NAMES.some((s) => resolution.profiles[s].authMode === "claude-subscription")) {
-      return {
-        status: 422,
-        body: { error: "Claude subscription execution cannot be enabled from this API", code: "claude_subscription_unsupported" },
-      };
-    }
+    resolveCandidateProjectStageConfig(projectKey, candidate);
   } catch {
     return { status: 422, body: { error: "stage configuration does not resolve", code: "resolution_failed" } };
   }

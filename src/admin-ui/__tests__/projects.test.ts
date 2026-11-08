@@ -724,7 +724,6 @@ describe("projects page agents tab", () => {
   });
 
   it.each([
-    [422, "claude_subscription_unsupported", "Claude subscription"],
     [409, "delivery_unreadable", "The workflow files could not be read. Run the workflow sync and try again."],
     [409, "readiness_unavailable", "Readiness could not be checked"],
     [503, "readiness_unavailable", "Readiness could not be checked"],

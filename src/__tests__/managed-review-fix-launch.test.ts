@@ -295,9 +295,22 @@ describe("production managed GHA review-fix launch", () => {
   it("does not dispatch a disabled account", async () => {
     profiles.retireAccountProfile("cdx");
     const { worker, plan } = await launch();
-    expect(await worker.launch(plan)).toEqual({ status: "unknown" });
+    expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
     expect(sent).toHaveLength(0);
     expect(count("model_credential_grants")).toBe(0);
+  });
+
+  it("keeps unexpected preparation exceptions unknown without exposing their text", async () => {
+    const adapter = await import("../managed-dispatch-auth.js");
+    const prepare = vi.spyOn(adapter, "prepareManagedDispatch").mockRejectedValue(new Error("managed dispatch refused: SYNTHETIC-private-error"));
+    try {
+      const { worker, plan } = await launch();
+      expect(await worker.launch(plan)).toEqual({ status: "unknown" });
+      expect(sent).toHaveLength(0);
+      expect(count("model_credential_grants")).toBe(0);
+    } finally {
+      prepare.mockRestore();
+    }
   });
 
   it("freezes the account once and never redispatches on reconstructed launch after settings change", async () => {
@@ -371,7 +384,7 @@ describe("production managed GHA review-fix launch", () => {
     profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage(), review: stage(),
       implementation: { ...stage("sub"), agent: "claude", provider: "anthropic" } } });
     const { worker, plan } = await launch();
-    expect(await worker.launch(plan)).toEqual({ status: "unknown" });
+    expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
     expect(count("model_credential_grants")).toBe(0);
     expect(sent).toHaveLength(0);
   });
@@ -526,14 +539,30 @@ describe("production managed GHA review-fix launch", () => {
       expect(snapshot.stages.implementation.accountProfileId).toBe("capi");
     });
 
-    it("refuses a managed Claude subscription stage", async () => {
+    it("rejects an explicit non-subscription preparation refusal after admission without dispatch or grants", async () => {
+      await writeKey("capi", "codex", "openai", "openai-api-key");
+      defaults("capi");
+      expect(await admit()).toBe("admit");
+      profiles.retireAccountProfile("capi");
+      const { worker, plan } = await launch();
+      expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
+      expect(sent).toHaveLength(0);
+      expect(count("run_agent_config_snapshots")).toBe(0);
+      expect(count("model_credential_grants")).toBe(0);
+    });
+
+    it("admits a ready managed Claude subscription stage, then rejects launch without dispatch or grants", async () => {
       profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
         authMode: "claude-subscription", });
       profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
         planning: { agent: "claude", provider: "anthropic", model: "claude-sonnet-5-5", accountProfileId: "sub", invocationTimeoutMs: 60_000 },
         implementation: stage(), review: stage(),
       } });
-      expect(await admit()).toBe("configuration_error");
+      expect(await admit()).toBe("admit");
+      const { worker, plan } = await launch();
+      expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
+      expect(sent).toHaveLength(0);
+      expect(count("run_agent_config_snapshots")).toBe(0);
       expect(count("model_credential_grants")).toBe(0);
     });
 

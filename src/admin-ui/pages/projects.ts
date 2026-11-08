@@ -788,7 +788,6 @@ export const projectsScript = `
   var AG_LABELS = { agent: 'Agent', provider: 'Provider', model: 'Model', fallbackModel: 'Fallback model', accountProfileId: 'Account profile', invocationTimeoutMs: 'Invocation timeout (ms)' };
   var AG_ERRORS = {
     resolution_failed: 'These settings do not resolve to a usable configuration. Check that every stage has an agent, provider, model, profile and timeout.',
-    claude_subscription_unsupported: 'Claude subscription profiles cannot be enabled from here. Pick a different profile.',
     readiness_unavailable: 'Readiness could not be checked right now. Nothing was changed; try again later.',
     stale_inputs: 'Defaults, a profile or this project changed while saving. The view was refreshed; review it and save again.',
     runner_incompatible: 'The project runner is not compatible with configured agents yet.',
