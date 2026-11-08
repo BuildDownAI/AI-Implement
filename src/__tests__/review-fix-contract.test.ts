@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  validateExecutionIdentity,
+  normalizeExecutionIdentity,
+  sameExecution,
+  resultMatchesExecution,
   validateScopedPrIdentity,
   validateAttemptId,
   validateReviewFixMetadata,
@@ -174,6 +178,69 @@ describe("validateReviewFixResultMetadata", () => {
     const first = validateReviewFixResultMetadata(resultMetadata);
     const second = validateReviewFixResultMetadata(resultMetadata);
     expect(first).toEqual(second);
+  });
+});
+
+describe("execution identity", () => {
+  const legacy = { githubRunId: 555, githubRunAttempt: 1 };
+  const github = { backend: "github-actions", ...legacy } as const;
+  const machines = ["fly-machines", "local-docker"] as const;
+
+  it("canonicalizes legacy and tagged GitHub identities", () => {
+    for (const identity of [legacy, github]) {
+      expect(validateExecutionIdentity(identity)).toEqual({ ok: true, value: github });
+      expect(normalizeExecutionIdentity(identity)).toEqual(github);
+    }
+    expect(normalizeExecutionIdentity(normalizeExecutionIdentity(legacy))).toEqual(github);
+  });
+
+  it.each(machines)("accepts and normalizes %s identities at the runRef length boundary", (backend) => {
+    const identity = { backend, runRef: "r".repeat(128) };
+    expect(validateExecutionIdentity(identity)).toEqual({ ok: true, value: identity });
+    expect(normalizeExecutionIdentity(identity)).toEqual(identity);
+    for (const runRef of [undefined, 123, "", "r".repeat(129)]) {
+      expect(validateExecutionIdentity({ backend, runRef }).ok).toBe(false);
+    }
+  });
+
+  it.each([null, undefined, [], "identity", {}, { backend: "unknown" }, { backend: null }])(
+    "rejects malformed identity %j", (identity) => {
+      expect(validateExecutionIdentity(identity).ok).toBe(false);
+    },
+  );
+
+  it("requires positive safe integer GitHub ids in both legacy and tagged forms", () => {
+    for (const backend of [undefined, "github-actions"]) {
+      for (const field of ["githubRunId", "githubRunAttempt"]) {
+        for (const value of [undefined, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "1", NaN, Infinity]) {
+          expect(validateExecutionIdentity({ ...legacy, backend, [field]: value }).ok).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("compares both GitHub ids and treats legacy identities as GitHub", () => {
+    expect(sameExecution(legacy, github)).toBe(true);
+    expect(sameExecution(github, legacy)).toBe(true);
+    expect(sameExecution(legacy, { ...github, githubRunId: 556 })).toBe(false);
+    expect(sameExecution(legacy, { ...github, githubRunAttempt: 2 })).toBe(false);
+  });
+
+  it.each(machines)("compares backend and reference for %s", (backend) => {
+    const identity = { backend, runRef: "run-1" };
+    expect(sameExecution(identity, identity)).toBe(true);
+    expect(sameExecution(identity, { backend, runRef: "run-2" })).toBe(false);
+    expect(sameExecution(identity, { backend: backend === "fly-machines" ? "local-docker" : "fly-machines", runRef: "run-1" })).toBe(false);
+    expect(sameExecution(identity, github)).toBe(false);
+    expect(sameExecution(github, identity)).toBe(false);
+    expect(resultMatchesExecution(resultMetadata, { ...legacy, ...identity })).toBe(false);
+  });
+
+  it("matches result metadata only when both GitHub ids agree", () => {
+    expect(resultMatchesExecution(resultMetadata, legacy)).toBe(true);
+    expect(resultMatchesExecution(resultMetadata, github)).toBe(true);
+    expect(resultMatchesExecution(resultMetadata, { ...github, githubRunId: 556 })).toBe(false);
+    expect(resultMatchesExecution(resultMetadata, { ...github, githubRunAttempt: 2 })).toBe(false);
   });
 });
 
