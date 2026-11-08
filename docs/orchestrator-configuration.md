@@ -164,7 +164,7 @@ The Restate registration hook runs only after successful registration. Boot awai
 
 To change the values after the object is seeded, save them on `/admin#settings` or call the admin-role `set_runner_backend` tool. The Settings page's `POST /api/settings` goes through that tool and writes no row; it answers 503 `restate-unavailable` when Restate cannot take the write. Clearing a field there stores `null` in the object, which leaves Fly without that value: it does not fall back to the environment.
 
-`GET /api/settings` reports `runnerBackendSource` (`restate` after any successful read, including an empty object, or the legacy `fallback` label before one), and for each value its runtime, row and environment values, with `overriddenByEnv` true only on the fallback path when the variable is set. Boot reconciliation of session machines runs in `main()` after the registration hook (including its awaited seed and refresh) finishes and main refreshes the cache again. There is no deferred reconciliation.
+`GET /api/settings` reports `runnerBackendSource` (`restate` after any successful read, including an empty object, or `not-loaded` before one), and for each value its runtime, row and environment values. Boot reconciliation of session machines runs in `main()` after the registration hook (including its awaited seed and refresh) finishes and main refreshes the cache again. There is no deferred reconciliation.
 
 ## Numeric tuning values
 

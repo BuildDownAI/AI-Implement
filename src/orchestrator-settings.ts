@@ -95,9 +95,9 @@ export function getFlySessionsConfig(): FlySessionsConfig {
   };
 }
 
-/** Whether a Restate read has completed; the legacy "fallback" label means nothing loaded yet. */
-export function getRunnerBackendSource(): "restate" | "fallback" {
-  return flyBackendCache.loaded ? "restate" : "fallback";
+/** Whether a Restate read has completed; nothing has loaded before the first successful read. */
+export function getRunnerBackendSource(): "restate" | "not-loaded" {
+  return flyBackendCache.loaded ? "restate" : "not-loaded";
 }
 
 /** Test seam: forgets the cached read and the outage latch. */

@@ -25,6 +25,7 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
   return {
     env: {},
     readSetting: () => null,
+    runnerBackendSource: () => "restate",
     runnerMode: () => ({ mode: "default", source: "default" }),
     flySessions: () => ({ token: null, app: null, region: null, source: { app: null, region: null } }),
     mappings: () => ({}),
