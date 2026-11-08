@@ -362,6 +362,31 @@ describe("historical reservations", () => {
     expect(rows("model_profile_reservations")).toEqual(before);
   });
 
+  it.each(["beginStop", "markRecoveryRequired", "releaseLaunchRejected"] as const)(
+    "prepares and reuses a grant independently of a historical %s owner", async op => {
+      const holder = ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
+      if (holder.status !== "reserved") throw new Error("setup");
+      ownership[op]({ dispatchId: "holder", profileId: "sub", generation: holder.reservations[0]!.generation });
+      const before = rows("model_profile_reservations");
+      const first = ready(await prep.prepareAgentRun(request(), deps));
+      const again = ready(await prep.prepareAgentRun(request(), deps));
+      expect(first.reservations).toEqual([]);
+      expect(again.reused).toBe(true);
+      expect(again.grant).toEqual(first.grant);
+      expect(rows("model_profile_reservations")).toEqual(before);
+    },
+  );
+
+  it("prepares a multi-profile Claude selection without partial reservations", async () => {
+    useStages(["sub2", "claude", "anthropic"], ["sub", "claude", "anthropic"]);
+    ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
+    const before = rows("model_profile_reservations");
+    const r = ready(await prep.prepareAgentRun(request(), deps));
+    expect(r.reservations).toEqual([]);
+    expect(r.grant.bindings.map(b => b.profileId)).toEqual(["sub2", "sub", "sub2"]);
+    expect(rows("model_profile_reservations")).toEqual(before);
+  });
+
   it("holds a revoked grant", async () => {
     ready(await prep.prepareAgentRun(request(), deps));
     dedup.getDb().prepare("UPDATE model_credential_grants SET revoked_at = 1").run();
@@ -490,6 +515,29 @@ describe("cleanup", () => {
     expect(rows("model_profile_reservations")).toEqual(before);
   });
 
+});
+
+describe("cleanup ownership completeness", () => {
+  for (const name of ["releaseRejectedLaunch", "releaseTerminated"] as const) {
+    it(`${name}: rejects unexpected, duplicate and wrong-dispatch owners without touching historical state`, async () => {
+      const r = ready(await prep.prepareAgentRun(request(), deps));
+      const historical = ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
+      if (historical.status !== "reserved") throw new Error("setup");
+      const owner = historical.reservations[0]!;
+      const before = rows("model_profile_reservations");
+      for (const supplied of [[owner], [owner, owner], [{ ...owner, generation: owner.generation + 1 }]]) {
+        expect((await prep[name]("d1", supplied, deps)).complete).toBe(false);
+        expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
+        expect(rows("model_profile_reservations")).toEqual(before);
+      }
+      expect((await prep[name]("other", [], deps)).complete).toBe(false);
+      expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
+      expect((await prep[name]("d1", r.reservations, deps)).complete).toBe(true);
+      expect(rows("model_credential_grants")[0]!.revoked_at).not.toBeNull();
+      expect((await prep[name]("d1", r.reservations, deps)).complete).toBe(true);
+      expect(rows("model_profile_reservations")).toEqual(before);
+    });
+  }
 });
 
 describe("inspectAgentReadiness", () => {

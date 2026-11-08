@@ -337,10 +337,72 @@ describe("client", () => {
 
   const sub = { profileId: "sub", authMode: "claude-subscription" as const };
 
+  it("invokes with the protected Claude token and never creates or checkpoints session state", async () => {
+    const { transport, calls } = fakeTransport((route) => reply(route, ack()));
+    const client = make(transport);
+    await client.checkout(sub);
+    expect(readdirSync(authRoot)).toEqual([]);
+    const boom = new Error("model crashed");
+    await expect(client.invoke("sub", async (inv) => {
+      expect(inv.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(S_API);
+      expect(inv.env).not.toHaveProperty("CLAUDE_CONFIG_DIR");
+      expect(JSON.stringify(inv.env)).not.toContain(S_INHERITED);
+      throw boom;
+    })).rejects.toBe(boom);
+    expect(await client.invoke("sub", async () => 42)).toBe(42);
+    await client.finish("sub", "completed");
+    expect(calls.map(c => c.route)).toEqual([MODEL_AUTH_ROUTES.checkout, MODEL_AUTH_ROUTES.finish]);
+    expect(readdirSync(authRoot)).toEqual([]);
+  });
+
+  it("rejects concurrent invocations of one Claude profile", async () => {
+    const { transport } = fakeTransport((route) => reply(route, ack()));
+    const client = make(transport);
+    await client.checkout(sub);
+    let release!: () => void;
+    const first = client.invoke("sub", () => new Promise<void>(r => { release = r; }));
+    await Promise.resolve();
+    const spy = vi.fn(async () => 1);
+    expect(await categoryAsync(client.invoke("sub", spy))).toBe("invocation_in_progress");
+    expect(spy).not.toHaveBeenCalled();
+    release();
+    await first;
+  });
+
+  it("rejects hosted session credentials before writing a file", async () => {
+    const { transport } = fakeTransport(() => okCheckout({
+      secret: { kind: "session", sessionData: S_SESSION, stateSequence: 5 },
+    }));
+    expect(await categoryAsync(make(transport).checkout(sub))).toBe("checkout_response_invalid");
+    expect(readdirSync(authRoot)).toEqual([]);
+  });
+
+  it("blocks further local invocations after refreshed session persistence fails", async () => {
+    const persistSession = vi.fn(async () => { throw new Error(S_REFRESHED); });
+    const client = createModelAuthClient({
+      source: { kind: "local", port: {
+        load: async () => ({ kind: "session", sessionData: S_SESSION, stateSequence: 0 }),
+        persistSession,
+      } }, authRoot, forbiddenRoots: [workspace],
+    });
+    await client.checkout(sub);
+    expect(await categoryAsync(client.invoke("sub", async inv => {
+      writeFileSync(join(inv.env.CLAUDE_CONFIG_DIR!, ".credentials.json"), S_REFRESHED);
+    }))).toBe("credential_source_failed");
+    expect(persistSession).toHaveBeenCalledWith({ profileId: "sub", sessionData: S_REFRESHED });
+    const spy = vi.fn(async () => 1);
+    expect(await categoryAsync(client.invoke("sub", spy))).toBe("checkpoint_uncertain");
+    expect(spy).not.toHaveBeenCalled();
+    expect(await categoryAsync(client.finish("sub", "completed"))).toBe("checkpoint_uncertain");
+    expect(readdirSync(authRoot)).toHaveLength(1);
+    await client.dispose();
+    expect(client.status("sub")).toBe("rejected");
+    expect(readdirSync(authRoot)).toEqual([]);
+  });
+
   describe("checkout authorization happens before any file is written", () => {
     const cases: Array<[string, Record<string, unknown>]> = [
       ["cross-profile response", { profileId: "api" }],
-
     ];
     for (const [name, over] of cases) {
       it(name, async () => {

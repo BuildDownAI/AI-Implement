@@ -230,6 +230,37 @@ describe("checkout", () => {
     expectNoLeak(res, [API_KEY]);
   });
 
+  it.each(["beginStop", "markRecoveryRequired", "missing", "other-dispatch"] as const)(
+    "resolves the Claude token independently of a %s owner", async state => {
+      if (state === "missing") {
+        handlers = server.createModelAuthHandlers({ ...depsFrom(), ownership: { snapshot: () => {
+          throw new Error("ownership must not be read");
+        } } });
+      } else if (state === "other-dispatch") {
+        grantOverrides = { dispatchId: "d2" };
+        dispatchOverrides = { dispatchId: "d2" };
+      } else {
+        ownership[state]({ dispatchId: "d1", profileId: "sub1", generation });
+      }
+      const res = await checkout("sub1");
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ secret: { kind: "claude-oauth-token", token: API_KEY } });
+      expect(snapshotSpy).not.toHaveBeenCalled();
+      expect(readSpy).not.toHaveBeenCalled();
+      expectNoLeak(res, [API_KEY]);
+    },
+  );
+
+  it("rejects historical generation-bearing grants before accessing credentials", async () => {
+    bindings = [{ ...SUB, ownerGeneration: generation }];
+    const res = await checkout("sub1");
+    expect(res.body).toEqual({ version: 1, ok: false, category: "unauthorized" });
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(readSpy).not.toHaveBeenCalled();
+    expect(snapshotSpy).not.toHaveBeenCalled();
+    expectNoLeak(res);
+  });
+
   it("derives revision and provider from the grant and snapshot, never the body", async () => {
     const res = await handlers.handle(req("checkout", { version: 1, profileId: "key1", revision: 9, provider: "anthropic" }));
     expect(res.status).toBe(400);
@@ -320,6 +351,26 @@ describe("non-reserved Claude checkpoint", () => {
     expect(checkpointSpy).not.toHaveBeenCalled();
     expect(snapshotSpy).not.toHaveBeenCalled();
   });
+  it("rejects a generation that differs from the binding, an API-key profile, and unlisted profiles", async () => {
+    const spy = checkpointSpy;
+    for (const res of [await checkpoint(1, "x", 2), await checkpoint(1, "x", 1, "key1"), await checkpoint(1, "x", 1, "nope")]) {
+      expect(res.body).toEqual({ version: 1, ok: false, category: "unauthorized" });
+    }
+    expect(spy).not.toHaveBeenCalled();
+    expect(readSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects bindings that no longer match the grant context before touching the store", async () => {
+    const spy = checkpointSpy;
+    dispatchOverrides = { projectKey: "other" };
+    handlers = build();
+    const res = await checkpoint(1);
+    expect(res.body).toMatchObject({ ok: false, category: "unauthorized" });
+    expect(spy).not.toHaveBeenCalled();
+    expect(readSpy).not.toHaveBeenCalled();
+  });
+
+
 });
 
 describe("finish", () => {
