@@ -10,7 +10,7 @@
  * `JSON.stringify` and structured logging never see. Refusal text is fixed and built from `kind`, `category`
  * and `code` only.
  */
-import { STAGE_NAMES, type StageName } from "./agent-config.js";
+import type { StageName } from "./agent-config.js";
 import { getProjectOptIn, resolveProjectStageConfig } from "./agent-config-store.js";
 import {
   loadStoredSnapshot,
@@ -73,27 +73,10 @@ export function selectsCodexImplementation(projectKey: string, dispatchId?: stri
   }
 }
 
-/** True when the stored or currently resolved snapshot selects a `claude-subscription` profile in any stage. */
-function selectsClaudeSubscription(projectKey: string, dispatchId: string): boolean {
-  const stored = loadStoredSnapshot(dispatchId);
-  let profiles: ResolvedAgentSnapshotV1["profiles"] | undefined = stored?.profiles;
-  if (!profiles) {
-    try {
-      const { resolution } = resolveProjectStageConfig(projectKey);
-      if (resolution.mode === "configured") profiles = resolution.profiles;
-    } catch {
-      // Not a refusal: `prepareAgentRun` reports `resolution_failed` itself.
-      return false;
-    }
-  }
-  if (!profiles) return false;
-  return STAGE_NAMES.some((stage) => profiles![stage]?.authMode === "claude-subscription");
-}
-
-const SUBSCRIPTION_REFUSAL = {
+const RESERVATION_REFUSAL = {
   kind: "refuse",
   category: "configuration-error",
-  code: "claude_subscription_unsupported",
+  code: "reserved_account_unsupported",
 } as const;
 
 export async function prepareManagedDispatch(
@@ -101,7 +84,6 @@ export async function prepareManagedDispatch(
   runtime: ModelAuthRuntime,
 ): Promise<ManagedDispatchDecision> {
   if (!isManagedProject(req.projectKey, req.dispatchId)) return { kind: "legacy" };
-  if (selectsClaudeSubscription(req.projectKey, req.dispatchId)) return SUBSCRIPTION_REFUSAL;
 
   const repository = `${req.owner}/${req.repo}`;
   let result;
@@ -128,7 +110,7 @@ export async function prepareManagedDispatch(
       if (result.reservations.length > 0) {
         // Refuse even if the release is incomplete: nothing launches, and the grant stays unusable without a bootstrap.
         releaseRejectedLaunch(req.dispatchId, result.reservations, { ownership: runtime.ownership });
-        return SUBSCRIPTION_REFUSAL;
+        return RESERVATION_REFUSAL;
       }
       return {
         kind: "launch",

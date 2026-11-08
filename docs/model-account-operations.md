@@ -1,6 +1,6 @@
 # Model account operations
 
-A ChatGPT plan profile works on public and private repositories. Claude subscription profiles resolve setup-tokens from protected-secret references without reserving an account. The managed-dispatch adapter still refuses Claude subscription stages; changing that admission rule is outside this slice.
+A ChatGPT plan profile works on public and private repositories. Claude subscription profiles run managed stages from a stored setup-token resolved through a protected-secret reference, without reserving an account (ADR 049).
 
 Operator procedures for hosted model accounts. The command is `src/model-account-cli.ts`, run on the orchestrator
 machine as `node dist/model-account-cli.js <command> --profile <id>`.
