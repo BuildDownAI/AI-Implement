@@ -235,8 +235,8 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const kgBodyOpts = {
       runConfig: encoded, runToken: input.tokens.runToken, runProgressToken: input.tokens.progressToken,
       ...(supportsRunPublicationToken ? { runPublicationToken: input.tokens.publicationToken } : {}),
-      runnerImage, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerPhase: "kg-refresh" as const, jobTimeoutMinutes: String(input.jobTimeoutMinutes), issueIdentifier: input.envelope.issue.identifier,
+      runnerImage,
+      jobTimeoutMinutes: String(input.jobTimeoutMinutes), issueIdentifier: input.envelope.issue.identifier,
     };
     // A strictly capable reader takes the bearers in the private run config; anything else keeps the masked inputs.
     const inputs = supportsPrivateRunConfig === true
