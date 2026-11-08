@@ -1,8 +1,10 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { format } from "node:util";
 import type { ChatGptPlanRecordV1 } from "../chatgpt-plan-token.js";
 import type * as DedupModule from "../dedup.js";
 import type * as CliModule from "../model-account-cli.js";
 import type * as ProtectedSecretsModule from "../model-protected-secrets.js";
+import { DEFAULT_MODEL } from "../pipeline/default-model.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
 import type * as SessionStoreModule from "../model-session-store.js";
 import type { ModelSessionStore } from "../model-session-store.js";
@@ -22,6 +24,7 @@ const OPENAI_REVOKES: Routes = {
   "POST /api/accounts/oauth/revoke": { status: 200 },
 };
 
+let accounts: typeof import("../agent-config-store.js");
 let dedup: typeof DedupModule;
 let cli: typeof CliModule;
 let protectedSecrets: typeof ProtectedSecretsModule;
@@ -71,8 +74,9 @@ const run = (argv: string[], stdin = JSON.stringify(record()), env?: NodeJS.Proc
   cli.main(argv, deps(stdin, env));
 
 beforeEach(async () => {
-  ({ dedup, cli, protectedSecrets, sessionStore } = (await testDb({
+  ({ dedup, cli, protectedSecrets, sessionStore, accounts } = (await testDb({
     modules: {
+      accounts: () => import("../agent-config-store.js"),
       dedup: () => import("../dedup.js"),
       cli: () => import("../model-account-cli.js"),
       protectedSecrets: () => import("../model-protected-secrets.js"),
@@ -354,5 +358,150 @@ describe("secret-import / secret-delete", () => {
     d.secrets = () => { throw new Error(`boom ${KEY}`); };
     expect(await cli.main(["secret-import", "--ref", REF], d)).toBe(1);
     leaks();
+  });
+});
+
+
+describe("adopt-env", () => {
+  const captureLogs = () => (["log", "error", "warn", "info", "debug"] as const)
+    .map(method => vi.spyOn(console, method));
+  afterEach(() => vi.restoreAllMocks());
+
+  const TOKEN = "SENTINEL-ADOPT-OAUTH";
+  const KEY = "SENTINEL-ADOPT-API-KEY";
+  const env = { RUNNER_TOKEN_SECRET: SECRET, CLAUDE_CODE_OAUTH_TOKEN: TOKEN };
+  const tables = ["model_account_profiles", "model_account_profile_revisions", "stage_agent_config_revisions", "model_protected_secrets"];
+  const dump = () => tables.map(t => dedup.getDb().prepare(`SELECT * FROM ${t} ORDER BY rowid`).all());
+  const adopt = (e: NodeJS.ProcessEnv = env) => run(["adopt-env"], "", e);
+  const stages = (id: string) => Object.fromEntries(["planning", "implementation", "review"].map(s =>
+    [s, { agent: "claude", provider: "anthropic", model: DEFAULT_MODEL, accountProfileId: id, invocationTimeoutMs: 5_400_000 }]));
+
+  it.each(["claude-subscription", "anthropic-api-key"] as const)("accepts defaults with an ungranted %s profile", authMode => {
+    accounts.saveAccountProfileRevision({ profileId: "ungranted", identity: "Ungrant", revision: 1, agent: "claude", provider: "anthropic", authMode });
+    expect(() => accounts.setOrchestratorDefaults({ version: 1, mode: "configured", stages: stages("ungranted") })).not.toThrow();
+    expect(dedup.getDb().prepare("SELECT * FROM stage_agent_config_revisions WHERE scope_kind = 'project'").all()).toEqual([]);
+  });
+
+  it.each([
+    ["token", env, "claude-subscription", TOKEN],
+    ["key", { RUNNER_TOKEN_SECRET: SECRET, ANTHROPIC_API_KEY: KEY }, "anthropic-api-key", KEY],
+    ["both", { ...env, ANTHROPIC_API_KEY: KEY }, "claude-subscription", TOKEN],
+  ] as const)("adopts %s and leaves a second run unchanged", async (kind, e, mode, value) => {
+    const logs = captureLogs();
+    expect(await adopt(e)).toBe(0);
+    const id = `adopted-env-${mode}`;
+    expect(accounts.listAccountProfiles()).toMatchObject([{ profileId: id, authMode: mode, revision: 1 }]);
+    expect(accounts.getOrchestratorDefaults()?.config).toEqual({ version: 1, mode: "configured", stages: stages(id) });
+    expect(protectedSecrets.createModelProtectedSecrets({ env: e }).resolve(`model-account:${id}`)).toBe(value);
+    if (kind === "both") expect(out.join("\n")).toContain("ANTHROPIC_API_KEY ignored");
+    const before = dump();
+    const firstOutput = [...out, ...err];
+    out = [];
+    expect(await adopt({})).toBe(0);
+    expect(dump()).toEqual(before);
+    expect(out.join("\n")).toContain(id);
+    expect(dedup.getDb().prepare("SELECT * FROM stage_agent_config_revisions WHERE scope_kind = 'project'").all()).toEqual([]);
+    const output = JSON.stringify([firstOutput, out, err, logs.map(l => l.mock.calls)]);
+    expect(output).not.toContain(TOKEN);
+    expect(output).not.toContain(KEY);
+  });
+
+  it.each([
+    [{ RUNNER_TOKEN_SECRET: SECRET }, "no model credential in the environment"],
+    [{ CLAUDE_CODE_OAUTH_TOKEN: TOKEN }, "RUNNER_TOKEN_SECRET"],
+  ])("refuses missing prerequisites without writes: %j", async (e, message) => {
+    const before = dump();
+    expect(await adopt(e)).toBe(1);
+    expect(err.join("\n")).toContain(message);
+    expect(dump()).toEqual(before);
+  });
+
+  it("replaces a legacy defaults row", async () => {
+    accounts.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    expect(await adopt()).toBe(0);
+    expect(accounts.getOrchestratorDefaults()?.revision).toBe(2);
+    expect(accounts.getOrchestratorDefaults()?.config.mode).toBe("configured");
+  });
+
+  it("reuses a compatible adopted profile without a revision", async () => {
+    await adopt();
+    accounts.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const profiles = dump().slice(0, 2);
+    const secret = dump()[3];
+    expect(await adopt()).toBe(0);
+    expect(dump().slice(0, 2)).toEqual(profiles);
+    expect(dump()[3]).toEqual(secret);
+  });
+
+  it.each([false, true])("refuses disabled adoption even with configured defaults=%s", async configured => {
+    await adopt();
+    if (!configured) accounts.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    accounts.retireAccountProfile("adopted-env-claude-subscription");
+    const before = dump();
+    expect(await adopt()).toBe(1);
+    expect(err.join("\n")).toContain("adopted profile is disabled");
+    expect(dump()).toEqual(before);
+  });
+
+  it("preserves existing configured defaults and reports their profile ids", async () => {
+    accounts.saveAccountProfileRevision({ profileId: "existing", identity: "Existing", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+    accounts.setOrchestratorDefaults({ version: 1, mode: "configured", stages: stages("existing") });
+    const before = dump();
+    expect(await adopt()).toBe(0);
+    expect(dump()).toEqual(before);
+    expect(out.join("\n")).toContain("existing");
+  });
+
+  it.each([false, true])("rolls back storage failures without exposing exceptions (throws=%s)", async throws => {
+    const logs = captureLogs();
+    const d = deps("", env);
+    const real = d.secrets;
+    d.secrets = () => ({ ...real(), write: () => {
+      if (throws) throw new Error(`${TOKEN} ${KEY}`);
+      return { ok: false, code: "write_failed" };
+    } });
+    const before = dump();
+    expect(await cli.main(["adopt-env"], d)).toBe(1);
+    expect(dump()).toEqual(before);
+    const output = [...out, ...err, ...logs.flatMap(log => log.mock.calls.map(call => format(...call)))].join("\n");
+    expect(output).not.toContain(TOKEN);
+    expect(output).not.toContain(KEY);
+  });
+
+  it("exposes configured adopted stages through authenticated GET /api/agent-defaults", async () => {
+    expect(await adopt()).toBe(0);
+    const { createSession } = await import("../admin-session.js");
+    const { handleAdminRequest } = await import("../admin.js");
+    const token = createSession();
+    let status = 0;
+    let body = "";
+    const response = {
+      writeHead: (code: number) => { status = code; },
+      end: (data: string) => { body = data; },
+    };
+    handleAdminRequest({ url: "/api/agent-defaults", method: "GET", headers: { authorization: `Bearer ${token}` } } as never,
+      response as never, { adminAccessCode: "test" } as never, {} as never);
+    expect(status).toBe(200);
+    expect(JSON.parse(body)).toMatchObject({ configured: true, mode: "configured", stages: stages("adopted-env-claude-subscription") });
+    expect(body).not.toContain(TOKEN);
+  });
+
+  it("refuses incompatible profile and orphaned secret collisions without writes", async () => {
+    const id = "adopted-env-claude-subscription";
+    const secrets = protectedSecrets.createModelProtectedSecrets({ env });
+    expect(secrets.write(`model-account:${id}`, KEY).ok).toBe(true);
+    let before = dump();
+    expect(await adopt()).toBe(1);
+    expect(dump()).toEqual(before);
+    accounts.saveAccountProfileRevision({ profileId: id, identity: "Other", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+    before = dump();
+    expect(await adopt()).toBe(1);
+    expect(dump()).toEqual(before);
+    expect(JSON.stringify([out, err])).not.toContain(KEY);
+  });
+
+  it("rejects arguments without echoing them", async () => {
+    expect(await run(["adopt-env", TOKEN])).toBe(2);
+    expect(err.join("\n")).not.toContain(TOKEN);
   });
 });
