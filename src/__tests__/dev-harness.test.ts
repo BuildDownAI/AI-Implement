@@ -656,6 +656,35 @@ describe("startDevRun — kg-refresh phase", () => {
     vi.unstubAllEnvs();
   });
 
+  it("launches without model credentials and preserves the kg-ingest stop", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json", untilStep: "kg-ingest" });
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.publicEnv["AI_IMPLEMENT_UNTIL_STEP"]).toBe("kg-ingest");
+  });
+
+  it.each([false, true])("omits model credentials even with explicit env overrides=%s", async (overrides) => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test");
+    const modelEnv = {
+      ANTHROPIC_API_KEY: "explicit-key",
+      CLAUDE_CODE_OAUTH_TOKEN: "explicit-oauth",
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      AWS_BEDROCK_ROLE_ARN: "test-role",
+    };
+    await startDevRun({
+      workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json",
+      anthropicApiKey: "option-key", claudeOAuthToken: "option-oauth",
+      ...(overrides ? { env: modelEnv } : {}),
+    });
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    for (const key of Object.keys(modelEnv)) {
+      expect(opts.publicEnv).not.toHaveProperty(key);
+      expect(opts.secretEnv).not.toHaveProperty(key);
+    }
+    expect({ ...opts.publicEnv, ...opts.secretEnv }["AI_IMPLEMENT_DEP_TOKEN_OVERRIDE"]).toBe("ghs-operator-token");
+  });
+
   it("sets RUNNER_PHASE=kg-refresh", async () => {
     await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" });
     const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];

@@ -532,7 +532,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     await sourceWorkspace?.cleanup().catch(() => undefined);
     throw error;
   }
-  if (!localConfigured.snapshot && !anthropicApiKey && !claudeOAuthToken) {
+  if (phase !== "kg-refresh" && !localConfigured.snapshot && !anthropicApiKey && !claudeOAuthToken) {
     throw new Error("Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set");
   }
 
@@ -577,10 +577,12 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
       AI_IMPLEMENT_DEP_TOKEN_OVERRIDE: operatorGhToken,
       ...(process.getuid ? { AI_IMPLEMENT_HOST_UID: String(process.getuid()) } : {}),
       ...(process.getgid ? { AI_IMPLEMENT_HOST_GID: String(process.getgid()) } : {}),
-      ...(anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
-      ...(claudeOAuthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOAuthToken } : {}),
       ...(opts.env ?? {}),
     };
+    // KG refresh never uses model authentication, including explicit env overrides.
+    for (const key of ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "AWS_BEDROCK_ROLE_ARN"]) {
+      delete allEnv[key];
+    }
 
     const { publicEnv, secretEnv } = splitLocalRunnerEnv(allEnv);
 
