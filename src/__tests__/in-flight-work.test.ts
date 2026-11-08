@@ -106,6 +106,22 @@ describe("getInFlightWork", () => {
     expect(await probes.unresolvedTerminations()).toBe(0);
     expect(await probes.activeOwners()).toBe(1);
   });
+  it.each(["fly-machines", "local-docker"])("counts only unbound %s launch intents", async (backend) => {
+    reserve("backend-attempt");
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       task_snapshot_json, finding_versions_json, execution_backend)
+      VALUES ('backend-attempt', 'backend-attempt', 'AII', '1', 'org/app', 1,
+       'AII', 'issue-1', 'backend-attempt', 'launch_intent', 1, 9999999999999, '{}', '[]', ?)`).run(backend);
+    db.prepare("UPDATE dispatch_admissions SET backend = ? WHERE dispatch_id = 'backend-attempt'").run(backend);
+    const probes = deploy.createRestateDrainProbes();
+    expect(await probes.unresolvedLaunches()).toBe(1);
+    db.prepare("UPDATE review_fix_attempts SET execution_ref = 'execution-1' WHERE attempt_id = 'backend-attempt'").run();
+    expect(await probes.unresolvedLaunches()).toBe(0);
+  });
+
   it("reports nothing on an idle orchestrator", () => {
     expect(inFlight.getInFlightWork()).toEqual([]);
   });

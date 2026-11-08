@@ -422,7 +422,7 @@ export function appendLog(entry: {
            WHERE a.dispatch_id = dispatch_log.dispatch_id
              AND (
                a.completed_at IS NULL OR a.completed_at >= ?
-               OR a.result_conflict_at IS NOT NULL OR a.github_run_id IS NULL
+               OR a.result_conflict_at IS NOT NULL OR (a.github_run_id IS NULL AND a.execution_ref IS NULL)
                OR EXISTS (SELECT 1 FROM dispatch_admissions d
                           WHERE d.dispatch_id = a.dispatch_id AND d.released_at IS NULL)
              )
