@@ -69,6 +69,31 @@ function makeDeps(overrides: Partial<KgRefreshSenderDeps> = {}, configOverrides:
 }
 
 describe("fly-machines sender", () => {
+  it.each([null, "m-kept"])("excludes all app secrets on launch (kept machine: %s), even with the global switch off", async (machineId) => {
+    vi.stubEnv("FLY_PROCESS_LEVEL_SECRETS", "false");
+    try {
+      const { deps, fly, created } = makeDeps();
+      await createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineId }));
+      const cfg = machineId === null
+        ? created[0]!.config
+        : vi.mocked(fly.updateMachine).mock.calls[0]![1];
+      expect(cfg.processes).toEqual([{ ignore_app_secrets: true, secrets: [] }]);
+      expect(cfg.env).toMatchObject({
+        MACHINE_NONCE: NONCE,
+        RUN_TOKEN: TOKENS.runToken,
+        RUN_PROGRESS_TOKEN: TOKENS.progressToken,
+        RUN_PUBLICATION_TOKEN: TOKENS.publicationToken,
+        GITHUB_TOKEN: "scoped-boot-token",
+        ORCHESTRATOR_URL: CALLBACK_BASE,
+        ISSUE_IDENTIFIER: IDENTIFIER,
+      });
+      expect(decodeRunConfig(cfg.env!.AI_IMPLEMENT_RUN_CONFIG!)).toEqual(envelope);
+      expect(cfg.metadata).toMatchObject({ purpose: "durable-runner", pipeline: "kg-refresh", dispatch_id: "d-1" });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("throws when the machine nonce is missing", async () => {
     const { deps, created } = makeDeps();
     await expect(createKgRefreshSenders(deps)["fly-machines"](makeInput({ machineNonce: null }))).rejects.toThrow(/machineNonce is required/);
@@ -240,8 +265,21 @@ describe("github-actions sender", () => {
     expect(posted.ref).toBe("trunk");
     expect(posted.inputs.run_publication_token).toBe("pub-tok");
     expect(posted.inputs.issue_identifier).toBe(IDENTIFIER);
-    expect(posted.inputs.runner_phase).toBe("kg-refresh");
+    expect(posted.inputs).not.toHaveProperty("runner_phase");
     expect(posted.inputs.job_timeout_minutes).toBe("240");
+  });
+
+  it.each([false, true])("keeps phase and callback in the envelope (private transport: %s)", async (supportsPrivateRunConfig) => {
+    const { deps } = makeDeps({
+      resolveWorkflowCapabilities: vi.fn(async () => ({ supportsRunPublicationToken: true, supportsPrivateRunConfig })) as never,
+    });
+    await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
+    const { inputs } = postedInputs(deps);
+    expect(Object.hasOwn(inputs, "runner_phase")).toBe(false);
+    expect(Object.hasOwn(inputs, "runner_callback_url")).toBe(false);
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded?.runnerPhase).toBe("kg-refresh");
+    expect(decoded?.runnerCallbackUrl).toBe(CALLBACK_BASE);
   });
 
   it("sends the profile's jobTimeoutMinutes as job_timeout_minutes", async () => {

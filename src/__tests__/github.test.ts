@@ -320,7 +320,7 @@ describe("postWorkflowDispatch — returnRunDetails opt-in", () => {
 
     const result = await postWorkflowDispatch({
       ...baseOpts,
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
       returnRunDetails: true,
     });
 
