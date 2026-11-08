@@ -398,11 +398,9 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  // Probe whether the KG repo's claude-implement.yml is on the envelope contract (AII-594,
-  // AII-654): the rail's phase and callback URL only ride the top-level runner_phase/
-  // runner_callback_url inputs on the legacy contract, and any envelope template — which
-  // declares run_config and reads the phase from it (AII-653) — works regardless of whether
-  // it still declares those two optional inputs (the poster strips them on a 422).
+  // Probe whether the KG repo's claude-implement.yml declares run_config (AII-594,
+  // AII-654). KG dispatches carry phase and callback URL only in the envelope,
+  // which the entrypoint reads under the envelope contract (AII-653).
   // Reuses the read token/branch minted above when available.
   try {
     const token = sourcesReadToken ?? (await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
