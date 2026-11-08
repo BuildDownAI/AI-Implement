@@ -122,6 +122,17 @@ describe("Restate's status, from the orchestrator's own health route", () => {
     expect(d.stdout()).toMatch(/FAIL +restate: .*\n +The sidecar is ready and the endpoint registration is declined-conflict/);
   });
 
+  it("reads Restate states from a 503 body and reports the failure", async () => {
+    const d = deps({
+      fetch: fakeFetch({ "GET /": { status: 503, json: { restate: { sidecar: { state: "starting" }, registration: { state: "not-attempted" } } } } }).fetch,
+      checks: [RESTATE_CHECK],
+    });
+
+    expect(await runCheckSetup([], d.deps)).toBe(1);
+    expect(d.stdout()).toMatch(/FAIL +restate: .*\n +The sidecar is starting and the endpoint registration is not-attempted/);
+    expect(d.stdout()).not.toContain("CANNOT VERIFY");
+  });
+
   it("reports Restate as cannot-verify, not as a failure, when the orchestrator is not answering", async () => {
     const d = deps({ fetch: notAnswering, checks: [RESTATE_CHECK] });
 
