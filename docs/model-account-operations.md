@@ -178,3 +178,20 @@ is `configured`, and all three stages name the adopted profile. Projects still
 need their own explicit opt-in. To roll back, revert the defaults and delete the
 profile on Models & providers; remove its encrypted credential with `secret-delete`
 if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it.
+
+## Adopting existing projects
+
+Existing projects remain legacy until an operator runs `adopt-projects`:
+
+```bash
+npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --dry-run
+npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --project PROJECT_KEY
+```
+
+Run `adopt-env` first to establish configured defaults. Each project line reports the outcome and each stage's model and source. Adoption reads `.ai-implement/config.yml`, `WORKFLOW.md` and `PLANNING.md` from the repository's default branch. Implementation and review prefer `models.implement` / `models.review`, then observable `mapping.extraEnv.CLAUDE_MODEL` on Fly/local, then WORKFLOW front matter. Planning prefers that mapping model on Fly/local, then PLANNING front matter. Legacy GitHub Actions does not receive mapping Extra Env, so adoption ignores it on that backend. Shadow implementation/review must resolve the same model on both backends; a difference reports `model_conflict` with the stage, backend values and sources, and skips the project without writes. Shadow planning uses GitHub Actions only. Stages without a repository model retain the legacy `DEFAULT_MODEL` fallback (shown as `DEFAULT_MODEL` in the report). Each effective legacy model becomes a stage override when it differs from configured defaults; matching models need no override. If repository reads fail, the report says “model not carried” and all stages inherit defaults.
+
+Runner-only environment settings (for example, Fly secrets, image environment, or GitHub Actions variables/secrets) are not observable through these readers. Adoption cannot preserve those unknown model overrides; inspect the preview against your runner configuration before opting in. The command does not read credentials or guess their values.
+
+Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and explicit legacy opt-outs are skipped. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
+
+After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, write an explicit legacy row on the project's **Agents** tab; future adoption runs preserve that opt-out.
