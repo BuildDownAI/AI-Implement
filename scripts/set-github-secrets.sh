@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 # set-github-secrets.sh — set GitHub Actions secrets for an AI-Implement deployment.
 #
-# Sets the secrets that the synced workflows (claude-implement.yml, claude-plan.yml,
-# comment-trigger.yml, sync-workflow.yml) need at run time:
-#
-#   On the ORCHESTRATOR repo (this fork of AI-Implement):
-#     AI_IMPLEMENT_APP_ID         — sync-workflow.yml authenticates the GitHub App
-#     AI_IMPLEMENT_PRIVATE_KEY    — same
+# Sets the secrets that the synced workflows (claude-implement.yml and
+# claude-plan.yml) need at run time:
 #
 #   On each TARGET repo (e.g. acme/api):
 #     AI_IMPLEMENT_APP_ID         — claude-implement.yml authenticates as the App
@@ -15,10 +11,10 @@
 #       or ANTHROPIC_API_KEY      — fallback Claude auth if no OAuth token
 #
 # Usage:
-#   ./scripts/set-github-secrets.sh <orchestrator-repo> <target-repo> [<target-repo>...]
+#   ./scripts/set-github-secrets.sh <target-repo> [<target-repo>...]
 #
 # Example:
-#   ./scripts/set-github-secrets.sh acme/ai-implement acme/api acme/web
+#   ./scripts/set-github-secrets.sh acme/api acme/web
 #
 # Sensitive values are read from stdin (-rsp / file path). Nothing is passed
 # via argv, so values never appear in shell history or process listings.
@@ -28,25 +24,22 @@
 
 set -euo pipefail
 
-if [ $# -lt 2 ]; then
+if [ $# -lt 1 ]; then
   cat >&2 <<USAGE
-Usage: $0 <orchestrator-repo> <target-repo> [<target-repo>...]
+Usage: $0 <target-repo> [<target-repo>...]
 
 Example:
-  $0 acme/ai-implement acme/api acme/web
+  $0 acme/api acme/web
 
-The orchestrator repo is the fork of AI-Implement. Each target repo
-receives the synced workflow templates and runner secrets.
+Each target repo receives the synced workflow templates and runner secrets.
 USAGE
   exit 1
 fi
 
-ORCH_REPO="$1"
-shift
 TARGET_REPOS=("$@")
 
 # Validate owner/repo format.
-for repo in "$ORCH_REPO" "${TARGET_REPOS[@]}"; do
+for repo in "${TARGET_REPOS[@]}"; do
   if ! echo "$repo" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
     echo "Error: repo must be in 'owner/name' form (got: $repo)" >&2
     exit 1
@@ -55,7 +48,6 @@ done
 
 echo
 echo "Will set secrets on:"
-echo "  Orchestrator: $ORCH_REPO  (AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY)"
 for repo in "${TARGET_REPOS[@]}"; do
   echo "  Target:       $repo  (AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY, CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)"
 done
@@ -100,11 +92,6 @@ set_secret_file() {
   echo "  ✓ $repo / $name (from $file)"
 }
 
-echo
-echo "=== Setting secrets on $ORCH_REPO (sync-workflow.yml auth) ==="
-set_secret      "$ORCH_REPO" AI_IMPLEMENT_APP_ID      "$APP_ID"
-set_secret_file "$ORCH_REPO" AI_IMPLEMENT_PRIVATE_KEY "$PEM_PATH"
-
 for target in "${TARGET_REPOS[@]}"; do
   echo
   echo "=== Setting secrets on $target (runner auth + Claude) ==="
@@ -121,12 +108,9 @@ unset OAUTH_TOKEN API_KEY
 
 echo
 echo "Done. Verify with:"
-echo "  gh secret list --repo $ORCH_REPO"
 for target in "${TARGET_REPOS[@]}"; do
   echo "  gh secret list --repo $target"
 done
 echo
-echo "Now dispatch the sync workflow per target repo:"
-for target in "${TARGET_REPOS[@]}"; do
-  echo "  gh workflow run sync-workflow.yml --repo $ORCH_REPO -f target_repo=$target"
-done
+echo "Now sync workflows for each target from the orchestrator Projects row action,"
+echo "POST /api/mappings/:teamKey/sync-workflows, or MCP trigger_workflow_sync."

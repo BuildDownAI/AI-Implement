@@ -796,7 +796,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
     });
 
     expect(github.calls).toHaveLength(2);
@@ -865,7 +865,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: {
         run_config: "cfg",
         run_token: "rt",
-        runner_phase: "kg-refresh",
+        runner_phase: "implementation",
         runner_callback_url: "https://orch.example",
       },
     });
@@ -930,7 +930,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
     });
 
     expect(github.calls).toHaveLength(2);
@@ -958,7 +958,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: {
         run_config: "cfg",
         run_token: "rt",
-        runner_phase: "kg-refresh",
+        runner_phase: "implementation",
         runner_callback_url: "https://orch.example",
       },
     });
@@ -983,7 +983,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
     });
 
     expect(github.calls).toHaveLength(1);
@@ -1027,7 +1027,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
     });
 
     expect(github.calls).toHaveLength(2);
@@ -1052,7 +1052,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       inputs: {
         run_config: "cfg",
         run_token: "rt",
-        runner_phase: "kg-refresh",
+        runner_phase: "implementation",
         runner_callback_url: "https://orch.example",
       },
     });
@@ -1073,7 +1073,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
     });
 
     expect(github.calls).toHaveLength(2);
@@ -1108,7 +1108,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       repo: "kg-repo",
       workflowFile: "claude-implement.yml",
       ref: "main",
-      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "kg-refresh" },
+      inputs: { run_config: "cfg", run_token: "rt", runner_phase: "implementation" },
     });
 
     expect(github.calls).toHaveLength(1);
@@ -1118,7 +1118,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
   it("the kg-refresh dispatch path (buildKgRefreshGhaDispatchBody + postWorkflowDispatch) retries on 422", async () => {
     const github = dispatches(
       "kg-repo",
-      { status: 422, text: 'Unexpected inputs provided: ["runner_phase", "runner_callback_url"]' },
+      { status: 422, text: 'Unexpected inputs provided: ["issue_identifier"]' },
       { status: 204 },
     );
 
@@ -1127,8 +1127,6 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
       runToken: "run-tok",
       runProgressToken: "prog-tok",
       runnerImage: undefined,
-      runnerCallbackUrl: "https://orch.example",
-      runnerPhase: "kg-refresh",
       jobTimeoutMinutes: "240",
       issueIdentifier: "AII-656",
     });
@@ -1150,7 +1148,7 @@ describe("postWorkflowDispatch — 422 strip-and-retry", () => {
     expect("runner_callback_url" in secondBody.inputs).toBe(false);
     expect(secondBody.inputs.run_config).toBe("b64cfg");
     expect(secondBody.inputs.job_timeout_minutes).toBe("240");
-    expect(secondBody.inputs.issue_identifier).toBe("AII-656");
+    expect(secondBody.inputs).not.toHaveProperty("issue_identifier");
     expect(result).toEqual({ success: true, status: 204 });
   });
 });

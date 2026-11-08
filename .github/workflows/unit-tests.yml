@@ -1,8 +1,8 @@
 # Unit-test gate for AI-Implement PRs (AII-449).
 #
 # Named unit-tests.yml deliberately: the claude-*.yml files here are TEMPLATES
-# synced to target repos, and sync-workflow.yml is the sync fallback — this file
-# is neither, and must never be distributed by sync.
+# synced to target repos by the orchestrator. This file is a repository-only
+# test gate and must never be distributed by sync.
 #
 # Operator step after first merge: mark the "unit-tests" check REQUIRED on the
 # testing branch (Settings → Branches). The branch is unprotected today, so the

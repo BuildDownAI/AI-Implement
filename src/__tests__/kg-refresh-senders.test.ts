@@ -240,8 +240,21 @@ describe("github-actions sender", () => {
     expect(posted.ref).toBe("trunk");
     expect(posted.inputs.run_publication_token).toBe("pub-tok");
     expect(posted.inputs.issue_identifier).toBe(IDENTIFIER);
-    expect(posted.inputs.runner_phase).toBe("kg-refresh");
+    expect(posted.inputs).not.toHaveProperty("runner_phase");
     expect(posted.inputs.job_timeout_minutes).toBe("240");
+  });
+
+  it.each([false, true])("keeps phase and callback in the envelope (private transport: %s)", async (supportsPrivateRunConfig) => {
+    const { deps } = makeDeps({
+      resolveWorkflowCapabilities: vi.fn(async () => ({ supportsRunPublicationToken: true, supportsPrivateRunConfig })) as never,
+    });
+    await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
+    const { inputs } = postedInputs(deps);
+    expect(Object.hasOwn(inputs, "runner_phase")).toBe(false);
+    expect(Object.hasOwn(inputs, "runner_callback_url")).toBe(false);
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded?.runnerPhase).toBe("kg-refresh");
+    expect(decoded?.runnerCallbackUrl).toBe(CALLBACK_BASE);
   });
 
   it("sends the profile's jobTimeoutMinutes as job_timeout_minutes", async () => {
