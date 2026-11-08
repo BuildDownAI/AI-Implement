@@ -526,14 +526,14 @@ describe("production managed GHA review-fix launch", () => {
       expect(snapshot.stages.implementation.accountProfileId).toBe("capi");
     });
 
-    it("refuses a managed Claude subscription stage", async () => {
+    it("admits a ready managed Claude subscription stage without minting grants", async () => {
       profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
         authMode: "claude-subscription", });
       profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
         planning: { agent: "claude", provider: "anthropic", model: "claude-sonnet-5-5", accountProfileId: "sub", invocationTimeoutMs: 60_000 },
         implementation: stage(), review: stage(),
       } });
-      expect(await admit()).toBe("configuration_error");
+      expect(await admit()).toBe("admit");
       expect(count("model_credential_grants")).toBe(0);
     });
 

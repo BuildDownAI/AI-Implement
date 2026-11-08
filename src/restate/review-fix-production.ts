@@ -122,10 +122,6 @@ async function decideAdmission(
   if (readiness.status === "not-ready") {
     return { verdict: DEFERRED_READINESS_CODES.has(readiness.code) ? "defer" : "configuration_error", reason: readiness.code };
   }
-  // Launch preparation refuses a Claude subscription stage on managed projects; fail the row now rather than at launch.
-  if (readiness.profiles.some((profile) => profile.authMode === "claude-subscription")) {
-    return { verdict: "configuration_error", reason: "claude_subscription_unsupported" };
-  }
   return { verdict: "admit", reason: "managed" };
 }
 

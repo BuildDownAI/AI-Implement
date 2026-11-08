@@ -6736,7 +6736,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(store.getProjectStageConfig("APP")?.config.stages?.review?.model).toBe("newer");
     });
 
-    it("keeps legacy, disabled and Claude-subscription candidates fail-closed without storing them", async () => {
+    it("rejects invalid candidates, skips readiness when disabled and stores nothing on inspection failure", async () => {
       const t = await seed();
       const store = modules.agentConfigStore;
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
@@ -6793,15 +6793,29 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
     });
 
-    it("never enables Claude subscription execution", async () => {
+    it.each([true, false])("continues Claude subscription opt-in to readiness (ready: %s)", async (ready) => {
       const t = await seed();
+      const store = modules.agentConfigStore;
       await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+      const revs = count("stage_agent_config_revisions");
+      const inspect = vi.fn(async () => ready
+        ? { status: "ready", profiles: [] }
+        : { status: "not-ready", code: "runner_incompatible" });
       const r = await call("/api/mappings/APP/agent-config", "PUT", t, {
         enabled: true,
         stages: { review: { agent: "claude", provider: "anthropic", accountProfileId: "cl-sub", model: "m" } },
-      }, readyDeps());
-      expect(r.status).toBe(422);
-      expect(r.json.code).toBe("claude_subscription_unsupported");
+      }, readyDeps(inspect));
+      expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ projectKey: "APP" }),
+        expect.objectContaining({ stages: expect.objectContaining({ review: expect.objectContaining({ accountProfileId: "cl-sub" }) }) }));
+      expect(r.status).toBe(ready ? 200 : 409);
+      expect(store.getProjectOptIn("APP")).toBe(ready);
+      if (ready) {
+        expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
+      } else {
+        expect(r.json.code).toBe("runner_incompatible");
+        expect(store.getProjectStageConfig("APP")).toBeNull();
+        expect(count("stage_agent_config_revisions")).toBe(revs);
+      }
     });
   });
 
