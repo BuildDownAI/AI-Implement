@@ -67,7 +67,7 @@ export const MODEL_AUTH_AUTH_MODES: readonly AccountAuthMode[] = AUTH_MODE_LIST;
 /** Plan-based credential modes. Ownership checks use `RESERVED_AUTH_MODES` instead. */
 export const SUBSCRIPTION_AUTH_MODES: readonly AccountAuthMode[] = ["claude-subscription", "codex-subscription"];
 /** Modes that reserve an account (owner generation, session state, checkpoints). */
-export const RESERVED_AUTH_MODES: readonly AccountAuthMode[] = ["claude-subscription"];
+export const RESERVED_AUTH_MODES: readonly AccountAuthMode[] = [];
 export const MODEL_AUTH_BACKENDS = ["fly", "gha", "local"] as const;
 export type ModelAuthBackend = (typeof MODEL_AUTH_BACKENDS)[number];
 
@@ -193,7 +193,7 @@ export function isSubscriptionAuthMode(mode: AccountAuthMode): boolean {
   return SUBSCRIPTION_AUTH_MODES.includes(mode);
 }
 
-/** Default checkout secret kind; Claude subscription also accepts a setup-token. */
+/** Default checkout secret kind for each auth mode. */
 export function expectedSecretKind(authMode: AccountAuthMode): ModelAuthSecret["kind"] {
   switch (authMode) {
     case "bedrock":
@@ -201,7 +201,7 @@ export function expectedSecretKind(authMode: AccountAuthMode): ModelAuthSecret["
     case "codex-subscription":
       return "chatgpt-access-token";
     case "claude-subscription":
-      return "session";
+      return "claude-oauth-token";
     default:
       return "api-key";
   }
@@ -628,19 +628,21 @@ export function parseModelAuthCheckoutResponse(raw: unknown): ValidationResult<M
       secret: chatgpt.value,
     });
   }
+  if (authMode.value === "claude-subscription") {
+    if (r.ownerGeneration !== undefined) return err("ownerGeneration is only allowed for reserved auth modes");
+    const keys = rejectUnknownKeys(s, ["kind", "token"], "checkout secret");
+    if (!keys.ok) return keys;
+    if (s.kind !== "claude-oauth-token") return err("checkout secret kind must be 'claude-oauth-token' for claude-subscription");
+    const token = validateBoundedSecret(s.token, "token", MAX_API_CREDENTIAL_LENGTH);
+    if (!token.ok) return token;
+    return ok({
+      version: 1, ok: true, profileId: profileId.value, authMode: authMode.value,
+      secret: { kind: "claude-oauth-token", token: token.value },
+    });
+  }
   if (reservesModelAccount(authMode.value)) {
     const gen = validatePositiveInt(r.ownerGeneration, "ownerGeneration");
     if (!gen.ok) return gen;
-    if (authMode.value === "claude-subscription" && s.kind === "claude-oauth-token") {
-      const keys = rejectUnknownKeys(s, ["kind", "token"], "checkout secret");
-      if (!keys.ok) return keys;
-      const token = validateBoundedSecret(s.token, "token", MAX_API_CREDENTIAL_LENGTH);
-      if (!token.ok) return token;
-      return ok({
-        version: 1, ok: true, profileId: profileId.value, authMode: authMode.value,
-        ownerGeneration: gen.value, secret: { kind: "claude-oauth-token", token: token.value },
-      });
-    }
     const su = rejectUnknownKeys(s, ["kind", "sessionData", "stateSequence"], "checkout secret");
     if (!su.ok) return su;
     if (s.kind !== "session") return err("checkout secret kind must be 'session' for subscription modes");

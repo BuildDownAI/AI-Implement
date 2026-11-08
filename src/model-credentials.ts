@@ -267,7 +267,9 @@ export function resolveModelCredential(req: CredentialRequest, deps: ModelCreden
     secret = { kind: "aws-bedrock", ...raw };
   } else {
     if (typeof raw !== "string") return fail("authentication_required", "secret_invalid");
-    secret = { kind: "api-key", apiKey: raw };
+    secret = profile.authMode === "claude-subscription"
+      ? { kind: "claude-oauth-token", token: raw }
+      : { kind: "api-key", apiKey: raw };
   }
   const parsed = parseModelAuthCheckoutResponse({
     version: 1,

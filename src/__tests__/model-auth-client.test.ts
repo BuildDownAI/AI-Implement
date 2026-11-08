@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdirSync, symlinkSync, readdirSync, readFileSync, statSync, writeFileSync, existsSync, realpathSync } from "node:fs";
+import { mkdirSync, symlinkSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ModelAuthClientError,
@@ -23,7 +23,6 @@ import {
   type SafeModelAuthDiagnostic,
 } from "../model-auth-contract.js";
 import { modelProcessEnv, repoProcessEnv } from "../pipeline/process-env.js";
-import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
 
@@ -51,7 +50,7 @@ function grant(overrides: Partial<ModelAuthGrantBootstrapV1> = {}): ModelAuthGra
     expiresAt: NOW + 60_000,
     bearer: S_BEARER,
     bindings: [
-      { stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 },
+      { stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription" },
       { stage: "review", profileId: "api", profileRevision: 1, authMode: "openai-api-key" },
       { stage: "planning", profileId: "bed", profileRevision: 1, authMode: "bedrock" },
     ],
@@ -311,14 +310,13 @@ describe("client", () => {
       ok: true,
       profileId: "sub",
       authMode: "claude-subscription",
-      ownerGeneration: 3,
-      secret: { kind: "session", sessionData: S_SESSION, stateSequence: 5 },
+      secret: { kind: "claude-oauth-token", token: S_API },
       ...over,
     },
   });
   const ack = (over: Record<string, unknown> = {}) => ({
     status: 200,
-    body: { version: 1, ok: true, profileId: "sub", ownerGeneration: 3, stateSequence: 6, ...over },
+    body: { version: 1, ok: true, profileId: "sub", stateSequence: 6, ...over },
   });
 
   const finishOk = { status: 200, body: { version: 1, ok: true, acknowledged: true } };
@@ -339,67 +337,10 @@ describe("client", () => {
 
   const sub = { profileId: "sub", authMode: "claude-subscription" as const };
 
-  it("writes a private 0700 dir with 0600 session file outside the workspace, then checkpoints after a successful invocation", async () => {
-    const { transport, calls } = fakeTransport((route) => (reply(route, ack())));
-    const client = make(transport);
-    await client.checkout(sub);
-    const [dir] = readdirSync(authRoot);
-    const full = join(authRoot, dir!);
-    expect(statSync(full).mode & 0o777).toBe(0o700);
-    const file = join(full, ".credentials.json");
-    expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(readdirSync(full)).toEqual([".credentials.json"]); // no leftover temp file
-    expect(full.startsWith(workspace)).toBe(false);
-
-    let argvSeen = "";
-    const result = await client.invoke("sub", async (inv) => {
-      expect(realpathSync(inv.env.CLAUDE_CONFIG_DIR!)).toBe(realpathSync(full));
-      expect(JSON.stringify(inv.env)).not.toContain(S_INHERITED);
-      argvSeen = JSON.stringify(process.argv);
-      writeFileSync(file, S_REFRESHED);
-      return 42;
-    });
-    expect(result).toBe(42);
-    expect(argvSeen).not.toContain("SENTINEL");
-    const cp = calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint);
-    expect(cp).toHaveLength(1);
-    expect(JSON.parse(cp[0]!.raw)).toEqual({
-      version: 1,
-      profileId: "sub",
-      ownerGeneration: 3,
-      stateSequence: 6,
-      sessionData: S_REFRESHED,
-    });
-
-    await client.finish("sub", "completed");
-    expect(existsSync(full)).toBe(false);
-    expect(calls.at(-1)!.route).toBe(MODEL_AUTH_ROUTES.finish);
-    expect(JSON.parse(calls.at(-1)!.raw)).toEqual({ version: 1, profileId: "sub", handling: "completed" });
-  });
-
-  it("checkpoints refreshed state even when the invocation fails, and rethrows the invocation error", async () => {
-    const { transport, calls } = fakeTransport((route) => (reply(route, ack())));
-    const client = make(transport);
-    await client.checkout(sub);
-    const file = join(authRoot, readdirSync(authRoot)[0]!, ".credentials.json");
-    const boom = new Error("model crashed");
-    await expect(
-      client.invoke("sub", async () => {
-        writeFileSync(file, S_REFRESHED);
-        throw boom;
-      }),
-    ).rejects.toBe(boom);
-    expect(calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint)).toHaveLength(1);
-    // Sequence advances for the next invocation.
-    await client.invoke("sub", async () => undefined).catch(() => undefined);
-    const seqs = calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint).map((c) => JSON.parse(c.raw).stateSequence);
-    expect(seqs[0]).toBe(6);
-  });
-
   describe("checkout authorization happens before any file is written", () => {
     const cases: Array<[string, Record<string, unknown>]> = [
       ["cross-profile response", { profileId: "api" }],
-      ["stale owner generation", { ownerGeneration: 2 }],
+
     ];
     for (const [name, over] of cases) {
       it(name, async () => {
@@ -411,8 +352,8 @@ describe("client", () => {
       });
     }
 
-    it("missing owner generation is an invalid response", async () => {
-      const { transport } = fakeTransport(() => okCheckout({ ownerGeneration: undefined }));
+    it("owner generation is an invalid managed response", async () => {
+      const { transport } = fakeTransport(() => okCheckout({ ownerGeneration: 3 }));
       expect(await categoryAsync(make(transport).checkout(sub))).toBe("checkout_response_invalid");
       expect(readdirSync(authRoot)).toEqual([]);
     });
@@ -530,108 +471,6 @@ describe("client", () => {
     });
   });
 
-  describe("checkpoint safety", () => {
-    async function ready(handler: Handler, extra: Partial<ModelAuthClientOptions> = {}) {
-      const f = fakeTransport((route, body) => (route === MODEL_AUTH_ROUTES.checkout ? okCheckout() : handler(route, body)));
-      const client = make(f.transport, extra);
-      await client.checkout(sub);
-      return { ...f, client };
-    }
-
-    for (const [name, over] of [
-      ["wrong profile", { profileId: "api" }],
-      ["wrong generation", { ownerGeneration: 4 }],
-      ["wrong sequence", { stateSequence: 7 }],
-    ] as const) {
-      it(`blocks further invocations on an acknowledgement with the ${name}`, async () => {
-        const { client } = await ready(() => ack(over));
-        expect(await categoryAsync(client.invoke("sub", async () => 1))).toBe("checkpoint_uncertain");
-        const spy = vi.fn(async () => 1);
-        expect(await categoryAsync(client.invoke("sub", spy))).toBe("checkpoint_uncertain");
-        expect(spy).not.toHaveBeenCalled();
-        expect(await categoryAsync(client.finish("sub", "completed"))).toBe("checkpoint_uncertain");
-        expect(readdirSync(authRoot)).toHaveLength(1); // fresher state is not destroyed while unreconciled
-      });
-    }
-
-    it("retries transport failures with the identical payload, then succeeds", async () => {
-      let n = 0;
-      const { client, calls } = await ready(() => {
-        n++;
-        if (n === 1) return Promise.reject(new Error(`network ${S_SESSION}`));
-        if (n === 2) return { status: 503, body: { leaked: S_SESSION } };
-        return ack();
-      });
-      await client.invoke("sub", async () => undefined);
-      const cps = calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint);
-      expect(cps).toHaveLength(3);
-      expect(new Set(cps.map((c) => c.raw)).size).toBe(1);
-      expect(sleeps).toHaveLength(2);
-      expect(sleeps.every((s) => s <= DEFAULT_RETRY_POLICY.backoffMaxMs)).toBe(true);
-    });
-
-    it("exhausted retries leave the profile uncertain and no further model call happens", async () => {
-      const { client, calls } = await ready(() => Promise.reject(new Error(`down ${S_REFRESHED}`)), { maxTransportAttempts: 3 });
-      const err = await client.invoke("sub", async () => undefined).catch((e) => e as Error);
-      expect((err as ModelAuthClientError).category).toBe("checkpoint_uncertain");
-      expect((err as Error).message).not.toContain("SENTINEL");
-      expect(calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint)).toHaveLength(3);
-      const spy = vi.fn(async () => 1);
-      expect(await categoryAsync(client.invoke("sub", spy))).toBe("checkpoint_uncertain");
-      expect(spy).not.toHaveBeenCalled();
-      expect(client.status("sub")).toBe("uncertain");
-    });
-
-    it("a definitive rejection blocks without retrying and surfaces the server category", async () => {
-      const { client, calls } = await ready(() => ({ status: 409, body: { version: 1, ok: false, category: "stale_owner" } }));
-      const err = (await client.invoke("sub", async () => 1).catch((e) => e)) as ModelAuthClientError;
-      expect(err.category).toBe("checkpoint_rejected");
-      expect(err.serverCategory).toBe("stale_owner");
-      expect(calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint)).toHaveLength(1);
-      expect(await categoryAsync(client.invoke("sub", async () => 1))).toBe("checkpoint_uncertain");
-    });
-
-    it("reconcile: accepted resumes, not_accepted resends the identical payload, unknown stays blocked", async () => {
-      let mode: "lost" | "ok" = "lost";
-      const verdicts: Array<"accepted" | "not_accepted" | "unknown"> = ["unknown", "not_accepted", "accepted"];
-      const reconcile = vi.fn(async () => verdicts.shift()!);
-      const { client, calls } = await ready(() => (mode === "lost" ? Promise.reject(new Error("x")) : ack()), {
-        maxTransportAttempts: 1,
-        reconcile,
-      });
-      await client.invoke("sub", async () => undefined).catch(() => undefined);
-      await client.reconcile("sub");
-      expect(client.status("sub")).toBe("uncertain");
-      mode = "ok";
-      await client.reconcile("sub");
-      expect(client.status("sub")).toBe("ready");
-      const cps = calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint);
-      expect(cps).toHaveLength(2);
-      expect(cps[0]!.raw).toBe(cps[1]!.raw);
-    });
-
-    it("reconcile accepted advances the sequence without resending", async () => {
-      const { client, calls } = await ready(() => Promise.reject(new Error("x")), {
-        maxTransportAttempts: 1,
-        reconcile: async () => "accepted",
-      });
-      await client.invoke("sub", async () => undefined).catch(() => undefined);
-      await client.reconcile("sub");
-      expect(client.status("sub")).toBe("ready");
-      expect(calls.filter((c) => c.route === MODEL_AUTH_ROUTES.checkpoint)).toHaveLength(1);
-    });
-
-    it("rejects concurrent invocations of one profile", async () => {
-      const { client } = await ready(() => ack());
-      let release!: () => void;
-      const first = client.invoke("sub", () => new Promise<void>((r) => (release = r)));
-      await Promise.resolve();
-      expect(await categoryAsync(client.invoke("sub", async () => 1))).toBe("invocation_in_progress");
-      release();
-      await first;
-    });
-  });
-
   it("clears temporary credentials when finish is not acknowledged, but still reports it", async () => {
     const { transport } = fakeTransport((route) =>
       route === MODEL_AUTH_ROUTES.checkout ? okCheckout() : route === MODEL_AUTH_ROUTES.checkpoint ? ack() : { status: 400, body: "raw" },
@@ -646,6 +485,7 @@ describe("client", () => {
   it("reports cleanup failure by category only, with no path or secret", async () => {
     const { transport } = fakeTransport((route) => (reply(route, ack())));
     const client = make(transport, {
+      source: { kind: "local", port: { load: async () => ({ kind: "session", sessionData: S_SESSION, stateSequence: 0 }), persistSession: async () => undefined } },
       removeDir: async (p) => {
         throw new Error(`EPERM ${p} ${S_SESSION}`);
       },
@@ -672,7 +512,7 @@ describe("client", () => {
   it("refuses a credential directory inside the workspace or artifacts", async () => {
     const { transport } = fakeTransport(() => okCheckout());
     for (const bad of [workspace, artifacts, "relative/path"]) {
-      const client = make(transport, { authRoot: bad });
+      const client = make(transport, { authRoot: bad, source: { kind: "local", port: { load: async () => ({ kind: "session", sessionData: S_SESSION, stateSequence: 0 }), persistSession: async () => undefined } } });
       expect(await categoryAsync(client.checkout(sub))).toBe("auth_dir_unsafe");
     }
     expect(readdirSync(workspace)).toEqual([]);
@@ -693,7 +533,11 @@ describe("client", () => {
       inheritedEnv: { OPENAI_API_KEY: S_INHERITED },
     });
     await client.checkout(sub);
-    const file = join(authRoot, readdirSync(authRoot)[0]!, ".credentials.json");
+    const dir = join(authRoot, readdirSync(authRoot)[0]!);
+    const file = join(dir, ".credentials.json");
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(readdirSync(dir)).toEqual([".credentials.json"]);
     await client.invoke("sub", async (inv) => {
       expect(inv.env).not.toHaveProperty("OPENAI_API_KEY");
       writeFileSync(file, S_REFRESHED);
@@ -702,6 +546,24 @@ describe("client", () => {
     await client.finish("sub", "completed");
     expect(readdirSync(authRoot)).toEqual([]);
     expect(readFileSync(login, "utf8")).toBe(S_SESSION);
+  });
+
+  it("persists refreshed local session state when an invocation fails", async () => {
+    const persistSession = vi.fn(async () => undefined);
+    const client = createModelAuthClient({
+      source: { kind: "local", port: {
+        load: async () => ({ kind: "session", sessionData: S_SESSION, stateSequence: 0 }),
+        persistSession,
+      } }, authRoot, forbiddenRoots: [workspace],
+    });
+    await client.checkout(sub);
+    const boom = new Error("model crashed");
+    await expect(client.invoke("sub", async (inv) => {
+      writeFileSync(join(inv.env.CLAUDE_CONFIG_DIR!, ".credentials.json"), S_REFRESHED);
+      throw boom;
+    })).rejects.toBe(boom);
+    expect(persistSession).toHaveBeenCalledWith({ profileId: "sub", sessionData: S_REFRESHED });
+    await client.dispose();
   });
 
   it("local credential port failure and kind mismatch use safe categories", async () => {
@@ -739,7 +601,7 @@ describe("client", () => {
       const load = vi.fn(localPort().load);
       const client = local({ load });
       expect(await categoryAsync(client.checkout(sub))).toBe("credential_source_failed");
-      expect(load).not.toHaveBeenCalled();
+      expect(load).toHaveBeenCalledOnce();
       expect(readdirSync(authRoot)).toEqual([]);
     });
 
@@ -769,7 +631,7 @@ describe("client", () => {
       mkdirSync(join(workspace, "inner"));
       const { transport } = fakeTransport(() => okCheckout());
       for (const bad of [link, join(parentLink, "inner"), join(authRoot, "..", "workspace"), join(root, "auth", "..", "workspace", "inner")]) {
-        const client = make(transport, { authRoot: bad });
+        const client = make(transport, { authRoot: bad, source: { kind: "local", port: { load: async () => ({ kind: "session", sessionData: S_SESSION, stateSequence: 0 }), persistSession: async () => undefined } } });
         expect(await categoryAsync(client.checkout(sub))).toBe("auth_dir_unsafe");
       }
       expect(readdirSync(join(workspace, "inner"))).toEqual([]);
@@ -777,7 +639,7 @@ describe("client", () => {
       // prefix collision: sibling "workspace-auth" is not inside "workspace"
       const sibling = join(root, "workspace-auth");
       mkdirSync(sibling);
-      const ok = make(transport, { authRoot: sibling });
+      const ok = make(transport, { authRoot: sibling, source: { kind: "local", port: { load: async () => ({ kind: "session", sessionData: S_SESSION, stateSequence: 0 }), persistSession: async () => undefined } } });
       await ok.checkout(sub);
       const dir = join(sibling, readdirSync(sibling)[0]!);
       expect(statSync(dir).mode & 0o777).toBe(0o700);
@@ -872,18 +734,6 @@ describe("client", () => {
       expect(await categoryAsync(used.invoke("sub", spy))).toBe("client_disposed");
       expect(spy).not.toHaveBeenCalled();
     });
-
-    it("dispose preserves uncertain state and pending payload and makes no transport call", async () => {
-      const f = fakeTransport((route) => (route === MODEL_AUTH_ROUTES.checkout ? okCheckout() : Promise.reject(new Error("down"))));
-      const reconcile = vi.fn(async () => "unknown" as const);
-      const client = make(f.transport, { maxTransportAttempts: 1, reconcile });
-      await client.checkout(sub);
-      await client.invoke("sub", async () => undefined).catch(() => undefined);
-      const before = f.calls.length;
-      await client.dispose();
-      expect(f.calls.length).toBe(before);
-      expect(client.status("sub")).toBe("uncertain");
-    });
   });
 
   it("does not label a multi-stage profile with its first binding's stage", async () => {
@@ -894,13 +744,12 @@ describe("client", () => {
       profileId: "sub",
       profileRevision: 1,
       authMode: "claude-subscription" as const,
-      ownerGeneration: 3,
     }));
     const client = make(transport, { onDiagnostic: (d) => seen.push(d) }, grant({ bindings }));
     await client.checkout(sub);
     await client.invoke("sub", async () => undefined);
     await client.finish("sub", "completed");
-    expect(seen.length).toBeGreaterThanOrEqual(3);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
     for (const d of seen) {
       expect(d.stage).not.toBe("planning");
       expect("stage" in d).toBe(false);
@@ -914,7 +763,7 @@ describe("client", () => {
     await client.checkout(sub);
     await client.invoke("sub", async () => undefined);
     await client.finish("sub", "completed");
-    expect(seen.length).toBeGreaterThanOrEqual(3);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
     for (const d of seen) expect(d.stage).toBe("implementation");
   });
 
@@ -925,9 +774,9 @@ describe("client", () => {
     await client.checkout(sub);
     await client.invoke("sub", async () => undefined);
     await client.finish("sub", "completed");
-    expect(seen.length).toBeGreaterThanOrEqual(3);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
     const dump = JSON.stringify(seen);
-    for (const s of [S_BEARER, S_SESSION, S_REFRESHED, S_INHERITED]) expect(dump).not.toContain(s);
+    for (const s of [S_BEARER, S_API, S_SESSION, S_REFRESHED, S_INHERITED]) expect(dump).not.toContain(s);
   });
 });
 
@@ -1111,7 +960,7 @@ describe("ChatGPT plan access token (codex-subscription)", () => {
     const load = vi.fn(async () => tok(S_TOKEN, NOW + 10 * REQ));
     const c = createModelAuthClient({ source: { kind: "local", port: { load } }, authRoot, forbiddenRoots: [] });
     await c.checkout(cg);
-    expect(await categoryAsync(c.checkout({ profileId: "sub", authMode: "claude-subscription" }))).toBe("credential_source_failed");
+    expect(await categoryAsync(c.checkout({ profileId: "sub", authMode: "claude-subscription" }))).toBe("credential_source_mismatch");
   });
 
   it("rejects a session secret for codex-subscription at checkout and writes no session file", async () => {

@@ -5,7 +5,6 @@
  */
 import { describe, it, expect, beforeEach, vi, type Mock } from "vitest";
 import { serializeChatGptPlanRecord } from "../chatgpt-plan-token.js";
-import type * as DedupModule from "../dedup.js";
 import type * as OwnershipModule from "../model-session-ownership.js";
 import type * as StoreModule from "../model-session-store.js";
 import type * as ServerModule from "../model-auth-server.js";
@@ -24,7 +23,6 @@ const KEYS = createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-ser
 const OPERATOR = { synthetic: "operator" };
 const NOW = 1_000_000;
 
-let dedup: typeof DedupModule;
 let own: typeof OwnershipModule;
 let storeMod: typeof StoreModule;
 let server: typeof ServerModule;
@@ -54,7 +52,7 @@ let snapshotSpy: Mock<(...args: any[]) => any>;
 let refreshSpy: Mock<(...args: any[]) => any>;
 let refreshImpl: (profileId: string) => Promise<void>;
 
-const SUB: ModelAuthGrantBinding = { stage: "implementation", profileId: "sub1", profileRevision: 3, authMode: "claude-subscription", ownerGeneration: 1 };
+const SUB: ModelAuthGrantBinding = { stage: "implementation", profileId: "sub1", profileRevision: 3, authMode: "claude-subscription" };
 const CDX: ModelAuthGrantBinding = { stage: "implementation", profileId: "cdx1", profileRevision: 4, authMode: "codex-subscription" };
 const ACCESS_TOKEN = "SYNTH-CHATGPT-ACCESS-TOKEN";
 const REFRESH_TOKEN = "SYNTH-CHATGPT-REFRESH-TOKEN";
@@ -194,7 +192,7 @@ beforeEach(async () => {
   snapshotSpy = vi.fn();
   refreshSpy = vi.fn();
   refreshImpl = async () => undefined;
-  ({ dedup, own, storeMod, server } = (await testDb({
+  ({ own, storeMod, server } = (await testDb({
     modules: {
       dedup: () => import("../dedup.js"),
       own: () => import("../model-session-ownership.js"),
@@ -222,27 +220,14 @@ describe("checkout", () => {
     expectNoLeak(res, [API_KEY]);
   });
 
-  it("returns session state with the verified generation and the real sequence", async () => {
+  it("returns the Claude token without an owner generation", async () => {
     const res = await checkout("sub1");
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ ok: true, authMode: "claude-subscription", ownerGeneration: 1, secret: { kind: "session", sessionData: `${SESSION}-0`, stateSequence: 0 } });
-    expectNoLeak(res, [SESSION]);
-  });
-
-  it("rebinds an earlier-generation session to the current generation", async () => {
-    // Move ownership to generation 2 while the stored state is still generation 1.
-    const ref = { dispatchId: "d1", profileId: "sub1", generation: 1 };
-    ownership.markCheckpointed(ref);
-    const db = dedup.getDb();
-    db.prepare("UPDATE model_profile_reservations SET released_at = 1, recovery_status = 'released' WHERE profile_id = 'sub1'").run();
-    const r2 = ownership.reserve({ dispatchId: "d2", profiles: [{ profileId: "sub1", authMode: "subscription" }] });
-    expect(r2.status).toBe("reserved");
-    bindings = [{ ...SUB, ownerGeneration: 2 }];
-    grantOverrides = { dispatchId: "d2" };
-    dispatchOverrides = { dispatchId: "d2" };
-    handlers = build();
-    const res = await checkout("sub1");
-    expect(res.body).toMatchObject({ ok: true, ownerGeneration: 2, secret: { sessionData: `${SESSION}-0`, stateSequence: 0 } });
+    expect(res.body).toMatchObject({ ok: true, authMode: "claude-subscription", secret: { kind: "claude-oauth-token", token: API_KEY } });
+    expect((res.body as { ownerGeneration?: number }).ownerGeneration).toBeUndefined();
+    expect(readSpy).not.toHaveBeenCalled();
+    expect(snapshotSpy).not.toHaveBeenCalled();
+    expectNoLeak(res, [API_KEY]);
   });
 
   it("derives revision and provider from the grant and snapshot, never the body", async () => {
@@ -311,39 +296,6 @@ describe("checkout", () => {
     expect(readSpy).not.toHaveBeenCalled();
   });
 
-  it("fails closed for released, other-dispatch, older-generation, and missing owners", async () => {
-    const run = async (mutate: () => void) => {
-      mutate();
-      return checkout("sub1");
-    };
-    // other dispatch holds the profile's reservation
-    let res = await run(() => { grantOverrides = { dispatchId: "d9" }; dispatchOverrides = { dispatchId: "d9" }; });
-    expect(res.body).toMatchObject({ ok: false, category: "stale_owner" });
-    grantOverrides = {}; dispatchOverrides = {};
-    // older generation in the binding
-    bindings = [{ ...SUB, ownerGeneration: 5 }];
-    handlers = build();
-    res = await checkout("sub1");
-    expect(res.body).toMatchObject({ ok: false, category: "stale_owner" });
-    // missing snapshot
-    handlers = server.createModelAuthHandlers({ ...(depsFrom()), ownership: { snapshot: () => undefined } });
-    bindings = [SUB, KEYB];
-    res = await checkout("sub1");
-    expect(res.body).toMatchObject({ ok: false, category: "stale_owner" });
-    // released
-    dedup.getDb().prepare("UPDATE model_profile_reservations SET released_at = 1, recovery_status = 'released'").run();
-    handlers = build();
-    res = await checkout("sub1");
-    expect(res.body).toMatchObject({ ok: false, category: "stale_owner" });
-    expectNoLeak(res);
-  });
-
-  it("does not hand out a session while the owner is stopping", async () => {
-    ownership.beginStop({ dispatchId: "d1", profileId: "sub1", generation: 1 });
-    const res = await checkout("sub1");
-    expect(res.body).toMatchObject({ ok: false, category: "recovery_required" });
-  });
-
   it("maps resolver throws and secret-store errors to a static category", async () => {
     const throwing = server.createModelAuthHandlers({
       ...depsFrom(),
@@ -361,75 +313,12 @@ describe("checkout", () => {
   });
 });
 
-describe("checkpoint", () => {
-  it("stores state, acknowledges, and then serves it back", async () => {
+describe("non-reserved Claude checkpoint", () => {
+  it("rejects managed session writes before reaching ownership or persistence", async () => {
     const res = await checkpoint(1);
-    expect(res).toMatchObject({ status: 200, body: { version: 1, ok: true, profileId: "sub1", ownerGeneration: 1, stateSequence: 1 } });
-    expect(JSON.stringify(res.body)).not.toContain(SESSION);
-    const out = await checkout("sub1");
-    expect(out.body).toMatchObject({ secret: { sessionData: `${SESSION}-1`, stateSequence: 1 } });
-  });
-
-  it("treats a duplicate as success and a stale or conflicting update as a failure that never overwrites", async () => {
-    expect((await checkpoint(1)).status).toBe(200);
-    expect((await checkpoint(2)).status).toBe(200);
-    expect((await checkpoint(2)).status).toBe(200); // duplicate
-    const stale = await checkpoint(1);
-    expect(stale.body).toMatchObject({ ok: false, category: "stale_owner" });
-    const conflict = await checkpoint(2, "different-payload");
-    expect(conflict.body).toMatchObject({ ok: false, category: "stale_owner" });
-    const gap = await checkpoint(9);
-    expect(gap.body).toMatchObject({ ok: false, category: "stale_owner" });
-    const out = await checkout("sub1");
-    expect(out.body).toMatchObject({ secret: { sessionData: `${SESSION}-2`, stateSequence: 2 } });
-    expectNoLeak(stale, []);
-  });
-
-  it("never acknowledges when persistence fails", async () => {
-    storeWrap = { checkpoint: () => { throw new Error(STORE_ERROR); } };
-    let res = await checkpoint(1);
-    expect(res.body).toEqual({ version: 1, ok: false, category: "persistence_failed" });
-    storeWrap = { checkpoint: () => ({ ok: false, category: "persistence_failed", reason: "write_failed" }) };
-    res = await checkpoint(1);
-    expect(res.status).toBe(503);
-    expect(res.body).toEqual({ version: 1, ok: false, category: "persistence_failed" });
-    expectNoLeak(res);
-    storeWrap = {};
-    const out = await checkout("sub1");
-    expect(out.body).toMatchObject({ secret: { stateSequence: 0 } });
-  });
-
-  it("does not trust a mismatched success from the store", async () => {
-    storeWrap = { checkpoint: () => ({ ok: true, profileId: "sub1", ownerGeneration: 1, stateSequence: 77, idempotent: false }) };
-    const res = await checkpoint(1);
-    expect(res.body).toMatchObject({ ok: false, category: "persistence_failed" });
-  });
-
-  it("rejects a generation that differs from the binding, an API-key profile, and unlisted profiles", async () => {
-    const spy = checkpointSpy;
-    for (const res of [await checkpoint(1, "x", 2), await checkpoint(1, "x", 1, "key1"), await checkpoint(1, "x", 1, "nope")]) {
-      expect(res.body).toEqual({ version: 1, ok: false, category: "unauthorized" });
-    }
-    expect(spy).not.toHaveBeenCalled();
-    expect(readSpy).not.toHaveBeenCalled();
-  });
-
-  it("rejects bindings that no longer match the grant context before touching the store", async () => {
-    const spy = checkpointSpy;
-    dispatchOverrides = { projectKey: "other" };
-    handlers = build();
-    const res = await checkpoint(1);
-    expect(res.body).toMatchObject({ ok: false, category: "unauthorized" });
-    expect(spy).not.toHaveBeenCalled();
-    expect(readSpy).not.toHaveBeenCalled();
-  });
-
-  it("rejects checkpoints from a released or other-dispatch owner and allows a stopping owner", async () => {
-    ownership.beginStop({ dispatchId: "d1", profileId: "sub1", generation: 1 });
-    expect((await checkpoint(1)).status).toBe(200);
-    dedup.getDb().prepare("UPDATE model_profile_reservations SET released_at = 1, recovery_status = 'released'").run();
-    const res = await checkpoint(2);
-    expect(res.body).toMatchObject({ ok: false, category: "stale_owner" });
+    expect(res).toMatchObject({ status: 403, body: { ok: false, category: "unauthorized" } });
+    expect(checkpointSpy).not.toHaveBeenCalled();
+    expect(snapshotSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -468,13 +357,6 @@ describe("transport limits", () => {
     expect(declared.status).toBe(413);
     const checkpointBig = await handlers.handle(req("checkpoint", "x".repeat(5000)));
     expect(checkpointBig.status).toBe(413);
-  });
-
-  it("accepts a maximum-size session payload under the real checkpoint cap", async () => {
-    const real = server.createModelAuthHandlers({ ...depsFrom(), maxCheckpointBodyBytes: undefined });
-    const data = "é".repeat(60000);
-    const res = await real.handle(req("checkpoint", { version: 1, profileId: "sub1", ownerGeneration: 1, stateSequence: 1, sessionData: data }));
-    expect(res.status).toBe(200);
   });
 
   it("times out a stalled body and malformed JSON is a 400", async () => {
@@ -532,13 +414,6 @@ describe("revalidation after the asynchronous body read", () => {
     const res = await handlers.handle(req("checkout", "", { body: delayed(bodies.checkout, () => undefined) }));
     expect(res.status).toBe(200);
     expect(lookupSpy).toHaveBeenCalledTimes(2);
-  });
-
-  it("keeps an exact-owner final checkpoint for a recovery_required owner and stays idempotent", async () => {
-    ownership.markRecoveryRequired({ dispatchId: "d1", profileId: "sub1", generation: 1 });
-    const first = await checkpoint(1);
-    expect(first.status).toBe(200);
-    expect((await checkpoint(1)).status).toBe(200);
   });
 });
 
@@ -617,12 +492,12 @@ describe("codex-subscription (hosted ChatGPT access token)", () => {
     expect(refreshSpy).toHaveBeenCalledTimes(3);
   });
 
-  it("makes no owner check on checkout, while claude-subscription still does", async () => {
+  it("makes no owner check for either subscription mode", async () => {
     seed(planRecord(NOW + 600_000));
     expect((await checkout("cdx1")).status).toBe(200);
     expect(snapshotSpy).not.toHaveBeenCalled();
     expect((await checkout("sub1")).status).toBe(200);
-    expect(snapshotSpy).toHaveBeenCalledTimes(1);
+    expect(snapshotSpy).not.toHaveBeenCalled();
   });
 
   it("rejects a checkpoint with 400 before any store or ownership call", async () => {

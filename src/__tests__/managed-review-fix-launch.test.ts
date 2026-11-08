@@ -528,7 +528,7 @@ describe("production managed GHA review-fix launch", () => {
 
     it("refuses a managed Claude subscription stage", async () => {
       profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
-        authMode: "claude-subscription", });
+        authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" }, });
       profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
         planning: { agent: "claude", provider: "anthropic", model: "claude-sonnet-5-5", accountProfileId: "sub", invocationTimeoutMs: 60_000 },
         implementation: stage(), review: stage(),

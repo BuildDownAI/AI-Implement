@@ -238,22 +238,6 @@ describe("workflow preparation", () => {
   });
 });
 
-describe("ownership", () => {
-  it("rejects any subscription request without writing a reservation", () => {
-    const { ownership } = runtime();
-    expect(ownership.reserve({ dispatchId: "d1", profiles: [{ profileId: "sub", authMode: "subscription" }] }))
-      .toEqual({ status: "rejected", reason: "invalid_input" });
-    expect(ownership.reserve({ dispatchId: "d2", profiles: [{ profileId: "sub", authMode: "subscription" }, { profileId: "k", authMode: "api_key" }] }))
-      .toEqual({ status: "rejected", reason: "invalid_input" });
-    expect(count("model_profile_reservations")).toBe(0);
-  });
-
-  it("reserves an api_key-only request as nothing", () => {
-    const r = runtime().ownership.reserve({ dispatchId: "d3", profiles: [{ profileId: "k", authMode: "api_key" }] });
-    expect(r).toMatchObject({ status: "reserved", reservations: [] });
-  });
-});
-
 describe("credentials and session store", () => {
   it("resolves no protected secret without a stored row, and ignores ambient keys", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "AMBIENT");
@@ -288,6 +272,57 @@ describe("prepareAgentRun with the runtime deps", () => {
     });
     store.setProjectOptIn("AII", true);
   }
+
+  function claudeProfile() {
+    store.saveAccountProfileRevision({
+      profileId: "sub", identity: "Claude", revision: 1, agent: "claude", provider: "anthropic",
+      authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" },
+    });
+    useStages("sub", "claude", "anthropic");
+  }
+
+  it("prepares two concurrent runs sharing a Claude profile without reservations", async () => {
+    claudeProfile();
+    const token = "SENTINEL-CLAUDE-SETUP";
+    const secrets = modules.protectedSecrets.createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } });
+    expect(secrets.write("model-account:sub", token)).toEqual({ ok: true });
+    const rt = runtime();
+    const deps = rt.preparationDeps({ owner: "acme", repo: "ready-repo", projectKey: "AII" });
+    const results = await Promise.all(["d1", "d2"].map(dispatchId =>
+      prep.prepareAgentRun({ ...request(), dispatchId }, deps)));
+    for (const result of results) {
+      expect(result.status).toBe("ready");
+      expect(JSON.stringify(result)).not.toContain(token);
+      expect(JSON.stringify(result)).not.toContain("ownerGeneration");
+    }
+    expect(count("model_profile_reservations")).toBe(0);
+    expect(count("model_credential_grants")).toBe(2);
+    expect(JSON.stringify(logs)).not.toContain(token);
+  });
+
+  it.each(["absent", "decrypt_failed", "key_unavailable"] as const)(
+    "requires authentication with a fixed code when Claude secret is %s", async (failure) => {
+      claudeProfile();
+      const secrets = modules.protectedSecrets.createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } });
+      if (failure !== "absent") {
+        expect(secrets.write("model-account:sub", "SENTINEL-CLAUDE-SETUP")).toEqual({ ok: true });
+      }
+      if (failure === "decrypt_failed") {
+        dedup.getDb().prepare("UPDATE model_protected_secrets SET ciphertext = ?").run(Buffer.from("corrupt"));
+        expect(secrets.open("model-account:sub")).toEqual({ ok: false, code: "decrypt_failed" });
+      }
+      const rt = failure === "key_unavailable"
+        ? mod.createModelAuthRuntime({ config: CONFIG, env: {}, fetchImpl: github.fetch })
+        : runtime();
+      const result = await prep.prepareAgentRun(request(),
+        rt.preparationDeps({ owner: "acme", repo: "ready-repo", projectKey: "AII" }));
+      expect(result).toMatchObject({ status: "authentication-required", code: "session_unavailable" });
+      expect(count("model_profile_reservations")).toBe(0);
+      expect(count("model_credential_grants")).toBe(0);
+      expect(JSON.stringify(result)).not.toContain("SENTINEL");
+      expect(JSON.stringify(logs)).not.toContain("SENTINEL-CLAUDE-SETUP");
+    },
+  );
 
   it("is ready for a codex-subscription profile with a stored plan record", async () => {
     store.saveAccountProfileRevision({
