@@ -167,7 +167,7 @@ export async function refreshRunnerBackendCache(deps: RunnerBackendCacheDeps = {
 }
 
 export interface RunnerBackendSeedDeps {
-  /** Sends `seed` for one backend key; resolves once the ingress accepted it. */
+  /** Calls `seed` for one backend key; resolves once the handler completes. */
   sendSeed?: (backend: "fly-machines" | "github-actions", state: Record<string, unknown>, idempotencyKey: string) => Promise<void>;
 }
 
@@ -176,13 +176,13 @@ export interface RunnerBackendSeedDeps {
  * into `RunnerBackend/fly-machines`, and `{}` into `github-actions`. `seed` writes only when the object
  * is empty, so after the first boot the env vars and rows are inert. With nothing configured the
  * fly-machines seed is skipped, leaving the object empty so a later env var still applies via the
- * fallback. A failed send logs and returns; the next boot retries.
+ * fallback. A failed call logs and returns; the next boot retries.
  */
 export async function seedRunnerBackends(deps: RunnerBackendSeedDeps = {}): Promise<void> {
   const sendSeed = deps.sendSeed ?? (async (backend, state, key) => {
     const ingress = restateClients.connect({ url: RESTATE_INGRESS_BASE_URL });
-    await ingress.objectSendClient<RunnerBackendDefinition>({ name: "RunnerBackend" }, backend)
-      .seed(state, restateClients.rpc.sendOpts({ idempotencyKey: key }));
+    await ingress.objectClient<RunnerBackendDefinition>({ name: "RunnerBackend" }, backend)
+      .seed(state, restateClients.rpc.opts({ idempotencyKey: key }));
   });
   const rows = getOrchestratorSettings();
   const app = process.env.FLY_SESSIONS_APP || rows.flySessionsApp || null;

@@ -18,7 +18,9 @@ The Fly sessions app and region were an env var, else a `settings` row, read by 
 
 **4. Secrets stay env.** No schema has a token field. Restate journals every handler input, so `FLY_SESSIONS_TOKEN` is read from env only.
 
-**5. Seed once (ADR 022).** At boot, after the endpoint registers, `seed` sends `fly-machines` from `FLY_SESSIONS_APP` / `FLY_SESSIONS_REGION`, else the `fly_sessions_*` rows (skipped when neither exists), with idempotency key `seed:runner-backend:fly-machines`, and `github-actions` with `{}`. Afterward the env vars and rows are inert for these values; the rows are left in place, so a revert still has the pre-seed values.
+**5. Seed once (ADR 022).** At boot, after the endpoint registers, `seed` is called and awaited for `fly-machines` from `FLY_SESSIONS_APP` / `FLY_SESSIONS_REGION`, else the `fly_sessions_*` rows (skipped when neither exists), with idempotency key `seed:runner-backend:fly-machines`, and `github-actions` with `{}`. Afterward the env vars and rows are inert for these values; the rows are left in place, so a revert still has the pre-seed values.
+
+**2026-11-07 amendment (AII-1727):** Await seed handler completion before refreshing the cache. A send only waits for ingress acceptance, so the following refresh could read the object before the seed writes its value. This ordering is required before S1-11 removes the env-then-row fallback. The handler, state, and idempotency keys are unchanged.
 
 **6. Outage rule: serve the last value read.** `getFlySessionsConfig()` stays synchronous and reads a process cache. `refreshRunnerBackendCache()` reads the object through the ingress client at boot and once per poll cycle (3 s timeout). On success it replaces the cache; on failure it keeps the last value and logs once per outage. Before the first successful read, and while the object is empty, the cache is not used and the old env-then-row rule applies, so a boot with Restate down still dispatches. The Settings page reports which applies: `restate` or `fallback`.
 
