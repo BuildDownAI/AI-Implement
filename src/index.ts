@@ -4298,7 +4298,7 @@ function startServer(
         setupCheckContext: () => createSetupCheckContext({ restateStatus: getRestateStatus }),
       }).then((body) => {
         const json = JSON.stringify(body);
-        res.writeHead(200, { "Content-Type": "application/json" });
+        res.writeHead(body.status === "unavailable" ? 503 : 200, { "Content-Type": "application/json" });
         res.end(json);
       });
     }

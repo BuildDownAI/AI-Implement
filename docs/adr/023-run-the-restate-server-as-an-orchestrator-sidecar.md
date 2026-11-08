@@ -89,3 +89,18 @@ After boot (to be implemented by S1-14):
 | sidecar exits because stop() or restart() ran | no action |
 | sidecar exits while a shutdown already runs | ignored |
 | an ingress call times out while the child is alive | unchanged: that call degrades (503 restate-unavailable), no shutdown |
+
+GET / (operator decision D6, AII-1750):
+
+`GET /` returns HTTP 200 with `status: "ok"` only when `restateCanServe` is true (sidecar `ready` and registration `registered`); otherwise it returns HTTP 503 with `status: "unavailable"`. Every other body field stays unchanged, including the Restate diagnostics.
+
+| sidecar | registration | HTTP | status |
+| -- | -- | -- | -- |
+| ready | registered | 200 | ok |
+| starting | not-attempted | 503 | unavailable |
+| timeout | not-attempted | 503 | unavailable |
+| ready | not-attempted | 503 | unavailable |
+| ready | declined-conflict | 503 | unavailable |
+| ready | unreachable | 503 | unavailable (the process is exiting per S1-10) |
+| exited | any | 503 | unavailable |
+| missing-binary | not-attempted | 503 | unavailable |
