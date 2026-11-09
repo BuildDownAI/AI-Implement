@@ -56,7 +56,7 @@ function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
   };
 }
 
-function resultOf(fake: FakeAttempt, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+function resultOf(fake: FakeAttempt, overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   return makeReviewFixResult({
     attemptId: fake.prepared.attemptId, ...fake.prepared.scope, deadlineAt: fake.prepared.deadlineAt,
     githubRunId: EXECUTION.githubRunId, githubRunAttempt: EXECUTION.githubRunAttempt,

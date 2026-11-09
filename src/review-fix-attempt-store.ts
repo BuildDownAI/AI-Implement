@@ -380,7 +380,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       // post-bind mismatch is surfaced (already_bound with the original
       // identity), and persist the conflict marker.
       if (row.accepted_result_json !== null) {
-        const accepted = JSON.parse(row.accepted_result_json) as ReviewFixResultMetadataV1;
+        const accepted = JSON.parse(row.accepted_result_json) as Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>;
         if (accepted.githubRunId !== identity.githubRunId || accepted.githubRunAttempt !== identity.githubRunAttempt) {
           db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
             .run(now, attemptId);
@@ -433,7 +433,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     return db.transaction((): ResultIntakeOutcome => {
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as AttemptRow | undefined;
       if (!row) return { status: "stale", attemptId, reason: "unknown attempt" };
-      if ((row.execution_backend ?? "github-actions") !== "github-actions") {
+      if ((row.execution_backend ?? "github-actions") !== "github-actions" || result.executionBackend !== undefined) {
         return { status: "stale", attemptId, reason: "GitHub result does not match the attempt backend" };
       }
       if (result.attemptId !== attemptId) {

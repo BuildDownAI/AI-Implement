@@ -231,7 +231,7 @@ function budgetEntryCount(repository: string, prNumber: number): number {
   return row.n;
 }
 
-function resultOf(fixture: GithubFixture, prepared: PreparedReviewFixAttempt, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+function resultOf(fixture: GithubFixture, prepared: PreparedReviewFixAttempt, overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   if (fixture.runId === null) throw new Error("test bug: no bound run id yet");
   return {
     version: 1, attemptId: prepared.attemptId, ...prepared.scope, deadlineAt: prepared.deadlineAt,

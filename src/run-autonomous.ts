@@ -559,6 +559,10 @@ function resolveReviewFixResult(
   env: NodeJS.ProcessEnv,
 ): ReviewFixResultResolution {
   if (!identity) return { kind: "legacy" };
+  // Machine result production is a separate runner slice; never emit mixed evidence.
+  if (identity.executionBackend !== undefined) {
+    return { kind: "no-result", reason: `machine result production is not supported for attempt ${identity.attemptId}` };
+  }
   const githubRunId = parsePositiveIntEnv(env.GITHUB_RUN_ID);
   const githubRunAttempt = parsePositiveIntEnv(env.GITHUB_RUN_ATTEMPT);
   if (githubRunId === null || githubRunAttempt === null) {
@@ -570,7 +574,8 @@ function resolveReviewFixResult(
   if (!outputCommit) {
     return { kind: "no-result", reason: `no published output commit for attempt ${identity.attemptId}` };
   }
-  return { kind: "attached", reviewFix: { ...identity, githubRunId, githubRunAttempt, outputCommit } };
+  const { executionBackend: _backend, ...githubIdentity } = identity;
+  return { kind: "attached", reviewFix: { ...githubIdentity, githubRunId, githubRunAttempt, outputCommit } };
 }
 
 /**
