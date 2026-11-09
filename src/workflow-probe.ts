@@ -27,6 +27,10 @@ const STAGE_AGENT_CONTEXT_RE = /^#\s*ai-implement-capability:\s*stage-agent-laun
 export type WorkflowContract = "envelope" | "legacy";
 export interface WorkflowCapabilities {
   contract: WorkflowContract;
+  /** Diagnostic facts for setup checks; dispatch keeps using the combined capability. */
+  missing?: boolean;
+  hasStageAgentConfigMarker?: boolean;
+  hasStageAgentLaunchContextMarker?: boolean;
   supportsRunPublicationToken: boolean;
   /** True when the workflow declares `run_attempt_token`, gating attempt-correlation / versioned-callback support. */
   supportsAttemptCorrelation: boolean;
@@ -134,7 +138,7 @@ async function probeCapabilities(
   }
 
   if (res.status === 404) {
-    return legacy();
+    return { ...legacy(), capabilities: { ...legacy().capabilities, missing: true } };
   }
   if (!res.ok) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: contents lookup returned HTTP ${res.status}; workflow read failed`);
@@ -154,11 +158,20 @@ async function probeCapabilities(
     return legacy(true);
   }
 
-  const yamlText = Buffer.from(body.content, "base64").toString("utf8");
+  // Buffer.from silently discards invalid characters and accepts truncated input.
+  // GitHub wraps base64 across lines, so validate after removing whitespace.
+  const encoded = body.content.replace(/\s/g, "");
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: invalid base64 content; workflow read failed`);
+    return legacy(true);
+  }
+  const yamlText = Buffer.from(encoded, "base64").toString("utf8");
   const contract = RUN_CONFIG_RE.test(yamlText) ? "envelope" : "legacy";
   return {
     capabilities: {
       contract,
+      hasStageAgentConfigMarker: STAGE_AGENT_CONFIG_RE.test(yamlText),
+      hasStageAgentLaunchContextMarker: STAGE_AGENT_CONTEXT_RE.test(yamlText),
       supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
       supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
       supportsPrivateRunConfig: contract === "envelope" && PRIVATE_RUN_CONFIG_RE.test(yamlText),

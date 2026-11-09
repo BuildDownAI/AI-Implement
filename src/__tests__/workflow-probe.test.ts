@@ -56,6 +56,8 @@ describe("resolveWorkflowContract", () => {
     });
     expect(capabilities).toEqual({
       contract: "envelope",
+      hasStageAgentConfigMarker: false,
+      hasStageAgentLaunchContextMarker: false,
       supportsRunPublicationToken: true,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
@@ -76,6 +78,8 @@ describe("resolveWorkflowContract", () => {
     });
     expect(capabilities).toEqual({
       contract: "envelope",
+      hasStageAgentConfigMarker: false,
+      hasStageAgentLaunchContextMarker: false,
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
@@ -98,6 +102,8 @@ describe("resolveWorkflowContract", () => {
     });
     expect(capabilities).toEqual({
       contract: "envelope",
+      hasStageAgentConfigMarker: false,
+      hasStageAgentLaunchContextMarker: false,
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
@@ -144,6 +150,8 @@ describe("resolveWorkflowContract", () => {
     });
     expect(capabilities).toEqual({
       contract: "legacy",
+      hasStageAgentConfigMarker: false,
+      hasStageAgentLaunchContextMarker: false,
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
@@ -334,6 +342,8 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
     });
     expect(capabilities).toEqual({
       contract: "envelope",
+      hasStageAgentConfigMarker: false,
+      hasStageAgentLaunchContextMarker: false,
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: true,
       supportsPrivateRunConfig: false,
@@ -388,6 +398,8 @@ describe("resolveWorkflowCapabilities — supportsAttemptCorrelation", () => {
     });
     expect(capabilities).toEqual({
       contract: "legacy",
+      hasStageAgentConfigMarker: false,
+      hasStageAgentLaunchContextMarker: false,
       supportsRunPublicationToken: false,
       supportsAttemptCorrelation: false,
       supportsPrivateRunConfig: false,
@@ -474,6 +486,9 @@ describe("transient probe failures (AII-1292)", () => {
     ["bad JSON", () => contents({ text: "<html>upstream error</html>" })],
     ["null body", () => contents({ text: "null" })],
     ["missing content", () => contents({ json: { type: "file", encoding: "base64" } })],
+    ["invalid base64", () => contents({ json: { type: "file", encoding: "base64", content: "!!!" } })],
+    ["truncated base64", () => contents({ json: { type: "file", encoding: "base64", content: "YWJ" } })],
+    ["misplaced base64 padding", () => contents({ json: { type: "file", encoding: "base64", content: "YW=J" } })],
     ["non-string content", () => contents({ json: { type: "file", encoding: "base64", content: 42 } })],
     ["non-file body", () => contents({ json: [{ type: "file", name: "claude-implement.yml" }] })],
   ];
@@ -498,6 +513,7 @@ describe("transient probe failures (AII-1292)", () => {
       const first = await resolveWorkflowCapabilities(input);
       expect(first).toEqual({
         contract: "legacy",
+        ...(_n === "404" ? { missing: true } : { hasStageAgentConfigMarker: false, hasStageAgentLaunchContextMarker: false }),
         supportsRunPublicationToken: false,
         supportsAttemptCorrelation: false,
         supportsPrivateRunConfig: false,
