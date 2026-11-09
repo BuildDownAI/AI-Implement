@@ -168,6 +168,13 @@ This table is intentionally initialized lazily with `CREATE TABLE IF NOT EXISTS`
 on access, including recovery reads, so older databases can recover without a new
 boot caller. No `src/index.ts` change is required. The intent commits before the
 external dispatch attempt; acceptance is recorded separately before job insertion.
+A uniquely matched run adopted without a prior intent also persists its validated
+original owner, repository and workflow plus explicitly selected job attribution,
+with acceptance, before job insertion, run binding or queue completion. Retries
+reuse this snapshot across restarts and project mapping changes or removal;
+status and cancellation continue to address the original repository. Failed
+snapshot persistence leaves adoption bookkeeping untouched. No intent is created
+for an empty, ambiguous or invalid initial lookup.
 A crash between intent and call is indistinguishable from an uncertain attempted
 call: both recover conservatively as unknown, retaining admission and preventing
 another preparation, grant or dispatch even when a successful listing is empty.
