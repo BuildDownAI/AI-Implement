@@ -170,6 +170,16 @@ Local containers use a name derived from the dispatch ID, independent of issue k
 Legacy callers retain their timestamp names. Docker name uniqueness also fences a late first create.
 An empty Docker inspect response is an error, not evidence of absence.
 
+Preparation identity is persisted before the first asynchronous preparation operation for managed
+and unmanaged projects alike. It freezes the exact admission generation, owner/backend, repository
+lookup and Fly app. A backend candidate without ordinary launch intent or an owned job is ambiguous:
+recovery cannot adopt it, invent callback authority, or launch a replacement.
+
+Tracker recovery uses the original allowlisted nonsecret project configuration (Jira field overrides
+and project selectors, or the filesystem directory). A scoped provider is reconstructed with current
+credentials and the usual provider identity and local runner-mode guards. Missing or edited current
+project mappings cannot redirect this bookkeeping. Failed tracker work remains incomplete and retries.
+
 Every production lookup repairs bookkeeping before returning an adopted execution to the workflow:
 the same idempotent dispatch row, execution reference, dedup mark and tracker transition are used.
 Completed bookkeeping is not repeated and terminal rows are preserved. An ambiguous intent prevents

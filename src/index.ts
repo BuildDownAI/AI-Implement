@@ -5366,7 +5366,7 @@ async function main(): Promise<void> {
   // The ImplementationRun workflow (AII-1557): registered; the poll submits first-time implementations for every project. Gap-fill routing follows in AII-1554.
   const implementationRunServices = createProductionImplementationRunServices({
     config,
-    resolveProvider: (mapping) => registry.forMapping(mapping),
+    resolveProvider: (mapping, recoveryScopeKey) => recoveryScopeKey ? registry.forRecovery(mapping, recoveryScopeKey) : registry.forMapping(mapping),
     resolveRunnerImage: resolveDispatchRunnerImage,
     isGroupingParentDispatch,
     fireBreakerTrip,

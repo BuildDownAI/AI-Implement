@@ -10,6 +10,7 @@ import { RESTATE_INGRESS_BASE_URL } from "./server.js";
  * AII-1555, gap-fill in AII-1554. One deps set serves all three backends: each backend-selected dep
  * switches on `input.backend`. */
 import type { RepoMapping } from "../config.js";
+import { validateTicketingConfig } from "../providers/ticketing-config.js";
 import { getMappings } from "../config.js";
 import { acquireDispatch } from "../dispatch-gate.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
@@ -86,7 +87,7 @@ export interface ImplementationRunProductionInput {
   /** Maps a team key to its mapping. Defaults to `getMappings()[teamKey]`. */
   getMapping?: (teamKey: string) => RepoMapping | undefined;
   /** The provider lookup (`ProviderRegistry.forMapping`). */
-  resolveProvider: (mapping: RepoMapping) => Promise<TicketingProvider>;
+  resolveProvider: (mapping: RepoMapping, recoveryScopeKey?: string) => Promise<TicketingProvider>;
   /** `resolveDispatchRunnerImage` from `src/index.ts`. */
   resolveRunnerImage: Parameters<typeof prepareImplementationLaunch>[0]["resolveRunnerImage"];
   /** `isGroupingParentDispatch` from `src/index.ts`. */
@@ -228,6 +229,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       teamKey: mapping.teamKey, owner: mapping.owner, repo: mapping.repo,
       workflowFile: mapping.workflowFile, defaultBranch: mapping.defaultBranch,
       ticketingProvider: mapping.ticketingProvider,
+      ticketingConfig: validateTicketingConfig(mapping.ticketingProvider, mapping.ticketingConfig),
       maxTurns: mapping.maxTurns, maxIterations: mapping.maxIterations,
       maxJobMinutes: mapping.maxJobMinutes,
     } as RepoMapping;
@@ -271,6 +273,13 @@ export function createProductionImplementationRunServices(input: ImplementationR
    *  for a decision taken, and the workflow releases the reservation on `rejected`. */
   async function prepare(run: ImplementationRunInput): Promise<Prelaunch> {
     const storedMapping = requireMapping(getMapping, run.teamKey);
+    const admission = readAdmission(run.dispatchId);
+    if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
+    // Persist before the first await: even provider/image/token preparation can be interrupted.
+    implementationIntentStore().writePreparation(run.dispatchId, {
+      generation: admission.generation, projectKey: run.teamKey, backend: run.backend,
+      mapping: recoveryMapping(storedMapping), flyApp: config.flySessionsApp,
+    });
     const provider = await input.resolveProvider(storedMapping);
     const found = await provider.findByKey(run.issueIdentifier, run.teamKey);
     if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
@@ -282,16 +291,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
       maxTurns: issue.maxTurns ?? storedMapping.maxTurns,
       maxIterations: issue.maxIterations ?? storedMapping.maxIterations,
     };
-    const admission = readAdmission(run.dispatchId);
-    if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
-
     const ineligible = containerIneligibility(run, mapping);
     if (ineligible) throw new Error(ineligible);
 
-    if (isManagedProject(run.teamKey, run.dispatchId)) implementationIntentStore().writePreparation(run.dispatchId, {
-      generation: admission.generation, projectKey: run.teamKey, backend: run.backend,
-      mapping: recoveryMapping(mapping), flyApp: config.flySessionsApp,
-    });
     const managedRuntime = getModelAuthRuntime(config);
     let managedDecision: Prelaunch["managedDecision"] = { kind: "legacy" };
     if (isManagedProject(run.teamKey, run.dispatchId)) {
@@ -658,7 +660,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       // Preparation freezes lookup identity, but carries no original callback nonce or
       // accounting authority. A candidate is uncertainty, never an adoptable execution.
       // Throw rather than return null: null would allow the workflow to launch again.
-      if (id !== null && preparation) {
+      if (id !== null && !stored && !getJobByDispatchId(run.dispatchId)) {
         throw new Error(`missing ordinary launch intent for existing execution: ${run.dispatchId}`);
       }
       const row = getJobByDispatchId(run.dispatchId);
@@ -669,7 +671,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         // Exact adoption confirms acceptance but never remints a previously revoked grant.
         implementationIntentStore().accept(run.dispatchId);
         const { context, metadata } = stored.snapshot;
-        await recordLaunch(run, { ...context, provider: await input.resolveProvider(context.mapping) }, {
+        await recordLaunch(run, { ...context, provider: await input.resolveProvider(context.mapping, run.teamKey) }, {
           ...metadata, ghToken: run.backend === GHA_BACKEND ? await getToken(context.mapping.owner) : "",
           ...(run.backend === "fly-machines" && metadata.statusComment ? { statusComment: { ...metadata.statusComment, logsUrl: `https://fly.io/apps/${stored.snapshot.flyApp}/machines/${id}` } } : {}),
           ...(run.backend === GHA_BACKEND ? { runId: Number(id) } : { machineId: id }),

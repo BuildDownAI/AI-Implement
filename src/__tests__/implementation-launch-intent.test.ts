@@ -131,7 +131,7 @@ it.each([
   const persisted = m.dedup.getDb().prepare("SELECT snapshot FROM implementation_launch_intent WHERE dispatch_id = ?").get(run.dispatchId) as { snapshot: string };
   for (const secret of [bearer, "REGISTRY-SENTINEL", "API-CREDENTIAL-SENTINEL", "APP-CREDENTIAL-SENTINEL", "CALLBACK-SENTINEL"]) expect(persisted.snapshot).not.toContain(secret);
   const snapshot = JSON.parse(persisted.snapshot);
-  expect(snapshot.context.mapping).toEqual({ owner: "Org", repo: "repo", workflowFile: mapping.workflowFile, defaultBranch: mapping.defaultBranch, ticketingProvider: mapping.ticketingProvider, maxTurns: 17, maxIterations: 3, maxJobMinutes: mapping.maxJobMinutes });
+  expect(snapshot.context.mapping).toEqual({ owner: "Org", repo: "repo", workflowFile: mapping.workflowFile, defaultBranch: mapping.defaultBranch, ticketingProvider: mapping.ticketingProvider, ticketingConfig: mapping.ticketingConfig, maxTurns: 17, maxIterations: 3, maxJobMinutes: mapping.maxJobMinutes });
   expect(snapshot.flyApp).toBe("original-app");
   expect(snapshot.accounting.trackerKind).toBe("linear");
   if (accepted) m.intent.implementationIntentStore().accept(run.dispatchId);
@@ -178,7 +178,7 @@ vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(async () => ({ token: "scoped-token" })),
 }));
 
-it.each(["github-actions", "fly-machines"] as const)("%s actual helper preparation cannot authorize candidate adoption after restart", async backend => {
+it.each([true, false].flatMap(managed => (["github-actions", "fly-machines"] as const).map(backend => ({ managed, backend }))))("%s actual helper preparation cannot authorize candidate adoption after restart", async ({ managed, backend }) => {
   vi.stubEnv("RUNNER_TOKEN_SECRET", "preparation-test-key");
   onTestFinished(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
   const db = await testDb({ modules: {
@@ -197,7 +197,7 @@ it.each(["github-actions", "fly-machines"] as const)("%s actual helper preparati
   m.config.saveAccountProfileRevision({ profileId: "api", identity: "API", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
   const stage = { agent: "claude", provider: "anthropic", model: "test", accountProfileId: "api", invocationTimeoutMs: 60_000 } as const;
   m.config.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  m.config.setProjectOptIn("ENG", true);
+  m.config.setProjectOptIn("ENG", managed);
   expect(m.secrets.createModelProtectedSecrets().write("model-account:api", "API-CREDENTIAL-SENTINEL").ok).toBe(true);
   const run: ImplementationRunInput = { dispatchId: `preparation-${backend}`, teamKey: "ENG", issueId: "issue-1", issueIdentifier: "ENG-1", backend, maxJobMinutes: 60, launchContext: {} };
   const mapping = makeMapping({ owner: "Org", repo: "repo" });
@@ -213,11 +213,9 @@ it.each(["github-actions", "fly-machines"] as const)("%s actual helper preparati
   // Suspend inside the actual helper before markLaunchAttempted. This stack never
   // creates anything; a separately discovered candidate is not proof it did.
   const suspend = () => { reached(); return new Promise<never>(() => {}); };
-  if (backend === "github-actions") vi.mocked(m.auth.getInstallationToken).mockImplementationOnce(suspend);
-  else vi.mocked(m.auth.getScopedInstallationToken).mockImplementationOnce(suspend);
-  const io = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json([]));
+  const io = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json(backend === "github-actions" ? { workflow_runs: [] } : []));
   const input: ImplementationRunProductionInput = {
-    config: { githubAppId: "1", githubAppPrivateKey: "test", flySessionsToken: "fly-token", flySessionsApp: "original-app", runnerTokenSecret: "callback-sentinel", runnerCallbackBaseUrl: "https://test" } as ImplementationRunProductionInput["config"],
+    config: { githubAppId: "1", githubAppPrivateKey: "test", flySessionsToken: "fly-token", flySessionsApp: "original-app", anthropicApiKey: "MODEL-CREDENTIAL-SENTINEL", runnerTokenSecret: "callback-sentinel", runnerCallbackBaseUrl: "https://test" } as ImplementationRunProductionInput["config"],
     getMapping: () => mapping, resolveProvider: async () => makeProvider({ findByKey: vi.fn(async () => makeIssue({ id: run.issueId, identifier: run.issueIdentifier, scopeKey: run.teamKey })) }),
     resolveRunnerImage: async () => undefined, isGroupingParentDispatch: () => false, fireBreakerTrip: async () => {},
     prepareImplementationLaunch: m.launch.prepareImplementationLaunch, launchImplementationRun: m.launch.launchImplementationRun,
@@ -226,12 +224,15 @@ it.each(["github-actions", "fly-machines"] as const)("%s actual helper preparati
   };
   m.production.createProductionImplementationRunServices(input);
   expect(await captured.deps!.reserve(run)).toBe(true);
+  expect(await captured.deps!.findExistingRun(run, Date.now())).toBeNull();
+  if (backend === "github-actions") vi.mocked(m.auth.getInstallationToken).mockImplementationOnce(suspend);
+  else vi.mocked(m.auth.getScopedInstallationToken).mockImplementationOnce(suspend);
   void captured.deps!.launch(run);
   await preparing;
   expect(m.intent.implementationIntentStore().read(run.dispatchId)).toBeNull();
   expect(m.intent.implementationIntentStore().readPreparation(run.dispatchId)).not.toBeNull();
   const grantsBefore = m.dedup.getDb().prepare("SELECT * FROM model_credential_grants WHERE dispatch_id = ?").all(run.dispatchId);
-  expect(grantsBefore).toHaveLength(1);
+  expect(grantsBefore).toHaveLength(managed ? 1 : 0);
   const restarted = await db.reopen();
   const admission = restarted.admission.read(run.dispatchId)!;
   const candidate = { id: backend === "github-actions" ? 42 : "machine-42", display_title: `${m.production.IMPLEMENTATION_RUN_TITLE_PREFIX}${run.issueIdentifier}`, name: m.production.implementationFlyMachineName(run.issueIdentifier), created_at: new Date(admission.createdAt).toISOString() };
@@ -249,4 +250,99 @@ it.each(["github-actions", "fly-machines"] as const)("%s actual helper preparati
   expect(input.postDispatch).not.toHaveBeenCalled();
   expect(restarted.admission.read(run.dispatchId)).toEqual(admission);
   expect(restarted.dedup.getDb().prepare("SELECT * FROM model_credential_grants WHERE dispatch_id = ?").all(run.dispatchId)).toEqual(grantsBefore);
+});
+
+import { testDir } from "./helpers/test-dir.js";
+import { writeFile, readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].map(configuration => ({ tracker, configuration }))))("recovers accepted $tracker bookkeeping with $configuration mappings and current authority", async ({ tracker, configuration }) => {
+  vi.stubEnv("RUNNER_MODE", "local");
+  onTestFinished(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+  captured.liveContainer = null;
+  const db = await testDb({ modules: {
+    production: () => import("../restate/implementation-run-production.js"),
+    registry: () => import("../providers/registry.js"),
+    intent: () => import("../restate/implementation-launch-intent.js"),
+    log: () => import("../log.js"),
+    dedup: () => import("../dedup.js"),
+  } });
+  const directory = testDir("intent-tracker");
+  await writeFile(join(directory, "ENG-1.md"), "---\ntitle: Recovery\n---\nOriginal task\n");
+  const mapping = makeMapping({
+    ticketingProvider: tracker,
+    ticketingConfig: tracker === "jira" ? {
+      kind: "jira", jql: "project = ENG", repoFieldValue: "Org/repo",
+      statusFieldOverride: "customfield_101", repoFieldOverride: "customfield_102",
+      profilesFieldOverride: "customfield_103", baseBranchFieldOverride: "customfield_104",
+    } : { kind: "filesystem", directory },
+    extraEnv: { SECRET: "EXTRA-SENTINEL" },
+  });
+  const run: ImplementationRunInput = { dispatchId: "tracker-recovery", teamKey: "ENG", issueId: tracker === "jira" ? "10001" : "filesystem:ENG:ENG-1", issueIdentifier: "ENG-1", backend: "local-docker", maxJobMinutes: 60, launchContext: {} };
+  const issue = makeIssue({ id: run.issueId, identifier: run.issueIdentifier, scopeKey: run.teamKey });
+  let mappings: Record<string, typeof mapping> = { ENG: mapping };
+  const credentials = { jiraEmail: "test@example.com", jiraToken: "CURRENT-CREDENTIAL-SENTINEL", jiraSiteUrl: "https://tracker.example.com" };
+  let registry = new db.modules.registry.ProviderRegistry({ ...credentials, jiraToken: "ORIGINAL-CREDENTIAL-SENTINEL" }, () => mappings);
+  const requests: Array<{ url: string; body: string; authorization: string }> = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+    requests.push({ url: String(url), body: String(init?.body ?? ""), authorization: String((init?.headers as Record<string, string>)?.Authorization ?? "") });
+    return (init?.method === "PUT") ? new Response(null, { status: 204 }) : Response.json({ id: "10001", key: "ENG-1", fields: { customfield_101: { value: "Ready" } } });
+  });
+  const launch = vi.fn(async (args: Parameters<ImplementationRunProductionInput["launchImplementationLocalSession"]>[0]) => {
+    args.input.markLaunchAttempted({ sessionImage: "runner:test", computeStartedAt: Date.now() });
+    captured.liveContainer = "container-42";
+    mappings = {};
+    return { executionMode: "local-docker" as const, machineId: "container-42", sessionImage: "runner:test", statusComment: null, computeStartedAt: Date.now() };
+  });
+  const input: ImplementationRunProductionInput = {
+    config: { githubAppId: "1", githubAppPrivateKey: "APP-SENTINEL", anthropicApiKey: "MODEL-SENTINEL" } as ImplementationRunProductionInput["config"],
+    getMapping: key => mappings[key],
+    resolveProvider: vi.fn(),
+    resolveRunnerImage: async () => undefined, isGroupingParentDispatch: () => false, fireBreakerTrip: vi.fn(),
+    prepareImplementationLaunch: vi.fn(), launchImplementationRun: vi.fn(), launchImplementationFlySession: vi.fn(),
+    launchImplementationLocalSession: launch,
+    postDispatch: async (_config, provider, ticket) => {
+      await provider.markImplementing(ticket.id, ticket.scopeKey);
+    },
+    finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn(),
+  };
+  // Make the original provider use the actual registry for bookkeeping, while avoiding a tracker issue lookup.
+  input.resolveProvider = async (m, scope) => {
+    if (scope) return registry.forRecovery(m, scope);
+    const provider = await registry.forMapping(m);
+    return new Proxy(provider, { get(target, key) {
+      if (key === "findByKey") return async () => issue;
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  };
+  db.modules.production.createProductionImplementationRunServices(input);
+  expect(await captured.deps!.reserve(run)).toBe(true);
+  await expect(captured.deps!.launch(run)).rejects.toThrow();
+  const originalJob = db.modules.log.getJobByDispatchId(run.dispatchId)!;
+  expect(originalJob.machineId).toBe("container-42");
+  expect(db.modules.intent.implementationIntentStore().read(run.dispatchId)?.done).toBe(false);
+  const restarted = await db.reopen();
+  // Changed project configuration must not redirect recovered work.
+  mappings = configuration === "missing" ? {} : { ENG: makeMapping({ ticketingProvider: "linear", ticketingConfig: { kind: "linear" } }) };
+  registry = new restarted.registry.ProviderRegistry(credentials, () => mappings);
+  restarted.production.createProductionImplementationRunServices(input);
+  for (let retry = 0; retry < 2; retry++) expect(await captured.deps!.findExistingRun(run, Date.now() - 1000)).toBe("container-42");
+  expect(launch).toHaveBeenCalledTimes(1);
+  expect(restarted.log.getJobByDispatchId(run.dispatchId)).toMatchObject({ id: originalJob.id, machineNonce: originalJob.machineNonce });
+  expect(restarted.intent.implementationIntentStore().read(run.dispatchId)?.done).toBe(true);
+  const rows = JSON.stringify(restarted.dedup.getDb().prepare("SELECT snapshot FROM implementation_launch_intent").all());
+  for (const secret of ["EXTRA-SENTINEL", "APP-SENTINEL", "MODEL-SENTINEL", "ORIGINAL-CREDENTIAL-SENTINEL", credentials.jiraToken]) expect(rows).not.toContain(secret);
+  if (tracker === "jira") {
+    expect(requests.filter(r => r.body.includes("Implementing"))).toHaveLength(1);
+    expect(requests.find(r => r.body.includes("Implementing"))!.body).toContain("customfield_101");
+    expect(requests.every(r => r.url.startsWith(credentials.jiraSiteUrl))).toBe(true);
+    expect(requests.every(r => r.authorization === `Basic ${Buffer.from(credentials.jiraEmail + ":" + credentials.jiraToken).toString("base64")}`)).toBe(true);
+    await expect(new restarted.registry.ProviderRegistry({}, () => mappings).forRecovery(mapping, "ENG")).rejects.toThrow("requires config");
+  } else {
+    expect(JSON.parse(await readFile(join(directory, ".state", "ENG", "ENG-1.json"), "utf8"))).toMatchObject({ status: "implementing" });
+    vi.stubEnv("RUNNER_MODE", "default");
+    await expect(registry.forRecovery(mapping, "ENG")).rejects.toThrow("local runner mode");
+  }
+  await expect(registry.forRecovery({ ...mapping, ticketingProvider: "linear" }, "ENG")).rejects.toThrow("provider mismatch");
 });

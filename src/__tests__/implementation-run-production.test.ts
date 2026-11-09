@@ -346,7 +346,7 @@ describe("production deps", () => {
           id: "unacknowledged-run", name: implementationFlyMachineName(INPUT.issueIdentifier),
           created_at: new Date(DISPATCHED_AT).toISOString(),
         }] as never);
-        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBe("unacknowledged-run");
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("missing ordinary launch intent");
       }
       expect(releaseByDispatchId).not.toHaveBeenCalled();
     });
@@ -508,6 +508,7 @@ describe("production deps", () => {
 
     it("github: a throw in the preparation returns rejected; a throw after the launch call propagates", async () => {
       expect(await compose({ prepareImplementationLaunch: vi.fn().mockRejectedValue(new Error("mint")) as never }).d.launch(INPUT)).toEqual({ outcome: "rejected" });
+      intents.clear(); // Independent dispatch scenario; the prior preparation is intentionally durable.
       await expect(compose({ launchImplementationRun: vi.fn().mockRejectedValue(new Error("lost ack")) as never }).d.launch(INPUT)).rejects.toThrow("lost ack");
       expect(appendLogIfAbsent).not.toHaveBeenCalled();
     });
@@ -523,6 +524,7 @@ describe("production deps", () => {
       vi.mocked(classifyLaunchError).mockReturnValueOnce("rejected");
       expect(await compose({ [key]: vi.fn().mockRejectedValue(new Error("no")) as never }).d.launch({ ...INPUT, backend })).toEqual({ outcome: "rejected" });
       expect(settleLaunch).toHaveBeenCalledWith({ kind: "legacy" }, "rejected", expect.anything());
+      intents.clear(); // Independent dispatch scenario.
       vi.mocked(classifyLaunchError).mockReturnValueOnce("unknown");
       await expect(compose({ [key]: vi.fn().mockRejectedValue(new Error("lost")) as never }).d.launch({ ...INPUT, backend })).rejects.toThrow("lost");
       expect(appendLogIfAbsent).not.toHaveBeenCalled();
