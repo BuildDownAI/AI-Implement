@@ -472,7 +472,10 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
     vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue(makeScopedInstallationToken({ token: "gh-token" }));
-    vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
+    vi.mocked(localDocker.startLocalRunnerContainer).mockImplementation(async (input) => {
+      input.onBeforeLaunch?.();
+      throw new Error("docker run failed");
+    });
     const config = makeAppConfig({ anthropicApiKey: "sk-test" });
 
     await expect(

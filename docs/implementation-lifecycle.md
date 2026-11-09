@@ -157,3 +157,25 @@ Settled 2026-10-26; the table above already uses them.
 - `grep -n isRestateOwnedJob src/index.ts src/stuck-watchdog.ts src/reaper.ts` shows one definition and the call sites in the table above (six, two, one).
 - Every function named in a row exists in the file named in its heading; run `grep -rn "<name>" src` for each before changing a row.
 - No file under `src/` changes with this doc.
+
+### Recovery after backend acceptance
+
+ImplementationRun stores a private SQLite launch intent immediately before the backend call.
+It freezes the issue and effective limits, mapping and branch, admission generation, accounting,
+image/guest/compute metadata, and container callback nonce. Credentials and bootstrap tokens are
+excluded from the intent; neither the intent nor its nonce is returned to the Restate journal.
+Local containers use a name derived from the dispatch ID, independent of issue key and runner mode;
+Legacy callers retain their timestamp names. Docker name uniqueness also fences a late first create.
+An empty Docker inspect response is an error, not evidence of absence.
+
+Every production lookup repairs bookkeeping before returning an adopted execution to the workflow:
+the same idempotent dispatch row, execution reference, dedup mark and tracker transition are used.
+Completed bookkeeping is not repeated and terminal rows are preserved. An ambiguous intent prevents
+new preparation or another managed grant even if a later lookup sees nothing or eligibility changes;
+the workflow retains ownership through reconciliation and its existing deadline. Definitive rejection
+removes the intent without creating a job or dedup mark. Backend read errors still propagate.
+
+`implementation-recovery.restate.test.ts` exercises lost acceptance before recording on all three
+backends against the pinned Restate binary, including the actual local finder and Docker launcher,
+repeat recovery, configuration changes, authenticated callbacks, shared finalization and release.
+Workflow input, journal command names and committed journal snapshots remain unchanged.

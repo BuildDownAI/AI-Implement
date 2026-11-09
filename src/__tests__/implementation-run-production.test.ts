@@ -8,6 +8,13 @@ import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { makeLaunchDecision, makeSnapshot, SENTINEL_BEARER } from "./helpers/fixtures/configured-run.js";
 import { buildRunConfig } from "../run-config.js";
 
+const intents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: boolean }>());
+vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationIntentStore: () => ({
+  read: (id: string) => intents.get(id) ?? null,
+  write: (id: string, snapshot: unknown) => { if (!intents.has(id)) intents.set(id, { snapshot: structuredClone(snapshot), done: false }); },
+  complete: (id: string) => { const intent = intents.get(id); if (intent) intent.done = true; },
+  remove: (id: string) => intents.delete(id),
+}) }));
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/implementation-run-workflow.js")>()),
@@ -38,7 +45,7 @@ vi.mock("../fly-machines.js", () => ({
   getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
   generateSessionToken: () => "SESSION-TOKEN", generateMachineNonce: () => "MACHINE-NONCE",
 }));
-vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn() }));
+vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn().mockResolvedValue(null) }));
 vi.mock("../dispatch-admission.js", () => ({ read: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../runner-tokens.js", () => ({
@@ -62,13 +69,14 @@ import { appendLogIfAbsent, getJobByDispatchId, updateJobRunId, updateJobStatus 
 import { markDispatched } from "../dedup.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
-import { inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
+import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
 import { classifyLaunchError, isManagedProject, prepareManagedDispatch, settleLaunch } from "../managed-dispatch-auth.js";
 import {
   IMPLEMENTATION_RUN_TITLE_PREFIX,
   createImplementationFindExistingRun,
   createProductionImplementationRunServices,
   implementationFlyMachineName,
+  implementationLocalContainerName,
   type ImplementationRunProductionInput,
 } from "../restate/implementation-run-production.js";
 
@@ -132,8 +140,17 @@ describe("findExistingRun", () => {
     expect(listMachines).not.toHaveBeenCalled();
   });
 
-  it("docker: no recorded id means null (the container name carries a timestamp)", async () => {
-    expect(await find({ ...INPUT, backend: "local-docker" }, DISPATCHED_AT)).toBeNull();
+  it("docker: identity is stable per dispatch, distinct across dispatches, and visible to the existing sweeper", () => {
+    const name = implementationLocalContainerName("dispatch-one");
+    expect(name).toMatch(/^ai-implement-/);
+    expect(implementationLocalContainerName("dispatch-one")).toBe(name);
+    expect(implementationLocalContainerName("dispatch-two")).not.toBe(name);
+  });
+
+  it("docker: discovers the exact dispatch-scoped name without a recorded id", async () => {
+    vi.mocked(findLocalContainerIdByName).mockResolvedValueOnce("local-id");
+    expect(await find({ ...INPUT, backend: "local-docker" }, DISPATCHED_AT)).toBe("local-id");
+    expect(findLocalContainerIdByName).toHaveBeenCalledWith(implementationLocalContainerName(INPUT.dispatchId));
   });
 
   it("fly: matches the session machine by name and creation time", async () => {
@@ -192,6 +209,7 @@ describe("production deps", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    intents.clear();
     vi.mocked(getJobByDispatchId).mockReset();
     provider.findByKey.mockResolvedValue(issue);
     vi.mocked(readAdmission).mockReturnValue({ dispatchId: "d-1", generation: 3, releasedAt: null } as never);
@@ -231,6 +249,7 @@ describe("production deps", () => {
       const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
       for (const failure of ["bedrock", "no-credentials", ...(backend === "fly-machines" ? ["no-fly-token", "no-fly-app"] : [])]) {
         vi.clearAllMocks();
+        intents.clear();
         vi.mocked(readAdmission).mockReturnValue(null);
         // Even managed projects cannot launch unsupported Bedrock mappings.
         vi.mocked(isManagedProject).mockReturnValue(failure === "bedrock");
@@ -330,6 +349,7 @@ describe("production deps", () => {
     it.each(BACKENDS)("%s: preserves managed, API and OAuth eligibility", async (backend) => {
       for (const auth of ["managed", "api", "oauth"] as const) {
         vi.clearAllMocks();
+        intents.clear();
         vi.mocked(isManagedProject).mockReturnValue(auth === "managed");
         vi.mocked(prepareManagedDispatch).mockResolvedValue(makeLaunchDecision(makeSnapshot(), backend).decision);
         const { d } = compose({ config: {
@@ -358,6 +378,7 @@ describe("production deps", () => {
     it.each(["fly-machines", "local-docker"] as const)("%s: managed refusals and holds still use managed preparation without environment credentials", async (backend) => {
       for (const kind of ["refuse", "hold"] as const) {
         vi.clearAllMocks();
+        intents.clear();
         vi.mocked(isManagedProject).mockReturnValue(true);
         vi.mocked(prepareManagedDispatch).mockResolvedValue({ kind, category: "configuration-error", code: "x" } as never);
         const { d, input } = compose({ config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null } });
@@ -382,6 +403,7 @@ describe("production deps", () => {
       ]) {
         provider.findByKey.mockResolvedValue({ ...issue, ...limits });
         const { d, input } = compose({ getMapping: () => storedMapping });
+        intents.clear();
         expect(await d.launch({ ...INPUT, backend })).toMatchObject({ outcome: "accepted" });
         const launch = backend === "github-actions" ? input.prepareImplementationLaunch : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
         const args = vi.mocked(launch).mock.calls[0][0];
@@ -401,6 +423,7 @@ describe("production deps", () => {
         const { d, input } = compose();
         const prices = await readOptionalModelPrices(read);
         expect(prices).toBeUndefined();
+        intents.clear();
         expect(await d.launch({ ...INPUT, backend }, prices)).toMatchObject({ outcome: "accepted" });
         const launch = backend === "github-actions" ? input.prepareImplementationLaunch : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
         expect(vi.mocked(launch).mock.calls.at(-1)?.[0].modelPrices).toBeUndefined();
@@ -522,9 +545,30 @@ describe("production deps", () => {
       expect(provider.findByKey).toHaveBeenCalledWith(INPUT.issueIdentifier, INPUT.teamKey);
     });
 
-    it("a failure after the row was written does not throw", async () => {
+    it("a failure after the row was written retries bookkeeping", async () => {
       const { d } = compose({ postDispatch: vi.fn().mockRejectedValue(new Error("tracker down")) });
-      expect(await d.launch(INPUT)).toEqual({ outcome: "accepted", jobId: "4242" });
+      await expect(d.launch(INPUT)).rejects.toThrow("tracker down");
+    });
+  });
+
+  describe("private launch recovery", () => {
+    it.each(BACKENDS)("%s: ambiguity prevents another preparation", async (backend) => {
+      const { d, input } = compose();
+      intents.set(INPUT.dispatchId, { snapshot: {}, done: false });
+      input.config.anthropicApiKey = null;
+      input.config.claudeOAuthToken = null;
+      expect(await d.launch({ ...INPUT, backend })).toEqual({ outcome: "unknown" });
+      expect(provider.findByKey).not.toHaveBeenCalled();
+      expect(prepareManagedDispatch).not.toHaveBeenCalled();
+      expect(markDispatched).not.toHaveBeenCalled();
+      expect(appendLogIfAbsent).not.toHaveBeenCalled();
+    });
+
+    it("Docker read failure never becomes backend absence", async () => {
+      vi.mocked(findLocalContainerIdByName).mockRejectedValueOnce(new Error("docker unavailable"));
+      const { d, input } = compose();
+      await expect(d.findExistingRun({ ...INPUT, backend: "local-docker" }, DISPATCHED_AT)).rejects.toThrow("docker unavailable");
+      expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
     });
   });
 

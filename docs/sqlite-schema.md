@@ -154,3 +154,9 @@ Running the change before `ensureAccountingTriggers()` is not enough for this ta
 4. If the change drops a column that a trigger names (or renames one), follow section 5.
 5. Read the deploy paths in [deployment.md](deployment.md#deploy-paths). Remember that a
    rollback keeps the schema change (section 3).
+
+`implementation_launch_intent` is created idempotently on first ImplementationRun recovery access
+by `src/restate/implementation-launch-intent.ts`, using the shared connection. Its dispatch-keyed
+private snapshot is written before backend acceptance and never overwritten by retry preparation.
+`bookkeeping_done` suppresses repeated tracker dispatch effects after adoption. It is separate from
+`dispatch_log`, so definitive pre-launch rejection cannot leave a ghost in-flight job or dedup mark.

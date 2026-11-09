@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { implementationIntentStore } from "./implementation-launch-intent.js";
 import { modelPricesResponseSchema } from "./model-prices.js";
 import type { RunModelPrices } from "../run-config.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -30,7 +32,7 @@ import {
 } from "../log.js";
 import { trackerAccounting } from "../job-accounting.js";
 import { generateMachineNonce, generateSessionToken, listMachines } from "../fly-machines.js";
-import { removeLocalContainer } from "../local-docker.js";
+import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { markDispatched } from "../dedup.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
 import { postBranchComment } from "../base-branch.js";
@@ -142,12 +144,12 @@ export function implementationFlyMachineName(issueIdentifier: string): string {
   return `session-${issueIdentifier.toLowerCase().replace(/[^a-z0-9-]/g, "-")}`;
 }
 
-/** Looks an implementation run up. The id recorded on the dispatch row wins. Otherwise Fly by machine name and
- *  creation time, and GitHub Actions by exact title, creation time, and a run id no other row holds. The launches
- *  set no per-dispatch name (the local container name carries a timestamp), so a local container that was started
- *  but not recorded cannot be found. `null` means only "the backend answered, and nothing matches"; an HTTP error
- *  throws, so the workflow retries the lookup rather than launching a second run.
- *  GitHub and Fly stamp `created_at` to the second, so the dispatch time is floored to the second before the compare. */
+/** Docker enforces name uniqueness even if the first create finishes after a retry's lookup. */
+export function implementationLocalContainerName(dispatchId: string): string {
+  return `ai-implement-dispatch-${createHash("sha256").update(dispatchId).digest("hex")}`;
+}
+
+/** A null lookup requires a successful backend read; failures propagate. */
 export function createImplementationFindExistingRun(opts: {
   getMapping: (teamKey: string) => RepoMapping | undefined;
   getToken: (owner: string) => Promise<string>;
@@ -159,7 +161,7 @@ export function createImplementationFindExistingRun(opts: {
     const floor = Math.floor(dispatchedAt / 1000) * 1000;
     if (backend) {
       if (recorded?.machineId) return recorded.machineId;
-      if (backend === "local-docker") return null;
+      if (backend === "local-docker") return findLocalContainerIdByName(implementationLocalContainerName(input.dispatchId));
       const fly = opts.getFlySessions?.();
       if (!fly?.token || !fly.app) throw new Error("findExistingRun: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set");
       const name = implementationFlyMachineName(input.issueIdentifier);
@@ -208,6 +210,32 @@ export function createProductionImplementationRunServices(input: ImplementationR
     managedRuntime: ReturnType<typeof getModelAuthRuntime>;
     managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
   };
+
+  type LaunchMetadata = Parameters<typeof recordLaunch>[2];
+  type Intent = {
+    context: Pick<Prelaunch, "mapping" | "issue" | "generation" | "baseBranch" | "baseBranchFieldValue" | "runnerMode">;
+    metadata: Omit<LaunchMetadata, "ghToken">;
+    accounting: ReturnType<typeof trackerAccounting>;
+    groupingParent: boolean;
+    dispatchedAt: number;
+    flyApp: string | null;
+  };
+  function saveIntent(run: ImplementationRunInput, ctx: Prelaunch, metadata: Omit<LaunchMetadata, "ghToken">) {
+    implementationIntentStore().write(run.dispatchId, {
+      context: { mapping: ctx.mapping, issue: ctx.issue, generation: ctx.generation, baseBranch: ctx.baseBranch, baseBranchFieldValue: ctx.baseBranchFieldValue, runnerMode: ctx.runnerMode },
+      metadata, accounting: trackerAccounting(ctx.mapping, ctx.provider, ctx.issue), groupingParent: input.isGroupingParentDispatch(ctx.issue),
+      dispatchedAt: readAdmission(run.dispatchId)?.createdAt ?? Date.now(), flyApp: config.flySessionsApp,
+    } satisfies Intent);
+  }
+
+  function frozenMapping(run: ImplementationRunInput): RepoMapping {
+    return implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.context.mapping ?? requireMapping(getMapping, run.teamKey);
+  }
+
+  function backendConfig(run: ImplementationRunInput): AppConfig {
+    const intent = implementationIntentStore().read<Intent>(run.dispatchId);
+    return intent ? { ...config, flySessionsApp: intent.snapshot.flyApp } : config;
+  }
 
   /** Pure eligibility for a new launch; never evidence that an earlier launch is absent. */
   function containerIneligibility(run: ImplementationRunInput, mapping: RepoMapping): string | null {
@@ -276,15 +304,17 @@ export function createProductionImplementationRunServices(input: ImplementationR
     };
   }
 
-  /** After an accepted launch: write the job row (idempotent per dispatch id), then the ticket-side effects the
-   *  legacy dispatch makes. The launch functions write none of these. A failure after the row exists is logged,
-   *  not thrown: the retry would adopt the run through `findExistingRun` and skip this code, so a throw cannot repair it. */
+  /** Both initial acceptance and adoption use this path. A failed write retries through the finder.
+   * Private intent data restores the original admission, nonce, issue and accounting without new grants. */
   async function recordLaunch(
     run: ImplementationRunInput,
-    ctx: Prelaunch,
+    ctx: Pick<Prelaunch, "mapping" | "issue" | "generation" | "baseBranch" | "baseBranchFieldValue" | "runnerMode" | "provider">,
     launched: { executionMode: "github-actions" | "fly-machines" | "local-docker"; machineId?: string; machineNonce?: string; runId?: number; sessionImage?: string | null; contract?: "legacy" | "envelope"; ghToken: string; statusComment?: { machineName: string; logsUrl?: string } | null; logLine?: string; machineSize?: MachineSize; computeStartedAt?: number },
   ): Promise<void> {
     const { issue, mapping, provider } = ctx;
+    const intent = implementationIntentStore().read<Intent>(run.dispatchId);
+    const existing = getJobByDispatchId(run.dispatchId);
+    if (intent?.done || (existing && existing.status !== "dispatched" && existing.status !== "running")) return;
     const rowId = appendLogIfAbsent({
       issueId: issue.id,
       issueIdentifier: issue.identifier,
@@ -294,11 +324,12 @@ export function createProductionImplementationRunServices(input: ImplementationR
       issueState: issue.nativeStatus,
       dispatchId: run.dispatchId,
       admissionGeneration: ctx.generation,
+      dispatchedAt: intent?.snapshot.dispatchedAt,
       executionMode: launched.executionMode,
       runnerMode: ctx.runnerMode,
       sessionImage: launched.sessionImage ?? null,
-      groupingParent: input.isGroupingParentDispatch(issue),
-      ...trackerAccounting(mapping, provider, issue),
+      groupingParent: intent?.snapshot.groupingParent ?? input.isGroupingParentDispatch(issue),
+      ...(intent?.snapshot.accounting ?? trackerAccounting(mapping, provider, issue)),
       machineSize: launched.machineSize ?? null,
       computeStartedAt: launched.computeStartedAt ?? null,
       ...(launched.machineNonce ? { machineNonce: launched.machineNonce } : {}),
@@ -317,8 +348,10 @@ export function createProductionImplementationRunServices(input: ImplementationR
           .catch((err) => console.error(`[implementation-run] machine_created status failed for ${issue.identifier}:`, err));
       }
       if (launched.logLine) console.log(launched.logLine);
+      implementationIntentStore().complete(run.dispatchId);
     } catch (err) {
       console.error(`[implementation-run] post-launch bookkeeping failed dispatch=${run.dispatchId}:`, err);
+      throw err;
     }
   }
 
@@ -347,12 +380,16 @@ export function createProductionImplementationRunServices(input: ImplementationR
         modelPrices, config, issue, mapping, baseBranch: ctx.baseBranch,
         isGroupingParentDispatch: input.isGroupingParentDispatch,
         input: {
+          containerName: implementationLocalContainerName(run.dispatchId),
           sessionToken, machineNonce, runnerCallbackUrl,
           runToken: tokens.runToken ?? "",
           runProgressToken: tokens.runProgressToken ?? "",
           runPublicationToken: tokens.runPublicationToken,
           managedAuth: ctx.managedDecision,
-          markLaunchAttempted: () => { launchAttempted = true; },
+          markLaunchAttempted: (metadata?: { sessionImage: string; machineSize?: MachineSize; computeStartedAt: number }) => {
+            saveIntent(run, ctx, { executionMode: execPath, machineNonce, statusComment: { machineName: execPath === "local-docker" ? implementationLocalContainerName(run.dispatchId) : implementationFlyMachineName(run.issueIdentifier) }, ...metadata });
+            launchAttempted = true;
+          },
         },
       };
       launched = execPath === "fly-machines"
@@ -362,6 +399,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       const outcome = classifyLaunchError(execPath, launchAttempted, err);
       settleLaunch(ctx.managedDecision, outcome, ctx.managedRuntime);
       if (outcome === "rejected") {
+        implementationIntentStore().remove(run.dispatchId);
         console.error(`[implementation-run] launch rejected dispatch=${run.dispatchId}:`, err);
         return { outcome: "rejected" };
       }
@@ -384,6 +422,11 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   async function launch(run: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult> {
+    if (implementationIntentStore().read(run.dispatchId)) {
+      // Backend absence after an ambiguous acceptance is not proof that a late create cannot finish.
+      // Keep the admission and let the workflow reconcile until its deadline; never mint a new grant.
+      return { outcome: "unknown" };
+    }
     let ctx: Prelaunch;
     try {
       ctx = await prepare(run);
@@ -410,13 +453,23 @@ export function createProductionImplementationRunServices(input: ImplementationR
 
     // A throw from here on propagates: the launch may have happened, and the retry reconciles first.
     // The workflow owns the reservation, so there is no `onRejected` release.
+    try {
+      saveIntent(run, ctx, { executionMode: "github-actions", sessionImage: prepared.runnerImage ?? null, contract: prepared.contract });
+    } catch (err) {
+      settleLaunch(ctx.managedDecision, "rejected", ctx.managedRuntime);
+      console.error(`[implementation-run] launch intent persistence failed dispatch=${run.dispatchId}:`, err);
+      return { outcome: "rejected" };
+    }
     const launched = await input.launchImplementationRun({
       config, provider: ctx.provider, issue: ctx.issue, mapping: ctx.mapping, launch: prepared,
       implSentBaseBranch: ctx.baseBranch !== ctx.mapping.defaultBranch,
       managedDecision: ctx.managedDecision, managedRuntime: ctx.managedRuntime,
       fireBreakerTrip: input.fireBreakerTrip,
     });
-    if (launched.outcome !== "accepted") return { outcome: launched.outcome === "rejected" ? "rejected" : "unknown" };
+    if (launched.outcome !== "accepted") {
+      if (launched.outcome === "rejected") implementationIntentStore().remove(run.dispatchId);
+      return { outcome: launched.outcome === "rejected" ? "rejected" : "unknown" };
+    }
     await recordLaunch(run, ctx, {
       executionMode: "github-actions",
       runId: launched.runId,
@@ -431,10 +484,10 @@ export function createProductionImplementationRunServices(input: ImplementationR
 
   async function readStatus(run: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus> {
     let status: OwnedRunStatus;
-    if (run.backend === "fly-machines") status = await classifyFlyMachine(config, jobId);
+    if (run.backend === "fly-machines") status = await classifyFlyMachine(backendConfig(run), jobId);
     else if (run.backend === "local-docker") status = await classifyLocalContainer(jobId);
     else {
-      const mapping = requireMapping(getMapping, run.teamKey);
+      const mapping = frozenMapping(run);
       const read = await getWorkflowRunStatus(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
       if (read) recordGhaRunCompleted(Number(jobId), read);
       status = read?.status === "completed" ? "ended" : read?.status === "in_progress" ? "started" : "unknown";
@@ -448,13 +501,13 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   async function stop(run: ImplementationRunInput, jobId: string): Promise<boolean> {
-    if (containerBackend(run)) return stopBackendRun(config, run.backend, jobId);
-    const mapping = requireMapping(getMapping, run.teamKey);
+    if (containerBackend(run)) return stopBackendRun(backendConfig(run), run.backend, jobId);
+    const mapping = frozenMapping(run);
     return cancelWorkflowRun(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
   }
 
   async function providerForJob(job: Job): Promise<TicketingProvider | null> {
-    const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;
+    const mapping = (job.dispatchId ? implementationIntentStore().read<Intent>(job.dispatchId)?.snapshot.context.mapping : undefined) ?? (job.teamKey ? getMapping(job.teamKey) : undefined);
     return mapping ? input.resolveProvider(mapping) : null;
   }
 
@@ -489,8 +542,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
   async function cleanup(run: ImplementationRunInput, jobId: string): Promise<void> {
     try {
       if (run.backend === "fly-machines") {
-        if (!config.flySessionsToken || !config.flySessionsApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
-        await destroyMachineRecorded(config, jobId, "monitor-stopped");
+        const frozenConfig = backendConfig(run);
+        if (!frozenConfig.flySessionsToken || !frozenConfig.flySessionsApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+        await destroyMachineRecorded(frozenConfig, jobId, "monitor-stopped");
       } else if (run.backend === "local-docker") {
         await removeLocalContainer(jobId);
       }
@@ -537,7 +591,25 @@ export function createProductionImplementationRunServices(input: ImplementationR
 
   const deps: ImplementationRunDependencies = {
     reserve,
-    findExistingRun: createImplementationFindExistingRun({ getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: config.flySessionsApp }) }),
+    findExistingRun: async (run, dispatchedAt) => {
+      const stored = implementationIntentStore().read<Intent>(run.dispatchId);
+      const frozenMapping = stored?.snapshot.context.mapping;
+      const find = createImplementationFindExistingRun({ getMapping: frozenMapping ? () => frozenMapping : getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: stored?.snapshot.flyApp ?? config.flySessionsApp }) });
+      const id = await find(run, dispatchedAt);
+      const row = getJobByDispatchId(run.dispatchId);
+      if (id !== null && run.backend === GHA_BACKEND && row && row.runId === null && (row.status === "dispatched" || row.status === "running")) {
+        updateJobRunId(row.id, Number(id));
+      }
+      if (id !== null && stored && !stored.done) {
+        const { context, metadata } = stored.snapshot;
+        await recordLaunch(run, { ...context, provider: await input.resolveProvider(context.mapping) }, {
+          ...metadata, ghToken: run.backend === GHA_BACKEND ? await getToken(context.mapping.owner) : "",
+          ...(run.backend === "fly-machines" && metadata.statusComment ? { statusComment: { ...metadata.statusComment, logsUrl: `https://fly.io/apps/${stored.snapshot.flyApp}/machines/${id}` } } : {}),
+          ...(run.backend === GHA_BACKEND ? { runId: Number(id) } : { machineId: id }),
+        });
+      }
+      return id;
+    },
     readModelPrices: async () => {
       const response = await fetch(`${RESTATE_INGRESS_BASE_URL}/ModelPrices/builddown/current`, { method: "POST", headers: { "content-type": "application/json" }, body: "null", signal: AbortSignal.timeout(1000) });
       if (!response.ok) return undefined;
