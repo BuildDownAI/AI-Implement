@@ -1724,14 +1724,21 @@ export async function compareCommits(
 /**
  * A file's text from `ref` when given, else from the repository's GitHub default branch (no `ref` sent), or
  * `null` when it does not exist.
- * Any other failure throws, so a caller inside a retried step never reads "no file" from an outage.
+ * HTTP and JSON read failures throw. With `strict`, invalid file blobs and base64 also throw,
+ * so only a 404 is treated as absence; otherwise invalid file blobs retain the legacy null result.
  */
-export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string, ref?: string): Promise<string | null> {
+export async function getDefaultBranchFileText(token: string, owner: string, repo: string, path: string, ref?: string, strict = false): Promise<string | null> {
   const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}${query}`, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`getDefaultBranchFileText ${path} failed: HTTP ${res.status}`);
   const body = (await res.json()) as { content?: string; encoding?: string; type?: string };
-  if (body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string") return null;
+  if (!body || body.type !== "file" || body.encoding !== "base64" || typeof body.content !== "string") {
+    if (strict) throw new Error(`getDefaultBranchFileText ${path} failed: response is not a file blob`);
+    return null;
+  }
+  if (strict && !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(body.content.replace(/\s/g, ""))) {
+    throw new Error(`getDefaultBranchFileText ${path} failed: invalid base64 content`);
+  }
   return Buffer.from(body.content, "base64").toString("utf8");
 }

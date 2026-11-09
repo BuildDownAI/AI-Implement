@@ -6,6 +6,10 @@
  * `orchestrator-config.ts` holds the orchestrator's own environment and settings checks.
  */
 
+import { getInstallationToken } from "../github-app-auth.js";
+import { getDefaultBranchFileText } from "../github.js";
+import { resolveWorkflowCapabilities, type WorkflowCapabilities } from "../workflow-probe.js";
+import { GITHUB_CONFIG_CHECKS } from "./github-config.js";
 import { statSync } from "node:fs";
 import { isAllowlistReadAvailable, getEffectiveAllowlist, listAccessEntries, type AccessEntry, type EffectiveAllowlist } from "../access-entries.js";
 import { getMappings, type RepoMapping } from "../config.js";
@@ -42,6 +46,7 @@ export const SETUP_CHECK_IDS = [
   "admin.providers",
   "admin.redirect-url",
   "admin.allowlist",
+  "github.workflow-generation",
   // tracker-config.ts
   "tracker.provider",
   "tracker.linear.credentials",
@@ -102,6 +107,8 @@ export interface SetupCheckContext {
   runnerMode(): RunnerModeStatus;
   flySessions(): FlySessionsConfig;
   mappings(): Record<string, RepoMapping>;
+  workflowCapabilities(mapping: RepoMapping, file: string): Promise<WorkflowCapabilities>;
+  defaultBranchFileExists(mapping: RepoMapping, path: string): Promise<boolean>;
   storedAccessEntries(): AccessEntry[];
   effectiveAllowlist(): EffectiveAllowlist | null;
   /** Availability of the latest read, even when effectiveAllowlist serves cached entries. */
@@ -126,6 +133,15 @@ export function createSetupCheckContext(
 ): SetupCheckContext {
   const registry = new ProviderRegistry(providerConfigFromEnv(), () => ctx.mappings());
   const setupFacts = new Map<string, Promise<TrackerSetupFacts | null>>();
+  const tokens = new Map<string, Promise<string>>();
+  const tokenFor = (mapping: RepoMapping): Promise<string> => {
+    let token = tokens.get(mapping.owner);
+    if (!token) {
+      token = getInstallationToken(ctx.env.GITHUB_APP_ID ?? "", ctx.env.GITHUB_APP_PRIVATE_KEY ?? "", mapping.owner);
+      tokens.set(mapping.owner, token);
+    }
+    return token;
+  };
   const ctx: SetupCheckContext = {
     env: process.env,
     // A database error throws, so the check reports cannot-verify instead of reading a missing row.
@@ -134,6 +150,11 @@ export function createSetupCheckContext(
     runnerMode: getRunnerMode,
     flySessions: getFlySessionsConfig,
     mappings: getMappings,
+    workflowCapabilities: async (mapping, file) => resolveWorkflowCapabilities({
+      owner: mapping.owner, repo: mapping.repo, workflowFile: file, ref: mapping.defaultBranch, token: await tokenFor(mapping),
+    }),
+    defaultBranchFileExists: async (mapping, path) =>
+      (await getDefaultBranchFileText(await tokenFor(mapping), mapping.owner, mapping.repo, path, mapping.defaultBranch, true)) !== null,
     storedAccessEntries: listAccessEntries,
     effectiveAllowlist: getEffectiveAllowlist,
     allowlistReadAvailable: isAllowlistReadAvailable,
@@ -175,7 +196,7 @@ export interface SetupCheck {
   run(ctx: SetupCheckContext): SetupCheckOutcome[] | Promise<SetupCheckOutcome[]>;
 }
 
-export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS, ...TRACKER_CONFIG_CHECKS];
+export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS, ...TRACKER_CONFIG_CHECKS, ...GITHUB_CONFIG_CHECKS];
 
 /** Runs every check. A check that throws reports `cannot-verify` with its error, and the others still run. */
 export async function runSetupChecks(
