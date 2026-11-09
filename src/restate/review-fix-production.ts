@@ -9,6 +9,7 @@ import { destroyMachineRecorded } from "../backend-run.js";
 import { removeLocalContainer } from "../local-docker.js";
 import { getJobByDispatchId, updateJobStatus, invalidateNonce } from "../log.js";
 import { getDb } from "../dedup.js";
+import { isEphemeralPolicyEnvName } from "../model-auth-contract.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
 import { isManagedProject, selectsCodexImplementation, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
@@ -26,7 +27,7 @@ import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDispositio
 import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { mintPreparedReviewFixToken } from "../runner-tokens.js";
-import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
+import { getRunnerMode, resolvePlanningExecutionPath } from "../runner-mode.js";
 import { inspectAgentReadiness } from "../agent-run-preparation.js";
 import { resolveWorkflowCapabilities, type WorkflowCapabilities } from "../workflow-probe.js";
 import type { ProviderRegistry } from "../providers/registry.js";
@@ -113,11 +114,13 @@ async function decideAdmission(
     return { verdict: "defer", reason: `Filesystem project ${key} requires local runner mode`, skip: true };
   }
   // Shadow launches its authoritative attempt on GHA, as resolvePlanningExecutionPath does.
-  const resolved = resolveExecutionPath(getRunnerMode().mode, mapping.executionMode);
-  const path = resolved === "both" ? "github-actions" : resolved;
+  const path = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
   const managed = isManagedProject(key);
   if (path !== "github-actions") {
     if (managed) return { verdict: "defer", reason: "managed_backend_unsupported" };
+    if (Object.keys(mapping.extraEnv ?? {}).some(isEphemeralPolicyEnvName)) {
+      return { verdict: "defer", reason: "ephemeral execution policy requires GitHub Actions; remove policy variables from extraEnv or select GHA execution" };
+    }
     if (mapping.provider === "bedrock") return { verdict: "defer", reason: "provider=bedrock is GHA-only" };
     if (path === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
       return { verdict: "defer", reason: "fly_sessions_token_or_app_missing" };
@@ -339,9 +342,9 @@ export function createProductionReviewFixWorker(
       const [projectKey, mapping] = entry;
       if (!isManagedProject(projectKey, plan.attemptId)) return null;
       // Mapping selection now includes containers; protected GHA preparation still
-      // requires the original GHA eligibility at launch time.
+      // requires the authoritative GHA path at launch time, including shadow.
       if (!selectedEntry(plan.scope)
-        || resolveExecutionPath(getRunnerMode().mode, mapping.executionMode) !== "github-actions") {
+        || resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode) !== "github-actions") {
         throw new Error("review-fix managed mapping unavailable");
       }
       if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");
