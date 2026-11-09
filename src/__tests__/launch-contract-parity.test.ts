@@ -56,8 +56,6 @@ const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }
 
 /** Cells the test does not run, each with its reason. Every kind × backend pair is a cell or listed here. */
 const OUT_OF_SCOPE_CELLS: ReadonlyArray<{ kind: Kind; backend: Backend; reason: string }> = [
-  { kind: "review-fix-attempt", backend: "fly-machines", reason: "branch 3 of AII-1308 adds the review-fix launch on Fly" },
-  { kind: "review-fix-attempt", backend: "local-docker", reason: "branch 3 of AII-1308 adds the review-fix launch on local Docker" },
   { kind: "legacy-review-fix", backend: "fly-machines", reason: "the legacy review-fix queue has no Fly branch" },
 ];
 
@@ -186,6 +184,7 @@ vi.mock("../fly-machines.js", async (importOriginal) => ({
 vi.mock("../local-docker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../local-docker.js")>()),
   startLocalRunnerContainer: async (input: StartLocalContainerInput) => {
+    input.onBeforeLaunch?.();
     recorder().launches.push({ carrier: "local-input", input });
     return { containerId: "c-1", containerName: "c-1" };
   },
@@ -236,6 +235,7 @@ const MODULES = {
   queue: () => import("../comment-gapfill-queue.js"),
   drain: () => import("../comment-gapfill-drain.js"),
   reviewFixQueue: () => import("../review-fix-queue.js"),
+  containerWorker: () => import("../review-fix-container-worker.js"),
   worker: () => import("../review-fix-worker.js"),
   runnerTokens: () => import("../runner-tokens.js"),
   repoImage: () => import("../repo-image.js"),
@@ -457,6 +457,27 @@ const reviewFixAttempt: LaunchPath = async (w) => {
   await reviewFixWorker.launch({ attemptId, scope, taskText: "Address the reported findings", deadlineAt: Date.now() + 60 * 60_000 });
 };
 
+const containerReviewFixAttempt = (backend: "fly-machines" | "local-docker"): LaunchPath => async (w) => {
+  const attemptId = "parity-attempt-1";
+  seedPreparedAttempt(w, attemptId);
+  w.dedup.getDb().prepare("UPDATE dispatch_admissions SET backend = ? WHERE dispatch_id = ?").run(backend, attemptId);
+  w.dedup.getDb().prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, attemptId);
+  const worker = new w.containerWorker.ContainerReviewFixWorker({
+    credentials: { resolve: async () => ({ token: "gh-token", installationId: INSTALLATION_ID }) },
+    callbackInputs: async (id) => ({
+      run_token: w.runnerTokens.mintPreparedReviewFixToken({ attemptId: id, audience: "result", secret: TOKEN_SECRET }).token,
+      run_progress_token: w.runnerTokens.mintPreparedReviewFixToken({ attemptId: id, audience: "progress", secret: TOKEN_SECRET }).token,
+      run_publication_token: w.runnerTokens.mintPreparedReviewFixToken({ attemptId: id, audience: "publication", secret: TOKEN_SECRET }).token,
+      runner_callback_url: CALLBACK_URL,
+    }),
+    fly: { ...CONFIG, flySessionsToken: CONFIG.flySessionsToken!, flySessionsApp: CONFIG.flySessionsApp! },
+    local: { image: CONFIG.localRunnerImage, orchestratorUrl: CONFIG.localRunnerOrchestratorUrl!, anthropicApiKey: CONFIG.anthropicApiKey },
+  });
+  await worker.launch({ executionBackend: backend, attemptId,
+    scope: { installationId: INSTALLATION_ID, repository: `${OWNER}/${REPO}`, prNumber: PR_NUMBER },
+    taskText: "Address the reported findings", deadlineAt: Date.now() + 60 * 60_000 });
+};
+
 const legacyReviewFix: Partial<Record<Backend, LaunchPath>> = {
   "github-actions": async (w) => runLegacyReviewFixQueue(w),
   "local-docker": async (w) => runLegacyReviewFixQueue(w),
@@ -549,6 +570,10 @@ const CELLS: readonly Cell[] = [
     // The attempt has no peer on another backend: it is compared with the legacy queue's GitHub Actions launch.
     reference: { kind: "legacy-review-fix", ignore: ["issue", "commentInstruction", "reviewFix"] },
   },
+  ...(["fly-machines", "local-docker"] as const).map((backend): Cell => ({
+    kind: "review-fix-attempt", backend, run: containerReviewFixAttempt(backend), imageRuns: [{}],
+    reference: { kind: "review-fix-attempt", ignore: ["issue", "reviewFix"] },
+  })),
   { kind: "legacy-review-fix", backend: "github-actions", runnerMode: "gha", run: legacyReviewFix["github-actions"]!, reference: sameKind("legacy-review-fix"), imageRuns: [{}] },
   { kind: "legacy-review-fix", backend: "local-docker", runnerMode: "local", run: legacyReviewFix["local-docker"]!, reference: sameKind("legacy-review-fix"), imageRuns: [{}] },
   ...BACKENDS.map((backend): Cell => ({

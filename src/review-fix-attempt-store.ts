@@ -433,8 +433,11 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     return db.transaction((): ResultIntakeOutcome => {
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as AttemptRow | undefined;
       if (!row) return { status: "stale", attemptId, reason: "unknown attempt" };
-      if ((row.execution_backend ?? "github-actions") !== "github-actions" || result.executionBackend !== undefined) {
-        return { status: "stale", attemptId, reason: "GitHub result does not match the attempt backend" };
+      if ((row.execution_backend ?? "github-actions") !== (result.executionBackend ?? "github-actions")) {
+        return { status: "stale", attemptId, reason: "result does not match the attempt backend" };
+      }
+      if (result.executionBackend !== undefined && row.execution_ref === null) {
+        return { status: "stale", attemptId, reason: "container execution is not bound" };
       }
       if (result.attemptId !== attemptId) {
         return { status: "stale", attemptId, reason: "result attemptId does not match the target attempt" };
@@ -450,7 +453,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       if (!isDispatchActive(db, row.dispatch_id)) {
         return { status: "stale", attemptId, reason: "attempt has been released or superseded" };
       }
-      if (row.github_run_id !== null
+      if (result.executionBackend === undefined && row.github_run_id !== null
         && (row.github_run_id !== result.githubRunId || row.github_run_attempt !== result.githubRunAttempt)) {
         db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
           .run(now, attemptId);

@@ -942,6 +942,23 @@ describe("review-fix admin facade: cycle evidence projection", () => {
 });
 
 describe("backend execution ownership", () => {
+  it.each(["fly-machines", "local-docker"] as const)("accepts a bound %s result and preserves conflict detection", async (backend) => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const id = admitted.attempt.attemptId;
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, id);
+    await store.bindExecution(id, { backend, runRef: "container" }, Date.now());
+    const { githubRunId: _id, githubRunAttempt: _attempt, ...base } = makeReviewFixResult({
+      attemptId: id, ...SCOPE, deadlineAt: admitted.attempt.deadlineAt,
+    });
+    const result = { ...base, executionBackend: backend };
+    expect((await store.recordResult(id, result, Date.now())).status).toBe("stored");
+    expect((await store.recordResult(id, result, Date.now())).status).toBe("duplicate");
+    expect((await store.recordResult(id, { ...result, outputCommit: "f".repeat(40) }, Date.now())).status).toBe("conflict");
+  });
+
   it.each(["github-actions", "fly-machines", "local-docker"] as const)("keeps machine result intake disabled for %s attempts before binding", async (backend) => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
