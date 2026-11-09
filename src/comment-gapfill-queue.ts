@@ -228,6 +228,7 @@ export interface CommentGapfillLaunch {
   record: Parameters<typeof import("./log.js").appendLogIfAbsent>[0];
   target: { owner: string; repo: string; workflowFile: string };
   accepted: boolean;
+  rejected?: { status: number };
 }
 function launchStore() {
   const db = getDb();
@@ -245,8 +246,9 @@ export function getCommentGapfillLaunch(dispatchId: string): CommentGapfillLaunc
 }
 export function confirmCommentGapfillLaunch(dispatchId: string): void {
   const launch = getCommentGapfillLaunch(dispatchId);
-  if (launch) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, accepted: true }), dispatchId);
+  if (launch && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, accepted: true }), dispatchId);
 }
-export function rejectCommentGapfillLaunch(dispatchId: string): void {
-  launchStore().prepare("DELETE FROM comment_gapfill_launch WHERE dispatch_id = ?").run(dispatchId);
+export function rejectCommentGapfillLaunch(dispatchId: string, status: number): void {
+  const launch = getCommentGapfillLaunch(dispatchId);
+  if (launch && !launch.accepted && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, rejected: { status } }), dispatchId);
 }

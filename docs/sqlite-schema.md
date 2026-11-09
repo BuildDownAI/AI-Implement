@@ -159,8 +159,9 @@ Running the change before `ensureAccountingTriggers()` is not enough for this ta
 
 `src/comment-gapfill-queue.ts` owns `comment_gapfill_launch`, keyed by
 `dispatch_id`, with `recovery_json` containing only the original job attribution,
-workflow target and confirmed-acceptance flag. It freezes issue title, mapping
-identity, admission generation, accounting and launch contract. Instructions,
+workflow target, confirmed-acceptance flag and optional rejected disposition
+(HTTP status only). It freezes issue title, mapping identity, admission generation,
+accounting and launch contract. Instructions,
 credentials, prepared inputs and grant/bootstrap secrets are never stored here.
 
 This table is intentionally initialized lazily with `CREATE TABLE IF NOT EXISTS`
@@ -175,8 +176,9 @@ settlement using the grant’s persisted profile/generation bindings (deduplicat
 across stages). Incomplete settlement fails closed and is retried without another
 launch; confirmed acceptance or backend adoption preserves the grant.
 
-Definite rejection deletes only the intent and creates no job. Accepted and unknown
-intents must not be removed because a job or backend listing is absent. Coordinated
+Definite rejection retains its disposition before settlement and creates no job.
+Exact-dispatch retries return rejected without preparing or dispatching again.
+Accepted and unknown intents must not be removed because a job or backend listing is absent. Coordinated
 retention with dispatch/admission records belongs to AII-1565; until that policy is
 implemented these intents are retained. Deadline/escape release policy remains
 AII-1787; this table does not change it. Schema deployment requires operator review;

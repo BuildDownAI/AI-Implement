@@ -79,6 +79,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       return result.ok;
     },
     findExistingRun: async (run, dispatchedAt) => {
+      if (getCommentGapfillLaunch(run.dispatchId)?.rejected) return null;
       const row = getJobByDispatchId(run.dispatchId);
       if (row?.runId) { confirmCommentGapfillLaunch(run.dispatchId); await recordLaunch(run, undefined, row); return String(row.runId); }
       // Only positive unused preparation evidence with no intent/job proves the
@@ -102,6 +103,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     launch: async (run) => {
       const gap = run.gapFill!;
       const staged = getCommentGapfillLaunch(run.dispatchId);
+      if (staged?.rejected) {
+        if (!releaseUnconfirmedLaunch(run.dispatchId, { ownership: getModelAuthRuntime(config).ownership }).complete) {
+          throw new Error("rejected gap-fill grant settlement incomplete");
+        }
+        markCommentGapfillProcessed(gap.queueItemId, "failed");
+        return { outcome: "rejected" };
+      }
       if (staged) {
         // Exact-dispatch settlement revokes only the unconfirmed grant, never admission.
         if (!staged.accepted && !releaseUnconfirmedLaunch(run.dispatchId, { ownership: getModelAuthRuntime(config).ownership }).complete) {
@@ -193,10 +201,11 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         result = { success: false, status: 0, outcome: "unknown" };
       }
       const outcome = result.success ? "accepted" : result.outcome === "rejected" ? "rejected" : "unknown";
+      // Keep definite rejection durable before settlement/reporting or step journaling.
+      if (outcome === "rejected") rejectCommentGapfillLaunch(run.dispatchId, result.status);
       if (outcome !== "accepted") settleLaunch(decision, outcome, runtime);
       if (outcome === "accepted") confirmCommentGapfillLaunch(run.dispatchId);
       if (outcome === "rejected") {
-        rejectCommentGapfillLaunch(run.dispatchId);
         markCommentGapfillProcessed(gap.queueItemId, "failed");
         try {
           await surfaceDispatchFailure(result, config.notifyType, config.notifyWebhookUrl, { ...record, site: "comment-gapfill", workflowFile: mapping.workflowFile, contract: prepared.contract });

@@ -1,3 +1,4 @@
+import { getCommentGapfillLaunch } from "../comment-gapfill-queue.js";
 import { createImplementationGapfillDependencies } from "./implementation-run-gapfill.js";
 import { modelPricesResponseSchema } from "./model-prices.js";
 import type { RunModelPrices } from "../run-config.js";
@@ -409,7 +410,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     if (run.backend === "fly-machines") status = await classifyFlyMachine(config, jobId);
     else if (run.backend === "local-docker") status = await classifyLocalContainer(jobId);
     else {
-      const mapping = requireMapping(getMapping, run.teamKey);
+      const mapping = (run.gapFill && getCommentGapfillLaunch(run.dispatchId)?.target) || requireMapping(getMapping, run.teamKey);
       const read = await getWorkflowRunStatus(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
       if (read) recordGhaRunCompleted(Number(jobId), read);
       status = read?.status === "completed" ? "ended" : read?.status === "in_progress" ? "started" : "unknown";
@@ -424,7 +425,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
 
   async function stop(run: ImplementationRunInput, jobId: string): Promise<boolean> {
     if (containerBackend(run)) return stopBackendRun(config, run.backend, jobId);
-    const mapping = requireMapping(getMapping, run.teamKey);
+    const mapping = (run.gapFill && getCommentGapfillLaunch(run.dispatchId)?.target) || requireMapping(getMapping, run.teamKey);
     return cancelWorkflowRun(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
   }
 

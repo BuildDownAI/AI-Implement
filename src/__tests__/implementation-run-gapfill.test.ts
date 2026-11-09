@@ -9,7 +9,7 @@ vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...awa
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => intents.set(id, value)), confirmCommentGapfillLaunch: vi.fn(), rejectCommentGapfillLaunch: vi.fn((id: string) => intents.delete(id)), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => intents.set(id, value)), confirmCommentGapfillLaunch: vi.fn(), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
 vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn() }));
@@ -34,6 +34,7 @@ import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { isParked } from "../dispatch-breaker.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { settleLaunch, type ManagedDispatchDecision } from "../managed-dispatch-auth.js";
+import { getWorkflowRunStatus, cancelWorkflowRun } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { mintLaunchTokens } from "../runner-tokens.js";
 import { postBranchComment } from "../base-branch.js";
@@ -398,6 +399,18 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(db.prepare("SELECT trigger, tracker_kind FROM dispatch_log WHERE id = ?").get(job.id)).toEqual({ trigger: "comment", tracker_kind: "linear" });
   expect(getCommentGapfillItem(queueItemId)?.status).toBe("dispatched");
   expect(db.prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = 'dispatch'").get()).toEqual({ revoked_at: null });
+  for (const current of [undefined, { ...mapping, owner: "Changed", repo: "different" }]) {
+    input.getMapping = () => current;
+    createProductionImplementationRunServices(input);
+    const lifecycle = captured.deps as ImplementationRunDependencies;
+    await lifecycle.readStatus(recoveryRun, "88");
+    expect(getWorkflowRunStatus).toHaveBeenLastCalledWith("TOKEN-SENTINEL", "Org", "repo", 88);
+    expect(getInstallationToken).toHaveBeenLastCalledWith("app", "key", "Org");
+    expect(await lifecycle.stop(recoveryRun, "88")).toBe(true);
+    expect(cancelWorkflowRun).toHaveBeenLastCalledWith("TOKEN-SENTINEL", "Org", "repo", 88);
+    expect(getInstallationToken).toHaveBeenLastCalledWith("app", "key", "Org");
+  }
+  input.getMapping = () => mapping;
   // Recover the intermediate state where insert/PR link committed but run binding did not.
   db.prepare("UPDATE dispatch_log SET run_id = NULL, status = 'dispatched' WHERE id = ?").run(job.id);
   expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
@@ -450,13 +463,13 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
   expect(resolveManagedDecision).toHaveBeenCalledTimes(1);
 
-  // Definite rejection removes this dispatch's intent without creating a ghost job.
+  // Definite rejection retains its terminal disposition without creating a ghost job.
   const rejectedQueue = reopened.queue.enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 44, commentId: 5678, commenter: "human", instruction: "COMMENT-SENTINEL" });
   const rejectedRun = { ...recoveryRun, dispatchId: "rejected", gapFill: { ...recoveryRun.gapFill!, prNumber: 44, queueItemId: rejectedQueue } };
   expect(reopened.admission.acquire({ dispatchId: "rejected", mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 44 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: "rejected" }, cap: 10 }).ok).toBe(true);
   vi.mocked(dispatchGhaGapfill).mockResolvedValueOnce({ success: false, status: 422, outcome: "rejected" });
   expect(await recovered.launch(rejectedRun)).toEqual({ outcome: "rejected" });
-  expect(reopened.queue.getCommentGapfillLaunch("rejected")).toBeNull();
+  expect(reopened.queue.getCommentGapfillLaunch("rejected")).toMatchObject({ rejected: { status: 422 } });
   expect(reopened.queue.getCommentGapfillLaunch("pre-call")).not.toBeNull();
   expect(reopened.log.getJobByDispatchId("rejected")).toBeNull();
 
@@ -607,4 +620,48 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
   expect(reopened.queue.getCommentGapfillLaunch(req.dispatchId)).toBeNull();
   expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
   expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+});
+
+
+it("retains definite rejection across process loss before journaling and never resurrects the queue", async () => {
+  for (const module of ["../agent-run-preparation.js", "../dedup.js", "../dispatch-admission.js", "../log.js", "../comment-gapfill-queue.js"]) vi.doUnmock(module);
+  const database = await testDb({ modules: {
+    production: () => import("../restate/implementation-run-production.js"),
+    queue: () => import("../comment-gapfill-queue.js"),
+    admission: () => import("../dispatch-admission.js"),
+    log: () => import("../log.js"),
+    dedup: () => import("../dedup.js"),
+  } });
+  const m = database.modules;
+  const queueItemId = m.queue.enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 1234, commenter: "human", instruction: "COMMENT-SENTINEL" });
+  const request = { ...run, gapFill: { ...run.gapFill!, queueItemId } };
+  expect(m.admission.acquire({ dispatchId: run.dispatchId, mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 42 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: run.dispatchId }, cap: 10 }).ok).toBe(true);
+  vi.mocked(dispatchGhaGapfill).mockResolvedValueOnce({ success: false, status: 422, outcome: "rejected" });
+  vi.mocked(prepareGhaGapfillLaunch).mockImplementationOnce(async () => {
+    m.dedup.getDb().prepare("INSERT INTO model_credential_grants (grant_id, dispatch_id, snapshot_id, project_key, backend, audience, bearer_hash, scope_json, expires_at) VALUES ('rejected-grant', ?, 'snapshot', 'ENG', 'gha', 'runner', 'hash', '{}', 9999999999999)").run(run.dispatchId);
+    return { contract: "envelope", runnerImage: undefined, inputs: { token: "TOKEN-SENTINEL" } };
+  });
+  // Settlement fails after the definite response, before a Restate result can be journaled.
+  vi.mocked(settleLaunch).mockImplementationOnce(() => { throw new Error("process lost before journal"); });
+  m.production.createProductionImplementationRunServices(input);
+  await expect((captured.deps as ImplementationRunDependencies).launch(request)).rejects.toThrow("process lost before journal");
+  const original = m.queue.getCommentGapfillLaunch(run.dispatchId);
+  expect(original).toMatchObject({ rejected: { status: 422 }, target: { owner: "Org", repo: "repo" } });
+  const reopened = await database.reopen();
+  input.getMapping = () => undefined;
+  reopened.production.createProductionImplementationRunServices(input);
+  const recovered = captured.deps as ImplementationRunDependencies;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    expect(await recovered.findExistingRun(request, 1000)).toBeNull();
+    expect(await recovered.launch(request)).toEqual({ outcome: "rejected" });
+    expect(reopened.queue.getCommentGapfillItem(queueItemId)?.status).toBe("failed");
+  }
+  expect(reopened.dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'rejected-grant'").get()).toEqual({ revoked_at: expect.any(Number) });
+  expect(reopened.queue.getCommentGapfillLaunch(run.dispatchId)).toEqual(original);
+  expect(reopened.log.getJobByDispatchId(run.dispatchId)).toBeNull();
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
+  expect(resolveManagedDecision).toHaveBeenCalledTimes(1);
+  expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
+  expect(fetch).not.toHaveBeenCalled();
+  expect(JSON.stringify(reopened.dedup.getDb().prepare("SELECT recovery_json FROM comment_gapfill_launch").all())).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
 });
