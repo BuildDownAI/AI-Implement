@@ -55,6 +55,7 @@ import { __clearWorkflowProbeCacheForTests, resolveWorkflowCapabilities } from "
 import { fakeFetch, type FakeFetch } from "../helpers/fake-fetch.js";
 import { githubFile } from "../helpers/replies/github.js";
 import { getDb } from "../../dedup.js";
+import { verifyRunToken } from "../../runner-tokens.js";
 import { getFlySessionsConfig, setOrchestratorSetting } from "../../orchestrator-settings.js";
 import { initMappingsTable } from "../../config.js";
 import { initLogTable, appendLog, updateJobStatus } from "../../log.js";
@@ -79,7 +80,7 @@ const SNAPSHOT_SHA = "abc123def456abc123def456abc123def456abc1";
 const SECRET = "kg-pilot-test-secret";
 const WATCH_INTERVAL_MS = 300;
 const UNROUTABLE_INGRESS = "http://127.0.0.1:59999";
-const ENVELOPE_WORKFLOW_YAML = "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        type: string\n";
+const ENVELOPE_WORKFLOW_YAML = "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        type: string\n      run_publication_token:\n        type: string\n";
 
 let workflowContents: FakeFetch;
 beforeEach(() => {
@@ -370,6 +371,12 @@ describe("Restate kg-refresh pilot: production-composition proof", () => {
     expect(mergeCalls).toBe(1);
     expect(gh.dispatches).toHaveLength(1);
     expect(gh.dispatches[0].run_config).toBeTruthy();
+    // Real capability probing, minting and sender composition must carry publication authority.
+    expect(verifyRunToken(gh.dispatches[0].run_publication_token!, SECRET, "publication", { consume: false })).toMatchObject({
+      ok: true,
+      claims: { dispatchId: triggerId, phase: "kg-refresh", repository: KG_SOURCE_REPO, audience: "publication" },
+      consumedAt: null,
+    });
     expect(workflowContents.calls).toHaveLength(1);
     expect(workflowContents.calls[0].url.searchParams.get("ref")).toBe("main");
     const status = await asSystem(env)("get_kg_status", {});

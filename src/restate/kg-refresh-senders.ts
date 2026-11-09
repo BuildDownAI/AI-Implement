@@ -234,10 +234,13 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
     const { supportsRunPublicationToken, supportsPrivateRunConfig } = await deps.resolveWorkflowCapabilities({
       owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, token, ref,
     });
+    if (!supportsRunPublicationToken) {
+      throw new Error("KG refresh workflow must declare run_publication_token; re-sync workflows");
+    }
     if (input.jobTimeoutMinutes === null) throw new Error("GitHub Actions dispatch needs jobTimeoutMinutes from GhaRunProfile");
     const kgBodyOpts = {
       runConfig: encoded, runToken: input.tokens.runToken, runProgressToken: input.tokens.progressToken,
-      ...(supportsRunPublicationToken ? { runPublicationToken: input.tokens.publicationToken } : {}),
+      runPublicationToken: input.tokens.publicationToken,
       runnerImage,
       jobTimeoutMinutes: String(input.jobTimeoutMinutes), issueIdentifier: input.envelope.issue.identifier,
     };

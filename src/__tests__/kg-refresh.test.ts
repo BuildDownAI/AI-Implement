@@ -1,3 +1,4 @@
+import { resolveWorkflowCapabilities, __clearWorkflowProbeCacheForTests } from "../workflow-probe.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
@@ -200,14 +201,15 @@ describe("kg-refresh", () => {
     let fetchCompare: ReturnType<typeof vi.fn>;
     let preflightTarball: Buffer;
 
-    // A claude-implement.yml body that declares run_config — the envelope contract, the happy
-    // path (AII-654). Also declares runner_phase, matching every currently-synced template.
+    // A workflow declaring both inputs required by the KG envelope sender.
     const WORKFLOW_WITH_RUNNER_PHASE = [
       "on:",
       "  workflow_dispatch:",
       "    inputs:",
       "      run_config:",
       "        required: true",
+      "      run_publication_token:",
+      "        required: false",
       "      runner_phase:",
       "        required: false",
       "jobs:",
@@ -235,7 +237,7 @@ describe("kg-refresh", () => {
       mintTokenPf = vi.fn(async () => ({ token: "tok", expiresAt: "" }));
       // probeRepo defaults to success; overrides can make specific slugs fail.
       probeRepo = vi.fn(async () => ({ ok: true, status: 200 }));
-      // fetchWorkflowFile defaults to a workflow that accepts runner_phase; overrides can flip this.
+      // Default to a workflow that accepts the KG envelope and publication token.
       fetchWorkflowFile = vi.fn(async () => ({ status: 200, content: WORKFLOW_WITH_RUNNER_PHASE }));
       // fetchCompare defaults to no drift; overrides can flip this. Always mocked so these
       // tests never make a real network call to GitHub's compare API.
@@ -243,6 +245,95 @@ describe("kg-refresh", () => {
     }
 
     // ---- AII-594 / AII-654: workflow:envelope row -----------------------------------
+
+    it.each([
+      ["run_config without publication input", "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {}"],
+      ["private marker without publication input", "# ai-implement-capability: private-run-config-v1\non:\n  workflow_dispatch:\n    inputs:\n      run_config: {}"],
+      ["publication input without run_config", "on:\n  workflow_dispatch:\n    inputs:\n      run_publication_token: {}"],
+      ["absent inputs", "on:\n  workflow_dispatch:"],
+      ["malformed YAML", "on: ["],
+      ["both inputs inline publication", "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_publication_token: { required: false, type: string }"],
+      ["both inputs inline declarations", "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {required: true}\n      run_publication_token: {required: false}"],
+      ["both inputs block declarations", "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_publication_token:\n        required: false"],
+      ["both inputs null declarations", "on: {workflow_dispatch: {inputs: {run_config: null, run_publication_token: null}}}"],
+      ["publication only outside inputs", "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {}\njobs:\n  run_publication_token:"],
+      ["run config only outside inputs", "on:\n  workflow_dispatch:\n    inputs:\n      run_publication_token: {}\nenv:\n  run_config:"],
+      ["publication comment outside inputs", "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {}\n      # run_publication_token:"],
+      ["malformed root sequence", "- on: {workflow_dispatch: {inputs: {run_config: {}, run_publication_token: {}}}}"],
+      ["malformed on sequence", "on: [{workflow_dispatch: {inputs: {run_config: {}, run_publication_token: {}}}}]"],
+      ["both inputs flow map", "on: { workflow_dispatch: { inputs: { run_config: {required: true}, run_publication_token: {required: false} } } }"],
+      ["both inputs quoted keys", '\'on\': { "workflow_dispatch": { "inputs": { "run_config": {}, "run_publication_token": {} } } }'],
+      ["malformed inputs sequence", "on: {workflow_dispatch: {inputs: [run_config, run_publication_token]}}"],
+      ["malformed dispatch scalar", "on: {workflow_dispatch: run_config}"],
+      ["non-input mappings", "jobs:\n  run_config:\n  run_publication_token:\nenv:\n  run_config:\n  run_publication_token:\nsteps:\n  run_config:\n  run_publication_token:"],
+      ["comments only", "# run_config:\n# run_publication_token:"],
+      ["both inputs", WORKFLOW_WITH_RUNNER_PHASE],
+      ["both inputs with private capability", "# ai-implement-capability: private-run-config-v1\n" + WORKFLOW_WITH_RUNNER_PHASE],
+    ])("checks the KG workflow contract: %s", async (name, content) => {
+      buildPreflight();
+      const ok = name.startsWith("both inputs");
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: vi.fn(async () => ({ status: 200, content })) as never,
+        fetchCompare: fetchCompare as never,
+      });
+      __clearWorkflowProbeCacheForTests();
+      const fetchImpl = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+        type: "file", encoding: "base64", content: Buffer.from(content).toString("base64"),
+      })));
+      const capabilities = await resolveWorkflowCapabilities({
+        owner: "TestOrg", repo: "test-kg", workflowFile: "claude-implement.yml",
+        token: "tok", ref: "release/requested", fetchImpl,
+      });
+      expect(capabilities.supportsRunPublicationToken).toBe(ok);
+      expect(fetchImpl.mock.calls[0]?.[0]).toContain("?ref=release%2Frequested");
+      expect(result.ok).toBe(ok);
+      const row = result.results.find((r) => r.grant === "workflow:envelope");
+      expect(row).toMatchObject({ ok, status: 200 });
+      if (!ok) expect(row?.hint).toContain("sync-workflows");
+      else expect(row).not.toHaveProperty("hint");
+    });
+
+    it.each([
+      ["modern default, old requested", true, "old", false, 200],
+      ["old default, modern requested", false, "modern", true, 200],
+      ["requested read throws", true, "throws", false, 0],
+      ["requested read missing", true, "missing", false, 404],
+    ] as const)("checks the requested workflow ref: %s", async (_name, modernDefault, requested, ok, status) => {
+      buildPreflight();
+      const oldWorkflow = "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {}";
+      const fetchWorkflow = vi.fn(async (_token: string, _owner: string, _repo: string, ref: string) => {
+        if (ref === "release/requested") {
+          if (requested === "throws") throw new Error("read failed");
+          if (requested === "missing") return { status: 404, content: null };
+          return { status: 200, content: requested === "modern" ? WORKFLOW_WITH_RUNNER_PHASE : oldWorkflow };
+        }
+        return { status: 200, content: modernDefault ? WORKFLOW_WITH_RUNNER_PHASE : oldWorkflow };
+      });
+      const fetchTarball = vi.fn(async () => preflightTarball);
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        kgSourceRef: "release/requested",
+        mintToken: mintTokenPf as never,
+        fetchTarball: fetchTarball as never,
+        fetchDefaultBranch: async () => "main",
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflow,
+        fetchCompare: fetchCompare as never,
+      });
+      expect(result.ok).toBe(ok);
+      expect(result.results.find((r) => r.grant === "workflow:envelope")).toMatchObject({ ok, status });
+      expect(fetchWorkflow).toHaveBeenCalledExactlyOnceWith("tok", "TestOrg", "test-kg", "release/requested");
+      expect(fetchTarball).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", "main");
+    });
 
     it("workflow row failing does not disturb the other row shapes", async () => {
       const failingWorkflowFetch = vi.fn(async () => ({ status: 404, content: null }));

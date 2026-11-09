@@ -132,6 +132,8 @@ export interface KgPreflightInput {
   githubAppId: string;
   githubAppPrivateKey: string;
   kgSourceRepo: string;
+  /** Requested dispatch ref; only the workflow capability read uses this override. */
+  kgSourceRef?: string;
   /**
    * Orchestrator setting (Settings → KG Refresh · "Base template repo", AII-633) — the
    * repo the PR-triggered dry-run webhook actually posts its sticky comment/commit status
@@ -323,10 +325,12 @@ async function defaultFetchCompare(
 }
 
 /**
- * True when a `claude-implement.yml` body declares `run_config` under
+ * True when a `claude-implement.yml` body declares both `run_config` and
+ * `run_publication_token` under
  * `on.workflow_dispatch.inputs` — i.e. the target repo is on the envelope contract, where
  * the entrypoint reads the kg-refresh phase and callback URL from `run_config` (AII-653)
- * rather than needing the `runner_phase` top-level input. GitHub Actions YAML is looser than
+ * rather than needing the `runner_phase` top-level input. Publication support is required
+ * even for private transport, matching the fail-closed GHA sender. GitHub Actions YAML is looser than
  * a plain config file — `workflow_dispatch` may be null/absent (no inputs at all is legal),
  * and a parse failure or unexpected shape must never throw. Any of those resolve to false,
  * same "unexpected shape → treat as absent" convention as `readCodeRepoFromSourcesYml`.
@@ -341,7 +345,8 @@ function workflowAcceptsEnvelope(yamlText: string): boolean {
     if (workflowDispatch === null || typeof workflowDispatch !== "object" || Array.isArray(workflowDispatch)) return false;
     const inputs = (workflowDispatch as Record<string, unknown>).inputs;
     if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs)) return false;
-    return Object.prototype.hasOwnProperty.call(inputs, "run_config");
+    return Object.prototype.hasOwnProperty.call(inputs, "run_config")
+      && Object.prototype.hasOwnProperty.call(inputs, "run_publication_token");
   } catch {
     return false;
   }
@@ -398,16 +403,17 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  // Probe whether the KG repo's claude-implement.yml declares run_config (AII-594,
+  // Probe whether the KG repo's claude-implement.yml declares run_config and
+  // run_publication_token, as required by the GHA sender (AII-1714, AII-594,
   // AII-654). KG dispatches carry phase and callback URL only in the envelope,
   // which the entrypoint reads under the envelope contract (AII-653).
-  // Reuses the read token/branch minted above when available.
+  // Reuses the read token above; an explicit dispatch ref must be checked verbatim.
   try {
     const token = sourcesReadToken ?? (await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
       permissions: { contents: "read" },
       repositories: [repo.repo],
     })).token;
-    const branch = defaultBranch ?? (await fetchDefaultBranchFn(token, repo.owner, repo.repo));
+    const branch = input.kgSourceRef ?? defaultBranch ?? (await fetchDefaultBranchFn(token, repo.owner, repo.repo));
     const file = await fetchWorkflowFileFn(token, repo.owner, repo.repo, branch);
     const ok = file.status === 200 && file.content !== null && workflowAcceptsEnvelope(file.content);
     results.push(

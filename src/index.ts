@@ -5230,11 +5230,12 @@ async function main(): Promise<void> {
       handleKgRefreshOutcome: (outcome, data) => handleKgRefreshOutcome(config, registry, outcome, data),
       isDeployHeld,
       readStatusRecord: defaultLoadLastRefresh,
-      runPreflight: () => runKgRefreshPreflight({
+      runPreflight: (kgSourceRef) => runKgRefreshPreflight({
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
         kgSourceRepo,
         kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
+        kgSourceRef,
       }),
     })
     : null;

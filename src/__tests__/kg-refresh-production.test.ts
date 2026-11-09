@@ -589,11 +589,11 @@ describe("GHA dispatch wrapper", () => {
     expect(postWorkflowDispatch.mock.calls[0][0].inputs.run_publication_token).toBe("pub");
   });
 
-  it("omits run_publication_token when the probe reports no support", async () => {
+  it("refuses dispatch when the probe reports no publication token support", async () => {
     postWorkflowDispatch.mockResolvedValue({ success: true, status: 200, outcome: "accepted", runId: 1 });
     const probe = vi.fn(async () => ({ contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: false }));
-    await createKgRefreshDispatch(makeInput({ resolveWorkflowCapabilities: probe as never }))(dispatchInput);
-    expect(postWorkflowDispatch.mock.calls[0][0].inputs).not.toHaveProperty("run_publication_token");
+    await expect(createKgRefreshDispatch(makeInput({ resolveWorkflowCapabilities: probe as never }))(dispatchInput)).rejects.toThrow("re-sync workflows");
+    expect(postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
   it("moves minted KG bearers into the private envelope on a capable reader", async () => {

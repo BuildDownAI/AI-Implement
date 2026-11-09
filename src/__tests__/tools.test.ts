@@ -1447,13 +1447,19 @@ describe("migrated write handlers (AII-713)", () => {
       expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com" });
     });
 
-    it("passes ref through as kgSourceRef to KgRepo.trigger", async () => {
+    it("passes the exact ref to preflight and KgRepo.trigger", async () => {
+      const runPreflight = vi.fn(async () => PREFLIGHT_OK);
+      setKgRefreshToolDeps(kgToolDeps({ runPreflight }));
       await call({ ref: "release/1.2" });
+      expect(runPreflight).toHaveBeenCalledWith("release/1.2");
       expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ kgSourceRef: "release/1.2" }));
     });
 
     it("omits ref and leaves actorEmail undefined for a null-email caller", async () => {
+      const runPreflight = vi.fn(async () => PREFLIGHT_OK);
+      setKgRefreshToolDeps(kgToolDeps({ runPreflight }));
       await call();
+      expect(runPreflight).toHaveBeenCalledWith(undefined);
       expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
     });
 

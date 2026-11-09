@@ -177,7 +177,7 @@ it.each(["valid", "directory", "invalid-base64", "invalid-json", "invalid-implem
   const { fakeFetch } = await import("../helpers/fake-fetch.js");
   const { createSetupCheckContext } = await import("../../setup-checks/index.js");
   const key = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-  const yaml = ["  run_config:", "  run_publication_token:", "  run_attempt_token:",
+  const yaml = ["on:", "  workflow_dispatch:", "    inputs:", "      run_config:", "      run_publication_token:", "      run_attempt_token:",
     "# ai-implement-capability: private-run-config-v1", "# ai-implement-capability: stage-agent-config-v1",
     "# ai-implement-capability: stage-agent-launch-context-v1"].join("\n");
   const blob = { type: "file", encoding: "base64", content: Buffer.from(yaml).toString("base64") };

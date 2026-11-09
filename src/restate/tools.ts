@@ -1186,7 +1186,7 @@ export const triggerKgRefreshTool = tool(
       return answer(507, { error: "insufficient-storage", detail: `less than ${MIN_FREE_BYTES} bytes free on the volume` });
     }
     const preflightFailure = await ctx.run("preflight", async () => {
-      const result = await toolDeps.runPreflight();
+      const result = await toolDeps.runPreflight(input.args.ref);
       if (result.ok) return null;
       toolDeps.persistPreflightFailure(result);
       return result.results

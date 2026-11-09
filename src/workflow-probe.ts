@@ -1,17 +1,19 @@
+import { parse as parseYaml } from "yaml";
 import { defaultFetchSignal } from "./github.js";
 
 const CACHE_TTL_MS = 300_000;
-const RUN_CONFIG_RE = /^\s{2,}run_config:\s*$/m;
-const RUN_PUBLICATION_TOKEN_RE = /^\s{2,}run_publication_token:\s*$/m;
-/**
- * Declared-input marker for the Restate review-fix pilot's attempt-correlation and
- * versioned-callback support (AII-778). No concrete workflow input name existed yet at
- * authoring time — this mirrors `run_publication_token`'s naming (`run_token`,
- * `run_progress_token`, `run_publication_token`, ...) so a target workflow opts in the same
- * way: declare a `run_attempt_token:` input. AII-776 ("carry attempt identity through the
- * runner envelope") should either adopt this name or update this regex to match.
- */
-const RUN_ATTEMPT_TOKEN_RE = /^\s{2,}run_attempt_token:\s*$/m;
+/** Read only declared dispatch inputs, matching the KG synchronous preflight. */
+function declaredInputs(yamlText: string): Record<string, unknown> {
+  const mapping = (value: unknown): Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : {};
+  try {
+    const doc = mapping(parseYaml(yamlText));
+    return mapping(mapping(mapping(doc.on).workflow_dispatch).inputs);
+  } catch {
+    return {};
+  }
+}
 
 /**
  * Static private-envelope marker (AII-982): a YAML comment, not a workflow_dispatch input.
@@ -170,14 +172,16 @@ async function probeCapabilities(
     return legacy(true);
   }
   const yamlText = Buffer.from(encoded, "base64").toString("utf8");
-  const contract = RUN_CONFIG_RE.test(yamlText) ? "envelope" : "legacy";
+  const inputs = declaredInputs(yamlText);
+  const hasInput = (name: string) => Object.prototype.hasOwnProperty.call(inputs, name);
+  const contract = hasInput("run_config") ? "envelope" : "legacy";
   return {
     capabilities: {
       contract,
       hasStageAgentConfigMarker: STAGE_AGENT_CONFIG_RE.test(yamlText),
       hasStageAgentLaunchContextMarker: STAGE_AGENT_CONTEXT_RE.test(yamlText),
-      supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
-      supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
+      supportsRunPublicationToken: contract === "envelope" && hasInput("run_publication_token"),
+      supportsAttemptCorrelation: contract === "envelope" && hasInput("run_attempt_token"),
       supportsPrivateRunConfig: contract === "envelope" && PRIVATE_RUN_CONFIG_RE.test(yamlText),
       supportsExecutionPolicy: contract === "envelope" && EXECUTION_POLICY_RE.test(yamlText),
       supportsStageAgentConfig: contract === "envelope" && STAGE_AGENT_CONFIG_RE.test(yamlText) && STAGE_AGENT_CONTEXT_RE.test(yamlText),
