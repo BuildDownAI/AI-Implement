@@ -174,10 +174,12 @@ Every production lookup repairs bookkeeping before returning an adopted executio
 the same idempotent dispatch row, execution reference, dedup mark and tracker transition are used.
 Completed bookkeeping is not repeated and terminal rows are preserved. An ambiguous intent prevents
 new preparation or another managed grant even if a later lookup sees nothing or eligibility changes;
-a reconstructed launch preserves the existing managed grant while acceptance is unknown, because a
-runner may already be live even without a recorded acceptance. Confirmed acceptance is persisted
-before bookkeeping. Recovery never prepares again, revokes on ambiguous acceptance, releases admission,
-or establishes backend absence from a missing acceptance record. The workflow retains ownership
+a reconstructed launch preserves the existing managed grant only when acceptance is confirmed.
+Unconfirmed staged recovery with no found execution revokes the old exact-dispatch grant and returns
+unknown while retaining admission and the original intent. Confirmed acceptance is persisted before
+bookkeeping, including when an exact execution is adopted; adoption never restores a revoked grant.
+Recovery never prepares again, releases admission on ambiguity, or establishes backend absence from
+a missing acceptance record. Credential revocation does not prove backend termination. The workflow retains ownership
 through reconciliation and its existing deadline. Definitive rejection
 removes the intent without creating a job or dedup mark. Backend read errors still propagate.
 

@@ -39,6 +39,7 @@ import { postBranchComment } from "../base-branch.js";
 import { postStatusComment } from "../status-events.js";
 import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "../runner-tokens.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
+import { releaseRejectedLaunch } from "../agent-run-preparation.js";
 import {
   classifyLaunchError,
   isManagedProject,
@@ -437,8 +438,11 @@ export function createProductionImplementationRunServices(input: ImplementationR
   async function launch(run: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult> {
     const staged = implementationIntentStore().read<Intent & { accepted?: boolean }>(run.dispatchId);
     if (staged) {
-      // No acceptance record is not proof of rejection: a runner may already be live.
-      // Preserve its existing grant until reconciliation confirms rejection or termination.
+      // Credential authority requires confirmed acceptance; unknown settlement revokes only
+      // this dispatch grant, independently of capacity ownership.
+      if (!staged.snapshot.accepted && isManagedProject(run.teamKey, run.dispatchId)) {
+        releaseRejectedLaunch(run.dispatchId, [], { ownership: getModelAuthRuntime(config).ownership });
+      }
       // Backend absence after an ambiguous acceptance is not proof that a late create cannot finish.
       // Keep the admission and let the workflow reconcile until its deadline; never mint a new grant.
       return { outcome: "unknown" };
@@ -618,6 +622,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
         updateJobRunId(row.id, Number(id));
       }
       if (id !== null && stored && !stored.done) {
+        // Exact adoption confirms acceptance but never remints a previously revoked grant.
+        implementationIntentStore().accept(run.dispatchId);
         const { context, metadata } = stored.snapshot;
         await recordLaunch(run, { ...context, provider: await input.resolveProvider(context.mapping) }, {
           ...metadata, ghToken: run.backend === GHA_BACKEND ? await getToken(context.mapping.owner) : "",

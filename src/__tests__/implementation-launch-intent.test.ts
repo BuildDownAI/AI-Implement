@@ -32,7 +32,7 @@ vi.mock("../local-docker.js", async (original) => ({
   findLocalContainerIdByName: vi.fn(async () => captured.liveContainer),
 }));
 
-it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) without snapshotting secrets or revoking live credentials", async (accepted) => {
+it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) with acceptance-specific credential settlement and no secret snapshots", async (accepted) => {
   captured.liveContainer = null;
   vi.stubEnv("RUNNER_TOKEN_SECRET", "intent-test-encryption-key");
   onTestFinished(() => { vi.unstubAllEnvs(); });
@@ -93,15 +93,19 @@ it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) 
   expect(restarted.intent.implementationIntentStore().read(run.dispatchId)).not.toBeNull();
   const grants = restarted.dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = ?").all(run.dispatchId) as { revoked_at: number | null }[];
   expect(grants).toHaveLength(1);
-  expect(grants[0].revoked_at).toBeNull();
+  if (accepted) expect(grants[0].revoked_at).toBeNull();
+  else expect(grants[0].revoked_at).toEqual(expect.any(Number));
+  expect(restarted.intent.implementationIntentStore().read(run.dispatchId)?.snapshot).toEqual({ ...snapshot, ...(accepted ? { accepted: true } : {}) });
   const routes = restarted.routes.createModelAuthRoutes({ runtime: restarted.runtime.getModelAuthRuntime(input.config), onFly: false, requestPlanRefresh: async () => {} });
   const server = createServer((req, res) => { void routes.handle(req, res); });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   onTestFinished(() => new Promise<void>((resolve) => server.close(() => resolve())));
   const address = server.address() as { port: number };
   const response = await fetch(`http://127.0.0.1:${address.port}/runner/model-auth/checkout`, { method: "POST", headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" }, body: JSON.stringify({ version: 1, profileId: "api" }) });
-  expect(response.status).toBe(200);
-  expect(await response.text()).toContain("API-CREDENTIAL-SENTINEL");
+  expect(response.status).toBe(accepted ? 200 : 403);
+  const responseBody = await response.text();
+  if (accepted) expect(responseBody).toContain("API-CREDENTIAL-SENTINEL");
+  else expect(responseBody).not.toContain("API-CREDENTIAL-SENTINEL");
   // The lost response can hide an accepted, live backend. Reconcile it using the
   // newly constructed deps and original intent, without another preparation/create.
   captured.liveContainer = "live-container";
@@ -111,6 +115,9 @@ it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) 
   expect(restarted.intent.implementationIntentStore().read(run.dispatchId)?.done).toBe(true);
   expect(restarted.admission.read(run.dispatchId)!.releasedAt).toBeNull();
   const afterAdoption = await fetch(`http://127.0.0.1:${address.port}/runner/model-auth/checkout`, { method: "POST", headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" }, body: JSON.stringify({ version: 1, profileId: "api" }) });
-  expect(afterAdoption.status).toBe(200);
-  expect(await afterAdoption.text()).toContain("API-CREDENTIAL-SENTINEL");
+  expect(afterAdoption.status).toBe(accepted ? 200 : 403);
+  const adoptedBody = await afterAdoption.text();
+  if (accepted) expect(adoptedBody).toContain("API-CREDENTIAL-SENTINEL");
+  else expect(adoptedBody).not.toContain("API-CREDENTIAL-SENTINEL");
+  expect(restarted.dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = ?").all(run.dispatchId)).toEqual(grants);
 });
