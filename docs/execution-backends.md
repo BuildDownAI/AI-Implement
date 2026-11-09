@@ -102,7 +102,7 @@ exact name match. Local inspection requires Docker status `exited` and
 `running: false` before interpreting an exit code; other observed states retain
 attempt occupancy. A missing container reports failure. Successful exits read the
 current PR head. Managed projects are
-explicitly rejected on these backends pending S2-29.
+explicitly rejected on these backends pending AII-1770.
 
 `ReviewFixWorker` routes plans and execution identities by backend and reads the
 persisted attempt backend for reconciliation. Production composition and admission

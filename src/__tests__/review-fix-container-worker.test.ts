@@ -10,13 +10,13 @@ vi.mock("../repo-image.js", async (original) => ({ ...await original<typeof impo
 vi.mock("../local-docker.js", async (original) => ({ ...await original<typeof import("../local-docker.js")>(), startLocalRunnerContainer: vi.fn(), inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn() }));
 vi.mock("../backend-run.js", async (original) => ({ ...await original<typeof import("../backend-run.js")>(), stopBackendRun: vi.fn() }));
 
-async function setup(backend: "fly-machines" | "local-docker") {
+async function setup(backend: "fly-machines" | "local-docker", attemptId = "attempt-1") {
   const { modules: m } = await testDb({ modules: {
-    worker: () => import("../review-fix-container-worker.js"), config: () => import("../config.js"), admission: () => import("../dispatch-admission.js"), log: () => import("../log.js"), fly: () => import("../fly-machines.js"), docker: () => import("../local-docker.js"), control: () => import("../backend-run.js"), managed: () => import("../managed-dispatch-auth.js"),
+    worker: () => import("../review-fix-container-worker.js"), config: () => import("../config.js"), admission: () => import("../dispatch-admission.js"), log: () => import("../log.js"), fly: () => import("../fly-machines.js"), docker: () => import("../local-docker.js"), control: () => import("../backend-run.js"), accounting: () => import("../job-accounting.js"), managed: () => import("../managed-dispatch-auth.js"),
   } });
   m.config.upsertMapping("AII", makeMapping({ owner: "owner", repo: "repo" }));
   const scope = makeScopedPrIdentity({ repository: "owner/repo" });
-  m.admission.acquire({ dispatchId: "attempt-1", mappingKey: "AII", scope: { kind: "pr", issueId: "issue", installationId: String(scope.installationId), repository: scope.repository, prNumber: scope.prNumber }, kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId: "attempt-1" }, cap: 10 });
+  m.admission.acquire({ dispatchId: attemptId, mappingKey: "AII", scope: { kind: "pr", issueId: "issue", installationId: String(scope.installationId), repository: scope.repository, prNumber: scope.prNumber }, kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId }, cap: 10 });
   const deps: ContainerReviewFixWorkerDeps = {
     credentials: { resolve: vi.fn().mockResolvedValue({ token: "sentinel-github", installationId: scope.installationId }) },
     callbackInputs: vi.fn().mockResolvedValue({ run_token: "sentinel-result", run_progress_token: "sentinel-progress", run_publication_token: "sentinel-publication", runner_callback_url: "https://callback" }),
@@ -26,7 +26,7 @@ async function setup(backend: "fly-machines" | "local-docker") {
   };
   vi.mocked(m.fly.createMachine).mockResolvedValue({ id: "machine", name: "review-fix-attempt-1" } as Awaited<ReturnType<typeof m.fly.createMachine>>);
   vi.mocked(m.docker.startLocalRunnerContainer).mockImplementation(async input => { input.onBeforeLaunch?.(); return { containerId: "container", containerName: input.containerName! }; });
-  const plan: WorkerLaunchPlan = { executionBackend: backend, attemptId: "attempt-1", scope, taskText: "fix findings", deadlineAt: Date.now() + 60000 };
+  const plan: WorkerLaunchPlan = { executionBackend: backend, attemptId, scope, taskText: "fix findings", deadlineAt: Date.now() + 60000 };
   return { ...m, deps, plan, instance: new m.worker.ContainerReviewFixWorker(deps), execution: { backend, runRef: backend === "fly-machines" ? "machine" : "container" } };
 }
 function seedLaunchIntent(s: Awaited<ReturnType<typeof setup>>) {
@@ -148,7 +148,7 @@ for (const backend of backends) describe(backend, () => {
     expect(await worker.reconcile("attempt-1", s.plan.scope)).toEqual(count === 1 ? { status: "found", execution: { backend, runRef: "id-0" } } : { status: "unknown" });
   });
   for (const exit of [0, 1, null, "running", "missing", "error"] as const) it(`inspects ${exit}`, async () => {
-    const s = await setup(backend);
+    const s = await setup(backend, "11111111-1111-1111-1111-111111111111");
     await s.instance.launch(s.plan);
     if (exit === "missing" || exit === "error") {
       vi.mocked(s.fly.getMachine).mockRejectedValue(new Error(exit === "missing" ? "404" : "sentinel-result"));
@@ -160,6 +160,17 @@ for (const backend of backends) describe(backend, () => {
     const result = await s.instance.inspectTerminal(s.execution);
     expect(result).toEqual(exit === "running" || exit === "error" ? { reached: false } : exit === 0 ? { reached: true, outcome: { status: "succeeded", outputCommit: "a".repeat(40) } } : { reached: true, outcome: { status: "failed", reason: "Container review-fix run failed" } });
     expect(JSON.stringify(result)).not.toContain("sentinel");
+    const row = s.log.getJobByDispatchId(s.plan.attemptId)!;
+    expect(row.completedAt !== null).toBe(exit !== "running" && exit !== "error");
+    expect(row.machineNonce).toBe(exit === "running" || exit === "error" ? "sentinel-nonce" : null);
+    expect(row.conclusion).not.toBe("runner_approved");
+    expect(row.approved).toBe(false);
+    expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
+    expect(s.accounting.listJobAccounting({ includeUnsettled: true }).records).toHaveLength(exit === "running" || exit === "error" ? 0 : 1);
+    const saved = { ...row };
+    await s.instance.inspectTerminal(s.execution);
+    expect(s.log.getJobByDispatchId(s.plan.attemptId)).toEqual(saved);
+    expect(s.accounting.listJobAccounting({ includeUnsettled: true }).records).toHaveLength(exit === "running" || exit === "error" ? 0 : 1);
   });
   it("leaves success unreached when PR head cannot be read", async () => {
     const s = await setup(backend);
@@ -245,4 +256,79 @@ for (const guard of ["terminal", "bound", "generation", "nonce", "backend", "dis
   expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
   expect(s.log.getJobById(protectedRow!.id)).toEqual(protectedRow!);
   expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
+});
+
+for (const backend of backends) describe(`${backend} terminal bookkeeping`, () => {
+  function ended(s: Awaited<ReturnType<typeof setup>>) {
+    vi.mocked(s.fly.getMachine).mockResolvedValue({ state: "stopped", events: [{ type: "exit", request: { exit_event: { exit_code: 0 } } }] } as Awaited<ReturnType<typeof s.fly.getMachine>>);
+    vi.mocked(s.docker.inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
+  }
+  for (const headFailure of ["null", "throws"] as const) it(`settles even when head read ${headFailure}, and can retry the outcome`, async () => {
+    const s = await setup(backend);
+    await s.instance.launch(s.plan);
+    ended(s);
+    if (headFailure === "null") vi.mocked(s.deps.getPullRequestHeadSha!).mockResolvedValueOnce(null);
+    else vi.mocked(s.deps.getPullRequestHeadSha!).mockRejectedValueOnce(new Error("unavailable"));
+    expect(await s.instance.inspectTerminal(s.execution)).toEqual({ reached: false });
+    const row = s.log.getJobByDispatchId(s.plan.attemptId)!;
+    expect(row).toMatchObject({ completedAt: expect.any(Number), machineNonce: null, approved: false });
+    expect(await s.instance.inspectTerminal(s.execution)).toMatchObject({ reached: true });
+    expect(s.log.getJobByDispatchId(s.plan.attemptId)).toEqual(row);
+    expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
+  });
+  for (const state of ["ended", "missing", "running", "error"] as const) it(`cancel acknowledgement with ${state} observation`, async () => {
+    const s = await setup(backend);
+    await s.instance.launch(s.plan);
+    ended(s);
+    if (state === "running") {
+      vi.mocked(s.fly.getMachine).mockResolvedValue({ state: "started" } as Awaited<ReturnType<typeof s.fly.getMachine>>);
+      vi.mocked(s.docker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: 0 });
+    }
+    if (state === "missing" || state === "error") {
+      vi.mocked(s.fly.getMachine).mockRejectedValue(new Error(state === "missing" ? "404" : "unavailable"));
+      vi.mocked(s.docker.inspectLocalContainer).mockRejectedValue(new Error(state === "missing" ? "No such container" : "unavailable"));
+    }
+    vi.mocked(s.control.stopBackendRun).mockResolvedValue(true);
+    expect(await s.instance.cancel(s.plan.attemptId, s.execution)).toEqual({ status: "cancelled" });
+    const row = s.log.getJobByDispatchId(s.plan.attemptId)!;
+    expect(row.completedAt !== null).toBe(state === "ended" || state === "missing");
+    expect(row.machineNonce).toBe(state === "ended" || state === "missing" ? null : "sentinel-nonce");
+    expect(row.approved).toBe(false);
+    expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
+  });
+  for (const guard of ["terminal", "generation", "backend", "execution", "nonce", "dispatch", "owner"] as const) it(`fences concurrent ${guard} changes`, async () => {
+    const s = await setup(backend);
+    await s.instance.launch(s.plan);
+    ended(s);
+    const { getDb } = await import("../dedup.js");
+    let saved: ReturnType<typeof s.log.getJobByDispatchId>;
+    const mutate = () => {
+      const row = s.log.getJobByDispatchId(s.plan.attemptId)!;
+      if (guard === "terminal") s.log.updateJobStatus(row.id, "completed", "runner_approved", undefined, { skipAdmissionRelease: true });
+      else if (guard === "owner") getDb().prepare("UPDATE dispatch_admissions SET lifecycle_owner = ? WHERE dispatch_id = ?").run("legacy", s.plan.attemptId);
+      else {
+        const column = { generation: "admission_generation", backend: "execution_mode", execution: "machine_id", nonce: "machine_nonce", dispatch: "dispatch_id" }[guard];
+        getDb().prepare(`UPDATE dispatch_log SET ${column} = ? WHERE id = ?`).run(guard === "generation" ? 999 : "replacement", row.id);
+      }
+      saved = s.log.getJobById(row.id);
+    };
+    if (backend === "fly-machines") {
+      const value = await s.fly.getMachine("fly", "sessions", s.execution.runRef);
+      vi.mocked(s.fly.getMachine).mockImplementationOnce(async () => { mutate(); return value; });
+    } else {
+      vi.mocked(s.docker.inspectLocalContainer).mockImplementationOnce(async () => { mutate(); return { status: "exited", running: false, exitCode: 0 }; });
+    }
+    expect(await s.instance.inspectTerminal(s.execution)).toEqual({ reached: false });
+    expect(s.log.getJobById(saved!.id)).toEqual(saved!);
+  });
+  it("retries a failed transactional settlement", async () => {
+    const s = await setup(backend);
+    await s.instance.launch(s.plan);
+    ended(s);
+    vi.spyOn(s.log, "updateJobStatus").mockImplementationOnce(() => { throw new Error("busy"); });
+    expect(await s.instance.inspectTerminal(s.execution)).toEqual({ reached: false });
+    expect(s.log.getJobByDispatchId(s.plan.attemptId)).toMatchObject({ completedAt: null, machineNonce: "sentinel-nonce" });
+    expect(await s.instance.inspectTerminal(s.execution)).toMatchObject({ reached: true });
+    expect(s.log.getJobByDispatchId(s.plan.attemptId)).toMatchObject({ completedAt: expect.any(Number), machineNonce: null });
+  });
 });

@@ -7,7 +7,7 @@ import { dispatchLocalGapfill, type DispatchLocalGapfillInput } from "./local-ga
 import { listMachines } from "./fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer } from "./local-docker.js";
 import { readBackendRun, stopBackendRun } from "./backend-run.js";
-import { appendLogIfAbsent, getJobByDispatchId, getJobById, setJobMachineId, updateJobStatus } from "./log.js";
+import { appendLogIfAbsent, getJobByDispatchId, getJobById, getJobByMachineId, setJobMachineId, updateJobStatus } from "./log.js";
 import { classifyLaunchError, isManagedProject } from "./managed-dispatch-auth.js";
 import { githubActionsReviewFixWorkerTransport, inMemoryReviewFixWorkerScopeStore, type GithubReviewFixWorkerDeps } from "./review-fix-worker.js";
 import type { ReviewFixWorkerPort } from "./review-fix-ports.js";
@@ -128,6 +128,8 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
   inspectTerminal: ReviewFixWorkerPort["inspectTerminal"] = async (execution) => {
     if (execution.backend !== "fly-machines" && execution.backend !== "local-docker") return { reached: false };
     try {
+      // Snapshot ownership before the asynchronous backend read; recheck every binding on settlement.
+      const owned = getJobByMachineId(execution.runRef);
       let exit: number | null;
       if (execution.backend === "fly-machines") {
         const read = await readBackendRun(this.deps.fly, execution.backend, execution.runRef);
@@ -144,6 +146,26 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
           exit = null;
         }
       }
+      if (!owned) return { reached: false };
+      {
+        const settled = getDb().transaction(() => {
+          const row = getJobById(owned.id);
+          const admission = owned.dispatchId ? readAdmission(owned.dispatchId) : null;
+          if (!row || !admission || admission.lifecycleOwner.kind !== "restate"
+            || admission.lifecycleOwner.attemptId !== owned.dispatchId
+            || admission.generation !== owned.admissionGeneration || admission.backend !== execution.backend
+            || row.dispatchId !== owned.dispatchId || row.admissionGeneration !== owned.admissionGeneration
+            || row.executionMode !== execution.backend || row.machineId !== execution.runRef
+            || row.machineNonce !== owned.machineNonce || row.status !== owned.status
+            || row.completedAt !== owned.completedAt) return false;
+          // Preserve callback outcomes and approval. Transport completion never grants approval or releases admission.
+          if (row.completedAt !== null) return true;
+          if (!row.machineNonce || (row.status !== "dispatched" && row.status !== "running")) return false;
+          updateJobStatus(row.id, exit === 0 ? "completed" : "failed", exit === 0 ? "success" : "failure", undefined, { skipAdmissionRelease: true });
+          return true;
+        }).immediate();
+        if (!settled) return { reached: false };
+      }
       if (exit !== 0) return { reached: true, outcome: { status: "failed", reason: "Container review-fix run failed" } };
       const scope = await this.scopes.scopeForExecution(execution);
       if (!scope) return { reached: false };
@@ -154,9 +176,16 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       return head && /^[0-9a-f]{40}$/.test(head) ? { reached: true, outcome: { status: "succeeded", outputCommit: head } } : { reached: false };
     } catch { return { reached: false }; }
   };
-  cancel: ReviewFixWorkerPort["cancel"] = async (_, execution: WorkerExecutionIdentity) => {
+  cancel: ReviewFixWorkerPort["cancel"] = async (attemptId, execution: WorkerExecutionIdentity) => {
     if (execution.backend !== "fly-machines" && execution.backend !== "local-docker") return { status: "unknown" };
-    try { return { status: await stopBackendRun(this.deps.fly, execution.backend, execution.runRef) ? "cancelled" : "unknown" }; }
+    try {
+      const row = getJobByMachineId(execution.runRef);
+      if (row && row.dispatchId !== attemptId) return { status: "unknown" };
+      const acknowledged = await stopBackendRun(this.deps.fly, execution.backend, execution.runRef);
+      // A stop acknowledgement is not proof of termination. Only the subsequent read can settle bookkeeping.
+      await this.inspectTerminal(execution);
+      return { status: acknowledged ? "cancelled" : "unknown" };
+    }
     catch { return { status: "unknown" }; }
   };
 }
