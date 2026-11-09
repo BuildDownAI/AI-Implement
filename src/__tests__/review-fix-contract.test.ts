@@ -27,14 +27,14 @@ import {
 
 const scope: ScopedPrIdentity = { installationId: 1, repository: "acme/widgets", prNumber: 42 };
 
-const metadata: ReviewFixMetadataV1 = {
+const metadata = {
   version: 1,
   attemptId: "attempt-1",
   installationId: scope.installationId,
   repository: scope.repository,
   prNumber: scope.prNumber,
   deadlineAt: 1_800_000_000_000,
-};
+} as const satisfies ReviewFixMetadataV1;
 
 const resultMetadata: ReviewFixResultMetadataV1 = {
   ...metadata,
@@ -110,6 +110,22 @@ describe("validateReviewFixMetadata / classifyLifecycleOwner", () => {
     expect(validateReviewFixMetadata(metadata)).toEqual({ ok: true, value: metadata });
   });
 
+  it.each(["fly-machines", "local-docker"] as const)("retains the %s marker", (executionBackend) => {
+    const value = { ...metadata, executionBackend };
+    expect(validateReviewFixMetadata(value)).toEqual({ ok: true, value });
+  });
+
+  it.each(["github-actions", "unknown", null])("rejects present backend %j", (executionBackend) => {
+    expect(validateReviewFixMetadata({ ...metadata, executionBackend }).ok).toBe(false);
+  });
+
+  it("omits an absent backend from canonical GitHub markers and results", () => {
+    for (const checked of [validateReviewFixMetadata(metadata), validateReviewFixResultMetadata(resultMetadata)]) {
+      expect(checked.ok).toBe(true);
+      if (checked.ok) expect(checked.value).not.toHaveProperty("executionBackend");
+    }
+  });
+
   it("classifies a message with no reviewFix block as legacy", () => {
     const res = classifyLifecycleOwner({});
     expect(res).toEqual({ ok: true, value: { kind: "legacy" } });
@@ -160,6 +176,36 @@ describe("validateReviewFixMetadata / classifyLifecycleOwner", () => {
 describe("validateReviewFixResultMetadata", () => {
   it("accepts well-formed result metadata", () => {
     expect(validateReviewFixResultMetadata(resultMetadata)).toEqual({ ok: true, value: resultMetadata });
+  });
+
+  it.each(["fly-machines", "local-docker"] as const)("accepts %s results without GitHub ids", (executionBackend) => {
+    const value = { ...metadata, executionBackend, outputCommit: resultMetadata.outputCommit };
+    expect(validateReviewFixResultMetadata({ ...value, unrelated: true })).toEqual({ ok: true, value });
+  });
+
+  it.each(["fly-machines", "local-docker"] as const)("rejects both and partial mixed evidence on %s", (executionBackend) => {
+    const value = { ...metadata, executionBackend, outputCommit: resultMetadata.outputCommit };
+    for (const ids of [{ githubRunId: 555 }, { githubRunAttempt: 1 }, { githubRunId: 555, githubRunAttempt: 1 },
+      { githubRunId: null }, { githubRunAttempt: undefined }]) {
+      expect(validateReviewFixResultMetadata({ ...value, ...ids }).ok).toBe(false);
+    }
+  });
+
+  it("requires both positive safe integer ids on GitHub results", () => {
+    for (const field of ["githubRunId", "githubRunAttempt"]) {
+      for (const value of [undefined, null, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "1", NaN, Infinity]) {
+        expect(validateReviewFixResultMetadata({ ...resultMetadata, [field]: value }).ok).toBe(false);
+      }
+    }
+  });
+
+  it("requires a lowercase full output SHA on every shape", () => {
+    for (const executionBackend of [undefined, "fly-machines", "local-docker"]) {
+      const value = executionBackend ? { ...metadata, executionBackend } : resultMetadata;
+      for (const outputCommit of [undefined, "", "a".repeat(39), "A".repeat(40), "g".repeat(40)]) {
+        expect(validateReviewFixResultMetadata({ ...value, outputCommit }).ok).toBe(false);
+      }
+    }
   });
 
   it("ignores unknown optional evidence fields on an old (legacy) result via classifyLifecycleOwner", () => {
@@ -244,8 +290,43 @@ describe("execution identity", () => {
   });
 });
 
+describe("resultMatchesExecution state table", () => {
+  const fly: ReviewFixResultMetadataV1 = { ...metadata, executionBackend: "fly-machines", outputCommit: "a".repeat(40) };
+  const local: ReviewFixResultMetadataV1 = { ...metadata, executionBackend: "local-docker", outputCommit: "a".repeat(40) };
+
+  it("matches equal GitHub ids", () => {
+    expect(resultMatchesExecution(resultMetadata, { backend: "github-actions", githubRunId: 555, githubRunAttempt: 1 })).toBe(true);
+  });
+
+  it("does not match a machine result to GitHub", () => {
+    for (const result of [fly, local]) {
+      expect(resultMatchesExecution(result, { backend: "github-actions", githubRunId: 555, githubRunAttempt: 1 })).toBe(false);
+    }
+  });
+
+  it("matches Fly results to Fly", () => {
+    expect(resultMatchesExecution(fly, { backend: "fly-machines", runRef: "machine" })).toBe(true);
+  });
+
+  it("matches local results to local", () => {
+    expect(resultMatchesExecution(local, { backend: "local-docker", runRef: "container" })).toBe(true);
+  });
+
+  it("rejects every other shape for a machine backend", () => {
+    expect(resultMatchesExecution(local, { backend: "fly-machines", runRef: "machine" })).toBe(false);
+    expect(resultMatchesExecution(fly, { backend: "local-docker", runRef: "container" })).toBe(false);
+    for (const backend of ["fly-machines", "local-docker"] as const) {
+      expect(resultMatchesExecution(resultMetadata, { backend, runRef: "run" })).toBe(false);
+    }
+  });
+
+  it("rejects mixed shapes during validation", () => {
+    expect(validateReviewFixResultMetadata({ ...resultMetadata, executionBackend: "fly-machines" }).ok).toBe(false);
+  });
+});
+
 describe("worker launch outcome", () => {
-  const execution = { githubRunId: 1, githubRunAttempt: 1 };
+  const execution = { backend: "github-actions" as const, githubRunId: 1, githubRunAttempt: 1 };
 
   it("accepted requires an execution identity", () => {
     expect(validateWorkerLaunchOutcome({ status: "accepted", execution })).toEqual({
@@ -280,7 +361,7 @@ describe("worker launch outcome", () => {
 });
 
 describe("worker lookup outcome", () => {
-  const execution = { githubRunId: 1, githubRunAttempt: 1 };
+  const execution = { backend: "github-actions" as const, githubRunId: 1, githubRunAttempt: 1 };
 
   it("pins found / not_found / unknown", () => {
     expect(validateWorkerLookupOutcome({ status: "found", execution })).toEqual({
@@ -480,5 +561,13 @@ describe("contract version constants", () => {
   it("are 1", () => {
     expect(REVIEW_FIX_CONTRACT_VERSION).toBe(1);
     expect(REVIEW_FIX_ACTIVITY_VERSION).toBe(1);
+  });
+});
+
+describe("machine worker outcomes", () => {
+  it.each(["fly-machines", "local-docker"] as const)("accepts %s launch and lookup identities", (backend) => {
+    const execution = { backend, runRef: "machine-123" };
+    expect(validateWorkerLaunchOutcome({ status: "accepted", execution })).toEqual({ ok: true, value: { status: "accepted", execution } });
+    expect(validateWorkerLookupOutcome({ status: "found", execution })).toEqual({ ok: true, value: { status: "found", execution } });
   });
 });

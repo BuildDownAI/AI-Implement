@@ -2,8 +2,19 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { makeMapping, makeJob } from "./helpers/builders.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../restate/implementation-run-production.js";
-vi.mock("../agent-run-preparation.js", async original => ({ ...await original<object>(), persistedPreparationState: vi.fn(() => "absent") }));
+vi.mock("../agent-run-preparation.js", async original => ({ ...await original<object>(), persistedPreparationState: vi.fn(() => "absent"), loadStoredSnapshot: vi.fn(() => null) }));
 const intents = vi.hoisted(() => new Map<string, unknown>());
+// The ordinary launch path now persists its own recovery intent (AII-1555).
+const ordinaryIntents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: boolean }>());
+vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationIntentStore: () => ({
+  readPreparation: (id: string) => ordinaryIntents.get(`preparation:${id}`)?.snapshot ?? null,
+  writePreparation: (id: string, snapshot: unknown) => { if (!ordinaryIntents.has(`preparation:${id}`)) ordinaryIntents.set(`preparation:${id}`, { snapshot: structuredClone(snapshot), done: false }); },
+  read: (id: string) => ordinaryIntents.get(id) ?? null,
+  write: (id: string, snapshot: unknown) => { if (!ordinaryIntents.has(id)) ordinaryIntents.set(id, { snapshot: structuredClone(snapshot), done: false }); },
+  accept: (id: string) => { const intent = ordinaryIntents.get(id); if (intent) Object.assign(intent.snapshot as object, { accepted: true }); },
+  complete: (id: string) => { const intent = ordinaryIntents.get(id); if (intent) intent.done = true; },
+  remove: (id: string) => ordinaryIntents.delete(id),
+}) }));
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...await original<object>(), createImplementationRunWorkflow: (d: unknown) => { captured.deps = d; return {}; } }));
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
@@ -11,7 +22,7 @@ vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
 vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => intents.set(id, value)), confirmCommentGapfillLaunch: vi.fn(), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
 vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
-vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
+vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn() }));
 vi.mock("../github.js", async original => ({ ...await original<object>(), dispatchWorkflow: vi.fn(), getWorkflowRunStatus: vi.fn(async () => null), cancelWorkflowRun: vi.fn(async () => true) }));
 vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
@@ -47,6 +58,7 @@ let input: ImplementationRunProductionInput;
 beforeEach(() => {
   vi.clearAllMocks();
   intents.clear();
+  ordinaryIntents.clear();
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [] }) })));
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(isParked).mockReturnValue(false);
@@ -218,6 +230,7 @@ it("first-time launch still calls existing launch helpers with the same argument
   const provider = { findByKey: vi.fn(async () => issue) };
   const prepared = { ghToken: "TOKEN-SENTINEL", runnerImage: "image", contract: "envelope", dispatchInputs: {} };
   input.resolveProvider = vi.fn(async () => provider) as never;
+  input.isGroupingParentDispatch = vi.fn(() => false);
   input.prepareImplementationLaunch = vi.fn(async () => prepared) as never;
   input.launchImplementationRun = vi.fn(async () => ({ outcome: "rejected" })) as never;
   createProductionImplementationRunServices(input);
@@ -261,12 +274,14 @@ it("absent gapFill preserves existing lookup calls and result", async () => {
   vi.mocked(fetch).mockClear();
   vi.mocked(getInstallationToken).mockClear();
   vi.mocked(getJobByDispatchId).mockClear();
+  // Ordinary recovery now requires an existing job or launch intent before adoption.
+  vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ dispatchId: first.dispatchId, runId: null, status: "running" }));
   runs([88, 87]);
   expect(await d.findExistingRun(first, 1999)).toBe("88");
   // Each invocation creates its own timeout signal; compare its type separately.
   expect(fetch).toHaveBeenCalledExactlyOnceWith(expectedFetch[0], { ...expectedFetch[1], signal: expect.any(AbortSignal) });
   expect(getInstallationToken).toHaveBeenCalledExactlyOnceWith(...expectedToken);
-  expect(getJobByDispatchId).toHaveBeenCalledExactlyOnceWith(...expectedRow);
+  expect(getJobByDispatchId).toHaveBeenCalledWith(...expectedRow);
 });
 function managedDecision(): Extract<ManagedDispatchDecision, { kind: "launch" }> {
   return { kind: "launch", dispatchId: "dispatch", projectKey: "ENG", backend: "github-actions",

@@ -151,7 +151,9 @@ export function makeScopedInstallationToken(overrides: Partial<ScopedInstallatio
 }
 
 // The deadline is an hour ahead of when the result is built, so a default attempt has not expired.
-export function makeReviewFixResult(overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+export function makeReviewFixResult(
+  overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {},
+): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   return {
     version: 1,
     attemptId: "attempt-1",

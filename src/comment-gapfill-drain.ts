@@ -538,6 +538,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         );
         if (!localDecision) continue;
         const localModelAuthUrl = opts.localRunnerOrchestratorUrl ?? opts.runnerCallbackBaseUrl ?? "";
+        let localMachineNonce: string | undefined;
         let launchStarted = false;
         let local: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
@@ -556,7 +557,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             runPublicationToken,
             commentInstruction,
             retryPolicy: getRetryPolicy(),
-            onBeforeLaunch: () => { launchStarted = true; },
+            onBeforeLaunch: (nonce) => { localMachineNonce = nonce; launchStarted = true; },
             ...(localDecision.kind === "launch" ? { managed: { decision: localDecision, modelAuthUrl: localModelAuthUrl } } : {}),
           });
         } catch (err) {
@@ -576,7 +577,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           admissionGeneration: admission.record.generation,
           dispatchNumber: prior.count + 1,
           executionMode: "local-docker",
-          machineNonce: local.machineNonce,
+          machineNonce: localMachineNonce,
           machineId: local.containerId,
           computeStartedAt: Date.now(),
           runnerMode: opts.runnerMode,
@@ -638,6 +639,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           admission, gapFillIssue.identifier,
         );
         if (!flyDecision) continue;
+        let machineNonce: string | undefined;
         let launchAttempted = false;
         let machineSize: MachineSize | undefined;
         let launched: Awaited<ReturnType<typeof dispatchFlyGapfill>>;
@@ -667,7 +669,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             runPublicationToken,
             commentInstruction,
             decision: flyDecision,
-            onBeforeLaunch: (requestedSize) => {
+            onBeforeLaunch: (requestedSize, nonce) => {
+              machineNonce = nonce;
               machineSize = requestedSize;
               launchAttempted = true;
             },
@@ -680,7 +683,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           if (outcome === "rejected") releaseGapfillAdmission(admission);
           throw err;
         }
-        const { machine, machineNonce, resolvedImage } = launched;
+        const { machine, resolvedImage } = launched;
 
         const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
         const jobId = appendLog({

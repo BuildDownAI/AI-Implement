@@ -162,6 +162,8 @@ export interface ReviewFixMetadataV1 {
   readonly repository: string;
   readonly prNumber: number;
   readonly deadlineAt: number;
+  /** Absent means github-actions; only machine backends carry a tag. */
+  readonly executionBackend?: "fly-machines" | "local-docker";
 }
 
 export function validateReviewFixMetadata(raw: unknown): ValidationResult<ReviewFixMetadataV1> {
@@ -175,6 +177,9 @@ export function validateReviewFixMetadata(raw: unknown): ValidationResult<Review
   if (!scope.ok) return scope;
   const deadlineAt = validateEpochMillis(raw.deadlineAt, "deadlineAt");
   if (!deadlineAt.ok) return deadlineAt;
+  if (raw.executionBackend !== undefined && raw.executionBackend !== "fly-machines" && raw.executionBackend !== "local-docker") {
+    return err("executionBackend must be fly-machines or local-docker when present");
+  }
   return ok({
     version: REVIEW_FIX_CONTRACT_VERSION,
     attemptId: attemptId.value,
@@ -182,6 +187,7 @@ export function validateReviewFixMetadata(raw: unknown): ValidationResult<Review
     repository: scope.value.repository,
     prNumber: scope.value.prNumber,
     deadlineAt: deadlineAt.value,
+    ...(raw.executionBackend === undefined ? {} : { executionBackend: raw.executionBackend }),
   });
 }
 
@@ -214,11 +220,10 @@ export function classifyLifecycleOwner(raw: { reviewFix?: unknown }): Validation
 // ---------------------------------------------------------------------------
 
 /** reviewFix metadata plus the evidence a completed attempt reports. */
-export interface ReviewFixResultMetadataV1 extends ReviewFixMetadataV1 {
-  readonly githubRunId: number;
-  readonly githubRunAttempt: number;
-  readonly outputCommit: string;
-}
+export type ReviewFixResultMetadataV1 = ReviewFixMetadataV1 & (
+  | { readonly executionBackend?: undefined; readonly githubRunId: number; readonly githubRunAttempt: number }
+  | { readonly executionBackend: "fly-machines" | "local-docker"; readonly githubRunId?: never; readonly githubRunAttempt?: never }
+) & { readonly outputCommit: string };
 
 /**
  * Unknown extra keys on `raw` beyond the recognised evidence fields are ignored,
@@ -229,14 +234,23 @@ export function validateReviewFixResultMetadata(raw: unknown): ValidationResult<
   const base = validateReviewFixMetadata(raw);
   if (!base.ok) return base;
   const obj = raw as Record<string, unknown>;
+  if (base.value.executionBackend !== undefined) {
+    if ("githubRunId" in obj || "githubRunAttempt" in obj) {
+      return err("machine results must not carry githubRunId or githubRunAttempt");
+    }
+    const outputCommit = validateCommitSha(obj.outputCommit);
+    if (!outputCommit.ok) return outputCommit;
+    return ok({ ...base.value, executionBackend: base.value.executionBackend, outputCommit: outputCommit.value });
+  }
   const githubRunId = validatePositiveInt(obj.githubRunId, "githubRunId");
   if (!githubRunId.ok) return githubRunId;
   const githubRunAttempt = validatePositiveInt(obj.githubRunAttempt, "githubRunAttempt");
   if (!githubRunAttempt.ok) return githubRunAttempt;
   const outputCommit = validateCommitSha(obj.outputCommit);
   if (!outputCommit.ok) return outputCommit;
+  const { executionBackend: _backend, ...githubBase } = base.value;
   return ok({
-    ...base.value,
+    ...githubBase,
     githubRunId: githubRunId.value,
     githubRunAttempt: githubRunAttempt.value,
     outputCommit: outputCommit.value,
@@ -247,11 +261,7 @@ export function validateReviewFixResultMetadata(raw: unknown): ValidationResult<
 // Worker launch / lookup / cancel / terminal outcomes
 // ---------------------------------------------------------------------------
 
-/** The GitHub Actions execution a launch was accepted onto, or a lookup found. */
-export interface WorkerExecutionIdentity {
-  readonly githubRunId: number;
-  readonly githubRunAttempt: number;
-}
+export type WorkerExecutionIdentity = ExecutionIdentity;
 
 /** Backend-neutral identity; omitted backends preserve legacy GitHub journal values. */
 export type ExecutionIdentity =
@@ -299,14 +309,17 @@ export function sameExecution(a: ExecutionIdentity, b: ExecutionIdentity): boole
   return right.backend !== "github-actions" && left.backend === right.backend && left.runRef === right.runRef;
 }
 
-/** Machine result matching is deferred until the result contract carries machine evidence. */
+/** Machine origin is proven by the attempt-scoped result token and launch-once. */
 export function resultMatchesExecution(result: ReviewFixResultMetadataV1, execution: ExecutionIdentity): boolean {
   const identity = normalizeExecutionIdentity(execution);
-  return identity.backend === "github-actions"
-    && result.githubRunId === identity.githubRunId && result.githubRunAttempt === identity.githubRunAttempt;
+  if (identity.backend === "github-actions") {
+    return result.executionBackend === undefined
+      && result.githubRunId === identity.githubRunId && result.githubRunAttempt === identity.githubRunAttempt;
+  }
+  return result.executionBackend === identity.backend;
 }
 
-function validateWorkerExecutionIdentity(raw: unknown): ValidationResult<WorkerExecutionIdentity> {
+function validateWorkerExecutionIdentity(raw: unknown): ValidationResult<{ githubRunId: number; githubRunAttempt: number }> {
   if (!isPlainObject(raw)) return err("execution identity must be an object");
   const githubRunId = validatePositiveInt(raw.githubRunId, "githubRunId");
   if (!githubRunId.ok) return githubRunId;
@@ -331,7 +344,7 @@ export function validateWorkerLaunchOutcome(raw: unknown): ValidationResult<Work
   switch (raw.status) {
     case "accepted": {
       if (raw.reason !== undefined) return err("accepted launch outcome must not carry a rejection reason");
-      const execution = validateWorkerExecutionIdentity(raw.execution);
+      const execution = validateExecutionIdentity(raw.execution);
       if (!execution.ok) return execution;
       return ok({ status: "accepted", execution: execution.value });
     }
@@ -362,7 +375,7 @@ export function validateWorkerLookupOutcome(raw: unknown): ValidationResult<Work
   if (!isPlainObject(raw)) return err("worker lookup outcome must be an object");
   switch (raw.status) {
     case "found": {
-      const execution = validateWorkerExecutionIdentity(raw.execution);
+      const execution = validateExecutionIdentity(raw.execution);
       if (!execution.ok) return execution;
       return ok({ status: "found", execution: execution.value });
     }

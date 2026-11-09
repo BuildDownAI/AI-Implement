@@ -229,7 +229,9 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
   try {
     input.onBeforeLaunch?.();
     const { stdout } = await execFile("docker", args);
-    return { containerId: stdout.trim(), containerName };
+    const containerId = stdout.trim();
+    if (!containerId) throw new Error("Docker run returned an empty container identity");
+    return { containerId, containerName };
   } catch (err) {
     throw new Error(`Failed to start local Docker runner: ${errorMessage(err)}`);
   } finally {
@@ -242,7 +244,9 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
 export async function findLocalContainerIdByName(name: string): Promise<string | null> {
   try {
     const { stdout } = await execFile("docker", ["inspect", "--type", "container", "--format", "{{.Id}}", name]);
-    return stdout.trim() || null;
+    const id = stdout.trim();
+    if (!id) throw new Error("Docker inspect returned an empty container identity");
+    return id;
   } catch (err) {
     if (/no such (container|object)/i.test(errorMessage(err))) return null;
     throw new Error(`Failed to look up local Docker runner ${name}: ${errorMessage(err)}`);
@@ -366,7 +370,12 @@ export async function removeLocalContainer(containerId: string): Promise<void> {
     await execFile("docker", ["rm", "-f", containerId]);
     await stampComputeStopped(containerId, false);
   } catch (err) {
-    throw new Error(`Failed to remove local Docker runner ${containerId}: ${errorMessage(err)}`);
+    const message = errorMessage(err);
+    // Removal may have succeeded before its acknowledgement was lost. Record
+    // the same completed_at fallback as stopLocalContainer before callers accept
+    // an already-gone response as successful cleanup.
+    if (/no such container/i.test(message)) await stampComputeStopped(containerId, true);
+    throw new Error(`Failed to remove local Docker runner ${containerId}: ${message}`);
   }
 }
 

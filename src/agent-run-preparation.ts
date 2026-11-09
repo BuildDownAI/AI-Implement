@@ -819,3 +819,19 @@ export async function releaseTerminated(
   if (complete) revokeGrants(dispatchId, (deps.now ?? Date.now)());
   return { complete, results };
 }
+
+/** Settle an unused API-only preparation from its frozen identity, without resolving current config.
+ * No session ownership policy is inferred here; subscription bindings fail closed.
+ */
+export function releaseUnusedManagedPreparation(
+  request: Pick<AgentRunRequest, "dispatchId" | "projectKey" | "backend">,
+  deps: Pick<AgentRunPreparationDeps, "ownership" | "now">,
+): CleanupOutcome {
+  const grant = readGrant(request.dispatchId);
+  if (!grant) return { complete: true, results: [] };
+  const snapshot = readSnapshotRow(request.dispatchId);
+  if (!snapshot || snapshot.project_key !== request.projectKey ||
+      grant.row.project_key !== request.projectKey || grant.row.snapshot_id !== snapshot.snapshot_id ||
+      grant.row.backend !== GRANT_BACKENDS[request.backend]) return { complete: false, results: [] };
+  return releaseRejectedLaunch(request.dispatchId, [], deps);
+}

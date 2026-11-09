@@ -1,14 +1,16 @@
 # Implementation lifecycle
 
-How an implementation job runs today (Legacy), and the duty table that maps every Legacy function that finishes or fixes an implementation job to the step of the `ImplementationRun` workflow (`src/restate/implementation-run-workflow.ts`) that takes its work over. Step 2 of [AII-1550](https://linear.app/eudoxus/issue/AII-1550/run-implementation-jobs-as-a-restate-workflow).
+The retained Legacy implementation lifecycle, and the duty table that maps every Legacy function that finishes or fixes an implementation job to the step of the `ImplementationRun` workflow (`src/restate/implementation-run-workflow.ts`) that takes its work over. Step 2 of [AII-1550](https://linear.app/eudoxus/issue/AII-1550/run-implementation-jobs-as-a-restate-workflow).
 
-**Status.** `ImplementationRun` exists in the tree ([AII-1553](https://linear.app/eudoxus/issue/AII-1553)); no production path starts it yet ([AII-1557](https://linear.app/eudoxus/issue/AII-1557) wires it). The step names below are the real ones, the `PlanningRun` names (`src/restate/planning-run-workflow.ts`) plus nothing new: `reserve`, `dispatch`, `wait`, `stop`, `finish-job`, `cleanup`, `outcome`, `release`. Keep a step name stable: the Restate UI, the job drawer and the tests read it. Every function, file, and rule named here exists in the tree; line numbers are not cited because they drift.
+**Status.** The poll loop submits `ImplementationRun` for every project's first-time implementation on GitHub Actions, Fly Machines and local Docker, regardless of the stored review-fix lifecycle. Shadow mode submits GitHub Actions only, with no Fly mirror. Restate unavailability skips dispatch without reserving capacity or marking dedup. Managed preparation remains in the workflow's prepare step. There is no per-project switch or rollback setting; rollback is a deploy revert. Gap-fill routing follows in AII-1554. The Legacy lifecycle below remains for existing jobs until Stage 3 cleanup. The step names below are the real ones, the `PlanningRun` names (`src/restate/planning-run-workflow.ts`) plus nothing new: `reserve`, `dispatch`, `wait`, `stop`, `finish-job`, `cleanup`, `outcome`, `release`. Keep a step name stable: the Restate UI, the job drawer and the tests read it. Every function, file, and rule named here exists in the tree; line numbers are not cited because they drift.
+
+For first-time container dispatches with neither an admission nor a recorded job, `reserve` checks eligibility before taking capacity or reading a backend: Bedrock is unsupported, Fly requires its sessions token and app, and unmanaged runs require API or OAuth credentials. Managed runs can prepare credentials without environment credentials. Ineligible issues remain queued with no job, dedup, or tracker transition. An existing admission or job bypasses this first-dispatch check: `dispatch` still reconciles before preparing any new launch, so later configuration changes cannot hide a recorded or possibly launched run. Missing Fly configuration and failed backend reads still throw during recovery; they never establish backend absence. Inputs and journal command names are unchanged.
 
 `ImplementationRun` accepts an optional strict `gapFill` input part with `queueItemId`, `repository` (`owner/repo`), `installationId`, `prNumber`, `prDispatchBudget`, and `humanRequested`. Its absence preserves first-time implementation inputs, including previously journaled values. Queue and PR IDs are positive integers; the budget is a nonnegative integer captured once at dispatch (ADR 045). This contract adds no caller wiring or workflow decisions. Future dependency wiring will consume the part and read comment text from the queue row at launch. The part carries neither comment text nor a token.
 
 **Why the table exists.** Planning missed two duties the first time (AII-1018): the reaper's machine cleanup, and the notice and breaker bookkeeping in `reportJobCompletion`. Each Legacy function below *skips* a Restate-owned job (`isRestateOwnedJob`), so a duty with no workflow step is silently dropped for an owned job. The table is the check that none is. Planning's version of this table is in [restate.md](restate.md) § "Legacy functions that fence on `isRestateOwnedJob`".
 
-## How an implementation job runs today
+## Retained Legacy implementation lifecycle
 
 ```mermaid
 flowchart TD
@@ -155,3 +157,43 @@ Settled 2026-10-26; the table above already uses them.
 - `grep -n isRestateOwnedJob src/index.ts src/stuck-watchdog.ts src/reaper.ts` shows one definition and the call sites in the table above (six, two, one).
 - Every function named in a row exists in the file named in its heading; run `grep -rn "<name>" src` for each before changing a row.
 - No file under `src/` changes with this doc.
+
+### Recovery after backend acceptance
+
+ImplementationRun stores a private SQLite launch intent immediately before the backend call.
+It freezes the issue and effective limits, allowlisted repository/workflow and tracker identity,
+branch, admission generation, accounting,
+image/guest/compute metadata, and container callback nonce. Credentials and bootstrap tokens are
+excluded from the intent, including arbitrary mapping `extraEnv` values and App/registry credentials;
+neither the intent nor its nonce is returned to the Restate journal.
+Local containers use a name derived from the dispatch ID, independent of issue key and runner mode;
+Legacy callers retain their timestamp names. Docker name uniqueness also fences a late first create.
+An empty Docker inspect response is an error, not evidence of absence.
+
+Preparation identity is persisted before the first asynchronous preparation operation for managed
+and unmanaged projects alike. It freezes the exact admission generation, owner/backend, repository
+lookup and Fly app. A backend candidate without ordinary launch intent or an owned job is ambiguous:
+recovery cannot adopt it, invent callback authority, or launch a replacement.
+
+Tracker recovery uses the original allowlisted nonsecret project configuration (Jira field overrides
+and project selectors, or the filesystem directory). A scoped provider is reconstructed with current
+credentials and the usual provider identity and local runner-mode guards. Missing or edited current
+project mappings cannot redirect this bookkeeping. Failed tracker work remains incomplete and retries.
+
+Every production lookup repairs bookkeeping before returning an adopted execution to the workflow:
+the same idempotent dispatch row, execution reference, dedup mark and tracker transition are used.
+Completed bookkeeping is not repeated and terminal rows are preserved. An ambiguous intent prevents
+new preparation or another managed grant even if a later lookup sees nothing or eligibility changes;
+a reconstructed launch preserves the existing managed grant only when acceptance is confirmed.
+Unconfirmed staged recovery with no found execution revokes the old exact-dispatch grant and returns
+unknown while retaining admission and the original intent. Confirmed acceptance is persisted before
+bookkeeping, including when an exact execution is adopted; adoption never restores a revoked grant.
+Recovery never prepares again, releases admission on ambiguity, or establishes backend absence from
+a missing acceptance record. Credential revocation does not prove backend termination. The workflow retains ownership
+through reconciliation and its existing deadline. Definitive rejection
+removes the intent without creating a job or dedup mark. Backend read errors still propagate.
+
+`implementation-recovery.restate.test.ts` exercises lost acceptance before recording on all three
+backends against the pinned Restate binary, including the actual local finder and Docker launcher,
+repeat recovery, configuration changes, authenticated callbacks, shared finalization and release.
+Workflow input, journal command names and committed journal snapshots remain unchanged.

@@ -503,6 +503,36 @@ describe("retention and tombstones", () => {
     expect(replayCycle.status).toBe("tombstoned");
   });
 
+  it.each(["fly-machines", "local-docker"])("purges bound %s evidence and retains unbound evidence", (backend) => {
+    const db = dedup.getDb();
+    const now = 1_700_000_000_000;
+    const old = now - evidence.REVIEW_FIX_EVIDENCE_RETENTION_MS - 1_000;
+    for (const [index, executionRef] of [null, "execution-1"].entries()) {
+      const attemptId = `backend-${index}`;
+      const dispatchId = `dispatch-${attemptId}`;
+      insertAttemptWithCompletion(db, attemptId, old, { githubRunId: null, prNumber: 60 + index });
+      db.prepare("UPDATE review_fix_attempts SET execution_backend = ?, execution_ref = ? WHERE attempt_id = ?")
+        .run(backend, executionRef, attemptId);
+      insertActiveReservation(db, dispatchId);
+      db.prepare("UPDATE dispatch_admissions SET backend = ?, released_at = ? WHERE dispatch_id = ?")
+        .run(backend, old, dispatchId);
+      evidence.appendReviewFixActivityBatch({
+        attemptId, producerId: "producer-1",
+        events: [makeEvent({ attemptId, producerId: "producer-1", sequence: 0, payload: "x" })],
+      });
+      evidence.recordReviewFixCycleSummary({
+        attemptId, cycle: 1, dispositions: [], tests: {}, verdict: "x", usage: {}, completedAt: old,
+      });
+    }
+    expect(evidence.sweepExpiredReviewFixEvidence(now).purgedAttemptIds).toEqual(["backend-1"]);
+    expect(evidence.listReviewFixActivity("backend-1", { pageSize: 10 }).events).toHaveLength(0);
+    expect(evidence.listReviewFixCycleSummaries("backend-1")).toHaveLength(0);
+    expect(evidence.isReviewFixEvidenceTombstoned("backend-1")).toBe(true);
+    expect(evidence.listReviewFixActivity("backend-0", { pageSize: 10 }).events).toHaveLength(1);
+    expect(evidence.listReviewFixCycleSummaries("backend-0")).toHaveLength(1);
+    expect(evidence.isReviewFixEvidenceTombstoned("backend-0")).toBe(false);
+  });
+
   it("never purges a long-completed attempt whose execution was never bound (unknown execution)", () => {
     const db = dedup.getDb();
     const now = 1_700_000_000_000;

@@ -13,7 +13,7 @@ Every cell is a real entry point. The test drives it with fakes at the outermost
 | implementation | `dispatchGitHubActions` (`src/index.ts`) then `prepareImplementationLaunch` and `launchImplementationRun` (`src/implementation-launch.ts`) | `dispatchFlyMachine` (`src/index.ts`) then `launchImplementationFlySession` (`src/implementation-launch.ts`) | `dispatchLocalDocker` (`src/index.ts`) then `launchImplementationLocalSession` (`src/implementation-launch.ts`) |
 | gap-fill (`/ai-implement` comment) | `prepareGhaGapfillLaunch` → `dispatchGhaGapfill` (`src/gapfill-launch.ts`) | `dispatchFlyGapfill` (`src/gapfill-launch.ts`) | same function, local branch, through `dispatchLocalGapfill` (`src/local-gapfill.ts`) |
 | planning | `dispatchPlanning` (`src/index.ts`) submits `PlanningRun` regardless of lifecycle; `src/restate/planning-run-production.ts` invokes `preparePlanningLaunch` and `launchPlanningRun` (`src/planning-launch.ts`) under the workflow-owned reservation | `dispatchPlanning` then `launchPlanningSession` (`src/planning-launch.ts`) | same as Fly |
-| review-fix attempt (Restate pilot) | `GithubReviewFixWorker.launch` (`src/review-fix-worker.ts`); callback tokens from `callbackInputs` (`src/restate/review-fix-production.ts`) | none yet | none yet |
+| review-fix attempt (Restate pilot) | `GithubReviewFixWorker.launch` (`src/review-fix-worker.ts`); callback tokens from `callbackInputs` (`src/restate/review-fix-production.ts`) | `ContainerReviewFixWorker.launch` through `dispatchFlyGapfill` | `ContainerReviewFixWorker.launch` through `dispatchLocalGapfill` |
 | legacy review-fix queue | `processReviewFixQueue` (`src/index.ts`), runner mode `gha` | none: the queue has no Fly branch | `processReviewFixQueue`, runner mode `local`, through `dispatchLocalGapfill` |
 | kg-refresh | `createKgRefreshSenders(...)["github-actions"]` (`src/restate/kg-refresh-senders.ts`) | `["fly-machines"]`, through `launchKeptMachine` (`src/restate/kg-refresh-production.ts`) | `["local-docker"]` |
 
@@ -32,7 +32,7 @@ A run carries up to three tokens: result (`run_token` / `RUN_TOKEN`), progress (
 - Implementation: every backend gets result, progress and publication, minted by `mintLaunchTokens` (`src/runner-tokens.ts`). On GitHub Actions the publication token is sent only when the target workflow supports `run_publication_token`.
 - Gap-fill: every backend gets all three, minted once by `mintLaunchTokens` (phase `gap-analysis`). Fly and local send them through the carriers; GitHub Actions sends the publication token only when the target workflow supports `run_publication_token`.
 - Planning gets result and progress on every backend, minted by `mintLaunchTokens`. It never pushes, and the vending route refuses a planning publication token (`src/publication-token-vending.ts`).
-- Review-fix attempt (GitHub Actions) gets all three from its own attempt-scoped mint (`mintPreparedReviewFixToken`, claims carry an `attemptId`). The legacy queue mints with `mintLaunchTokens` and gets all three on GitHub Actions and local.
+- Review-fix attempt (all backends) gets all three from its own attempt-scoped mint (`mintPreparedReviewFixToken`, claims carry an `attemptId`). The legacy queue mints with `mintLaunchTokens` and gets all three on GitHub Actions and local.
 - kg-refresh: every backend gets all three from `mintLaunchTokens`, minted inside the `dispatch-N` step and kept in a closure, so no token enters the journal.
 - On Fly and local runs the runner prefers the machine nonce for its GitHub token (`src/runner-token.ts`), so the publication token on a Fly or local run is carried but unused until AII-1365. Fly and local runs push with the nonce.
 
@@ -52,7 +52,7 @@ Every cell runs three checks:
 
 | Check | Passes when |
 |---|---|
-| `envelope:<key>` | The decoded envelope has the same value for `<key>` as the GitHub Actions cell of the same run kind. The review-fix attempt has no peer on another backend: it is compared with the legacy review-fix GitHub Actions cell, except `issue`, `commentInstruction` and `reviewFix`. |
+| `envelope:<key>` | The decoded envelope has the same value for `<key>` as the GitHub Actions cell of the same run kind. The review-fix GitHub Actions cell is compared with the legacy queue except `issue`, `commentInstruction` and `reviewFix`; its Fly/local peers compare against that attempt cell except `issue` and `reviewFix`. |
 | `token:<audience>` | The set of tokens that reach the carrier as non-empty strings equals the set the run kind expects. |
 | `image` | With `.ai-implement/image.yml` naming an image that is not allowed, the path makes no launch call. Local Docker cells are out of scope. |
 
@@ -62,7 +62,7 @@ Today's gaps are data. `KNOWN_GAPS` in the test lists one row for each check tha
 
 A change that closes a gap deletes its rows in the same pull request. Do not add a row to make a new failure pass: the failure is the bug.
 
-Cells that are not run (review-fix attempt on Fly and local, the legacy queue on Fly) are listed in the test as data, each with its reason, and a test checks that every run kind and backend pair is a cell or is listed.
+Cells that are not run (the legacy queue on Fly) are listed in the test as data, each with its reason, and a test checks that every run kind and backend pair is a cell or is listed.
 
 ## Ephemeral full access for Codex implementation (AII-1437)
 
@@ -92,3 +92,31 @@ Configured Codex implementation defaults to the pinned CLI's `--dangerously-bypa
 ## Per-job compute accounting
 
 Each `dispatch_log` row saves what billing needs when the job runs, because the mapping can change afterwards: `tracker_kind`, `issue_url`, the requested guest (`machine_cpu_kind`, `machine_cpus`, `machine_memory_mb`, read from the built Fly config), and `compute_started_at` / `compute_stopped_at` (epoch ms). Fly and local Docker stamp the start at launch and the stop when `destroyMachineRecorded`, `stopBackendRun` with `keep`, or the local remove path runs; the first stop wins, and a 404 falls back to `completed_at`. A durable-runner `destroyMachineRecorded` does not stamp a stop. GitHub Actions rows take `run_started_at` / `updated_at` from `getWorkflowRunStatus` once the run is `completed` and leave the machine size null. Issueless kg-refresh rows have no tracker kind or issue URL. Old rows keep nulls; nothing is backfilled.
+
+`ContainerReviewFixWorker` wraps the existing Fly/local gap-fill launch helpers for
+review-fix attempts. It creates a fresh execution named `review-fix-<48 hex characters of SHA-256(attemptId)>`
+(never a kept Fly machine), mints prepared callback tokens inside launch, and
+records the nonce and existing admission generation in a gap-analysis row without
+a PR URL. Reconciliation prefers that row's execution ID, otherwise requiring one
+exact name match. Local inspection requires Docker status `exited` and
+`running: false` before interpreting an exit code; other observed states retain
+attempt occupancy. A missing container reports failure. Successful exits read the
+current PR head. Managed projects are
+explicitly rejected on these backends pending AII-1770.
+
+`ReviewFixWorker` routes plans and execution identities by backend and reads the
+persisted attempt backend for reconciliation. Production composes all three workers; `selectedEntry` still admits only GitHub Actions until the separate backend admission rollout.
+
+Review-fix container cleanup runs inside the existing attempt `recordOutcome` step,
+after terminal confirmation on bound paths. It checks the persisted execution and
+admission generation, closes the dispatch row without releasing admission, and
+invalidates its nonce before destroying the Fly machine or removing the local
+container. Callback statuses are preserved. Fly 404 and Docker “No such container”
+count as done; other errors retry the outcome step. A retry skips already completed
+row writes and still retries removal. Admission releases in the existing release
+step. GHA outcome recording is unchanged; no journal step or live-GHA drain is added.
+
+An unbound `launch_unresolved` outcome records the unresolved launch without
+cleanup, even if the dispatch row already has a machine or container ID. There is
+no terminal confirmation: the resource, nonce and occupancy remain for operator
+recovery.

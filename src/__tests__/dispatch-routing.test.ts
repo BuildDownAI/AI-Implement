@@ -5,7 +5,7 @@ import type * as GateModule from "../dispatch-gate.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
-import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
 import { testDb } from "./helpers/test-db.js";
@@ -85,6 +85,12 @@ const planningIngress = vi.hoisted(() => ({ submit: vi.fn(), report: vi.fn() }))
 vi.mock("../restate/planning-run-client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../restate/planning-run-client.js")>();
   return { ...actual, createPlanningRunIngressClient: () => planningIngress };
+});
+
+const implementationIngress = vi.hoisted(() => ({ submit: vi.fn(), report: vi.fn() }));
+vi.mock("../restate/implementation-run-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../restate/implementation-run-client.js")>();
+  return { ...actual, createImplementationRunIngressClient: () => implementationIngress };
 });
 
 /** A Jira project's mapping, its tracker config as validation stores it, for the describes whose provider is Jira. */
@@ -466,7 +472,10 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
     vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue(makeScopedInstallationToken({ token: "gh-token" }));
-    vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
+    vi.mocked(localDocker.startLocalRunnerContainer).mockImplementation(async (input) => {
+      input.onBeforeLaunch?.();
+      throw new Error("docker run failed");
+    });
     const config = makeAppConfig({ anthropicApiKey: "sk-test" });
 
     await expect(
@@ -1649,4 +1658,145 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(activeRows()).toEqual([]);
   });
 
+});
+
+describe("poll implementation submission — ImplementationRun for every project", () => {
+  const issue = makeIssue({ identifier: "AII-1555", scopeKey: "AII" });
+  const config = makeAppConfig({ ...CALLBACK_CONFIG, runnerTokenSecret: "TOKEN_SENTINEL" });
+  const ctx = { execPath: "github-actions" as const, runnerMode: "default", baseBranch: "feature/group", baseBranchFieldValue: null as string | null };
+  let indexModule: typeof import("../index.js");
+  let dedup: typeof DedupModule;
+  let status: typeof import("../restate/status.js");
+  const rows = () => dedup.getDb().prepare("SELECT * FROM dispatch_admissions").all();
+
+  beforeEach(async () => {
+    const db = await testDb({ modules: {
+      indexModule: () => import("../index.js"), dedup: () => import("../dedup.js"),
+      status: () => import("../restate/status.js"),
+    } });
+    ({ indexModule, dedup, status } = db.modules);
+    status.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    implementationIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
+  });
+  afterEach(() => status.resetRestateStatus());
+
+  it.each(["github-actions", "fly-machines", "local-docker", "both"] as const)("submits %s with a schema-valid credential-free input", async (execPath) => {
+    const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
+    const { normalizeGithubActionsJobTimeoutMinutes } = await import("../github-actions-watchdog.js");
+    const mapping = jiraMapping("AII", { maxJobMinutes: 42 });
+    const log = vi.spyOn(console, "log");
+    await indexModule.submitImplementationRun(config, issue, mapping, { ...ctx, execPath });
+    const [key, input] = implementationIngress.submit.mock.calls[0];
+    expect(implementationRunInputSchema.parse(input)).toEqual(input);
+    expect(key).toMatch(/^[0-9a-f-]{36}$/);
+    const backend = execPath === "both" ? "github-actions" : execPath;
+    expect(input).toEqual({ dispatchId: key, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier,
+      backend, maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(42),
+      launchContext: { baseBranch: "feature/group", runnerMode: "default" } });
+    expect(JSON.stringify(input)).not.toContain("TOKEN_SENTINEL");
+    expect(log).toHaveBeenCalledWith(`[poll] Submitted ImplementationRun for AII-1555 dispatch=${key} backend=${backend} (accepted)`);
+    expect(rows()).toEqual([]);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+  });
+
+  describe.each([null, "legacy", "restate"] as const)("poll with stored lifecycle %s", (reviewFixLifecycle) => {
+    it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits through ImplementationRun on %s", async (executionMode) => {
+      fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+      const store = await import("../config.js");
+      const auth = await import("../github-app-auth.js");
+      const github = await import("../github.js");
+      const fly = await import("../fly-machines.js");
+      const docker = await import("../local-docker.js");
+      const runnerMode = executionMode === "local-docker" ? "local" : "default";
+      const mode = await import("../runner-mode.js");
+      mode.setRunnerMode(runnerMode);
+      vi.mocked(docker.sweepExitedLocalContainers).mockResolvedValue([]);
+      const mapping = jiraMapping("AII", { reviewFixLifecycle, executionMode: executionMode === "local-docker" ? "github-actions" : executionMode, defaultBranch: "release/poll", maxJobMinutes: 42 });
+      store.upsertMapping("AII", mapping);
+      expect(dedup.getDb().prepare("SELECT review_fix_lifecycle FROM mappings WHERE team_key = ?").get("AII"))
+        .toEqual({ review_fix_lifecycle: reviewFixLifecycle });
+      const provider = jiraProvider();
+      vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+        needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+      });
+      vi.mocked(auth.getInstallationToken).mockResolvedValue("TOKEN_SENTINEL");
+      const legacyCalls = (["dispatchGitHubActions", "dispatchFlyMachine", "dispatchLocalDocker", "dispatchBothMode"] as const)
+        .map((name) => vi.spyOn(indexModule, name));
+      // Same-module calls can bypass export spies; the launch API spies also catch those calls.
+      const launchCalls = [github.postWorkflowDispatch, fly.createMachine, docker.startLocalRunnerContainer];
+      for (const call of launchCalls) vi.mocked(call).mockClear();
+
+      await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
+
+      expect(provider.fetchAIImplementSnapshot).toHaveBeenCalledTimes(1);
+      expect(implementationIngress.submit).toHaveBeenCalledTimes(1);
+      const [dispatchId, input] = implementationIngress.submit.mock.calls[0];
+      expect(input).toEqual({
+        dispatchId, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier,
+        backend: executionMode, maxJobMinutes: 42,
+        launchContext: { baseBranch: "release/poll", runnerMode },
+      });
+      const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
+      expect(implementationRunInputSchema.parse(input)).toEqual(input);
+      expect(JSON.stringify(input)).not.toContain("TOKEN_SENTINEL");
+      for (const call of [...legacyCalls, ...launchCalls]) expect(call).not.toHaveBeenCalled();
+      expect(rows()).toEqual([]);
+      expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+    });
+  });
+
+  it("skips unavailable Restate without admission or dedup", async () => {
+    status.setRestateStatus({ sidecar: { state: "starting" } });
+    const log = vi.spyOn(console, "log");
+    const mark = vi.spyOn(dedup, "markDispatched");
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), ctx);
+    expect(implementationIngress.submit).not.toHaveBeenCalled();
+    expect(rows()).toEqual([]);
+    expect(mark).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith("[poll] Implementation for AII-1555 skipped: Restate unavailable");
+  });
+
+  it("does not submit when admission refuses", async () => {
+    dedup.markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), ctx);
+    expect(implementationIngress.submit).not.toHaveBeenCalled();
+    expect(rows()).toEqual([]);
+  });
+
+  it.each(["unavailable", "not-found", "conflict"] as const)("handles submit status %s without reserving or marking dedup", async (submitStatus) => {
+    implementationIngress.submit.mockResolvedValue({ status: submitStatus });
+    const log = vi.spyOn(console, "log");
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), ctx);
+    const key = implementationIngress.submit.mock.calls[0][0];
+    const line = submitStatus === "unavailable" ? "Implementation for AII-1555 skipped: Restate unavailable"
+      : submitStatus === "not-found" ? "Implementation for AII-1555 skipped: the ImplementationRun service is not registered"
+      : `Existing ImplementationRun owns dispatch=${key}`;
+    expect(log).toHaveBeenCalledWith(`[poll] ${line}`);
+    expect(rows()).toEqual([]);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+  });
+
+  it("passes explicit branch context and leaves managed preparation to the workflow", async () => {
+    const managed = await import("../managed-dispatch-auth.js");
+    const prepare = vi.spyOn(managed, "prepareManagedDispatch");
+    prepare.mockClear();
+    const store = await import("../agent-config-store.js");
+    store.saveAccountProfileRevision({
+      profileId: "managed", identity: "Managed", revision: 1, agent: "codex", provider: "openai", authMode: "codex-subscription",
+    });
+    const stage = { agent: "codex" as const, provider: "openai" as const, model: "m", accountProfileId: "managed", invocationTimeoutMs: 60_000 };
+    store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
+    store.setProjectOptIn("AII", true);
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), {
+      ...ctx, runnerMode: "shadow", baseBranch: "release", baseBranchFieldValue: "release",
+    });
+    expect(implementationIngress.submit).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      launchContext: { baseBranch: "release", baseBranchFieldValue: "release", runnerMode: "shadow" },
+    }));
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it("the submission helper does not resolve a lifecycle switch", () => {
+    expect(indexModule.submitImplementationRun.toString()).not.toContain("resolveReviewFixLifecycle");
+  });
 });
