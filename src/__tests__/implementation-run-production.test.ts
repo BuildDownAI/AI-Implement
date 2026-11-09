@@ -65,6 +65,7 @@ vi.mock("../managed-dispatch-auth.js", () => ({
   classifyLaunchError: vi.fn(),
 }));
 
+import { releaseUnusedManagedPreparation } from "../agent-run-preparation.js";
 import { mintLaunchTokens } from "../runner-tokens.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { acquireDispatch } from "../dispatch-gate.js";
@@ -93,9 +94,9 @@ const getMapping = (team: string) => (team === "ENG" ? MAPPING : undefined);
 const title = (id: string) => `${IMPLEMENTATION_RUN_TITLE_PREFIX}${id}`;
 const BACKENDS = ["github-actions", "fly-machines", "local-docker"] as const;
 
-function githubRuns(runs: Array<Record<string, unknown>>, status = 200): FakeFetch {
+function githubRuns(runs: Array<Record<string, unknown>>, status = 200, replies = 1): FakeFetch {
   return fakeFetch({
-    [`GET /repos/Org/repo/actions/workflows/${MAPPING.workflowFile}/runs`]: [{ status, json: { workflow_runs: runs } }],
+    [`GET /repos/Org/repo/actions/workflows/${MAPPING.workflowFile}/runs`]: Array.from({ length: replies }, () => ({ status, json: { workflow_runs: runs } })),
   }).install();
 }
 
@@ -566,6 +567,72 @@ describe("production deps", () => {
       expect(prepareManagedDispatch).not.toHaveBeenCalled();
       expect(markDispatched).not.toHaveBeenCalled();
       expect(appendLogIfAbsent).not.toHaveBeenCalled();
+    });
+
+    describe("preparation finder before launch", () => {
+      function recovery(backend: "github-actions" | "fly-machines", change: string) {
+        const run = { ...INPUT, backend };
+        intents.set(`preparation:${run.dispatchId}`, { snapshot: { generation: 3, projectKey: run.teamKey, backend, mapping: MAPPING, flyApp: "original-app" }, done: false });
+        vi.mocked(readAdmission).mockReturnValue({ dispatchId: run.dispatchId, mappingKey: run.teamKey, backend, generation: 3, createdAt: DISPATCHED_AT,
+          releasedAt: null, executionId: null, lifecycleOwner: { kind: "restate", attemptId: run.dispatchId } } as never);
+        const { d, input } = compose({ getMapping: () => change === "missing" ? undefined : makeMapping({ owner: "Changed", repo: "changed" }) });
+        input.config.flySessionsApp = change === "missing" ? null : "changed-app";
+        vi.mocked(listMachines).mockResolvedValue([]);
+        githubRuns([], 200, 2);
+        return { d, run, input };
+      }
+
+      it.each(["missing", "changed", "opted-out"])("GHA uses frozen mapping after %s configuration", async change => {
+        const { d, run, input } = recovery("github-actions", change);
+        vi.mocked(isManagedProject).mockReturnValue(change !== "opted-out");
+        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBeNull();
+        expect(await d.launch(run)).toEqual({ outcome: "rejected" });
+        expect(releaseUnusedManagedPreparation).toHaveBeenCalledTimes(1);
+        expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
+      });
+
+      it.each(["missing", "changed"])("Fly uses frozen app after %s configuration", async change => {
+        const { d, run } = recovery("fly-machines", change);
+        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBeNull();
+        expect(await d.launch(run)).toEqual({ outcome: "rejected" });
+        expect(listMachines).toHaveBeenCalledWith("fly-token", "original-app");
+      });
+
+      it.each(["github-actions", "fly-machines"] as const)("%s lookup failure retains preparation and occupancy", async backend => {
+        const { d, run } = recovery(backend, "missing");
+        githubRuns([], 503);
+        vi.mocked(listMachines).mockRejectedValue(new Error("lookup failed"));
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow();
+        expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
+        expect(releaseByDispatchId).not.toHaveBeenCalled();
+      });
+
+      it.each(["github-actions", "fly-machines"] as const)("%s existing execution prevents cleanup", async backend => {
+        const { d, run } = recovery(backend, "missing");
+        githubRuns([{ id: 42, display_title: title(run.issueIdentifier), created_at: new Date(DISPATCHED_AT).toISOString() }], 200, 2);
+        vi.mocked(listMachines).mockResolvedValue([{ id: "42", name: implementationFlyMachineName(run.issueIdentifier), created_at: new Date(DISPATCHED_AT).toISOString() }] as never);
+        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBe("42");
+        expect(await d.launch(run)).toEqual({ outcome: "unknown" });
+        expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
+      });
+
+      it.each(["generation", "owner", "attempt", "dispatch", "project", "backend", "released", "bound"])("%s mismatch cannot authorize adoption or cleanup", async mismatch => {
+        const { d, run } = recovery("github-actions", "missing");
+        const admission = { ...readAdmission(run.dispatchId)! };
+        if (mismatch === "generation") admission.generation++;
+        if (mismatch === "owner") admission.lifecycleOwner = { kind: "legacy" };
+        if (mismatch === "attempt") admission.lifecycleOwner = { kind: "restate", attemptId: "other" };
+        if (mismatch === "dispatch") admission.dispatchId = "other";
+        if (mismatch === "project") admission.mappingKey = "other";
+        if (mismatch === "backend") admission.backend = "local-docker";
+        if (mismatch === "released") admission.releasedAt = 123;
+        if (mismatch === "bound") admission.executionId = "42";
+        vi.mocked(readAdmission).mockReturnValue(admission);
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("preparation identity");
+        expect(await d.launch(run)).toEqual({ outcome: "unknown" });
+        expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
+        expect(updateJobRunId).not.toHaveBeenCalled();
+      });
     });
 
     it("Docker read failure never becomes backend absence", async () => {

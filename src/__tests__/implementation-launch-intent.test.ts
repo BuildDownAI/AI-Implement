@@ -82,6 +82,8 @@ it.each([
   expect(await captured.deps!.reserve(run)).toBe(true);
   void captured.deps!.launch(run);
   await stagedPromise;
+  const privateRows = m.dedup.getDb().prepare("SELECT snapshot FROM implementation_launch_intent WHERE dispatch_id IN (?, ?)").all(run.dispatchId, `preparation:${run.dispatchId}`);
+  for (const secret of [bearer, "REGISTRY-SENTINEL", "API-CREDENTIAL-SENTINEL", "APP-CREDENTIAL-SENTINEL", "CALLBACK-SENTINEL"]) expect(JSON.stringify(privateRows)).not.toContain(secret);
   if (preIntent) {
     expect(m.intent.implementationIntentStore().read(run.dispatchId)).toBeNull();
     const restarted = await db.reopen();
@@ -98,6 +100,9 @@ it.each([
       if (configuration === "terminal") restarted.log.updateJobStatus(id, "failed");
     }
     if (configuration === "existing") captured.liveContainer = "existing-container";
+    if (["unchanged", "missing", "opted-out", "provider-failure", "retry", "existing"].includes(configuration)) {
+      expect(await captured.deps!.findExistingRun(run, restarted.admission.read(run.dispatchId)!.createdAt)).toBe(configuration === "existing" ? "existing-container" : null);
+    }
     if (configuration === "retry") {
       sql.exec("CREATE TRIGGER fail_settlement BEFORE UPDATE ON model_credential_grants BEGIN SELECT RAISE(ABORT, 'settlement failed'); END");
       await expect(captured.deps!.launch(run)).rejects.toThrow("settlement failed");

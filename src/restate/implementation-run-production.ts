@@ -457,7 +457,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
     const preparation = store.readPreparation(run.dispatchId);
     const admission = readAdmission(run.dispatchId);
     if (preparation) {
-      if (!admission || admission.releasedAt !== null || admission.executionId !== null || admission.generation !== preparation.generation ||
+      if (!admission || admission.dispatchId !== run.dispatchId || admission.mappingKey !== run.teamKey || admission.backend !== run.backend ||
+          admission.releasedAt !== null || admission.executionId !== null || admission.generation !== preparation.generation ||
           admission.lifecycleOwner.kind !== "restate" || admission.lifecycleOwner.attemptId !== run.dispatchId ||
           preparation.projectKey !== run.teamKey || preparation.backend !== run.backend) {
         return { outcome: "unknown" };
@@ -638,8 +639,21 @@ export function createProductionImplementationRunServices(input: ImplementationR
     reserve,
     findExistingRun: async (run, dispatchedAt) => {
       const stored = implementationIntentStore().read<Intent>(run.dispatchId);
-      const frozenMapping = stored?.snapshot.context.mapping;
-      const find = createImplementationFindExistingRun({ getMapping: frozenMapping ? () => frozenMapping : getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: stored?.snapshot.flyApp ?? config.flySessionsApp }) });
+      const preparation = stored ? null : implementationIntentStore().readPreparation(run.dispatchId);
+      if (preparation) {
+        const admission = readAdmission(run.dispatchId);
+        // A preparation can freeze lookup identity only for its exact, still-unbound owner.
+        // Throw on stale identity: absence would let the workflow release another generation.
+        if (!admission || admission.dispatchId !== run.dispatchId || admission.mappingKey !== run.teamKey || admission.backend !== run.backend ||
+            admission.releasedAt !== null || admission.executionId !== null || admission.generation !== preparation.generation ||
+            admission.lifecycleOwner.kind !== "restate" || admission.lifecycleOwner.attemptId !== run.dispatchId ||
+            preparation.projectKey !== run.teamKey || preparation.backend !== run.backend) {
+          throw new Error(`managed preparation identity mismatch: ${run.dispatchId}`);
+        }
+      }
+      const frozenMapping = stored?.snapshot.context.mapping ?? preparation?.mapping;
+      const flyApp = stored ? stored.snapshot.flyApp ?? config.flySessionsApp : preparation ? preparation.flyApp : config.flySessionsApp;
+      const find = createImplementationFindExistingRun({ getMapping: frozenMapping ? () => frozenMapping : getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: flyApp }) });
       const id = await find(run, dispatchedAt);
       const row = getJobByDispatchId(run.dispatchId);
       if (id !== null && run.backend === GHA_BACKEND && row && row.runId === null && (row.status === "dispatched" || row.status === "running")) {
