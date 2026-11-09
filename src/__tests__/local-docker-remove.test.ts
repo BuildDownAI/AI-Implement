@@ -1,4 +1,5 @@
 import { execFile as rawExecFile } from "node:child_process";
+import { testTempRoot } from "./helpers/test-dir.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const archiveLocalContainerLogsBestEffortMock = vi.hoisted(() => vi.fn(async () => {}));
@@ -11,7 +12,7 @@ vi.mock("../local-job-logs.js", () => ({
   archiveLocalContainerLogsBestEffort: archiveLocalContainerLogsBestEffortMock,
 }));
 
-import { removeLocalContainer, stopLocalContainer } from "../local-docker.js";
+import { findLocalContainerIdByName, removeLocalContainer, startLocalRunnerContainer, stopLocalContainer } from "../local-docker.js";
 
 describe("removeLocalContainer", () => {
   beforeEach(() => {
@@ -81,4 +82,25 @@ describe("stopLocalContainer", () => {
     mockExec(Object.assign(new Error("failed"), { stderr: "Cannot connect to the Docker daemon" }));
     await expect(stopLocalContainer("c-1")).rejects.toThrow(/Cannot connect/);
   });
+});
+
+
+describe("findLocalContainerIdByName", () => {
+  it.each(["", "   "])("rejects an unreadable Docker identity %j", async (stdout) => {
+    vi.mocked(rawExecFile).mockImplementationOnce((_cmd: unknown, _args: unknown, cb: unknown) => {
+      (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, { stdout, stderr: "" });
+      return {} as ReturnType<typeof rawExecFile>;
+    });
+    await expect(findLocalContainerIdByName("implementation-dispatch")).rejects.toThrow("empty container identity");
+  });
+});
+
+
+it("an empty Docker launch response remains ambiguous and keeps its deterministic identity", async () => {
+  testTempRoot("docker-empty-response");
+  vi.mocked(rawExecFile).mockImplementationOnce((_cmd: unknown, _args: unknown, cb: unknown) => {
+    (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, { stdout: "", stderr: "" });
+    return {} as ReturnType<typeof rawExecFile>;
+  });
+  await expect(startLocalRunnerContainer({ image: "runner", containerName: "implementation-dispatch", issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "test", issueDescription: "test", owner: "Org", repo: "repo", defaultBranch: "main", githubToken: "test-token", sessionToken: "test-session", machineNonce: "test-nonce", anthropicApiKey: "test-api" })).rejects.toThrow("empty container identity");
 });

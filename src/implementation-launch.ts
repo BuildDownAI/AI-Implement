@@ -289,6 +289,7 @@ export async function launchImplementationRun(args: LaunchImplementationRunArgs)
 
 /** The per-launch values `dispatchSession` mints and hands to a session backend. In-process only. */
 export interface ImplementationSessionInput {
+  containerName?: string;
   sessionToken: string;
   machineNonce: string;
   runnerCallbackUrl: string;
@@ -297,7 +298,7 @@ export interface ImplementationSessionInput {
   runPublicationToken?: string;
   managedAuth: ManagedLaunchDecision;
   /** Called immediately before `createMachine` / the container start. */
-  markLaunchAttempted: () => void;
+  markLaunchAttempted: (metadata?: { sessionImage: string; machineSize?: MachineSize; computeStartedAt: number }) => void;
 }
 
 export interface LaunchImplementationSessionArgs {
@@ -430,7 +431,7 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
     console.log(`[poll] process-level secrets for ${issue.identifier}: [${secretNames.join(", ")}]`);
   }
 
-  markLaunchAttempted();
+  markLaunchAttempted({ sessionImage: resolvedImage, machineSize: guestSize(machineConfig), computeStartedAt: Date.now() });
   const machine = await createMachine(flyToken, flyApp, machineConfig);
 
   const tag = shadow ? "shadow fly-machines" : "fly-machines";
@@ -486,6 +487,8 @@ export async function launchImplementationLocalSession(args: LaunchImplementatio
 
   const localRunnerInput: StartLocalContainerInput = {
     image: config.localRunnerImage,
+    containerName: input.containerName,
+    onBeforeLaunch: () => markLaunchAttempted({ sessionImage: config.localRunnerImage, computeStartedAt: Date.now() }),
     issueId: issue.id,
     issueIdentifier: issue.identifier,
     issueTitle: issue.title,
@@ -513,7 +516,6 @@ export async function launchImplementationLocalSession(args: LaunchImplementatio
   // Reserved extraEnv names and legacy credentials fail here, before the grant is marked launched.
   if (protectedModelAuth) validateProtectedLocalInput(localRunnerInput, protectedModelAuth);
 
-  markLaunchAttempted();
   const container = await startLocalRunnerContainer(localRunnerInput);
 
   return {

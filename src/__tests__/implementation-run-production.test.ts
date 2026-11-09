@@ -5,7 +5,20 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import { makeJob, makeMapping } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { makeLaunchDecision, makeSnapshot, SENTINEL_BEARER } from "./helpers/fixtures/configured-run.js";
+import { buildRunConfig } from "../run-config.js";
 
+const intents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: boolean }>());
+vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationIntentStore: () => ({
+  readPreparation: (id: string) => intents.get(`preparation:${id}`)?.snapshot ?? null,
+  writePreparation: (id: string, snapshot: unknown) => { if (!intents.has(`preparation:${id}`)) intents.set(`preparation:${id}`, { snapshot: structuredClone(snapshot), done: false }); },
+  read: (id: string) => intents.get(id) ?? null,
+  write: (id: string, snapshot: unknown) => { if (!intents.has(id)) intents.set(id, { snapshot: structuredClone(snapshot), done: false }); },
+  accept: (id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent.snapshot as object, { accepted: true }); },
+  complete: (id: string) => { const intent = intents.get(id); if (intent) intent.done = true; },
+  remove: (id: string) => intents.delete(id),
+}) }));
+vi.mock("../agent-run-preparation.js", () => ({ releaseRejectedLaunch: vi.fn(), loadStoredSnapshot: vi.fn().mockReturnValue(null), releaseUnusedManagedPreparation: vi.fn().mockReturnValue({ complete: true }) }));
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/implementation-run-workflow.js")>()),
@@ -36,7 +49,7 @@ vi.mock("../fly-machines.js", () => ({
   getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
   generateSessionToken: () => "SESSION-TOKEN", generateMachineNonce: () => "MACHINE-NONCE",
 }));
-vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn() }));
+vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn().mockResolvedValue(null) }));
 vi.mock("../dispatch-admission.js", () => ({ read: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../runner-tokens.js", () => ({
@@ -52,19 +65,23 @@ vi.mock("../managed-dispatch-auth.js", () => ({
   classifyLaunchError: vi.fn(),
 }));
 
+import { releaseUnusedManagedPreparation } from "../agent-run-preparation.js";
+import { mintLaunchTokens } from "../runner-tokens.js";
+import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { acquireDispatch } from "../dispatch-gate.js";
 import { cancelWorkflowRun, getPullRequestState, getWorkflowRunStatus } from "../github.js";
 import { appendLogIfAbsent, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
 import { markDispatched } from "../dedup.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
-import { inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
+import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
 import { classifyLaunchError, isManagedProject, prepareManagedDispatch, settleLaunch } from "../managed-dispatch-auth.js";
 import {
   IMPLEMENTATION_RUN_TITLE_PREFIX,
   createImplementationFindExistingRun,
   createProductionImplementationRunServices,
   implementationFlyMachineName,
+  implementationLocalContainerName,
   type ImplementationRunProductionInput,
 } from "../restate/implementation-run-production.js";
 
@@ -77,9 +94,9 @@ const getMapping = (team: string) => (team === "ENG" ? MAPPING : undefined);
 const title = (id: string) => `${IMPLEMENTATION_RUN_TITLE_PREFIX}${id}`;
 const BACKENDS = ["github-actions", "fly-machines", "local-docker"] as const;
 
-function githubRuns(runs: Array<Record<string, unknown>>, status = 200): FakeFetch {
+function githubRuns(runs: Array<Record<string, unknown>>, status = 200, replies = 1): FakeFetch {
   return fakeFetch({
-    [`GET /repos/Org/repo/actions/workflows/${MAPPING.workflowFile}/runs`]: [{ status, json: { workflow_runs: runs } }],
+    [`GET /repos/Org/repo/actions/workflows/${MAPPING.workflowFile}/runs`]: Array.from({ length: replies }, () => ({ status, json: { workflow_runs: runs } })),
   }).install();
 }
 
@@ -128,8 +145,17 @@ describe("findExistingRun", () => {
     expect(listMachines).not.toHaveBeenCalled();
   });
 
-  it("docker: no recorded id means null (the container name carries a timestamp)", async () => {
-    expect(await find({ ...INPUT, backend: "local-docker" }, DISPATCHED_AT)).toBeNull();
+  it("docker: identity is stable per dispatch, distinct across dispatches, and visible to the existing sweeper", () => {
+    const name = implementationLocalContainerName("dispatch-one");
+    expect(name).toMatch(/^ai-implement-/);
+    expect(implementationLocalContainerName("dispatch-one")).toBe(name);
+    expect(implementationLocalContainerName("dispatch-two")).not.toBe(name);
+  });
+
+  it("docker: discovers the exact dispatch-scoped name without a recorded id", async () => {
+    vi.mocked(findLocalContainerIdByName).mockResolvedValueOnce("local-id");
+    expect(await find({ ...INPUT, backend: "local-docker" }, DISPATCHED_AT)).toBe("local-id");
+    expect(findLocalContainerIdByName).toHaveBeenCalledWith(implementationLocalContainerName(INPUT.dispatchId));
   });
 
   it("fly: matches the session machine by name and creation time", async () => {
@@ -151,7 +177,7 @@ describe("findExistingRun", () => {
 });
 
 describe("production deps", () => {
-  const SENTINELS = ["secret-gh-token", "RUN-TOKEN", "PROGRESS-TOKEN", "PUBLICATION-TOKEN", "SESSION-TOKEN", "MACHINE-NONCE"];
+  const SENTINELS = ["secret-gh-token", "RUN-TOKEN", "PROGRESS-TOKEN", "PUBLICATION-TOKEN", "SESSION-TOKEN", "MACHINE-NONCE", "legacy-api-sentinel", "legacy-oauth-sentinel", SENTINEL_BEARER];
   const issue = { id: "i-1", identifier: "ENG-1", title: "T", scopeKey: "ENG", nativeStatus: "Todo" };
   const provider = {
     findByKey: vi.fn(), issueUrl: vi.fn((i: { identifier: string }) => `https://tracker.test/issue/${i.identifier}`),
@@ -161,7 +187,7 @@ describe("production deps", () => {
 
   function deps(overrides: Partial<ImplementationRunProductionInput> = {}) {
     const input: ImplementationRunProductionInput = {
-      config: { githubAppId: "1", githubAppPrivateKey: "k", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://o", runnerTokenSecret: "s" } as never,
+      config: { githubAppId: "1", githubAppPrivateKey: "k", anthropicApiKey: "legacy-api-sentinel", notifyType: "slack", notifyWebhookUrl: null, flySessionsToken: "fly-token", flySessionsApp: "fly-app", runnerCallbackBaseUrl: "https://o", runnerTokenSecret: "s" } as never,
       getMapping,
       resolveProvider: async () => provider as never,
       resolveRunnerImage: async () => undefined,
@@ -188,6 +214,7 @@ describe("production deps", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    intents.clear();
     vi.mocked(getJobByDispatchId).mockReset();
     provider.findByKey.mockResolvedValue(issue);
     vi.mocked(readAdmission).mockReturnValue({ dispatchId: "d-1", generation: 3, releasedAt: null } as never);
@@ -222,12 +249,186 @@ describe("production deps", () => {
     });
   });
 
+  describe("container eligibility in production preparation", () => {
+    it.each(["fly-machines", "local-docker"] as const)("%s: skips ineligible first dispatch before production backend reconciliation", async (backend) => {
+      const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
+      for (const failure of ["bedrock", "no-credentials", ...(backend === "fly-machines" ? ["no-fly-token", "no-fly-app"] : [])]) {
+        vi.clearAllMocks();
+        intents.clear();
+        vi.mocked(readAdmission).mockReturnValue(null);
+        // Even managed projects cannot launch unsupported Bedrock mappings.
+        vi.mocked(isManagedProject).mockReturnValue(failure === "bedrock");
+        const config = { ...deps().config,
+          anthropicApiKey: failure.startsWith("no-fly-") ? "legacy-api-sentinel" : null, claudeOAuthToken: null };
+        if (failure === "no-fly-token") config.flySessionsToken = null;
+        if (failure === "no-fly-app") config.flySessionsApp = null;
+        const { d, input } = compose({ config, getMapping: () => ({ ...MAPPING, provider: failure === "bedrock" ? "bedrock" : "anthropic" }) });
+        vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+        // Keep the production finder: a first dispatch must skip before any backend read.
+        const workflow = createImplementationRunWorkflow({ ...d, retentionMs: 1000 });
+        // The SDK exposes the callable routes at runtime, but its public definition type hides them.
+        const routes = (workflow as unknown as { workflow: {
+          run: (ctx: unknown, input: ImplementationRunInput) => Promise<unknown>;
+        } }).workflow;
+        const journal: unknown[] = [];
+        const ctx = {
+          key: INPUT.dispatchId, set: vi.fn(), console, date: { now: async () => Date.now() },
+          run: async (_name: string, action: () => Promise<unknown>) => {
+            const value = await action(); journal.push(value); return value;
+          },
+        };
+        expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "refused" });
+        expect(acquireDispatch).not.toHaveBeenCalled();
+        expect(releaseByDispatchId).not.toHaveBeenCalled();
+        expect(listMachines).not.toHaveBeenCalled();
+        expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
+        expect(input.launchImplementationRun).not.toHaveBeenCalled();
+        expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
+        expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
+        expect(getModelAuthRuntime).not.toHaveBeenCalled();
+        expect(prepareManagedDispatch).not.toHaveBeenCalled();
+        expect(mintLaunchTokens).not.toHaveBeenCalled();
+        expect(appendLogIfAbsent).not.toHaveBeenCalled();
+        expect(markDispatched).not.toHaveBeenCalled();
+        expect(updateJobStatus).not.toHaveBeenCalled();
+        expect(input.postDispatch).not.toHaveBeenCalled();
+        expect(provider.markImplementationFailed).not.toHaveBeenCalled();
+        for (const sentinel of SENTINELS) expect(JSON.stringify([INPUT, journal])).not.toContain(sentinel);
+      }
+    });
+
+    it.each(["fly-machines", "local-docker"] as const)("%s: workflow adopts a recorded run after configuration becomes ineligible", async (backend) => {
+      const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
+      vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "prior-run" }));
+      // Even without admission evidence, a recorded job must prevent the first-dispatch shortcut.
+      vi.mocked(readAdmission).mockReturnValue(null);
+      vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+      const { d, input } = compose({
+        config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null, flySessionsToken: null, flySessionsApp: null },
+        getMapping: () => ({ ...MAPPING, provider: "bedrock" }),
+      });
+      const readStatus = vi.fn().mockResolvedValue("ended");
+      const workflow = createImplementationRunWorkflow({
+        ...d, readModelPrices: undefined, retentionMs: 1000, readStatus,
+        finishJob: async () => ({}), cleanup: async () => {}, onOutcome: async () => {},
+      });
+      const routes = (workflow as unknown as { workflow: {
+        run: (ctx: unknown, input: ImplementationRunInput) => Promise<unknown>;
+      } }).workflow;
+      const ctx = {
+        key: INPUT.dispatchId, set: vi.fn(), console, date: { now: async () => Date.now() },
+        run: async (_name: string, action: () => Promise<unknown>) => action(),
+        promise: () => ({ get: () => ({ map: () => new Promise(() => {}) }) }),
+      };
+      expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "finalized" });
+      expect(readStatus).toHaveBeenCalledWith({ ...INPUT, backend }, "prior-run");
+      expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
+      expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
+      expect(listMachines).not.toHaveBeenCalled();
+    });
+
+    it.each(["missing-config", "backend-error", "found"] as const)("Fly recovery with admission and no job: %s remains fail-closed", async (scenario) => {
+      vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+      const { d } = compose({
+        config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null,
+          ...(scenario === "missing-config" ? { flySessionsToken: null } : {}) },
+        getMapping: () => ({ ...MAPPING, provider: "bedrock" }),
+      });
+      const run = { ...INPUT, backend: "fly-machines" as const };
+      expect(await d.reserve(run)).toBe(true);
+      if (scenario === "missing-config") {
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow(/FLY_SESSIONS/);
+      } else if (scenario === "backend-error") {
+        vi.mocked(listMachines).mockRejectedValueOnce(new Error("backend unavailable"));
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("backend unavailable");
+      } else {
+        vi.mocked(listMachines).mockResolvedValueOnce([{
+          id: "unacknowledged-run", name: implementationFlyMachineName(INPUT.issueIdentifier),
+          created_at: new Date(DISPATCHED_AT).toISOString(),
+        }] as never);
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("missing ordinary launch intent");
+      }
+      expect(releaseByDispatchId).not.toHaveBeenCalled();
+    });
+
+    it.each(BACKENDS)("%s: preserves managed, API and OAuth eligibility", async (backend) => {
+      for (const auth of ["managed", "api", "oauth"] as const) {
+        vi.clearAllMocks();
+        intents.clear();
+        vi.mocked(isManagedProject).mockReturnValue(auth === "managed");
+        vi.mocked(prepareManagedDispatch).mockResolvedValue(makeLaunchDecision(makeSnapshot(), backend).decision);
+        const { d } = compose({ config: {
+          ...deps().config,
+          anthropicApiKey: auth === "api" ? "legacy-api-sentinel" : null,
+          claudeOAuthToken: auth === "oauth" ? "legacy-oauth-sentinel" : null,
+        } });
+        vi.mocked(readAdmission).mockReturnValueOnce(null);
+        vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
+        expect(await d.reserve({ ...INPUT, backend })).toBe(true);
+        const result = await d.launch({ ...INPUT, backend });
+        expect(result).toMatchObject({ outcome: "accepted" });
+        expect(prepareManagedDispatch).toHaveBeenCalledTimes(auth === "managed" ? 1 : 0);
+        for (const sentinel of SENTINELS) expect(JSON.stringify([INPUT, result])).not.toContain(sentinel);
+      }
+    });
+
+    it("GHA keeps allowing Bedrock and credential-free unmanaged configuration without Fly sessions", async () => {
+      const { d } = compose({
+        config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null, flySessionsToken: null, flySessionsApp: null },
+        getMapping: () => ({ ...MAPPING, provider: "bedrock" }),
+      });
+      expect(await d.launch(INPUT)).toEqual({ outcome: "accepted", jobId: "4242" });
+    });
+
+    it.each(["fly-machines", "local-docker"] as const)("%s: managed refusals and holds still use managed preparation without environment credentials", async (backend) => {
+      for (const kind of ["refuse", "hold"] as const) {
+        vi.clearAllMocks();
+        intents.clear();
+        vi.mocked(isManagedProject).mockReturnValue(true);
+        vi.mocked(prepareManagedDispatch).mockResolvedValue({ kind, category: "configuration-error", code: "x" } as never);
+        const { d, input } = compose({ config: { ...deps().config, anthropicApiKey: null, claudeOAuthToken: null } });
+        expect(await d.launch({ ...INPUT, backend })).toEqual({ outcome: "rejected" });
+        expect(prepareManagedDispatch).toHaveBeenCalledTimes(1);
+        expect(provider.markImplementationFailed).toHaveBeenCalledTimes(kind === "refuse" ? 1 : 0);
+        expect(input.launchImplementationFlySession).not.toHaveBeenCalled();
+        expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
+        expect(mintLaunchTokens).not.toHaveBeenCalled();
+      }
+    });
+  });
+
   describe("launch", () => {
+    it.each(BACKENDS)("%s: runner configuration preserves issue limits and falls back to project defaults", async (backend) => {
+      const storedMapping = makeMapping({ maxTurns: 100, maxIterations: 10 });
+      for (const limits of [
+        { maxTurns: 20, maxIterations: 2 },
+        { maxTurns: 20 },
+        { maxIterations: 2 },
+        {},
+      ]) {
+        provider.findByKey.mockResolvedValue({ ...issue, ...limits });
+        const { d, input } = compose({ getMapping: () => storedMapping });
+        intents.clear();
+        expect(await d.launch({ ...INPUT, backend })).toMatchObject({ outcome: "accepted" });
+        const launch = backend === "github-actions" ? input.prepareImplementationLaunch : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
+        const args = vi.mocked(launch).mock.calls[0][0];
+        const runnerConfig = buildRunConfig({
+          issue: args.issue, mapping: args.mapping, runnerPhase: "implementation", retryPolicy: null,
+        });
+        expect(runnerConfig).toMatchObject({
+          maxTurns: limits.maxTurns ?? 100,
+          maxIterations: limits.maxIterations ?? 10,
+        });
+        expect(storedMapping).toMatchObject({ maxTurns: 100, maxIterations: 10 });
+      }
+    });
+
     it.each(BACKENDS)("%s: failed and empty price reads still launch without prices", async (backend) => {
       for (const read of [async () => { throw new Error("cache unavailable"); }, async () => ({ prices: [], fetchedAt: null })]) {
         const { d, input } = compose();
         const prices = await readOptionalModelPrices(read);
         expect(prices).toBeUndefined();
+        intents.clear();
         expect(await d.launch({ ...INPUT, backend }, prices)).toMatchObject({ outcome: "accepted" });
         const launch = backend === "github-actions" ? input.prepareImplementationLaunch : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
         expect(vi.mocked(launch).mock.calls.at(-1)?.[0].modelPrices).toBeUndefined();
@@ -307,6 +508,7 @@ describe("production deps", () => {
 
     it("github: a throw in the preparation returns rejected; a throw after the launch call propagates", async () => {
       expect(await compose({ prepareImplementationLaunch: vi.fn().mockRejectedValue(new Error("mint")) as never }).d.launch(INPUT)).toEqual({ outcome: "rejected" });
+      intents.clear(); // Independent dispatch scenario; the prior preparation is intentionally durable.
       await expect(compose({ launchImplementationRun: vi.fn().mockRejectedValue(new Error("lost ack")) as never }).d.launch(INPUT)).rejects.toThrow("lost ack");
       expect(appendLogIfAbsent).not.toHaveBeenCalled();
     });
@@ -322,6 +524,7 @@ describe("production deps", () => {
       vi.mocked(classifyLaunchError).mockReturnValueOnce("rejected");
       expect(await compose({ [key]: vi.fn().mockRejectedValue(new Error("no")) as never }).d.launch({ ...INPUT, backend })).toEqual({ outcome: "rejected" });
       expect(settleLaunch).toHaveBeenCalledWith({ kind: "legacy" }, "rejected", expect.anything());
+      intents.clear(); // Independent dispatch scenario.
       vi.mocked(classifyLaunchError).mockReturnValueOnce("unknown");
       await expect(compose({ [key]: vi.fn().mockRejectedValue(new Error("lost")) as never }).d.launch({ ...INPUT, backend })).rejects.toThrow("lost");
       expect(appendLogIfAbsent).not.toHaveBeenCalled();
@@ -349,9 +552,96 @@ describe("production deps", () => {
       expect(provider.findByKey).toHaveBeenCalledWith(INPUT.issueIdentifier, INPUT.teamKey);
     });
 
-    it("a failure after the row was written does not throw", async () => {
+    it("a failure after the row was written retries bookkeeping", async () => {
       const { d } = compose({ postDispatch: vi.fn().mockRejectedValue(new Error("tracker down")) });
-      expect(await d.launch(INPUT)).toEqual({ outcome: "accepted", jobId: "4242" });
+      await expect(d.launch(INPUT)).rejects.toThrow("tracker down");
+    });
+  });
+
+  describe("private launch recovery", () => {
+    it.each(BACKENDS)("%s: ambiguity prevents another preparation", async (backend) => {
+      const { d, input } = compose();
+      intents.set(INPUT.dispatchId, { snapshot: {}, done: false });
+      input.config.anthropicApiKey = null;
+      input.config.claudeOAuthToken = null;
+      expect(await d.launch({ ...INPUT, backend })).toEqual({ outcome: "unknown" });
+      expect(provider.findByKey).not.toHaveBeenCalled();
+      expect(prepareManagedDispatch).not.toHaveBeenCalled();
+      expect(markDispatched).not.toHaveBeenCalled();
+      expect(appendLogIfAbsent).not.toHaveBeenCalled();
+    });
+
+    describe("preparation finder before launch", () => {
+      function recovery(backend: "github-actions" | "fly-machines", change: string) {
+        const run = { ...INPUT, backend };
+        intents.set(`preparation:${run.dispatchId}`, { snapshot: { generation: 3, projectKey: run.teamKey, backend, mapping: MAPPING, flyApp: "original-app" }, done: false });
+        vi.mocked(readAdmission).mockReturnValue({ dispatchId: run.dispatchId, mappingKey: run.teamKey, backend, generation: 3, createdAt: DISPATCHED_AT,
+          releasedAt: null, executionId: null, lifecycleOwner: { kind: "restate", attemptId: run.dispatchId } } as never);
+        const { d, input } = compose({ getMapping: () => change === "missing" ? undefined : makeMapping({ owner: "Changed", repo: "changed" }) });
+        input.config.flySessionsApp = change === "missing" ? null : "changed-app";
+        vi.mocked(listMachines).mockResolvedValue([]);
+        githubRuns([], 200, 2);
+        return { d, run, input };
+      }
+
+      it.each(["missing", "changed", "opted-out"])("GHA uses frozen mapping after %s configuration", async change => {
+        const { d, run, input } = recovery("github-actions", change);
+        vi.mocked(isManagedProject).mockReturnValue(change !== "opted-out");
+        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBeNull();
+        expect(await d.launch(run)).toEqual({ outcome: "rejected" });
+        expect(releaseUnusedManagedPreparation).toHaveBeenCalledTimes(1);
+        expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
+      });
+
+      it.each(["missing", "changed"])("Fly uses frozen app after %s configuration", async change => {
+        const { d, run } = recovery("fly-machines", change);
+        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBeNull();
+        expect(await d.launch(run)).toEqual({ outcome: "rejected" });
+        expect(listMachines).toHaveBeenCalledWith("fly-token", "original-app");
+      });
+
+      it.each(["github-actions", "fly-machines"] as const)("%s lookup failure retains preparation and occupancy", async backend => {
+        const { d, run } = recovery(backend, "missing");
+        githubRuns([], 503);
+        vi.mocked(listMachines).mockRejectedValue(new Error("lookup failed"));
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow();
+        expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
+        expect(releaseByDispatchId).not.toHaveBeenCalled();
+      });
+
+      it.each(["github-actions", "fly-machines"] as const)("%s existing execution prevents cleanup", async backend => {
+        const { d, run } = recovery(backend, "missing");
+        githubRuns([{ id: 42, display_title: title(run.issueIdentifier), created_at: new Date(DISPATCHED_AT).toISOString() }], 200, 2);
+        vi.mocked(listMachines).mockResolvedValue([{ id: "42", name: implementationFlyMachineName(run.issueIdentifier), created_at: new Date(DISPATCHED_AT).toISOString() }] as never);
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("missing ordinary launch intent");
+        expect(await d.launch(run)).toEqual({ outcome: "unknown" });
+        expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
+      });
+
+      it.each(["generation", "owner", "attempt", "dispatch", "project", "backend", "released", "bound"])("%s mismatch cannot authorize adoption or cleanup", async mismatch => {
+        const { d, run } = recovery("github-actions", "missing");
+        const admission = { ...readAdmission(run.dispatchId)! };
+        if (mismatch === "generation") admission.generation++;
+        if (mismatch === "owner") admission.lifecycleOwner = { kind: "legacy" };
+        if (mismatch === "attempt") admission.lifecycleOwner = { kind: "restate", attemptId: "other" };
+        if (mismatch === "dispatch") admission.dispatchId = "other";
+        if (mismatch === "project") admission.mappingKey = "other";
+        if (mismatch === "backend") admission.backend = "local-docker";
+        if (mismatch === "released") admission.releasedAt = 123;
+        if (mismatch === "bound") admission.executionId = "42";
+        vi.mocked(readAdmission).mockReturnValue(admission);
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("preparation identity");
+        expect(await d.launch(run)).toEqual({ outcome: "unknown" });
+        expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
+        expect(updateJobRunId).not.toHaveBeenCalled();
+      });
+    });
+
+    it("Docker read failure never becomes backend absence", async () => {
+      vi.mocked(findLocalContainerIdByName).mockRejectedValueOnce(new Error("docker unavailable"));
+      const { d, input } = compose();
+      await expect(d.findExistingRun({ ...INPUT, backend: "local-docker" }, DISPATCHED_AT)).rejects.toThrow("docker unavailable");
+      expect(input.launchImplementationLocalSession).not.toHaveBeenCalled();
     });
   });
 

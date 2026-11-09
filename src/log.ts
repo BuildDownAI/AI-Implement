@@ -343,6 +343,8 @@ export function appendLog(entry: {
   /** Generation of the admission that owns this exact backend launch. */
   admissionGeneration?: number | null;
   dispatchNumber?: number;
+  /** Original launch intent time when recovering a lost acceptance. */
+  dispatchedAt?: number;
   machineNonce?: string;
   executionMode?: string;
   machineId?: string;
@@ -376,7 +378,7 @@ export function appendLog(entry: {
     entry.issueTitle ?? null,
     entry.teamKey ?? null,
     entry.repo ?? null,
-    Date.now(),
+    entry.dispatchedAt ?? Date.now(),
     entry.dispatchId ?? null,
     entry.admissionGeneration ?? null,
     dispatchNumber,

@@ -166,7 +166,7 @@ import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
-import { createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
+import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
@@ -461,7 +461,7 @@ async function reviewFixAccounting(
   return trackerAccounting(mapping, provider, { id: fix.issueId, identifier: fix.issueIdentifier });
 }
 
-async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+export async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
   if (!cycle) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
@@ -858,16 +858,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           // feature-branch-grouping fallback and must not trigger a comment).
           const implFieldValue = implValidated.branch;
 
-          if (execPath === "both") {
-            // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchBothMode(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else if (execPath === "local-docker") {
-            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else {
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          }
+          await submitImplementationRun(config, issue, mapping, {
+            execPath, runnerMode, baseBranch, baseBranchFieldValue: implFieldValue,
+          });
         }
       } catch (err) {
         console.error(`[poll] Error processing ${issue.identifier}:`, err);
@@ -1452,6 +1445,57 @@ export async function preparePlanningDispatch(
   }
 
   return { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
+}
+
+// Submit only safe launch context; credentials are resolved by the workflow at launch.
+export async function submitImplementationRun(
+  _config: AppConfig,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  ctx: {
+    execPath: ReturnType<typeof resolveExecutionPath>;
+    runnerMode: string;
+    baseBranch: string;
+    baseBranchFieldValue: string | null;
+  },
+): Promise<void> {
+  if (!restateCanServe()) {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: Restate unavailable`);
+    return;
+  }
+  const dispatchId = crypto.randomUUID();
+  const backend = ctx.execPath === "fly-machines" || ctx.execPath === "local-docker" ? ctx.execPath : "github-actions";
+  // Advisory only: the workflow's reserve step owns admission and deduplication.
+  const decision = canDispatch({
+    issueId: issue.id,
+    kind: "implementation",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+  });
+  if (!decision.ok) return;
+  const launchContext: Record<string, string> = {
+    [IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY]: ctx.baseBranch,
+    [IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY]: ctx.runnerMode,
+  };
+  if (ctx.baseBranchFieldValue) {
+    launchContext[IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY] = ctx.baseBranchFieldValue;
+  }
+  const submitted = await createImplementationRunIngressClient().submit(dispatchId, {
+    dispatchId, teamKey: issue.scopeKey, issueId: issue.id, issueIdentifier: issue.identifier,
+    launchContext, maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(mapping.maxJobMinutes), backend,
+  });
+  if (submitted.status === "unavailable") {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: Restate unavailable`);
+    return;
+  }
+  if (submitted.status === "not-found") {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: the ImplementationRun service is not registered`);
+    return;
+  }
+  console.log(`[poll] Submitted ImplementationRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+  if (submitted.status === "conflict") {
+    console.log(`[poll] Existing ImplementationRun owns dispatch=${dispatchId}`);
+  }
 }
 
 // Exported for direct testing of the GHA result-based admission release/hold branch —
@@ -5320,10 +5364,10 @@ async function main(): Promise<void> {
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
-  // The ImplementationRun workflow (AII-1557): registered, but no dispatch path submits it yet (AII-1555, AII-1554).
+  // The ImplementationRun workflow (AII-1557): registered; the poll submits first-time implementations for every project. Gap-fill routing follows in AII-1554.
   const implementationRunServices = createProductionImplementationRunServices({
     config,
-    resolveProvider: (mapping) => registry.forMapping(mapping),
+    resolveProvider: (mapping, recoveryScopeKey) => recoveryScopeKey ? registry.forRecovery(mapping, recoveryScopeKey) : registry.forMapping(mapping),
     resolveRunnerImage: resolveDispatchRunnerImage,
     isGroupingParentDispatch,
     fireBreakerTrip,
