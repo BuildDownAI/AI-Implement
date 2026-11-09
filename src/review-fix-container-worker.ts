@@ -60,15 +60,15 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
         reviewFix: { version: 1 as const, attemptId: plan.attemptId, installationId: plan.scope.installationId, repository: plan.scope.repository, prNumber: plan.scope.prNumber, deadlineAt: plan.deadlineAt, executionBackend: backend },
         runnerCallbackUrl: tokens.runner_callback_url, runToken: tokens.run_token, runProgressToken: tokens.run_progress_token, runPublicationToken: tokens.run_publication_token, commentInstruction: plan.taskText };
       let jobId: number | undefined;
-      const beforeLaunch = (nonce: string) => {
-        jobId = appendLogIfAbsent({ issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title, teamKey, repo: plan.scope.repository, dispatchId: plan.attemptId, admissionGeneration: admission.generation, executionMode: backend, machineNonce: nonce, phase: "gap-analysis", computeStartedAt: Date.now() });
+      const beforeLaunch = (nonce: string, machineSize?: Parameters<typeof appendLogIfAbsent>[0]["machineSize"]) => {
+        jobId = appendLogIfAbsent({ issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title, teamKey, repo: plan.scope.repository, dispatchId: plan.attemptId, admissionGeneration: admission.generation, executionMode: backend, machineNonce: nonce, machineSize, phase: "gap-analysis", computeStartedAt: Date.now() });
         staged = { id: jobId, nonce, generation: admission.generation };
         started = true;
       };
       let id: string;
       if (backend === "fly-machines") {
         const result = await dispatchFlyGapfill({ ...this.deps.fly, ...common, issue: { issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title }, owner: mapping.owner, repo: mapping.repo, issueIdentifier: issue.identifier, scopeKey: teamKey, allTeamKeys: Object.keys(getMappings()), decision: { kind: "legacy" },
-          runnerCallbackUrl: tokens.runner_callback_url ?? "", runToken: tokens.run_token ?? "", runProgressToken: tokens.run_progress_token ?? "", onBeforeLaunch: (_, n) => beforeLaunch(n) });
+          runnerCallbackUrl: tokens.runner_callback_url ?? "", runToken: tokens.run_token ?? "", runProgressToken: tokens.run_progress_token ?? "", onBeforeLaunch: (size, n) => beforeLaunch(n, size) });
         id = result.machine.id;
       } else {
         const result = await dispatchLocalGapfill({ ...this.deps.local, ...common, issue, retryPolicy: null, onBeforeLaunch: beforeLaunch });

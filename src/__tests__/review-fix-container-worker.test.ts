@@ -34,6 +34,22 @@ function seedLaunchIntent(s: Awaited<ReturnType<typeof setup>>) {
 }
 beforeEach(() => vi.clearAllMocks());
 const backends = ["fly-machines", "local-docker"] as const;
+it("persists the launched Fly guest size for accounting", async () => {
+  const s = await setup("fly-machines", "11111111-1111-1111-1111-111111111111");
+  s.config.upsertMapping("AII", makeMapping({ owner: "owner", repo: "repo", machineCpus: 4, machineMemoryMb: 8192 }));
+  expect(await s.instance.launch(s.plan)).toEqual({ status: "accepted", execution: s.execution });
+  const guest = vi.mocked(s.fly.createMachine).mock.calls[0][2].config.guest!;
+  expect(guest).toMatchObject({ cpus: 4, memory_mb: 8192 });
+  const { getDb } = await import("../dedup.js");
+  expect(getDb().prepare("SELECT machine_cpu_kind, machine_cpus, machine_memory_mb FROM dispatch_log WHERE dispatch_id = ?").get(s.plan.attemptId)).toEqual({
+    machine_cpu_kind: guest.cpu_kind, machine_cpus: guest.cpus, machine_memory_mb: guest.memory_mb,
+  });
+  vi.mocked(s.fly.getMachine).mockResolvedValue({ state: "stopped", events: [{ type: "exit", request: { exit_event: { exit_code: 0 } } }] } as Awaited<ReturnType<typeof s.fly.getMachine>>);
+  expect(await s.instance.inspectTerminal(s.execution)).toMatchObject({ reached: true });
+  const records = s.accounting.listJobAccounting({ includeUnsettled: true }).records;
+  expect(records).toHaveLength(1);
+  expect(records[0].compute).toMatchObject({ cpuKind: guest.cpu_kind, cpus: guest.cpus, memoryMb: guest.memory_mb });
+});
 for (const backend of backends) describe(backend, () => {
   for (const field of ["runner_callback_url", "run_token"] as const) {
     for (const value of [undefined, "", "   "]) it(`does not launch with ${field}=${JSON.stringify(value)}`, async () => {
