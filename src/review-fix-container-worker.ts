@@ -1,4 +1,5 @@
 /** Fresh, attempt-owned containers using the established gap-fill transports (ADR 037). */
+import { createHash } from "node:crypto";
 import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { read as readAdmission } from "./dispatch-admission.js";
@@ -23,6 +24,12 @@ export interface ContainerReviewFixWorkerDeps {
   /** Docker names are unique; the array seam also permits conservative duplicate handling. */
   localCandidates?: (name: string) => Promise<readonly string[]>;
   getPullRequestHeadSha?: typeof githubActionsReviewFixWorkerTransport.getPullRequestHeadSha;
+}
+
+// Hash the complete ID, including numbered re-admissions. 192 digest bits keep
+// names bounded (59 characters) without discarding identity-bearing suffixes.
+function containerName(attemptId: string): string {
+  return `review-fix-${createHash("sha256").update(attemptId).digest("hex").slice(0, 48)}`;
 }
 
 export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
@@ -54,7 +61,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       const tokens = await this.deps.callbackInputs(plan.attemptId);
       // Without a callback URL and result token, the runner cannot report an approvable result.
       if (!tokens.runner_callback_url?.trim() || !tokens.run_token?.trim()) return { status: "unknown" };
-      const runName = `review-fix-${plan.attemptId}`;
+      const runName = containerName(plan.attemptId);
       const issue = { id: `review-fix:${plan.attemptId}`, identifier: `review-fix-${plan.scope.prNumber}`, title: `Review-fix for ${plan.scope.repository}#${plan.scope.prNumber}`, description: plan.taskText };
       const common = { mapping, prNumber: plan.scope.prNumber, githubToken: credential.token, runName, dispatchId: plan.attemptId,
         reviewFix: { version: 1 as const, attemptId: plan.attemptId, installationId: plan.scope.installationId, repository: plan.scope.repository, prNumber: plan.scope.prNumber, deadlineAt: plan.deadlineAt, executionBackend: backend },
@@ -112,7 +119,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       if (!row?.machineNonce || row.admissionGeneration !== admission.generation || row.executionMode !== backend) return { status: "unknown" };
       let id = row.machineId;
       if (!id) {
-        const name = `review-fix-${attemptId}`;
+        const name = containerName(attemptId);
         const candidates = backend === "fly-machines"
           ? (await listMachines(this.deps.fly.flySessionsToken, this.deps.fly.flySessionsApp)).filter(m => m.name === name).map(m => m.id)
           : await (this.deps.localCandidates ?? (async (n) => { const found = await findLocalContainerIdByName(n); return found ? [found] : []; }))(name);
