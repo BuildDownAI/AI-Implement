@@ -7,14 +7,29 @@
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
 import { getDb } from "../../dedup.js";
+import { initMappingsTable } from "../../config.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
+import { initSettingsTable } from "../../runner-mode.js";
 import { initLogTable } from "../../log.js";
 import { toRecordedUsage } from "../../agent-usage.js";
 import type { OwnedRunReportResult } from "../../restate/owned-run-lifecycle.js";
 import type { RestateEnvironment } from "./harness.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi, onTestFinished } from "vitest";
 import type { DispatchAdmissionReleaseReason } from "../../dispatch-admission.js";
 import type { OwnedRunStatus } from "../../restate/owned-run-wait.js";
 import type { Job } from "../../log.js";
+import { createImplementationGapfillDependencies } from "../../restate/implementation-run-gapfill.js";
+import type { ImplementationRunProductionInput } from "../../restate/implementation-run-production.js";
+import * as gapfillLaunch from "../../gapfill-launch.js";
+import * as localGapfill from "../../local-gapfill.js";
+import * as gapfillDrain from "../../comment-gapfill-drain.js";
+import * as auth from "../../github-app-auth.js";
+import * as runnerTokens from "../../runner-tokens.js";
+import * as managedAuth from "../../managed-dispatch-auth.js";
+import * as admission from "../../dispatch-admission.js";
+import { enqueueCommentGapfill, getCommentGapfillItem } from "../../comment-gapfill-queue.js";
+import { getJobByDispatchId } from "../../log.js";
+import { makeMapping } from "../helpers/builders.js";
 import { makeJob } from "../helpers/builders.js";
 import { finishImplementationJob } from "../../restate/implementation-run-finish.js";
 import {
@@ -63,6 +78,8 @@ interface Scenario {
   cleanupGate?: Gate;
   /** Parks the first `stop` call. */
   stopGate?: Gate;
+  reserveImpl?: (input: ImplementationRunInput) => Promise<boolean>;
+  releaseImpl?: (dispatchId: string, reason: DispatchAdmissionReleaseReason) => void;
   launchImpl?: (input: ImplementationRunInput) => Promise<ImplementationLaunchResult>;
   /** Every effect call in order, one string per attempt (the shape the contract suite reads). */
   calls: string[];
@@ -109,7 +126,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
         sc.reserveTaken = true;
         await sc.reserveGate.wait();
       }
-      return !sc.faults.refuseReservation;
+      return sc.reserveImpl ? sc.reserveImpl(input) : !sc.faults.refuseReservation;
     },
     async findExistingRun(input) {
       const sc = scenarioOf(input.dispatchId);
@@ -174,6 +191,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
     async release(dispatchId, reason) {
       scenarios.get(dispatchId)?.calls.push("release");
       scenarios.get(dispatchId)?.events.push("release");
+      scenarioOf(dispatchId).releaseImpl?.(dispatchId, reason);
       releases.push({ dispatchId, reason });
     },
   };
@@ -249,6 +267,9 @@ describe("ImplementationRun durable workflow", () => {
   beforeAll(async () => {
     getDb();
     initLogTable();
+    initDispatchBreakerTable();
+    initSettingsTable();
+    initMappingsTable();
     [slow, window, deadline] = await Promise.all([
       startVariants([createImplementationRunWorkflow(makeDeps(SLOW))]),
       startVariants([createImplementationRunWorkflow(makeDeps(WINDOW))]),
@@ -269,7 +290,7 @@ describe("ImplementationRun durable workflow", () => {
   }
 
   /** Registers a scenario and starts `ImplementationRun.run`; `done` settles with the run's result. */
-  function begin(envs: Map<string, RestateEnvironment>, label: string, overrides: Partial<Scenario> = {}) {
+  function begin(envs: Map<string, RestateEnvironment>, label: string, overrides: Partial<Scenario> = {}, inputOverrides: Partial<ImplementationRunInput> = {}) {
     const dispatchId = `implementation-${label}-${counter++}`;
     const sc: Scenario = {
       launchResult: { outcome: "accepted", jobId: `job-${dispatchId}` },
@@ -283,7 +304,7 @@ describe("ImplementationRun durable workflow", () => {
     scenarios.set(dispatchId, sc);
     const url = baseUrl(envs, label);
     const input: ImplementationRunInput = {
-      dispatchId, teamKey: "ENG", issueId: `issue-${dispatchId}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions",
+      dispatchId, teamKey: "ENG", issueId: `issue-${dispatchId}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions", ...inputOverrides,
     };
     const done = callWorkflow<ImplementationRunResult>(url, "ImplementationRun", dispatchId, "run", input);
     // A scenario that expects `run` to fail reads `done` itself; keep the early rejection from being unhandled.
@@ -292,6 +313,77 @@ describe("ImplementationRun durable workflow", () => {
     const report = () => callWorkflow(url, "ImplementationRun", dispatchId, "report");
     return { dispatchId, sc, done, read, report };
   }
+
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("%s gap-fill finishes once and releases its reservation without journaling credentials", async backend => {
+    const label = labels[0]!;
+    const nonce = "NONCE-SENTINEL";
+    const bootstrap = "BOOTSTRAP-SENTINEL";
+    onTestFinished(() => { vi.restoreAllMocks(); });
+    const mapping = makeMapping({ owner: "Org", repo: "repo" });
+    const minted = vi.spyOn(runnerTokens, "mintLaunchTokens").mockReturnValue({ runToken: SECRET_TOKEN, runProgressToken: SECRET_TOKEN, runPublicationToken: SECRET_TOKEN });
+    vi.spyOn(auth, "getInstallationToken").mockResolvedValue(SECRET_TOKEN);
+    vi.spyOn(auth, "getScopedInstallationToken").mockResolvedValue({ token: SECRET_TOKEN } as Awaited<ReturnType<typeof auth.getScopedInstallationToken>>);
+    vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(true);
+    const takeBootstrap = vi.fn(() => ({ bearer: bootstrap }) as ReturnType<Extract<managedAuth.ManagedDispatchDecision, { kind: "launch" }>["takeBootstrap"]>);
+    const decision = { kind: "launch", dispatchId: "private", projectKey: "ENG", backend, snapshot: {} as never, fallbackModels: {}, grant: {} as never, takeBootstrap } as Extract<managedAuth.ManagedDispatchDecision, { kind: "launch" }>;
+    const managed = vi.spyOn(gapfillDrain, "resolveManagedDecision").mockResolvedValue(decision);
+    vi.spyOn(gapfillDrain, "gapfillAccounting").mockResolvedValue({ trackerKind: "linear", issueUrl: "https://tracker.test/ENG-1" });
+    const prepared = vi.spyOn(gapfillLaunch, "prepareGhaGapfillLaunch").mockImplementation(async args => {
+      expect(args.ghToken).toBe(SECRET_TOKEN);
+      expect(args.runToken).toBe(SECRET_TOKEN);
+      expect(args.decision).toBe(decision);
+      return { contract: "envelope", runnerImage: undefined, inputs: { token: args.runToken, nonce, bootstrap: takeBootstrap()!.bearer } };
+    });
+    const gha = vi.spyOn(gapfillLaunch, "dispatchGhaGapfill").mockImplementation(async args => {
+      expect(args.inputs).toEqual({ token: SECRET_TOKEN, nonce, bootstrap });
+      return { success: true, status: 200, runId: 987654 };
+    });
+    const fly = vi.spyOn(gapfillLaunch, "dispatchFlyGapfill").mockImplementation(async args => {
+      expect(args.githubToken).toBe(SECRET_TOKEN);
+      expect(args.runToken).toBe(SECRET_TOKEN);
+      expect(args.decision).toBe(decision);
+      expect(args.decision.kind === "launch" && args.decision.takeBootstrap()!.bearer).toBe(bootstrap);
+      args.onBeforeLaunch({} as never, nonce);
+      return { machine: { id: "fly-gapfill", nonce, bootstrap }, resolvedImage: "runner:test" } as unknown as Awaited<ReturnType<typeof gapfillLaunch.dispatchFlyGapfill>>;
+    });
+    const local = vi.spyOn(localGapfill, "dispatchLocalGapfill").mockImplementation(async args => {
+      expect(args.githubToken).toBe(SECRET_TOKEN);
+      expect(args.runToken).toBe(SECRET_TOKEN);
+      expect(args.managed?.decision).toBe(decision);
+      expect(args.managed!.decision.takeBootstrap()!.bearer).toBe(bootstrap);
+      args.onBeforeLaunch!(nonce);
+      return { containerId: "local-gapfill", containerName: args.runName!, runConfig: { bootstrap, nonce, token: SECRET_TOKEN } as never };
+    });
+    const production = createImplementationGapfillDependencies({ config: {
+      githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://callback.test", runnerTokenSecret: "secret",
+      flySessionsToken: SECRET_TOKEN, flySessionsApp: "sessions", sessionImage: "runner:test", localRunnerImage: "runner:test",
+    } } as ImplementationRunProductionInput, () => mapping);
+    const queueItemId = enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 900000 + counter, commenter: "human", instruction: "Fix review findings" });
+    const w = begin(slow, label, { status: "ended", row: makeJob({ status: "completed" }),
+      reserveImpl: async input => production.reserve(input),
+      releaseImpl: (id, reason) => { admission.releaseByDispatchId(id, reason); },
+      launchImpl: production.launch,
+    }, { backend, gapFill: { queueItemId, installationId: "123", repository: "Org/repo", prNumber: 42, prDispatchBudget: 5, humanRequested: true } });
+    expect(await w.done).toMatchObject({ reason: "finalized" });
+    expect(w.sc.finishCalls).toHaveLength(1);
+    expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
+    expect(admission.read(w.dispatchId)?.releasedAt).toEqual(expect.any(Number));
+    expect(getCommentGapfillItem(queueItemId)?.status).toBe("dispatched");
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ executionMode: backend });
+    expect(minted).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ dispatchId: w.dispatchId }));
+    expect(managed).toHaveBeenCalledTimes(1);
+    expect(takeBootstrap).toHaveBeenCalledTimes(1);
+    expect(prepared).toHaveBeenCalledTimes(backend === "github-actions" ? 1 : 0);
+    expect(gha).toHaveBeenCalledTimes(backend === "github-actions" ? 1 : 0);
+    expect(fly).toHaveBeenCalledTimes(backend === "fly-machines" ? 1 : 0);
+    expect(local).toHaveBeenCalledTimes(backend === "local-docker" ? 1 : 0);
+    expect(w.sc.launchCalls).toBe(1);
+    const env = slow.get(label)!;
+    const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}'`);
+    expect(rows.length).toBeGreaterThan(0);
+    const text = (await Promise.all(rows.map(async row => journalText(await journalEntries(env.adminAPIBaseUrl(), String(row.id)))))).join("\n");
+    for (const sentinel of [SECRET_TOKEN, nonce, bootstrap]) expect(text).not.toContain(sentinel);
+  }, 60_000);
 
   it.each(labels)("accepts an empty HTTP report body (%s)", async (label) => {
     const w = begin(slow, label);

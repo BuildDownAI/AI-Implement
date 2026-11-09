@@ -2,23 +2,27 @@
 import type { ImplementationRunProductionInput } from "./implementation-run-production.js";
 import { IMPLEMENTATION_RUN_TITLE_PREFIX } from "./implementation-run-production.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "./implementation-run-workflow.js";
-import type { RepoMapping } from "../config.js";
+import { getMappings, type RepoMapping } from "../config.js";
 import { acquire, read } from "../dispatch-admission.js";
 import { isParked } from "../dispatch-breaker.js";
 import { confirmCommentGapfillLaunch, getCommentGapfillLaunch, stageCommentGapfillLaunch, rejectCommentGapfillLaunch, CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
 import { buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, updateJobStatus, suppressStaleNotifications } from "../log.js";
+import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, updateJobStatus, suppressStaleNotifications, setJobMachineId } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
 import { defaultFetchSignal, dispatchWorkflow } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
-import { prepareGhaGapfillLaunch, dispatchGhaGapfill } from "../gapfill-launch.js";
+import { prepareGhaGapfillLaunch, dispatchGhaGapfill, dispatchFlyGapfill } from "../gapfill-launch.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
-import { settleLaunch, type ManagedDispatchDecision } from "../managed-dispatch-auth.js";
+import { settleLaunch, classifyLaunchError, isManagedProject, type ManagedDispatchDecision } from "../managed-dispatch-auth.js";
 import { persistedPreparationState, releaseUnconfirmedLaunch } from "../agent-run-preparation.js";
 import { trackerAccounting } from "../job-accounting.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "../runner-tokens.js";
+import { dispatchLocalGapfill } from "../local-gapfill.js";
+import { findLocalContainerIdByName } from "../local-docker.js";
+import { listMachines } from "../fly-machines.js";
+import { getRetryPolicy } from "../orchestrator-settings.js";
 
 // Kept private, as in implementation-launch: child credentials must be repository scoped.
 async function getTargetRepoToken(config: ImplementationRunProductionInput["config"], owner: string, repo: string): Promise<string> {
@@ -60,13 +64,14 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     const admission = read(run.dispatchId);
     if (!admission || admission.releasedAt !== null) throw new Error("no active gap-fill reservation");
     return { ...issue, teamKey: run.teamKey, repo: gap.repository, dispatchId: run.dispatchId,
-      admissionGeneration: admission.generation, executionMode: "github-actions" as const,
+      admissionGeneration: admission.generation, executionMode: run.backend,
       runnerMode: "default" as const, contract, phase: "gap-analysis" as const, trigger: "comment" as const, ...accounting };
   };
   // An intent records uncertainty, not acceptance, including a crash before the call.
-  const recordLaunch = async (run: ImplementationRunInput, runId?: number, existingRow = getJobByDispatchId(run.dispatchId), record?: Parameters<typeof appendLogIfAbsent>[0]) => {
+  const recordLaunch = async (run: ImplementationRunInput, runId?: number, existingRow = getJobByDispatchId(run.dispatchId), record?: Parameters<typeof appendLogIfAbsent>[0], machineId?: string) => {
     const row = existingRow;
     const jobId = row?.id ?? appendLogIfAbsent(record ?? getCommentGapfillLaunch(run.dispatchId)?.record ?? await launchRecord(run));
+    if (machineId) setJobMachineId(jobId, machineId);
     updateJobPrUrl(jobId, `https://github.com/${run.gapFill!.repository}/pull/${run.gapFill!.prNumber}`);
     if (runId !== undefined) {
       // Boot normalizes unbound GHA jobs to unknown. Restore only this open
@@ -98,7 +103,8 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     findExistingRun: async (run, dispatchedAt) => {
       if (getCommentGapfillLaunch(run.dispatchId)?.rejected) return null;
       const row = getJobByDispatchId(run.dispatchId);
-      if (row?.runId) { confirmCommentGapfillLaunch(run.dispatchId); await recordLaunch(run, undefined, row); return String(row.runId); }
+      if (run.backend !== "github-actions" && row?.machineId) { confirmCommentGapfillLaunch(run.dispatchId); await recordLaunch(run, undefined, row); return row.machineId; }
+      if (run.backend === "github-actions" && row?.runId) { confirmCommentGapfillLaunch(run.dispatchId); await recordLaunch(run, undefined, row); return String(row.runId); }
       // Only positive unused preparation evidence with no intent/job proves the
       // external call was never reached. Missing config or an empty list does not.
       if (!row && !getCommentGapfillLaunch(run.dispatchId) && persistedPreparationState(run.dispatchId) === "unused") return null;
@@ -111,6 +117,25 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         // Reconciliation precedes launch, so validate before credentials or lookup.
         // Let launch report an invalid initial target as a definite rejection.
         try { mapping = adoptionMapping = { ...initialTarget(run).mapping }; } catch { return null; }
+      }
+      if (run.backend !== "github-actions") {
+        // A fresh launch must reach preflight to reject missing Fly configuration.
+        // Existing uncertainty remains a lookup error, never permission to relaunch.
+        if (run.backend === "fly-machines" && !staged && !row && (!config.flySessionsToken || !config.flySessionsApp)) return null;
+        const name = `gap-fill-${run.dispatchId}`;
+        const id = run.backend === "fly-machines"
+          ? (await listMachines(config.flySessionsToken!, config.flySessionsApp!)).find(machine => machine.name === name)?.id ?? null
+          : await findLocalContainerIdByName(name);
+        if (!id) return null;
+        if (!staged) {
+          const record = await launchRecord(run, undefined, undefined, adoptionMapping);
+          stageCommentGapfillLaunch(run.dispatchId, { record: { ...record, computeStartedAt: Date.now(),
+            sessionImage: run.backend === "fly-machines" ? config.sessionImage : config.localRunnerImage },
+            target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, accepted: true });
+        }
+        confirmCommentGapfillLaunch(run.dispatchId);
+        await recordLaunch(run, undefined, row, undefined, id);
+        return id;
       }
       const res = await fetch(`https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`, {
         headers: { Authorization: `Bearer ${await token(mapping.owner)}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal(),
@@ -163,15 +188,28 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       }
       let decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
       let recoverySettlementFailed = false;
-      let prepared: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;
+      let prepared!: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;
+      let tokens: ReturnType<typeof mintLaunchTokens> | undefined;
+      let commentInstruction: string | undefined;
       let ghToken: string;
       let mapping: RepoMapping;
       const issue: { issueId: string; issueIdentifier: string; issueTitle?: string } = { issueId: run.issueId, issueIdentifier: run.issueIdentifier };
       try {
-        if (run.backend !== "github-actions") throw new Error("gap-fill backend not wired");
         const target = initialTarget(run);
         mapping = target.mapping;
         const { item } = target;
+        if (run.backend !== "github-actions") {
+          const backendLabel = run.backend === "fly-machines" ? "Fly Machines" : "local Docker";
+          const reason = run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)
+            ? "FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set"
+            : mapping.provider === "bedrock" ? "provider=bedrock not supported"
+            : !isManagedProject(run.teamKey) && !config.anthropicApiKey && !config.claudeOAuthToken ? "no API key configured" : null;
+          if (reason) {
+            console.error(`[comment-gapfill] Cannot dispatch ${run.issueIdentifier} via ${backendLabel}: ${reason}`);
+            markCommentGapfillProcessed(gap.queueItemId, "failed");
+            return { outcome: "rejected" };
+          }
+        }
         // The input carries identity only. Recover the same title the comment drain
         // uses, including PRs whose original dispatch has no PR URL recorded yet.
         let prLog = getLatestDispatchForPr(item.owner, item.repo, gap.prNumber);
@@ -199,13 +237,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           return { outcome: "rejected" };
         }
         decision = resolved;
-        const commentInstruction = buildCommentGapfillInstruction(item.instruction, item.commenter === CONFLICT_COMMENTER ? [] : listOpenReviewFindings(gap.repository, gap.prNumber).map(f => ({
+        commentInstruction = buildCommentGapfillInstruction(item.instruction, item.commenter === CONFLICT_COMMENTER ? [] : listOpenReviewFindings(gap.repository, gap.prNumber).map(f => ({
           finding_key: f.findingKey, source: f.source, severity: f.severity, path: f.path ?? null, line: f.line ?? null, body: f.body, url: f.url ?? null,
         })));
-        const tokens = config.runnerCallbackBaseUrl && config.runnerTokenSecret ? mintLaunchTokens({ issueId: run.issueId, mappingTeamKey: run.teamKey, phase: "gap-analysis", dispatchId: run.dispatchId,
+        tokens = config.runnerCallbackBaseUrl && config.runnerTokenSecret ? mintLaunchTokens({ issueId: run.issueId, mappingTeamKey: run.teamKey, phase: "gap-analysis", dispatchId: run.dispatchId,
           repository: gap.repository, ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes), secret: config.runnerTokenSecret }) : undefined;
         ghToken = run.backend === "github-actions" ? await token(mapping.owner) : await getTargetRepoToken(config, mapping.owner, mapping.repo);
-        prepared = await prepareGhaGapfillLaunch({ mapping, issue, item, ghToken, decision,
+        if (run.backend === "github-actions") prepared = await prepareGhaGapfillLaunch({ mapping, issue, item, ghToken, decision,
           runnerCallbackBaseUrl: config.runnerCallbackBaseUrl, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? "",
           runToken: tokens?.runToken ?? "", runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
           commentInstruction, resolveRunnerImage: (m, t) => input.resolveRunnerImage(config, m, t), checkContract: resolveWorkflowCapabilities });
@@ -218,12 +256,65 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       }
       let record: Awaited<ReturnType<typeof launchRecord>>;
       try {
-        record = await launchRecord(run, prepared.contract, issue);
+        record = await launchRecord(run, prepared?.contract, issue);
       } catch (err) {
         settleLaunch(decision, "rejected", runtime);
         markCommentGapfillProcessed(gap.queueItemId, "failed");
         console.error(`[implementation-run] gap-fill accounting failed dispatch=${run.dispatchId}:`, err);
         return { outcome: "rejected" };
+      }
+      if (run.backend !== "github-actions") {
+        let launchStarted = false;
+        let privateRecord: Parameters<typeof appendLogIfAbsent>[0] = { ...record,
+          sessionImage: run.backend === "fly-machines" ? config.sessionImage : config.localRunnerImage };
+        // The insert-once private intent captures the nonce at the launch boundary;
+        // only the outcome and backend id may leave this step for Restate.
+        const onBeforeLaunch = (nonce: string) => {
+          privateRecord = { ...privateRecord, machineNonce: nonce, computeStartedAt: Date.now() };
+          stageCommentGapfillLaunch(run.dispatchId, { record: privateRecord,
+            target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, accepted: false });
+          launchStarted = true;
+        };
+        let machineId: string;
+        try {
+          const common = { mapping, prNumber: gap.prNumber, githubToken: ghToken,
+            runName: `gap-fill-${run.dispatchId}`, dispatchId: run.dispatchId,
+            runnerCallbackUrl: config.runnerCallbackBaseUrl ?? "", runToken: tokens?.runToken ?? "",
+            runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
+            commentInstruction };
+          if (run.backend === "fly-machines") {
+            const result = await dispatchFlyGapfill({ ...common, issue, owner: mapping.owner, repo: mapping.repo,
+              issueIdentifier: run.issueIdentifier, scopeKey: run.teamKey, allTeamKeys: Object.keys(getMappings()),
+              flySessionsToken: config.flySessionsToken!, flySessionsApp: config.flySessionsApp!,
+              flySessionsRegion: config.flySessionsRegion, flyOrchestratorApp: config.flyOrchestratorApp,
+              sessionImage: config.sessionImage, runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+              tenantId: config.tenantId, anthropicApiKey: config.anthropicApiKey, claudeOAuthToken: config.claudeOAuthToken,
+              decision, onBeforeLaunch: (size, nonce) => { privateRecord.machineSize = size; onBeforeLaunch(nonce); } });
+            machineId = result.machine.id;
+            privateRecord.sessionImage = result.resolvedImage;
+          } else {
+            const modelAuthUrl = config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? "";
+            const result = await dispatchLocalGapfill({ ...common,
+              issue: { id: issue.issueId, identifier: issue.issueIdentifier, title: issue.issueTitle ?? issue.issueId,
+                description: issue.issueTitle ?? issue.issueId },
+              image: config.localRunnerImage ?? "ai-implement-runner:local", orchestratorUrl: modelAuthUrl,
+              anthropicApiKey: decision.kind === "launch" ? undefined : config.anthropicApiKey,
+              claudeOAuthToken: decision.kind === "launch" ? undefined : config.claudeOAuthToken,
+              retryPolicy: getRetryPolicy(), onBeforeLaunch,
+              ...(decision.kind === "launch" ? { managed: { decision, modelAuthUrl } } : {}) });
+            machineId = result.containerId;
+          }
+        } catch (err) {
+          const outcome = classifyLaunchError(run.backend, launchStarted, err);
+          if (outcome === "rejected" && launchStarted) rejectCommentGapfillLaunch(run.dispatchId, 0);
+          settleLaunch(decision, outcome, runtime);
+          if (outcome === "rejected") markCommentGapfillProcessed(gap.queueItemId, "failed");
+          else await recordLaunch(run, undefined, undefined, privateRecord);
+          return { outcome };
+        }
+        confirmCommentGapfillLaunch(run.dispatchId);
+        await recordLaunch(run, undefined, undefined, { ...privateRecord, machineId }, machineId);
+        return { outcome: "accepted", jobId: machineId };
       }
       // Persist only explicitly selected non-secret attribution before the external call.
       stageCommentGapfillLaunch(run.dispatchId, { record, target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, accepted: false });
