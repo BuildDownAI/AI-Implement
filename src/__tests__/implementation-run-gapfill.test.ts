@@ -370,6 +370,16 @@ it("reconstructs bookkeeping for a reconciled run without staging", async () => 
   expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "dispatch", contract: undefined }));
 });
 
+it("failed adoption snapshot persistence leaves bookkeeping untouched", async () => {
+  const { stageCommentGapfillLaunch } = await import("../comment-gapfill-queue.js");
+  vi.mocked(stageCommentGapfillLaunch).mockImplementationOnce(() => { throw new Error("snapshot unavailable"); });
+  runs([88]);
+  await expect(d.findExistingRun(run, 1000)).rejects.toThrow("snapshot unavailable");
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+  expect(attachJobRunIdIfMissing).not.toHaveBeenCalled();
+  expect(markCommentGapfillProcessed).not.toHaveBeenCalled();
+});
+
 it("a crash before dispatch leaves no durable intent and retry dispatches", async () => {
   vi.mocked(read).mockReturnValueOnce({ generation: 3, releasedAt: null } as never).mockImplementationOnce(() => { throw new Error("process interrupted before dispatch"); });
   expect(await d.launch(run)).toEqual({ outcome: "rejected" });
@@ -718,4 +728,51 @@ it("retains definite rejection across process loss before journaling and never r
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
   expect(fetch).not.toHaveBeenCalled();
   expect(JSON.stringify(reopened.dedup.getDb().prepare("SELECT recovery_json FROM comment_gapfill_launch").all())).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
+});
+
+it.each(["retarget", "remove"].flatMap(drift => ["insert", "binding"].map(failure => ({ drift, failure }))))("persists unstaged adoption across restart: $drift / $failure", async ({ drift, failure }) => {
+  for (const module of ["../agent-run-preparation.js", "../dedup.js", "../dispatch-admission.js", "../log.js", "../comment-gapfill-queue.js"]) vi.doUnmock(module);
+  const database = await testDb({ modules: {
+    production: () => import("../restate/implementation-run-production.js"), queue: () => import("../comment-gapfill-queue.js"),
+    log: () => import("../log.js"), dedup: () => import("../dedup.js"), admission: () => import("../dispatch-admission.js"),
+  } });
+  let m = database.modules;
+  const queueItemId = m.queue.enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 1234, commenter: "human", instruction: "COMMENT-SENTINEL" });
+  const req = { ...run, gapFill: { ...run.gapFill!, queueItemId } };
+  expect(m.admission.acquire({ dispatchId: req.dispatchId, mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 42 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: req.dispatchId }, cap: 10 }).ok).toBe(true);
+  m.log.appendLog({ issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "Frozen title", repo: "Org/repo", status: "completed" });
+  const db = m.dedup.getDb();
+  db.prepare("INSERT INTO model_credential_grants (grant_id, dispatch_id, snapshot_id, project_key, backend, audience, bearer_hash, scope_json, expires_at) VALUES ('adopted', 'dispatch', 'snapshot', 'ENG', 'gha', 'runner', 'hash', '{}', 9999999999999)").run();
+  db.prepare("UPDATE model_credential_grants SET consumed_at = 1 WHERE grant_id = 'adopted'").run();
+  db.exec(failure === "insert"
+    ? "CREATE TRIGGER fail_adoption BEFORE INSERT ON dispatch_log BEGIN SELECT RAISE(FAIL, 'adoption interrupted'); END"
+    : "CREATE TRIGGER fail_adoption BEFORE UPDATE OF run_id ON dispatch_log BEGIN SELECT RAISE(FAIL, 'adoption interrupted'); END");
+  runs([88]);
+  m.production.createProductionImplementationRunServices(input);
+  await expect((captured.deps as ImplementationRunDependencies).findExistingRun(req, 1000)).rejects.toThrow("adoption interrupted");
+  expect(m.queue.getCommentGapfillLaunch(req.dispatchId)).toMatchObject({ accepted: true, target: { owner: "Org", repo: "repo", workflowFile: mapping.workflowFile }, record: { issueTitle: "Frozen title" } });
+  expect(m.queue.getCommentGapfillItem(queueItemId)?.status).toBe("pending");
+  db.exec("DROP TRIGGER fail_adoption");
+  input.getMapping = () => drift === "remove" ? undefined : { ...mapping, owner: "Changed", repo: "different", workflowFile: "changed.yml" };
+  m = await database.reopen();
+  m.production.createProductionImplementationRunServices(input);
+  const deps = captured.deps as ImplementationRunDependencies;
+  runs([88]);
+  expect(await deps.findExistingRun(req, 1000)).toBe("88");
+  expect(fetch).toHaveBeenLastCalledWith(expect.stringContaining(`/Org/repo/actions/workflows/${mapping.workflowFile}/runs?`), expect.anything());
+  expect(await deps.findExistingRun(req, 1000)).toBe("88");
+  const job = m.log.getJobByDispatchId(req.dispatchId)!;
+  expect(job).toMatchObject({ issueTitle: "Frozen title", runId: 88 });
+  expect(m.dedup.getDb().prepare("SELECT count(*) AS count FROM dispatch_log WHERE dispatch_id = 'dispatch'").get()).toEqual({ count: 1 });
+  expect(m.queue.getCommentGapfillItem(queueItemId)?.status).toBe("dispatched");
+  await deps.readStatus(req, "88");
+  expect(getWorkflowRunStatus).toHaveBeenLastCalledWith("TOKEN-SENTINEL", "Org", "repo", 88);
+  expect(await deps.stop(req, "88")).toBe(true);
+  expect(cancelWorkflowRun).toHaveBeenLastCalledWith("TOKEN-SENTINEL", "Org", "repo", 88);
+  expect(getInstallationToken).toHaveBeenLastCalledWith("app", "key", "Org");
+  expect(m.dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'adopted'").get()).toEqual({ revoked_at: null });
+  expect(JSON.stringify(m.dedup.getDb().prepare("SELECT recovery_json FROM comment_gapfill_launch").all())).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
+  expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
+  expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+  expect(resolveManagedDecision).not.toHaveBeenCalled();
 });

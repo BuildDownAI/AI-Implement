@@ -8,7 +8,7 @@ import { isParked } from "../dispatch-breaker.js";
 import { confirmCommentGapfillLaunch, getCommentGapfillLaunch, stageCommentGapfillLaunch, rejectCommentGapfillLaunch, CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
 import { buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, suppressStaleNotifications } from "../log.js";
+import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, updateJobStatus, suppressStaleNotifications } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
 import { defaultFetchSignal, dispatchWorkflow } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
@@ -46,9 +46,8 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     return { mapping, item };
   };
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-  const launchRecord = async (run: ImplementationRunInput, contract?: "legacy" | "envelope", launchIssue?: { issueId: string; issueIdentifier: string; issueTitle?: string }) => {
+  const launchRecord = async (run: ImplementationRunInput, contract?: "legacy" | "envelope", launchIssue?: { issueId: string; issueIdentifier: string; issueTitle?: string }, mapping = mappingFor(run)) => {
     const gap = run.gapFill!;
-    const mapping = mappingFor(run);
     let prior = launchIssue ? null : getLatestDispatchForPr(mapping.owner, mapping.repo, gap.prNumber);
     if (!launchIssue && (prior?.issueId !== run.issueId || prior.issueTitle == null)) {
       prior = getLatestDispatchForIssueIdentifier(mapping.owner, mapping.repo, run.issueIdentifier);
@@ -69,7 +68,12 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     const row = existingRow;
     const jobId = row?.id ?? appendLogIfAbsent(record ?? getCommentGapfillLaunch(run.dispatchId)?.record ?? await launchRecord(run));
     updateJobPrUrl(jobId, `https://github.com/${run.gapFill!.repository}/pull/${run.gapFill!.prNumber}`);
-    if (runId !== undefined) attachJobRunIdIfMissing(jobId, runId);
+    if (runId !== undefined) {
+      // Boot normalizes unbound GHA jobs to unknown. Restore only this open
+      // exact-dispatch row so the guarded binding can finish after a restart.
+      if (row?.status === "unknown" && !row.runId) updateJobStatus(jobId, "dispatched");
+      attachJobRunIdIfMissing(jobId, runId);
+    }
     suppressStaleNotifications(run.issueId, jobId);
     const item = getCommentGapfillItem(run.gapFill!.queueItemId);
     if (item?.status === "pending" || item?.status === "dispatched") {
@@ -100,12 +104,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       if (!row && !getCommentGapfillLaunch(run.dispatchId) && persistedPreparationState(run.dispatchId) === "unused") return null;
       const staged = getCommentGapfillLaunch(run.dispatchId);
       let mapping;
+      let adoptionMapping: RepoMapping | undefined;
       if (staged || row) {
         mapping = staged?.target ?? mappingFor(run);
       } else {
         // Reconciliation precedes launch, so validate before credentials or lookup.
         // Let launch report an invalid initial target as a definite rejection.
-        try { mapping = initialTarget(run).mapping; } catch { return null; }
+        try { mapping = adoptionMapping = { ...initialTarget(run).mapping }; } catch { return null; }
       }
       const res = await fetch(`https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`, {
         headers: { Authorization: `Bearer ${await token(mapping.owner)}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal(),
@@ -117,6 +122,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       const matches = data.workflow_runs.filter(r => r.display_title === `${IMPLEMENTATION_RUN_TITLE_PREFIX}${run.issueIdentifier}` && r.created_at !== undefined && Date.parse(r.created_at) >= floor && !claimed.has(r.id));
       if (matches.length > 1) throw new Error("findExistingRun: multiple unclaimed gap-fill runs match");
       if (!matches.length) return null;
+      if (!staged) {
+        // Freeze the validated lookup target and allowlisted attribution before any
+        // adoption bookkeeping. Recovery must not consult a changed project mapping.
+        const record = await launchRecord(run, undefined, undefined, adoptionMapping);
+        stageCommentGapfillLaunch(run.dispatchId, { record,
+          target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, accepted: true });
+      }
       confirmCommentGapfillLaunch(run.dispatchId);
       await recordLaunch(run, matches[0].id);
       return String(matches[0].id);
