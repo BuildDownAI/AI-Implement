@@ -158,7 +158,7 @@ export async function resolveManagedDecision(
   identifier: string,
   beforeNonLaunch?: (decision: Exclude<ManagedDispatchDecision, { kind: "legacy" | "launch" }>) => void,
 ): Promise<Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> | null> {
-  if (!isManagedProject(req.projectKey)) return { kind: "legacy" };
+  if (!isManagedProject(req.projectKey, req.dispatchId)) return { kind: "legacy" };
   let decision: ManagedDispatchDecision;
   if (!opts.modelAuthRuntime) {
     decision = { kind: "refuse", category: "configuration-error", code: "phase_not_wired" };

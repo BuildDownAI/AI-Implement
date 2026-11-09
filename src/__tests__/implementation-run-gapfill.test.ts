@@ -506,7 +506,7 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
 
 });
 
-it.each(["unchanged", "missing", "opted-out"])("replays real managed preparation after SQLite restart with %s config", async configuration => {
+it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays real managed preparation after SQLite restart with %s config", async configuration => {
   for (const path of ["../dedup.js", "../dispatch-admission.js", "../log.js", "../comment-gapfill-queue.js", "../agent-run-preparation.js"]) vi.doUnmock(path);
   const database = await testDb({ modules: {
     production: () => import("../restate/implementation-run-production.js"),
@@ -531,7 +531,39 @@ it.each(["unchanged", "missing", "opted-out"])("replays real managed preparation
   m.config.setProjectOptIn("ENG", true);
   const actual = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
   const req = { dispatchId: "before-intent", projectKey: "ENG", backend: "github-actions" as const, owner: "Org", repo: "repo", workflowFile: "claude-implement.yml" };
-  const initial = await actual.prepareManagedDispatch(req, makeRuntime(m));
+  const initialRuntime = makeRuntime(m);
+  if (configuration === "snapshot-before-grant") initialRuntime.credentials.resolveProtectedSecret = () => "";
+  const initial = await actual.prepareManagedDispatch(req, initialRuntime);
+  if (configuration === "snapshot-before-grant") {
+    expect(initial.kind).toBe("refuse");
+    const frozen = m.prep.loadStoredSnapshot(req.dispatchId);
+    expect(frozen).not.toBeNull();
+    expect(m.dedup.getDb().prepare("SELECT * FROM model_credential_grants").all()).toEqual([]);
+    m.config.setProjectOptIn("ENG", false);
+    const reopened = await database.reopen();
+    const managed = await import("../managed-dispatch-auth.js");
+    const replay = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
+    vi.mocked(managed.isManagedProject).mockImplementation(replay.isManagedProject);
+    vi.mocked(managed.prepareManagedDispatch).mockImplementation(replay.prepareManagedDispatch);
+    const shared = await vi.importActual<typeof import("../comment-gapfill-drain.js")>("../comment-gapfill-drain.js");
+    const runtime = makeRuntime(reopened);
+    const admission = reopened.admission.acquire({ dispatchId: req.dispatchId, mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 42 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: req.dispatchId }, cap: 10 });
+    if (!admission.ok) throw new Error("expected admission");
+    // A fresh opted-out dispatch still uses legacy credentials, without persisting a snapshot.
+    expect(await shared.resolveManagedDecision({ modelAuthRuntime: runtime }, { id: 1 },
+      { ...req, dispatchId: "fresh-opted-out" }, admission, "ENG-1")).toEqual({ kind: "legacy" });
+    expect(reopened.prep.loadStoredSnapshot("fresh-opted-out")).toBeNull();
+    const decision = await shared.resolveManagedDecision({ modelAuthRuntime: runtime }, { id: 1 },
+      req, admission, "ENG-1");
+    expect(decision?.kind).toBe("launch");
+    if (decision?.kind !== "launch") throw new Error("frozen dispatch lost managed selection");
+    expect(decision.snapshot).toEqual(frozen);
+    expect(decision.takeBootstrap()).toBeDefined();
+    expect(reopened.dedup.getDb().prepare("SELECT dispatch_id FROM model_credential_grants").all()).toEqual([{ dispatch_id: req.dispatchId }]);
+    expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
+    expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+    return;
+  }
   if (initial.kind !== "launch") throw new Error(JSON.stringify(initial));
   expect(initial.takeBootstrap()).toBeDefined();
   expect(initial.takeBootstrap()).toBeUndefined();
