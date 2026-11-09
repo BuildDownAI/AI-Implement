@@ -154,3 +154,30 @@ Running the change before `ensureAccountingTriggers()` is not enough for this ta
 4. If the change drops a column that a trigger names (or renames one), follow section 5.
 5. Read the deploy paths in [deployment.md](deployment.md#deploy-paths). Remember that a
    rollback keeps the schema change (section 3).
+
+## Gap-fill dispatch uncertainty
+
+`src/comment-gapfill-queue.ts` owns `comment_gapfill_launch`, keyed by
+`dispatch_id`, with `recovery_json` containing only the original job attribution,
+workflow target and confirmed-acceptance flag. It freezes issue title, mapping
+identity, admission generation, accounting and launch contract. Instructions,
+credentials, prepared inputs and grant/bootstrap secrets are never stored here.
+
+This table is intentionally initialized lazily with `CREATE TABLE IF NOT EXISTS`
+on access, including recovery reads, so older databases can recover without a new
+boot caller. No `src/index.ts` change is required. The intent commits before the
+external dispatch attempt; acceptance is recorded separately before job insertion.
+A crash between intent and call is indistinguishable from an uncertain attempted
+call: both recover conservatively as unknown, retaining admission and preventing
+another preparation, grant or dispatch even when a successful listing is empty.
+Reconstructed recovery revokes an unconfirmed managed grant through exact-dispatch
+settlement using the grant’s persisted profile/generation bindings (deduplicated
+across stages). Incomplete settlement fails closed and is retried without another
+launch; confirmed acceptance or backend adoption preserves the grant.
+
+Definite rejection deletes only the intent and creates no job. Accepted and unknown
+intents must not be removed because a job or backend listing is absent. Coordinated
+retention with dispatch/admission records belongs to AII-1565; until that policy is
+implemented these intents are retained. Deadline/escape release policy remains
+AII-1787; this table does not change it. Schema deployment requires operator review;
+this change performs no live database migration.

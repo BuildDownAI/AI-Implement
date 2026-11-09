@@ -2,12 +2,13 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { makeMapping, makeJob } from "./helpers/builders.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../restate/implementation-run-production.js";
+const intents = vi.hoisted(() => new Map<string, unknown>());
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...await original<object>(), createImplementationRunWorkflow: (d: unknown) => { captured.deps = d; return {}; } }));
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => intents.set(id, value)), confirmCommentGapfillLaunch: vi.fn(), rejectCommentGapfillLaunch: vi.fn((id: string) => intents.delete(id)), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
 vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn() }));
@@ -43,6 +44,7 @@ let d: ImplementationRunDependencies;
 let input: ImplementationRunProductionInput;
 beforeEach(() => {
   vi.clearAllMocks();
+  intents.clear();
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [] }) })));
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(isParked).mockReturnValue(false);
@@ -336,21 +338,31 @@ it.each(["http", "unreadable"])("lookup remains fail-closed on %s failure", asyn
 import { testDb } from "./helpers/test-db.js";
 it("durably recovers accepted launch and shares terminal bookkeeping without duplicate jobs", async () => {
   vi.doUnmock("../dedup.js");
+  vi.doUnmock("../dispatch-admission.js");
   vi.doUnmock("../log.js");
   vi.doUnmock("../comment-gapfill-queue.js");
-  const { modules: { production, queue, log, dedup } } = await testDb({ modules: {
+  const database = await testDb({ modules: {
     production: () => import("../restate/implementation-run-production.js"), queue: () => import("../comment-gapfill-queue.js"),
-    log: () => import("../log.js"), dedup: () => import("../dedup.js"),
+    ownership: () => import("../model-session-ownership.js"), store: () => import("../model-session-store.js"), keys: () => import("../model-session-keys.js"),
+    log: () => import("../log.js"), dedup: () => import("../dedup.js"), admission: () => import("../dispatch-admission.js"),
   } });
+  const { production, queue, log, dedup } = database.modules;
   const { createProductionImplementationRunServices } = production;
   const { enqueueCommentGapfill, getCommentGapfillItem } = queue;
   const { appendLog, getJobByDispatchId } = log;
   const { getDb } = dedup;
   const db = getDb();
+  const grant = (id: string) => db.prepare("INSERT INTO model_credential_grants (grant_id, dispatch_id, snapshot_id, project_key, backend, audience, bearer_hash, scope_json, expires_at) VALUES (?, ?, 'snapshot', 'ENG', 'gha', 'runner', 'hash', '{}', 9999999999999)").run(id, id);
+  grant("dispatch");
   const queueItemId = enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 1234, commenter: "human", instruction: "COMMENT-SENTINEL" });
   const recoveryRun = { ...run, gapFill: { ...run.gapFill!, queueItemId } };
   appendLog({ issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "Original title", repo: "Org/repo", status: "completed" });
-  vi.mocked(read).mockReturnValue({ generation: 3, releasedAt: null, lifecycleOwner: { kind: "restate", attemptId: "dispatch" } } as never);
+  const reserve = (dispatchId: string, prNumber: number) => database.modules.admission.acquire({
+    dispatchId, mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber },
+    kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 10,
+  });
+  expect(reserve("dispatch", 42).ok).toBe(true);
+  const generation = database.modules.admission.read("dispatch")!.generation;
   vi.mocked(resolveManagedDecision).mockResolvedValue({ kind: "legacy" });
   vi.mocked(prepareGhaGapfillLaunch).mockResolvedValue({ contract: "envelope", runnerImage: undefined, inputs: { token: "TOKEN-SENTINEL" } });
   vi.mocked(dispatchGhaGapfill).mockImplementation(async () => {
@@ -362,16 +374,25 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   createProductionImplementationRunServices(input);
   await expect((captured.deps as ImplementationRunDependencies).launch(recoveryRun)).rejects.toThrow("crash before insert");
   expect(getJobByDispatchId("dispatch")).toBeNull();
-  expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'comment_gapfill_launch'").get()).toBeUndefined();
+  expect(db.prepare("SELECT recovery_json FROM comment_gapfill_launch").get()).toBeDefined();
   db.exec("DROP TRIGGER fail_job");
+  input.getMapping = () => ({ ...mapping, owner: "Changed", repo: "different", workflowFile: "changed.yml" });
+
   createProductionImplementationRunServices(input);
   const deps = captured.deps as ImplementationRunDependencies;
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [{ id: 88, display_title: "Claude AI Implementation — ENG-1", created_at: new Date(1000).toISOString() }] }) })));
+  vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ workflow_runs: [] }) } as Response);
+  expect(await deps.findExistingRun(recoveryRun, 1999)).toBeNull();
+  expect(await deps.launch(recoveryRun)).toEqual({ outcome: "unknown" });
+  expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
+  expect(JSON.stringify(db.prepare("SELECT recovery_json FROM comment_gapfill_launch").all())).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
   expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
   const job = getJobByDispatchId("dispatch")!;
-  expect(job).toMatchObject({ issueTitle: "Original title", phase: "gap-analysis", admissionGeneration: 3, runId: 88, prUrl: "https://github.com/Org/repo/pull/42", status: "running" });
+  expect(job).toMatchObject({ issueTitle: "Original title", phase: "gap-analysis", admissionGeneration: generation, runId: 88, prUrl: "https://github.com/Org/repo/pull/42", status: "running" });
   expect(db.prepare("SELECT trigger, tracker_kind FROM dispatch_log WHERE id = ?").get(job.id)).toEqual({ trigger: "comment", tracker_kind: "linear" });
   expect(getCommentGapfillItem(queueItemId)?.status).toBe("dispatched");
+  expect(db.prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = 'dispatch'").get()).toEqual({ revoked_at: null });
   // Recover the intermediate state where insert/PR link committed but run binding did not.
   db.prepare("UPDATE dispatch_log SET run_id = NULL, status = 'dispatched' WHERE id = ?").run(job.id);
   expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
@@ -384,4 +405,53 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(db.prepare("SELECT COUNT(*) AS n FROM dispatch_log WHERE dispatch_id = 'dispatch'").get()).toEqual({ n: 1 });
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
   expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(fetch).mock.calls.at(-1)?.[0]).toContain("Org/repo/actions/workflows/");
+
+  // Persist an intent without calling dispatch, then close SQLite and reconstruct modules.
+  const preCall = { ...recoveryRun, dispatchId: "pre-call" };
+  expect(reserve("pre-call", 43).ok).toBe(true);
+  const preCallAdmission = database.modules.admission.read("pre-call");
+  queue.stageCommentGapfillLaunch(preCall.dispatchId, {
+    record: { issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "Frozen title", dispatchId: "pre-call", teamKey: "ENG", repo: "Org/repo", admissionGeneration: 3, phase: "gap-analysis", trigger: "comment", contract: "envelope" },
+    target: { owner: "Org", repo: "repo", workflowFile: mapping.workflowFile }, accepted: false,
+  });
+  grant("pre-call");
+  const ownershipFor = (modules: typeof database.modules) => modules.ownership.createModelSessionOwnership({
+    store: modules.store.createModelSessionStore({ keys: modules.keys.createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-test-key" }), verifyOwner: modules.ownership.sessionOwnerVerifier, authorizeOperator: () => false }),
+    probe: () => "unknown",
+  });
+  const reserved = ownershipFor(database.modules).reserve({ dispatchId: "pre-call", profiles: [{ profileId: "managed-profile", authMode: "subscription" }] });
+  if (reserved.status !== "reserved") throw new Error("reservation failed");
+  const ownerGeneration = reserved.reservations[0]!.generation;
+  for (const stage of ["implementation", "review"]) db.prepare("INSERT INTO model_credential_grant_profiles VALUES ('pre-call', ?, 'managed-profile', 1, ?)").run(stage, ownerGeneration);
+  const reopened = await database.reopen();
+  const recoveredOwnership = ownershipFor(reopened);
+  const releaseOwner = vi.spyOn(recoveredOwnership, "releaseLaunchRejected");
+  releaseOwner.mockReturnValueOnce({ status: "rejected", reason: "invalid_state" });
+  vi.mocked(getModelAuthRuntime).mockReturnValue({ ownership: recoveredOwnership } as never);
+  reopened.production.createProductionImplementationRunServices(input);
+  const recovered = captured.deps as ImplementationRunDependencies;
+  vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ workflow_runs: [] }) } as Response);
+  expect(await recovered.findExistingRun(preCall, 1999)).toBeNull();
+  await expect(recovered.launch(preCall)).rejects.toThrow("settlement incomplete");
+  expect(reopened.dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'pre-call'").get()).toEqual({ revoked_at: null });
+  expect(reopened.log.getJobByDispatchId("pre-call")).toBeNull();
+  expect(JSON.stringify(await recovered.launch(preCall))).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
+  expect(await recovered.launch(preCall)).toEqual({ outcome: "unknown" });
+  expect(reopened.dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'pre-call'").get()).toEqual({ revoked_at: expect.any(Number) });
+  expect(reopened.dedup.getDb().prepare("SELECT recovery_status FROM model_profile_reservations WHERE dispatch_id = 'pre-call'").get()).toEqual({ recovery_status: "released" });
+  expect(reopened.admission.read("pre-call")).toEqual(preCallAdmission);
+  expect(reopened.log.getJobByDispatchId("pre-call")).toMatchObject({ issueTitle: "Frozen title", repo: "Org/repo", admissionGeneration: 3, contract: "envelope" });
+  expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
+  expect(resolveManagedDecision).toHaveBeenCalledTimes(1);
+
+  // Definite rejection removes this dispatch's intent without creating a ghost job.
+  const rejectedQueue = reopened.queue.enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 44, commentId: 5678, commenter: "human", instruction: "COMMENT-SENTINEL" });
+  const rejectedRun = { ...recoveryRun, dispatchId: "rejected", gapFill: { ...recoveryRun.gapFill!, prNumber: 44, queueItemId: rejectedQueue } };
+  expect(reopened.admission.acquire({ dispatchId: "rejected", mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 44 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: "rejected" }, cap: 10 }).ok).toBe(true);
+  vi.mocked(dispatchGhaGapfill).mockResolvedValueOnce({ success: false, status: 422, outcome: "rejected" });
+  expect(await recovered.launch(rejectedRun)).toEqual({ outcome: "rejected" });
+  expect(reopened.queue.getCommentGapfillLaunch("rejected")).toBeNull();
+  expect(reopened.queue.getCommentGapfillLaunch("pre-call")).not.toBeNull();
+  expect(reopened.log.getJobByDispatchId("rejected")).toBeNull();
 });

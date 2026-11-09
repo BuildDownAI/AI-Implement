@@ -773,6 +773,27 @@ export function releaseRejectedLaunch(
   return { complete, results };
 }
 
+/** Settle an unconfirmed reconstructed launch using only its persisted owner identity.
+ * No grant means a legacy launch; conflicting bindings fail closed in the normal seam.
+ */
+export function releaseUnconfirmedLaunch(
+  dispatchId: string,
+  deps: Pick<AgentRunPreparationDeps, "ownership" | "now">,
+): CleanupOutcome {
+  const grant = readGrant(dispatchId);
+  if (!grant) return { complete: true, results: [] };
+  const owners = new Map<string, number>();
+  for (const binding of grant.bindings) {
+    if (binding.ownerGeneration === undefined) continue;
+    if (owners.has(binding.profileId) && owners.get(binding.profileId) !== binding.ownerGeneration) {
+      return { complete: false, results: [] };
+    }
+    owners.set(binding.profileId, binding.ownerGeneration);
+  }
+  return releaseRejectedLaunch(dispatchId,
+    [...owners].map(([profileId, generation]) => ({ profileId, generation })), deps);
+}
+
 /**
  * Release after confirmed termination. Delegates to the ownership probe and checkpoint
  * policy: heartbeat freshness never releases, and `pending`/`held` outcomes keep ownership.
