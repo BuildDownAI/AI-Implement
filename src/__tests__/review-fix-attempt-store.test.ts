@@ -146,7 +146,7 @@ describe("deploy drain admission barrier", () => {
   });
 });
 
-function result(overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+function result(overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   return makeReviewFixResult({ ...SCOPE, ...overrides });
 }
 
@@ -942,6 +942,25 @@ describe("review-fix admin facade: cycle evidence projection", () => {
 });
 
 describe("backend execution ownership", () => {
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("keeps machine result intake disabled for %s attempts before binding", async (backend) => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const id = admitted.attempt.attemptId;
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, id);
+    const row = () => db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(id);
+    const before = row();
+    for (const executionBackend of ["fly-machines", "local-docker"] as const) {
+      const { githubRunId: _id, githubRunAttempt: _attempt, ...base } = makeReviewFixResult({
+        attemptId: id, ...SCOPE, deadlineAt: admitted.attempt.deadlineAt,
+      });
+      expect((await store.recordResult(id, { ...base, executionBackend }, Date.now())).status).toBe("stale");
+      expect(row()).toEqual(before);
+    }
+  });
+
   it.each(["github-actions", "fly-machines", "local-docker"] as const)("binds only matching identities for %s", async (backend) => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();

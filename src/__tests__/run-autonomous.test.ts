@@ -1290,6 +1290,36 @@ describe("runAutonomous", () => {
       errSpy.mockRestore();
     });
 
+    it.each(["fly-machines", "local-docker"] as const)("keeps %s result production disabled even with GitHub environment ids", async (executionBackend) => {
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ ...REVIEW_FIX_IDENTITY, executionBackend })));
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "555");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
+      errSpy.mockRestore();
+    });
+
     it("skips delivery and logs an explicit no-result outcome on a caught pipeline failure with no push at all — never an unmarked Legacy POST for a pilot attempt", async () => {
       stubReviewFixEnvelope();
       vi.stubEnv("RUN_TOKEN", "run-token");

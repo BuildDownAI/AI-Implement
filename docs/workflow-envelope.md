@@ -430,3 +430,21 @@ snapshot selections and source maps are unchanged. The envelope delivers the val
 `run_config.modelFallbacks`, and the runner uses them as described in
 [Pipeline architecture](pipeline-architecture.md). Before reverting to code that predates this field,
 clear fallback models from every stored configuration.
+
+
+### Review-fix machine result contract
+
+The optional review-fix marker field `executionBackend` accepts only
+`fly-machines` or `local-docker`; absence preserves the GitHub Actions wire
+shape. GitHub results require positive safe integer `githubRunId` and
+`githubRunAttempt`. Machine results carry the backend tag and `outputCommit`
+without either GitHub ID. Mixed shapes fail validation. Every result requires
+a full lowercase 40-character output commit SHA.
+
+`resultMatchesExecution` correlates GitHub IDs or matching machine backend tags.
+For machines, origin proof is the attempt-scoped result token plus launch-once,
+rather than a machine/container ID. This contract does not enable machine result
+production, intake admission, or publication. An old Fly/local runner drops the
+backend tag and, without GitHub IDs, reports no result; approval ends as
+`not_applicable` (fails closed). An old orchestrator with a newer runner retains
+the unchanged GitHub shape; machine launches remain a later slice.
