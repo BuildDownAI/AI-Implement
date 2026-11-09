@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { decodeRunConfig } from "../run-config.js";
 import { testDb } from "./helpers/test-db.js";
 import { makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
@@ -10,13 +11,33 @@ vi.mock("../repo-image.js", async (original) => ({ ...await original<typeof impo
 vi.mock("../local-docker.js", async (original) => ({ ...await original<typeof import("../local-docker.js")>(), startLocalRunnerContainer: vi.fn(), inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn() }));
 vi.mock("../backend-run.js", async (original) => ({ ...await original<typeof import("../backend-run.js")>(), stopBackendRun: vi.fn() }));
 
-async function setup(backend: "fly-machines" | "local-docker", attemptId = "attempt-1") {
+async function setup(backend: "fly-machines" | "local-docker", attemptId = "attempt-1", readmissions?: number) {
   const { modules: m } = await testDb({ modules: {
-    worker: () => import("../review-fix-container-worker.js"), config: () => import("../config.js"), admission: () => import("../dispatch-admission.js"), log: () => import("../log.js"), fly: () => import("../fly-machines.js"), docker: () => import("../local-docker.js"), control: () => import("../backend-run.js"), accounting: () => import("../job-accounting.js"), managed: () => import("../managed-dispatch-auth.js"),
+    store: () => import("../review-fix-attempt-store.js"), worker: () => import("../review-fix-container-worker.js"), config: () => import("../config.js"), admission: () => import("../dispatch-admission.js"), log: () => import("../log.js"), fly: () => import("../fly-machines.js"), docker: () => import("../local-docker.js"), control: () => import("../backend-run.js"), accounting: () => import("../job-accounting.js"), managed: () => import("../managed-dispatch-auth.js"),
   } });
-  m.config.upsertMapping("AII", makeMapping({ owner: "owner", repo: "repo" }));
+  const previousMode = process.env.RUNNER_MODE;
+  process.env.RUNNER_MODE = backend === "local-docker" ? "local" : "default";
+  onTestFinished(() => {
+    if (previousMode === undefined) delete process.env.RUNNER_MODE;
+    else process.env.RUNNER_MODE = previousMode;
+  });
+  m.config.upsertMapping("AII", makeMapping({ owner: "owner", repo: "repo", executionMode: "fly-machines" }));
   const scope = makeScopedPrIdentity({ repository: "owner/repo" });
-  m.admission.acquire({ dispatchId: attemptId, mappingKey: "AII", scope: { kind: "pr", issueId: "issue", installationId: String(scope.installationId), repository: scope.repository, prNumber: scope.prNumber }, kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId }, cap: 10 });
+  if (readmissions !== undefined) {
+    const store = new m.store.SqliteReviewFixAttemptStore();
+    let base = "";
+    for (let i = 0; i <= readmissions; i++) {
+      const admitted = await store.admit({ scope, feedback: { taskText: "fix findings", findings: [] }, jobTimeoutMinutes: 90 });
+      if (admitted.status !== "prepared") throw new Error(`Admission failed: ${admitted.reason}`);
+      expect(admitted.attempt.executionBackend).toBe(backend);
+      attemptId = admitted.attempt.attemptId;
+      if (i === 0) { base = attemptId; expect(base).toMatch(/^reviewfix-[0-9a-f]{64}$/); }
+      else expect(attemptId).toBe(`${base}-${i}`);
+      if (i < readmissions) expect(await store.releaseOwner(attemptId, "cancelled")).toEqual({ status: "released" });
+    }
+  } else {
+    m.admission.acquire({ dispatchId: attemptId, mappingKey: "AII", scope: { kind: "pr", issueId: "issue", installationId: String(scope.installationId), repository: scope.repository, prNumber: scope.prNumber }, kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId }, cap: 10 });
+  }
   const deps: ContainerReviewFixWorkerDeps = {
     credentials: { resolve: vi.fn().mockResolvedValue({ token: "sentinel-github", installationId: scope.installationId }) },
     callbackInputs: vi.fn().mockResolvedValue({ run_token: "sentinel-result", run_progress_token: "sentinel-progress", run_publication_token: "sentinel-publication", runner_callback_url: "https://callback" }),
@@ -24,13 +45,21 @@ async function setup(backend: "fly-machines" | "local-docker", attemptId = "atte
     local: { image: "runner", orchestratorUrl: "https://callback", anthropicApiKey: "key" },
     getPullRequestHeadSha: vi.fn().mockResolvedValue("a".repeat(40)),
   };
-  vi.mocked(m.fly.createMachine).mockResolvedValue({ id: "machine", name: "review-fix-attempt-1" } as Awaited<ReturnType<typeof m.fly.createMachine>>);
+  vi.mocked(m.fly.createMachine).mockResolvedValue({ id: "machine", name: expectedName(attemptId) } as Awaited<ReturnType<typeof m.fly.createMachine>>);
   vi.mocked(m.docker.startLocalRunnerContainer).mockImplementation(async input => { input.onBeforeLaunch?.(); return { containerId: "container", containerName: input.containerName! }; });
   const plan: WorkerLaunchPlan = { executionBackend: backend, attemptId, scope, taskText: "fix findings", deadlineAt: Date.now() + 60000 };
   return { ...m, deps, plan, instance: new m.worker.ContainerReviewFixWorker(deps), execution: { backend, runRef: backend === "fly-machines" ? "machine" : "container" } };
 }
+function expectedName(attemptId: string) {
+  return `review-fix-${createHash("sha256").update(attemptId).digest("hex").slice(0, 48)}`;
+}
+function createdName(s: Awaited<ReturnType<typeof setup>>) {
+  return s.plan.executionBackend === "fly-machines"
+    ? vi.mocked(s.fly.createMachine).mock.calls.at(-1)![2].name!
+    : vi.mocked(s.docker.startLocalRunnerContainer).mock.calls.at(-1)![0].containerName!;
+}
 function seedLaunchIntent(s: Awaited<ReturnType<typeof setup>>) {
-  s.log.appendLogIfAbsent({ issueId: "review-fix:attempt-1", dispatchId: "attempt-1", machineNonce: "sentinel-nonce", admissionGeneration: s.admission.read("attempt-1")!.generation, executionMode: s.plan.executionBackend, phase: "gap-analysis" });
+  s.log.appendLogIfAbsent({ issueId: `review-fix:${s.plan.attemptId}`, dispatchId: s.plan.attemptId, machineNonce: "sentinel-nonce", admissionGeneration: s.admission.read(s.plan.attemptId)!.generation, executionMode: s.plan.executionBackend, phase: "gap-analysis" });
 }
 beforeEach(() => vi.clearAllMocks());
 const backends = ["fly-machines", "local-docker"] as const;
@@ -51,6 +80,29 @@ it("persists the launched Fly guest size for accounting", async () => {
   expect(records[0].compute).toMatchObject({ cpuKind: guest.cpu_kind, cpus: guest.cpus, memoryMb: guest.memory_mb });
 });
 for (const backend of backends) describe(backend, () => {
+  it("bounds names for SQLite content IDs and preserves suffix and shared-prefix identity", async () => {
+    const names: string[] = [];
+    let base = "";
+    for (const suffix of [0, 1, 2]) {
+      const s = await setup(backend, undefined, suffix);
+      if (suffix === 0) base = s.plan.attemptId;
+      else expect(s.plan.attemptId).toBe(`${base}-${suffix}`);
+      expect(await s.instance.launch(s.plan)).toEqual({ status: "accepted", execution: s.execution });
+      const name = createdName(s);
+      expect(name).toBe(expectedName(s.plan.attemptId));
+      expect(name.length).toBeLessThanOrEqual(63);
+      expect(name).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+      names.push(name);
+    }
+    const other = await setup(backend, `${base.slice(0, -1)}${base.endsWith("0") ? "1" : "0"}`);
+    await other.instance.launch(other.plan);
+    names.push(createdName(other));
+    expect(new Set(names).size).toBe(4);
+    const repeated = await setup(backend, undefined, 0);
+    await repeated.instance.launch(repeated.plan);
+    expect(createdName(repeated)).toBe(names[0]);
+  });
+
   for (const field of ["runner_callback_url", "run_token"] as const) {
     for (const value of [undefined, "", "   "]) it(`does not launch with ${field}=${JSON.stringify(value)}`, async () => {
       const s = await setup(backend);
@@ -64,15 +116,16 @@ for (const backend of backends) describe(backend, () => {
     });
   }
   it("launches fresh execution with marker and required nonce row, without journaled credentials", async () => {
-    const s = await setup(backend);
+    const s = await setup(backend, undefined, 2);
     const prepared = await s.instance.prepare({ ...s.plan, findings: [], owner: s.plan.attemptId });
     expect(s.deps.callbackInputs).not.toHaveBeenCalled();
     const launch = await s.instance.launch(prepared);
     expect(launch).toEqual({ status: "accepted", execution: s.execution });
-    const row = s.log.getJobByDispatchId("attempt-1")!;
-    expect(row).toMatchObject({ machineId: s.execution.runRef, machineNonce: "sentinel-nonce", dispatchId: "attempt-1", admissionGeneration: s.admission.read("attempt-1")!.generation, phase: "gap-analysis", prUrl: null });
+    const row = s.log.getJobByDispatchId(s.plan.attemptId)!;
+    expect(row).toMatchObject({ machineId: s.execution.runRef, machineNonce: "sentinel-nonce", dispatchId: s.plan.attemptId, admissionGeneration: s.admission.read(s.plan.attemptId)!.generation, phase: "gap-analysis", prUrl: null });
     const request = backend === "fly-machines" ? vi.mocked(s.fly.createMachine).mock.calls[0][2] : vi.mocked(s.docker.startLocalRunnerContainer).mock.calls[0][0];
-    expect(JSON.stringify(request)).toContain("review-fix-attempt-1");
+    expect(createdName(s)).toBe(expectedName(s.plan.attemptId));
+    expect(s.deps.callbackInputs).toHaveBeenCalledWith(s.plan.attemptId);
     const envelope = backend === "fly-machines"
       ? vi.mocked(s.fly.createMachine).mock.calls[0][2].config.env!.AI_IMPLEMENT_RUN_CONFIG
       : vi.mocked(s.docker.startLocalRunnerContainer).mock.calls[0][0].extraEnv!.AI_IMPLEMENT_RUN_CONFIG;
@@ -82,16 +135,21 @@ for (const backend of backends) describe(backend, () => {
       deadlineAt: s.plan.deadlineAt, executionBackend: backend,
     });
     expect(JSON.stringify(request)).toContain("sentinel-result");
-    const reconciled = await s.instance.reconcile("attempt-1", s.plan.scope);
+    const restarted = new s.worker.ContainerReviewFixWorker(s.deps);
+    expect(await restarted.launch(s.plan)).toEqual({ status: "unknown" });
+    const reconciled = await restarted.reconcile(s.plan.attemptId, s.plan.scope);
     expect(reconciled).toEqual({ status: "found", execution: s.execution });
     expect(s.fly.listMachines).not.toHaveBeenCalled();
+    expect(s.log.getJobByDispatchId(s.plan.attemptId)).toEqual(row);
+    if (backend === "fly-machines") expect(s.fly.createMachine).toHaveBeenCalledTimes(1);
+    else expect(s.docker.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
     const outputs = JSON.stringify([prepared, launch, reconciled]);
     for (const sentinel of ["sentinel-nonce", "sentinel-result", "sentinel-progress", "sentinel-publication", "sentinel-github", "sentinel-bootstrap"]) expect(outputs).not.toContain(sentinel);
   });
   for (const failure of ["lost acknowledgement", "attachment failure"] as const) it(`recovers after ${failure} and worker restart`, async () => {
-    const s = await setup(backend);
+    const s = await setup(backend, undefined, 2);
     const assertIntent = () => {
-      expect(s.log.getJobByNonce("sentinel-nonce")).toMatchObject({ dispatchId: "attempt-1", machineId: null, status: "dispatched", admissionGeneration: s.admission.read("attempt-1")!.generation });
+      expect(s.log.getJobByNonce("sentinel-nonce")).toMatchObject({ dispatchId: s.plan.attemptId, machineId: null, status: "dispatched", admissionGeneration: s.admission.read(s.plan.attemptId)!.generation });
     };
     if (failure === "lost acknowledgement") {
       vi.mocked(s.fly.createMachine).mockImplementation(async () => { assertIntent(); throw new Error("lost acknowledgement"); });
@@ -101,12 +159,21 @@ for (const backend of backends) describe(backend, () => {
     }
     expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
     assertIntent();
-    vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: s.execution.runRef, name: "review-fix-attempt-1" }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
+    vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: s.execution.runRef, name: expectedName(s.plan.attemptId) }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
     vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue(s.execution.runRef);
+    const original = s.log.getJobByDispatchId(s.plan.attemptId)!;
+    const name = createdName(s);
     const restarted = new s.worker.ContainerReviewFixWorker(s.deps);
     expect(await restarted.launch(s.plan)).toEqual({ status: "unknown" });
-    expect(await restarted.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "found", execution: s.execution });
-    expect(s.log.getJobByNonce("sentinel-nonce")).toMatchObject({ machineId: s.execution.runRef, status: "dispatched", admissionGeneration: s.admission.read("attempt-1")!.generation });
+    expect(await restarted.reconcile(s.plan.attemptId, s.plan.scope)).toEqual({ status: "found", execution: s.execution });
+    expect(createdName(s)).toBe(name);
+    if (backend === "fly-machines") expect(s.fly.createMachine).toHaveBeenCalledTimes(1);
+    else {
+      expect(s.docker.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
+      expect(s.docker.findLocalContainerIdByName).toHaveBeenCalledWith(name);
+    }
+    expect(s.log.getJobByDispatchId(s.plan.attemptId)!.id).toBe(original.id);
+    expect(s.log.getJobByNonce("sentinel-nonce")).toMatchObject({ machineId: s.execution.runRef, status: "dispatched", admissionGeneration: s.admission.read(s.plan.attemptId)!.generation });
   });
   it("uses the admitted mapping when unmanaged siblings share the repository", async () => {
     const s = await setup(backend);
@@ -133,7 +200,7 @@ for (const backend of backends) describe(backend, () => {
   });
   it("does not report an execution without a durable nonce row", async () => {
     const s = await setup(backend);
-    vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: "orphan", name: "review-fix-attempt-1" }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
+    vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: "orphan", name: expectedName(s.plan.attemptId) }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
     vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue("orphan");
     expect(await s.instance.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "unknown" });
   });
@@ -151,7 +218,7 @@ for (const backend of backends) describe(backend, () => {
     expect(result).toEqual({ status: "unknown" });
     for (const sentinel of sentinels) expect(JSON.stringify(result)).not.toContain(sentinel);
     if (backend === "fly-machines") expect(s.fly.listMachines).toHaveBeenCalledWith("fly", "sessions");
-    else expect(s.docker.findLocalContainerIdByName).toHaveBeenCalledWith("review-fix-attempt-1");
+    else expect(s.docker.findLocalContainerIdByName).toHaveBeenCalledWith(expectedName(s.plan.attemptId));
     expect(s.log.getJobByNonce("sentinel-nonce")).toEqual(row);
     expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
   });
@@ -159,8 +226,8 @@ for (const backend of backends) describe(backend, () => {
     const s = await setup(backend);
     seedLaunchIntent(s);
     const ids = Array.from({ length: count }, (_, i) => `id-${i}`);
-    vi.mocked(s.fly.listMachines).mockResolvedValue(ids.map(id => ({ id, name: "review-fix-attempt-1" })) as Awaited<ReturnType<typeof s.fly.listMachines>>);
-    const worker = new s.worker.ContainerReviewFixWorker({ ...s.deps, localCandidates: async name => { expect(name).toBe("review-fix-attempt-1"); return ids; } });
+    vi.mocked(s.fly.listMachines).mockResolvedValue(ids.map(id => ({ id, name: expectedName(s.plan.attemptId) })) as Awaited<ReturnType<typeof s.fly.listMachines>>);
+    const worker = new s.worker.ContainerReviewFixWorker({ ...s.deps, localCandidates: async name => { expect(name).toBe(expectedName(s.plan.attemptId)); return ids; } });
     expect(await worker.reconcile("attempt-1", s.plan.scope)).toEqual(count === 1 ? { status: "found", execution: { backend, runRef: "id-0" } } : { status: "unknown" });
   });
   for (const exit of [0, 1, null, "running", "missing", "error"] as const) it(`inspects ${exit}`, async () => {
@@ -226,17 +293,17 @@ for (const started of [false, true]) it(`local error ${started ? "after" : "befo
   expect(JSON.stringify(result)).not.toContain("sentinel");
 });
 it("Fly reconciliation excludes prefix and suffix name matches", async () => {
-  const s = await setup("fly-machines");
+  const s = await setup("fly-machines", undefined, 2);
   seedLaunchIntent(s);
-  vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: "wrong", name: "review-fix-attempt-1-extra" }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
-  expect(await s.instance.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "unknown" });
+  vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: "wrong", name: `${expectedName(s.plan.attemptId)}-extra` }, { id: "also-wrong", name: `extra-${expectedName(s.plan.attemptId)}` }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
+  expect(await s.instance.reconcile(s.plan.attemptId, s.plan.scope)).toEqual({ status: "unknown" });
 });
 it("local reconciliation uses Docker's exact-name helper by default", async () => {
   const s = await setup("local-docker");
   seedLaunchIntent(s);
   vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue("found");
   expect(await s.instance.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "found", execution: { backend: "local-docker", runRef: "found" } });
-  expect(s.docker.findLocalContainerIdByName).toHaveBeenCalledWith("review-fix-attempt-1");
+  expect(s.docker.findLocalContainerIdByName).toHaveBeenCalledWith(expectedName(s.plan.attemptId));
 });
 it("pre-launch persistence failure prevents external creation", async () => {
   const s = await setup("fly-machines");
