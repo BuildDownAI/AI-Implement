@@ -500,3 +500,67 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(recoveryDb.prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = 'dispatch'").get()).toEqual({ revoked_at: null });
 
 });
+
+it("replays real managed preparation after SQLite restart before intent without minting or dispatching again", async () => {
+  for (const path of ["../dedup.js", "../dispatch-admission.js", "../log.js", "../comment-gapfill-queue.js"]) vi.doUnmock(path);
+  const database = await testDb({ modules: {
+    production: () => import("../restate/implementation-run-production.js"),
+    queue: () => import("../comment-gapfill-queue.js"), admission: () => import("../dispatch-admission.js"),
+    dedup: () => import("../dedup.js"), config: () => import("../agent-config-store.js"),
+    sessions: () => import("../model-session-store.js"), keys: () => import("../model-session-keys.js"),
+    ownership: () => import("../model-session-ownership.js"), prep: () => import("../agent-run-preparation.js"),
+  } });
+  const makeRuntime = (m: typeof database.modules) => {
+    const sessionStore = m.sessions.createModelSessionStore({ keys: m.keys.createModelSessionKeyProvider({ RUNNER_TOKEN_SECRET: "synthetic-key" }), verifyOwner: m.ownership.sessionOwnerVerifier, authorizeOperator: () => false });
+    const ownership = m.ownership.createModelSessionOwnership({ store: sessionStore, probe: () => "unknown" });
+    const credentials = { sessionStore, resolveProtectedSecret: () => "synthetic-api-key" };
+    return { sessionStore, ownership, credentials, preparationDeps: () => ({ ownership, credentials,
+      readDefaultBranchWorkflows: async () => ({ ".github/workflows/comment-trigger.yml": null, ".github/workflows/claude-kg-refresh.yml": null, ".github/workflows/claude-implement.yml": "# ai-implement-capability: stage-agent-config-v1\n# ai-implement-capability: stage-agent-launch-context-v1" }),
+      checkRunnerCapability: async () => true,
+    }) };
+  };
+  const m = database.modules;
+  m.config.saveAccountProfileRevision({ profileId: "api", identity: "API", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
+  const stage = { agent: "claude" as const, provider: "anthropic" as const, model: "m", accountProfileId: "api", invocationTimeoutMs: 60000 };
+  m.config.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
+  m.config.setProjectOptIn("ENG", true);
+  const actual = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
+  const req = { dispatchId: "before-intent", projectKey: "ENG", backend: "github-actions" as const, owner: "Org", repo: "repo", workflowFile: "claude-implement.yml" };
+  const initial = await actual.prepareManagedDispatch(req, makeRuntime(m));
+  if (initial.kind !== "launch") throw new Error(JSON.stringify(initial));
+  expect(initial.takeBootstrap()).toBeDefined();
+  expect(initial.takeBootstrap()).toBeUndefined();
+  const grantId = initial.grant.grantId;
+  const queueItemId = m.queue.enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 8888, commenter: "human", instruction: "recover" });
+  const recoveryRun = { ...run, dispatchId: req.dispatchId, gapFill: { ...run.gapFill!, queueItemId } };
+  const reservation = m.admission.acquire({ dispatchId: req.dispatchId, mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 42 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: req.dispatchId }, cap: 10 });
+  expect(reservation.ok).toBe(true);
+  expect(m.queue.getCommentGapfillLaunch(req.dispatchId)).toBeNull();
+  const reopened = await database.reopen();
+  const runtime = makeRuntime(reopened);
+  vi.mocked(getModelAuthRuntime).mockReturnValue(runtime);
+  const managed = await import("../managed-dispatch-auth.js");
+  const replay = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
+  vi.mocked(managed.isManagedProject).mockImplementation(replay.isManagedProject);
+  vi.mocked(managed.prepareManagedDispatch).mockImplementation(replay.prepareManagedDispatch);
+  const shared = await vi.importActual<typeof import("../comment-gapfill-drain.js")>("../comment-gapfill-drain.js");
+  vi.mocked(resolveManagedDecision).mockImplementation(shared.resolveManagedDecision);
+  // Prove the actual retry returns no credential and cannot create another grant.
+  expect(await replay.prepareManagedDispatch(req, runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
+  reopened.production.createProductionImplementationRunServices(input);
+  const deps = captured.deps as ImplementationRunDependencies;
+  const db = reopened.dedup.getDb();
+  db.exec("CREATE TRIGGER fail_revoke BEFORE UPDATE OF revoked_at ON model_credential_grants BEGIN SELECT RAISE(FAIL, 'settlement unavailable'); END");
+  await expect(deps.launch(recoveryRun)).rejects.toThrow("settlement unavailable");
+  expect(reopened.admission.read(req.dispatchId)?.releasedAt).toBeNull();
+  expect(db.prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = ?").get(grantId)).toEqual({ revoked_at: null });
+  expect(reopened.queue.getCommentGapfillLaunch(req.dispatchId)).toBeNull();
+  db.exec("DROP TRIGGER fail_revoke");
+  expect(await deps.launch(recoveryRun)).toEqual({ outcome: "rejected" });
+  expect(reopened.dedup.getDb().prepare("SELECT grant_id, revoked_at FROM model_credential_grants WHERE dispatch_id = ?").all(req.dispatchId)).toEqual([{ grant_id: grantId, revoked_at: expect.any(Number) }]);
+  expect(reopened.admission.read(req.dispatchId)?.releasedAt).not.toBeNull();
+  expect(reopened.queue.getCommentGapfillItem(queueItemId)?.status).toBe("pending");
+  expect(reopened.queue.getCommentGapfillLaunch(req.dispatchId)).toBeNull();
+  expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
+  expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+});
