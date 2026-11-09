@@ -1290,18 +1290,21 @@ describe("runAutonomous", () => {
       errSpy.mockRestore();
     });
 
-    it.each(["fly-machines", "local-docker"] as const)("keeps %s result production disabled even with GitHub environment ids", async (executionBackend) => {
+    it.each([
+      ["fly-machines", false], ["fly-machines", true],
+      ["local-docker", false], ["local-docker", true],
+    ] as const)("attaches a %s result with GitHub ids present: %s", async (executionBackend, githubIdsPresent) => {
       vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ ...REVIEW_FIX_IDENTITY, executionBackend })));
       vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
       vi.stubEnv("RUN_TOKEN", "run-token");
-      vi.stubEnv("GITHUB_RUN_ID", "555");
-      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
-      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.stubEnv("GITHUB_RUN_ID", githubIdsPresent ? "555" : "");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", githubIdsPresent ? "1" : "");
+      const publishedCommit = "b".repeat(40);
 
-      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext, [RESULT]: reviewFixResultStored });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
-        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42)) }],
+        ["push", { run: vi.fn().mockResolvedValue(updatedPr(42, { commitSha: publishedCommit })) }],
       ]);
 
       const result = await runAutonomous({
@@ -1315,6 +1318,37 @@ describe("runAutonomous", () => {
       });
 
       expect(result.exitCode).toBe(0);
+      const body = resultBody(fake) as { reviewFix?: Record<string, unknown> };
+      expect(body.reviewFix).toEqual({ ...REVIEW_FIX_IDENTITY, executionBackend, outputCommit: publishedCommit });
+      expect(body.reviewFix).not.toHaveProperty("githubRunId");
+      expect(body.reviewFix).not.toHaveProperty("githubRunAttempt");
+    });
+
+    it.each(["fly-machines", "local-docker"] as const)("skips %s result delivery when push fails without publishing a commit", async (executionBackend) => {
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig(makeReviewFixRunConfig({ ...REVIEW_FIX_IDENTITY, executionBackend })));
+      vi.stubEnv("RUN_PROGRESS_TOKEN", "pilot-progress");
+      vi.stubEnv("RUN_TOKEN", "run-token");
+      vi.stubEnv("GITHUB_RUN_ID", "555");
+      vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const fake = fakeFetch({ [PLANNING_CONTEXT]: noPlanningContext });
+      const { pipeline, runner } = makeStepsPipeline([
+        ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
+        ["push", { run: vi.fn().mockRejectedValue(new Error("push failed")) }],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeExecutor(),
+        fetchImpl: fake.fetch,
+        ghSpawn: noReviewThreads,
+      });
+
+      expect(result.exitCode).toBe(1);
       expect(routesRequested(fake)).toEqual([PLANNING_CONTEXT]);
       expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("pilot result delivery skipped"));
       errSpy.mockRestore();
