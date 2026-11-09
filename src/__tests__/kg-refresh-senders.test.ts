@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createKgRefreshSenders, type KgRefreshSendInput, type KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
 import { syncRowToMachineNonce, type KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { CreateMachineOpts, Machine } from "../fly-machines.js";
-import { buildKgRefreshRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import { buildKgRefreshRunConfig, decodeRunConfig, decodeTrustedRunConfig, type RunConfigV1 } from "../run-config.js";
 import { makeAppConfig, makeScopedInstallationToken } from "./helpers/builders.js";
 
 vi.mock("../restate/kg-refresh-production.js", async (importOriginal) => ({
@@ -280,6 +280,12 @@ describe("github-actions sender", () => {
     const decoded = decodeRunConfig(inputs.run_config!);
     expect(decoded?.runnerPhase).toBe("kg-refresh");
     expect(decoded?.runnerCallbackUrl).toBe(CALLBACK_BASE);
+    if (supportsPrivateRunConfig) {
+      expect(decodeTrustedRunConfig(inputs.run_config!).credentials?.publicationToken).toBe(TOKENS.publicationToken);
+      expect(inputs).not.toHaveProperty("run_publication_token");
+    } else {
+      expect(inputs.run_publication_token).toBe(TOKENS.publicationToken);
+    }
   });
 
   it("sends the profile's jobTimeoutMinutes as job_timeout_minutes", async () => {
@@ -299,10 +305,21 @@ describe("github-actions sender", () => {
     expect(result).toEqual({ outcome: "accepted", runId: 42, runUrl: "https://gh/run/42", jobId: "42", executionMode: "github-actions" });
   });
 
-  it("omits the publication token when the probe says unsupported", async () => {
-    const { deps } = makeDeps({ resolveWorkflowCapabilities: vi.fn(async () => ({ supportsRunPublicationToken: false })) as never });
-    await createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }));
-    expect(postedInputs(deps).inputs).not.toHaveProperty("run_publication_token");
+  it.each([false, true])("refuses unsupported publication tokens before posting (private transport: %s)", async (supportsPrivateRunConfig) => {
+    const { deps } = makeDeps({
+      resolveWorkflowCapabilities: vi.fn(async () => ({ supportsRunPublicationToken: false, supportsPrivateRunConfig })) as never,
+    });
+    await expect(createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }))).rejects.toThrow("re-sync workflows");
+    expect(deps.postWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("propagates capability probe failures before posting", async () => {
+    const error = new Error("workflow read failed");
+    const { deps } = makeDeps({
+      resolveWorkflowCapabilities: vi.fn(async () => { throw error; }) as never,
+    });
+    await expect(createKgRefreshSenders(deps)["github-actions"](makeInput({ machineNonce: null }))).rejects.toBe(error);
+    expect(deps.postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
   it("dispatches on the envelope's kgSourceRef and falls back to main when the default branch lookup fails", async () => {
