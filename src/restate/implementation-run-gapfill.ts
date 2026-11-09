@@ -16,7 +16,7 @@ import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill } from "../gapfill-launch.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { settleLaunch, type ManagedDispatchDecision } from "../managed-dispatch-auth.js";
-import { releaseUnconfirmedLaunch } from "../agent-run-preparation.js";
+import { persistedPreparationState, releaseUnconfirmedLaunch } from "../agent-run-preparation.js";
 import { trackerAccounting } from "../job-accounting.js";
 import { mintLaunchTokens, implementationTtlSeconds } from "../runner-tokens.js";
 
@@ -81,6 +81,9 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     findExistingRun: async (run, dispatchedAt) => {
       const row = getJobByDispatchId(run.dispatchId);
       if (row?.runId) { confirmCommentGapfillLaunch(run.dispatchId); await recordLaunch(run, undefined, row); return String(row.runId); }
+      // Only positive unused preparation evidence with no intent/job proves the
+      // external call was never reached. Missing config or an empty list does not.
+      if (!row && !getCommentGapfillLaunch(run.dispatchId) && persistedPreparationState(run.dispatchId) === "unused") return null;
       const mapping = getCommentGapfillLaunch(run.dispatchId)?.target ?? mappingFor(run);
       const res = await fetch(`https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`, {
         headers: { Authorization: `Bearer ${await token(mapping.owner)}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal(),
@@ -108,6 +111,15 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         return { outcome: "unknown" };
       }
       const runtime = getModelAuthRuntime(config);
+      const preparation = persistedPreparationState(run.dispatchId);
+      if (preparation !== "absent") {
+        if (getJobByDispatchId(run.dispatchId) || preparation === "consumed" ||
+            !releaseUnconfirmedLaunch(run.dispatchId, { ownership: runtime.ownership }).complete) {
+          throw new Error("unconfirmed gap-fill grant settlement incomplete");
+        }
+        markCommentGapfillProcessed(gap.queueItemId, "pending");
+        return { outcome: "rejected" };
+      }
       let decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
       let recoverySettlementFailed = false;
       let prepared: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;

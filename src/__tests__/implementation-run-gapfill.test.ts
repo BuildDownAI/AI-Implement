@@ -2,6 +2,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { makeMapping, makeJob } from "./helpers/builders.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../restate/implementation-run-production.js";
+vi.mock("../agent-run-preparation.js", async original => ({ ...await original<object>(), persistedPreparationState: vi.fn(() => "absent") }));
 const intents = vi.hoisted(() => new Map<string, unknown>());
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...await original<object>(), createImplementationRunWorkflow: (d: unknown) => { captured.deps = d; return {}; } }));
@@ -337,6 +338,7 @@ it.each(["http", "unreadable"])("lookup remains fail-closed on %s failure", asyn
 
 import { testDb } from "./helpers/test-db.js";
 it("durably recovers accepted launch and shares terminal bookkeeping without duplicate jobs", async () => {
+  vi.doUnmock("../agent-run-preparation.js");
   vi.doUnmock("../dedup.js");
   vi.doUnmock("../dispatch-admission.js");
   vi.doUnmock("../log.js");
@@ -353,7 +355,6 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   const { getDb } = dedup;
   const db = getDb();
   const grant = (id: string) => db.prepare("INSERT INTO model_credential_grants (grant_id, dispatch_id, snapshot_id, project_key, backend, audience, bearer_hash, scope_json, expires_at) VALUES (?, ?, 'snapshot', 'ENG', 'gha', 'runner', 'hash', '{}', 9999999999999)").run(id, id);
-  grant("dispatch");
   const queueItemId = enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 1234, commenter: "human", instruction: "COMMENT-SENTINEL" });
   const recoveryRun = { ...run, gapFill: { ...run.gapFill!, queueItemId } };
   appendLog({ issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "Original title", repo: "Org/repo", status: "completed" });
@@ -368,6 +369,10 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   vi.mocked(dispatchGhaGapfill).mockImplementation(async () => {
     db.exec("CREATE TRIGGER fail_job BEFORE INSERT ON dispatch_log BEGIN SELECT RAISE(FAIL, 'crash before insert'); END");
     return { success: true, status: 200, runId: 88 };
+  });
+  vi.mocked(prepareGhaGapfillLaunch).mockImplementationOnce(async () => {
+    grant("dispatch");
+    return { contract: "envelope", runnerImage: undefined, inputs: { token: "TOKEN-SENTINEL" } };
   });
   const input = { config: { githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "callback", runnerTokenSecret: "secret" }, getMapping: () => mapping,
     resolveProvider: vi.fn(async () => ({})), resolveRunnerImage: vi.fn(), postDispatch: vi.fn(), finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn() } as unknown as ImplementationRunProductionInput;
@@ -490,7 +495,7 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(recoveryDb.prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'no-intent-grant'").get()).toEqual({ revoked_at: null });
   expect(reopened.queue.getCommentGapfillLaunch(noIntent.dispatchId)).toBeNull();
   expect(await noIntentDeps.launch(noIntent)).toEqual({ outcome: "rejected" });
-  expect(reopened.admission.read(noIntent.dispatchId)?.releasedAt).not.toBeNull();
+  expect(reopened.admission.read(noIntent.dispatchId)?.releasedAt).toBeNull();
   expect(recoveryDb.prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'no-intent-grant'").get()).toEqual({ revoked_at: expect.any(Number) });
   expect(reopened.queue.getCommentGapfillItem(noIntentId)?.status).toBe("pending");
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(beforeDispatch);
@@ -501,8 +506,8 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
 
 });
 
-it("replays real managed preparation after SQLite restart before intent without minting or dispatching again", async () => {
-  for (const path of ["../dedup.js", "../dispatch-admission.js", "../log.js", "../comment-gapfill-queue.js"]) vi.doUnmock(path);
+it.each(["unchanged", "missing", "opted-out"])("replays real managed preparation after SQLite restart with %s config", async configuration => {
+  for (const path of ["../dedup.js", "../dispatch-admission.js", "../log.js", "../comment-gapfill-queue.js", "../agent-run-preparation.js"]) vi.doUnmock(path);
   const database = await testDb({ modules: {
     production: () => import("../restate/implementation-run-production.js"),
     queue: () => import("../comment-gapfill-queue.js"), admission: () => import("../dispatch-admission.js"),
@@ -547,9 +552,16 @@ it("replays real managed preparation after SQLite restart before intent without 
   vi.mocked(resolveManagedDecision).mockImplementation(shared.resolveManagedDecision);
   // Prove the actual retry returns no credential and cannot create another grant.
   expect(await replay.prepareManagedDispatch(req, runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
+  if (configuration === "missing") input.getMapping = () => undefined;
+  if (configuration === "opted-out") reopened.config.setProjectOptIn("ENG", false);
   reopened.production.createProductionImplementationRunServices(input);
   const deps = captured.deps as ImplementationRunDependencies;
   const db = reopened.dedup.getDb();
+  expect(await deps.findExistingRun(recoveryRun, 1999)).toBeNull();
+  db.prepare("UPDATE model_credential_grants SET consumed_at = 1 WHERE grant_id = ?").run(grantId);
+  await expect(deps.launch(recoveryRun)).rejects.toThrow("settlement incomplete");
+  expect(db.prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = ?").get(grantId)).toEqual({ revoked_at: null });
+  db.prepare("UPDATE model_credential_grants SET consumed_at = NULL WHERE grant_id = ?").run(grantId);
   db.exec("CREATE TRIGGER fail_revoke BEFORE UPDATE OF revoked_at ON model_credential_grants BEGIN SELECT RAISE(FAIL, 'settlement unavailable'); END");
   await expect(deps.launch(recoveryRun)).rejects.toThrow("settlement unavailable");
   expect(reopened.admission.read(req.dispatchId)?.releasedAt).toBeNull();
@@ -558,7 +570,7 @@ it("replays real managed preparation after SQLite restart before intent without 
   db.exec("DROP TRIGGER fail_revoke");
   expect(await deps.launch(recoveryRun)).toEqual({ outcome: "rejected" });
   expect(reopened.dedup.getDb().prepare("SELECT grant_id, revoked_at FROM model_credential_grants WHERE dispatch_id = ?").all(req.dispatchId)).toEqual([{ grant_id: grantId, revoked_at: expect.any(Number) }]);
-  expect(reopened.admission.read(req.dispatchId)?.releasedAt).not.toBeNull();
+  expect(reopened.admission.read(req.dispatchId)?.releasedAt).toBeNull();
   expect(reopened.queue.getCommentGapfillItem(queueItemId)?.status).toBe("pending");
   expect(reopened.queue.getCommentGapfillLaunch(req.dispatchId)).toBeNull();
   expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();

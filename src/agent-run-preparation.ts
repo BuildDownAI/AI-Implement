@@ -773,6 +773,12 @@ export function releaseRejectedLaunch(
   return { complete, results };
 }
 
+/** Positive persisted preparation evidence; consumed credentials require execution recovery. */
+export function persistedPreparationState(dispatchId: string): "absent" | "unused" | "consumed" {
+  const row = getDb().prepare("SELECT consumed_at FROM model_credential_grants WHERE dispatch_id = ? ORDER BY expires_at DESC, rowid DESC LIMIT 1").get(dispatchId) as { consumed_at: number | null } | undefined;
+  return !row ? "absent" : row.consumed_at === null ? "unused" : "consumed";
+}
+
 /** Settle an unconfirmed reconstructed launch using only its persisted owner identity.
  * No grant means a legacy launch; conflicting bindings fail closed in the normal seam.
  */
