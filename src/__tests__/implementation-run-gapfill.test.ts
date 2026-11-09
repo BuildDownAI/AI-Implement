@@ -18,7 +18,7 @@ vi.mock("../gapfill-launch.js", () => ({ prepareGhaGapfillLaunch: vi.fn(), dispa
 vi.mock("../dispatch-failure.js", () => ({ surfaceDispatchFailure: vi.fn() }));
 vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() => []) }));
 vi.mock("../model-auth-runtime.js", () => ({ getModelAuthRuntime: vi.fn(() => ({})) }));
-vi.mock("../managed-dispatch-auth.js", () => ({ settleLaunch: vi.fn(), isManagedProject: vi.fn(() => false) }));
+vi.mock("../managed-dispatch-auth.js", () => ({ settleLaunch: vi.fn(), prepareManagedDispatch: vi.fn(), refusalText: vi.fn(() => "held"), isManagedProject: vi.fn(() => false) }));
 vi.mock("../runner-tokens.js", () => ({ mintLaunchTokens: vi.fn(() => ({ runToken: "TOKEN-SENTINEL", runProgressToken: "NONCE-SENTINEL" })), implementationTtlSeconds: () => 100 }));
 vi.mock("../base-branch.js", async original => ({ ...await original<object>(), postBranchComment: vi.fn() }));
 vi.mock("../dedup.js", () => ({ markDispatched: vi.fn() }));
@@ -454,4 +454,49 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(reopened.queue.getCommentGapfillLaunch("rejected")).toBeNull();
   expect(reopened.queue.getCommentGapfillLaunch("pre-call")).not.toBeNull();
   expect(reopened.log.getJobByDispatchId("rejected")).toBeNull();
+
+  // A process died after grant persistence but before intent staging. Use the real
+  // shared decision/release path against reopened SQLite, with preparation's replay result.
+  const managed = await import("../managed-dispatch-auth.js");
+  const shared = await vi.importActual<typeof import("../comment-gapfill-drain.js")>("../comment-gapfill-drain.js");
+  vi.mocked(managed.isManagedProject).mockReturnValue(true);
+  vi.mocked(managed.prepareManagedDispatch).mockResolvedValue({ kind: "hold", code: "bootstrap_consumed" });
+  vi.mocked(resolveManagedDecision).mockImplementation(shared.resolveManagedDecision);
+  const noIntentId = reopened.queue.enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 45, commentId: 9999, commenter: "human", instruction: "recover" });
+  const noIntent = { ...recoveryRun, dispatchId: "no-intent", gapFill: { ...recoveryRun.gapFill!, prNumber: 45, queueItemId: noIntentId } };
+  expect(reopened.admission.acquire({ dispatchId: noIntent.dispatchId, mappingKey: "ENG", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 45 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: noIntent.dispatchId }, cap: 10 }).ok).toBe(true);
+  const recoveryDb = reopened.dedup.getDb();
+  recoveryDb.prepare("INSERT INTO model_credential_grants (grant_id, dispatch_id, snapshot_id, project_key, backend, audience, bearer_hash, scope_json, expires_at) VALUES ('no-intent-grant', 'no-intent', 'snapshot', 'ENG', 'gha', 'runner', 'hash', '{}', 9999999999999)").run();
+  const noIntentOwner = recoveredOwnership.reserve({ dispatchId: noIntent.dispatchId, profiles: [{ profileId: "recovery-profile", authMode: "subscription" }] });
+  if (noIntentOwner.status !== "reserved") throw new Error("reservation failed");
+  recoveryDb.prepare("INSERT INTO model_credential_grant_profiles VALUES ('no-intent-grant', 'implementation', 'recovery-profile', 1, ?)").run(noIntentOwner.reservations[0]!.generation);
+  // Recreate production dependencies only after persistence, as on process restart.
+  reopened.production.createProductionImplementationRunServices(input);
+  const noIntentDeps = captured.deps as ImplementationRunDependencies;
+  const beforeDispatch = vi.mocked(dispatchGhaGapfill).mock.calls.length;
+  const beforePrepare = vi.mocked(prepareGhaGapfillLaunch).mock.calls.length;
+  // An adopted run without an intent is never a cleanup authorization.
+  const adoptedJob = reopened.log.appendLog({ issueId: "issue", issueIdentifier: "ENG-1", repo: "Org/repo", dispatchId: noIntent.dispatchId, status: "running" });
+  reopened.log.attachJobRunIdIfMissing(adoptedJob, 999);
+  const ownerReleaseCount = releaseOwner.mock.calls.length;
+  await expect(noIntentDeps.launch(noIntent)).rejects.toThrow("settlement incomplete");
+  expect(releaseOwner).toHaveBeenCalledTimes(ownerReleaseCount);
+  expect(reopened.admission.read(noIntent.dispatchId)?.releasedAt).toBeNull();
+  expect(recoveryDb.prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'no-intent-grant'").get()).toEqual({ revoked_at: null });
+  recoveryDb.prepare("DELETE FROM dispatch_log WHERE id = ?").run(adoptedJob);
+  releaseOwner.mockReturnValueOnce({ status: "rejected", reason: "invalid_state" });
+  await expect(noIntentDeps.launch(noIntent)).rejects.toThrow("settlement incomplete");
+  expect(reopened.admission.read(noIntent.dispatchId)?.releasedAt).toBeNull();
+  expect(recoveryDb.prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'no-intent-grant'").get()).toEqual({ revoked_at: null });
+  expect(reopened.queue.getCommentGapfillLaunch(noIntent.dispatchId)).toBeNull();
+  expect(await noIntentDeps.launch(noIntent)).toEqual({ outcome: "rejected" });
+  expect(reopened.admission.read(noIntent.dispatchId)?.releasedAt).not.toBeNull();
+  expect(recoveryDb.prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'no-intent-grant'").get()).toEqual({ revoked_at: expect.any(Number) });
+  expect(reopened.queue.getCommentGapfillItem(noIntentId)?.status).toBe("pending");
+  expect(dispatchGhaGapfill).toHaveBeenCalledTimes(beforeDispatch);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(beforePrepare);
+  expect(recoveryDb.prepare("SELECT COUNT(*) AS n FROM model_credential_grants WHERE dispatch_id = 'no-intent'").get()).toEqual({ n: 1 });
+  // Accepted/adopted recovery above retained its exact grant despite shared recovery.
+  expect(recoveryDb.prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = 'dispatch'").get()).toEqual({ revoked_at: null });
+
 });

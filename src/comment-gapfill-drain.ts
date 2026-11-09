@@ -147,6 +147,8 @@ function releaseGapfillAdmission(admission: GapfillAdmission): void {
  * Managed-dispatch decision for an admitted item. Opted-out projects resolve to `legacy` without
  * touching the runtime. Any non-launch decision releases the admission, fails the item on `refuse`
  * (and leaves it pending otherwise), and resolves to null so the caller `continue`s.
+ * Restate may opt into persisted-grant settlement before admission release; a thrown
+ * settlement error retains admission for retry. Legacy callers omit this hook.
  */
 export async function resolveManagedDecision(
   opts: Pick<DrainCommentGapfillsInput, "modelAuthRuntime">,
@@ -154,6 +156,7 @@ export async function resolveManagedDecision(
   req: { dispatchId: string; projectKey: string; backend: "local-docker" | "fly-machines" | "github-actions"; owner: string; repo: string; workflowFile: string },
   admission: GapfillAdmission,
   identifier: string,
+  beforeNonLaunch?: (decision: Exclude<ManagedDispatchDecision, { kind: "legacy" | "launch" }>) => void,
 ): Promise<Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> | null> {
   if (!isManagedProject(req.projectKey)) return { kind: "legacy" };
   let decision: ManagedDispatchDecision;
@@ -169,6 +172,7 @@ export async function resolveManagedDecision(
   }
   console.log(`[comment-gapfill] Managed dispatch for ${identifier}: ${decision.kind}${"code" in decision ? ` (${decision.code})` : ""}`);
   if (decision.kind === "legacy" || decision.kind === "launch") return decision;
+  beforeNonLaunch?.(decision);
   releaseGapfillAdmission(admission);
   console.log(`[comment-gapfill] ${refusalText(decision)} (${identifier})`);
   if (decision.kind === "refuse") markCommentGapfillProcessed(item.id, "failed");

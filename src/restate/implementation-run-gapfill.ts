@@ -109,6 +109,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       }
       const runtime = getModelAuthRuntime(config);
       let decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
+      let recoverySettlementFailed = false;
       let prepared: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;
       let ghToken: string;
       let mapping: RepoMapping;
@@ -129,7 +130,16 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         if (!admission || admission.releasedAt !== null) throw new Error("no active gap-fill reservation");
         const resolved = await resolveManagedDecision({ modelAuthRuntime: runtime }, item,
           { dispatchId: run.dispatchId, projectKey: run.teamKey, backend: run.backend, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
-          { ok: true, record: admission, count: 0, cap: mapping.maxInProgressAiIssues }, run.issueIdentifier);
+          { ok: true, record: admission, count: 0, cap: mapping.maxInProgressAiIssues }, run.issueIdentifier, () => {
+            // No intent means no backend call was made. Settle the persisted grant
+            // before the shared helper releases this admission. Never clean up adoption.
+            recoverySettlementFailed = true;
+            if (getJobByDispatchId(run.dispatchId)?.runId ||
+                !releaseUnconfirmedLaunch(run.dispatchId, { ownership: runtime.ownership }).complete) {
+              throw new Error("unconfirmed gap-fill grant settlement incomplete");
+            }
+            recoverySettlementFailed = false;
+          });
         if (!resolved) {
           // The shared helper fails refusals; transient decisions must restore a claimed row.
           if (getCommentGapfillItem(item.id)?.status !== "failed") markCommentGapfillProcessed(item.id, "pending");
@@ -147,6 +157,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           runToken: tokens?.runToken ?? "", runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
           commentInstruction, resolveRunnerImage: (m, t) => input.resolveRunnerImage(config, m, t), checkContract: resolveWorkflowCapabilities });
       } catch (err) {
+        if (recoverySettlementFailed) throw err;
         settleLaunch(decision, "rejected", runtime);
         markCommentGapfillProcessed(gap.queueItemId, "failed");
         console.error(`[implementation-run] gap-fill preparation failed dispatch=${run.dispatchId}:`, err);
