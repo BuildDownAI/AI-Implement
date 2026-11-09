@@ -3,6 +3,11 @@
  * boundary where those adapters become Restate services. */
 import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { randomUUID } from "node:crypto";
+import { ContainerReviewFixWorker } from "../review-fix-container-worker.js";
+import { read as readAdmission } from "../dispatch-admission.js";
+import { destroyMachineRecorded } from "../backend-run.js";
+import { removeLocalContainer } from "../local-docker.js";
+import { getJobByDispatchId, updateJobStatus, invalidateNonce } from "../log.js";
 import { getDb } from "../dedup.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
 import { isManagedProject, selectsCodexImplementation, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
@@ -16,7 +21,7 @@ import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
 import { inspectPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
-import { GithubReviewFixWorker, ManagedReviewFixLaunchRefusedError, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
+import { GithubReviewFixWorker, ReviewFixWorker, ManagedReviewFixLaunchRefusedError, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
 import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDisposition } from "../review-fix-ports.js";
 import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
@@ -39,6 +44,15 @@ export interface ReviewFixProductionConfig {
   runnerTokenSecret: string | null;
   sessionImage: string;
   runnerImageExplicit: boolean;
+  flySessionsToken?: string | null;
+  flySessionsApp?: string | null;
+  flySessionsRegion?: string | null;
+  flyOrchestratorApp?: string | null;
+  tenantId?: string | null;
+  anthropicApiKey?: string | null;
+  claudeOAuthToken?: string | null;
+  localRunnerImage?: string;
+  localRunnerOrchestratorUrl?: string | null;
 }
 
 /** Mapping identity stays available to already-admitted legacy GHA attempts across runner-mode changes. */
@@ -280,9 +294,9 @@ export function createProductionReviewFixWorker(
   config: ReviewFixProductionConfig,
   store: SqliteReviewFixAttemptStore,
   runtime?: ModelAuthRuntime,
-): GithubReviewFixWorker {
+): ReviewFixWorker {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
-  return new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+  const gha = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
     runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
     retryPolicy: getRetryPolicy,
     requiresProtectedTransport: (plan) => {
@@ -328,6 +342,67 @@ export function createProductionReviewFixWorker(
       };
     },
   });
+  const container = new ContainerReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    callbackInputs: async (attemptId) => {
+      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
+      return {
+        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
+        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
+        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
+        runner_callback_url: config.runnerCallbackBaseUrl,
+      };
+    },
+    fly: { flySessionsToken: config.flySessionsToken ?? "", flySessionsApp: config.flySessionsApp ?? "",
+      flySessionsRegion: config.flySessionsRegion ?? null, flyOrchestratorApp: config.flyOrchestratorApp ?? null,
+      tenantId: config.tenantId ?? null, sessionImage: config.sessionImage, runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+      anthropicApiKey: config.anthropicApiKey ?? null, claudeOAuthToken: config.claudeOAuthToken ?? null },
+    local: { image: config.localRunnerImage ?? config.sessionImage,
+      orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? "",
+      anthropicApiKey: config.anthropicApiKey, claudeOAuthToken: config.claudeOAuthToken },
+  });
+  return new ReviewFixWorker({ "github-actions": gha, "fly-machines": container, "local-docker": container }, store);
+}
+
+/** Runs inside the existing outcome journal entry, after terminal confirmation on bound paths. */
+export function withReviewFixCleanup(config: ReviewFixProductionConfig, store: SqliteReviewFixAttemptStore,
+  finalizer: ReviewFixFinalizer): ReviewFixFinalizer {
+  return { ...finalizer, recordOutcome: async (outcome, now) => {
+    // An unresolved launch has no bound identity or terminal confirmation. A
+    // transport may already have persisted a resource ID; retain it and occupancy
+    // for reconciliation/operator recovery rather than treating it as a stopped run.
+    if (outcome.terminal.status === "launch_unresolved") return finalizer.recordOutcome(outcome, now);
+    const attempt = await store.getPreparedAttempt(outcome.attemptId);
+    const backend = attempt?.executionBackend;
+    if (backend === "fly-machines" || backend === "local-docker") {
+      const row = getJobByDispatchId(outcome.attemptId);
+      if (row?.machineId) {
+        const bound = await store.findPreparedAttemptByExecution({ backend, runRef: row.machineId });
+        const admission = readAdmission(outcome.attemptId);
+        if (bound?.attemptId !== outcome.attemptId || !admission
+          || admission.lifecycleOwner.kind !== "restate" || admission.lifecycleOwner.attemptId !== outcome.attemptId
+          || admission.backend !== backend || row.executionMode !== backend
+          || row.admissionGeneration !== admission.generation) throw new Error("review-fix cleanup ownership mismatch");
+        getDb().transaction(() => {
+          const current = getJobByDispatchId(outcome.attemptId);
+          if (!current || current.id !== row.id || current.machineId !== row.machineId
+            || current.executionMode !== backend || current.admissionGeneration !== admission.generation) {
+            throw new Error("review-fix cleanup ownership changed");
+          }
+          // Preserve callback outcomes, including callbacks accepted during the binding lookup.
+          if (current.completedAt === null) updateJobStatus(current.id, "failed", "failure", undefined, { skipAdmissionRelease: true });
+          if (current.machineNonce !== null) invalidateNonce(current.id);
+        }).immediate();
+        try {
+          if (backend === "fly-machines") await destroyMachineRecorded({ flySessionsToken: config.flySessionsToken ?? null,
+            flySessionsApp: config.flySessionsApp ?? null }, row.machineId, "backend-stop");
+          else await removeLocalContainer(row.machineId);
+        } catch (err) {
+          if (!/\(404\)|no such container/i.test(err instanceof Error ? err.message : String(err))) throw err;
+        }
+      }
+    }
+    return finalizer.recordOutcome(outcome, now);
+  } };
 }
 
 export function createProductionReviewFixServices(
@@ -341,7 +416,7 @@ export function createProductionReviewFixServices(
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = createProductionReviewFixWorker(config, store, runtime);
   const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
-  const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
+  const finalizer = withReviewFixCleanup(config, store, createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview }));
   const pr = createReviewFixPR({
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {

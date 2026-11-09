@@ -1,5 +1,6 @@
 /** Fresh, attempt-owned containers using the established gap-fill transports (ADR 037). */
 import { createHash } from "node:crypto";
+import { getRetryPolicy } from "./orchestrator-settings.js";
 import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { read as readAdmission } from "./dispatch-admission.js";
@@ -78,7 +79,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
           runnerCallbackUrl: tokens.runner_callback_url ?? "", runToken: tokens.run_token ?? "", runProgressToken: tokens.run_progress_token ?? "", onBeforeLaunch: (size, n) => beforeLaunch(n, size) });
         id = result.machine.id;
       } else {
-        const result = await dispatchLocalGapfill({ ...this.deps.local, ...common, issue, retryPolicy: null, onBeforeLaunch: beforeLaunch });
+        const result = await dispatchLocalGapfill({ ...this.deps.local, ...common, issue, retryPolicy: getRetryPolicy(), onBeforeLaunch: beforeLaunch });
         id = result.containerId;
       }
       created = true;
