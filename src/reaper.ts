@@ -1,4 +1,4 @@
-import { listExitedAiImplementContainers, removeLocalContainer, selectSweepableContainers } from "./local-docker.js";
+import { listAiImplementContainers, removeLocalContainer, selectSweepableContainers } from "./local-docker.js";
 import { listMachines, destroyMachine } from "./fly-machines.js";
 import { getJobByMachineId, updateJobStatus, invalidateNonce } from "./log.js";
 import type { IssueLifecycleState } from "./providers/types.js";
@@ -60,7 +60,7 @@ export async function reconcileRestateMachine(config: ReaperConfig, job: Job, ma
 export async function reconcileRestateLocalContainers(config: ReaperConfig, legacyInFlightIds?: string[]): Promise<string[] | null> {
   let containers;
   try {
-    containers = await listExitedAiImplementContainers();
+    containers = await listAiImplementContainers();
   } catch {
     // Do not let a failed ownership census authorize the Legacy Docker sweep.
     return null;
@@ -72,6 +72,7 @@ export async function reconcileRestateLocalContainers(config: ReaperConfig, lega
       // Use the same snapshot for ownership and Legacy selection: a second Docker
       // listing could introduce a newly exited, terminal-but-held Restate container.
       if (legacyInFlightIds !== undefined
+        && /^Exited\b/i.test(container.status)
         && selectSweepableContainers([container], legacyInFlightIds).length > 0) {
         try {
           await removeLocalContainer(container.id);
