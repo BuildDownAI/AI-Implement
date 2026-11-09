@@ -32,6 +32,19 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     if (!mapping) throw new Error(`no project mapping found for team ${run.teamKey}`);
     return mapping;
   };
+  // Current configuration is authority only before an intent or job is persisted.
+  const initialTarget = (run: ImplementationRunInput) => {
+    const gap = run.gapFill!;
+    const mapping = mappingFor(run);
+    const item = getCommentGapfillItem(gap.queueItemId);
+    if (!item) throw new Error(`gap-fill queue item ${gap.queueItemId} not found`);
+    const repository = gap.repository.toLowerCase();
+    if (`${mapping.owner}/${mapping.repo}`.toLowerCase() !== repository ||
+        `${item.owner}/${item.repo}`.toLowerCase() !== repository || item.prNumber !== gap.prNumber) {
+      throw new Error("gap-fill launch target does not match the reserved PR");
+    }
+    return { mapping, item };
+  };
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
   const launchRecord = async (run: ImplementationRunInput, contract?: "legacy" | "envelope", launchIssue?: { issueId: string; issueIdentifier: string; issueTitle?: string }) => {
     const gap = run.gapFill!;
@@ -85,7 +98,15 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       // Only positive unused preparation evidence with no intent/job proves the
       // external call was never reached. Missing config or an empty list does not.
       if (!row && !getCommentGapfillLaunch(run.dispatchId) && persistedPreparationState(run.dispatchId) === "unused") return null;
-      const mapping = getCommentGapfillLaunch(run.dispatchId)?.target ?? mappingFor(run);
+      const staged = getCommentGapfillLaunch(run.dispatchId);
+      let mapping;
+      if (staged || row) {
+        mapping = staged?.target ?? mappingFor(run);
+      } else {
+        // Reconciliation precedes launch, so validate before credentials or lookup.
+        // Let launch report an invalid initial target as a definite rejection.
+        try { mapping = initialTarget(run).mapping; } catch { return null; }
+      }
       const res = await fetch(`https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`, {
         headers: { Authorization: `Bearer ${await token(mapping.owner)}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal(),
       });
@@ -136,16 +157,9 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       const issue: { issueId: string; issueIdentifier: string; issueTitle?: string } = { issueId: run.issueId, issueIdentifier: run.issueIdentifier };
       try {
         if (run.backend !== "github-actions") throw new Error("gap-fill backend not wired");
-        mapping = mappingFor(run);
-        const item = getCommentGapfillItem(gap.queueItemId);
-        if (!item) throw new Error(`gap-fill queue item ${gap.queueItemId} not found`);
-        // Only a first launch consults the current mapping. Persisted intents above
-        // remain authoritative for recovery after a project is moved or removed.
-        const repository = gap.repository.toLowerCase();
-        if (`${mapping.owner}/${mapping.repo}`.toLowerCase() !== repository ||
-            `${item.owner}/${item.repo}`.toLowerCase() !== repository || item.prNumber !== gap.prNumber) {
-          throw new Error("gap-fill launch target does not match the reserved PR");
-        }
+        const target = initialTarget(run);
+        mapping = target.mapping;
+        const { item } = target;
         // The input carries identity only. Recover the same title the comment drain
         // uses, including PRs whose original dispatch has no PR URL recorded yet.
         let prLog = getLatestDispatchForPr(item.owner, item.repo, gap.prNumber);

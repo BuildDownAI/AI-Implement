@@ -68,7 +68,7 @@ it("reserve admits with PR budget and Restate ownership", async () => {
   expect(await d.reserve(run)).toBe(true);
   expect(acquire).toHaveBeenCalledWith(expect.objectContaining({ kind: "gap-fill", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 42 }, lifecycleOwner: { kind: "restate", attemptId: "dispatch" }, prDispatchBudget: 5, humanRequested: true, parked: false, cap: mapping.maxInProgressAiIssues }));
 });
-it.each(["retargeted owner", "retargeted repo", "missing mapping", "queue owner", "queue repo", "queue PR", "input repository", "input PR"])("first launch rejects %s before preparation or credentials", async mismatch => {
+it.each([[], [88]].flatMap(ids => ["retargeted owner", "retargeted repo", "missing mapping", "missing queue", "queue owner", "queue repo", "queue PR", "input repository", "input PR"].map(mismatch => ({ ids, mismatch }))))("reserve → find → launch rejects $mismatch with listing $ids before credentials", async ({ ids, mismatch }) => {
   expect(await d.reserve(run)).toBe(true);
   if (mismatch.startsWith("retargeted") || mismatch === "missing mapping") {
     input.getMapping = () => mismatch === "missing mapping" ? undefined : { ...mapping,
@@ -81,7 +81,11 @@ it.each(["retargeted owner", "retargeted repo", "missing mapping", "queue owner"
     ...(mismatch === "queue owner" ? { owner: "Other" } : mismatch === "queue repo" ? { repo: "other" } : { prNumber: 43 }) });
   const request = { ...run, gapFill: { ...run.gapFill!,
     ...(mismatch === "input repository" ? { repository: "Other/repo" } : mismatch === "input PR" ? { prNumber: 43 } : {}) } };
-  const result = await d.launch(request);
+  if (mismatch === "missing queue") vi.mocked(getCommentGapfillItem).mockReturnValue(null);
+  runs(ids);
+  const existing = await d.findExistingRun(request, 1999);
+  expect(existing).toBeNull();
+  const result = existing === null ? await d.launch(request) : { outcome: "accepted", jobId: existing };
   expect(result).toEqual({ outcome: "rejected" });
   expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "failed");
   expect(resolveManagedDecision).not.toHaveBeenCalled();
@@ -99,6 +103,8 @@ it("first launch accepts GitHub repository casing differences", async () => {
   createProductionImplementationRunServices(input);
   d = captured.deps as ImplementationRunDependencies;
   vi.mocked(getCommentGapfillItem).mockReturnValue({ ...vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!, owner: "org", repo: "Repo" });
+  expect(await d.reserve(run)).toBe(true);
+  expect(await d.findExistingRun(run, 1999)).toBeNull();
   expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
 });
 it.each(["parked", "budget_exhausted", "occupied", "at_capacity"])("reserve refusal %s restores pending", async reason => {
