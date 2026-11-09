@@ -2824,7 +2824,12 @@ describe("admin settings", () => {
     expect(JSON.parse(res.body).flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
     expect(get.runnerBackendSource).toBe("restate");
-    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate", overriddenByEnv: false });
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
     expect(get.flySessionsApp.dbValue).toBeNull();
   });
 
@@ -2845,7 +2850,12 @@ describe("admin settings", () => {
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
     expect(get.flySessionsApp.dbValue).toBeNull();
     expect(get.flySessionsRegion.dbValue).toBeNull();
-    expect(get.runnerBackendSource).toBe("fallback");
+    expect(get.runnerBackendSource).toBe("not-loaded");
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
   });
 
   it("POST /api/settings answers 503 when callTool throws", async () => {
@@ -2854,12 +2864,17 @@ describe("admin settings", () => {
     expect(res.statusCode).toBe(503);
   });
 
-  it("GET /api/settings reports source fallback before any Restate read, with env as the runtime value", async () => {
+  it("GET /api/settings reports source not-loaded before any Restate read, with a null runtime value despite env", async () => {
     process.env.FLY_SESSIONS_APP = "env-app";
     const token = await login("secret");
     const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
-    expect(get.runnerBackendSource).toBe("fallback");
-    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "env-app", source: "fallback" });
+    expect(get.runnerBackendSource).toBe("not-loaded");
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: null, source: "not-loaded", envValue: "env-app", dbValue: null });
   });
 
 
@@ -6524,6 +6539,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
     expect(find(accts, "cl-sub").account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
     expect(find(accts, "cl-sub").account).not.toHaveProperty("sessionRecovery");
+    expect(JSON.stringify(accts)).not.toContain("sessionRecovery");
     expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
     expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
 
@@ -6531,6 +6547,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(raw).not.toContain(SENTINEL);
     expect(raw).not.toContain("credentialRef");
     expect(raw).not.toContain("metadata");
+    expect(raw).not.toContain("sessionRecovery");
   });
 
   it("keeps old revisions on PATCH of a disabled profile", async () => {
@@ -6736,7 +6753,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(store.getProjectStageConfig("APP")?.config.stages?.review?.model).toBe("newer");
     });
 
-    it("keeps legacy, disabled and Claude-subscription candidates fail-closed without storing them", async () => {
+    it("rejects invalid candidates, skips readiness when disabled and stores nothing on inspection failure", async () => {
       const t = await seed();
       const store = modules.agentConfigStore;
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
@@ -6753,11 +6770,25 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(store.getProjectOptIn("APP")).toBe(false);
     });
 
-    it("refuses GitHub Actions opt-in as unsupported while workflows are unreadable", async () => {
+    it("refuses unreadable GitHub Actions workflows with the sync action and stores nothing", async () => {
       const t = await seed();
+      const revs = count("stage_agent_config_revisions");
       const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));
       expect(r.status).toBe(409);
-      expect(r.json.code).toBe("unsupported_backend");
+      expect(r.json).toMatchObject({ code: "delivery_unreadable", backend: "github-actions",
+        action: "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows." });
+      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(false);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+    });
+
+    it("enables a ready GitHub Actions project after inspecting readiness", async () => {
+      const t = await seed();
+      const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
+      expect((await optIn(t, inspect)).status).toBe(200);
+      expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions", projectKey: "APP" }), expect.objectContaining({ mode: "configured" }));
+      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(true);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
     });
 
     it("inspects the Fly backend without GHA template checks", async () => {
@@ -6779,15 +6810,37 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
     });
 
-    it("never enables Claude subscription execution", async () => {
+    it.each([true, false])("continues Claude subscription opt-in to readiness (ready: %s)", async (ready) => {
       const t = await seed();
+      const store = modules.agentConfigStore;
       await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+        enabled: false, stages: { review: { model: "previous-model" } },
+      })).status).toBe(200);
+      const previousConfig = store.getProjectStageConfig("APP");
+      const revs = count("stage_agent_config_revisions");
+      const inspect = vi.fn(async () => ready
+        ? { status: "ready", profiles: [] }
+        : { status: "not-ready", code: "runner_incompatible" });
       const r = await call("/api/mappings/APP/agent-config", "PUT", t, {
         enabled: true,
         stages: { review: { agent: "claude", provider: "anthropic", accountProfileId: "cl-sub", model: "m" } },
-      }, readyDeps());
-      expect(r.status).toBe(422);
-      expect(r.json.code).toBe("claude_subscription_unsupported");
+      }, readyDeps(inspect));
+      expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ projectKey: "APP" }),
+        expect.objectContaining({ stages: expect.objectContaining({ review: expect.objectContaining({ accountProfileId: "cl-sub" }) }) }));
+      expect(r.status).toBe(ready ? 200 : 409);
+      expect(store.getProjectOptIn("APP")).toBe(ready);
+      if (ready) {
+        expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
+        const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, readyDeps());
+        // Admission is mocked ready; the read still reports the profile's missing protected reference.
+        expect(resolved.json.stages.review.account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
+        expect(resolved.raw).not.toContain("sessionRecovery");
+      } else {
+        expect(r.json.code).toBe("runner_incompatible");
+        expect(store.getProjectStageConfig("APP")).toEqual(previousConfig);
+        expect(count("stage_agent_config_revisions")).toBe(revs);
+      }
     });
   });
 
@@ -6939,10 +6992,14 @@ describe("model accounts and stage configuration (AII-962)", () => {
       return t;
     }
 
-    it("round-trips a key like secret-import, never leaks it, and DELETE removes it", async () => {
+    it.each([
+      { agent: "codex", provider: "openai", authMode: "openai-api-key" },
+      { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+      { agent: "claude", provider: "anthropic", authMode: "claude-subscription" },
+    ])("round-trips $authMode like secret-import, never leaks it, and DELETE removes it", async (mode) => {
       const logs: string[] = [];
       for (const m of ["log", "info", "warn", "error"] as const) vi.spyOn(console, m).mockImplementation((...a) => { logs.push(a.join(" ")); });
-      const t = await seedProfile();
+      const t = await seedProfile(mode);
       const revs = count("model_account_profile_revisions");
       const put = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
       expect(put.status).toBe(200);
@@ -6954,9 +7011,16 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const row = list.json.accounts.find((a: { profileId: string }) => a.profileId === "oai-1");
       expect(row.credentialSet).toBe(true);
       expect(typeof row.credentialUpdatedAt).toBe("number");
+      expect(row.account).toEqual({ readiness: "unknown", failureCode: null });
+      expect(list.raw).not.toContain("sessionRecovery");
+      const withDeps = await call("/api/model-accounts", "GET", t, undefined, readyDeps());
+      expect(withDeps.json.accounts[0].account).toEqual({ readiness: "ready", failureCode: null });
+      expect(withDeps.raw).not.toContain(KEY);
       expect(list.raw).not.toContain(KEY);
       expect(list.raw).not.toContain(REF);
       const del = await call(url("oai-1"), "DELETE", t);
+      expect(del.status).toBe(200);
+      expect(del.raw).not.toContain(KEY);
       expect(del.json).toEqual({ ref: REF, result: "removed" });
       expect(store().resolve(REF)).toBeNull();
       expect(count("model_protected_secrets")).toBe(0);
@@ -7001,6 +7065,25 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(await read()).toMatchObject({ credentialSet: false, credentialUpdatedAt: null, account: { readiness: "missing", failureCode: "secret_unavailable" } });
     });
 
+    it("redacts a Claude setup-token when the protected store fails", async () => {
+      const logs: string[] = [];
+      for (const m of ["log", "info", "warn", "error", "debug"] as const) vi.spyOn(console, m).mockImplementation((...a) => { logs.push(a.join(" ")); });
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "claude-subscription" });
+      // Make SQLite's raw error contain the token, proving that it is redacted.
+      dedup.getDb().exec(`CREATE TRIGGER fail_credential_write BEFORE INSERT ON model_protected_secrets
+        BEGIN SELECT RAISE(ABORT, '${KEY}'); END`);
+      try {
+        const failed = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+        expect(failed.status).toBe(500);
+        expect(failed.json).toEqual({ error: "could not write the credential" });
+        expect(failed.raw).not.toContain(KEY);
+        expect(logs.join("\n")).not.toContain(KEY);
+        expect(count("model_protected_secrets")).toBe(0);
+      } finally {
+        dedup.getDb().exec("DROP TRIGGER fail_credential_write");
+      }
+    });
+
     it("derives model-account:<id> and appends one revision for a profile without a ref", async () => {
       const t = adminTok();
       await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: undefined }));
@@ -7033,6 +7116,9 @@ describe("model accounts and stage configuration (AII-962)", () => {
         ["oai-1", {}, 400],
         ["oai-1", { apiKey: KEY, extra: 1 }, 400],
       ];
+      for (const id of ["plan-1", "bed"]) {
+        expect((await call(url(id), "DELETE", t)).status).toBe(400);
+      }
       for (const [id, body, status] of cases) {
         const r = await call(url(id), "PUT", t, body);
         expect(r.status, id).toBe(status);
@@ -7091,8 +7177,8 @@ describe("model accounts and stage configuration (AII-962)", () => {
       spy.mockRestore();
     });
 
-    it("refuses a non-admin with every page granted", async () => {
-      await seedProfile();
+    it.each(["openai-api-key", "claude-subscription"])("refuses a non-admin with every page granted for %s", async (authMode) => {
+      await seedProfile(authMode === "claude-subscription" ? { agent: "claude", provider: "anthropic", authMode } : {});
       accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
       const u = userTok();
       expect((await call(url("oai-1"), "PUT", u, { apiKey: KEY })).status).toBe(403);

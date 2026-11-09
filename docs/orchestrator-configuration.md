@@ -10,7 +10,7 @@ The group's checks are listed in [setup-checks.md § orchestrator](setup-checks.
 
 ## Boot
 
-`main()` (`src/index.ts`) runs in this order: create the database tables, seeding the seed-once settings (below) right after the `settings` table, start the knowledge-graph sidecar and the Restate sidecar, then call `loadConfig()`. Both sidecars start before `loadConfig()` and neither failure stops boot (see [restate.md](restate.md) and [kg-sidecar.md](kg-sidecar.md)). After `loadConfig()`, `main()` logs a summary, starts the HTTP server, refreshes the runner-backend cache, runs boot reconciliation or defers it to the Restate registration hook (see "The Fly sessions app and region"), runs the first poll cycle immediately, and only then schedules the poll interval.
+`main()` (`src/index.ts`) runs in this order: create the database tables, seeding the seed-once settings (below) right after the `settings` table, start the knowledge-graph sidecar and the Restate sidecar, then call `loadConfig()`. Both sidecars start before `loadConfig()` and only KG failure is non-fatal (see [restate.md](restate.md) and [kg-sidecar.md](kg-sidecar.md)). After `loadConfig()`, `main()` logs a summary, starts the HTTP server, waits for Restate readiness, registration and its completed hook, refreshes the runner-backend cache, runs startup reconciliation, posts the boot notice, runs the first poll cycle immediately, and only then schedules the poll interval.
 
 ### What `loadConfig` requires
 
@@ -63,7 +63,7 @@ After `loadConfig()`, `main()` logs these lines in this order, among others:
 
 The Fly rows read only each mapping's own execution mode, so under runner mode `fly` or `shadow` a mapping set to GitHub Actions is sent to Fly without this warning (under `fly` with no sessions app it is skipped at dispatch instead, by `checkForcedPathEligibility`). The `runner.fly-sessions` check resolves each mapping's path the way dispatch does (`resolveExecutionPath`, `src/runner-mode.ts`) and reports that case too.
 
-The sessions app in the last two rows is resolved as described in "The Fly sessions app and region". `main()` has not yet refreshed the runner-backend cache at this point, so the value is the environment-then-row fallback unless the Restate registration hook has already refreshed the cache.
+The sessions app in the last two rows comes from the cache refreshed by the completed successful registration hook. These Fly logs print after the boot wait.
 
 ### Boot checks presence, not validity
 
@@ -74,7 +74,7 @@ A wrong credential therefore boots cleanly and surfaces as an error from the fir
 | Work | Credential | Failure log |
 |---|---|---|
 | `applyVolumeSnapshotRetentionAtBoot` (`src/fly-volumes.ts`), fire-and-forget | `FLY_DEPLOY_TOKEN` | `[fly-volumes] snapshot retention not applied: …` |
-| `startupReconciliation` (`src/index.ts`), only when a sessions token and app are set; while the sessions app is still the fallback it is deferred to the Restate registration hook (see "The Fly sessions app and region") | `FLY_SESSIONS_TOKEN` | `[startup] Failed to list machines for reconciliation: …` |
+| `startupReconciliation` (`src/index.ts`), only when a sessions token and app are set; runs after the successful registration hook and cache refresh | `FLY_SESSIONS_TOKEN` | `[startup] Failed to list machines for reconciliation: …` |
 | The first poll cycle, which `main()` awaits before scheduling the interval | The GitHub App pair, tracker credentials | Per-step errors inside the cycle, for example `[poll] Fatal error during poll cycle: …`, which drops that cycle's snapshot and dispatch work but not the process |
 
 ## Where a setting lives
@@ -98,7 +98,7 @@ The sign-in allowlist is a fifth shape, closest to the second: the environment a
 | `OAUTH_ALLOWED_DOMAINS`, `OAUTH_ALLOWED_EMAILS` | `access_entries` table | Stored list when it has entries > environment | `/admin#access`; see [access-model.md](access-model.md) |
 | `RUNNER_MODE` | `settings` row `runner_mode` | Recognized env value > row > `default` | Unset the variable and restart, then `/admin#runners` |
 | `FLY_PROCESS_LEVEL_SECRETS` | `settings` row `fly_process_level_secrets` | Recognized env value > row > on | Unset the variable and restart, then `/admin#runners` |
-| `FLY_SESSIONS_APP`, `FLY_SESSIONS_REGION` | Restate `RunnerBackend/fly-machines`; legacy rows `fly_sessions_app`, `fly_sessions_region` | Object state once read > env > row > none | `/admin#settings`, or the `set_runner_backend` tool |
+| `FLY_SESSIONS_APP`, `FLY_SESSIONS_REGION` | Restate `RunnerBackend/fly-machines`; legacy rows `fly_sessions_app`, `fly_sessions_region` | Cached object state only (null before read or when empty); boot seed: env > row > none | `/admin#settings`, or the `set_runner_backend` tool |
 | `FLY_SESSIONS_TOKEN` | Environment only | — | Set the variable and restart |
 | `AI_IMPLEMENT_SOURCE_REPO`, `AI_IMPLEMENT_SOURCE_BRANCH` | Image build stamp | `settings` rows `deploy_watched_repo` + `deploy_watched_ref`, when both are set and the repo is well-formed > stamp | `/admin#deployments`; see "Values the image build stamps" |
 
@@ -155,16 +155,16 @@ Both live in `src/runner-mode.ts`, where the precedence is decided by the pure `
 `getFlySessionsConfig` (`src/orchestrator-settings.ts`) answers the token, app and region synchronously from a process cache:
 
 1. `FLY_SESSIONS_TOKEN` always comes from the environment. It is never stored in a row or in Restate, because Restate journals every handler input.
-2. Once a read of `RunnerBackend/fly-machines` has returned state, the app and region come from that state, including a `null` field. The environment variables and the rows are then ignored for these two values.
-3. Before any such read, or while the object holds nothing, each value comes from its environment variable, else its `settings` row, else nothing. This keeps a boot with Restate down able to dispatch.
+2. The app and region always come from the cached `RunnerBackend/fly-machines` state, including explicit `null` fields.
+3. Before the first successful read, and after a successful read of an empty object, app and region are null with null field sources. An empty read marks the cache loaded. Environment variables and legacy rows are boot seed inputs only; a later variable applies only through a seed at a boot where the object is empty. A thrown read keeps the last cached values; boot dispatch waits for the registration hook to seed and refresh.
 
 `refreshRunnerBackendCache` fills the cache. It runs in `main()` before boot reconciliation, in the Restate registration hook, at the start of every poll cycle, and after a successful `set_runner_backend` call through `/mcp` or the Settings page. Each read has a 3-second timeout. A failed read keeps the last value and logs `[runner-backend] Restate unreachable; serving last value (…)` once per outage.
 
-The Restate registration hook runs after the boot registration attempt, whatever its outcome except a declined conflict (which defers it to the retry that resolves the conflict), so it also runs after a failed attempt. `seedRunnerBackends` runs in it. It sends `seed` to `RunnerBackend/fly-machines` with `FLY_SESSIONS_APP` else the `fly_sessions_app` row, and `FLY_SESSIONS_REGION` else `fly_sessions_region`; it skips that send when both are empty, and then seeds `github-actions` with `{}` (not reached when the `fly-machines` send fails). The object's `seed` handler (`src/restate/runner-backend.ts`) writes only when the object is empty, so after the first successful seed the variables and rows are inert. A deployment that boots with nothing configured leaves the object empty, so a variable added later is seeded at a later boot. A failed send logs `[runner-backend] could not seed RunnerBackend; the env vars and settings rows keep serving: …`.
+The Restate registration hook runs only after successful registration. Boot awaits the hook; unreachable registration or a thrown hook is fatal, while declined conflicts retry every 60 seconds with polling held. Missing binary, sidecar exit and the five-minute deadline (except while declined) are also fatal: both sidecars stop, HTTP closes and the process exits 1 without webhook notices. `seedRunnerBackends` runs in it. It calls and awaits the `seed` handler on `RunnerBackend/fly-machines` with `FLY_SESSIONS_APP` else the `fly_sessions_app` row, and `FLY_SESSIONS_REGION` else `fly_sessions_region`; it skips that call when both are empty, and then calls and awaits `seed` on `github-actions` with `{}` (not reached when the `fly-machines` call fails). Each successful call waits for handler completion, so the hook's following cache refresh sees the completed seed. Each call has a 3-second caller timeout; a timeout reaches the same failure path and lets the hook continue to cache refresh. This bounds only the caller wait and does not cancel the durable seed invocation. The object's `seed` handler (`src/restate/runner-backend.ts`) writes only when the object is empty, so after the first successful seed the variables and rows are inert. A deployment that boots with nothing configured leaves the object empty, so a variable added later is seeded at a later boot. A failed call logs `[runner-backend] could not seed RunnerBackend; Fly dispatch skips while the object is empty; the next boot retries: …` and returns. If the object is empty after refresh, Fly dispatch skips until a boot seeds it.
 
 To change the values after the object is seeded, save them on `/admin#settings` or call the admin-role `set_runner_backend` tool. The Settings page's `POST /api/settings` goes through that tool and writes no row; it answers 503 `restate-unavailable` when Restate cannot take the write. Clearing a field there stores `null` in the object, which leaves Fly without that value: it does not fall back to the environment.
 
-`GET /api/settings` reports `runnerBackendSource` (`restate` or `fallback`), and for each value its runtime, row and environment values, with `overriddenByEnv` true only on the fallback path when the variable is set. Boot reconciliation of session machines runs in `main()` only when the cache already holds the `restate` source (`createBootReconciliation`, `src/index.ts`). Otherwise `main()` logs `[main] Runner backend cache is on the fallback; startup reconciliation deferred to Restate registration`, and the hook runs it once, after its own cache refresh: against the object's app when that refresh loaded it, else against the fallback. If the hook never runs, neither does reconciliation.
+`GET /api/settings` reports `runnerBackendSource` (`restate` after any successful read, including an empty object, or `not-loaded` before one), and for each value its runtime, row and environment values. Boot reconciliation of session machines runs in `main()` after the registration hook (including its awaited seed and refresh) finishes and main refreshes the cache again. There is no deferred reconciliation.
 
 ## Numeric tuning values
 

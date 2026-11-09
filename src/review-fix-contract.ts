@@ -342,7 +342,8 @@ export function validateWorkerCancelOutcome(raw: unknown): ValidationResult<Work
 export type WorkerTerminalOutcome =
   | { readonly status: "succeeded"; readonly outputCommit: string }
   | { readonly status: "failed"; readonly reason: string }
-  | { readonly status: "cancelled" };
+  | { readonly status: "cancelled" }
+  | { readonly status: "launch_unresolved" };
 
 export function validateWorkerTerminalOutcome(raw: unknown): ValidationResult<WorkerTerminalOutcome> {
   if (!isPlainObject(raw)) return err("worker terminal outcome must be an object");
@@ -359,11 +360,12 @@ export function validateWorkerTerminalOutcome(raw: unknown): ValidationResult<Wo
       if (!reason.ok) return reason;
       return ok({ status: "failed", reason: reason.value });
     }
+    case "launch_unresolved":
     case "cancelled":
       if (raw.outputCommit !== undefined || raw.reason !== undefined) {
-        return err("cancelled terminal outcome must not carry an output commit or failure reason");
+        return err(`${raw.status} terminal outcome must not carry an output commit or failure reason`);
       }
-      return ok({ status: "cancelled" });
+      return ok({ status: raw.status });
     default:
       return err(`unsupported worker terminal outcome status: ${JSON.stringify(raw.status)}`);
   }

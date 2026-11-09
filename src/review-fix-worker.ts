@@ -465,6 +465,9 @@ export interface ManagedReviewFixLaunch {
   settle(outcome: "accepted" | "rejected" | "unknown"): void;
 }
 
+/** An explicit preparation refusal proves this launch did not dispatch. */
+export class ManagedReviewFixLaunchRefusedError extends Error {}
+
 export interface GithubReviewFixWorkerDeps {
   credentials: ReviewFixWorkerCredentialResolver;
   /** Mint callback bearers inside the launch adapter, after preparation. The
@@ -483,8 +486,9 @@ export interface GithubReviewFixWorkerDeps {
   /** True when this work must travel over protected (private-envelope) transport and may never
    *  fall back to legacy top-level credentials. */
   requiresProtectedTransport?: (plan: WorkerLaunchPlan) => boolean;
-  /** Production managed preparation, after protected transport is verified. A refusal throws
-   * fixed text; null is legacy. Neither secrets nor settlement callbacks enter the launch plan. */
+  /** Production managed preparation, after protected transport is verified. An explicit refusal
+   * throws ManagedReviewFixLaunchRefusedError with fixed text; null is legacy.
+   * Neither secrets nor settlement callbacks enter the launch plan. */
   prepareManagedLaunch?: (plan: WorkerLaunchPlan, capabilities: WorkflowCapabilities) => Promise<ManagedReviewFixLaunch | null>;
   /** Orchestrator callback base URL, carried in the run envelope (not a secret). */
   runnerCallbackUrl?: string;
@@ -592,7 +596,10 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
         if (this.requiresProtectedTransport?.(plan)) return { status: "unknown" };
         inputs = buildLaunchInputs(plan, mapping, this.runnerCallbackUrl, undefined, retryPolicy);
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof ManagedReviewFixLaunchRefusedError) {
+        return finish({ status: "rejected", reason: "review-fix managed preparation refused" });
+      }
       // A missing/expired prepared credential is not proof that an earlier
       // dispatch did not happen. The workflow reconciles under its launch intent.
       return finish({ status: "unknown" });

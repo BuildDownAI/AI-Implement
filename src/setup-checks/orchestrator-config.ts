@@ -249,7 +249,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       const { sidecar, registration } = restateStatus();
       const detail = `The sidecar is ${sidecar.state} and the endpoint registration is ${registration.state}`;
       if (sidecar.state === "ready" && registration.state === "registered") return [{ state: "pass", detail }];
-      return [{ state: "fail", detail, fix: "Read the [restate] lines in the orchestrator log, which name the cause." }];
+      return [{ state: "fail", detail, fix: "Read the [restate] lines in the orchestrator log, which name the cause. The orchestrator does not dispatch until Restate serves." }];
     },
   },
   {
@@ -281,12 +281,17 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "mode",
     onAdminPath: false,
-    run: ({ runnerMode, mappings, flySessions }) => {
+    run: ({ runnerMode, mappings, flySessions, runnerBackendSource }) => {
       const mode = runnerMode().mode;
       const onFly = Object.entries(mappings())
         .filter(([, mapping]) => ["fly-machines", "both"].includes(resolveExecutionPath(mode, mapping.executionMode)))
         .map(([key]) => key);
       if (onFly.length === 0) return [{ state: "not-applicable", detail: "No project runs on Fly Machines" }];
+      if (runnerBackendSource() === "not-loaded") return [{
+        state: "fail",
+        detail: "Restate has not answered yet, so the sessions app cannot be read",
+        fix: "Wait for Restate to serve; read the [restate] lines in the orchestrator log.",
+      }];
       const fly = flySessions();
       const missing = [fly.token ? null : "FLY_SESSIONS_TOKEN", fly.app ? null : "the sessions app"].filter((name) => name !== null);
       if (missing.length === 0) {

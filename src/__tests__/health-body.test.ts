@@ -2,6 +2,7 @@ import type http from "node:http";
 import { withRequestErrorBoundary } from "../http-server.js";
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import type { RestateStatus } from "../restate/status.js";
 import { buildHealthBody, type HealthBodyReaders } from "../health-body.js";
 import { getLastSetupCheckRun, recordSetupCheckRun, runSetupChecks, type SetupCheckRun } from "../setup-checks/index.js";
 import { ORCHESTRATOR_CONFIG_CHECKS } from "../setup-checks/orchestrator-config.js";
@@ -23,6 +24,30 @@ function readers(): HealthBodyReaders {
 }
 
 describe("public health body", () => {
+  const states: [RestateStatus["sidecar"], RestateStatus["registration"]["state"], string][] = [
+    [{ state: "ready" }, "registered", "ok"],
+    [{ state: "starting" }, "not-attempted", "unavailable"],
+    [{ state: "timeout" }, "not-attempted", "unavailable"],
+    [{ state: "ready" }, "not-attempted", "unavailable"],
+    [{ state: "ready" }, "declined-conflict", "unavailable"],
+    [{ state: "ready" }, "unreachable", "unavailable"],
+    ...(["registered", "not-attempted", "declined-conflict", "unreachable"] as const).map(
+      (registration): [RestateStatus["sidecar"], RestateStatus["registration"]["state"], string] =>
+        [{ state: "exited", code: 1, signal: null }, registration, "unavailable"],
+    ),
+    [{ state: "missing-binary" }, "not-attempted", "unavailable"],
+  ];
+
+  it.each(states)("reports %j / %s as %s from one snapshot", async (sidecar, registration, status) => {
+    const read = readers();
+    const snapshot: RestateStatus = { sidecar, registration: { state: registration } };
+    read.restateStatus = vi.fn(() => snapshot);
+    const body = await buildHealthBody(read);
+    expect(body.status).toBe(status);
+    expect(body.restate).toBe(snapshot);
+    expect(read.restateStatus).toHaveBeenCalledOnce();
+  });
+
   it("lets the request boundary finish a failed health build without sending 200", async () => {
     const read = readers();
     read.setupCheckContext = () => { throw new Error("context unavailable"); };
@@ -49,7 +74,7 @@ describe("public health body", () => {
 
   it("preserves every legacy field and adds the unknown-run summary", async () => {
     expect(await buildHealthBody(readers())).toEqual({
-      status: "ok", sourceCommit: "abc123", polls: 42, kgDegraded: true,
+      status: "unavailable", sourceCommit: "abc123", polls: 42, kgDegraded: true,
       kgUnavailable: true, sidecar: { reachable: false, toolsListed: false, lastError: "probe failed", checkedAt: 123 },
       restate: { sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } },
       deploy: { held: true, startedAt: 456 }, lastPollStartedAt: new Date(1000).toISOString(), lastPollFinishedAt: new Date(2000).toISOString(),

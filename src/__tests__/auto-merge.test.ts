@@ -359,7 +359,7 @@ describe("runAutoMerges honours the Auto-merge setting", () => {
   });
 });
 
-describe("default-branch sync after an auto-merged child (Restate lifecycle)", () => {
+describe("default-branch sync after an auto-merged child", () => {
   const MSG = "Merge default branch into feature branch";
   const restate = () => mapping({ reviewFixLifecycle: "restate" });
   const baseA = "ai-implement/feature/aii-200-feat";
@@ -385,13 +385,6 @@ describe("default-branch sync after an auto-merged child (Restate lifecycle)", (
 
   beforeEach(() => { autoMerge.resetCapExhaustedNotifications(); });
 
-  it.each(["legacy", undefined] as const)("does not sync for lifecycle %s", async (lc) => {
-    setupOne();
-    await autoMerge.runAutoMerges([mapping({ reviewFixLifecycle: lc })], deps());
-    expect(mergePullRequest).toHaveBeenCalledTimes(1);
-    expect(mergeBranch).not.toHaveBeenCalled();
-  });
-
   it.each(["blocked", "conflict", "error"] as const)("does not sync when the child merge result is %s", async (res) => {
     setupOne();
     vi.mocked(mergePullRequest).mockResolvedValue(res as never);
@@ -399,11 +392,11 @@ describe("default-branch sync after an auto-merged child (Restate lifecycle)", (
     expect(mergeBranch).not.toHaveBeenCalled();
   });
 
-  it("syncs the default branch with a key-free message, after the child merge", async () => {
+  it.each([null, "legacy", "restate"] as const)("syncs the default branch with a key-free message after the child merge for lifecycle %s", async (lifecycle) => {
     setupOne();
     vi.mocked(mergeBranch).mockResolvedValue("merged");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    const m = restate();
+    const m = mapping({ reviewFixLifecycle: lifecycle });
     await autoMerge.runAutoMerges([m], deps());
     expect(mergeBranch).toHaveBeenCalledTimes(1);
     expect(mergeBranch).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", baseA, m.defaultBranch, MSG);

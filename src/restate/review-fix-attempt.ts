@@ -33,6 +33,8 @@ import { restateRetentionMs } from "./retention.js";
 
 const INSPECTION_INTERVAL_MS = 1_000;
 const RECONCILE_INTERVAL_MS = 1_000;
+const UNKNOWN_LAUNCH_GRACE_MS = 30 * 60_000;
+const POST_DEADLINE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const RUN_STATUS_TICK_MS = 60_000;
 
 /** The adapter supplying approval facts must read the current PR head and policy,
@@ -63,6 +65,9 @@ export interface ReviewFixAttemptDependencies {
    * value here, the same way a short `jobTimeoutMinutes` on an admission request
    * shrinks `deadlineAt` without touching the production buffer constant. */
   unknownLaunchAlertMs?: number;
+  /** Test timing overrides; production uses a fixed 30-minute grace and five-minute backoff. */
+  unknownLaunchGraceMs?: number;
+  postDeadlineReconcileIntervalMs?: number;
 }
 
 type Wake =
@@ -72,6 +77,7 @@ type Wake =
 
 export type ReviewFixAttemptCompletion =
   | { status: "finalized"; terminal: WorkerTerminalOutcome; approval: "applied" | "withheld" | "not_applicable" }
+  | { status: "launch_unresolved" }
   | { status: "launch_rejected" }
   | { status: "deadline_before_launch" }
   | { status: "not_owner" };
@@ -172,9 +178,21 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       execution = launch.execution;
     } else {
       const unknownSince = await ctx.date.now();
+      const unresolvedUntil = attempt.deadlineAt + (deps.unknownLaunchGraceMs ?? UNKNOWN_LAUNCH_GRACE_MS);
+      let revoked = false;
       let warned = false;
       let lookupIndex = 0;
       for (;;) {
+        const checkedAt = await ctx.date.now();
+        if (await ctx.promise<boolean>("cancel").peek() || checkedAt >= unresolvedUntil) {
+          await ctx.run("revoke-terminal-unresolved-launch", () => store.revokeAuthority(attemptId, checkedAt));
+          await ctx.run("record-unresolved-launch", () => finalizer.recordOutcome({
+            attemptId, scope: attempt.scope, terminal: { status: "launch_unresolved" },
+          }, checkedAt));
+          // No execution identity means no proof of termination. Only an operator
+          // may release this reservation after checking GitHub.
+          return { completion: { status: "launch_unresolved" }, scope: attempt.scope };
+        }
         const lookup = await ctx.run(`reconcile-${lookupIndex++}`, () => worker.reconcile(attemptId, attempt.scope));
         if (lookup.status === "found") {
           execution = lookup.execution;
@@ -187,10 +205,18 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
           await alert(ctx, attemptId, "launch identity still unresolved; occupancy retained", "alert-unknown-launch");
           warned = true;
         }
-        if (now >= attempt.deadlineAt) {
+        if (now >= attempt.deadlineAt && !revoked) {
           await ctx.run("revoke-unresolved-launch", () => store.revokeAuthority(attemptId, now));
+          revoked = true;
         }
-        await ctx.sleep(RECONCILE_INTERVAL_MS);
+        const interval = now >= attempt.deadlineAt
+          ? deps.postDeadlineReconcileIntervalMs ?? POST_DEADLINE_RECONCILE_INTERVAL_MS
+          : RECONCILE_INTERVAL_MS;
+        const boundary = now >= attempt.deadlineAt ? unresolvedUntil : attempt.deadlineAt;
+        await restate.RestatePromise.race([
+          ctx.promise<boolean>("cancel").get(),
+          ctx.sleep(Math.max(1, Math.min(interval, boundary - now))),
+        ]);
       }
     }
 
