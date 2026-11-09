@@ -121,6 +121,24 @@ for (const backend of backends) describe(backend, () => {
     vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue("orphan");
     expect(await s.instance.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "unknown" });
   });
+  it("keeps reconciliation lookup errors secret and preserves launch intent", async () => {
+    const s = await setup(backend);
+    seedLaunchIntent(s);
+    const row = s.log.getJobByDispatchId(s.plan.attemptId);
+    const sentinels = ["sentinel-result", "sentinel-progress", "sentinel-publication", "sentinel-nonce", "sentinel-bootstrap", "sentinel-github"];
+    const error = new Error(sentinels.join(" "));
+    vi.mocked(s.fly.listMachines).mockRejectedValue(error);
+    vi.mocked(s.docker.findLocalContainerIdByName).mockRejectedValue(error);
+
+    const result = await s.instance.reconcile(s.plan.attemptId, s.plan.scope);
+
+    expect(result).toEqual({ status: "unknown" });
+    for (const sentinel of sentinels) expect(JSON.stringify(result)).not.toContain(sentinel);
+    if (backend === "fly-machines") expect(s.fly.listMachines).toHaveBeenCalledWith("fly", "sessions");
+    else expect(s.docker.findLocalContainerIdByName).toHaveBeenCalledWith("review-fix-attempt-1");
+    expect(s.log.getJobByNonce("sentinel-nonce")).toEqual(row);
+    expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
+  });
   for (const count of [0, 1, 2]) it(`reconciles ${count} exact name candidates conservatively`, async () => {
     const s = await setup(backend);
     seedLaunchIntent(s);
@@ -164,12 +182,20 @@ for (const status of [400, 503, null]) it(`Fly launch error ${status}`, async ()
   const result = await s.instance.launch(s.plan);
   expect(result.status).toBe(status === 400 ? "rejected" : "unknown");
   expect(JSON.stringify(result)).not.toContain("sentinel");
+  const row = s.log.getJobByDispatchId(s.plan.attemptId)!;
+  expect(row).toMatchObject(status === 400
+    ? { status: "dispatch-failed", machineNonce: null, machineId: null, completedAt: expect.any(Number) }
+    : { status: "dispatched", machineNonce: "sentinel-nonce", machineId: null, completedAt: null });
+  expect(s.log.getJobByNonce("sentinel-nonce")).toEqual(status === 400 ? null : row);
+  expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
 });
 for (const started of [false, true]) it(`local error ${started ? "after" : "before"} launch boundary`, async () => {
   const s = await setup("local-docker");
   vi.mocked(s.docker.startLocalRunnerContainer).mockImplementation(async input => { if (started) input.onBeforeLaunch?.(); throw new Error("sentinel-bootstrap"); });
   const result = await s.instance.launch(s.plan);
   expect(result.status).toBe(started ? "unknown" : "rejected");
+  expect(s.log.getJobByDispatchId(s.plan.attemptId)).toEqual(started ? expect.objectContaining({ status: "dispatched", machineNonce: "sentinel-nonce", completedAt: null }) : null);
+  expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
   expect(JSON.stringify(result)).not.toContain("sentinel");
 });
 it("Fly reconciliation excludes prefix and suffix name matches", async () => {
@@ -198,4 +224,25 @@ for (const status of ["created", "restarting", "paused", "running", "removing", 
   vi.mocked(s.docker.inspectLocalContainer).mockResolvedValue({ status, running: false, exitCode: 0 });
   expect(await s.instance.inspectTerminal(s.execution)).toEqual({ reached: false });
   expect(s.deps.getPullRequestHeadSha).not.toHaveBeenCalled();
+});
+
+for (const guard of ["terminal", "bound", "generation", "nonce", "backend", "dispatch"] as const) it(`definite refusal preserves ${guard} row and fails closed`, async () => {
+  const s = await setup("fly-machines");
+  let protectedRow: ReturnType<typeof s.log.getJobByDispatchId>;
+  vi.mocked(s.fly.createMachine).mockImplementation(async () => {
+    const row = s.log.getJobByDispatchId(s.plan.attemptId)!;
+    if (guard === "terminal") s.log.updateJobStatus(row.id, "completed", "runner_approved");
+    if (guard === "bound") s.log.setJobMachineId(row.id, "existing-execution");
+    if (guard === "nonce") s.log.setJobMachineNonce(row.id, "replacement-nonce");
+    if (["generation", "backend", "dispatch"].includes(guard)) {
+      const { getDb } = await import("../dedup.js");
+      const column = { generation: "admission_generation", backend: "execution_mode", dispatch: "dispatch_id" }[guard as "generation" | "backend" | "dispatch"];
+      getDb().prepare(`UPDATE dispatch_log SET ${column} = ? WHERE id = ?`).run(guard === "generation" ? row.admissionGeneration! + 1 : "other", row.id);
+    }
+    protectedRow = s.log.getJobById(row.id);
+    throw new Error("create (400) sentinel-result");
+  });
+  expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
+  expect(s.log.getJobById(protectedRow!.id)).toEqual(protectedRow!);
+  expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
 });

@@ -1,4 +1,5 @@
 /** Fresh, attempt-owned containers using the established gap-fill transports (ADR 037). */
+import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import { dispatchFlyGapfill, type DispatchFlyGapfillInput } from "./gapfill-launch.js";
@@ -6,7 +7,7 @@ import { dispatchLocalGapfill, type DispatchLocalGapfillInput } from "./local-ga
 import { listMachines } from "./fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer } from "./local-docker.js";
 import { readBackendRun, stopBackendRun } from "./backend-run.js";
-import { appendLogIfAbsent, getJobByDispatchId, setJobMachineId } from "./log.js";
+import { appendLogIfAbsent, getJobByDispatchId, getJobById, setJobMachineId, updateJobStatus } from "./log.js";
 import { classifyLaunchError, isManagedProject } from "./managed-dispatch-auth.js";
 import { githubActionsReviewFixWorkerTransport, inMemoryReviewFixWorkerScopeStore, type GithubReviewFixWorkerDeps } from "./review-fix-worker.js";
 import type { ReviewFixWorkerPort } from "./review-fix-ports.js";
@@ -38,6 +39,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
     if (backend !== "fly-machines" && backend !== "local-docker") return { status: "rejected", reason: "Container worker requires a container backend" };
     let started = false;
     let created = false;
+    let staged: { id: number; nonce: string; generation: number } | undefined;
     try {
       const admission = readAdmission(plan.attemptId);
       if (!admission || admission.releasedAt !== null || admission.backend !== backend) return { status: "unknown" };
@@ -60,6 +62,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       let jobId: number | undefined;
       const beforeLaunch = (nonce: string) => {
         jobId = appendLogIfAbsent({ issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title, teamKey, repo: plan.scope.repository, dispatchId: plan.attemptId, admissionGeneration: admission.generation, executionMode: backend, machineNonce: nonce, phase: "gap-analysis", computeStartedAt: Date.now() });
+        staged = { id: jobId, nonce, generation: admission.generation };
         started = true;
       };
       let id: string;
@@ -79,7 +82,24 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       console.log(`[review-fix] dispatched via ${backend} (attempt ${plan.attemptId}, run ${id})`);
       return { status: "accepted", execution };
     } catch (err) {
-      const status = created ? "unknown" : classifyLaunchError(backend, started, err);
+      let status = created ? "unknown" : classifyLaunchError(backend, started, err);
+      if (status === "rejected" && staged) {
+        const owned = staged;
+        try {
+          const settled = getDb().transaction(() => {
+            const row = getJobById(owned.id);
+            const admission = readAdmission(plan.attemptId);
+            if (!admission || admission.generation !== owned.generation || admission.backend !== backend
+              || !row || row.dispatchId !== plan.attemptId || row.admissionGeneration !== owned.generation
+              || row.executionMode !== backend || row.machineNonce !== owned.nonce || row.machineId !== null
+              || row.completedAt !== null || (row.status !== "dispatched" && row.status !== "running")) return false;
+            // Definite refusal proves no execution was created. The workflow still owns admission release.
+            updateJobStatus(row.id, "dispatch-failed", "failure", undefined, { skipAdmissionRelease: true });
+            return true;
+          }).immediate();
+          if (!settled) status = "unknown";
+        } catch { status = "unknown"; }
+      }
       return status === "rejected" ? { status, reason: "Container review-fix launch rejected" } : { status };
     }
   };
