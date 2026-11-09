@@ -92,3 +92,18 @@ Configured Codex implementation defaults to the pinned CLI's `--dangerously-bypa
 ## Per-job compute accounting
 
 Each `dispatch_log` row saves what billing needs when the job runs, because the mapping can change afterwards: `tracker_kind`, `issue_url`, the requested guest (`machine_cpu_kind`, `machine_cpus`, `machine_memory_mb`, read from the built Fly config), and `compute_started_at` / `compute_stopped_at` (epoch ms). Fly and local Docker stamp the start at launch and the stop when `destroyMachineRecorded`, `stopBackendRun` with `keep`, or the local remove path runs; the first stop wins, and a 404 falls back to `completed_at`. A durable-runner `destroyMachineRecorded` does not stamp a stop. GitHub Actions rows take `run_started_at` / `updated_at` from `getWorkflowRunStatus` once the run is `completed` and leave the machine size null. Issueless kg-refresh rows have no tracker kind or issue URL. Old rows keep nulls; nothing is backfilled.
+
+`ContainerReviewFixWorker` wraps the existing Fly/local gap-fill launch helpers for
+review-fix attempts. It creates a fresh execution named `review-fix-<dispatchId>`
+(never a kept Fly machine), mints prepared callback tokens inside launch, and
+records the nonce and existing admission generation in a gap-analysis row without
+a PR URL. Reconciliation prefers that row's execution ID, otherwise requiring one
+exact name match. Local inspection requires Docker status `exited` and
+`running: false` before interpreting an exit code; other observed states retain
+attempt occupancy. A missing container reports failure. Successful exits read the
+current PR head. Managed projects are
+explicitly rejected on these backends pending AII-1770.
+
+`ReviewFixWorker` routes plans and execution identities by backend and reads the
+persisted attempt backend for reconciliation. Production composition and admission
+remain GitHub-only until the separate backend admission rollout.

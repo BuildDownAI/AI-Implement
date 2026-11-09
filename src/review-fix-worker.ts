@@ -784,3 +784,18 @@ export class GithubReviewFixWorker implements ReviewFixWorkerPort {
     return { reached: true, outcome: { status: "failed", reason: detail.conclusion ?? "unknown conclusion" } };
   }
 }
+
+/** Routes without changing GitHub's launch inputs or opening production admission. */
+export class ReviewFixWorker implements ReviewFixWorkerPort {
+  constructor(private readonly workers: Record<"github-actions" | "fly-machines" | "local-docker", ReviewFixWorkerPort>,
+    private readonly attempts: { getPreparedAttempt(attemptId: AttemptId): Promise<Pick<PreparedReviewFixAttempt, "executionBackend"> | null> }) {}
+  prepare: ReviewFixWorkerPort["prepare"] = (attempt) => this.workers[attempt.executionBackend ?? "github-actions"].prepare(attempt);
+  launch: ReviewFixWorkerPort["launch"] = (plan) => this.workers[plan.executionBackend ?? "github-actions"].launch(plan);
+  reconcile: ReviewFixWorkerPort["reconcile"] = async (attemptId, scope) => {
+    const attempt = await this.attempts.getPreparedAttempt(attemptId);
+    if (!attempt) return { status: "unknown" };
+    return this.workers[attempt.executionBackend ?? "github-actions"].reconcile(attemptId, scope);
+  };
+  inspectTerminal: ReviewFixWorkerPort["inspectTerminal"] = (execution) => this.workers[execution.backend ?? "github-actions"].inspectTerminal(execution);
+  cancel: ReviewFixWorkerPort["cancel"] = (attemptId, execution) => this.workers[execution.backend ?? "github-actions"].cancel(attemptId, execution);
+}

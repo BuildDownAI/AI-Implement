@@ -1068,3 +1068,33 @@ describe("frozen execution backend", () => {
     }
   });
 });
+
+describe("backend router", () => {
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("delegates %s with identical arguments and persisted reconciliation", async backend => {
+    const fake = () => ({ prepare: vi.fn(), launch: vi.fn(), reconcile: vi.fn(), inspectTerminal: vi.fn(), cancel: vi.fn() });
+    const workers = { "github-actions": fake(), "fly-machines": fake(), "local-docker": fake() };
+    const selected = workers[backend];
+    const source = { getPreparedAttempt: vi.fn().mockResolvedValue({ executionBackend: backend }) };
+    const router = new workerModule.ReviewFixWorker(workers, source);
+    const attempt = makeAttempt({ executionBackend: backend });
+    const plan = { executionBackend: backend, attemptId: attempt.attemptId, scope: attempt.scope, taskText: attempt.taskText, deadlineAt: attempt.deadlineAt };
+    const execution = backend === "github-actions" ? { backend, githubRunId: 42, githubRunAttempt: 1 } as const : { backend, runRef: "machine" } as const;
+    await router.prepare(attempt);
+    await router.launch(plan);
+    await router.reconcile(attempt.attemptId, attempt.scope);
+    await router.inspectTerminal(execution);
+    await router.cancel(attempt.attemptId, execution);
+    expect(selected.prepare).toHaveBeenCalledWith(attempt);
+    expect(selected.launch.mock.calls[0][0]).toBe(plan);
+    expect(selected.reconcile).toHaveBeenCalledWith(attempt.attemptId, attempt.scope);
+    expect(selected.inspectTerminal).toHaveBeenCalledWith(execution);
+    expect(selected.cancel).toHaveBeenCalledWith(attempt.attemptId, execution);
+    for (const [key, worker] of Object.entries(workers)) if (key !== backend) expect(worker.launch).not.toHaveBeenCalled();
+  });
+  it("does not guess a backend for a missing persisted attempt", async () => {
+    const worker = { prepare: vi.fn(), launch: vi.fn(), reconcile: vi.fn(), inspectTerminal: vi.fn(), cancel: vi.fn() };
+    const router = new workerModule.ReviewFixWorker({ "github-actions": worker, "fly-machines": worker, "local-docker": worker }, { getPreparedAttempt: async () => null });
+    expect(await router.reconcile("missing", SCOPE)).toEqual({ status: "unknown" });
+    expect(worker.reconcile).not.toHaveBeenCalled();
+  });
+});
