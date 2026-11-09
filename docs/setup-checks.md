@@ -89,6 +89,26 @@ The orchestrator's own environment and settings (`ORCHESTRATOR_CONFIG_CHECKS`, `
 | [`admin.redirect-url`](orchestrator-configuration.md#what-boot-warns-about) | A sign-in provider without `OAUTH_REDIRECT_BASE_URL` |
 | [`admin.allowlist`](orchestrator-configuration.md#the-sign-in-allowlist) | SSO as the only admin path with no admin address in the list; with BuildDown configured it passes, naming the organization role claim |
 
+### github
+
+Each mapped project gets a `github.workflow-generation` row (`GITHUB_CONFIG_CHECKS`, `src/setup-checks/github-config.ts`), with its team key as `project`. It reads the implementation workflow on the mapping's default branch, the planning workflow only when planning is enabled, and every retired workflow path. Details name each file and ref and the missing inputs or markers.
+
+First match wins:
+
+| Condition | GitHub Actions mapping | Fly / local Docker mapping |
+|---|---|---|
+| Installation-token mint or any workflow read fails | cannot-verify | cannot-verify |
+| Retired `comment-trigger.yml` or `claude-kg-refresh.yml` exists | fail (`retired_workflow_present`) | warn |
+| Implementation is missing (404) or lacks `run_config` | fail | warn |
+| Enabled planning workflow is missing or lacks `run_config` | fail | warn |
+| Implementation lacks `run_publication_token` or `run_attempt_token` | warn | warn |
+| Either checked workflow lacks `private-run-config-v1`, `stage-agent-config-v1` or `stage-agent-launch-context-v1` | warn | warn |
+| All required inputs and markers are present | pass | pass |
+
+Every warn or fail asks: “Sync workflows on this project (admin row action or MCP trigger_workflow_sync) and merge its PR”. Fly and local Docker still need the workflows for GHA failover. Severity follows the mapping's configured backend, independent of a temporary runner-mode override. Local Docker is a runner override rather than a stored mapping backend. The Codex-only `github-hosted-execution-policy-v2` capability stays a dispatch-time gate and is not judged here.
+
+A run evaluates each mapping once, with separate GitHub GETs for its files; installation-token minting is the only POST. These network reads make setup runs longer. Capability probes share the existing five-minute process cache, and the runner uses `allSettled` so other checks continue. A failed read reports cannot-verify, never legacy. Retired-file reads treat only HTTP 404 as absence; malformed JSON, non-file responses and invalid base64 report cannot-verify. The existing CLI, setup-check API routes and `get_tenant_health` expose these rows; every allowlisted identity sees state and project through the summary, while detail and fix remain admin-only.
+
 ### tracker
 
 The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracker-config.ts`), explained in [ticketing-providers.md](ticketing-providers.md). Each provider reads its own facts once per run (`fetchSetupFacts`), and the checks judge them; a run that cannot read them reports its dependent checks as *cannot verify*, with the reason.

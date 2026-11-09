@@ -1,3 +1,4 @@
+import { resolveWorkflowCapabilities, __clearWorkflowProbeCacheForTests } from "../workflow-probe.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
@@ -251,6 +252,21 @@ describe("kg-refresh", () => {
       ["publication input without run_config", "on:\n  workflow_dispatch:\n    inputs:\n      run_publication_token: {}"],
       ["absent inputs", "on:\n  workflow_dispatch:"],
       ["malformed YAML", "on: ["],
+      ["both inputs inline publication", "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_publication_token: { required: false, type: string }"],
+      ["both inputs inline declarations", "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {required: true}\n      run_publication_token: {required: false}"],
+      ["both inputs block declarations", "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_publication_token:\n        required: false"],
+      ["both inputs null declarations", "on: {workflow_dispatch: {inputs: {run_config: null, run_publication_token: null}}}"],
+      ["publication only outside inputs", "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {}\njobs:\n  run_publication_token:"],
+      ["run config only outside inputs", "on:\n  workflow_dispatch:\n    inputs:\n      run_publication_token: {}\nenv:\n  run_config:"],
+      ["publication comment outside inputs", "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {}\n      # run_publication_token:"],
+      ["malformed root sequence", "- on: {workflow_dispatch: {inputs: {run_config: {}, run_publication_token: {}}}}"],
+      ["malformed on sequence", "on: [{workflow_dispatch: {inputs: {run_config: {}, run_publication_token: {}}}}]"],
+      ["both inputs flow map", "on: { workflow_dispatch: { inputs: { run_config: {required: true}, run_publication_token: {required: false} } } }"],
+      ["both inputs quoted keys", '\'on\': { "workflow_dispatch": { "inputs": { "run_config": {}, "run_publication_token": {} } } }'],
+      ["malformed inputs sequence", "on: {workflow_dispatch: {inputs: [run_config, run_publication_token]}}"],
+      ["malformed dispatch scalar", "on: {workflow_dispatch: run_config}"],
+      ["non-input mappings", "jobs:\n  run_config:\n  run_publication_token:\nenv:\n  run_config:\n  run_publication_token:\nsteps:\n  run_config:\n  run_publication_token:"],
+      ["comments only", "# run_config:\n# run_publication_token:"],
       ["both inputs", WORKFLOW_WITH_RUNNER_PHASE],
       ["both inputs with private capability", "# ai-implement-capability: private-run-config-v1\n" + WORKFLOW_WITH_RUNNER_PHASE],
     ])("checks the KG workflow contract: %s", async (name, content) => {
@@ -267,6 +283,16 @@ describe("kg-refresh", () => {
         fetchWorkflowFile: vi.fn(async () => ({ status: 200, content })) as never,
         fetchCompare: fetchCompare as never,
       });
+      __clearWorkflowProbeCacheForTests();
+      const fetchImpl = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+        type: "file", encoding: "base64", content: Buffer.from(content).toString("base64"),
+      })));
+      const capabilities = await resolveWorkflowCapabilities({
+        owner: "TestOrg", repo: "test-kg", workflowFile: "claude-implement.yml",
+        token: "tok", ref: "release/requested", fetchImpl,
+      });
+      expect(capabilities.supportsRunPublicationToken).toBe(ok);
+      expect(fetchImpl.mock.calls[0]?.[0]).toContain("?ref=release%2Frequested");
       expect(result.ok).toBe(ok);
       const row = result.results.find((r) => r.grant === "workflow:envelope");
       expect(row).toMatchObject({ ok, status: 200 });

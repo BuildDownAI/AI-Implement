@@ -1,15 +1,19 @@
+import { parse as parseYaml } from "yaml";
+import { defaultFetchSignal } from "./github.js";
+
 const CACHE_TTL_MS = 300_000;
-const RUN_CONFIG_RE = /^\s{2,}run_config:\s*$/m;
-const RUN_PUBLICATION_TOKEN_RE = /^\s{2,}run_publication_token:\s*$/m;
-/**
- * Declared-input marker for the Restate review-fix pilot's attempt-correlation and
- * versioned-callback support (AII-778). No concrete workflow input name existed yet at
- * authoring time — this mirrors `run_publication_token`'s naming (`run_token`,
- * `run_progress_token`, `run_publication_token`, ...) so a target workflow opts in the same
- * way: declare a `run_attempt_token:` input. AII-776 ("carry attempt identity through the
- * runner envelope") should either adopt this name or update this regex to match.
- */
-const RUN_ATTEMPT_TOKEN_RE = /^\s{2,}run_attempt_token:\s*$/m;
+/** Read only declared dispatch inputs, matching the KG synchronous preflight. */
+function declaredInputs(yamlText: string): Record<string, unknown> {
+  const mapping = (value: unknown): Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : {};
+  try {
+    const doc = mapping(parseYaml(yamlText));
+    return mapping(mapping(mapping(doc.on).workflow_dispatch).inputs);
+  } catch {
+    return {};
+  }
+}
 
 /**
  * Static private-envelope marker (AII-982): a YAML comment, not a workflow_dispatch input.
@@ -27,6 +31,10 @@ const STAGE_AGENT_CONTEXT_RE = /^#\s*ai-implement-capability:\s*stage-agent-laun
 export type WorkflowContract = "envelope" | "legacy";
 export interface WorkflowCapabilities {
   contract: WorkflowContract;
+  /** Diagnostic facts for setup checks; dispatch keeps using the combined capability. */
+  missing?: boolean;
+  hasStageAgentConfigMarker?: boolean;
+  hasStageAgentLaunchContextMarker?: boolean;
   supportsRunPublicationToken: boolean;
   /** True when the workflow declares `run_attempt_token`, gating attempt-correlation / versioned-callback support. */
   supportsAttemptCorrelation: boolean;
@@ -121,6 +129,8 @@ async function probeCapabilities(
   let res: Response;
   try {
     res = await fetchImpl(url, {
+      // Fetch keeps this deadline active while consuming the response body too.
+      signal: defaultFetchSignal(),
       headers: {
         Accept: "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -134,7 +144,7 @@ async function probeCapabilities(
   }
 
   if (res.status === 404) {
-    return legacy();
+    return { ...legacy(), capabilities: { ...legacy().capabilities, missing: true } };
   }
   if (!res.ok) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: contents lookup returned HTTP ${res.status}; workflow read failed`);
@@ -154,13 +164,24 @@ async function probeCapabilities(
     return legacy(true);
   }
 
-  const yamlText = Buffer.from(body.content, "base64").toString("utf8");
-  const contract = RUN_CONFIG_RE.test(yamlText) ? "envelope" : "legacy";
+  // Buffer.from silently discards invalid characters and accepts truncated input.
+  // GitHub wraps base64 across lines, so validate after removing whitespace.
+  const encoded = body.content.replace(/\s/g, "");
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: invalid base64 content; workflow read failed`);
+    return legacy(true);
+  }
+  const yamlText = Buffer.from(encoded, "base64").toString("utf8");
+  const inputs = declaredInputs(yamlText);
+  const hasInput = (name: string) => Object.prototype.hasOwnProperty.call(inputs, name);
+  const contract = hasInput("run_config") ? "envelope" : "legacy";
   return {
     capabilities: {
       contract,
-      supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
-      supportsAttemptCorrelation: contract === "envelope" && RUN_ATTEMPT_TOKEN_RE.test(yamlText),
+      hasStageAgentConfigMarker: STAGE_AGENT_CONFIG_RE.test(yamlText),
+      hasStageAgentLaunchContextMarker: STAGE_AGENT_CONTEXT_RE.test(yamlText),
+      supportsRunPublicationToken: contract === "envelope" && hasInput("run_publication_token"),
+      supportsAttemptCorrelation: contract === "envelope" && hasInput("run_attempt_token"),
       supportsPrivateRunConfig: contract === "envelope" && PRIVATE_RUN_CONFIG_RE.test(yamlText),
       supportsExecutionPolicy: contract === "envelope" && EXECUTION_POLICY_RE.test(yamlText),
       supportsStageAgentConfig: contract === "envelope" && STAGE_AGENT_CONFIG_RE.test(yamlText) && STAGE_AGENT_CONTEXT_RE.test(yamlText),

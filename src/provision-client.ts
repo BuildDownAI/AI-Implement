@@ -200,6 +200,8 @@ function envOnlyContext(env: Record<string, string>): SetupCheckContext {
     runnerMode: unavailable,
     flySessions: unavailable,
     mappings: unavailable,
+    workflowCapabilities: unavailable,
+    defaultBranchFileExists: unavailable,
     storedAccessEntries: unavailable,
     effectiveAllowlist: () => ({ entries: allowlistFromEnv(env), source: "env" }),
     allowlistReadAvailable: () => true,
