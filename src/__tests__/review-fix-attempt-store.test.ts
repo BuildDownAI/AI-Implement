@@ -191,7 +191,7 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
-    const execution = { githubRunId: 9001, githubRunAttempt: 2 };
+    const execution = { backend: "github-actions" as const, githubRunId: 9001, githubRunAttempt: 2 };
     const facade = adminFacade.createReviewFixAdminFacade(store, {
       reconcile: async () => ({ status: "found", execution }),
     }, { cancel: async () => ({ status: "accepted" }) });
@@ -566,7 +566,7 @@ describe("SqliteReviewFixAttemptStore: launch intent and execution binding", () 
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
-    const execution = { githubRunId: 123, githubRunAttempt: 1 };
+    const execution = { backend: "github-actions" as const, githubRunId: 123, githubRunAttempt: 1 };
 
     expect((await store.bindExecution("unknown-attempt", execution, Date.now())).status).toBe("not_owner");
 
@@ -575,7 +575,7 @@ describe("SqliteReviewFixAttemptStore: launch intent and execution binding", () 
     const rebind = await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     expect(rebind).toEqual({ status: "already_bound", execution });
 
-    const different = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 999, githubRunAttempt: 1 }, Date.now());
+    const different = await store.bindExecution(outcome.attempt.attemptId, { backend: "github-actions" as const, githubRunId: 999, githubRunAttempt: 1 }, Date.now());
     expect(different).toEqual({ status: "already_bound", execution });
   });
 
@@ -585,7 +585,7 @@ describe("SqliteReviewFixAttemptStore: launch intent and execution binding", () 
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     await store.releaseOwner(outcome.attempt.owner, "finalized");
-    const bind = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 1, githubRunAttempt: 1 }, Date.now());
+    const bind = await store.bindExecution(outcome.attempt.attemptId, { backend: "github-actions" as const, githubRunId: 1, githubRunAttempt: 1 }, Date.now());
     expect(bind).toEqual({ status: "not_owner" });
   });
 });
@@ -641,7 +641,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
-    const execution = { githubRunId: 555, githubRunAttempt: 1 };
+    const execution = { backend: "github-actions" as const, githubRunId: 555, githubRunAttempt: 1 };
     await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     return { store, attemptId: outcome.attempt.attemptId, deadlineAt: outcome.attempt.deadlineAt, execution };
   }
@@ -707,7 +707,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     const attemptId = outcome.attempt.attemptId;
     const deadlineAt = outcome.attempt.deadlineAt;
-    const early = { githubRunId: 777, githubRunAttempt: 1 };
+    const early = { backend: "github-actions" as const, githubRunId: 777, githubRunAttempt: 1 };
     const r = result({ attemptId, deadlineAt, githubRunId: early.githubRunId, githubRunAttempt: early.githubRunAttempt });
     expect((await store.recordResult(attemptId, r, Date.now())).status).toBe("stored");
 
@@ -716,7 +716,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     // identity (matching the already-bound-mismatch handling used post-launch)
     // and persist the conflict, not leave accepted_result_json and the bound
     // columns permanently inconsistent with nothing recorded.
-    const mismatched = await store.bindExecution(attemptId, { githubRunId: 888, githubRunAttempt: 1 }, Date.now());
+    const mismatched = await store.bindExecution(attemptId, { backend: "github-actions" as const, githubRunId: 888, githubRunAttempt: 1 }, Date.now());
     expect(mismatched).toEqual({ status: "already_bound", execution: early });
 
     const row = dedup.getDb().prepare("SELECT github_run_id, github_run_attempt, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
@@ -832,7 +832,7 @@ describe("SqliteReviewFixAttemptStore: journaled timestamps", () => {
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
     const { attemptId, deadlineAt } = admitted.attempt;
-    const execution = { githubRunId: 555, githubRunAttempt: 1 };
+    const execution = { backend: "github-actions" as const, githubRunId: 555, githubRunAttempt: 1 };
     await store.bindExecution(attemptId, execution, Date.now());
     const clockReads = spyOnClock();
     const read = (column: string) => (dedup.getDb().prepare(`SELECT ${column} AS v FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as { v: number | null }).v;
@@ -868,7 +868,7 @@ describe("SqliteReviewFixAttemptStore: journaled timestamps", () => {
     const attemptId = outcome.attempt.attemptId;
     await store.recordResult(attemptId, result({ attemptId, deadlineAt: outcome.attempt.deadlineAt, githubRunId: 777, githubRunAttempt: 1 }), Date.now());
     const clockReads = spyOnClock();
-    await store.bindExecution(attemptId, { githubRunId: 888, githubRunAttempt: 1 }, SENTINEL);
+    await store.bindExecution(attemptId, { backend: "github-actions" as const, githubRunId: 888, githubRunAttempt: 1 }, SENTINEL);
     const row = dedup.getDb().prepare("SELECT result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { result_conflict_at: number };
     expect(row.result_conflict_at).toBe(SENTINEL);
     expect(clockReads).toEqual([]);
@@ -938,5 +938,50 @@ describe("review-fix admin facade: cycle evidence projection", () => {
     const detail = await facade.getAttempt(attemptId as never, admin);
     if (detail.status !== "ok") throw new Error("expected ok");
     expect(detail.attempt.attribution).toBeNull();
+  });
+});
+
+describe("backend execution ownership", () => {
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("binds only matching identities for %s", async (backend) => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const id = admitted.attempt.attemptId;
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, id);
+    const identities = [
+      { backend: "github-actions" as const, githubRunId: 123, githubRunAttempt: 1 },
+      { backend: "fly-machines" as const, runRef: "same-ref" },
+      { backend: "local-docker" as const, runRef: "same-ref" },
+    ];
+    const row = () => dedup.getDb().prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(id);
+    for (const identity of identities.filter((item) => item.backend !== backend)) {
+      const before = row();
+      expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "not_owner" });
+      expect(row()).toEqual(before);
+    }
+    const identity = identities.find((item) => item.backend === backend)!;
+    expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "bound" });
+    expect(row()).toMatchObject(backend === "github-actions"
+      ? { github_run_id: 123, github_run_attempt: 1, execution_ref: null }
+      : { github_run_id: null, github_run_attempt: null, execution_ref: "same-ref" });
+    dedup.closeDb();
+    expect((await store.findPreparedAttemptByExecution(identity))?.attemptId).toBe(id);
+    for (const other of identities.filter((item) => item.backend !== backend)) {
+      expect(await store.findPreparedAttemptByExecution(other)).toBeNull();
+      const before = row();
+      expect(await store.bindExecution(id, other, Date.now())).toEqual({ status: "not_owner" });
+      expect(row()).toEqual(before);
+    }
+    expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "already_bound", execution: identity });
+    if (backend !== "github-actions") {
+      const before = row();
+      expect((await store.recordResult(id, makeReviewFixResult({ attemptId: id, ...SCOPE, deadlineAt: admitted.attempt.deadlineAt }), Date.now())).status).toBe("stale");
+      expect(row()).toEqual(before);
+      expect(await store.bindExecution(id, { backend, runRef: "different" }, Date.now())).toEqual({ status: "already_bound", execution: identity });
+    }
+    await store.releaseOwner(admitted.attempt.owner, "cancelled");
+    expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "not_owner" });
   });
 });

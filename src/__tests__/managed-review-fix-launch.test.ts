@@ -212,7 +212,7 @@ describe("production managed GHA review-fix launch", () => {
     });
     expect(response.status).toBe(200);
     expect(await response.text()).toContain(ACCESS);
-    expect(result).toEqual({ status: "accepted", execution: { githubRunId: 9100, githubRunAttempt: 1 } });
+    expect(result).toEqual({ status: "accepted", execution: { backend: "github-actions", githubRunId: 9100, githubRunAttempt: 1 } });
     expect(revoked()).toBeNull();
     expect(sent).toHaveLength(1);
     expect(count("run_agent_config_snapshots")).toBe(1);
