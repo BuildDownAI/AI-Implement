@@ -540,13 +540,13 @@ type ReviewFixResultResolution =
   | { readonly kind: "no-result"; readonly reason: string };
 
 /**
- * Folds the actual GitHub Actions execution identity and the real published output commit onto
+ * Folds the execution backend evidence and the real published output commit onto
  * a pilot attempt's resolved identity (run_config.reviewFix, AII-776) into the full result
  * marker the callback validates (ReviewFixResultMetadataV1, AII-794). Undefined `identity` means
- * a Legacy (non-pilot) dispatch — no marker is ever in play. `outputCommit` and
- * githubRunId/githubRunAttempt are all required by the wire contract (ReviewFixResultMetadataV1
- * has no optional-evidence variant), so when any of them can't be resolved (no push happened on
- * this path, or the process isn't actually running under GHA) this reports `no-result` rather
+ * a Legacy (non-pilot) dispatch — no marker is ever in play. Machine results use the envelope
+ * executionBackend without GitHub ids; GitHub results require githubRunId/githubRunAttempt.
+ * Both require `outputCommit`, so when the required evidence cannot be resolved (no push
+ * happened, or a GitHub dispatch lacks valid run ids) this reports `no-result` rather
  * than a fabricated or partial marker. The caller must not then send an unmarked Legacy POST for
  * this attempt: the server's `classifyLifecycleOwner` (review-fix-contract.ts) would read a
  * missing `reviewFix` field as "this was never a pilot attempt" and process it on the Legacy
@@ -559,9 +559,11 @@ function resolveReviewFixResult(
   env: NodeJS.ProcessEnv,
 ): ReviewFixResultResolution {
   if (!identity) return { kind: "legacy" };
-  // Machine result production is a separate runner slice; never emit mixed evidence.
   if (identity.executionBackend !== undefined) {
-    return { kind: "no-result", reason: `machine result production is not supported for attempt ${identity.attemptId}` };
+    if (!outputCommit) {
+      return { kind: "no-result", reason: `no published output commit for attempt ${identity.attemptId}` };
+    }
+    return { kind: "attached", reviewFix: { ...identity, executionBackend: identity.executionBackend, outputCommit } };
   }
   const githubRunId = parsePositiveIntEnv(env.GITHUB_RUN_ID);
   const githubRunAttempt = parsePositiveIntEnv(env.GITHUB_RUN_ATTEMPT);
