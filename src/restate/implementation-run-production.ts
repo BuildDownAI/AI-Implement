@@ -655,6 +655,12 @@ export function createProductionImplementationRunServices(input: ImplementationR
       const flyApp = stored ? stored.snapshot.flyApp ?? config.flySessionsApp : preparation ? preparation.flyApp : config.flySessionsApp;
       const find = createImplementationFindExistingRun({ getMapping: frozenMapping ? () => frozenMapping : getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: flyApp }) });
       const id = await find(run, dispatchedAt);
+      // Preparation freezes lookup identity, but carries no original callback nonce or
+      // accounting authority. A candidate is uncertainty, never an adoptable execution.
+      // Throw rather than return null: null would allow the workflow to launch again.
+      if (id !== null && preparation) {
+        throw new Error(`missing ordinary launch intent for existing execution: ${run.dispatchId}`);
+      }
       const row = getJobByDispatchId(run.dispatchId);
       if (id !== null && run.backend === GHA_BACKEND && row && row.runId === null && (row.status === "dispatched" || row.status === "running")) {
         updateJobRunId(row.id, Number(id));

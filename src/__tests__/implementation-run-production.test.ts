@@ -611,7 +611,7 @@ describe("production deps", () => {
         const { d, run } = recovery(backend, "missing");
         githubRuns([{ id: 42, display_title: title(run.issueIdentifier), created_at: new Date(DISPATCHED_AT).toISOString() }], 200, 2);
         vi.mocked(listMachines).mockResolvedValue([{ id: "42", name: implementationFlyMachineName(run.issueIdentifier), created_at: new Date(DISPATCHED_AT).toISOString() }] as never);
-        expect(await d.findExistingRun(run, DISPATCHED_AT)).toBe("42");
+        await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("missing ordinary launch intent");
         expect(await d.launch(run)).toEqual({ outcome: "unknown" });
         expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
       });
