@@ -12,9 +12,11 @@ const intents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: bool
 vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationIntentStore: () => ({
   read: (id: string) => intents.get(id) ?? null,
   write: (id: string, snapshot: unknown) => { if (!intents.has(id)) intents.set(id, { snapshot: structuredClone(snapshot), done: false }); },
+  accept: (id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent.snapshot as object, { accepted: true }); },
   complete: (id: string) => { const intent = intents.get(id); if (intent) intent.done = true; },
   remove: (id: string) => intents.delete(id),
 }) }));
+vi.mock("../agent-run-preparation.js", () => ({ releaseRejectedLaunch: vi.fn() }));
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/implementation-run-workflow.js")>()),

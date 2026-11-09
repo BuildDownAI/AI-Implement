@@ -14,6 +14,9 @@ export function implementationIntentStore() {
     write(dispatchId: string, snapshot: unknown) {
       db.prepare("INSERT OR IGNORE INTO implementation_launch_intent (dispatch_id, snapshot) VALUES (?, ?)").run(dispatchId, JSON.stringify(snapshot));
     },
+    accept(dispatchId: string) {
+      db.prepare("UPDATE implementation_launch_intent SET snapshot = json_set(snapshot, '$.accepted', json('true')) WHERE dispatch_id = ?").run(dispatchId);
+    },
     complete(dispatchId: string) {
       db.prepare("UPDATE implementation_launch_intent SET bookkeeping_done = 1 WHERE dispatch_id = ?").run(dispatchId);
     },

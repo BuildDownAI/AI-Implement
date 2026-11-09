@@ -220,9 +220,21 @@ export function createProductionImplementationRunServices(input: ImplementationR
     dispatchedAt: number;
     flyApp: string | null;
   };
+  // Recovery only: never copy launch configuration (especially arbitrary extraEnv values).
+  // These are the fields consumed by provider selection, bookkeeping and backend lookup.
+  function recoveryMapping(mapping: RepoMapping): RepoMapping {
+    return {
+      teamKey: mapping.teamKey, owner: mapping.owner, repo: mapping.repo,
+      workflowFile: mapping.workflowFile, defaultBranch: mapping.defaultBranch,
+      ticketingProvider: mapping.ticketingProvider,
+      maxTurns: mapping.maxTurns, maxIterations: mapping.maxIterations,
+      maxJobMinutes: mapping.maxJobMinutes,
+    } as RepoMapping;
+  }
+
   function saveIntent(run: ImplementationRunInput, ctx: Prelaunch, metadata: Omit<LaunchMetadata, "ghToken">) {
     implementationIntentStore().write(run.dispatchId, {
-      context: { mapping: ctx.mapping, issue: ctx.issue, generation: ctx.generation, baseBranch: ctx.baseBranch, baseBranchFieldValue: ctx.baseBranchFieldValue, runnerMode: ctx.runnerMode },
+      context: { mapping: recoveryMapping(ctx.mapping), issue: ctx.issue, generation: ctx.generation, baseBranch: ctx.baseBranch, baseBranchFieldValue: ctx.baseBranchFieldValue, runnerMode: ctx.runnerMode },
       metadata, accounting: trackerAccounting(ctx.mapping, ctx.provider, ctx.issue), groupingParent: input.isGroupingParentDispatch(ctx.issue),
       dispatchedAt: readAdmission(run.dispatchId)?.createdAt ?? Date.now(), flyApp: config.flySessionsApp,
     } satisfies Intent);
@@ -406,6 +418,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       // The launch call may have happened: propagate, and the retry reconciles through `findExistingRun`.
       throw err;
     }
+    implementationIntentStore().accept(run.dispatchId);
     await recordLaunch(run, ctx, {
       executionMode: launched.executionMode,
       machineId: launched.machineId,
@@ -422,7 +435,10 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   async function launch(run: ImplementationRunInput, modelPrices?: RunModelPrices): Promise<ImplementationLaunchResult> {
-    if (implementationIntentStore().read(run.dispatchId)) {
+    const staged = implementationIntentStore().read<Intent & { accepted?: boolean }>(run.dispatchId);
+    if (staged) {
+      // No acceptance record is not proof of rejection: a runner may already be live.
+      // Preserve its existing grant until reconciliation confirms rejection or termination.
       // Backend absence after an ambiguous acceptance is not proof that a late create cannot finish.
       // Keep the admission and let the workflow reconcile until its deadline; never mint a new grant.
       return { outcome: "unknown" };
@@ -470,6 +486,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       if (launched.outcome === "rejected") implementationIntentStore().remove(run.dispatchId);
       return { outcome: launched.outcome === "rejected" ? "rejected" : "unknown" };
     }
+    implementationIntentStore().accept(run.dispatchId);
     await recordLaunch(run, ctx, {
       executionMode: "github-actions",
       runId: launched.runId,
