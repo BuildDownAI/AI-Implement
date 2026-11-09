@@ -92,7 +92,7 @@ import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
 import { getMachine, listMachines, updateMachine, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
-import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
+import { reconcileRestateMachine, reconcileRestateLocalContainers, isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
@@ -125,7 +125,6 @@ import {
   inspectLocalContainer,
   removeLocalContainer,
   startLocalRunnerContainer,
-  sweepExitedLocalContainers,
 } from "./local-docker.js";
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
@@ -897,10 +896,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     const inFlightMachineIds = getInFlightJobs()
       .map((j) => j.machineId)
       .filter((id): id is string => Boolean(id));
-    const swept = await sweepExitedLocalContainers(inFlightMachineIds);
-    for (const name of swept) {
-      console.log(`[monitor] Swept exited local container ${name}`);
-    }
+    await reconcileRestateLocalContainers(reaperConfig(config, registry), inFlightMachineIds);
   }
 
   // Sweep for orphaned/stale/aged-out Fly machines
@@ -3251,6 +3247,9 @@ function reaperConfig(config: AppConfig, registry: ProviderRegistry) {
 }
 
 async function startupReconciliation(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+  if (getRunnerMode().mode === "local") {
+    await reconcileRestateLocalContainers(reaperConfig(config, registry));
+  }
   if (!config.flySessionsToken || !config.flySessionsApp) return;
 
   console.log("[startup] Running machine reconciliation...");
@@ -3314,7 +3313,8 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
     // AII-791: boot recovery never finalizes a Restate-owned attempt, even one that
     // looks orphaned or stale from this row's own status — Restate's own workflow
     // owns confirming its termination.
-    if (isRestateOwnedJob(job)) continue;
+    if (await reconcileRestateMachine(reaperConfig(config, registry), job, machine.id,
+      Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000), "startup-stale-terminal")) continue;
 
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";

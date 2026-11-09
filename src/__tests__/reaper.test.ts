@@ -1,11 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { safeDestroyMachine, sweepOrphanedMachines, getLastSweepAt } from "../reaper.js";
+import { safeDestroyMachine, sweepOrphanedMachines, getLastSweepAt, reconcileRestateMachine, reconcileRestateLocalContainers, canReapFinishedRestateJob } from "../reaper.js";
 import type { ReaperConfig, ReaperHelpers } from "../reaper.js";
 import { makeJob, makeMapping, makeProvider, makeRegistry } from "./helpers/builders.js";
 
 vi.mock("../fly-machines.js", () => ({
   listMachines: vi.fn(),
   destroyMachine: vi.fn(),
+}));
+
+vi.mock("../local-docker.js", async (importOriginal) => ({
+  listExitedAiImplementContainers: vi.fn(), removeLocalContainer: vi.fn(),
+  selectSweepableContainers: (await importOriginal<typeof import("../local-docker.js")>()).selectSweepableContainers,
 }));
 
 vi.mock("../log.js", () => ({
@@ -932,4 +937,182 @@ describe("sweepOrphanedMachines — durable-runner machines", () => {
       expect.objectContaining({ ruleMatched: "durable-expired", dryRun: true }),
     );
   });
+});
+
+
+describe("finished Restate resource cleanup", () => {
+  const job = makeJob({ dispatchId: "owned", admissionGeneration: 7,
+    status: "completed", executionMode: "fly-machines", machineId: "leftover" });
+  function admission(releasedAt: number | null, generation = 7) {
+    return { lifecycleOwner: { kind: "restate", attemptId: "owned" },
+      releasedAt, generation, backend: "fly-machines" } as NonNullable<ReturnType<typeof readAdmission>>;
+  }
+  it.each(["completed", "failed", "review_failed", "timed_out", "dispatch-failed"] as const)("removes released %s sessions without finalizing", async (status) => {
+    vi.mocked(listMachines).mockResolvedValue([makeMachine("leftover", { state: "stopped" })] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue({ ...job, status });
+    vi.mocked(readAdmission).mockReturnValue(admission(123));
+    const helpers = makeHelpers();
+    const log = vi.spyOn(console, "log");
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "leftover");
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("[reaper] rule=stale-terminal-job machine=leftover"));
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(invalidateNonce).not.toHaveBeenCalled();
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
+  });
+  it.each([[null, 7, "completed"], [123, 8, "completed"], [123, 7, "running"]] as const)("fences admission %s generation %s status %s", async (released, generation, status) => {
+    vi.mocked(listMachines).mockResolvedValue([makeMachine("leftover")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue({ ...job, status });
+    vi.mocked(readAdmission).mockReturnValue(admission(released, generation));
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+  });
+  it("keeps a KG profile machine even when its last admission is released", async () => {
+    const machine = makeMachine("leftover");
+    machine.config.metadata = { ...machine.config.metadata, purpose: "durable-runner" } as typeof machine.config.metadata;
+    vi.mocked(listMachines).mockResolvedValue([machine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue({ ...job, phase: "kg-refresh" });
+    vi.mocked(readAdmission).mockReturnValue(admission(123));
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+    expect(destroyMachine).not.toHaveBeenCalled();
+  });
+  it.each([null, 123])("boot reconciliation only removes released admissions (%s)", async (released) => {
+    vi.mocked(readAdmission).mockReturnValue(admission(released));
+    expect(await reconcileRestateMachine(makeConfig(false), job, "leftover", 60, "startup-stale-terminal")).toBe(true);
+    expect(destroyMachine).toHaveBeenCalledTimes(released === null ? 0 : 1);
+    expect(invalidateNonce).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+  it.each(["No such container: leftover", "daemon unavailable"])("handles local removal error: %s", async (message) => {
+    const { listExitedAiImplementContainers, removeLocalContainer } = await import("../local-docker.js");
+    vi.mocked(listExitedAiImplementContainers).mockResolvedValue([{ id: "leftover", name: "runner", status: "Exited (0) 5 minutes ago" }]);
+    vi.mocked(getJobByMachineId).mockReturnValue({ ...job, executionMode: "local-docker" });
+    vi.mocked(readAdmission).mockReturnValue({ ...admission(123), backend: "local-docker" });
+    vi.mocked(removeLocalContainer).mockRejectedValue(new Error(message));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    await reconcileRestateLocalContainers(makeConfig(false));
+    expect(errors).toHaveBeenCalledTimes(message.startsWith("No such") ? 0 : 1);
+  });
+  it.each([false, true])("reconciles local containers with dry run=%s", async (dryRun) => {
+    const { listExitedAiImplementContainers, removeLocalContainer } = await import("../local-docker.js");
+    vi.mocked(listExitedAiImplementContainers).mockResolvedValue([{ id: "leftover", name: "runner", status: "Exited (0) 5 minutes ago" }]);
+    vi.mocked(getJobByMachineId).mockReturnValue({ ...job, executionMode: "local-docker" });
+    vi.mocked(readAdmission).mockReturnValue({ ...admission(123), backend: "local-docker" });
+    expect(await reconcileRestateLocalContainers(makeConfig(dryRun))).toEqual(["leftover"]);
+    expect(removeLocalContainer).toHaveBeenCalledTimes(dryRun ? 0 : 1);
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+  it("protects terminal held local containers from the Legacy sweep", async () => {
+    const { listExitedAiImplementContainers, removeLocalContainer } = await import("../local-docker.js");
+    vi.mocked(listExitedAiImplementContainers).mockResolvedValue([{ id: "leftover", name: "runner", status: "Exited (0) 5 minutes ago" }]);
+    vi.mocked(getJobByMachineId).mockReturnValue({ ...job, executionMode: "local-docker" });
+    vi.mocked(readAdmission).mockReturnValue({ ...admission(null), backend: "local-docker" });
+    expect(await reconcileRestateLocalContainers(makeConfig(false), [])).toEqual(["leftover"]);
+    expect(removeLocalContainer).not.toHaveBeenCalled();
+  });
+});
+
+// Execute the production boot function with its dependencies supplied explicitly,
+// without starting the orchestrator's HTTP server or poll loop.
+async function runBoot(config: ReaperConfig, local = false) {
+  const { readFileSync } = await import("node:fs");
+  const ts = await import("typescript");
+  const source = readFileSync("src/index.ts", "utf8");
+  const start = source.indexOf("async function startupReconciliation(");
+  const end = source.indexOf("// ---------- Reconciliation", start);
+  const { isDurableRunnerMachine } = await import("../reaper.js");
+  const dependencies = { getRunnerMode: () => ({ mode: local ? "local" : "default" }),
+    reconcileRestateLocalContainers, reaperConfig: () => config, listMachines,
+    isDurableRunnerMachine, recordReaperAction, getJobByMachineId, safeDestroyMachine,
+    reconcileRestateMachine, invalidateNonce };
+  const compiled = ts.transpileModule(source.slice(start, end), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText;
+  const boot = new Function(...Object.keys(dependencies), `${compiled}; return startupReconciliation;`)(...Object.values(dependencies));
+  await boot(config, config.registry);
+}
+
+async function runPeriodicLocal(config: ReaperConfig) {
+  const { readFileSync } = await import("node:fs");
+  const ts = await import("typescript");
+  const source = readFileSync("src/index.ts", "utf8");
+  const start = source.indexOf('  if (getRunnerMode().mode === "local") {', source.indexOf("// Local mode: reap exited containers"));
+  const end = source.indexOf("// Reconciliation for admission reservations", start);
+  const dependencies = { config, registry: config.registry, getRunnerMode: () => ({ mode: "local" }),
+    getInFlightJobs: () => [], reconcileRestateLocalContainers, reaperConfig: () => config,
+    sweepOrphanedMachines, makeReaperHelpers: makeHelpers };
+  const compiled = ts.transpileModule(`async function reconcile() { ${source.slice(start, end)} }`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText;
+  await new Function(...Object.keys(dependencies), `${compiled}; return reconcile();`)(...Object.values(dependencies));
+}
+
+describe("finished Restate cleanup integration regressions", () => {
+  it("preserves Legacy Docker cleanup during Fly reaper dry run", async () => {
+    const { listExitedAiImplementContainers, removeLocalContainer } = await import("../local-docker.js");
+    vi.mocked(listExitedAiImplementContainers).mockResolvedValue([{ id: "legacy", name: "runner", status: "Exited" }]);
+    vi.mocked(getJobByMachineId).mockReturnValue(makeJob({ status: "completed" }));
+    await reconcileRestateLocalContainers(makeConfig(true), []);
+    expect(removeLocalContainer).toHaveBeenCalledWith("legacy");
+  });
+
+  it.each(["fly-machines", "local-docker"] as const)("requires explicit admission evidence for %s", (backend) => {
+    vi.mocked(readAdmission).mockReturnValue(null);
+    expect(canReapFinishedRestateJob(makeJob({ dispatchId: "missing", status: "completed", executionMode: backend }))).toBe(false);
+  });
+
+  it.each(["boot", "periodic"] as const)("%s wiring retains local cleanup and Fly ownership ordering", async (entry) => {
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync("src/index.ts", "utf8");
+    if (entry === "periodic") {
+      // Pin the monitor call site as well as exercising its shared reconciliation below.
+      expect(source).toContain("await reconcileRestateLocalContainers(reaperConfig(config, registry), inFlightMachineIds)");
+      expect(source).toContain("await sweepOrphanedMachines(reaperConfig(config, registry), makeReaperHelpers(config, registry))");
+    } else {
+      vi.mocked(listMachines).mockResolvedValue([]);
+      const { listExitedAiImplementContainers, removeLocalContainer } = await import("../local-docker.js");
+      vi.mocked(listExitedAiImplementContainers).mockResolvedValue([{ id: "local", name: "runner", status: "Exited" }]);
+      vi.mocked(getJobByMachineId).mockReturnValue(makeJob({ dispatchId: "owned", admissionGeneration: 7, status: "completed", executionMode: "local-docker" }));
+      vi.mocked(readAdmission).mockReturnValue({ lifecycleOwner: { kind: "restate", attemptId: "owned" }, generation: 7, backend: "local-docker", releasedAt: 123 } as NonNullable<ReturnType<typeof readAdmission>>);
+      await runBoot(makeConfig(false), true);
+      expect(removeLocalContainer).toHaveBeenCalledWith("local");
+    }
+  });
+
+  for (const backend of ["fly-machines", "local-docker"] as const) {
+    for (const entry of ["boot", "periodic"] as const) {
+      it.each(["released", "held", "running", "backend-mismatch", "github-actions"] as const)(`${entry} ${backend}: %s preserves workflow state`, async (scenario) => {
+        const { listExitedAiImplementContainers, removeLocalContainer } = await import("../local-docker.js");
+        const job = makeJob({ dispatchId: "owned", admissionGeneration: 7, machineId: "leftover",
+          executionMode: scenario === "github-actions" ? "github-actions" : scenario === "backend-mismatch" ? (backend === "fly-machines" ? "local-docker" : "fly-machines") : backend,
+          status: scenario === "running" ? "running" : "completed", dispatchedAt: Date.now() - 10 * 60 * 60 * 1000 });
+        const admission = { lifecycleOwner: { kind: "restate", attemptId: "owned" }, generation: 7,
+          backend: job.executionMode, releasedAt: scenario === "held" ? null : 123 } as NonNullable<ReturnType<typeof readAdmission>>;
+        const before = structuredClone(admission);
+        vi.mocked(readAdmission).mockReturnValue(admission);
+        vi.mocked(getJobByMachineId).mockReturnValue(job);
+        vi.mocked(listMachines).mockResolvedValue(backend === "fly-machines" ? [makeMachine("leftover", {
+          state: "stopped", created_at: new Date(job.dispatchedAt).toISOString(),
+        })] as never : []);
+        vi.mocked(listExitedAiImplementContainers).mockResolvedValue([{ id: "leftover", name: "runner", status: "Exited" }]);
+        const helpers = makeHelpers();
+        const config = makeConfig(false, { getMappings: () => ({ [job.teamKey!]: makeMapping() }),
+          registry: makeRegistry({ provider: makeProvider({ fetchLifecycleStates: vi.fn(async () => new Map([[job.issueId!, "completed" as const]])) }) }) });
+        const log = vi.spyOn(console, "log");
+        if (entry === "boot") await runBoot(config, backend === "local-docker");
+        else if (backend === "fly-machines") await sweepOrphanedMachines(config, helpers);
+        else await runPeriodicLocal(config);
+        const removal = backend === "fly-machines" ? destroyMachine : removeLocalContainer;
+        expect(removal).toHaveBeenCalledTimes(scenario === "released" ? 1 : 0);
+        if (scenario === "released") {
+          expect(recordReaperAction).toHaveBeenCalledWith(expect.objectContaining({ machineId: "leftover", dryRun: false }));
+          expect(log).toHaveBeenCalledWith(expect.stringMatching(/\[reaper\] rule=.* machine=leftover/));
+        }
+        expect(updateJobStatus).not.toHaveBeenCalled();
+        expect(invalidateNonce).not.toHaveBeenCalled();
+        expect(helpers.resetTicket).not.toHaveBeenCalled();
+        expect(admission).toEqual(before);
+      });
+    }
+  }
 });
