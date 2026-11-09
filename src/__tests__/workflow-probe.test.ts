@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   WorkflowProbeTransientError,
   resolveWorkflowContract,
@@ -6,6 +6,9 @@ import {
   __clearWorkflowProbeCacheForTests,
 } from "../workflow-probe.js";
 import { fakeFetch, type FakeFetch, type Reply } from "./helpers/fake-fetch.js";
+import { GITHUB_CONFIG_CHECKS } from "../setup-checks/github-config.js";
+import { makeMapping } from "./helpers/builders.js";
+import { makeSetupCheckContext } from "./helpers/fixtures/setup-checks.js";
 import { githubError, githubFile } from "./helpers/replies/github.js";
 
 const ENVELOPE_YML =
@@ -523,5 +526,76 @@ describe("transient probe failures (AII-1292)", () => {
       expect(await resolveWorkflowCapabilities(input)).toEqual(first);
       expect(github.calls).toHaveLength(1);
     });
+  });
+});
+
+
+describe("workflow probe deadlines", () => {
+  it.each(["headers", "body"] as const)("cancels stalled %s, reports the project, and recovers without caching failure", async (phase) => {
+    __clearWorkflowProbeCacheForTests();
+    vi.useFakeTimers();
+    // Node's native AbortSignal.timeout uses internal timers; replace only its clock.
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    let cancelled = 0;
+    let bodyReads = 0;
+    let healthy = false;
+    const github = contents(githubFile(PUBLICATION_TOKEN_YML));
+    const fetchImpl: typeof fetch = async (url, init) => {
+      if (healthy) return github.fetch(url, init);
+      const signal = init!.signal!;
+      if (phase === "headers") {
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            cancelled++;
+            reject(signal.reason);
+          }, { once: true });
+        });
+      }
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"type":"file",'));
+          signal.addEventListener("abort", () => {
+            cancelled++;
+            controller.error(signal.reason);
+          }, { once: true });
+        },
+        pull() { bodyReads++; },
+      }));
+    };
+    const mapping = makeMapping({ owner: "o", repo: "r", defaultBranch: "release/exact", planningEnabled: false });
+    const input = { owner: "o", repo: "r", workflowFile: mapping.workflowFile, token: "synthetic", ref: mapping.defaultBranch, fetchImpl };
+    try {
+      const failed = expect(resolveWorkflowCapabilities(input)).rejects.toThrow(WorkflowProbeTransientError);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await failed;
+      expect(cancelled).toBe(1);
+      if (phase === "body") expect(bodyReads).toBeGreaterThan(0);
+      const ctx = makeSetupCheckContext({
+        mappings: () => ({ STALLED: mapping, HEALTHY: makeMapping() }),
+        workflowCapabilities: (project, file) => project === mapping
+          ? resolveWorkflowCapabilities({ ...input, workflowFile: file })
+          : makeSetupCheckContext().workflowCapabilities(project, file),
+      });
+      const rows = GITHUB_CONFIG_CHECKS[0].run(ctx);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await rows).toEqual([
+        expect.objectContaining({ project: "STALLED", state: "cannot-verify", detail: expect.stringContaining(`${mapping.workflowFile}@release/exact`) }),
+        expect.objectContaining({ project: "HEALTHY", state: "pass" }),
+      ]);
+      expect(cancelled).toBe(2);
+      healthy = true;
+      expect(await resolveWorkflowCapabilities(input)).toMatchObject({ contract: "envelope", supportsRunPublicationToken: true });
+      expect(await resolveWorkflowCapabilities(input)).toMatchObject({ contract: "envelope" });
+      expect(github.calls).toHaveLength(1);
+      expect(github.calls[0].url.searchParams.get("ref")).toBe("release/exact");
+      expect(timeout).toHaveBeenCalledWith(60_000);
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,3 +1,5 @@
+import { defaultFetchSignal } from "./github.js";
+
 const CACHE_TTL_MS = 300_000;
 const RUN_CONFIG_RE = /^\s{2,}run_config:\s*$/m;
 const RUN_PUBLICATION_TOKEN_RE = /^\s{2,}run_publication_token:\s*$/m;
@@ -125,6 +127,8 @@ async function probeCapabilities(
   let res: Response;
   try {
     res = await fetchImpl(url, {
+      // Fetch keeps this deadline active while consuming the response body too.
+      signal: defaultFetchSignal(),
       headers: {
         Accept: "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
