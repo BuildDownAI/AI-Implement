@@ -517,6 +517,85 @@ describe("projects page agents tab", () => {
   const preview = (doc: Document, stage: string, f: string) => doc.querySelector(`[data-ag-preview="${stage}.${f}"]`)!.textContent;
   const puts = (m: ReturnType<typeof mountAgents>) => m.calls.filter((c) => c.method === "PUT");
 
+  const claudeAccount = (overrides: Mapping = {}) => account({
+    profileId: "acct-claude", agent: "claude", provider: "anthropic", authMode: "claude-subscription", ...overrides,
+  });
+  const claudeDefaults = {
+    ...defaults,
+    stages: Object.fromEntries(Object.entries(defaults.stages).map(([stage, values]) => [
+      stage, { ...values, agent: "claude", provider: "anthropic", model: "claude-default", accountProfileId: "acct-claude" },
+    ])),
+  };
+
+  it("offers compatible active setup-token profiles for inherited and overridden selections", async () => {
+    const m = mountAgents({ defaults: claudeDefaults, accounts: [
+      claudeAccount(),
+      claudeAccount({ profileId: "disabled", profileStatus: "disabled" }),
+      claudeAccount({ profileId: "inactive", profileStatus: "inactive" }),
+      claudeAccount({ profileId: "wrong-agent", agent: "codex" }),
+      claudeAccount({ profileId: "wrong-provider", provider: "bedrock" }),
+    ] });
+    await open(m);
+    expect(m.doc.querySelector("[data-ag-problem]")).toBeNull();
+    expect(preview(m.doc, "review", "accountProfileId")).toContain("acct-claude (source: orchestrator default)");
+    expect(field(m.doc, "value", "review", "accountProfileId").disabled).toBe(true);
+    const mode = field(m.doc, "mode", "review", "accountProfileId");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const select = field(m.doc, "value", "review", "accountProfileId");
+    expect(select.disabled).toBe(false);
+    expect(select.value).toBe("acct-claude");
+    expect([...select.options].map((o) => o.value)).toEqual(["", "acct-claude"]);
+  });
+
+  it("enables a project with ready inherited setup-token selections", async () => {
+    const m = mountAgents({ defaults: claudeDefaults, accounts: [claudeAccount()] });
+    await open(m);
+    const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
+    box.checked = true;
+    fire(m.doc, box);
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toEqual([{ url: "/api/mappings/AII/agent-config", method: "PUT", body: { enabled: true } }]);
+  });
+
+  it("preserves a stored setup-token selection when saving an enabled project's stage change", async () => {
+    const m = mountAgents({ defaults: claudeDefaults, accounts: [claudeAccount()],
+      stored: { enabled: true, stages: { review: { accountProfileId: "acct-claude" } } },
+    });
+    await open(m);
+    expect(field(m.doc, "value", "review", "accountProfileId").value).toBe("acct-claude");
+    expect(preview(m.doc, "review", "accountProfileId")).toContain("(source: project)");
+    const mode = field(m.doc, "mode", "review", "model");
+    mode.value = "override";
+    fire(m.doc, mode);
+    const input = field(m.doc, "value", "review", "model");
+    input.value = "claude-custom";
+    input.dispatchEvent(new m.doc.defaultView!.Event("input", { bubbles: true }));
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toEqual([{ url: "/api/mappings/AII/agent-config", method: "PUT", body: { stages: { review: { model: "claude-custom" } } } }]);
+  });
+
+  it("shows missing setup-token readiness and lets the server refuse enable safely", async () => {
+    const error = "Missing credential <img src=x onerror=alert(1)>";
+    const m = mountAgents({ defaults: claudeDefaults,
+      accounts: [claudeAccount({ account: { readiness: "missing", failureCode: "credential_missing" } })],
+      put: { status: 422, body: { error, code: "credential_missing" } },
+    });
+    await open(m);
+    expect(m.doc.querySelector('[data-ag-profile="acct-claude"]')!.textContent).toContain("readiness: missing (credential_missing)");
+    expect(m.doc.querySelector("[data-ag-problem]")).toBeNull();
+    const box = m.doc.getElementById("md-agents-enabled") as HTMLInputElement;
+    box.checked = true;
+    fire(m.doc, box);
+    await m.win.saveAgentConfig();
+    expect(puts(m)).toEqual([{ url: "/api/mappings/AII/agent-config", method: "PUT", body: { enabled: true } }]);
+    expect(box.checked).toBe(false);
+    const err = m.doc.getElementById("md-agents-error")!;
+    expect(err.textContent).toBe(error);
+    expect(err.querySelector("img")).toBeNull();
+    expect(m.doc.querySelector('[data-md-panel="agents"] input[type="password"]')).toBeNull();
+  });
+
   it("previews the override and restores the inherited value on clear, sending only changed fields", async () => {
     const m = mountAgents();
     await open(m);
