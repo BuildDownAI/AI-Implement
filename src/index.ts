@@ -3593,6 +3593,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           }
         }
         let launchStarted = false;
+        let localMachineNonce: string | undefined;
         let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
           // The child boots repo-scoped; a mint failure aborts the launch (no broad fallback).
@@ -3616,7 +3617,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             anthropicApiKey: reviewFixDecision.kind === "launch" ? undefined : config.anthropicApiKey,
             claudeOAuthToken: reviewFixDecision.kind === "launch" ? undefined : config.claudeOAuthToken,
             retryPolicy: getRetryPolicy(),
-            onBeforeLaunch: () => { launchStarted = true; },
+            onBeforeLaunch: (nonce) => { localMachineNonce = nonce; launchStarted = true; },
             ...(reviewFixDecision.kind === "launch"
               ? {
                   managed: {
@@ -3644,7 +3645,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           executionMode: "local-docker",
           runnerMode,
           sessionImage: config.localRunnerImage,
-          machineNonce: container.machineNonce,
+          machineNonce: localMachineNonce,
           machineId: container.containerId,
           computeStartedAt: Date.now(),
           phase: "gap-analysis",
