@@ -274,6 +274,41 @@ describe("kg-refresh", () => {
       else expect(row).not.toHaveProperty("hint");
     });
 
+    it.each([
+      ["modern default, old requested", true, "old", false, 200],
+      ["old default, modern requested", false, "modern", true, 200],
+      ["requested read throws", true, "throws", false, 0],
+      ["requested read missing", true, "missing", false, 404],
+    ] as const)("checks the requested workflow ref: %s", async (_name, modernDefault, requested, ok, status) => {
+      buildPreflight();
+      const oldWorkflow = "on:\n  workflow_dispatch:\n    inputs:\n      run_config: {}";
+      const fetchWorkflow = vi.fn(async (_token: string, _owner: string, _repo: string, ref: string) => {
+        if (ref === "release/requested") {
+          if (requested === "throws") throw new Error("read failed");
+          if (requested === "missing") return { status: 404, content: null };
+          return { status: 200, content: requested === "modern" ? WORKFLOW_WITH_RUNNER_PHASE : oldWorkflow };
+        }
+        return { status: 200, content: modernDefault ? WORKFLOW_WITH_RUNNER_PHASE : oldWorkflow };
+      });
+      const fetchTarball = vi.fn(async () => preflightTarball);
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        kgSourceRef: "release/requested",
+        mintToken: mintTokenPf as never,
+        fetchTarball: fetchTarball as never,
+        fetchDefaultBranch: async () => "main",
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflow,
+        fetchCompare: fetchCompare as never,
+      });
+      expect(result.ok).toBe(ok);
+      expect(result.results.find((r) => r.grant === "workflow:envelope")).toMatchObject({ ok, status });
+      expect(fetchWorkflow).toHaveBeenCalledExactlyOnceWith("tok", "TestOrg", "test-kg", "release/requested");
+      expect(fetchTarball).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", "main");
+    });
+
     it("workflow row failing does not disturb the other row shapes", async () => {
       const failingWorkflowFetch = vi.fn(async () => ({ status: 404, content: null }));
       buildPreflight();

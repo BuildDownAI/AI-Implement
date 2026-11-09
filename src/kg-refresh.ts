@@ -132,6 +132,8 @@ export interface KgPreflightInput {
   githubAppId: string;
   githubAppPrivateKey: string;
   kgSourceRepo: string;
+  /** Requested dispatch ref; only the workflow capability read uses this override. */
+  kgSourceRef?: string;
   /**
    * Orchestrator setting (Settings → KG Refresh · "Base template repo", AII-633) — the
    * repo the PR-triggered dry-run webhook actually posts its sticky comment/commit status
@@ -405,13 +407,13 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
   // run_publication_token, as required by the GHA sender (AII-1714, AII-594,
   // AII-654). KG dispatches carry phase and callback URL only in the envelope,
   // which the entrypoint reads under the envelope contract (AII-653).
-  // Reuses the read token/branch minted above when available.
+  // Reuses the read token above; an explicit dispatch ref must be checked verbatim.
   try {
     const token = sourcesReadToken ?? (await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
       permissions: { contents: "read" },
       repositories: [repo.repo],
     })).token;
-    const branch = defaultBranch ?? (await fetchDefaultBranchFn(token, repo.owner, repo.repo));
+    const branch = input.kgSourceRef ?? defaultBranch ?? (await fetchDefaultBranchFn(token, repo.owner, repo.repo));
     const file = await fetchWorkflowFileFn(token, repo.owner, repo.repo, branch);
     const ok = file.status === 200 && file.content !== null && workflowAcceptsEnvelope(file.content);
     results.push(

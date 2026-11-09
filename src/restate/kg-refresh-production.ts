@@ -295,7 +295,7 @@ export interface KgRefreshProductionInput {
   ) => void | Promise<void>;
   isDeployHeld: () => boolean;
   readStatusRecord: () => RefreshOutcome | null;
-  runPreflight: () => Promise<PreflightCheckResult>;
+  runPreflight: (kgSourceRef?: string) => Promise<PreflightCheckResult>;
 }
 
 /** What the two tool handlers in `src/restate/tools.ts` read once AII-683 lands. */
@@ -308,7 +308,7 @@ export interface KgRefreshToolDeps {
   mappingExists: () => boolean;
   /** Free bytes on the KG data volume. */
   freeBytes: () => number;
-  runPreflight: () => Promise<PreflightCheckResult>;
+  runPreflight: (kgSourceRef?: string) => Promise<PreflightCheckResult>;
   /** Records a failed preflight as the last refresh, as `trigger()` does today. */
   persistPreflightFailure: (result: PreflightCheckResult) => void;
   readStatusRecord: () => RefreshOutcome | null;
