@@ -35,6 +35,18 @@ function seedLaunchIntent(s: Awaited<ReturnType<typeof setup>>) {
 beforeEach(() => vi.clearAllMocks());
 const backends = ["fly-machines", "local-docker"] as const;
 for (const backend of backends) describe(backend, () => {
+  for (const field of ["runner_callback_url", "run_token"] as const) {
+    for (const value of [undefined, "", "   "]) it(`does not launch with ${field}=${JSON.stringify(value)}`, async () => {
+      const s = await setup(backend);
+      vi.mocked(s.deps.callbackInputs).mockResolvedValue({
+        runner_callback_url: "https://callback", run_token: "sentinel-result", [field]: value,
+      });
+      expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
+      expect(s.fly.createMachine).not.toHaveBeenCalled();
+      expect(s.docker.startLocalRunnerContainer).not.toHaveBeenCalled();
+      expect(s.log.getJobByDispatchId(s.plan.attemptId)).toBeNull();
+    });
+  }
   it("launches fresh execution with marker and required nonce row, without journaled credentials", async () => {
     const s = await setup(backend);
     const prepared = await s.instance.prepare({ ...s.plan, findings: [], owner: s.plan.attemptId });

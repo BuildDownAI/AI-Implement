@@ -50,6 +50,8 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       const credential = await this.deps.credentials.resolve(plan.scope);
       if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
       const tokens = await this.deps.callbackInputs(plan.attemptId);
+      // Without a callback URL and result token, the runner cannot report an approvable result.
+      if (!tokens.runner_callback_url?.trim() || !tokens.run_token?.trim()) return { status: "unknown" };
       const runName = `review-fix-${plan.attemptId}`;
       const issue = { id: `review-fix:${plan.attemptId}`, identifier: `review-fix-${plan.scope.prNumber}`, title: `Review-fix for ${plan.scope.repository}#${plan.scope.prNumber}`, description: plan.taskText };
       const common = { mapping, prNumber: plan.scope.prNumber, githubToken: credential.token, runName, dispatchId: plan.attemptId,
