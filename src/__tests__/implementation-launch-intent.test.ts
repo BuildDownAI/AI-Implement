@@ -32,7 +32,11 @@ vi.mock("../local-docker.js", async (original) => ({
   findLocalContainerIdByName: vi.fn(async () => captured.liveContainer),
 }));
 
-it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) with acceptance-specific credential settlement and no secret snapshots", async (accepted) => {
+it.each([
+  { accepted: false, preIntent: false, configuration: "missing" },
+  { accepted: true, preIntent: false, configuration: "missing" },
+  ...["unchanged", "missing", "opted-out", "provider-failure", "retry", "generation", "existing", "owner", "bound", "terminal"].map(configuration => ({ accepted: false, preIntent: true, configuration })),
+])("reconstructs managed launch %j across SQLite reopen and HTTP checkout", async ({ accepted, preIntent, configuration }) => {
   captured.liveContainer = null;
   vi.stubEnv("RUNNER_TOKEN_SECRET", "intent-test-encryption-key");
   onTestFinished(() => { vi.unstubAllEnvs(); });
@@ -44,6 +48,7 @@ it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) 
     secrets: () => import("../model-protected-secrets.js"),
     runtime: () => import("../model-auth-runtime.js"),
     routes: () => import("../model-auth-routes.js"),
+    log: () => import("../log.js"),
     admission: () => import("../dispatch-admission.js"),
   } });
   const m = db.modules;
@@ -61,7 +66,7 @@ it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) 
   const backend = vi.fn(async (args: Parameters<ImplementationRunProductionInput["launchImplementationLocalSession"]>[0]) => {
     if (args.input.managedAuth?.kind !== "launch") throw new Error("expected managed launch");
     bearer = args.input.managedAuth.takeBootstrap()!.bearer;
-    args.input.markLaunchAttempted({ sessionImage: "runner:test", computeStartedAt: Date.now() });
+    if (!preIntent) args.input.markLaunchAttempted({ sessionImage: "runner:test", computeStartedAt: Date.now() });
     staged();
     // Simulate process death: the original stack never resumes to settle its decision.
     return await new Promise<never>(() => {});
@@ -77,6 +82,45 @@ it.each([false, true])("reconstructs a real staged managed launch (accepted=%s) 
   expect(await captured.deps!.reserve(run)).toBe(true);
   void captured.deps!.launch(run);
   await stagedPromise;
+  if (preIntent) {
+    expect(m.intent.implementationIntentStore().read(run.dispatchId)).toBeNull();
+    const restarted = await db.reopen();
+    if (configuration === "opted-out") restarted.config.setProjectOptIn("ENG", false);
+    restarted.production.createProductionImplementationRunServices({ ...input,
+      getMapping: () => configuration === "missing" ? undefined : mapping,
+      resolveProvider: configuration === "provider-failure" ? async () => { throw new Error("unavailable"); } : input.resolveProvider,
+    });
+    const sql = restarted.dedup.getDb();
+    if (configuration === "generation") sql.prepare("UPDATE dispatch_admissions SET generation = generation + 1 WHERE dispatch_id = ?").run(run.dispatchId);
+    if (configuration === "owner") sql.prepare("UPDATE dispatch_admissions SET lifecycle_owner = 'legacy' WHERE dispatch_id = ?").run(run.dispatchId);
+    if (configuration === "bound" || configuration === "terminal") {
+      const id = restarted.log.appendLogIfAbsent({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: "Test", teamKey: run.teamKey, repo: "Org/repo", executionMode: "local-docker" });
+      if (configuration === "terminal") restarted.log.updateJobStatus(id, "failed");
+    }
+    if (configuration === "existing") captured.liveContainer = "existing-container";
+    if (configuration === "retry") {
+      sql.exec("CREATE TRIGGER fail_settlement BEFORE UPDATE ON model_credential_grants BEGIN SELECT RAISE(ABORT, 'settlement failed'); END");
+      await expect(captured.deps!.launch(run)).rejects.toThrow("settlement failed");
+      expect(restarted.admission.read(run.dispatchId)!.releasedAt).toBeNull();
+      sql.exec("DROP TRIGGER fail_settlement");
+    }
+    const protectedRun = ["generation", "existing", "owner", "bound", "terminal"].includes(configuration);
+    expect(await captured.deps!.launch(run)).toEqual({ outcome: protectedRun ? "unknown" : "rejected" });
+    expect(backend).toHaveBeenCalledTimes(1);
+    expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
+    expect(restarted.admission.read(run.dispatchId)!.releasedAt).toBeNull();
+    expect(sql.prepare("SELECT grant_id FROM model_credential_grants WHERE dispatch_id = ?").all(run.dispatchId)).toHaveLength(1);
+    const routes = restarted.routes.createModelAuthRoutes({ runtime: restarted.runtime.getModelAuthRuntime(input.config), onFly: false, requestPlanRefresh: async () => {} });
+    const server = createServer((req, res) => { void routes.handle(req, res); });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    onTestFinished(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const address = server.address() as { port: number };
+    const response = await fetch(`http://127.0.0.1:${address.port}/runner/model-auth/checkout`, { method: "POST", headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" }, body: JSON.stringify({ version: 1, profileId: "api" }) });
+    expect(response.status).toBe(protectedRun ? 200 : 403);
+    const body = await response.text();
+    if (!protectedRun) expect(body).not.toContain("API-CREDENTIAL-SENTINEL");
+    return;
+  }
   const persisted = m.dedup.getDb().prepare("SELECT snapshot FROM implementation_launch_intent WHERE dispatch_id = ?").get(run.dispatchId) as { snapshot: string };
   for (const secret of [bearer, "REGISTRY-SENTINEL", "API-CREDENTIAL-SENTINEL", "APP-CREDENTIAL-SENTINEL", "CALLBACK-SENTINEL"]) expect(persisted.snapshot).not.toContain(secret);
   const snapshot = JSON.parse(persisted.snapshot);

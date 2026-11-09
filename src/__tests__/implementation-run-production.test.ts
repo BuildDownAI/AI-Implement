@@ -10,13 +10,15 @@ import { buildRunConfig } from "../run-config.js";
 
 const intents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: boolean }>());
 vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationIntentStore: () => ({
+  readPreparation: (id: string) => intents.get(`preparation:${id}`)?.snapshot ?? null,
+  writePreparation: (id: string, snapshot: unknown) => { if (!intents.has(`preparation:${id}`)) intents.set(`preparation:${id}`, { snapshot: structuredClone(snapshot), done: false }); },
   read: (id: string) => intents.get(id) ?? null,
   write: (id: string, snapshot: unknown) => { if (!intents.has(id)) intents.set(id, { snapshot: structuredClone(snapshot), done: false }); },
   accept: (id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent.snapshot as object, { accepted: true }); },
   complete: (id: string) => { const intent = intents.get(id); if (intent) intent.done = true; },
   remove: (id: string) => intents.delete(id),
 }) }));
-vi.mock("../agent-run-preparation.js", () => ({ releaseRejectedLaunch: vi.fn() }));
+vi.mock("../agent-run-preparation.js", () => ({ releaseRejectedLaunch: vi.fn(), loadStoredSnapshot: vi.fn().mockReturnValue(null), releaseUnusedManagedPreparation: vi.fn().mockReturnValue({ complete: true }) }));
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/implementation-run-workflow.js")>()),

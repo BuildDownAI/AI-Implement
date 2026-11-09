@@ -39,7 +39,7 @@ import { postBranchComment } from "../base-branch.js";
 import { postStatusComment } from "../status-events.js";
 import { mintLaunchTokens, implementationTtlSeconds, type LaunchTokens } from "../runner-tokens.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
-import { releaseRejectedLaunch } from "../agent-run-preparation.js";
+import { loadStoredSnapshot, releaseRejectedLaunch, releaseUnusedManagedPreparation } from "../agent-run-preparation.js";
 import {
   classifyLaunchError,
   isManagedProject,
@@ -288,6 +288,10 @@ export function createProductionImplementationRunServices(input: ImplementationR
     const ineligible = containerIneligibility(run, mapping);
     if (ineligible) throw new Error(ineligible);
 
+    if (isManagedProject(run.teamKey, run.dispatchId)) implementationIntentStore().writePreparation(run.dispatchId, {
+      generation: admission.generation, projectKey: run.teamKey, backend: run.backend,
+      mapping: recoveryMapping(mapping), flyApp: config.flySessionsApp,
+    });
     const managedRuntime = getModelAuthRuntime(config);
     let managedDecision: Prelaunch["managedDecision"] = { kind: "legacy" };
     if (isManagedProject(run.teamKey, run.dispatchId)) {
@@ -447,6 +451,26 @@ export function createProductionImplementationRunServices(input: ImplementationR
       // Keep the admission and let the workflow reconcile until its deadline; never mint a new grant.
       return { outcome: "unknown" };
     }
+    // A bound/terminal job is never evidence of a new non-launch, even without intent.
+    if (getJobByDispatchId(run.dispatchId)) return { outcome: "unknown" };
+    const store = implementationIntentStore();
+    const preparation = store.readPreparation(run.dispatchId);
+    const admission = readAdmission(run.dispatchId);
+    if (preparation) {
+      if (!admission || admission.releasedAt !== null || admission.executionId !== null || admission.generation !== preparation.generation ||
+          admission.lifecycleOwner.kind !== "restate" || admission.lifecycleOwner.attemptId !== run.dispatchId ||
+          preparation.projectKey !== run.teamKey || preparation.backend !== run.backend) {
+        return { outcome: "unknown" };
+      }
+      // Backend reads must succeed before declaring a never-attempted launch absent.
+      const find = createImplementationFindExistingRun({ getMapping: () => preparation.mapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: preparation.flyApp }) });
+      if (await find(run, admission.createdAt) !== null) return { outcome: "unknown" };
+      const settled = releaseUnusedManagedPreparation({ dispatchId: run.dispatchId, projectKey: run.teamKey, backend: run.backend }, { ownership: getModelAuthRuntime(config).ownership });
+      if (!settled.complete) throw new Error(`managed preparation settlement incomplete: ${run.dispatchId}`);
+      return { outcome: "rejected" };
+    }
+    // Older preparations without a persisted admission identity cannot prove generation ownership.
+    if (loadStoredSnapshot(run.dispatchId)) return { outcome: "unknown" };
     let ctx: Prelaunch;
     try {
       ctx = await prepare(run);
