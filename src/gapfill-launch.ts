@@ -11,6 +11,9 @@ import { resolveSessionImage } from "./repo-image.js";
 import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 
 export interface DispatchFlyGapfillInput {
+  runName?: string;
+  dispatchId?: string;
+  reviewFix?: RunConfigV1["reviewFix"];
   mapping: RepoMapping;
   issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null };
   owner: string;
@@ -36,17 +39,22 @@ export interface DispatchFlyGapfillInput {
   commentInstruction?: string;
   decision: ManagedDispatchDecision;
   /** Called after preparation, immediately before the potentially ambiguous create. */
-  onBeforeLaunch: (machineSize: ReturnType<typeof guestSize>) => void;
+  onBeforeLaunch: (machineSize: ReturnType<typeof guestSize>, machineNonce: string) => void;
 }
 
 export interface DispatchFlyGapfillResult {
-  machine: Awaited<ReturnType<typeof createMachine>>;
-  machineNonce: string;
+  machine: Pick<Awaited<ReturnType<typeof createMachine>>, "id" | "name">;
   resolvedImage: string;
 }
 
 /** The proven Fly gap-fill launch; admission, settlement and persistence belong to the caller. */
 export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promise<DispatchFlyGapfillResult> {
+  if (input.runName !== undefined && !/^[a-z0-9][a-z0-9-]*$/.test(input.runName)) {
+    throw new Error("Invalid Fly gap-fill runName");
+  }
+  if (input.decision.kind === "launch" && input.dispatchId !== undefined && input.dispatchId !== input.decision.dispatchId) {
+    throw new Error("managed dispatch refused: dispatchId mismatch");
+  }
   const { mapping, issue: prLog, githubToken: ghToken, scopeKey, allTeamKeys,
     runnerCallbackUrl, runToken, runProgressToken, runPublicationToken, commentInstruction } = input;
   const protectedLaunch = input.decision.kind === "launch" ? input.decision : null;
@@ -92,6 +100,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
       prNumber: String(input.prNumber),
       commentInstruction,
       retryPolicy: getRetryPolicy(),
+      reviewFix: input.reviewFix,
     }),
     ...managedRunConfigFields(protectedLaunch),
   };
@@ -111,6 +120,8 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
   }
 
   const machineConfig = buildSessionMachineConfig({
+    machineName: input.runName,
+    dispatchId: input.dispatchId ?? protectedLaunch?.dispatchId,
     image: resolvedImage,
     issueId: prLog.issueId,
     issueIdentifier: prLog.issueIdentifier ?? prLog.issueId,
@@ -150,15 +161,15 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
       };
       return Object.keys(merged).length > 0 ? merged : undefined;
     })(),
-    ...(protectedLaunch && protectedModelBootstrap ? { protectedModelBootstrap, dispatchId: protectedLaunch.dispatchId } : {}),
+    ...(protectedLaunch && protectedModelBootstrap ? { protectedModelBootstrap } : {}),
   });
   if (getFlyProcessLevelSecrets().enabled) {
     const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
     console.log(`[comment-gapfill] process-level secrets for ${prLog.issueIdentifier ?? prLog.issueId}: [${secretNames.join(", ")}]`);
   }
-  input.onBeforeLaunch(guestSize(machineConfig));
+  input.onBeforeLaunch(guestSize(machineConfig), machineNonce);
   const machine = await createMachine(flyToken, flyApp, machineConfig);
-  return { machine, machineNonce, resolvedImage };
+  return { machine: { id: machine.id, name: machine.name }, resolvedImage };
 }
 
 
