@@ -29,6 +29,9 @@ async function setup(backend: "fly-machines" | "local-docker") {
   const plan: WorkerLaunchPlan = { executionBackend: backend, attemptId: "attempt-1", scope, taskText: "fix findings", deadlineAt: Date.now() + 60000 };
   return { ...m, deps, plan, instance: new m.worker.ContainerReviewFixWorker(deps), execution: { backend, runRef: backend === "fly-machines" ? "machine" : "container" } };
 }
+function seedLaunchIntent(s: Awaited<ReturnType<typeof setup>>) {
+  s.log.appendLogIfAbsent({ issueId: "review-fix:attempt-1", dispatchId: "attempt-1", machineNonce: "sentinel-nonce", admissionGeneration: s.admission.read("attempt-1")!.generation, executionMode: s.plan.executionBackend, phase: "gap-analysis" });
+}
 beforeEach(() => vi.clearAllMocks());
 const backends = ["fly-machines", "local-docker"] as const;
 for (const backend of backends) describe(backend, () => {
@@ -57,14 +60,58 @@ for (const backend of backends) describe(backend, () => {
     const outputs = JSON.stringify([prepared, launch, reconciled]);
     for (const sentinel of ["sentinel-nonce", "sentinel-result", "sentinel-progress", "sentinel-publication", "sentinel-github", "sentinel-bootstrap"]) expect(outputs).not.toContain(sentinel);
   });
+  for (const failure of ["lost acknowledgement", "attachment failure"] as const) it(`recovers after ${failure} and worker restart`, async () => {
+    const s = await setup(backend);
+    const assertIntent = () => {
+      expect(s.log.getJobByNonce("sentinel-nonce")).toMatchObject({ dispatchId: "attempt-1", machineId: null, status: "dispatched", admissionGeneration: s.admission.read("attempt-1")!.generation });
+    };
+    if (failure === "lost acknowledgement") {
+      vi.mocked(s.fly.createMachine).mockImplementation(async () => { assertIntent(); throw new Error("lost acknowledgement"); });
+      vi.mocked(s.docker.startLocalRunnerContainer).mockImplementation(async input => { input.onBeforeLaunch?.(); assertIntent(); throw new Error("lost acknowledgement"); });
+    } else {
+      vi.spyOn(s.log, "setJobMachineId").mockImplementationOnce(() => { throw new Error("(400) persistence failed"); });
+    }
+    expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
+    assertIntent();
+    vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: s.execution.runRef, name: "review-fix-attempt-1" }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
+    vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue(s.execution.runRef);
+    const restarted = new s.worker.ContainerReviewFixWorker(s.deps);
+    expect(await restarted.launch(s.plan)).toEqual({ status: "unknown" });
+    expect(await restarted.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "found", execution: s.execution });
+    expect(s.log.getJobByNonce("sentinel-nonce")).toMatchObject({ machineId: s.execution.runRef, status: "dispatched", admissionGeneration: s.admission.read("attempt-1")!.generation });
+  });
+  it("uses the admitted mapping when unmanaged siblings share the repository", async () => {
+    const s = await setup(backend);
+    vi.spyOn(s.config, "getMappings").mockReturnValue({
+      SIBLING: makeMapping({ owner: "owner", repo: "repo" }),
+      AII: makeMapping({ owner: "owner", repo: "repo" }),
+    });
+    const managed = vi.spyOn(s.managed, "isManagedProject").mockImplementation(key => key === "AII");
+    expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: `managed review-fix on ${backend} not supported yet` });
+    expect(managed).toHaveBeenCalledWith("AII", "attempt-1");
+    expect(s.deps.credentials.resolve).not.toHaveBeenCalled();
+  });
+  it("refuses a mapping that no longer targets the admitted repository", async () => {
+    const s = await setup(backend);
+    s.config.upsertMapping("AII", makeMapping({ owner: "owner", repo: "other" }));
+    expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
+    expect(s.deps.callbackInputs).not.toHaveBeenCalled();
+  });
   it("rejects managed launches before minting tokens", async () => {
     const s = await setup(backend);
     vi.spyOn(s.managed, "isManagedProject").mockReturnValueOnce(true);
     expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: `managed review-fix on ${backend} not supported yet` });
     expect(s.deps.callbackInputs).not.toHaveBeenCalled();
   });
+  it("does not report an execution without a durable nonce row", async () => {
+    const s = await setup(backend);
+    vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: "orphan", name: "review-fix-attempt-1" }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
+    vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue("orphan");
+    expect(await s.instance.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "unknown" });
+  });
   for (const count of [0, 1, 2]) it(`reconciles ${count} exact name candidates conservatively`, async () => {
     const s = await setup(backend);
+    seedLaunchIntent(s);
     const ids = Array.from({ length: count }, (_, i) => `id-${i}`);
     vi.mocked(s.fly.listMachines).mockResolvedValue(ids.map(id => ({ id, name: "review-fix-attempt-1" })) as Awaited<ReturnType<typeof s.fly.listMachines>>);
     const worker = new s.worker.ContainerReviewFixWorker({ ...s.deps, localCandidates: async name => { expect(name).toBe("review-fix-attempt-1"); return ids; } });
@@ -115,19 +162,22 @@ for (const started of [false, true]) it(`local error ${started ? "after" : "befo
 });
 it("Fly reconciliation excludes prefix and suffix name matches", async () => {
   const s = await setup("fly-machines");
+  seedLaunchIntent(s);
   vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: "wrong", name: "review-fix-attempt-1-extra" }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
   expect(await s.instance.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "unknown" });
 });
 it("local reconciliation uses Docker's exact-name helper by default", async () => {
   const s = await setup("local-docker");
+  seedLaunchIntent(s);
   vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue("found");
   expect(await s.instance.reconcile("attempt-1", s.plan.scope)).toEqual({ status: "found", execution: { backend: "local-docker", runRef: "found" } });
   expect(s.docker.findLocalContainerIdByName).toHaveBeenCalledWith("review-fix-attempt-1");
 });
-it("post-create persistence failure remains ambiguous even with a 4xx-shaped error", async () => {
+it("pre-launch persistence failure prevents external creation", async () => {
   const s = await setup("fly-machines");
   vi.spyOn(s.log, "appendLogIfAbsent").mockImplementationOnce(() => { throw new Error("(400) sentinel-nonce"); });
-  expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
+  expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: "Container review-fix launch rejected" });
+  expect(s.fly.createMachine).not.toHaveBeenCalled();
 });
 
 for (const status of ["created", "restarting", "paused", "running", "removing", "unknown"]) it(`local ${status} with zero exit code is not terminal`, async () => {

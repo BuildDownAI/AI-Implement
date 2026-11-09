@@ -6,7 +6,7 @@ import { dispatchLocalGapfill, type DispatchLocalGapfillInput } from "./local-ga
 import { listMachines } from "./fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer } from "./local-docker.js";
 import { readBackendRun, stopBackendRun } from "./backend-run.js";
-import { appendLogIfAbsent, getJobByDispatchId } from "./log.js";
+import { appendLogIfAbsent, getJobByDispatchId, setJobMachineId } from "./log.js";
 import { classifyLaunchError, isManagedProject } from "./managed-dispatch-auth.js";
 import { githubActionsReviewFixWorkerTransport, inMemoryReviewFixWorkerScopeStore, type GithubReviewFixWorkerDeps } from "./review-fix-worker.js";
 import type { ReviewFixWorkerPort } from "./review-fix-ports.js";
@@ -39,12 +39,14 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
     let started = false;
     let created = false;
     try {
-      const entry = Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === plan.scope.repository);
-      if (!entry) return { status: "unknown" };
-      const [teamKey, mapping] = entry;
-      if (isManagedProject(teamKey, plan.attemptId)) return { status: "rejected", reason: `managed review-fix on ${backend} not supported yet` };
       const admission = readAdmission(plan.attemptId);
       if (!admission || admission.releasedAt !== null || admission.backend !== backend) return { status: "unknown" };
+      const teamKey = admission.mappingKey;
+      const mapping = getMappings()[teamKey];
+      if (!mapping || admission.scope.kind !== "pr" || admission.scope.repository !== plan.scope.repository || `${mapping.owner}/${mapping.repo}` !== admission.scope.repository) return { status: "unknown" };
+      if (isManagedProject(teamKey, plan.attemptId)) return { status: "rejected", reason: `managed review-fix on ${backend} not supported yet` };
+      // A durable launch intent must be reconciled, never launched again with a new nonce.
+      if (getJobByDispatchId(plan.attemptId)) return { status: "unknown" };
       const credential = await this.deps.credentials.resolve(plan.scope);
       if (credential.installationId !== plan.scope.installationId) return { status: "unknown" };
       const tokens = await this.deps.callbackInputs(plan.attemptId);
@@ -53,19 +55,23 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       const common = { mapping, prNumber: plan.scope.prNumber, githubToken: credential.token, runName, dispatchId: plan.attemptId,
         reviewFix: { version: 1 as const, attemptId: plan.attemptId, installationId: plan.scope.installationId, repository: plan.scope.repository, prNumber: plan.scope.prNumber, deadlineAt: plan.deadlineAt, executionBackend: backend },
         runnerCallbackUrl: tokens.runner_callback_url, runToken: tokens.run_token, runProgressToken: tokens.run_progress_token, runPublicationToken: tokens.run_publication_token, commentInstruction: plan.taskText };
-      let nonce: string | undefined;
+      let jobId: number | undefined;
+      const beforeLaunch = (nonce: string) => {
+        jobId = appendLogIfAbsent({ issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title, teamKey, repo: plan.scope.repository, dispatchId: plan.attemptId, admissionGeneration: admission.generation, executionMode: backend, machineNonce: nonce, phase: "gap-analysis", computeStartedAt: Date.now() });
+        started = true;
+      };
       let id: string;
       if (backend === "fly-machines") {
         const result = await dispatchFlyGapfill({ ...this.deps.fly, ...common, issue: { issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title }, owner: mapping.owner, repo: mapping.repo, issueIdentifier: issue.identifier, scopeKey: teamKey, allTeamKeys: Object.keys(getMappings()), decision: { kind: "legacy" },
-          runnerCallbackUrl: tokens.runner_callback_url ?? "", runToken: tokens.run_token ?? "", runProgressToken: tokens.run_progress_token ?? "", onBeforeLaunch: (_, n) => { nonce = n; started = true; } });
+          runnerCallbackUrl: tokens.runner_callback_url ?? "", runToken: tokens.run_token ?? "", runProgressToken: tokens.run_progress_token ?? "", onBeforeLaunch: (_, n) => beforeLaunch(n) });
         id = result.machine.id;
       } else {
-        const result = await dispatchLocalGapfill({ ...this.deps.local, ...common, issue, retryPolicy: null, onBeforeLaunch: (n) => { nonce = n; started = true; } });
+        const result = await dispatchLocalGapfill({ ...this.deps.local, ...common, issue, retryPolicy: null, onBeforeLaunch: beforeLaunch });
         id = result.containerId;
       }
       created = true;
-      if (!nonce) return { status: "unknown" };
-      appendLogIfAbsent({ issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title, teamKey, repo: plan.scope.repository, dispatchId: plan.attemptId, admissionGeneration: admission.generation, executionMode: backend, machineId: id, machineNonce: nonce, phase: "gap-analysis", computeStartedAt: Date.now() });
+      if (jobId === undefined) return { status: "unknown" };
+      setJobMachineId(jobId, id);
       const execution = { backend, runRef: id } as const;
       await this.scopes.rememberExecution(execution, plan.scope);
       console.log(`[review-fix] dispatched via ${backend} (attempt ${plan.attemptId}, run ${id})`);
@@ -79,9 +85,10 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
     try {
       const admission = readAdmission(attemptId);
       const backend = admission?.backend;
-      if (backend !== "fly-machines" && backend !== "local-docker") return { status: "unknown" };
+      if (!admission || (backend !== "fly-machines" && backend !== "local-docker")) return { status: "unknown" };
       const row = getJobByDispatchId(attemptId);
-      let id = row?.machineId;
+      if (!row?.machineNonce || row.admissionGeneration !== admission.generation || row.executionMode !== backend) return { status: "unknown" };
+      let id = row.machineId;
       if (!id) {
         const name = `review-fix-${attemptId}`;
         const candidates = backend === "fly-machines"
@@ -89,6 +96,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
           : await (this.deps.localCandidates ?? (async (n) => { const found = await findLocalContainerIdByName(n); return found ? [found] : []; }))(name);
         if (candidates.length !== 1) return { status: "unknown" };
         id = candidates[0];
+        setJobMachineId(row.id, id);
       }
       const execution = { backend, runRef: id } as const;
       await this.scopes.rememberExecution(execution, scope);
