@@ -428,6 +428,38 @@ describe("prepared review-fix credentials", () => {
         ? { ok: true } : { ok: false, reason: "wrong_scope" });
     });
 
+    it("ends publication authority on release while retaining ordinary result retries", () => {
+      const { now, token } = prepare();
+      const execution = { repository: "acme/app", githubRunId: 123, githubRunAttempt: 2 };
+      const publication = runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET,
+      });
+      const progress = runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "progress", secret: SECRET,
+      });
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: execution,
+      }).ok).toBe(true);
+      dedup.getDb().prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?")
+        .run(now, PILOT_ATTEMPT);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result", {
+        publicationExecution: execution,
+      })).toMatchObject({ ok: false, reason: "revoked" });
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result").ok).toBe(true);
+      expect(runnerTokens.verifyPreparedReviewFixToken(progress.token, SECRET, "progress"))
+        .toMatchObject({ ok: false, reason: "revoked" });
+      expect(runnerTokens.verifyPreparedReviewFixToken(publication.token, SECRET, "publication", {
+        consumePublication: true, publicationExecution: execution,
+      })).toMatchObject({ ok: false, reason: "revoked" });
+      expect(() => runnerTokens.mintPreparedReviewFixToken({
+        attemptId: PILOT_ATTEMPT, audience: "publication", secret: SECRET,
+      })).toThrow(/no current authority/);
+      dedup.getDb().prepare("UPDATE review_fix_attempts SET authority_revoked_at = ? WHERE attempt_id = ?")
+        .run(now, PILOT_ATTEMPT);
+      expect(runnerTokens.verifyPreparedReviewFixToken(token, SECRET, "result"))
+        .toMatchObject({ ok: false, reason: "revoked" });
+    });
+
     it("rejects an unbound execution", () => {
       const { token } = prepare();
       dedup.getDb().prepare(`UPDATE review_fix_attempts SET execution_ref = NULL,
@@ -452,7 +484,7 @@ describe("prepared review-fix credentials", () => {
       })).toMatchObject({ ok: false, reason: "revoked" });
     });
 
-    it.each(["state = 'completed'", "terminal_outcome_json = '{}'", "completed_at = 1"])(
+    it.each(["state = 'completed'", "terminal_outcome_json = '{}'", "completed_at = 1", "authority_revoked_at = 1"])(
       "refuses ended authority: %s", (assignment) => {
         const { token } = prepare();
         dedup.getDb().prepare(`UPDATE review_fix_attempts SET ${assignment} WHERE attempt_id = ?`).run(PILOT_ATTEMPT);

@@ -61,7 +61,7 @@ async function callHandler(
 }
 
 describe("handlePublicationTokenRequest", () => {
-  it("allows a bound fly attempt without run headers and mints only once", async () => {
+  it.each(["github-actions", "fly-machines", "local-docker"])("allows bound %s publication once and rejects released pre-write authority", async (backend) => {
     const attemptId = "fly-attempt-1";
     const db = dedup.getDb();
     db.prepare(`INSERT INTO dispatch_admissions
@@ -77,21 +77,25 @@ describe("handlePublicationTokenRequest", () => {
       VALUES (?, ?, 'AII', '7', 'acme/app', 42, 'pr', 'acme/app#42', ?,
               'launch_intent', ?, ?, 'fly-machines', 'machine-1', '{}', '[]')`)
       .run(attemptId, attemptId, attemptId, Date.now(), Date.now() + 60_000);
+    db.prepare(`UPDATE review_fix_attempts SET execution_backend = ?, github_run_id = 123,
+      github_run_attempt = 2 WHERE attempt_id = ?`).run(backend, attemptId);
+    db.prepare("UPDATE dispatch_admissions SET backend = ? WHERE dispatch_id = ?").run(backend, attemptId);
     const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: SECRET });
     const result = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "result", secret: SECRET });
     const request = {
       secret: SECRET, githubAppId: "app-id", githubAppPrivateKey: "fake-key",
       repository: "acme/app",
+      ...(backend === "github-actions" ? { githubRunId: 123, githubRunAttempt: 2 } : {}),
     };
     const authorityRequest = { ...request, authorization: `Bearer ${result.token}` };
     expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(200);
     expect(publicationToken.handlePublicationAuthorityCheck({ ...authorityRequest, repository: "other/repo" }).status).toBe(403);
-    db.prepare("UPDATE review_fix_attempts SET execution_ref = NULL WHERE attempt_id = ?").run(attemptId);
+    db.prepare("UPDATE review_fix_attempts SET execution_ref = NULL, github_run_id = NULL, github_run_attempt = NULL WHERE attempt_id = ?").run(attemptId);
     expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(403);
     expect((await publicationToken.handlePublicationTokenRequest({ ...request,
       authorization: `Bearer ${publication.token}` })).status).toBe(403);
     expect(mockGetScopedToken).not.toHaveBeenCalled();
-    db.prepare("UPDATE review_fix_attempts SET execution_ref = 'machine-1' WHERE attempt_id = ?").run(attemptId);
+    db.prepare("UPDATE review_fix_attempts SET execution_ref = 'machine-1', github_run_id = 123, github_run_attempt = 2 WHERE attempt_id = ?").run(attemptId);
     mockGetScopedToken.mockResolvedValue({ token: "ghs_fresh", expiresAt: "2030-01-01T00:00:00Z" });
     expect((await publicationToken.handlePublicationTokenRequest({ ...request,
       authorization: `Bearer ${publication.token}` })).status).toBe(200);
@@ -99,6 +103,9 @@ describe("handlePublicationTokenRequest", () => {
       authorization: `Bearer ${publication.token}` })).status).toBe(403);
     expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
     expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(200);
+    db.prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?").run(Date.now(), attemptId);
+    expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(403);
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result").ok).toBe(true);
   });
 
   it("binds pilot issuance and subsequent push checks to the live attempt and exact run", async () => {
