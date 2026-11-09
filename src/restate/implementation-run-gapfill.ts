@@ -5,10 +5,10 @@ import type { ImplementationRunDependencies, ImplementationRunInput } from "./im
 import type { RepoMapping } from "../config.js";
 import { acquire, read } from "../dispatch-admission.js";
 import { isParked } from "../dispatch-breaker.js";
-import { CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
+import { getCommentGapfillLaunch, stageCommentGapfillLaunch, rejectCommentGapfillLaunch, CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
 import { buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
-import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, updateJobRunId, suppressStaleNotifications } from "../log.js";
+import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, suppressStaleNotifications } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
 import { defaultFetchSignal, dispatchWorkflow } from "../github.js";
 import { resolveWorkflowCapabilities } from "../workflow-probe.js";
@@ -32,6 +32,24 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     return mapping;
   };
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+  // Repair only a durably staged launch (or its existing row), never invent attribution
+  // from a title match. Conditional run binding preserves callback/finisher terminal state.
+  const recordLaunch = (run: ImplementationRunInput, runId?: number, existingRow = getJobByDispatchId(run.dispatchId)) => {
+    const row = existingRow;
+    const record = getCommentGapfillLaunch(run.dispatchId);
+    if (!row && !record) throw new Error("gap-fill adoption has no durable launch metadata");
+    const jobId = row?.id ?? appendLogIfAbsent(record!);
+    updateJobPrUrl(jobId, `https://github.com/${run.gapFill!.repository}/pull/${run.gapFill!.prNumber}`);
+    if (runId !== undefined) attachJobRunIdIfMissing(jobId, runId);
+    suppressStaleNotifications(run.issueId, jobId);
+    const item = getCommentGapfillItem(run.gapFill!.queueItemId);
+    if (item?.status === "pending" || item?.status === "dispatched") {
+      const status = row?.status;
+      const terminal = status && status !== "dispatched" && status !== "running" && status !== "unknown";
+      if (terminal) markCommentGapfillProcessed(item.id, status === "completed" ? "completed" : "failed");
+      else if (item.status === "pending") markCommentGapfillProcessed(item.id, "dispatched");
+    }
+  };
   return {
     reserve: async (run) => {
       const gap = run.gapFill!;
@@ -46,7 +64,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     },
     findExistingRun: async (run, dispatchedAt) => {
       const row = getJobByDispatchId(run.dispatchId);
-      if (row?.runId) return String(row.runId);
+      if (row?.runId) { recordLaunch(run, undefined, row); return String(row.runId); }
       const mapping = mappingFor(run);
       const res = await fetch(`https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`, {
         headers: { Authorization: `Bearer ${await token(mapping.owner)}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal(),
@@ -57,10 +75,16 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       const floor = Math.floor(dispatchedAt / 1000) * 1000;
       const matches = data.workflow_runs.filter(r => r.display_title === `${IMPLEMENTATION_RUN_TITLE_PREFIX}${run.issueIdentifier}` && r.created_at !== undefined && Date.parse(r.created_at) >= floor && !claimed.has(r.id));
       if (matches.length > 1) throw new Error("findExistingRun: multiple unclaimed gap-fill runs match");
-      return matches.length ? String(matches[0].id) : null;
+      if (!matches.length) return null;
+      recordLaunch(run, matches[0].id);
+      return String(matches[0].id);
     },
     launch: async (run) => {
       const gap = run.gapFill!;
+      if (getCommentGapfillLaunch(run.dispatchId)) {
+        recordLaunch(run);
+        return { outcome: "unknown" };
+      }
       const runtime = getModelAuthRuntime(config);
       let decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
       let prepared: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;
@@ -106,6 +130,21 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         console.error(`[implementation-run] gap-fill preparation failed dispatch=${run.dispatchId}:`, err);
         return { outcome: "rejected" };
       }
+      let accounting: Awaited<ReturnType<typeof gapfillAccounting>>;
+      try {
+        accounting = await gapfillAccounting({ trackerAccounting: async (m, ref) => {
+          const provider = await input.resolveProvider(m);
+          return trackerAccounting(m, provider, ref);
+        } }, mapping, issue);
+        const admission = read(run.dispatchId)!;
+        stageCommentGapfillLaunch({ ...issue, teamKey: run.teamKey, repo: gap.repository, dispatchId: run.dispatchId, admissionGeneration: admission.generation,
+          executionMode: "github-actions", runnerMode: "default", contract: prepared.contract, phase: "gap-analysis", trigger: "comment", ...accounting });
+      } catch (err) {
+        settleLaunch(decision, "rejected", runtime);
+        markCommentGapfillProcessed(gap.queueItemId, "failed");
+        console.error(`[implementation-run] gap-fill staging failed dispatch=${run.dispatchId}:`, err);
+        return { outcome: "rejected" };
+      }
       let result: Awaited<ReturnType<typeof dispatchGhaGapfill>>;
       try {
         result = await dispatchGhaGapfill({ ghToken, mapping, inputs: prepared.inputs, dispatch: dispatchWorkflow });
@@ -114,11 +153,8 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       }
       const outcome = result.success ? "accepted" : result.outcome === "rejected" ? "rejected" : "unknown";
       if (outcome !== "accepted") settleLaunch(decision, outcome, runtime);
-      const accounting = await gapfillAccounting({ trackerAccounting: async (m, ref) => {
-        const provider = await input.resolveProvider(m);
-        return trackerAccounting(m, provider, ref);
-      } }, mapping, issue);
       if (outcome === "rejected") {
+        rejectCommentGapfillLaunch(run.dispatchId);
         markCommentGapfillProcessed(gap.queueItemId, "failed");
         try {
           await surfaceDispatchFailure(result, config.notifyType, config.notifyWebhookUrl, { site: "comment-gapfill", ...issue, teamKey: run.teamKey, repo: gap.repository, workflowFile: mapping.workflowFile, contract: prepared.contract, phase: "gap-analysis", ...accounting });
@@ -127,13 +163,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         }
         return { outcome };
       }
-      const admission = read(run.dispatchId)!;
-      const jobId = appendLogIfAbsent({ ...issue, teamKey: run.teamKey, repo: gap.repository, dispatchId: run.dispatchId, admissionGeneration: admission.generation,
-        executionMode: "github-actions", runnerMode: "default", contract: prepared.contract, phase: "gap-analysis", trigger: "comment", ...accounting });
-      updateJobPrUrl(jobId, `https://github.com/${gap.repository}/pull/${gap.prNumber}`);
-      if (result.runId !== undefined) updateJobRunId(jobId, result.runId);
-      suppressStaleNotifications(run.issueId, jobId);
-      markCommentGapfillProcessed(gap.queueItemId, "dispatched");
+      recordLaunch(run, result.runId);
       return { outcome, ...(result.runId !== undefined ? { jobId: String(result.runId) } : {}) };
     },
   };

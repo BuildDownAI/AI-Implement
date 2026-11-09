@@ -2,14 +2,14 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { makeMapping, makeJob } from "./helpers/builders.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../restate/implementation-run-production.js";
-const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
+const captured = vi.hoisted(() => ({ records: new Map<string, unknown>(), deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...await original<object>(), createImplementationRunWorkflow: (d: unknown) => { captured.deps = d; return {}; } }));
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => captured.records.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((record: { dispatchId: string }) => captured.records.set(record.dispatchId, record)), rejectCommentGapfillLaunch: vi.fn((id: string) => captured.records.delete(id)), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
 vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
-vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
+vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn() }));
 vi.mock("../github.js", async original => ({ ...await original<object>(), dispatchWorkflow: vi.fn(), getWorkflowRunStatus: vi.fn(async () => null), cancelWorkflowRun: vi.fn(async () => true) }));
 vi.mock("../workflow-probe.js", () => ({ resolveWorkflowCapabilities: vi.fn() }));
@@ -19,6 +19,7 @@ vi.mock("../review-ledger-store.js", () => ({ listOpenReviewFindings: vi.fn(() =
 vi.mock("../model-auth-runtime.js", () => ({ getModelAuthRuntime: vi.fn(() => ({})) }));
 vi.mock("../managed-dispatch-auth.js", () => ({ settleLaunch: vi.fn(), isManagedProject: vi.fn(() => false) }));
 vi.mock("../runner-tokens.js", () => ({ mintLaunchTokens: vi.fn(() => ({ runToken: "TOKEN-SENTINEL", runProgressToken: "NONCE-SENTINEL" })), implementationTtlSeconds: () => 100 }));
+vi.mock("../base-branch.js", async original => ({ ...await original<object>(), postBranchComment: vi.fn() }));
 vi.mock("../dedup.js", () => ({ markDispatched: vi.fn() }));
 import { createProductionImplementationRunServices, createImplementationFindExistingRun } from "../restate/implementation-run-production.js";
 import { acquire, read } from "../dispatch-admission.js";
@@ -26,13 +27,14 @@ import { acquireDispatch } from "../dispatch-gate.js";
 import { getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
 import { resolveManagedDecision, buildCommentGapfillInstruction } from "../comment-gapfill-drain.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill } from "../gapfill-launch.js";
-import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, updateJobPrUrl, updateJobRunId, suppressStaleNotifications } from "../log.js";
+import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, updateJobPrUrl, attachJobRunIdIfMissing, suppressStaleNotifications } from "../log.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
 import { isParked } from "../dispatch-breaker.js";
 import { getModelAuthRuntime } from "../model-auth-runtime.js";
 import { settleLaunch, type ManagedDispatchDecision } from "../managed-dispatch-auth.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { mintLaunchTokens } from "../runner-tokens.js";
+import { postBranchComment } from "../base-branch.js";
 import { markDispatched } from "../dedup.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 const mapping = makeMapping({ owner: "Org", repo: "repo" });
@@ -41,12 +43,13 @@ let d: ImplementationRunDependencies;
 let input: ImplementationRunProductionInput;
 beforeEach(() => {
   vi.clearAllMocks();
+  captured.records.clear();
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [] }) })));
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(isParked).mockReturnValue(false);
   vi.mocked(acquire).mockReturnValue({ ok: true } as never);
   vi.mocked(read).mockReturnValue({ generation: 3, releasedAt: null } as never);
-  vi.mocked(getCommentGapfillItem).mockReturnValue({ id: 1, instruction: "COMMENT-SENTINEL", owner: "Org", repo: "repo", prNumber: 42, commenter: "human", status: "dispatched" } as never);
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ id: 1, instruction: "COMMENT-SENTINEL", owner: "Org", repo: "repo", prNumber: 42, commenter: "human", status: "pending" } as never);
   vi.mocked(resolveManagedDecision).mockResolvedValue({ kind: "legacy" });
   vi.mocked(prepareGhaGapfillLaunch).mockResolvedValue({ contract: "envelope", runnerImage: undefined, inputs: { token: "TOKEN-SENTINEL" } });
   vi.mocked(dispatchGhaGapfill).mockResolvedValue({ success: true, status: 200, runId: 88 });
@@ -85,10 +88,11 @@ it("dispatch success records only gap-analysis comment bookkeeping", async () =>
   expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
   expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ phase: "gap-analysis", trigger: "comment", dispatchId: "dispatch", admissionGeneration: 3, contract: "envelope", executionMode: "github-actions", runnerMode: "default", trackerKind: "linear" }));
   expect(updateJobPrUrl).toHaveBeenCalledWith(7, "https://github.com/Org/repo/pull/42");
-  expect(updateJobRunId).toHaveBeenCalledWith(7, 88);
+  expect(attachJobRunIdIfMissing).toHaveBeenCalledWith(7, 88);
   expect(suppressStaleNotifications).toHaveBeenCalledExactlyOnceWith("issue", 7);
   expect(markDispatched).not.toHaveBeenCalled();
   expect(input.postDispatch).not.toHaveBeenCalled();
+  expect(postBranchComment).not.toHaveBeenCalled();
   expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "dispatched");
   expect(mintLaunchTokens).toHaveBeenCalledWith(expect.objectContaining({ phase: "gap-analysis" }));
 });
@@ -98,6 +102,7 @@ it("definite rejection surfaces failure and fails queue", async () => {
   expect(surfaceDispatchFailure).toHaveBeenCalled();
   expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "failed");
   expect(appendLogIfAbsent).not.toHaveBeenCalled();
+  expect(captured.records.size).toBe(0);
 });
 it("ambiguous dispatch retains dispatched queue and records row", async () => {
   vi.mocked(dispatchGhaGapfill).mockResolvedValueOnce({ success: false, status: 503, outcome: "unknown" });
@@ -113,7 +118,7 @@ it("recorded run id wins", async () => {
 function runs(ids: number[]) {
   vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ workflow_runs: ids.map(id => ({ id, display_title: "Claude AI Implementation — ENG-1", created_at: new Date(1000).toISOString() })) }) } as Response);
 }
-it("one unclaimed title match after floored time wins", async () => { runs([99, 88]); expect(await d.findExistingRun(run, 1999)).toBe("88"); });
+it("one unclaimed title match after floored time wins", async () => { captured.records.set("dispatch", { dispatchId: "dispatch" }); runs([99, 88]); expect(await d.findExistingRun(run, 1999)).toBe("88"); });
 it("no matching run returns null", async () => { runs([]); expect(await d.findExistingRun(run, 1000)).toBeNull(); });
 it("multiple unclaimed matches throw", async () => { runs([88, 87]); await expect(d.findExistingRun(run, 1000)).rejects.toThrow("multiple"); });
 it("absent gapFill preserves existing reserve calls", async () => {
@@ -285,4 +290,95 @@ it.each(["missing title", "different issue"])("recovers the input issue's title 
     issue: { issueId: run.issueId, issueIdentifier: run.issueIdentifier, issueTitle: job.issueTitle },
   }));
   expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ issueTitle: job.issueTitle }));
+});
+
+it("recovers accepted dispatch after insert failure using reconstructed production deps", async () => {
+  vi.mocked(getLatestDispatchForPr).mockReturnValueOnce(makeJob({ issueId: run.issueId, issueTitle: "Original title" }));
+  vi.mocked(appendLogIfAbsent).mockImplementationOnce(() => { throw new Error("process lost before insert"); });
+  await expect(d.launch(run)).rejects.toThrow("process lost");
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
+  runs([88]);
+  expect(await d.findExistingRun(run, 1000)).toBe("88");
+  expect(appendLogIfAbsent).toHaveBeenLastCalledWith(expect.objectContaining({ issueTitle: "Original title", phase: "gap-analysis", trigger: "comment", admissionGeneration: 3, trackerKind: "linear" }));
+  expect(attachJobRunIdIfMissing).toHaveBeenCalledWith(7, 88);
+  vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ id: 7, runId: 88, status: "completed" }));
+  expect(await d.findExistingRun(run, 1000)).toBe("88");
+  expect(appendLogIfAbsent).toHaveBeenCalledTimes(2);
+  expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
+  expect(JSON.stringify([...captured.records.values()])).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
+});
+it("does not invent bookkeeping for an unstaged title match", async () => {
+  runs([88]);
+  await expect(d.findExistingRun(run, 1000)).rejects.toThrow("no durable launch metadata");
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+});
+
+it("a staged uncertain launch never prepares or dispatches again", async () => {
+  vi.mocked(dispatchGhaGapfill).mockResolvedValueOnce({ success: false, status: 503, outcome: "unknown" });
+  await d.launch(run);
+  createProductionImplementationRunServices(input);
+  const retry = captured.deps as ImplementationRunDependencies;
+  expect(await retry.launch(run)).toEqual({ outcome: "unknown" });
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
+  expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
+});
+it.each(["http", "unreadable"])("lookup remains fail-closed on %s failure", async kind => {
+  vi.mocked(fetch).mockResolvedValueOnce(kind === "http" ? { ok: false, status: 503 } as Response : { ok: true, json: async () => { throw new Error("unreadable"); } } as unknown as Response);
+  await expect(d.findExistingRun(run, 1000)).rejects.toThrow();
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+});
+
+import { testDb } from "./helpers/test-db.js";
+it("durably recovers accepted launch and shares terminal bookkeeping without duplicate jobs", async () => {
+  vi.doUnmock("../dedup.js");
+  vi.doUnmock("../log.js");
+  vi.doUnmock("../comment-gapfill-queue.js");
+  const { modules: { production, queue, log, dedup } } = await testDb({ modules: {
+    production: () => import("../restate/implementation-run-production.js"), queue: () => import("../comment-gapfill-queue.js"),
+    log: () => import("../log.js"), dedup: () => import("../dedup.js"),
+  } });
+  const { createProductionImplementationRunServices } = production;
+  const { enqueueCommentGapfill, getCommentGapfillLaunch, getCommentGapfillItem } = queue;
+  const { appendLog, getJobByDispatchId } = log;
+  const { getDb } = dedup;
+  const db = getDb();
+  const queueItemId = enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 1234, commenter: "human", instruction: "COMMENT-SENTINEL" });
+  const recoveryRun = { ...run, gapFill: { ...run.gapFill!, queueItemId } };
+  appendLog({ issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "Original title", repo: "Org/repo", status: "completed" });
+  vi.mocked(read).mockReturnValue({ generation: 3, releasedAt: null, lifecycleOwner: { kind: "restate", attemptId: "dispatch" } } as never);
+  vi.mocked(resolveManagedDecision).mockResolvedValue({ kind: "legacy" });
+  vi.mocked(prepareGhaGapfillLaunch).mockResolvedValue({ contract: "envelope", runnerImage: undefined, inputs: { token: "TOKEN-SENTINEL" } });
+  vi.mocked(dispatchGhaGapfill).mockImplementation(async () => {
+    db.exec("CREATE TRIGGER fail_job BEFORE INSERT ON dispatch_log BEGIN SELECT RAISE(FAIL, 'crash before insert'); END");
+    return { success: true, status: 200, runId: 88 };
+  });
+  const input = { config: { githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "callback", runnerTokenSecret: "secret" }, getMapping: () => mapping,
+    resolveProvider: vi.fn(async () => ({})), resolveRunnerImage: vi.fn(), postDispatch: vi.fn(), finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn() } as unknown as ImplementationRunProductionInput;
+  createProductionImplementationRunServices(input);
+  await expect((captured.deps as ImplementationRunDependencies).launch(recoveryRun)).rejects.toThrow("crash before insert");
+  expect(getJobByDispatchId("dispatch")).toBeNull();
+  expect(JSON.stringify(getCommentGapfillLaunch("dispatch"))).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
+  db.exec("DROP TRIGGER fail_job");
+  createProductionImplementationRunServices(input);
+  const deps = captured.deps as ImplementationRunDependencies;
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [{ id: 88, display_title: "Claude AI Implementation — ENG-1", created_at: new Date(1000).toISOString() }] }) })));
+  expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
+  const job = getJobByDispatchId("dispatch")!;
+  expect(job).toMatchObject({ issueTitle: "Original title", phase: "gap-analysis", admissionGeneration: 3, runId: 88, prUrl: "https://github.com/Org/repo/pull/42", status: "running" });
+  expect(db.prepare("SELECT trigger, tracker_kind FROM dispatch_log WHERE id = ?").get(job.id)).toEqual({ trigger: "comment", tracker_kind: "linear" });
+  expect(getCommentGapfillItem(queueItemId)?.status).toBe("dispatched");
+  // Recover the intermediate state where insert/PR link committed but run binding did not.
+  db.prepare("UPDATE dispatch_log SET run_id = NULL, status = 'dispatched' WHERE id = ?").run(job.id);
+  expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
+  await deps.finishJob!("dispatch", { kind: "run_ended" });
+  expect(input.finalizeImplementation).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.objectContaining({ id: job.id, phase: "gap-analysis" }), { ownerCall: true });
+  expect(getCommentGapfillItem(queueItemId)?.status).toBe("failed");
+  expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
+  expect(getJobByDispatchId("dispatch")?.status).toBe("failed");
+  expect(getCommentGapfillItem(queueItemId)?.status).toBe("failed");
+  expect(db.prepare("SELECT COUNT(*) AS n FROM dispatch_log WHERE dispatch_id = 'dispatch'").get()).toEqual({ n: 1 });
+  expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
 });
