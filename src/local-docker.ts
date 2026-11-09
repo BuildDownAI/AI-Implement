@@ -283,18 +283,29 @@ export async function fetchLocalContainerLogs(containerId: string, lastN = 100):
   }
 }
 
-export interface ExitedContainer {
+export interface LocalContainerSummary {
   id: string;
   name: string;
-  /** Human-readable docker status, e.g. "Exited (0) 5 minutes ago". */
+  /** Human-readable Docker status, e.g. "Up 5 minutes" or "Exited (0) 5 minutes ago". */
   status: string;
+}
+
+export type ExitedContainer = LocalContainerSummary;
+
+/** Lists ai-implement-* containers in every state with full IDs. */
+export async function listAiImplementContainers(): Promise<LocalContainerSummary[]> {
+  return listContainers(false);
 }
 
 /** Lists exited ai-implement-* containers with full (untruncated) IDs. */
 export async function listExitedAiImplementContainers(): Promise<ExitedContainer[]> {
+  return listContainers(true);
+}
+
+async function listContainers(exitedOnly: boolean): Promise<LocalContainerSummary[]> {
   const { stdout } = await execFile("docker", [
     "ps", "-a", "--no-trunc",
-    "--filter", "status=exited",
+    ...(exitedOnly ? ["--filter", "status=exited"] : []),
     "--filter", "name=ai-implement-",
     "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}",
   ]);

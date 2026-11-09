@@ -12,7 +12,7 @@ vi.mock("../local-job-logs.js", () => ({
   archiveLocalContainerLogsBestEffort: archiveLocalContainerLogsBestEffortMock,
 }));
 
-import { findLocalContainerIdByName, removeLocalContainer, startLocalRunnerContainer, stopLocalContainer } from "../local-docker.js";
+import { listAiImplementContainers, listExitedAiImplementContainers, findLocalContainerIdByName, removeLocalContainer, startLocalRunnerContainer, stopLocalContainer } from "../local-docker.js";
 
 describe("removeLocalContainer", () => {
   beforeEach(() => {
@@ -103,4 +103,28 @@ it("an empty Docker launch response remains ambiguous and keeps its deterministi
     return {} as ReturnType<typeof rawExecFile>;
   });
   await expect(startLocalRunnerContainer({ image: "runner", containerName: "implementation-dispatch", issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "test", issueDescription: "test", owner: "Org", repo: "repo", defaultBranch: "main", githubToken: "test-token", sessionToken: "test-session", machineNonce: "test-nonce", anthropicApiKey: "test-api" })).rejects.toThrow("empty container identity");
+});
+
+describe("local container census", () => {
+  it.each([false, true])("lists containers with exitedOnly=%s", async (exitedOnly) => {
+    vi.clearAllMocks();
+    const id = "a".repeat(64);
+    const status = exitedOnly ? "Exited (0) 5 minutes ago" : "Up 5 minutes";
+    vi.mocked(rawExecFile).mockImplementationOnce(
+      (_cmd: unknown, _args: unknown, cb: unknown) => {
+        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
+          stdout: `${id}\tai-implement-runner\t${status}\n`, stderr: "",
+        });
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+    const list = exitedOnly ? listExitedAiImplementContainers : listAiImplementContainers;
+    expect(await list()).toEqual([{ id, name: "ai-implement-runner", status }]);
+    expect(rawExecFile).toHaveBeenCalledWith("docker", [
+      "ps", "-a", "--no-trunc",
+      ...(exitedOnly ? ["--filter", "status=exited"] : []),
+      "--filter", "name=ai-implement-",
+      "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}",
+    ], expect.any(Function));
+  });
 });
