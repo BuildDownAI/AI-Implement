@@ -1,3 +1,5 @@
+import { getCommentGapfillLaunch } from "../comment-gapfill-queue.js";
+import { createImplementationGapfillDependencies } from "./implementation-run-gapfill.js";
 import { createHash } from "node:crypto";
 import { implementationIntentStore } from "./implementation-launch-intent.js";
 import { modelPricesResponseSchema } from "./model-prices.js";
@@ -535,7 +537,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     if (run.backend === "fly-machines") status = await classifyFlyMachine(backendConfig(run), jobId);
     else if (run.backend === "local-docker") status = await classifyLocalContainer(jobId);
     else {
-      const mapping = frozenMapping(run);
+      const mapping = (run.gapFill && getCommentGapfillLaunch(run.dispatchId)?.target) || frozenMapping(run);
       const read = await getWorkflowRunStatus(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
       if (read) recordGhaRunCompleted(Number(jobId), read);
       status = read?.status === "completed" ? "ended" : read?.status === "in_progress" ? "started" : "unknown";
@@ -550,7 +552,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
 
   async function stop(run: ImplementationRunInput, jobId: string): Promise<boolean> {
     if (containerBackend(run)) return stopBackendRun(backendConfig(run), run.backend, jobId);
-    const mapping = frozenMapping(run);
+    const mapping = (run.gapFill && getCommentGapfillLaunch(run.dispatchId)?.target) || frozenMapping(run);
     return cancelWorkflowRun(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
   }
 
@@ -638,9 +640,11 @@ export function createProductionImplementationRunServices(input: ImplementationR
     return held;
   }
 
+  const gapfill = createImplementationGapfillDependencies(input, getMapping);
   const deps: ImplementationRunDependencies = {
-    reserve,
+    reserve: (run) => run.gapFill ? gapfill.reserve(run) : reserve(run),
     findExistingRun: async (run, dispatchedAt) => {
+      if (run.gapFill) return gapfill.findExistingRun(run, dispatchedAt);
       const stored = implementationIntentStore().read<Intent>(run.dispatchId);
       const preparation = stored ? null : implementationIntentStore().readPreparation(run.dispatchId);
       if (preparation) {
@@ -688,7 +692,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       if (!parsed.success || (body.fetchedAt !== null && typeof body.fetchedAt !== "number")) return undefined;
       return { prices: parsed.data.prices, fetchedAt: body.fetchedAt };
     },
-    launch,
+    launch: (run, prices) => run.gapFill ? gapfill.launch(run, prices) : launch(run, prices),
     readStatus,
     stop,
     finishJob,
