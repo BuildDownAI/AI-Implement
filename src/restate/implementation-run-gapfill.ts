@@ -5,7 +5,7 @@ import type { ImplementationRunDependencies, ImplementationRunInput } from "./im
 import type { RepoMapping } from "../config.js";
 import { acquire, read } from "../dispatch-admission.js";
 import { isParked } from "../dispatch-breaker.js";
-import { getCommentGapfillLaunch, stageCommentGapfillLaunch, rejectCommentGapfillLaunch, CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
+import { CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
 import { buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, suppressStaleNotifications } from "../log.js";
@@ -32,13 +32,29 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     return mapping;
   };
   const token = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-  // Repair only a durably staged launch (or its existing row), never invent attribution
-  // from a title match. Conditional run binding preserves callback/finisher terminal state.
-  const recordLaunch = (run: ImplementationRunInput, runId?: number, existingRow = getJobByDispatchId(run.dispatchId)) => {
+  const launchRecord = async (run: ImplementationRunInput, contract?: "legacy" | "envelope", launchIssue?: { issueId: string; issueIdentifier: string; issueTitle?: string }) => {
+    const gap = run.gapFill!;
+    const mapping = mappingFor(run);
+    let prior = launchIssue ? null : getLatestDispatchForPr(mapping.owner, mapping.repo, gap.prNumber);
+    if (!launchIssue && (prior?.issueId !== run.issueId || prior.issueTitle == null)) {
+      prior = getLatestDispatchForIssueIdentifier(mapping.owner, mapping.repo, run.issueIdentifier);
+    }
+    const issue = launchIssue ?? { issueId: run.issueId, issueIdentifier: run.issueIdentifier,
+      ...(prior?.issueId === run.issueId && prior.issueTitle != null ? { issueTitle: prior.issueTitle } : {}) };
+    const accounting = await gapfillAccounting({ trackerAccounting: async (m, ref) => {
+      return trackerAccounting(m, await input.resolveProvider(m), ref);
+    } }, mapping, issue);
+    const admission = read(run.dispatchId);
+    if (!admission || admission.releasedAt !== null) throw new Error("no active gap-fill reservation");
+    return { ...issue, teamKey: run.teamKey, repo: gap.repository, dispatchId: run.dispatchId,
+      admissionGeneration: admission.generation, executionMode: "github-actions" as const,
+      runnerMode: "default" as const, contract, phase: "gap-analysis" as const, trigger: "comment" as const, ...accounting };
+  };
+  // Only an actual dispatch result or a reconciled run justifies writing a job.
+  // Recovery cannot know the historical contract when the insert never committed.
+  const recordLaunch = async (run: ImplementationRunInput, runId?: number, existingRow = getJobByDispatchId(run.dispatchId), record?: Parameters<typeof appendLogIfAbsent>[0]) => {
     const row = existingRow;
-    const record = getCommentGapfillLaunch(run.dispatchId);
-    if (!row && !record) throw new Error("gap-fill adoption has no durable launch metadata");
-    const jobId = row?.id ?? appendLogIfAbsent(record!);
+    const jobId = row?.id ?? appendLogIfAbsent(record ?? await launchRecord(run));
     updateJobPrUrl(jobId, `https://github.com/${run.gapFill!.repository}/pull/${run.gapFill!.prNumber}`);
     if (runId !== undefined) attachJobRunIdIfMissing(jobId, runId);
     suppressStaleNotifications(run.issueId, jobId);
@@ -64,7 +80,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
     },
     findExistingRun: async (run, dispatchedAt) => {
       const row = getJobByDispatchId(run.dispatchId);
-      if (row?.runId) { recordLaunch(run, undefined, row); return String(row.runId); }
+      if (row?.runId) { await recordLaunch(run, undefined, row); return String(row.runId); }
       const mapping = mappingFor(run);
       const res = await fetch(`https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.workflowFile}/runs?event=workflow_dispatch&per_page=20`, {
         headers: { Authorization: `Bearer ${await token(mapping.owner)}`, Accept: "application/vnd.github+json" }, signal: defaultFetchSignal(),
@@ -76,15 +92,11 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       const matches = data.workflow_runs.filter(r => r.display_title === `${IMPLEMENTATION_RUN_TITLE_PREFIX}${run.issueIdentifier}` && r.created_at !== undefined && Date.parse(r.created_at) >= floor && !claimed.has(r.id));
       if (matches.length > 1) throw new Error("findExistingRun: multiple unclaimed gap-fill runs match");
       if (!matches.length) return null;
-      recordLaunch(run, matches[0].id);
+      await recordLaunch(run, matches[0].id);
       return String(matches[0].id);
     },
     launch: async (run) => {
       const gap = run.gapFill!;
-      if (getCommentGapfillLaunch(run.dispatchId)) {
-        recordLaunch(run);
-        return { outcome: "unknown" };
-      }
       const runtime = getModelAuthRuntime(config);
       let decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }> = { kind: "legacy" };
       let prepared: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;
@@ -130,19 +142,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         console.error(`[implementation-run] gap-fill preparation failed dispatch=${run.dispatchId}:`, err);
         return { outcome: "rejected" };
       }
-      let accounting: Awaited<ReturnType<typeof gapfillAccounting>>;
+      let record: Awaited<ReturnType<typeof launchRecord>>;
       try {
-        accounting = await gapfillAccounting({ trackerAccounting: async (m, ref) => {
-          const provider = await input.resolveProvider(m);
-          return trackerAccounting(m, provider, ref);
-        } }, mapping, issue);
-        const admission = read(run.dispatchId)!;
-        stageCommentGapfillLaunch({ ...issue, teamKey: run.teamKey, repo: gap.repository, dispatchId: run.dispatchId, admissionGeneration: admission.generation,
-          executionMode: "github-actions", runnerMode: "default", contract: prepared.contract, phase: "gap-analysis", trigger: "comment", ...accounting });
+        record = await launchRecord(run, prepared.contract, issue);
       } catch (err) {
         settleLaunch(decision, "rejected", runtime);
         markCommentGapfillProcessed(gap.queueItemId, "failed");
-        console.error(`[implementation-run] gap-fill staging failed dispatch=${run.dispatchId}:`, err);
+        console.error(`[implementation-run] gap-fill accounting failed dispatch=${run.dispatchId}:`, err);
         return { outcome: "rejected" };
       }
       let result: Awaited<ReturnType<typeof dispatchGhaGapfill>>;
@@ -154,16 +160,15 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       const outcome = result.success ? "accepted" : result.outcome === "rejected" ? "rejected" : "unknown";
       if (outcome !== "accepted") settleLaunch(decision, outcome, runtime);
       if (outcome === "rejected") {
-        rejectCommentGapfillLaunch(run.dispatchId);
         markCommentGapfillProcessed(gap.queueItemId, "failed");
         try {
-          await surfaceDispatchFailure(result, config.notifyType, config.notifyWebhookUrl, { site: "comment-gapfill", ...issue, teamKey: run.teamKey, repo: gap.repository, workflowFile: mapping.workflowFile, contract: prepared.contract, phase: "gap-analysis", ...accounting });
+          await surfaceDispatchFailure(result, config.notifyType, config.notifyWebhookUrl, { ...record, site: "comment-gapfill", workflowFile: mapping.workflowFile, contract: prepared.contract });
         } catch (err) {
           console.error(`[implementation-run] failed to report rejected gap-fill dispatch=${run.dispatchId}:`, err);
         }
         return { outcome };
       }
-      recordLaunch(run, result.runId);
+      await recordLaunch(run, result.runId, undefined, record);
       return { outcome, ...(result.runId !== undefined ? { jobId: String(result.runId) } : {}) };
     },
   };

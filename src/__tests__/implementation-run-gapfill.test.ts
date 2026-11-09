@@ -2,12 +2,12 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { makeMapping, makeJob } from "./helpers/builders.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../restate/implementation-run-production.js";
-const captured = vi.hoisted(() => ({ records: new Map<string, unknown>(), deps: undefined as unknown }));
+const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...await original<object>(), createImplementationRunWorkflow: (d: unknown) => { captured.deps = d; return {}; } }));
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => captured.records.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((record: { dispatchId: string }) => captured.records.set(record.dispatchId, record)), rejectCommentGapfillLaunch: vi.fn((id: string) => captured.records.delete(id)), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
 vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), suppressStaleNotifications: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn() }));
@@ -43,7 +43,6 @@ let d: ImplementationRunDependencies;
 let input: ImplementationRunProductionInput;
 beforeEach(() => {
   vi.clearAllMocks();
-  captured.records.clear();
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [] }) })));
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.mocked(isParked).mockReturnValue(false);
@@ -102,7 +101,6 @@ it("definite rejection surfaces failure and fails queue", async () => {
   expect(surfaceDispatchFailure).toHaveBeenCalled();
   expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "failed");
   expect(appendLogIfAbsent).not.toHaveBeenCalled();
-  expect(captured.records.size).toBe(0);
 });
 it("ambiguous dispatch retains dispatched queue and records row", async () => {
   vi.mocked(dispatchGhaGapfill).mockResolvedValueOnce({ success: false, status: 503, outcome: "unknown" });
@@ -118,7 +116,7 @@ it("recorded run id wins", async () => {
 function runs(ids: number[]) {
   vi.mocked(fetch).mockResolvedValueOnce({ ok: true, json: async () => ({ workflow_runs: ids.map(id => ({ id, display_title: "Claude AI Implementation — ENG-1", created_at: new Date(1000).toISOString() })) }) } as Response);
 }
-it("one unclaimed title match after floored time wins", async () => { captured.records.set("dispatch", { dispatchId: "dispatch" }); runs([99, 88]); expect(await d.findExistingRun(run, 1999)).toBe("88"); });
+it("one unclaimed title match after floored time wins", async () => { runs([99, 88]); expect(await d.findExistingRun(run, 1999)).toBe("88"); });
 it("no matching run returns null", async () => { runs([]); expect(await d.findExistingRun(run, 1000)).toBeNull(); });
 it("multiple unclaimed matches throw", async () => { runs([88, 87]); await expect(d.findExistingRun(run, 1000)).rejects.toThrow("multiple"); });
 it("absent gapFill preserves existing reserve calls", async () => {
@@ -293,7 +291,7 @@ it.each(["missing title", "different issue"])("recovers the input issue's title 
 });
 
 it("recovers accepted dispatch after insert failure using reconstructed production deps", async () => {
-  vi.mocked(getLatestDispatchForPr).mockReturnValueOnce(makeJob({ issueId: run.issueId, issueTitle: "Original title" }));
+  vi.mocked(getLatestDispatchForPr).mockReturnValue(makeJob({ issueId: run.issueId, issueTitle: "Original title" }));
   vi.mocked(appendLogIfAbsent).mockImplementationOnce(() => { throw new Error("process lost before insert"); });
   await expect(d.launch(run)).rejects.toThrow("process lost");
   createProductionImplementationRunServices(input);
@@ -307,21 +305,26 @@ it("recovers accepted dispatch after insert failure using reconstructed producti
   expect(appendLogIfAbsent).toHaveBeenCalledTimes(2);
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
   expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
-  expect(JSON.stringify([...captured.records.values()])).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
 });
-it("does not invent bookkeeping for an unstaged title match", async () => {
+it("reconstructs bookkeeping for a reconciled run without staging", async () => {
   runs([88]);
-  await expect(d.findExistingRun(run, 1000)).rejects.toThrow("no durable launch metadata");
-  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+  expect(await d.findExistingRun(run, 1000)).toBe("88");
+  expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "dispatch", contract: undefined }));
 });
 
-it("a staged uncertain launch never prepares or dispatches again", async () => {
-  vi.mocked(dispatchGhaGapfill).mockResolvedValueOnce({ success: false, status: 503, outcome: "unknown" });
-  await d.launch(run);
+it("a crash before dispatch leaves no durable intent and retry dispatches", async () => {
+  vi.mocked(read).mockReturnValueOnce({ generation: 3, releasedAt: null } as never).mockImplementationOnce(() => { throw new Error("process interrupted before dispatch"); });
+  expect(await d.launch(run)).toEqual({ outcome: "rejected" });
+  expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
   createProductionImplementationRunServices(input);
-  const retry = captured.deps as ImplementationRunDependencies;
-  expect(await retry.launch(run)).toEqual({ outcome: "unknown" });
-  expect(prepareGhaGapfillLaunch).toHaveBeenCalledTimes(1);
+  d = captured.deps as ImplementationRunDependencies;
+  expect(await d.findExistingRun(run, 1000)).toBeNull();
+  vi.mocked(dispatchGhaGapfill).mockImplementationOnce(async () => {
+    expect(appendLogIfAbsent).not.toHaveBeenCalled();
+    return { success: true, status: 200, runId: 88 };
+  });
+  expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
 });
 it.each(["http", "unreadable"])("lookup remains fail-closed on %s failure", async kind => {
@@ -340,7 +343,7 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
     log: () => import("../log.js"), dedup: () => import("../dedup.js"),
   } });
   const { createProductionImplementationRunServices } = production;
-  const { enqueueCommentGapfill, getCommentGapfillLaunch, getCommentGapfillItem } = queue;
+  const { enqueueCommentGapfill, getCommentGapfillItem } = queue;
   const { appendLog, getJobByDispatchId } = log;
   const { getDb } = dedup;
   const db = getDb();
@@ -359,7 +362,7 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   createProductionImplementationRunServices(input);
   await expect((captured.deps as ImplementationRunDependencies).launch(recoveryRun)).rejects.toThrow("crash before insert");
   expect(getJobByDispatchId("dispatch")).toBeNull();
-  expect(JSON.stringify(getCommentGapfillLaunch("dispatch"))).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
+  expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'comment_gapfill_launch'").get()).toBeUndefined();
   db.exec("DROP TRIGGER fail_job");
   createProductionImplementationRunServices(input);
   const deps = captured.deps as ImplementationRunDependencies;

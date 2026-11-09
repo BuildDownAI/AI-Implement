@@ -222,21 +222,3 @@ export function requeueGapfillAfterPushFailure(repoFull: string, prNumber: numbe
   const after = db.prepare("SELECT COUNT(*) AS n FROM comment_gapfill_queue").get() as { n: number };
   return after.n > before.n;
 }
-
-/** Non-secret launch intent, durable before the external dispatch effect. Not an in-flight job. */
-export type GapfillLaunchRecord = Parameters<typeof import("./log.js").appendLogIfAbsent>[0];
-function launchStore() {
-  const db = getDb();
-  db.exec("CREATE TABLE IF NOT EXISTS comment_gapfill_launch (dispatch_id TEXT PRIMARY KEY, record TEXT NOT NULL)");
-  return db;
-}
-export function stageCommentGapfillLaunch(record: GapfillLaunchRecord): void {
-  launchStore().prepare("INSERT OR IGNORE INTO comment_gapfill_launch VALUES (?, ?)").run(record.dispatchId, JSON.stringify(record));
-}
-export function getCommentGapfillLaunch(dispatchId: string): GapfillLaunchRecord | null {
-  const row = launchStore().prepare("SELECT record FROM comment_gapfill_launch WHERE dispatch_id = ?").get(dispatchId) as { record: string } | undefined;
-  return row ? JSON.parse(row.record) as GapfillLaunchRecord : null;
-}
-export function rejectCommentGapfillLaunch(dispatchId: string): void {
-  launchStore().prepare("DELETE FROM comment_gapfill_launch WHERE dispatch_id = ?").run(dispatchId);
-}
