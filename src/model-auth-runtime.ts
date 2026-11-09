@@ -55,20 +55,9 @@ export function createModelAuthRuntime(input: {
     db: () => getDb(),
   });
 
-  const baseOwnership = createModelSessionOwnership({ store: sessionStore, probe: () => "unknown" });
-  const ownership: ModelSessionOwnership = {
-    ...baseOwnership,
-    reserve(request) {
-      const profiles = request?.profiles;
-      // Decision 1: no claude-subscription account is reserved in this slice, even if a pre-check misses one.
-      if (Array.isArray(profiles) && profiles.some((p) => p?.authMode === "subscription")) {
-        return { status: "rejected", reason: "invalid_input" };
-      }
-      return baseOwnership.reserve(request);
-    },
-  };
+  const ownership = createModelSessionOwnership({ store: sessionStore, probe: () => "unknown" });
 
-  // API-key and Bedrock secrets come only from encrypted storage keyed off RUNNER_TOKEN_SECRET.
+  // API-key, Claude setup-token and Bedrock secrets come only from encrypted storage keyed off RUNNER_TOKEN_SECRET.
   const credentials: ModelCredentialDeps = {
     sessionStore,
     resolveProtectedSecret: createModelProtectedSecrets({ env: input.env }).resolve,
@@ -130,7 +119,6 @@ export function createAgentConfigAdminDeps(config: RuntimeConfig): AgentConfigAd
   const runtime = getModelAuthRuntime(config);
   return {
     credentials: runtime.credentials,
-    sessionSnapshot: (profileId) => runtime.ownership.snapshot(profileId),
     inspectReadiness(request, candidate) {
       const [owner, repo] = request.workflowRepository.split("/");
       return inspectAgentReadiness(

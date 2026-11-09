@@ -28,6 +28,35 @@ export function isAdminPathConfigured({ env, effectiveAllowlist, allowlistReadAv
 
 export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
   {
+    id: "model.credentials-adopted",
+    title: "Model credential adoption",
+    group: "orchestrator",
+    tier: "core",
+    onAdminPath: false,
+    run: ({ env, orchestratorDefaults, projectStageConfig, mappings }) => {
+      const hasEnv = Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN);
+      const configured = orchestratorDefaults()?.config.mode === "configured";
+      if (hasEnv && !configured) return [{
+        state: "warn",
+        detail: "An environment model credential exists without configured defaults",
+        fix: "Run node dist/model-account-cli.js adopt-env.",
+      }];
+      const keys = Object.keys(mappings());
+      if (!configured) return keys.length === 0
+        ? [{ state: "pass", detail: "No environment model credential or project mappings" }]
+        : [{ state: "fail", detail: "no model access configured", fix: "Configure model access and orchestrator defaults before adopting projects." }];
+      const pending = keys.filter((key) => projectStageConfig(key)?.config.mode !== "configured");
+      if (pending.length > 0) return [{
+        state: "warn",
+        detail: `Projects without configured model access: ${pending.join(", ")}`,
+        fix: "Run node dist/model-account-cli.js adopt-projects. Existing legacy rows are explicit opt-outs and are skipped; configure those projects explicitly.",
+      }];
+      return [{ state: "pass", detail: hasEnv
+        ? "Defaults and all mapped projects are configured; environment credential is unused"
+        : "Defaults and all mapped projects are configured" }];
+    },
+  },
+  {
     id: "env.github-app",
     title: "GitHub App credentials",
     group: "orchestrator",

@@ -52,7 +52,7 @@ export const modelsAndProvidersHtml = `
         <div style="overflow-x:auto">
         <table class="tbl">
           <thead>
-            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Profile</th><th>Readiness</th><th>Busy / recovery</th><th>API key</th></tr>
+            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Profile</th><th>Readiness</th><th>API key</th></tr>
           </thead>
           <tbody id="mp-account-rows"></tbody>
         </table>
@@ -72,7 +72,7 @@ export const modelsAndProvidersHtml = `
           </div>
         </div>
         <div class="text-tertiary" style="font-size:11.5px;padding:12px">
-          <div><strong>Provisioning.</strong> Add a profile above and set an API key per profile; a key is encrypted on save and never shown again. Connect a ChatGPT plan from a laptop with a pairing code; other subscription sign-ins and Bedrock credentials are provisioned on the host.</div>
+          <div><strong>Provisioning.</strong> Add a profile above and set an API key or Claude subscription setup-token per profile; a key is encrypted on save and never shown again. Connect a ChatGPT plan from a laptop with a pairing code; Bedrock credentials are provisioned on the host.</div>
           <div>ChatGPT plan, <em>sign-in required</em> or <em>missing</em>: run <span class="mono">node dist/chatgpt-plan-login.js login</span>, or import an existing sign-in with <span class="mono">chatgpt-import</span>.</div>
         </div>
       </div>
@@ -279,27 +279,17 @@ export const modelsAndProvidersScript = `(function () {
     let html = '';
     for (const a of mpAccounts) {
       const account = a.account || {};
-      let readyCell;
-      let recoveryCell = '<span class="text-tertiary">—</span>';
-      if (a.authMode === 'claude-subscription') {
-        readyCell = '<span class="text-tertiary">—</span>';
-        const rec = account.sessionRecovery;
-        recoveryCell = rec
-          ? window.esc(rec.state) + (rec.recoveryRequired ? ' <span class="badge fail">recovery required</span>' : '')
-          : '<span class="text-tertiary">idle</span>';
-      } else {
-        const label = mpReadinessLabel(account.readiness);
-        readyCell = '<span class="badge ' + mpReadinessKind(label) + '">' + window.esc(label) + '</span>';
-        if (a.authMode === 'codex-subscription' && (label === 'sign-in required' || label === 'missing')) {
-          readyCell += '<div class="text-tertiary" style="font-size:11px">Run <span class="mono">node dist/chatgpt-plan-login.js login</span> or <span class="mono">chatgpt-import</span> on the host.</div>';
-        }
+      const label = mpReadinessLabel(account.readiness);
+      let readyCell = '<span class="badge ' + mpReadinessKind(label) + '">' + window.esc(label) + '</span>';
+      if (a.authMode === 'codex-subscription' && (label === 'sign-in required' || label === 'missing')) {
+        readyCell += '<div class="text-tertiary" style="font-size:11px">Run <span class="mono">node dist/chatgpt-plan-login.js login</span> or <span class="mono">chatgpt-import</span> on the host.</div>';
       }
       let keyCell = '<span class="text-tertiary">—</span>';
-      if (a.authMode === 'openai-api-key' || a.authMode === 'anthropic-api-key') {
+      if (a.authMode === 'openai-api-key' || a.authMode === 'anthropic-api-key' || a.authMode === 'claude-subscription') {
         const pid = window.escAttr(a.profileId);
         keyCell = '<span class="badge ' + (a.credentialSet ? 'success' : 'neutral') + '">' + (a.credentialSet ? 'set' : 'not set') + '</span>' +
           (mpCanEdit()
-            ? '<div style="display:flex;gap:4px;margin-top:4px"><input class="input" type="password" autocomplete="off" data-key-for="' + pid + '" placeholder="API key">' +
+            ? '<div style="display:flex;gap:4px;margin-top:4px"><input class="input" type="password" autocomplete="off" data-key-for="' + pid + '" placeholder="' + (a.authMode === 'claude-subscription' ? 'setup-token' : 'API key') + '">' +
               '<button class="btn btn-sm" data-act="set-key" data-profile="' + pid + '">Set key</button>' +
               '<button class="btn btn-sm" data-act="remove-key" data-profile="' + pid + '">Remove key</button></div>'
             : '');
@@ -315,7 +305,6 @@ export const modelsAndProvidersScript = `(function () {
         '<td>' + window.esc(mpAuthLabel(a.authMode)) + '</td>' +
         '<td><span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span></td>' +
         '<td>' + readyCell + '</td>' +
-        '<td>' + recoveryCell + '</td>' +
         '<td>' + keyCell + '</td>' +
         '</tr>';
     }

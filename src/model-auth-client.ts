@@ -360,6 +360,10 @@ export function buildModelInvocationEnv(input: {
       if (secret.sessionToken !== undefined) env.AWS_SESSION_TOKEN = secret.sessionToken;
       break;
     case "claude-subscription":
+      if (secret.kind === "claude-oauth-token") {
+        env.CLAUDE_CODE_OAUTH_TOKEN = secret.token;
+        break;
+      }
       if (secret.kind !== "session" || !input.authDir) fail("credential_source_mismatch");
       env.CLAUDE_CONFIG_DIR = input.authDir;
       break;
@@ -859,7 +863,10 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
       // One profile may serve several stages and checkout carries no stage: label only when unambiguous.
       const stage = soleStage(options.source, request.profileId);
       const { secret, ownerGeneration } = await obtainSecret(request, stage);
-      if (secret.kind !== expectedSecretKind(request.authMode)) fail("credential_source_mismatch", { profileId: request.profileId });
+      if (
+        secret.kind !== expectedSecretKind(request.authMode) &&
+        !(options.source.kind === "local" && request.authMode === "claude-subscription" && secret.kind === "session")
+      ) fail("credential_source_mismatch", { profileId: request.profileId });
       // A refreshed session with nowhere to go would be silently lost.
       if (
         options.source.kind === "local" &&

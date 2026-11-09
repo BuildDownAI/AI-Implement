@@ -6528,7 +6528,6 @@ describe("model accounts and stage configuration (AII-962)", () => {
       agentConfig: {
         inspectReadiness: async () => ({ status: "ready", profiles: [] }),
         credentials: { sessionStore: { readPlanRecord } as never, resolveProtectedSecret: () => null },
-        sessionSnapshot: (id) => (id === "cl-sub" ? { profileId: id, dispatchId: "d", generation: 1, state: "recovery_required", heartbeatAt: null } : undefined),
       },
     });
     const list = async (readPlanRecord: () => unknown) => (await call("/api/model-accounts", "GET", t, undefined, mk(readPlanRecord))).json.accounts;
@@ -6538,7 +6537,8 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
     accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
     expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
-    expect(find(accts, "cl-sub").account).toEqual({ readiness: "ready", failureCode: null });
+    expect(find(accts, "cl-sub").account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
+    expect(find(accts, "cl-sub").account).not.toHaveProperty("sessionRecovery");
     expect(JSON.stringify(accts)).not.toContain("sessionRecovery");
     expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
     expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
@@ -6547,6 +6547,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(raw).not.toContain(SENTINEL);
     expect(raw).not.toContain("credentialRef");
     expect(raw).not.toContain("metadata");
+    expect(raw).not.toContain("sessionRecovery");
   });
 
   it("keeps old revisions on PATCH of a disabled profile", async () => {
@@ -6832,7 +6833,8 @@ describe("model accounts and stage configuration (AII-962)", () => {
       if (ready) {
         expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
         const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, readyDeps());
-        expect(resolved.json.stages.review.account).toEqual({ readiness: "ready", failureCode: null });
+        // Admission is mocked ready; the read still reports the profile's missing protected reference.
+        expect(resolved.json.stages.review.account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
         expect(resolved.raw).not.toContain("sessionRecovery");
       } else {
         expect(r.json.code).toBe("runner_incompatible");
@@ -7028,6 +7030,39 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(after.credentialUpdatedAt).toBeNull();
       expect(logs.filter((l) => l.includes("[admin] model-account credential"))).toHaveLength(3);
       expect(logs.join("\n")).not.toContain(KEY);
+    });
+
+    it.each([undefined, "model-account:claude-token"])("saves, replaces and removes a Claude setup-token (ref: %s)", async (credentialRef) => {
+      const token = "sk-ant-oat01-synthetic-setup-token";
+      const t = await seedProfile({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef });
+      const ref = credentialRef ?? "model-account:cl-sub";
+      const deps = readyDeps();
+      const resolveSecret = vi.fn(() => { throw new Error("status must not read a secret"); });
+      deps.agentConfig!.credentials.resolveProtectedSecret = resolveSecret;
+      const read = async () => {
+        const r = await call("/api/model-accounts", "GET", t, undefined, deps);
+        expect(r.raw).not.toContain(token);
+        expect(r.raw).not.toContain(ref);
+        expect(resolveSecret).not.toHaveBeenCalled();
+        return r.json.accounts.find((a: { profileId: string }) => a.profileId === "cl-sub");
+      };
+      expect((await read()).credentialSet).toBe(false);
+      expect((await read()).account).toEqual({ readiness: "missing", failureCode: credentialRef ? "secret_unavailable" : "reference_missing" });
+      const revs = count("model_account_profile_revisions");
+      for (const value of [token, token + "-replacement"]) {
+        const put = await call(url("cl-sub"), "PUT", t, { apiKey: value });
+        expect(put.status).toBe(200);
+        expect(put.raw).not.toContain(token);
+        expect(store().resolve(ref)).toBe(value);
+        const row = await read();
+        expect(row.credentialSet).toBe(true);
+        expect(typeof row.credentialUpdatedAt).toBe("number");
+        expect(row.account.readiness).toBe("ready");
+      }
+      expect(count("model_account_profile_revisions")).toBe(revs + (credentialRef ? 0 : 1));
+      for (let i = 0; i < 2; i++) expect((await call(url("cl-sub"), "DELETE", t)).status).toBe(200);
+      expect(store().resolve(ref)).toBeNull();
+      expect(await read()).toMatchObject({ credentialSet: false, credentialUpdatedAt: null, account: { readiness: "missing", failureCode: "secret_unavailable" } });
     });
 
     it("redacts a Claude setup-token when the protected store fails", async () => {

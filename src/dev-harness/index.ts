@@ -5,6 +5,9 @@ import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { splitLocalRunnerEnv } from "../local-docker.js";
+import {
+  MODEL_CREDENTIAL_KEYS, MODEL_SESSION_KEYS, PROTECTED_BOOTSTRAP_KEYS, PROTECTED_BOOTSTRAP_PREFIXES,
+} from "../pipeline/process-env.js";
 import type { LocalContainerState } from "../local-docker.js";
 import { encodeRunConfig } from "../run-config.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
@@ -532,7 +535,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     await sourceWorkspace?.cleanup().catch(() => undefined);
     throw error;
   }
-  if (!localConfigured.snapshot && !anthropicApiKey && !claudeOAuthToken) {
+  if (phase !== "kg-refresh" && !localConfigured.snapshot && !anthropicApiKey && !claudeOAuthToken) {
     throw new Error("Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set");
   }
 
@@ -554,6 +557,17 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     const trackerData = await resolveKgTrackerDataFile(opts, artifactsDir);
     const operatorGhToken = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? githubToken;
 
+    // Filter caller overrides before assembly so the generated KG run config survives.
+    const kgEnvOverrides = Object.fromEntries(Object.entries(opts.env ?? {}).filter(([key]) => {
+      const upper = key.toUpperCase();
+      return !(
+        (MODEL_CREDENTIAL_KEYS as readonly string[]).includes(upper) ||
+        (MODEL_SESSION_KEYS as readonly string[]).includes(upper) ||
+        (PROTECTED_BOOTSTRAP_KEYS as readonly string[]).includes(upper) ||
+        PROTECTED_BOOTSTRAP_PREFIXES.some((prefix) => upper.startsWith(prefix)) ||
+        upper === "AWS_BEDROCK_ROLE_ARN"
+      );
+    }));
     const allEnv: Record<string, string> = {
       AI_IMPLEMENT_MODE: "local",
       AI_IMPLEMENT_LOG_LEVEL: logLevel,
@@ -577,9 +591,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
       AI_IMPLEMENT_DEP_TOKEN_OVERRIDE: operatorGhToken,
       ...(process.getuid ? { AI_IMPLEMENT_HOST_UID: String(process.getuid()) } : {}),
       ...(process.getgid ? { AI_IMPLEMENT_HOST_GID: String(process.getgid()) } : {}),
-      ...(anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
-      ...(claudeOAuthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOAuthToken } : {}),
-      ...(opts.env ?? {}),
+      ...kgEnvOverrides,
     };
 
     const { publicEnv, secretEnv } = splitLocalRunnerEnv(allEnv);
