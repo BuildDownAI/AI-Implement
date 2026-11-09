@@ -296,7 +296,7 @@ describe("restate", () => {
     expect(await run("restate", { restateStatus: () => ({ sidecar: { state: sidecar }, registration: { state: registration } }) })).toMatchObject([{
       state: "fail",
       detail: `The sidecar is ${sidecar} and the endpoint registration is ${registration}`,
-      fix: "Read the [restate] lines in the orchestrator log, which name the cause.",
+      fix: "Read the [restate] lines in the orchestrator log, which name the cause. The orchestrator does not dispatch until Restate serves.",
     }]);
   });
 });
@@ -340,6 +340,37 @@ describe("runner.fly-sessions", () => {
     expect(await run("runner.fly-sessions", { mappings, runnerMode: () => ({ mode, source: "db" }), flySessions: unconfigured })).toMatchObject([
       { state: "not-applicable" },
     ]);
+  });
+
+  it.each([
+    [null, null],
+    [null, "fly-token"],
+    ["ai-sessions", null],
+    ["ai-sessions", "fly-token"],
+  ])("reports not-loaded before app=%s and token=%s checks", async (app, token) => {
+    expect(await run("runner.fly-sessions", {
+      mappings: onFly,
+      runnerBackendSource: () => "not-loaded",
+      flySessions: () => ({ app, token, region: null, source: { app: null, region: null } }),
+    })).toMatchObject([{
+      state: "fail",
+      detail: "Restate has not answered yet, so the sessions app cannot be read",
+      fix: "Wait for Restate to serve; read the [restate] lines in the orchestrator log.",
+    }]);
+  });
+
+  it.each(["restate", "not-loaded"] as const)("does not apply without Fly projects when source is %s", async (source) => {
+    expect(await run("runner.fly-sessions", {
+      mappings: onGha,
+      runnerBackendSource: () => source,
+    })).toMatchObject([{ state: "not-applicable" }]);
+  });
+
+  it("reports only the missing token when the loaded app is set", async () => {
+    expect(await run("runner.fly-sessions", {
+      mappings: onFly,
+      flySessions: () => ({ ...configured(), token: null }),
+    })).toMatchObject([{ state: "fail", detail: expect.stringMatching(/^FLY_SESSIONS_TOKEN not set/) }]);
   });
 
   it("passes when the token and the sessions app are set, listing the projects on Fly", async () => {

@@ -1,6 +1,6 @@
 # 031. Control review-fix attempts with Restate
 
-**Status:** Accepted — design approved on 2026-09-24; live pilot evaluation pending.
+**Status:** Accepted — design approved on 2026-09-24; amended on 2026-11-07 to require Restate.
 **Date:** 2026-09-24
 **References:** ADR 018, ADR 026, ADR 027, ADR 028; [pilot research](../research/2026-09-23-restate-review-fix-explained.md)
 
@@ -127,3 +127,22 @@ Admission stays one atomic SQLite step. Legacy and Restate owners share `dispatc
 The SQLite delivery record (`review_fix_inbox`, AII-781) and its pump (AII-802) are retired (AII-1187). Feedback, runner results and cancellations now go straight to Restate ingress, each keyed by the sender's event id: the GitHub delivery id, the attempt result key, and the cancel keys. The drain's periodic nudge uses the same client with a `<queue id>.<event id>.<30 s bucket>` key. The operating-contract rows for a duplicate event and for Restate being unavailable read accordingly.
 
 The reason for the inbox, "GitHub does not automatically redeliver a failed webhook", is answered two ways. The redelivery sweep (AII-1178) redelivers failed GitHub App webhook deliveries once Restate registers, and the one-route pattern (ADR 023 amendment, 2026-09-29) lets the route answer non-2xx without holding data only in memory. Validated review events are still committed to the SQLite event/finding queue before the forward, so no accepted data is lost. Existing `review_fix_inbox` tables are left in place for history, as this ADR requires of SQLite records; nothing creates, reads or drops them.
+
+## Amendment (2026-11-07): Restate is the only review-fix owner
+
+**Decision.** The operator requires Restate as the only review-fix owner on every backend. In [Gates, Not Inspectors](https://linear.app/eudoxus/project/gates-not-inspectors-85011c2b1f67), the per-project switch (`reviewFixLifecycle`) is being removed, and the Legacy review-fix path is being removed. Stage 2 cuts review fix over to Restate on GitHub Actions, Fly Machines and local Docker. Stage 3 deletes the Legacy drain and the switch. This supersedes the Legacy default, optional project rollout, local-execution exclusion and rollback-to-Legacy policy above; it records scheduled changes, not completed removal or a successful live pilot evaluation.
+
+**Rejection reasons re-checked (standing rule 3).**
+
+| Alternative and quoted reason | Assessment and evidence |
+| --- | --- |
+| Relaunch after an uncertain response: “The pilot first reconciles the original execution instead of knowingly admitting duplicate launches.” | **still holds** — The required-owner decision does not establish whether an uncertain external launch executed, so reconciliation remains necessary. |
+| Release capacity before termination: “GitHub can still be running the cancelled execution.” | **still holds** — Stage 2 changes ownership on all backends but does not make a cancellation request proof of external termination. |
+| One global lifecycle switch: “A project setting permits an isolated rollout while other projects continue on Legacy.” | **no longer holds** — The operator requires Restate for every project and backend, so neither a project switch nor a global owner switch is part of the end state. |
+| Keep multiple endpoint versions (deferred): “It adds infrastructure to the first run-lifecycle pilot.” | **no longer holds** — ADR 018's 2026-10-01 amendment records two migrations and closes the evaluation gate, so the first-pilot scope no longer justifies deferral; this decision adds no endpoint-version infrastructure. |
+| Keep only cycle summaries and GitHub log links: “An investigation needs retained activity and explicit evidence gaps.” | **still holds** — Required Restate ownership does not replace the retained activity and explicit evidence gaps required by the evidence contract above. |
+| Begin the next migration after CI and one live success: “It omits restart recovery and the agreed operating observation period.” | **no longer holds** — ADR 018's 2026-09-28 and 2026-10-01 amendments explicitly permit further migrations on integrated evidence without that live-evaluation gate. |
+| Reject feedback whenever Restate is down: “GitHub does not automatically redeliver a failed webhook. A durable delivery record preserves accepted events across a sidecar outage.” | **no longer holds** — The 2026-10-10 amendment replaces the SQLite inbox with Restate ingress and the failed-delivery sweep, allowing non-2xx responses and redelivery under the sender's event id. |
+| Infer approval from GitHub success: “A successful execution does not establish the runner's review result.” | **still holds** — The valid-result approval contract above remains required regardless of lifecycle owner or backend. |
+
+**Rollback.** Revert this documentation amendment; the Stage 2 and Stage 3 implementation changes carry their own rollout and recovery contracts.

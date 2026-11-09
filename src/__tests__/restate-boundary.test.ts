@@ -41,7 +41,8 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // src/restate/fly-machine-profile.ts so the stamp and the reaper's reading of it share one definition (AII-1132).
   // orchestrator-settings.ts is the RunnerBackend cache's reader and boot seed: it reaches the object through the ingress client (AII-1243).
   // model-account-cli.ts is the operator command; it reaches ChatGptPlanAccount through the ingress client (AII-1204).
-  const ALLOWLIST = new Set(["src/model-account-cli.ts", "src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/oauth/routes.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/webhook.ts"]);
+  // health-body.ts reads only the local status contract to report HTTP availability (AII-1750).
+  const ALLOWLIST = new Set(["src/health-body.ts", "src/model-account-cli.ts", "src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/oauth/routes.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/webhook.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -90,6 +91,13 @@ describe("import allowlist: only the door adapters may import Restate from outsi
     expect(violations).toEqual([]);
   });
 
+  it("src/health-body.ts imports only local Restate status, never the SDK or ingress", () => {
+    const imports = extractImportSpecifiers(readFileSync("src/health-body.ts", "utf8"))
+      .filter((entry) => isRestateSpecifier(entry.source))
+      .map((entry) => entry.source);
+    expect(imports).toEqual(["./restate/status.js"]);
+  });
+
   it("src/admin.ts's Restate import(s) are type-only — it carries no runtime Restate dependency", () => {
     const content = readFileSync("src/admin.ts", "utf8");
     const restateImports = extractImportSpecifiers(content).filter((i) => isRestateSpecifier(i.source));
@@ -112,7 +120,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
   it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/model-account-cli.ts", "src/oauth/routes.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/webhook.ts"]);
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/health-body.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/model-account-cli.ts", "src/oauth/routes.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/webhook.ts"]);
   });
 });
 

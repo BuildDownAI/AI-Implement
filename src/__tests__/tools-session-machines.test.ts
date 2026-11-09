@@ -49,17 +49,17 @@ async function get(args: Record<string, unknown>) {
 
 beforeEach(async () => {
   process.env.FLY_SESSIONS_TOKEN = "tok";
-  process.env.FLY_SESSIONS_APP = "sessions";
   ({ tools, log } = (
     await testDb({ modules: { tools: () => import("../restate/tools.js"), log: () => import("../log.js") } })
   ).modules);
+  const settings = await import("../orchestrator-settings.js");
+  await settings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "sessions", region: null }) });
   log.appendLog({ issueId: "issue-1", issueIdentifier: "AII-1", phase: "implementation", status: "completed", machineId: "m1" });
 });
 
 afterEach(() => {
   vi.clearAllMocks();
   delete process.env.FLY_SESSIONS_TOKEN;
-  delete process.env.FLY_SESSIONS_APP;
 });
 
 describe("get_session_machine", () => {

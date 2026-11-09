@@ -34,6 +34,30 @@ export interface CommandResult {
   stderr: string;
 }
 
+export type HealthProbe =
+  | { kind: "serving" }
+  | { kind: "starting"; sidecar: string; registration: string }
+  | { kind: "not-answering" };
+
+/** Reads health defensively: only a 200 serves, and a structured 503 identifies Restate startup. */
+export async function probeHealth(url: string): Promise<HealthProbe> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    if (response.status === 200) return { kind: "serving" };
+    if (response.status === 503) {
+      const body = await response.json();
+      const sidecar: unknown = body?.restate?.sidecar?.state;
+      const registration: unknown = body?.restate?.registration?.state;
+      if (typeof sidecar === "string" && typeof registration === "string") {
+        return { kind: "starting", sidecar, registration };
+      }
+    }
+  } catch {
+    // Fetch, timeout and malformed-body failures all remain retryable.
+  }
+  return { kind: "not-answering" };
+}
+
 export interface ProvisionDependencies {
   /** Asks one question. A hidden prompt never echoes what is typed. */
   prompt: (label: string, hidden: boolean) => Promise<string>;
@@ -45,8 +69,8 @@ export interface ProvisionDependencies {
   /** A read-only token for one knowledge-graph repository, minted with the GitHub App. */
   kgToken: (appId: string, privateKey: string, owner: string, repo: string) => Promise<string>;
   generateSecret: () => string;
-  /** Whether the URL answers with a 2xx status. */
-  isAnswering: (url: string) => Promise<boolean>;
+  /** Whether the orchestrator serves, is starting Restate, or is not answering. */
+  probeHealth: (url: string) => Promise<HealthProbe>;
   homeDir: () => string;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -89,7 +113,7 @@ const DEFAULT_DEPENDENCIES: ProvisionDependencies = {
   kgToken: async (appId, privateKey, owner, repo) =>
     (await getScopedInstallationToken(appId, privateKey, owner, { permissions: { contents: "read" }, repositories: [repo] })).token,
   generateSecret: () => randomBytes(32).toString("hex"),
-  isAnswering: async (url) => (await fetch(url, { signal: AbortSignal.timeout(10_000) })).ok,
+  probeHealth,
   homeDir: homedir,
   now: Date.now,
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -159,7 +183,7 @@ const FLY_NAME = /^[a-zA-Z0-9][a-zA-Z0-9-]*$/;
 const DOCS_URL = "https://docs.builddown.ai/latest/setup/deploy";
 /** Adding a project, and choosing how it reaches a model, which is set per project once the orchestrator runs. */
 const PROJECT_DOCS_URL = "https://docs.builddown.ai/latest/setup/target-repo";
-const HEALTH_WAIT_MS = 15 * 60_000;
+export const HEALTH_WAIT_MS = 15 * 60_000;
 const HEALTH_RETRY_MS = 5_000;
 const HEALTH_PROGRESS_MS = 60_000;
 const CHECK_SETUP_COMMAND = "node /app/dist/check-setup.js";
@@ -201,6 +225,7 @@ function envOnlyContext(env: Record<string, string>): SetupCheckContext {
     projectStageConfig: unavailable,
     runnerMode: unavailable,
     flySessions: unavailable,
+    runnerBackendSource: unavailable,
     mappings: unavailable,
     storedAccessEntries: unavailable,
     effectiveAllowlist: () => ({ entries: allowlistFromEnv(env), source: "env" }),
@@ -1141,7 +1166,7 @@ async function deploy(deps: ProvisionDependencies, io: Io, slug: string, client:
   stillToRun.push(handRun(kg));
 }
 
-/** Polls the orchestrator for up to `HEALTH_WAIT_MS`, as the control plane's set-up does. False when it never answered. */
+/** Polls the orchestrator for up to `HEALTH_WAIT_MS`, as the control plane's set-up does. False when it does not become serving. */
 async function waitForHealth(deps: ProvisionDependencies, io: Io, client: ClientFile, stillToRun: string[]): Promise<boolean> {
   const health = `https://${client.app}.fly.dev/`;
   const minutes = HEALTH_WAIT_MS / 60_000;
@@ -1155,22 +1180,28 @@ async function waitForHealth(deps: ProvisionDependencies, io: Io, client: Client
   const start = deps.now();
   const deadline = start + HEALTH_WAIT_MS;
   let reported = start;
+  let probe: HealthProbe = { kind: "not-answering" };
   while (deps.now() < deadline) {
     try {
-      if (await deps.isAnswering(health)) {
+      probe = await deps.probeHealth(health);
+      if (probe.kind === "serving") {
         io.say("The orchestrator is answering.");
         return true;
       }
     } catch {
+      probe = { kind: "not-answering" };
       // Not answering yet. Retry until the deadline.
     }
     if (deps.now() - reported >= HEALTH_PROGRESS_MS) {
       reported = deps.now();
-      io.say(`Still waiting, ${Math.floor((reported - start) / 60_000)} of ${minutes} minutes.`);
+      const states = probe.kind === "starting" ? ` Restate is not serving (sidecar ${probe.sidecar}, registration ${probe.registration}).` : "";
+      io.say(`Still waiting, ${Math.floor((reported - start) / 60_000)} of ${minutes} minutes.${states}`);
     }
     await deps.sleep(Math.min(HEALTH_RETRY_MS, deadline - deps.now()));
   }
-  io.explain(`The orchestrator did not answer within ${minutes} minutes.`);
+  io.explain(probe.kind === "starting"
+    ? `The orchestrator answers, but Restate is not serving (sidecar ${probe.sidecar}, registration ${probe.registration}).`
+    : `The orchestrator did not answer within ${minutes} minutes.`);
   stillToRun.push(`curl --fail ${health}`);
   return false;
 }

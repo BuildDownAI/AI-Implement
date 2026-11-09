@@ -83,41 +83,21 @@ let runnerBackendOutageLogged = false;
 
 /**
  * The Fly sessions token, app, and region. The token comes from env only. App and region come from
- * the `RunnerBackend/fly-machines` cache once one read has succeeded; before that, from the env
- * var, else the settings row, else null (so a boot with Restate down still dispatches). Stays
- * synchronous: `refreshRunnerBackendCache()` fills the cache at boot and once per poll cycle.
+ * the `RunnerBackend/fly-machines` cache only, initially null. Stays synchronous:
+ * `refreshRunnerBackendCache()` fills the cache at boot and once per poll cycle.
  */
 export function getFlySessionsConfig(): FlySessionsConfig {
-  const token = process.env.FLY_SESSIONS_TOKEN || null;
-  if (flyBackendCache.loaded) {
-    return {
-      token,
-      app: flyBackendCache.app,
-      region: flyBackendCache.region,
-      source: { app: flyBackendCache.app ? "restate" : null, region: flyBackendCache.region ? "restate" : null },
-    };
-  }
-  const envApp = process.env.FLY_SESSIONS_APP || null;
-  const envRegion = process.env.FLY_SESSIONS_REGION || null;
-  const rows = envApp && envRegion ? null : getOrchestratorSettings();
-  const pick = (env: string | null, row: string | null | undefined) => {
-    if (env) return { value: env, source: "env" as const };
-    if (row) return { value: row, source: "settings" as const };
-    return { value: null, source: null };
-  };
-  const app = pick(envApp, rows?.flySessionsApp);
-  const region = pick(envRegion, rows?.flySessionsRegion);
   return {
-    token,
-    app: app.value,
-    region: region.value,
-    source: { app: app.source, region: region.source },
+    token: process.env.FLY_SESSIONS_TOKEN || null,
+    app: flyBackendCache.app,
+    region: flyBackendCache.region,
+    source: { app: flyBackendCache.app !== null ? "restate" : null, region: flyBackendCache.region !== null ? "restate" : null },
   };
 }
 
-/** Where `getFlySessionsConfig()` app and region come from right now: the Restate object, or the env-then-row fallback. */
-export function getRunnerBackendSource(): "restate" | "fallback" {
-  return flyBackendCache.loaded ? "restate" : "fallback";
+/** Whether a Restate read has completed; nothing has loaded before the first successful read. */
+export function getRunnerBackendSource(): "restate" | "not-loaded" {
+  return flyBackendCache.loaded ? "restate" : "not-loaded";
 }
 
 /** Test seam: forgets the cached read and the outage latch. */
@@ -130,6 +110,9 @@ export function resetRunnerBackendCache(): void {
 
 /** Bounds the per-poll read so a down Restate cannot eat the poll cycle's budget. */
 const RUNNER_BACKEND_READ_TIMEOUT_MS = 3_000;
+
+/** Bounds the boot caller wait without cancelling the durable seed invocation. */
+const RUNNER_BACKEND_SEED_TIMEOUT_MS = 3_000;
 
 export interface RunnerBackendCacheDeps {
   /** Reads `RunnerBackend/fly-machines`; null when the object holds nothing. Throws when Restate is unreachable. */
@@ -145,44 +128,44 @@ async function readFlyMachinesViaIngress(): Promise<{ app?: string | null; regio
 
 /**
  * Replaces the Fly app/region cache from `RunnerBackend/fly-machines`. On failure it keeps the last
- * value and logs once per outage; the latch re-arms after the next success. An empty object (the seed
- * has not landed) is "no value yet" and leaves the fallback in place. Never throws.
+ * value and logs once per outage; the latch re-arms after the next success. An empty object
+ * loads null app and region values. Never throws.
  */
 export async function refreshRunnerBackendCache(deps: RunnerBackendCacheDeps = {}): Promise<void> {
   try {
     const state = await (deps.readFlyMachines ?? readFlyMachinesViaIngress)();
     runnerBackendOutageLogged = false;
-    if (!state) return;
-    flyBackendCache.app = state.app ?? null;
-    flyBackendCache.region = state.region ?? null;
+    flyBackendCache.app = state?.app ?? null;
+    flyBackendCache.region = state?.region ?? null;
     flyBackendCache.loaded = true;
   } catch (err) {
     if (runnerBackendOutageLogged) return;
     runnerBackendOutageLogged = true;
     const serving = flyBackendCache.loaded
       ? `app=${flyBackendCache.app ?? "none"} region=${flyBackendCache.region ?? "none"}`
-      : "the env-then-settings fallback";
+      : "nothing loaded yet";
     console.warn(`[runner-backend] Restate unreachable; serving last value (${serving}): ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
 export interface RunnerBackendSeedDeps {
-  /** Sends `seed` for one backend key; resolves once the ingress accepted it. */
+  /** Calls `seed` for one backend key; resolves once the handler completes. */
   sendSeed?: (backend: "fly-machines" | "github-actions", state: Record<string, unknown>, idempotencyKey: string) => Promise<void>;
 }
 
 /**
  * Boot seed (ADR 022 seed-once): copies FLY_SESSIONS_APP / FLY_SESSIONS_REGION, else the settings rows,
  * into `RunnerBackend/fly-machines`, and `{}` into `github-actions`. `seed` writes only when the object
- * is empty, so after the first boot the env vars and rows are inert. With nothing configured the
- * fly-machines seed is skipped, leaving the object empty so a later env var still applies via the
- * fallback. A failed send logs and returns; the next boot retries.
+ * is empty, so once seeded the env vars and rows are inert. With nothing configured the
+ * fly-machines seed is skipped. A later env var applies only through the seed at a boot where
+ * the object is empty. Each call awaits handler completion with a 3-second caller timeout; a failure logs
+ * and returns so registration can continue. The durable seed is not cancelled; the next boot retries.
  */
 export async function seedRunnerBackends(deps: RunnerBackendSeedDeps = {}): Promise<void> {
   const sendSeed = deps.sendSeed ?? (async (backend, state, key) => {
     const ingress = restateClients.connect({ url: RESTATE_INGRESS_BASE_URL });
-    await ingress.objectSendClient<RunnerBackendDefinition>({ name: "RunnerBackend" }, backend)
-      .seed(state, restateClients.rpc.sendOpts({ idempotencyKey: key }));
+    await ingress.objectClient<RunnerBackendDefinition>({ name: "RunnerBackend" }, backend)
+      .seed(state, restateClients.rpc.opts({ idempotencyKey: key, timeout: RUNNER_BACKEND_SEED_TIMEOUT_MS }));
   });
   const rows = getOrchestratorSettings();
   const app = process.env.FLY_SESSIONS_APP || rows.flySessionsApp || null;
@@ -191,7 +174,7 @@ export async function seedRunnerBackends(deps: RunnerBackendSeedDeps = {}): Prom
     if (app !== null || region !== null) await sendSeed("fly-machines", { app, region }, "seed:runner-backend:fly-machines");
     await sendSeed("github-actions", {}, "seed:runner-backend:github-actions");
   } catch (err) {
-    console.error(`[runner-backend] could not seed RunnerBackend; the env vars and settings rows keep serving: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`[runner-backend] could not seed RunnerBackend; Fly dispatch skips while the object is empty; the next boot retries: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

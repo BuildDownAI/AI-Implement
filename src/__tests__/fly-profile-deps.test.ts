@@ -35,10 +35,10 @@ afterEach(() => {
 });
 
 describe("buildFlyMachineProfileDeps", () => {
-  it("uses the app from the settings row written after the deps were built", async () => {
+  it("uses the app from the cache refreshed after the deps were built", async () => {
     process.env.FLY_SESSIONS_TOKEN = "tok";
     const deps = production.buildFlyMachineProfileDeps();
-    settings.setOrchestratorSetting("flySessionsApp", "late-app");
+    await settings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ app: "late-app", region: null }) });
     await deps.fly.getMachine("m1");
     await deps.fly.clearMachineEnv("m1", { [DURABLE_UNTIL_KEY]: String(Math.floor(Date.now() / 1000) + 3600) });
     await deps.fly.destroyMachine("m1");
@@ -47,7 +47,7 @@ describe("buildFlyMachineProfileDeps", () => {
     expect(destroyMachine.mock.calls[0].slice(0, 3)).toEqual(["tok", "late-app", "m1"]);
   });
 
-  it("throws the not-configured error with neither env nor row", async () => {
+  it("throws the not-configured error before the cache is loaded", async () => {
     const deps = production.buildFlyMachineProfileDeps();
     await expect(deps.fly.getMachine("m1")).rejects.toThrow(/not configured/);
   });

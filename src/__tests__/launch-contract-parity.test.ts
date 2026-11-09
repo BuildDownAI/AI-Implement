@@ -229,6 +229,8 @@ const MODULES = {
   dedup: () => import("../dedup.js"),
   log: () => import("../log.js"),
   admission: () => import("../dispatch-admission.js"),
+  gate: () => import("../dispatch-gate.js"),
+  planningLaunch: () => import("../planning-launch.js"),
   config: () => import("../config.js"),
   settings: () => import("../orchestrator-settings.js"),
   queue: () => import("../comment-gapfill-queue.js"),
@@ -313,13 +315,37 @@ const implementation: Record<Backend, LaunchPath> = {
   "local-docker": (w) => w.index.dispatchLocalDocker(CONFIG, provider(), ISSUE, MAPPING, PRIOR, "default", BASE_BRANCH, null),
 };
 
-const planning = (execPath: Backend): LaunchPath => (w) =>
-  w.index.dispatchPlanning(CONFIG, provider(), ISSUE, MAPPING, {
+const planning = (execPath: Backend): LaunchPath => async (w) => {
+  if (execPath === "github-actions") {
+    const dispatchId = "parity-planning-1";
+    const reservation = w.gate.acquireDispatch({
+      dispatchId, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, kind: "planning",
+      teamKey: TEAM, maxInProgressAiIssues: MAPPING.maxInProgressAiIssues, backend: execPath,
+      lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+    });
+    if (!reservation.ok) throw new Error("planning reservation refused");
+    const p = provider();
+    const fireBreakerTrip = async () => {};
+    const prepared = await w.planningLaunch.preparePlanningLaunch({
+      config: CONFIG, provider: p, issue: ISSUE, mapping: MAPPING, dispatchId,
+      resolvedPlanningBranch: BASE_BRANCH,
+      resolveRunnerImage: (config, mapping, ghToken) => w.repoImage.resolveRunnerImageForDispatch({
+        owner: mapping.owner, repo: mapping.repo, token: ghToken, defaultImage: config.sessionImage, runnerImageExplicit: config.runnerImageExplicit,
+      }), fireBreakerTrip,
+    });
+    await w.planningLaunch.launchPlanningRun({
+      ...prepared, config: CONFIG, provider: p, issue: ISSUE, mapping: MAPPING, dispatchId,
+      admissionGeneration: reservation.admissionGeneration, planningFieldValue: null, fireBreakerTrip,
+    });
+    return;
+  }
+  await w.index.dispatchPlanning(CONFIG, provider(), ISSUE, MAPPING, {
     execPath,
     runnerMode: "default",
     resolvedPlanningBranch: BASE_BRANCH,
     planningFieldValue: null,
   });
+};
 
 const gapFill = (runnerMode: "gha" | "fly" | "local"): LaunchPath => async (w) => {
   w.queue.enqueueCommentGapfill({ owner: OWNER, repo: REPO, prNumber: PR_NUMBER, commentId: 9001, commenter: "sam", instruction: "please address the review" });

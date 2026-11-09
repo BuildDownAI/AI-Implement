@@ -65,7 +65,7 @@ describe("SelfDeploy durable phase machine", () => {
     f = deployFixture();
     f.deps.setHold = vi.fn(async held => { if (held) setDeployHold(); else clearDeployHold(); });
     const boot = (releaseHold: () => Promise<void>, step = vi.fn(async () => {})) => onRestateRegistered({
-      releaseHold, sweep: step, scrub: step, seed: step, refresh: step, reconcile: step,
+      releaseHold, sweep: step, scrub: step, seed: step, refresh: step,
     });
     const log = vi.spyOn(console, "log");
     const error = vi.spyOn(console, "error");
@@ -118,8 +118,8 @@ describe("SelfDeploy durable phase machine", () => {
         try {
           releaseUnownedHold.mockClear();
           await registration.attempt();
-          expect(onRegistered).toHaveBeenCalledTimes(outcome === "unreachable" ? 1 : 0);
-          expect(otherBootSteps).toHaveBeenCalledTimes(outcome === "unreachable" ? 5 : 0);
+          expect(onRegistered).not.toHaveBeenCalled();
+          expect(otherBootSteps).not.toHaveBeenCalled();
           expect(releaseUnownedHold).not.toHaveBeenCalled();
         }
         finally { registration.stopRetrying(); }

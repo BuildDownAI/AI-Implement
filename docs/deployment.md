@@ -324,12 +324,9 @@ To run a target repo against Bedrock instead of the Anthropic API, use the **Git
 
 1. **In the admin UI (`/admin`)**, edit the repo's mapping: set **Provider** to `bedrock` and **AWS Region** to the region hosting your inference profile (e.g. `us-west-2`).
 2. **In the target repo**, add a repository secret `AWS_BEDROCK_ROLE_ARN` — an IAM role trusting the GitHub OIDC provider for that repo, with `bedrock:InvokeModel` on the profiles you need.
-3. **In the target repo**, add two repository *variables* so `/ai-implement` comment-triggered runs route to the same provider:
-   - `AI_IMPLEMENT_PROVIDER` = `bedrock`
-   - `AI_IMPLEMENT_AWS_REGION` = the same region
-4. **In the target repo's `WORKFLOW.md`** (and `PLANNING.md` if planning is enabled), change `model:` to a Bedrock model ID or inference-profile ARN.
+3. **In the target repo's `WORKFLOW.md`** (and `PLANNING.md` if planning is enabled), change `model:` to a Bedrock model ID or inference-profile ARN.
 
-**Step 4 is not optional and nothing enforces it.** The workflows validate that `aws_region` and `AWS_BEDROCK_ROLE_ARN` are present, and fail clearly when they are not — but **nothing validates the model against the provider**. An Anthropic-style ID left in front matter is passed to Bedrock verbatim and fails at Claude invocation time with a provider error rather than a configuration error.
+**Step 3 is not optional and nothing enforces it.** The workflows validate that `aws_region` and `AWS_BEDROCK_ROLE_ARN` are present, and fail clearly when they are not — but **nothing validates the model against the provider**. An Anthropic-style ID left in front matter is passed to Bedrock verbatim and fails at Claude invocation time with a provider error rather than a configuration error.
 
 IAM trust policy shape, scoped to one repo:
 
@@ -362,12 +359,14 @@ To repair a degraded image, re-deploy with `--no-cache` and a working `--build-s
 
 ## The health body (`GET /`)
 
-`GET /` needs no authentication and always answers 200 while the process serves HTTP
-(`src/index.ts`). Monitors read it; it carries no secret.
+`GET /` needs no authentication and answers HTTP 200 with `status: "ok"` only when
+Restate is `ready` and `registered`; otherwise it answers HTTP 503 with
+`status: "unavailable"` (`src/index.ts`). Both responses retain every diagnostic
+body field. Monitors should read the diagnostic body even on 503; it carries no secret.
 
 | Field | Meaning |
 |---|---|
-| `status` | Always `"ok"` |
+| `status` | `"ok"` when Restate is `ready` and `registered`; otherwise `"unavailable"` |
 | `sourceCommit` | Full `AI_IMPLEMENT_SOURCE_COMMIT` build stamp, or `null` when unset |
 | `polls` | Poll cycles since boot |
 | `lastPollStartedAt`, `lastPollFinishedAt` | ISO times, or `null` before the first poll |
@@ -385,7 +384,8 @@ projects. An access code, complete SSO path with an admin address, or BuildDown
 with its redirect URL ends bootstrap mode; an unreadable allowlist also keeps it
 off. The count comes from the last known run, restored after Restate registration;
 bootstrap ids are checked locally on each request. `GET /` never calls Restate or
-any other network service, so it continues answering during their outages.
+any other network service, so it continues returning diagnostics during their
+outages, with HTTP 503 while Restate cannot serve.
 
 A healthy orchestrator shows `restate.sidecar.state: "ready"`,
 `restate.registration.state: "registered"`, and a recent `lastPollFinishedAt`.
@@ -402,9 +402,9 @@ The sidecar is probed at boot and on a failed proxied call (throttled). While it
 
 ## Restate sidecar
 
-`restate-server` runs as a second child-process sidecar of the orchestrator, spawned and stopped alongside the KG sidecar with the same non-fatal contract (ADR 023; full reference: [docs/restate.md](restate.md) § "Deployment and operations"). It adds no deployment surface of its own — no separate Fly app, no new health endpoint, no `fly.toml` change — because every listener it and its SDK endpoint expose binds to `127.0.0.1` only, and the orchestrator process is the only thing on the machine that talks to any of them.
+`restate-server` runs as a second child-process sidecar of the orchestrator, spawned and stopped alongside the KG sidecar — under the required contract, the orchestrator exits when the Restate sidecar cannot serve. S1-10 and S1-14 will implement this behavior; until then, Restate failure does not terminate the orchestrator ([ADR 023 amendment](adr/023-run-the-restate-server-as-an-orchestrator-sidecar.md#amendment-2026-11-07-restate-is-a-hard-dependency); full reference: [docs/restate.md](restate.md) § "Deployment and operations"). The machine restarts on a non-zero exit, at most 10 times in a row under the restart policy (`fly.toml` `[[restart]]`), but proxy auto-start remains enabled and can start a stopped machine on incoming traffic, so the retry cap does not guarantee it stays stopped. It adds no deployment surface of its own — no separate Fly app or new health endpoint — because every listener it and its SDK endpoint expose binds to `127.0.0.1` only, and the orchestrator process is the only thing on the machine that talks to any of them.
 
-`RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change. On macOS, a long checkout path can push the sidecar's unix-socket paths past the platform's 104-byte limit and make `restate-server` exit at boot with `RT0004 … path must be shorter than 104 bytes` — set `RESTATE_DATA_DIR` to a short path (e.g. `/tmp/restate-dev`) in that case (full detail: [docs/restate.md](restate.md) § "Deployment and operations").
+`RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change. The sidecar automatically selects TCP listeners on macOS, or on other platforms when the resolved absolute `<dataDir>/<hostname>/ingress.sock` path exceeds 100 UTF-8 bytes, so long checkout paths need no `RESTATE_DATA_DIR` workaround (full detail: [docs/restate.md](restate.md#boot-sequence) § "Boot sequence").
 
 **Required checks (operator step).** Mark `unit-tests`, `restate-tests-binary (1)`, `restate-tests-binary (2)`, `restate-tests-binary (3)`, and `orchestrator-image` as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
 
