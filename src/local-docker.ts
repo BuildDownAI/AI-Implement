@@ -366,7 +366,12 @@ export async function removeLocalContainer(containerId: string): Promise<void> {
     await execFile("docker", ["rm", "-f", containerId]);
     await stampComputeStopped(containerId, false);
   } catch (err) {
-    throw new Error(`Failed to remove local Docker runner ${containerId}: ${errorMessage(err)}`);
+    const message = errorMessage(err);
+    // Removal may have succeeded before its acknowledgement was lost. Record
+    // the same completed_at fallback as stopLocalContainer before callers accept
+    // an already-gone response as successful cleanup.
+    if (/no such container/i.test(message)) await stampComputeStopped(containerId, true);
+    throw new Error(`Failed to remove local Docker runner ${containerId}: ${message}`);
   }
 }
 
