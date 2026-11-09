@@ -139,6 +139,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         mapping = mappingFor(run);
         const item = getCommentGapfillItem(gap.queueItemId);
         if (!item) throw new Error(`gap-fill queue item ${gap.queueItemId} not found`);
+        // Only a first launch consults the current mapping. Persisted intents above
+        // remain authoritative for recovery after a project is moved or removed.
+        const repository = gap.repository.toLowerCase();
+        if (`${mapping.owner}/${mapping.repo}`.toLowerCase() !== repository ||
+            `${item.owner}/${item.repo}`.toLowerCase() !== repository || item.prNumber !== gap.prNumber) {
+          throw new Error("gap-fill launch target does not match the reserved PR");
+        }
         // The input carries identity only. Recover the same title the comment drain
         // uses, including PRs whose original dispatch has no PR URL recorded yet.
         let prLog = getLatestDispatchForPr(item.owner, item.repo, gap.prNumber);

@@ -68,6 +68,39 @@ it("reserve admits with PR budget and Restate ownership", async () => {
   expect(await d.reserve(run)).toBe(true);
   expect(acquire).toHaveBeenCalledWith(expect.objectContaining({ kind: "gap-fill", scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "Org/repo", prNumber: 42 }, lifecycleOwner: { kind: "restate", attemptId: "dispatch" }, prDispatchBudget: 5, humanRequested: true, parked: false, cap: mapping.maxInProgressAiIssues }));
 });
+it.each(["retargeted owner", "retargeted repo", "missing mapping", "queue owner", "queue repo", "queue PR", "input repository", "input PR"])("first launch rejects %s before preparation or credentials", async mismatch => {
+  expect(await d.reserve(run)).toBe(true);
+  if (mismatch.startsWith("retargeted") || mismatch === "missing mapping") {
+    input.getMapping = () => mismatch === "missing mapping" ? undefined : { ...mapping,
+      ...(mismatch === "retargeted owner" ? { owner: "Other" } : { repo: "other" }) };
+  }
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  if (mismatch.startsWith("queue")) vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item,
+    ...(mismatch === "queue owner" ? { owner: "Other" } : mismatch === "queue repo" ? { repo: "other" } : { prNumber: 43 }) });
+  const request = { ...run, gapFill: { ...run.gapFill!,
+    ...(mismatch === "input repository" ? { repository: "Other/repo" } : mismatch === "input PR" ? { prNumber: 43 } : {}) } };
+  const result = await d.launch(request);
+  expect(result).toEqual({ outcome: "rejected" });
+  expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "failed");
+  expect(resolveManagedDecision).not.toHaveBeenCalled();
+  expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
+  expect(mintLaunchTokens).not.toHaveBeenCalled();
+  expect(getInstallationToken).not.toHaveBeenCalled();
+  expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+  expect(intents.size).toBe(0);
+  expect(JSON.stringify(result)).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
+});
+it("first launch accepts GitHub repository casing differences", async () => {
+  input.getMapping = () => ({ ...mapping, owner: "ORG", repo: "REPO" });
+  createProductionImplementationRunServices(input);
+  d = captured.deps as ImplementationRunDependencies;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!, owner: "org", repo: "Repo" });
+  expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
+});
 it.each(["parked", "budget_exhausted", "occupied", "at_capacity"])("reserve refusal %s restores pending", async reason => {
   vi.mocked(acquire).mockReturnValue({ ok: false, reason } as never);
   expect(await d.reserve(run)).toBe(false);
@@ -134,7 +167,7 @@ it("no deps result exposes token, nonce or comment text", async () => {
   expect(JSON.stringify(values)).not.toMatch(/TOKEN-SENTINEL|NONCE-SENTINEL|COMMENT-SENTINEL/);
 });
 it("conflict commenter receives no review findings", async () => {
-  vi.mocked(getCommentGapfillItem).mockReturnValue({ id: 1, commenter: "conflict", instruction: "merge" } as never);
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ id: 1, owner: "Org", repo: "repo", prNumber: 42, commenter: "conflict", instruction: "merge" } as never);
   await d.launch(run);
   expect(listOpenReviewFindings).not.toHaveBeenCalled();
   expect(buildCommentGapfillInstruction).toHaveBeenCalledWith("merge", []);
@@ -147,7 +180,7 @@ it("gap-analysis rows use shared finish and finalize with ownerCall", async () =
 });
 it("managed refusal preserves failed state from the shared decision helper", async () => {
   vi.mocked(resolveManagedDecision).mockResolvedValueOnce(null);
-  vi.mocked(getCommentGapfillItem).mockReturnValue({ id: 1, status: "failed" } as never);
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ id: 1, owner: "Org", repo: "repo", prNumber: 42, status: "failed" } as never);
   expect(await d.launch(run)).toEqual({ outcome: "rejected" });
   expect(markCommentGapfillProcessed).not.toHaveBeenCalledWith(1, "pending");
   expect(dispatchGhaGapfill).not.toHaveBeenCalled();
