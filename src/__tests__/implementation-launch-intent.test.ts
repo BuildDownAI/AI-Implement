@@ -256,7 +256,9 @@ import { testDir } from "./helpers/test-dir.js";
 import { writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].map(configuration => ({ tracker, configuration }))))("recovers accepted $tracker bookkeeping with $configuration mappings and current authority", async ({ tracker, configuration }) => {
+it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].flatMap(configuration =>
+  ["adoption", "cancelled", "no-work", "legacy-reset"].map(operation => ({ tracker, configuration, operation })),
+)))("recovers accepted $tracker $operation with $configuration mappings and current authority", async ({ tracker, configuration, operation }) => {
   vi.stubEnv("RUNNER_MODE", "local");
   onTestFinished(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
   captured.liveContainer = null;
@@ -266,6 +268,7 @@ it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].map(con
     intent: () => import("../restate/implementation-launch-intent.js"),
     log: () => import("../log.js"),
     dedup: () => import("../dedup.js"),
+    finalize: () => import("../implementation-finalize.js"),
   } });
   const directory = testDir("intent-tracker");
   await writeFile(join(directory, "ENG-1.md"), "---\ntitle: Recovery\n---\nOriginal task\n");
@@ -307,7 +310,7 @@ it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].map(con
     finalizeImplementation: vi.fn(), remediateStuckJob: vi.fn(), reportTerminalJob: vi.fn(),
   };
   // Make the original provider use the actual registry for bookkeeping, while avoiding a tracker issue lookup.
-  input.resolveProvider = async (m, scope) => {
+  input.resolveProvider = vi.fn<ImplementationRunProductionInput["resolveProvider"]>(async (m, scope) => {
     if (scope) return registry.forRecovery(m, scope);
     const provider = await registry.forMapping(m);
     return new Proxy(provider, { get(target, key) {
@@ -315,7 +318,7 @@ it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].map(con
       const value = Reflect.get(target, key);
       return typeof value === "function" ? value.bind(target) : value;
     } });
-  };
+  });
   db.modules.production.createProductionImplementationRunServices(input);
   expect(await captured.deps!.reserve(run)).toBe(true);
   await expect(captured.deps!.launch(run)).rejects.toThrow();
@@ -345,4 +348,37 @@ it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].map(con
     await expect(registry.forRecovery(mapping, "ENG")).rejects.toThrow("local runner mode");
   }
   await expect(registry.forRecovery({ ...mapping, ticketingProvider: "linear" }, "ENG")).rejects.toThrow("provider mismatch");
+  if (operation === "adoption") return;
+
+  vi.stubEnv("RUNNER_MODE", "local");
+  if (operation === "legacy-reset") {
+    restarted.intent.implementationIntentStore().remove(run.dispatchId);
+    mappings = { ENG: mapping };
+    registry = new restarted.registry.ProviderRegistry(credentials, () => mappings);
+  }
+  input.finalizeImplementation = restarted.finalize.finalizeImplementation;
+  const sql = restarted.dedup.getDb();
+  if (operation === "no-work") {
+    sql.prepare("UPDATE dispatch_log SET grouping_parent = 1 WHERE id = ?").run(originalJob.id);
+  } else {
+    sql.prepare("UPDATE dispatch_log SET status = 'failed', conclusion = 'operator_cancelled' WHERE id = ?").run(originalJob.id);
+  }
+  vi.mocked(input.resolveProvider).mockClear();
+  const expected = operation === "no-work" ? {} : { release: "cancelled" };
+  for (let retry = 0; retry < 2; retry++) {
+    expect(await captured.deps!.finishJob!(run.dispatchId, { kind: "run_ended" })).toEqual(expected);
+  }
+  const resolved = vi.mocked(input.resolveProvider).mock.calls.at(-1)!;
+  expect(resolved[0]).toMatchObject({ ticketingConfig: mapping.ticketingConfig });
+  expect(resolved[1]).toBe(operation === "legacy-reset" ? undefined : run.teamKey);
+  if (tracker === "jira") {
+    const terminalWrite = requests.filter(request => request.body.includes("customfield_101")).at(-1)!;
+    expect(JSON.parse(terminalWrite.body)).toEqual({ fields: { customfield_101: { value: operation === "no-work" ? "Merged" : "Plan Approved" } } });
+    expect(terminalWrite.authorization).toBe(`Basic ${Buffer.from(credentials.jiraEmail + ":" + credentials.jiraToken).toString("base64")}`);
+  } else {
+    const state = JSON.parse(await readFile(join(directory, ".state", "ENG", "ENG-1.json"), "utf8"));
+    expect(state.status).toBe(operation === "no-work" ? "completed" : "plan-approved");
+  }
+  expect(launch).toHaveBeenCalledTimes(1);
+  expect(restarted.log.getJobByDispatchId(run.dispatchId)).toMatchObject({ id: originalJob.id, status: operation === "no-work" ? "completed" : "failed" });
 });

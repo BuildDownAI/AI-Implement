@@ -555,8 +555,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   async function providerForJob(job: Job): Promise<TicketingProvider | null> {
-    const mapping = (job.dispatchId ? implementationIntentStore().read<Intent>(job.dispatchId)?.snapshot.context.mapping : undefined) ?? (job.teamKey ? getMapping(job.teamKey) : undefined);
-    return mapping ? input.resolveProvider(mapping) : null;
+    const context = job.dispatchId ? implementationIntentStore().read<Intent>(job.dispatchId)?.snapshot.context : undefined;
+    const mapping = context?.mapping ?? (job.teamKey ? getMapping(job.teamKey) : undefined);
+    return mapping ? input.resolveProvider(mapping, context?.issue.scopeKey) : null;
   }
 
   async function finishJob(dispatchId: string, outcome: Parameters<NonNullable<ImplementationRunDependencies["finishJob"]>>[1]) {
