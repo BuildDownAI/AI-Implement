@@ -827,7 +827,6 @@ export const projectsScript = `
     var provider = agEffective(stage, 'provider').value;
     return agentState.accounts.filter(function (a) {
       return a.profileStatus === 'active'
-        && a.authMode !== 'claude-subscription'
         && a.agent === agent && a.provider === provider;
     });
   }
