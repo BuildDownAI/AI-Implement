@@ -55,6 +55,29 @@ function useStages(impl: string) {
   });
 }
 
+function withSubscriptionToken() {
+  const previous = prepDepsOverride;
+  prepDepsOverride = (deps) => {
+    const d = previous ? previous(deps) : deps;
+    return {
+      ...d,
+      credentials: {
+        ...d.credentials,
+        resolveProtectedSecret: (ref) => ref === "model-account:sub" ? "synthetic-setup-token" : null,
+      },
+    };
+  };
+}
+
+function expectSubscriptionLaunch(d: AdapterModule.ManagedDispatchDecision) {
+  const launch = launchOf(d);
+  expect(launch.snapshot.profiles.implementation.authMode).toBe("claude-subscription");
+  expect(launch.takeBootstrap()?.bearer).toBeTruthy();
+  expect(count("model_profile_reservations")).toBe(0);
+  expect(count("model_credential_grants")).toBe(1);
+  expect(calls.preparationDeps).toBe(1);
+}
+
 function req(over: Partial<AdapterModule.ManagedDispatchRequest> = {}): AdapterModule.ManagedDispatchRequest {
   return { dispatchId: "d1", projectKey: "AII", backend: "fly-machines", ...REPO, workflowFile: "claude-implement.yml", ...over };
 }
@@ -118,7 +141,7 @@ beforeEach(async () => {
   });
   store.saveAccountProfileRevision({
     profileId: "sub", identity: "Sub", revision: 1, agent: "claude", provider: "anthropic",
-    authMode: "claude-subscription",
+    authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" },
   });
   useCodex();
   store.setProjectOptIn("AII", true);
@@ -145,17 +168,24 @@ describe("prepareManagedDispatch", () => {
     expect(calls.preparationDeps).toBe(0);
   });
 
-  it("refuses a resolved claude-subscription profile with no reservation or grant", async () => {
+  it("launches a resolved claude-subscription profile with a stored setup-token", async () => {
     useStages("sub");
-    const d = await adapter.prepareManagedDispatch(req(), runtime);
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
-    expect(count("model_profile_reservations")).toBe(0);
-    expect(count("model_credential_grants")).toBe(0);
-    expect(calls.preparationDeps).toBe(0);
+    withSubscriptionToken();
+    expectSubscriptionLaunch(await adapter.prepareManagedDispatch(req(), runtime));
   });
 
-  it("refuses a stored claude-subscription snapshot even after the project opted out", async () => {
+  it("refuses a claude-subscription profile without a stored setup-token", async () => {
     useStages("sub");
+    expect(await adapter.prepareManagedDispatch(req(), runtime))
+      .toEqual({ kind: "refuse", category: "authentication-required", code: "session_unavailable" });
+    expect(count("model_profile_reservations")).toBe(0);
+    expect(count("model_credential_grants")).toBe(0);
+    expect(calls).toEqual({ preparationDeps: 1, ownershipReserve: 0 });
+  });
+
+  it("launches a stored claude-subscription snapshot even after the project opted out", async () => {
+    useStages("sub");
+    withSubscriptionToken();
     // Persist the snapshot directly, as an earlier preparation would have.
     const resolved = store.resolveProjectStageConfig("AII");
     if (resolved.resolution.mode !== "configured") throw new Error("expected configured");
@@ -168,7 +198,7 @@ describe("prepareManagedDispatch", () => {
     store.setProjectOptIn("AII", false);
     expect(adapter.isManagedProject("AII", "d1")).toBe(true);
     const d = await adapter.prepareManagedDispatch(req(), runtime);
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
+    expectSubscriptionLaunch(d);
   });
 
   it("holds with preparation_failed when preparation throws", async () => {
@@ -235,37 +265,11 @@ describe("prepareManagedDispatch", () => {
     const mocked = await import("../managed-dispatch-auth.js");
     const d = await mocked.prepareManagedDispatch(req(), runtime);
     expect(release).toHaveBeenCalledWith("d1", reservations, { ownership: runtime.ownership });
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
+    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "reserved_account_unsupported" });
     vi.doUnmock("../agent-run-preparation.js");
   });
 
-  it("revokes the grant when ready carries real reservations (real release)", async () => {
-    // Pass the adapter's subscription check on a codex config, then let the real preparation resolve a
-    // claude-subscription implementation stage so it reserves the profile and binds the owner generation.
-    const seed = ownership.reserve({ dispatchId: "seed-sub", profiles: [{ profileId: "sub", authMode: "subscription" }] });
-    if (seed.status !== "reserved") throw new Error("seed reserve failed");
-    const gen = seed.reservations[0]!.generation;
-    expect(sessions.importSession({ profileId: "sub", ownerGeneration: gen, sessionData: "synthetic-session", operator: OPERATOR }).ok).toBe(true);
-    expect(ownership.releaseLaunchRejected({ dispatchId: "seed-sub", profileId: "sub", generation: gen }).status).toBe("ok");
 
-    vi.resetModules();
-    vi.doMock("../agent-run-preparation.js", async () => {
-      const actual = await vi.importActual<typeof PrepModule>("../agent-run-preparation.js");
-      return {
-        ...actual,
-        prepareAgentRun: async (r: PrepModule.AgentRunRequest, deps: PrepModule.AgentRunPreparationDeps) => {
-          useStages("sub");
-          return actual.prepareAgentRun(r, deps);
-        },
-      };
-    });
-    const mocked = await import("../managed-dispatch-auth.js");
-    const d = await mocked.prepareManagedDispatch(req(), runtime);
-    vi.doUnmock("../agent-run-preparation.js");
-    expect(d).toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
-    expect(revokedAt()).not.toBeNull();
-    expect(JSON.stringify(d)).not.toContain("bearer");
-  });
 });
 
 const CAPABLE = "name: Implement\n# ai-implement-capability: stage-agent-config-v1\n# ai-implement-capability: stage-agent-launch-context-v1\n";
@@ -374,13 +378,12 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
     noRunner();
   });
 
-  it("still refuses claude-subscription even with a capable template", async () => {
+  it("launches claude-subscription with a stored setup-token and a capable template", async () => {
     useStages("sub");
     const spies = gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
-    expect(await adapter.prepareManagedDispatch(ghaReq(), runtime))
-      .toEqual({ kind: "refuse", category: "configuration-error", code: "claude_subscription_unsupported" });
-    expect(spies.reads).toBe(0);
-    noRunner();
+    withSubscriptionToken();
+    expectSubscriptionLaunch(await adapter.prepareManagedDispatch(ghaReq(), runtime));
+    expect(spies.reads).toBe(1);
   });
 
   it("keeps the snapshot across a config change and mints no second bootstrap", async () => {

@@ -158,33 +158,31 @@ describe("resolveModelCredential", () => {
     expect(cred.resolveModelCredential(r0, deps())).toMatchObject({ ok: false, code: "secret_invalid" });
   });
 
-  it("rebinds subscription state to the authorized generation and keeps the stored sequence", () => {
-    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: {} });
-    const r = cred.resolveModelCredential(
-      req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription", ownerGeneration: 3 }),
-      deps(),
-    );
-    expect(r).toMatchObject({ ok: true, ownerGeneration: 3, secret: { kind: "session", sessionData: SESSION_SENTINEL, stateSequence: 7 } });
-    expect(readCalls).toEqual([["sub", 3]]);
-    expect(resolverCalls).toEqual([]);
-  });
-
-  it("requires an owner generation for subscriptions before reading", () => {
-    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: {} });
-    const r = cred.resolveModelCredential(req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription" }), deps());
-    expect(r).toMatchObject({ ok: false, category: "stale_owner" });
+  it("resolves Claude setup-tokens without owner generation or session reads", () => {
+    save({ profileId: "sub", authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" } });
+    secrets.set("model-account:sub", SESSION_SENTINEL);
+    expect(cred.resolveModelCredential(req({ profileId: "sub", authMode: "claude-subscription" }), deps())).toEqual({
+      ok: true, profileId: "sub", revision: 1, authMode: "claude-subscription",
+      secret: { kind: "claude-oauth-token", token: SESSION_SENTINEL },
+    });
     expect(readCalls).toEqual([]);
+    expect(planReads).toEqual([]);
+    expect(resolverCalls).toEqual(["model-account:sub"]);
   });
 
-  it("maps session store failures to categories without leaking the reason", () => {
-    save({ profileId: "sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: {} });
-    const sub = req({ profileId: "sub", provider: "anthropic", authMode: "claude-subscription", ownerGeneration: 1 });
-    for (const [category, reason] of [["stale_owner", "stale_generation"], ["recovery_required", "no_state"], ["authentication_required", "key_unavailable"]] as const) {
-      readResult = { ok: false, category, reason };
-      const r = cred.resolveModelCredential(sub, deps());
-      expect(r).toMatchObject({ ok: false, category, code: "session_unavailable" });
-      expect(JSON.stringify(r)).not.toContain(reason);
+  it("fails redacted for missing or malformed Claude secrets", () => {
+    save({ profileId: "sub", authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" } });
+    const sub = req({ profileId: "sub", authMode: "claude-subscription" });
+    expect(cred.resolveModelCredential(sub, deps())).toEqual({
+      ok: false, category: "authentication_required", code: "secret_unavailable",
+    });
+    for (const value of [BEDROCK, "x".repeat(4097)]) {
+      secrets.set("model-account:sub", value);
+      expect(cred.resolveModelCredential(sub, deps())).toEqual({
+        ok: false, category: "authentication_required", code: "secret_invalid",
+      });
     }
+    expect(readCalls).toEqual([]);
   });
 
   it("never lets a subscription profile yield an api key, nor an api profile read sessions", () => {

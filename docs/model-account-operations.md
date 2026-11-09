@@ -1,6 +1,6 @@
 # Model account operations
 
-A ChatGPT plan profile works on public and private repositories. Claude subscription profiles are still refused for managed runs.
+A ChatGPT plan profile works on public and private repositories. Claude subscription profiles run managed stages from a stored setup-token resolved through a protected-secret reference, without reserving an account (ADR 049).
 
 Operator procedures for hosted model accounts. The command is `src/model-account-cli.ts`, run on the orchestrator
 machine as `node dist/model-account-cli.js <command> --profile <id>`.
@@ -95,12 +95,12 @@ sign in again on the laptop (step 1), then import again (step 2).
 `src/model-auth-runtime.ts` composes the dependencies a hosted (configured) run needs. Three facts matter to an operator:
 
 - **Protection key.** The Fly protection key is derived, not a new secret: HKDF-SHA256 over `RUNNER_TOKEN_SECRET`, salt `ai-implement`, info `ai-implement/model-auth-protection-key/v1`, 32 bytes (`deriveModelAuthProtectionKey`, `src/model-session-keys.ts`). The info label differs from the hosted session key's (`ai-implement/model-session-key/v1`), as ADR 009 requires, so the two keys are never equal. It travels base64url-encoded. With `RUNNER_TOKEN_SECRET` unset there is no key. Rotating the secret changes both keys.
-- **API-key and Bedrock profiles resolve from encrypted storage.** `src/model-protected-secrets.ts` stores each credential in `model_protected_secrets`, sealed with AES-256-GCM under a key derived by HKDF from `RUNNER_TOKEN_SECRET` (info `ai-implement/model-protected-secret-key/v1`, distinct from the session and protection labels) and bound to the exact `model-account:` reference as authenticated data. An active profile whose reference has a stored row prepares as `ready`. A missing key, row or reference, a malformed value, a bad tag, a changed `RUNNER_TOKEN_SECRET` or a swapped reference is unavailable: the profile prepares as `authentication-required`, with a fixed failure code and no value in errors. There is never an ambient fallback key. Rotating `RUNNER_TOKEN_SECRET` requires re-importing the credentials. Import and delete are described in [API credentials](#api-credentials).
-- **Scope of this slice.** Only `codex-subscription` and API-key profiles prepare. No `claude-subscription` account is reserved. A repo image override (`.ai-implement/image.yml`) is refused on Fly. No new environment variable is involved.
+- **API-key, Claude subscription and Bedrock profiles resolve from encrypted storage.** `src/model-protected-secrets.ts` stores each credential in `model_protected_secrets`, sealed with AES-256-GCM under a key derived by HKDF from `RUNNER_TOKEN_SECRET` (info `ai-implement/model-protected-secret-key/v1`, distinct from the session and protection labels) and bound to the exact `model-account:` reference as authenticated data. An active profile whose reference has a stored row prepares as `ready`. A missing key, row or reference, a malformed value, a bad tag, a changed `RUNNER_TOKEN_SECRET` or a swapped reference is unavailable: the profile prepares as `authentication-required`, with a fixed failure code and no value in errors. There is never an ambient fallback key. Rotating `RUNNER_TOKEN_SECRET` requires re-importing the credentials. Import and delete are described in [API credentials](#api-credentials).
+- **Scope of this slice.** Claude subscription profiles prepare from stored setup-tokens, Codex subscription profiles from plan records, and API-key and Bedrock profiles from protected secrets. No model account is reserved. A repo image override (`.ai-implement/image.yml`) is refused on Fly. No new environment variable is involved.
 
 ## API credentials
 
-Import and remove API-key and Bedrock credentials with `secret-import` and `secret-delete` (AII-1422). The value enters only through stdin, never argv. Output is the reference and a fixed result (`ref=model-account:<name> secret-import ok`); failures print fixed text and never a value. Browser entry also exists (AII-1500): on Models & providers an admin can add a profile and, for `openai-api-key` and `anthropic-api-key` profiles, set or remove a write-only key. It uses `PUT` / `DELETE /api/model-accounts/:id/credential` with body `{ "apiKey": "..." }`, writes through the same store as `secret-import`, uses the profile's `credentialRef` or else `model-account:<profileId>` (saved as a new revision), and answers `{ ref, result }` only. When the profile has no `credentialRef` and another profile already uses the fallback reference, `PUT` answers 409 and writes nothing, and `DELETE` is a no-op success. A failed revision save restores a row that existed before the request. `bedrock` is refused with 400, a profile id that does not fit the reference pattern is refused rather than transformed, and 503 means `RUNNER_TOKEN_SECRET` is unset. `GET /api/model-accounts` reports `credentialSet` and `credentialUpdatedAt`, never the reference or value.
+Import and remove API-key and Bedrock credentials with `secret-import` and `secret-delete` (AII-1422). The value enters only through stdin, never argv. Output is the reference and a fixed result (`ref=model-account:<name> secret-import ok`); failures print fixed text and never a value. Browser entry also exists (AII-1500): on Models & providers an admin can add a profile and, for `openai-api-key` and `anthropic-api-key` profiles, set or remove a write-only key, or for `claude-subscription` profiles, a write-only setup-token. It uses `PUT` / `DELETE /api/model-accounts/:id/credential` with body `{ "apiKey": "..." }`, writes through the same store as `secret-import`, uses the profile's `credentialRef` or else `model-account:<profileId>` (saved as a new revision), and answers `{ ref, result }` only. When the profile has no `credentialRef` and another profile already uses the fallback reference, `PUT` answers 409 and writes nothing, and `DELETE` is a no-op success. A failed revision save restores a row that existed before the request. `bedrock` is refused with 400, a profile id that does not fit the reference pattern is refused rather than transformed, and 503 means `RUNNER_TOKEN_SECRET` is unset. `GET /api/model-accounts` reports `credentialSet` and `credentialUpdatedAt`, never the reference or value.
 
 - **Import.** Over Fly SSH, pipe the value in. An API key is the whole of stdin; one trailing newline is dropped and nothing else is trimmed:
 
@@ -143,4 +143,55 @@ These lines appear only for hosted credentials, so an empty search does not mean
 
 ## Claude subscription accounts
 
-To be filled by [AII-963](https://linear.app/eudoxus/issue/AII-963/provision-accounts-and-recover-held-subscription-sessions).
+[ADR 049](adr/049-claude-subscription-profiles-hold-a-setup-token.md) records the 2026-11-07 operator decision: a managed `claude-subscription` profile holds the long-lived value produced by `claude setup-token`. The orchestrator resolves the stored setup-token through the profile's protected-secret reference. Two runs can share the same profile; neither takes a reservation or reads historical session-store rows.
+
+Import the token on the orchestrator with `node dist/model-account-cli.js secret-import --ref model-account:<name>`. Supply the token value on stdin, never in argv. Use the profile's configured `credentialRef` (for example, `model-account:<name>`); importing a secret does not configure that reference. This uses the existing protected-secret store in `model_protected_secrets`, with the same protection and rotation requirements as [API credentials](#api-credentials).
+
+Admins can set, replace or remove the profile's setup-token using the write-only **Set key** / **Remove key** controls on **Models & providers**. The set/not-set badge reports whether a protected credential is stored; saved tokens are never read back into the field. Readiness requires a configured reference and a stored row; row presence does not prove that the provider accepts the token.
+
+The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token }`, delivered to the runner as `CLAUDE_CODE_OAUTH_TOKEN`. Managed checkout requires no owner generation; setup-tokens need no refresh. Missing secrets, decryption failures and an unset `RUNNER_TOKEN_SECRET` prepare as `authentication-required` with the fixed code `session_unavailable`. Local `local-login` subscription runs retain the `session` kind and `authDir`.
+
+## Adopt an environment credential
+
+On the orchestrator, run `node dist/model-account-cli.js adopt-env` with no arguments.
+It reads `CLAUDE_CODE_OAUTH_TOKEN` first, then `ANTHROPIC_API_KEY`. When both are
+present, the token wins and the command reports that the key was ignored. Bedrock
+is outside this migration. `RUNNER_TOKEN_SECRET` must be set before adoption can write.
+
+The command creates `adopted-env-claude-subscription` or
+`adopted-env-anthropic-api-key`, stores the value encrypted at the matching
+`model-account:<profile-id>` reference, and configures planning, implementation
+and review with that profile, agent `claude`, provider `anthropic` and the built-in
+`DEFAULT_MODEL`. Each stage uses 90 minutes because configured stages require a
+timeout. It creates no project grants and opts no project into configured runs.
+
+Output lists each stage and profile id, never the credential. Existing configured
+defaults are a no-op, including when the environment no longer has the credential;
+the output reports their existing profile ids. A legacy defaults row is replaced
+with a configured revision. An active compatible adopted profile is reused without
+another profile revision; a disabled or archived adopted profile is refused, including
+when existing defaults reference it. Identifier or reference collisions fail without
+changes. Adoption writes are atomic.
+
+Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode`
+is `configured`, and all three stages name the adopted profile. Projects still
+need their own explicit opt-in. To roll back, revert the defaults and delete the
+profile on Models & providers; remove its encrypted credential with `secret-delete`
+if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it.
+
+## Adopting existing projects
+
+Existing projects remain legacy until an operator runs `adopt-projects`:
+
+```bash
+npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --dry-run
+npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --project PROJECT_KEY
+```
+
+Run `adopt-env` first to establish configured defaults. Each project line reports the outcome and each stage's model and source. Adoption reads `.ai-implement/config.yml`, `WORKFLOW.md` and `PLANNING.md` at one commit resolved from the configured dispatch branch (`mapping.defaultBranch`). Implementation and review prefer `models.implement` / `models.review`, then observable `mapping.extraEnv.CLAUDE_MODEL` on Fly/local, then WORKFLOW front matter. Planning prefers that mapping model on Fly/local, then PLANNING front matter. Legacy GitHub Actions does not receive mapping Extra Env, so adoption ignores it on that backend. Shadow implementation/review must resolve the same model on both backends; a difference reports `model_conflict` with the stage, backend values and sources, and skips the project without writes. Shadow planning uses GitHub Actions only. Stages without a repository model retain the legacy `DEFAULT_MODEL` fallback (shown as `DEFAULT_MODEL` in the report). Each effective legacy model becomes a stage override when it differs from configured defaults; matching models need no override. If repository reads fail, the report says “model not carried” and all stages inherit defaults.
+
+Runner-only environment settings (for example, Fly secrets, image environment, or GitHub Actions variables/secrets) are not observable through these readers. Adoption cannot preserve those unknown model overrides; inspect the preview against your runner configuration before opting in. The command does not read credentials or guess their values.
+
+Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and explicit legacy opt-outs are skipped. After readiness, adoption rechecks that branch head before synchronously revalidating local inputs and writing. An observed push or disappeared branch reports `inputs_changed`; retry to inspect the new snapshot. A failed final revision check reports `repository_unavailable` without writing or replacing the checked candidate. Dry-run uses the same guard. This last GitHub observation does not lock remote pushes: a push after it is a later repository change. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
+
+After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, write an explicit legacy row on the project's **Agents** tab; future adoption runs preserve that opt-out.

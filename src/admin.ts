@@ -70,7 +70,6 @@ import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./mode
 import { mintPairingCode, readPairingStatus, PAIRING_OPERATOR } from "./chatgpt-pairing.js";
 import { createModelSessionStore } from "./model-session-store.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
-import type { OwnershipSnapshot } from "./model-session-ownership.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
@@ -608,8 +607,6 @@ export interface AgentConfigAdminDeps {
   inspectReadiness(request: Omit<AgentRunRequest, "dispatchId">, candidate?: StageAgentConfigurationV1): Promise<AgentReadiness>;
   /** Safe credential status inputs; no secret is read through them. */
   credentials: ModelCredentialDeps;
-  /** Ownership snapshot of a `claude-subscription` profile; absent when never reserved. */
-  sessionSnapshot?(profileId: string): OwnershipSnapshot | undefined;
 }
 
 /** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
@@ -4015,7 +4012,14 @@ function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): Acco
   }
   view.failureCode = status.failure?.code ?? null;
   if (status.usable) {
-    view.readiness = "ready";
+    // Reference status does not inspect protected values. Row presence is safe
+    // metadata, not proof that the provider will accept the setup-token.
+    if (profile.authMode === "claude-subscription" && !credentialView(profile).credentialSet) {
+      view.readiness = "missing";
+      view.failureCode = "secret_unavailable";
+    } else {
+      view.readiness = "ready";
+    }
   } else if (status.failure?.code === "session_unavailable") {
     view.readiness = status.failure.category === "authentication_required" ? "sign-in required" : "refresh failed (transient)";
   } else if (status.failure?.code === "reference_missing" || status.referenceConfigured === false) {
@@ -4055,7 +4059,7 @@ const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-a
 
 const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   invalid_ref: "the reference is not a valid model-account reference",
-  invalid_value: "the value is not a valid API key",
+  invalid_value: "the value is not a valid credential",
   key_unavailable: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it",
   row_missing: "could not write the credential",
   decrypt_failed: "could not write the credential",

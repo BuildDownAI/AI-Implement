@@ -67,11 +67,11 @@ function seedProfiles() {
   });
   store.saveAccountProfileRevision({
     profileId: "sub", identity: "Sub", revision: 1, agent: "claude", provider: "anthropic",
-    authMode: "claude-subscription",
+    authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" },
   });
   store.saveAccountProfileRevision({
     profileId: "sub2", identity: "Sub2", revision: 1, agent: "claude", provider: "anthropic",
-    authMode: "claude-subscription",
+    authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" },
   });
   store.saveAccountProfileRevision({
     profileId: "cdx", identity: "Cdx", revision: 1, agent: "codex", provider: "openai",
@@ -151,7 +151,7 @@ beforeEach(async () => {
     ".github/workflows/comment-trigger.yml": null,
     ".github/workflows/claude-kg-refresh.yml": null,
   };
-  secrets = new Map<string, string | { region: string; accessKeyId: string; secretAccessKey: string }>([["model-account:api", API_SENTINEL], ["model-account:brk", { region: "us-east-1", accessKeyId: "AKIASYNTHETIC0001", secretAccessKey: "synthetic-secret-0003" }]]);
+  secrets = new Map<string, string | { region: string; accessKeyId: string; secretAccessKey: string }>([["model-account:sub", SESSION_SENTINEL], ["model-account:api", API_SENTINEL], ["model-account:brk", { region: "us-east-1", accessKeyId: "AKIASYNTHETIC0001", secretAccessKey: "synthetic-secret-0003" }]]);
   secretReads = [];
   deps = {
     ownership: {
@@ -194,11 +194,10 @@ describe("legacy", () => {
 });
 
 describe("ready", () => {
-  it("persists the snapshot, reserves the subscription set and mints a hashed grant", async () => {
+  it("persists the snapshot and mints a hashed grant without reserving", async () => {
     const r = ready(await prep.prepareAgentRun(request(), deps));
     expect(r.reused).toBe(false);
-    expect(r.reservations).toHaveLength(1);
-    expect(r.reservations[0]!.profileId).toBe("sub");
+    expect(r.reservations).toEqual([]);
     const refs = store.resolveProjectStageConfig("AII").configReferences!;
     expect(r.snapshot.configRevisions).toEqual({ orchestratorDefault: refs.orchestratorDefault, project: refs.project });
     expect(r.snapshot.profiles.implementation.id).toBe("sub");
@@ -207,7 +206,7 @@ describe("ready", () => {
     expect(bootstrap.backend).toBe("gha");
     expect(bootstrap.snapshotId).toBe(r.snapshot.snapshotId);
     expect(bootstrap.bindings.find((b) => b.stage === "implementation")).toMatchObject({
-      profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: r.reservations[0]!.generation,
+      profileId: "sub", profileRevision: 1, authMode: "claude-subscription",
     });
     expect(bootstrap.bindings.find((b) => b.stage === "planning")!.ownerGeneration).toBeUndefined();
     expect(r.takeBootstrap()).toBeUndefined();
@@ -257,7 +256,6 @@ describe("snapshot immutability and idempotence", () => {
     expect(JSON.parse(row.resolved_config_json as string).fallbackModels).toEqual({ review: "backup" });
     store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { fallbackModel: "changed" } } });
     expect(ready(await prep.prepareAgentRun(request(), deps)).fallbackModels).toEqual({ review: "backup" });
-    ownership.releaseLaunchRejected({ dispatchId: "d1", profileId: "sub", generation: first.reservations[0]!.generation });
     expect(ready(await prep.prepareAgentRun(request({ dispatchId: "d2" }), deps)).fallbackModels).toEqual({ review: "changed" });
   });
 
@@ -267,7 +265,7 @@ describe("snapshot immutability and idempotence", () => {
     store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { review: { model: "changed" } } });
     store.saveAccountProfileRevision({
       profileId: "sub", identity: "Sub", revision: 2, agent: "claude", provider: "anthropic",
-      authMode: "claude-subscription",
+      authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" },
     });
     const again = ready(await prep.prepareAgentRun(request(), deps));
     expect(JSON.stringify(rows("run_agent_config_snapshots"))).toBe(before);
@@ -275,14 +273,13 @@ describe("snapshot immutability and idempotence", () => {
     expect(again.snapshot.stages.review.model).toBe("m");
     expect(again.snapshot.profiles.implementation.revision).toBe(1);
 
-    ownership.releaseLaunchRejected({ dispatchId: "d1", profileId: "sub", generation: first.reservations[0]!.generation });
     const replacement = ready(await prep.prepareAgentRun(request({ dispatchId: "d2" }), deps));
     expect(replacement.snapshot.snapshotId).not.toBe(first.snapshot.snapshotId);
     expect(replacement.snapshot.stages.review.model).toBe("changed");
     expect(replacement.snapshot.profiles.implementation.revision).toBe(2);
   });
 
-  it("reuses snapshot, grant and owner generation without new rows or a new bearer", async () => {
+  it("reuses snapshot and grant without new rows or a new bearer", async () => {
     const first = ready(await prep.prepareAgentRun(request(), deps));
     const before = counts();
     const again = ready(await prep.prepareAgentRun(request(), deps));
@@ -351,60 +348,43 @@ describe("snapshot immutability and idempotence", () => {
   });
 });
 
-describe("queueing and recovery", () => {
-  it("queues a busy profile before any grant and leaves no partial reservation", async () => {
-    ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
-    const r = await prep.prepareAgentRun(request(), deps);
-    expect(r).toEqual({ status: "queued", dispatchId: "d1", busyProfiles: ["sub"] });
-    expect(rows("model_credential_grants")).toHaveLength(0);
-    expect(rows("model_profile_reservations").filter((x) => x.dispatch_id === "d1")).toHaveLength(0);
-  });
-
-  it("is all-or-nothing across a multi-profile set", async () => {
-    store.setOrchestratorDefaults({
-      version: 1, mode: "configured",
-      stages: { planning: stage("sub2", "claude", "anthropic"), implementation: stage("sub", "claude", "anthropic"), review: stage("sub2", "claude", "anthropic") },
-    });
-    ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
-    expect((await prep.prepareAgentRun(request(), deps)).status).toBe("queued");
-    expect(rows("model_profile_reservations").filter((x) => x.dispatch_id === "d1")).toHaveLength(0);
-  });
-
-  it("queued dispatch prepares once the profile frees, on the same identity", async () => {
+describe("historical reservations", () => {
+  it("ignores an existing owner and leaves its session rows untouched", async () => {
     const holder = ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
-    expect((await prep.prepareAgentRun(request(), deps)).status).toBe("queued");
-    if (holder.status !== "reserved") throw new Error("setup");
-    ownership.releaseLaunchRejected({ dispatchId: "holder", profileId: "sub", generation: holder.reservations[0]!.generation });
-    expect(ready(await prep.prepareAgentRun(request(), deps)).snapshot.stages.implementation.accountProfileId).toBe("sub");
+    expect(holder.status).toBe("reserved");
+    const before = rows("model_profile_reservations");
+    const [a, b] = await Promise.all([
+      prep.prepareAgentRun(request(), deps),
+      prep.prepareAgentRun(request({ dispatchId: "d2" }), deps),
+    ]);
+    expect(ready(a).reservations).toEqual([]);
+    expect(ready(b).reservations).toEqual([]);
+    expect(rows("model_profile_reservations")).toEqual(before);
   });
 
-  it.each(["beginStop", "markRecoveryRequired"] as const)("returns recovery-required for a %s owner on repeat", async (op) => {
+  it.each(["beginStop", "markRecoveryRequired", "releaseLaunchRejected"] as const)(
+    "prepares and reuses a grant independently of a historical %s owner", async op => {
+      const holder = ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
+      if (holder.status !== "reserved") throw new Error("setup");
+      ownership[op]({ dispatchId: "holder", profileId: "sub", generation: holder.reservations[0]!.generation });
+      const before = rows("model_profile_reservations");
+      const first = ready(await prep.prepareAgentRun(request(), deps));
+      const again = ready(await prep.prepareAgentRun(request(), deps));
+      expect(first.reservations).toEqual([]);
+      expect(again.reused).toBe(true);
+      expect(again.grant).toEqual(first.grant);
+      expect(rows("model_profile_reservations")).toEqual(before);
+    },
+  );
+
+  it("prepares a multi-profile Claude selection without partial reservations", async () => {
+    useStages(["sub2", "claude", "anthropic"], ["sub", "claude", "anthropic"]);
+    ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
+    const before = rows("model_profile_reservations");
     const r = ready(await prep.prepareAgentRun(request(), deps));
-    const ref = { dispatchId: "d1", profileId: "sub", generation: r.reservations[0]!.generation };
-    if (op === "beginStop") ownership.beginStop(ref);
-    else ownership.markRecoveryRequired(ref);
-    const again = await prep.prepareAgentRun(request(), deps);
-    expect(again).toMatchObject({ status: "recovery-required", code: "owner_state_unsafe", profileId: "sub" });
-  });
-
-  it("returns recovery-required when a fresh reservation is already past reserved", async () => {
-    const reserve = ownership.reserve({ dispatchId: "d1", profiles: [{ profileId: "sub", authMode: "subscription" }] });
-    if (reserve.status !== "reserved") throw new Error("setup");
-    ownership.markRecoveryRequired({ dispatchId: "d1", profileId: "sub", generation: reserve.reservations[0]!.generation });
-    expect(await prep.prepareAgentRun(request(), deps)).toMatchObject({ status: "recovery-required", code: "owner_state_unsafe" });
-    expect(rows("model_credential_grants")).toHaveLength(0);
-  });
-
-  it("surfaces reservation_set_changed as a safe configuration error", async () => {
-    ownership.reserve({ dispatchId: "d1", profiles: [{ profileId: "sub2", authMode: "subscription" }] });
-    expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code: "reservation_set_changed" });
-    expect(rows("model_credential_grants")).toHaveLength(0);
-  });
-
-  it("does not reclaim a released dispatch", async () => {
-    const first = ready(await prep.prepareAgentRun(request(), deps));
-    ownership.releaseLaunchRejected({ dispatchId: "d1", profileId: "sub", generation: first.reservations[0]!.generation });
-    expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code: "dispatch_released" });
+    expect(r.reservations).toEqual([]);
+    expect(r.grant.bindings.map(b => b.profileId)).toEqual(["sub2", "sub", "sub2"]);
+    expect(rows("model_profile_reservations")).toEqual(before);
   });
 
   it("holds a revoked grant", async () => {
@@ -475,7 +455,7 @@ describe("credential readiness", () => {
     expect(counts().reservations).toBe(before.reservations);
   });
 
-  it("returns authentication-required for missing session state and releases the fresh lease", async () => {
+  it("returns authentication-required for a missing Claude token without a lease", async () => {
     store.saveAccountProfileRevision({
       profileId: "fresh", identity: "Fresh", revision: 1, agent: "claude", provider: "anthropic",
       authMode: "claude-subscription",
@@ -493,22 +473,22 @@ describe("credential readiness", () => {
     expect(ownership.reserve({ dispatchId: "other", profiles: [{ profileId: "fresh", authMode: "subscription" }] }).status).toBe("reserved");
   });
 
-  it("does not accept usable status alone: a subscription needs readable session state", async () => {
+  it("proves the protected Claude token without reading historical session state", async () => {
     const status = testDatabase.modules.credentials.getCredentialStatus(
       { profileId: "sub", revision: 1, provider: "anthropic", authMode: "claude-subscription" },
       deps.credentials,
     );
     expect(status.usable).toBe(true);
-    // ...yet preparation reads session state under the reserved generation.
+    // Historical session state is unused, even when it exists.
     let reads = 0;
     const counting = { ...sessions, read: (p: string, g: number) => { reads++; return sessions.read(p, g); } } as SessionModule.ModelSessionStore;
     ready(await prep.prepareAgentRun(request(), { ...deps, credentials: { ...deps.credentials, sessionStore: counting } }));
-    expect(reads).toBe(1);
+    expect(reads).toBe(0);
   });
 
-  it("never reads a secret for subscription profiles from the protected store", async () => {
+  it("reads the Claude token from the protected store", async () => {
     ready(await prep.prepareAgentRun(request(), deps));
-    expect(secretReads.every((ref) => ref === "model-account:api")).toBe(true);
+    expect(secretReads).toContain("model-account:sub");
   });
 
   it("fails resolution for a new dispatch once a selected profile is retired", async () => {
@@ -527,112 +507,46 @@ describe("cleanup", () => {
     expect(prep.releaseRejectedLaunch("d1", r.reservations, deps).complete).toBe(true);
     expect(ownership.reserve({ dispatchId: "next", profiles: [{ profileId: "sub", authMode: "subscription" }] }).status).toBe("reserved");
   });
-
-  it("rejects a stale generation and a wrong dispatch", async () => {
+  it("finishes a terminated run without owners and leaves historical session ownership alone", async () => {
+    const before = rows("model_profile_reservations");
     const r = ready(await prep.prepareAgentRun(request(), deps));
-    const stale = [{ profileId: "sub", generation: r.reservations[0]!.generation + 5 }];
-    expect(prep.releaseRejectedLaunch("d1", stale, deps).complete).toBe(false);
-    expect(prep.releaseRejectedLaunch("other", r.reservations, deps).complete).toBe(false);
-    expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
-  });
-
-  it("does not release a started launch through the rejection path", async () => {
-    const r = ready(await prep.prepareAgentRun(request(), deps));
-    ownership.markRunning({ dispatchId: "d1", profileId: "sub", generation: r.reservations[0]!.generation });
-    expect(prep.releaseRejectedLaunch("d1", r.reservations, deps).complete).toBe(false);
-  });
-
-  it("releases after termination only with a valid checkpoint, never on heartbeat", async () => {
-    const r = ready(await prep.prepareAgentRun(request(), deps));
-    const ref = { dispatchId: "d1", profileId: "sub", generation: r.reservations[0]!.generation };
-    ownership.markRunning(ref);
-    ownership.heartbeat(ref);
-    ownership.beginStop(ref);
-    const held = await prep.releaseTerminated("d1", r.reservations, deps);
-    expect(held.complete).toBe(false); // no checkpoint by this owner
-    expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
-    const cp = sessions.checkpoint({ profileId: "sub", ownerGeneration: ref.generation, stateSequence: 1, sessionData: "synthetic-next" });
-    expect(cp.ok).toBe(true);
-    const done = await prep.releaseTerminated("d1", r.reservations, deps);
-    expect(done.complete).toBe(true);
+    expect((await prep.releaseTerminated("d1", r.reservations, deps)).complete).toBe(true);
     expect(rows("model_credential_grants")[0]!.revoked_at).not.toBeNull();
+    expect(rows("model_profile_reservations")).toEqual(before);
   });
+
 });
 
 describe("cleanup ownership completeness", () => {
-  function twoOwners() {
-    store.setOrchestratorDefaults({
-      version: 1, mode: "configured",
-      stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("sub", "claude", "anthropic"), review: stage("sub2", "claude", "anthropic") },
-    });
-  }
-  const entries = [
-    ["releaseRejectedLaunch", async (o: readonly OwnershipModule.ReservedProfile[]) => prep.releaseRejectedLaunch("d1", o, deps)],
-    ["releaseTerminated", async (o: readonly OwnershipModule.ReservedProfile[]) => prep.releaseTerminated("d1", o, deps)],
-  ] as const;
-
-  for (const [name, release] of entries) {
-    it(`${name}: empty or subset selections are incomplete and leave grant and owners intact`, async () => {
-      twoOwners();
+  for (const name of ["releaseRejectedLaunch", "releaseTerminated"] as const) {
+    it(`${name}: an API-only dispatch completes with no owners and repeats idempotently`, async () => {
+      useStages(["api", "claude", "anthropic"], ["api", "claude", "anthropic"]);
+      const before = rows("model_profile_reservations");
       const r = ready(await prep.prepareAgentRun(request(), deps));
-      expect(r.reservations).toHaveLength(2);
-      for (const owners of [[], [r.reservations[0]!]]) {
-        expect((await release(owners)).complete).toBe(false);
-        expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
-      }
-      for (const o of r.reservations) {
-        expect(ownership.snapshot(o.profileId)).toMatchObject({ dispatchId: "d1", generation: o.generation, state: "reserved" });
-      }
-    });
-
-    it(`${name}: extra, wrong and duplicate owner selections are rejected`, async () => {
-      const r = ready(await prep.prepareAgentRun(request(), deps));
-      const owner = r.reservations[0]!;
-      for (const owners of [
-        [owner, { profileId: "sub2", generation: 1 }],
-        [{ profileId: owner.profileId, generation: owner.generation + 1 }],
-        [owner, owner],
-      ]) {
-        expect((await release(owners)).complete).toBe(false);
-        expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
-        expect(ownership.snapshot("sub")).toMatchObject({ dispatchId: "d1", generation: owner.generation });
-      }
-    });
-
-    it(`${name}: a stale selection cannot release a newer owner`, async () => {
-      const r = ready(await prep.prepareAgentRun(request(), deps));
-      const old = r.reservations;
-      expect(prep.releaseRejectedLaunch("d1", old, deps).complete).toBe(true);
-      const next = ownership.reserve({ dispatchId: "d2", profiles: [{ profileId: "sub", authMode: "subscription" }] });
-      expect(next.status).toBe("reserved");
-      await release(old);
-      expect(ownership.snapshot("sub")).toMatchObject({ dispatchId: "d2", state: "reserved" });
-    });
-
-    it(`${name}: the full set completes, revokes, and repeats idempotently`, async () => {
-      twoOwners();
-      const r = ready(await prep.prepareAgentRun(request(), deps));
-      if (name === "releaseTerminated") {
-        for (const o of r.reservations) {
-          const ref = { dispatchId: "d1", profileId: o.profileId, generation: o.generation };
-          ownership.markRunning(ref);
-          ownership.beginStop(ref);
-          expect(sessions.checkpoint({ profileId: o.profileId, ownerGeneration: o.generation, stateSequence: 1, sessionData: "synthetic-next" }).ok).toBe(true);
-        }
-      }
-      expect((await release(r.reservations)).complete).toBe(true);
+      expect(r.reservations).toEqual([]);
+      expect((await prep[name]("d1", [], deps)).complete).toBe(true);
       expect(rows("model_credential_grants")[0]!.revoked_at).not.toBeNull();
-      expect((await release(r.reservations)).complete).toBe(true);
+      expect((await prep[name]("d1", [], deps)).complete).toBe(true);
+      expect(rows("model_profile_reservations")).toEqual(before);
     });
 
-    it(`${name}: an API-only dispatch completes with no owners`, async () => {
-      store.setOrchestratorDefaults({
-        version: 1, mode: "configured",
-        stages: { planning: stage("api", "claude", "anthropic"), implementation: stage("api", "claude", "anthropic"), review: stage("api", "claude", "anthropic") },
-      });
-      ready(await prep.prepareAgentRun(request(), deps));
-      expect((await release([])).complete).toBe(true);
+    it(`${name}: rejects unexpected, duplicate and wrong-dispatch owners without touching historical state`, async () => {
+      const r = ready(await prep.prepareAgentRun(request(), deps));
+      const historical = ownership.reserve({ dispatchId: "holder", profiles: [{ profileId: "sub", authMode: "subscription" }] });
+      if (historical.status !== "reserved") throw new Error("setup");
+      const owner = historical.reservations[0]!;
+      const before = rows("model_profile_reservations");
+      for (const supplied of [[owner], [owner, owner], [{ ...owner, generation: owner.generation + 1 }]]) {
+        expect((await prep[name]("d1", supplied, deps)).complete).toBe(false);
+        expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
+        expect(rows("model_profile_reservations")).toEqual(before);
+      }
+      expect((await prep[name]("other", [], deps)).complete).toBe(false);
+      expect(rows("model_credential_grants")[0]!.revoked_at).toBeNull();
+      expect((await prep[name]("d1", r.reservations, deps)).complete).toBe(true);
       expect(rows("model_credential_grants")[0]!.revoked_at).not.toBeNull();
+      expect((await prep[name]("d1", r.reservations, deps)).complete).toBe(true);
+      expect(rows("model_profile_reservations")).toEqual(before);
     });
   }
 });
@@ -654,12 +568,12 @@ describe("inspectAgentReadiness", () => {
     expect(await prep.inspectAgentReadiness(request(), deps)).toMatchObject({ status: "ready" });
   });
 
-  it("is read-only and reports ready with deferred subscription credentials", async () => {
+  it("is read-only and reports configured credential references", async () => {
     const before = counts();
     const r = await prep.inspectAgentReadiness(request(), deps);
     expect(r).toMatchObject({ status: "ready" });
     if (r.status === "ready") {
-      expect(r.profiles.find((p) => p.stage === "implementation")!.credential).toBe("deferred");
+      expect(r.profiles.find((p) => p.stage === "implementation")!.credential).toBe("reference-configured");
       expect(r.profiles.find((p) => p.stage === "planning")!.credential).toBe("reference-configured");
     }
     expect(counts()).toEqual(before);
@@ -727,13 +641,13 @@ describe("codex-subscription is not reserved", () => {
     ready(await prep.prepareAgentRun(request({ dispatchId: "d2" }), deps));
   });
 
-  it("reserves only the Claude profile in a mixed snapshot", async () => {
+  it("reserves neither profile in a mixed snapshot", async () => {
     useStages(CODEX, ["sub", "claude", "anthropic"]);
     const r = ready(await prep.prepareAgentRun(request(), deps));
-    expect(r.reservations.map((x) => x.profileId)).toEqual(["sub"]);
+    expect(r.reservations).toEqual([]);
     const bindings = r.takeBootstrap()!.bindings;
     expect(bindings.find((x) => x.stage === "planning")!.ownerGeneration).toBeUndefined();
-    expect(bindings.find((x) => x.stage === "implementation")!.ownerGeneration).toBe(r.reservations[0]!.generation);
+    expect(bindings.find((x) => x.stage === "implementation")!.ownerGeneration).toBeUndefined();
   });
 
   it("retries an existing codex grant without grant_mismatch", async () => {
@@ -765,18 +679,18 @@ describe("codex-subscription is not reserved", () => {
     expect(counts().reservations).toBe(before);
   });
 
-  it("is not deferred in inspectAgentReadiness; Claude stays deferred", async () => {
+  it("reports configured references for both subscriptions", async () => {
     useStages(CODEX, ["sub", "claude", "anthropic"]);
     const r = await prep.inspectAgentReadiness(request(), deps);
     if (r.status !== "ready") throw new Error(JSON.stringify(r));
     expect(r.profiles.find((p) => p.stage === "planning")!.credential).toBe("reference-configured");
-    expect(r.profiles.find((p) => p.stage === "implementation")!.credential).toBe("deferred");
+    expect(r.profiles.find((p) => p.stage === "implementation")!.credential).toBe("reference-configured");
   });
 });
 
 describe("auth mode state table", () => {
   const cases = [
-    { name: "claude-subscription", profile: ["sub", "claude", "anthropic"], reserved: true },
+    { name: "claude-subscription", profile: ["sub", "claude", "anthropic"], reserved: false },
     { name: "codex-subscription", profile: ["cdx", "codex", "openai"], reserved: false },
     { name: "API key", profile: ["api", "claude", "anthropic"], reserved: false },
     { name: "bedrock", profile: ["brk", "claude", "bedrock"], reserved: false },
