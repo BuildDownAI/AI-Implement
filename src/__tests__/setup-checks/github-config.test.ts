@@ -7,6 +7,8 @@ import { WorkflowProbeTransientError, type WorkflowCapabilities } from "../../wo
 import { makeMapping } from "../helpers/builders.js";
 import { makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 
+import datedFleet from "../helpers/fixtures/workflow-generation-fleet-2026-11-07.js";
+
 const modern: WorkflowCapabilities = {
   contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
   supportsPrivateRunConfig: true, supportsStageAgentConfig: true,
@@ -107,33 +109,64 @@ describe("workflow generation", () => {
     expect(reader).not.toHaveBeenCalled();
   });
 
-  it("matches the issue's fleet expectations with explicit representative configurations", async () => {
-    // These are representative inputs, not an authenticated historical export.
-    // The issue supplies states only; actual 2026-11-07 mappings/blobs are still needed.
-    const fleet = {
-      AII: { mapping: makeMapping({ executionMode: "fly-machines", planningEnabled: true }), implementation: modern, planning: modern },
-      CON: { mapping: makeMapping({ executionMode: "github-actions", planningEnabled: true }), implementation: modern, planning: modern },
-      TEST: { mapping: makeMapping({ executionMode: "github-actions", planningEnabled: false }), implementation: modern, planning: null },
-      SAN: { mapping: makeMapping({ executionMode: "fly-machines", planningEnabled: false }), implementation: { ...modern, contract: "legacy" as const }, planning: null },
-      KGB: { mapping: makeMapping({ executionMode: "fly-machines", planningEnabled: true }), implementation: { ...modern, supportsPrivateRunConfig: false }, planning: modern },
-      DOC: { mapping: makeMapping({ executionMode: "github-actions", planningEnabled: true }), implementation: { ...modern, supportsRunPublicationToken: false }, planning: modern },
-      KGA: { mapping: makeMapping({ executionMode: "fly-machines", planningEnabled: false }), implementation: { ...modern, hasStageAgentConfigMarker: false }, planning: null },
-      BDS: { mapping: makeMapping({ executionMode: "github-actions", planningEnabled: true }), implementation: modern, planning: { ...modern, hasStageAgentLaunchContextMarker: false } },
-    };
+  it("reproduces the November 7 fleet states from captured immutable workflow facts", async () => {
+    // Historical workflow facts, with mapping coordinates read live November 9.
+    // This is not a historical deployment-settings export or a raw-blob probe test.
+    type CapturedFile = { blobSha?: string; capabilities?: WorkflowCapabilities; missing?: boolean };
+    const fleet = datedFleet.projects.map((project) => {
+      const [owner, repo] = project.repository.split("/");
+      return {
+        ...project,
+        files: project.files as Record<string, CapturedFile | undefined>,
+        mapping: makeMapping({
+          owner, repo, defaultBranch: project.configuredRef,
+          workflowFile: project.workflowFile, planningWorkflowFile: project.planningWorkflowFile,
+          planningEnabled: project.planningEnabled, executionMode: "github-actions",
+        }),
+      };
+    });
+    const capabilities = vi.fn(async (mapping: ReturnType<typeof makeMapping>, file: string) => {
+      const project = fleet.find((entry) => entry.mapping === mapping)!;
+      const captured = project.files[file];
+      if (!captured?.capabilities) throw new Error(`Uncaptured workflow: ${project.team}/${file}`);
+      return captured.capabilities;
+    });
+    const retired = vi.fn(async (mapping: ReturnType<typeof makeMapping>, file: string) => {
+      const project = fleet.find((entry) => entry.mapping === mapping)!;
+      expect(project.files[file.replace(/^\.github\/workflows\//, "")]).toEqual({ missing: true });
+      return false;
+    });
     const rows = await check.run(makeSetupCheckContext({
-      mappings: () => Object.fromEntries(Object.entries(fleet).map(([project, entry]) => [project, entry.mapping])),
-      workflowCapabilities: async (mapping, file) => {
-        const entry = Object.values(fleet).find((entry) => entry.mapping === mapping)!;
-        const capabilities = file === mapping.workflowFile ? entry.implementation : entry.planning;
-        if (!capabilities) throw new Error("Disabled planning must not be probed");
-        return capabilities;
-      },
+      mappings: () => Object.fromEntries(fleet.map((entry) => [entry.team, entry.mapping])),
+      workflowCapabilities: capabilities,
+      defaultBranchFileExists: retired,
     }));
     expect(rows.map(({ project, state }) => [project, state])).toEqual([
-      ["AII", "pass"], ["CON", "pass"], ["TEST", "pass"], ["SAN", "warn"],
-      ["KGB", "warn"], ["DOC", "warn"], ["KGA", "warn"], ["BDS", "warn"],
+      ["SAN", "warn"], ["KGB", "warn"], ["DOC", "warn"], ["KGA", "warn"],
+      ["BDS", "warn"], ["TEST", "pass"], ["AII", "pass"], ["CON", "pass"],
     ]);
-    for (const row of rows) if (row.state === "warn") expect(row.fix).toBe(fix);
+    expect(rows.map((row) => row.state)).toEqual(fleet.map((entry) => entry.expectedState));
+    for (const [i, project] of fleet.entries()) {
+      const row = rows[i];
+      expect(row.fix).toBe(project.expectedState === "warn" ? fix : undefined);
+      const files = [project.workflowFile, ...(project.planningEnabled ? [project.planningWorkflowFile] : [])];
+      for (const file of files) {
+        expect(capabilities).toHaveBeenCalledWith(project.mapping, file);
+        expect(row.detail).toContain(`${file}@${project.configuredRef}`);
+      }
+      for (const file of ["comment-trigger.yml", "claude-kg-refresh.yml"]) {
+        expect(retired).toHaveBeenCalledWith(project.mapping, `.github/workflows/${file}`);
+      }
+      if (row.state === "warn") {
+        for (const marker of ["private-run-config-v1", "stage-agent-config-v1", "stage-agent-launch-context-v1"]) {
+          expect(row.detail).toContain(marker);
+        }
+      }
+    }
+    const doc = fleet.find((entry) => entry.team === "DOC")!;
+    expect(capabilities).not.toHaveBeenCalledWith(doc.mapping, doc.planningWorkflowFile);
+    expect(capabilities).toHaveBeenCalledTimes(15);
+    expect(retired).toHaveBeenCalledTimes(16);
   });
 });
 
