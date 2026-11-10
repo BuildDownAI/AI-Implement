@@ -230,7 +230,7 @@ owner/backend, and retains on active/unknown/unreadable evidence. Confirmed end
 runs unfinished finalization, cleanup and outcome reporting before exact-generation
 release. Successful finalization and its result are persisted, so a later
 bookkeeping failure can retry without spending the stuck-attempt budget again.
-Deadline remediation commits its retry charge and private owner receipt in one
+Deadline and failure remediation commit their retry charge and private owner receipt in one
 SQLite transaction before awaiting tracker bookkeeping. Recovery resumes that
 same charge, including the original give-up decision after parking resets the
 shared counter. A completed cleanup receipt also survives later owner updates;

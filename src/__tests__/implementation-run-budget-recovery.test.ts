@@ -10,13 +10,14 @@ vi.mock("../restate/implementation-run-workflow.js", async (original) => ({
   createImplementationRunWorkflow: (deps: ImplementationRunDependencies) => { captured.deps = deps; return {}; },
 }));
 
-it.each([0, 2, 3])("charges a deadline once when recovery resumes interrupted tracker bookkeeping (prior attempts: %s)", async (prior) => {
+it.each([0, 2, 3].flatMap(prior => (["deadline", "run_ended", "cancelled"] as const).map(kind => ({ prior, kind }))))("charges once when recovery resumes interrupted $kind bookkeeping (prior attempts: $prior)", async ({ prior, kind }) => {
   const db = await testDb({ modules: {
     production: () => import("../restate/implementation-run-production.js"),
     log: () => import("../log.js"),
     admission: () => import("../dispatch-admission.js"),
     owner: () => import("../restate/implementation-run-owner.js"),
     watchdog: () => import("../stuck-watchdog.js"),
+    finalize: () => import("../implementation-finalize.js"),
   } });
   const run: ImplementationRunInput = { dispatchId: "budget-recovery", teamKey: "ENG", issueId: "issue-1", issueIdentifier: "ENG-1", backend: "github-actions", launchContext: {}, maxJobMinutes: 90 };
   expect(db.modules.admission.acquire({ dispatchId: run.dispatchId, mappingKey: run.teamKey,
@@ -38,7 +39,7 @@ it.each([0, 2, 3])("charges a deadline once when recovery resumes interrupted tr
       launchImplementationRun: async () => { throw new Error("unexpected launch"); },
       launchImplementationFlySession: async () => { throw new Error("unexpected launch"); },
       launchImplementationLocalSession: async () => { throw new Error("unexpected launch"); },
-      postDispatch: async () => {}, finalizeImplementation: async () => {},
+      postDispatch: async () => {}, finalizeImplementation: m.finalize.finalizeImplementation,
       getMapping: () => makeMapping(), resolveProvider: async () => provider,
       remediateStuckJob: m.watchdog.remediateStuckJob, reportTerminalJob: async () => {},
     } satisfies ImplementationRunProductionInput);
@@ -46,18 +47,18 @@ it.each([0, 2, 3])("charges a deadline once when recovery resumes interrupted tr
   };
   // The process stops while the external tracker call is in flight. The same
   // production finish effect will be retried from durable state after restart.
-  void compose(db.modules).finishJob!(run.dispatchId, { kind: "deadline" });
+  void compose(db.modules).finishJob!(run.dispatchId, { kind });
   await reached;
   expect(db.modules.log.getStuckAttempts(run.issueId)).toBe(prior + 1);
   expect(db.modules.admission.read(run.dispatchId)!.releasedAt).toBeNull();
   const restarted = await db.reopen();
   vi.mocked(provider.clearWorkingState).mockResolvedValue(true);
   vi.mocked(provider.parkForHuman).mockResolvedValue(true);
-  await compose(restarted).finishJob!(run.dispatchId, { kind: "deadline" });
-  await captured.deps!.finishJob!(run.dispatchId, { kind: "deadline" });
+  await compose(restarted).finishJob!(run.dispatchId, { kind });
+  await captured.deps!.finishJob!(run.dispatchId, { kind });
   expect(restarted.log.getStuckAttempts(run.issueId)).toBe(prior === 3 ? 0 : prior + 1);
   expect(restarted.owner.readImplementationRunOwner(run.dispatchId)!.stuckCleanup).toEqual({ attempts: prior + 1, complete: true });
-  expect(restarted.log.getJobByDispatchId(run.dispatchId)!.conclusion).toBe(prior === 3 ? "stuck_giveup" : "stuck_requeued");
+  expect(restarted.log.getJobByDispatchId(run.dispatchId)!.conclusion).toBe(kind === "deadline" ? (prior === 3 ? "stuck_giveup" : "stuck_requeued") : kind === "cancelled" ? "workflow_cancelled" : "ended_without_callback");
   expect(provider.postComment).toHaveBeenCalledTimes(prior === 3 ? 1 : 0);
   expect(restarted.admission.read(run.dispatchId)!.releasedAt).toBeNull();
 });

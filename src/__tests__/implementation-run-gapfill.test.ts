@@ -636,7 +636,7 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   db.prepare("UPDATE dispatch_log SET run_id = NULL, status = 'dispatched' WHERE id = ?").run(job.id);
   expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
   await deps.finishJob!("dispatch", { kind: "run_ended" });
-  expect(input.finalizeImplementation).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.objectContaining({ id: job.id, phase: "gap-analysis" }), { ownerCall: true });
+  expect(input.finalizeImplementation).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.objectContaining({ id: job.id, phase: "gap-analysis" }), expect.objectContaining({ ownerCall: true }));
   expect(getCommentGapfillItem(queueItemId)?.status).toBe("failed");
   expect(await deps.findExistingRun(recoveryRun, 1999)).toBe("88");
   expect(getJobByDispatchId("dispatch")?.status).toBe("failed");
