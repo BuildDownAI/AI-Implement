@@ -264,12 +264,17 @@ function isRestateOwned(dispatchId: string): boolean {
   }
 }
 
-function restateRefForRow(d: DispatchRow): RunEntry["restate"] {
-  if (!d.dispatch_id) return null;
-  if (d.phase === "kg-refresh") return { service: "KgRefresh", key: d.dispatch_id };
-  if (!isRestateOwned(d.dispatch_id)) return null;
-  if (d.phase === "implementation") return { service: "ImplementationRun", key: d.dispatch_id };
-  return { service: d.phase === "planning" ? "PlanningRun" : "ReviewFixAttempt", key: d.dispatch_id };
+/** Resolve the owning workflow using durable admission and review-fix attempt records. */
+export function restateRefForJob(dispatchId: string | null, phase: string): RunEntry["restate"] {
+  if (!dispatchId) return null;
+  if (phase === "kg-refresh") return { service: "KgRefresh", key: dispatchId };
+  if (!isRestateOwned(dispatchId)) return null;
+  if (phase === "implementation") return { service: "ImplementationRun", key: dispatchId };
+  if (phase === "gap-analysis") {
+    const attempt = getDb().prepare("SELECT 1 FROM review_fix_attempts WHERE dispatch_id = ?").get(dispatchId);
+    return { service: attempt ? "ReviewFixAttempt" : "ImplementationRun", key: dispatchId };
+  }
+  return { service: phase === "planning" ? "PlanningRun" : "ReviewFixAttempt", key: dispatchId };
 }
 
 // ---- getIssueReportCard ----
@@ -312,7 +317,7 @@ export function getIssueReportCard(identifier: string, prices: readonly ModelPri
     status: d.status,
     conclusion: d.conclusion,
     ...derivedStatsForJob(db, d.id),
-    restate: restateRefForRow(d),
+    restate: restateRefForJob(d.dispatch_id, d.phase),
   }));
 
   const implRuns = runs.filter((r) => r.phase !== "planning");

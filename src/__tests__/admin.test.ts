@@ -3392,6 +3392,31 @@ describe("admin job-detail endpoint", () => {
     expect(Array.isArray(body.steps)).toBe(true);
   });
 
+  it.each(["restate", "legacy"] as const)("reports workflow ownership for a %s job", async (owner) => {
+    const token = await login("secret");
+    const dispatchId = `detail-${owner}`;
+    const admission = await import("../dispatch-admission.js");
+    expect(admission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "s", issueId: dispatchId },
+      kind: "implementation",
+      backend: "fly-machines",
+      lifecycleOwner: owner === "restate" ? { kind: owner, attemptId: "att-detail" } : { kind: owner },
+      cap: 5,
+    }).ok).toBe(true);
+    const id = log.appendLog({
+      issueId: dispatchId, issueIdentifier: "ENG-99", issueTitle: "Workflow",
+      teamKey: "ENG", repo: "org/repo", dispatchId, phase: "implementation",
+    });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.job.restate).toEqual(owner === "restate" ? { service: "ImplementationRun", key: dispatchId } : null);
+    expect(body.job.issueUrl).toBeNull();
+    expect(body.steps).toEqual([]);
+  });
+
   it("resolves the job's issueUrl through the mapping's ticketing provider", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
