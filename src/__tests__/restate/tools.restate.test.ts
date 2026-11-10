@@ -1,3 +1,4 @@
+import { getReviewerScorecard } from "../../report-card.js";
 import { initReconciliationTable } from "../../reconciliation.js";
 import { readFileSync } from "node:fs";
 import { createModelPrices, type ModelPrice } from "../../restate/model-prices.js";
@@ -192,6 +193,19 @@ describe("orchestratorTools (Restate)", () => {
   afterAll(async () => {
     await stopAll(environments);
   });
+
+  it.each(VARIANTS.map(([label]) => label))("returns reviewer scores to a user with nested args (%s)", async (label) => {
+      const env = environments.get(label)!;
+      const args = { days: 7, repo: "scorecard/repo" };
+      dedup.getDb().prepare(`INSERT OR IGNORE INTO review_findings
+        (repo, pr_number, finding_key, source, severity, body, status, disposition, first_seen_at, last_seen_at)
+        VALUES ('scorecard/repo', 1, 'scorecard-key', 'ai-implement-internal', 'blocking', 'fix', 'resolved', 'fixed', ?, ?)`).run(Date.now(), Date.now());
+      const expected = getReviewerScorecard(args);
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_reviewer_scorecard", {
+        caller: { kind: "human", email: "user@example.com", role: "user", grants: [] }, args,
+      });
+      expect(result).toEqual({ content: [{ type: "text", text: JSON.stringify(expected, null, 2) }] });
+    });
 
   it.each(VARIANTS.map(([label]) => label))("estimates report-card costs from ModelPrices state (%s)", async (label) => {
     const env = environments.get(label)!;

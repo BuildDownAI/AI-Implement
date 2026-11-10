@@ -55,6 +55,7 @@ export function upsertReviewFinding(input: UpsertReviewFindingInput): number {
       line = excluded.line,
       url = excluded.url,
       status = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.status ELSE 'open' END,
+      disposition = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.disposition ELSE NULL END,
       revision = review_findings.revision + 1,
       last_seen_at = excluded.last_seen_at,
       resolved_at = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.resolved_at ELSE NULL END
@@ -91,6 +92,25 @@ export function recordReviewFinding(input: UpsertReviewFindingInput): number {
     .get(input.repo, input.prNumber, findingKey) as { id: number; status: StoredReviewFinding["status"] } | undefined;
   if (existing && existing.status !== "resolved") return existing.id;
   return upsertReviewFinding(input);
+}
+
+/** Records a new dispatch report once, retaining its revision across callback retries. */
+export function recordInternalReviewFinding(input: UpsertReviewFindingInput, dispatchId: string): { id: number; revision: number } {
+  const db = getDb();
+  return db.transaction(() => {
+    const previous = db.prepare(`
+      SELECT r.finding_id AS id, r.revision
+      FROM internal_review_finding_reports r
+      JOIN review_findings f ON f.id = r.finding_id
+      WHERE r.dispatch_id = ? AND f.repo = ? AND f.pr_number = ? AND f.finding_key = ?
+    `).get(dispatchId, input.repo, input.prNumber, stableReviewFindingKey(input)) as { id: number; revision: number } | undefined;
+    if (previous) return previous;
+    const id = recordReviewFinding(input);
+    const { revision } = db.prepare("SELECT revision FROM review_findings WHERE id = ?").get(id) as { revision: number };
+    db.prepare("INSERT INTO internal_review_finding_reports (dispatch_id, finding_id, revision) VALUES (?, ?, ?)")
+      .run(dispatchId, id, revision);
+    return { id, revision };
+  })();
 }
 
 export function upsertReviewFindings(repo: string, prNumber: number, findings: ReviewLedgerFinding[]): number[] {
@@ -136,7 +156,7 @@ export function markReviewFindingsResolvedForPrSeenBefore(
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE repo = ? AND pr_number = ? AND status = 'open' AND last_seen_at <= ? AND finding_key IN (${placeholders})
     `)
     .run(Date.now(), Date.now(), repo, prNumber, seenBefore, ...keys);
@@ -161,7 +181,7 @@ export function markReviewFindingsResolvedByIds(
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE repo = ? AND pr_number = ? AND status = 'open' AND id IN (${placeholders}) AND finding_key IN (${keyPlaceholders})
     `)
     .run(Date.now(), Date.now(), repo, prNumber, ...findingIds, ...keys);
@@ -211,7 +231,7 @@ export function markReviewFindingResolvedIfRevision(id: number, revision: number
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE id = ? AND revision = ? AND status = 'open'
     `)
     .run(Date.now(), Date.now(), id, revision);

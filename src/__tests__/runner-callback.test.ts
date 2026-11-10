@@ -4707,6 +4707,64 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
     expect(fake.recordedCalls().filter((c) => c.method === "postComment" && (c.args[1] as string).includes("deferred"))).toHaveLength(1);
   });
 
+  it.each([
+    ["invalid", "rejected"],
+    ["follow-up", "deferred"],
+  ] as const)("applies %s to internal findings on an initial run using the callback PR", async (disposition, status) => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Handle missing input." };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "another finding remains", prUrl: "https://github.com/org/repo/pull/11",
+        comments: [], internalFindings: [finding],
+        findingDispositions: [{ findingKey: key, disposition, reason: "Outside this issue." }],
+      },
+      secret: SECRET, resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status }]);
+    expect(fake.recordedCalls().filter(c => c.method === "postComment" && (c.args[1] as string).includes("deferred")))
+      .toHaveLength(disposition === "follow-up" ? 1 : 0);
+  });
+
+  it.each([undefined, "invalid", "follow-up", "fixed"] as const)("reopens internal findings reported by a later dispatch with disposition %s", async (disposition) => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Handle missing input.", path: "src/example.ts", line: 4 };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+      });
+      const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+      log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+          failureReason: "another finding remains", prUrl: "https://github.com/org/repo/pull/11",
+          comments: [], internalFindings: [finding],
+          findingDispositions: attempt === 0 || disposition ? [{ findingKey: key, disposition: attempt === 0 ? "fixed" : disposition!, reason: "addressed" }] : [],
+        },
+        secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      });
+      expect(res.status).toBe(200);
+      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{
+        status: attempt === 0 || disposition === "fixed" ? "resolved" : disposition === "invalid" ? "rejected" : disposition === "follow-up" ? "deferred" : "open",
+        revision: attempt + 1,
+      }]);
+      const row = dedup.getDb().prepare("SELECT disposition FROM review_findings WHERE finding_key = ?").get(key);
+      expect(row).toEqual({ disposition: attempt === 0 || disposition === "fixed" ? "fixed" : null });
+    }
+  });
+
   it("rejects on a non-gap-analysis failure outcome too, as long as the job already has a PR", async () => {
     const deferredId = reviewStore.upsertReviewFinding({
       repo: "org/repo",
