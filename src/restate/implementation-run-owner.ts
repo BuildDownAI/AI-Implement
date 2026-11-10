@@ -1,4 +1,5 @@
-import { getJobByDispatchId } from "../log.js";
+import { getJobByDispatchId, incrementStuckAttempts } from "../log.js";
+import { getDb } from "../dedup.js";
 import type { RepoMapping } from "../config.js";
 import { read, release, type DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { implementationIntentStore } from "./implementation-launch-intent.js";
@@ -16,6 +17,7 @@ export interface ImplementationRunOwner {
   finishResult?: ImplementationFinishResult;
   mapping?: RepoMapping;
   flyApp?: string | null;
+  stuckCleanup?: { attempts: number; complete: boolean };
 }
 const key = (dispatchId: string) => `owner:${dispatchId}`;
 export function readImplementationRunOwner(dispatchId: string): ImplementationRunOwner | null {
@@ -62,7 +64,27 @@ export function updateImplementationRunOwner(owner: ImplementationRunOwner): voi
   if (owner.generation !== current.generation || (current.jobId !== null && owner.jobId !== current.jobId)) {
     throw new Error(`implementation execution identity is frozen: ${owner.input.dispatchId}`);
   }
-  implementationIntentStore().replacePrivateOwner(key(owner.input.dispatchId), owner);
+  implementationIntentStore().replacePrivateOwner(key(owner.input.dispatchId), {
+    ...owner, ...(current.stuckCleanup ? { stuckCleanup: current.stuckCleanup } : {}),
+  });
+}
+/** Charge and receipt commit together; a replay resumes the same attempt, even
+ * after parking reset the issue's shared counter. Existing owner fencing applies. */
+export function claimImplementationStuckAttempt(input: ImplementationRunInput): { attempts: number; complete: boolean } {
+  return getDb().transaction(() => {
+    const owner = requireImplementationRunOwner(input);
+    if (owner.stuckCleanup) return owner.stuckCleanup;
+    const stuckCleanup = { attempts: incrementStuckAttempts(input.issueId), complete: false };
+    implementationIntentStore().replacePrivateOwner(key(input.dispatchId), { ...owner, stuckCleanup });
+    return stuckCleanup;
+  })();
+}
+export function completeImplementationStuckCleanup(input: ImplementationRunInput): void {
+  const owner = requireImplementationRunOwner(input);
+  if (!owner.stuckCleanup) throw new Error(`missing implementation retry receipt: ${input.dispatchId}`);
+  implementationIntentStore().replacePrivateOwner(key(input.dispatchId), {
+    ...owner, stuckCleanup: { ...owner.stuckCleanup, complete: true },
+  });
 }
 export function releaseImplementationRunOwner(dispatchId: string, reason: DispatchAdmissionReleaseReason): void {
   const admission = read(dispatchId);

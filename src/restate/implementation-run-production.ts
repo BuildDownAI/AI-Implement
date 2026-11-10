@@ -1,5 +1,5 @@
 import * as restate from "@restatedev/restate-sdk";
-import { requireImplementationRunOwner, updateImplementationRunOwner, readImplementationRunOwner, releaseImplementationRunOwner } from "./implementation-run-owner.js";
+import { requireImplementationRunOwner, updateImplementationRunOwner, readImplementationRunOwner, releaseImplementationRunOwner, claimImplementationStuckAttempt, completeImplementationStuckCleanup } from "./implementation-run-owner.js";
 import { getCommentGapfillLaunch } from "../comment-gapfill-queue.js";
 import { createImplementationGapfillDependencies } from "./implementation-run-gapfill.js";
 import { createHash } from "node:crypto";
@@ -60,7 +60,7 @@ import type {
   prepareImplementationLaunch,
 } from "../implementation-launch.js";
 import type { ImplementationOutcome } from "../implementation-finalize.js";
-import type { StuckWatchdogConfig } from "../stuck-watchdog.js";
+import type { StuckWatchdogConfig, StuckCleanupProgress } from "../stuck-watchdog.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
 import { finishImplementationJob } from "./implementation-run-finish.js";
@@ -128,7 +128,7 @@ export interface ImplementationRunProductionInput {
     job: Job,
     lastRunStatus: string,
     stopRunner?: () => Promise<boolean>,
-    opts?: { ownerCall?: boolean },
+    opts?: { ownerCall?: boolean; stuckCleanup?: StuckCleanupProgress },
   ) => Promise<boolean>;
   /** `reportTerminalJob` from `src/index.ts`, called as an owner call: the completion notice, failure comment, and breaker count. */
   reportTerminalJob: (job: Job) => Promise<void>;
@@ -601,7 +601,13 @@ export function createProductionImplementationRunServices(input: ImplementationR
             if (!owner || owner.input.backend !== backend) throw new Error(`missing implementation stop authority: ${dispatchId}`);
             return stop(owner.input, job.machineId!);
           } : undefined;
-          await input.remediateStuckJob(watchdogConfig, await providerForJob(job), job, reason, stopRunner, { ownerCall: true });
+          await input.remediateStuckJob(watchdogConfig, await providerForJob(job), job, reason, stopRunner, {
+            ownerCall: true,
+            ...(owner ? { stuckCleanup: {
+              claim: () => claimImplementationStuckAttempt(owner.input),
+              complete: () => completeImplementationStuckCleanup(owner.input),
+            } } : {}),
+          });
         },
         clearWorkingState: async (job) => {
           const provider = await providerForJob(job);

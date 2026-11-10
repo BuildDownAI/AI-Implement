@@ -9,6 +9,32 @@ const request = { dispatchId: input.dispatchId, mappingKey: input.teamKey,
   lifecycleOwner: { kind: "restate" as const, attemptId: input.dispatchId }, cap: 1 };
 const modules = { admission: () => import("../dispatch-admission.js"), owner: () => import("../restate/implementation-run-owner.js"), intent: () => import("../restate/implementation-launch-intent.js") };
 
+it("keeps a charged cleanup receipt across stale owner writes and fences replacement generations", async () => {
+  const { modules: m } = await testDb({ modules });
+  m.admission.acquire(request);
+  const before = m.owner.requireImplementationRunOwner(input);
+  expect(m.owner.claimImplementationStuckAttempt(input)).toEqual({ attempts: 1, complete: false });
+  m.owner.completeImplementationStuckCleanup(input);
+  m.owner.updateImplementationRunOwner({ ...before, finalized: true });
+  expect(m.owner.claimImplementationStuckAttempt(input)).toEqual({ attempts: 1, complete: true });
+  m.owner.releaseImplementationRunOwner(input.dispatchId, "finalized");
+  m.admission.acquire(request);
+  expect(() => m.owner.claimImplementationStuckAttempt(input)).toThrow("stale implementation owner");
+  expect((await import("../log.js")).getStuckAttempts(input.issueId)).toBe(1);
+});
+
+it("rolls back the counter if writing its durable owner receipt fails", async () => {
+  const { modules: m } = await testDb({ modules });
+  m.admission.acquire(request);
+  m.owner.requireImplementationRunOwner(input);
+  const db = (await import("../dedup.js")).getDb();
+  db.exec("CREATE TEMP TRIGGER fail_owner_receipt BEFORE UPDATE ON implementation_launch_intent BEGIN SELECT RAISE(ABORT, 'receipt write failed'); END");
+  expect(() => m.owner.claimImplementationStuckAttempt(input)).toThrow("receipt write failed");
+  expect((await import("../log.js")).getStuckAttempts(input.issueId)).toBe(0);
+  db.exec("DROP TRIGGER fail_owner_receipt");
+  expect(m.owner.claimImplementationStuckAttempt(input)).toEqual({ attempts: 1, complete: false });
+});
+
 it("reconstructs a historical reserve outcome without metadata and preserves it across restart", async () => {
   const db = await testDb({ modules });
   expect(db.modules.admission.acquire(request).ok).toBe(true);

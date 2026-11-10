@@ -151,6 +151,11 @@ function imagePullCommentLines(
  * Does NOT stop the runner, update job status, or log — all of which vary
  * between the timeout and failure paths and are handled by each caller.
  */
+export interface StuckCleanupProgress {
+  claim(): { attempts: number; complete: boolean };
+  complete(): void;
+}
+
 async function boundedCleanup(
   config: StuckWatchdogConfig,
   provider: TicketingProvider | null,
@@ -158,8 +163,11 @@ async function boundedCleanup(
   runUrl: string | null,
   lastRunStatus: string,
   imagePullFailure?: ImagePullFailure,
+  progress?: StuckCleanupProgress,
 ): Promise<number> {
-  const attempts = incrementStuckAttempts(job.issueId!);
+  const receipt = progress?.claim();
+  const attempts = receipt?.attempts ?? incrementStuckAttempts(job.issueId!);
+  if (receipt?.complete) return attempts;
   const imagePullGiveUp = isImagePullGiveUp(imagePullFailure, attempts);
 
   if (!imagePullGiveUp && attempts <= STUCK_JOB_MAX_ATTEMPTS) {
@@ -244,6 +252,7 @@ async function boundedCleanup(
     }
   }
 
+  progress?.complete();
   return attempts;
 }
 
@@ -292,6 +301,7 @@ export async function remediateStuckJob(
     /** The `ImplementationRun` workflow running the handling for the job it owns. A Legacy monitor
      *  leaves this unset, because it must never re-arm a job that a workflow owns. */
     ownerCall?: boolean;
+    stuckCleanup?: StuckCleanupProgress;
   },
 ): Promise<boolean> {
   if (!job.issueId) return false;
@@ -368,7 +378,7 @@ export async function remediateStuckJob(
     return stopConfirmed;
   }
 
-  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus, undefined, opts?.stuckCleanup);
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
     if (stopConfirmed && !opts?.ownerCall) {
