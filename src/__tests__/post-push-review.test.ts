@@ -1125,6 +1125,39 @@ describe("postPushReviewStep", () => {
     expect(invokePrompt(invoke, 2)).toContain("Same defect");
   });
 
+  it("retains advisory internal findings when a matching gating GitHub finding wins prompt deduplication", async () => {
+    const body = "Use the shared validator for path params.";
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: JSON.stringify([[{ state: "CHANGES_REQUESTED", body: "", user: { login: "reviewer" } }]]), exitCode: 0 };
+      }
+      if (args[0] === "api" && args[1] === "graphql") {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [{ isResolved: false, isOutdated: false, path: "src/routes.ts", line: 88,
+            comments: { nodes: [{ body, author: { login: "reviewer" }, url: "https://example.com/thread" }] } }],
+          pageInfo: { hasNextPage: false },
+        } } } } }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body }] }));
+    const out = await runReview(makeCtx(invoke), {
+      prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "custom-review", gates: false }],
+      trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review")]),
+    }, { report: vi.fn(async () => undefined) });
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invokePrompt(invoke, 1)).toContain("github-review-thread blocking src/routes.ts:88");
+    expect(invokePrompt(invoke, 1)).not.toContain("ai-implement-internal");
+    expect(out.internalFindings).toEqual([expect.objectContaining({
+      source: "ai-implement-internal", reviewerId: "custom-review", severity: "blocking", body,
+    })]);
+  });
+
   it("reports a selected reviewer's own maxTurns when that reviewer exhausts", async () => {
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {

@@ -2127,6 +2127,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       if (selectedReviewerResult.priorLlmFailure) priorLlmFailure = true;
       const gatingIncompleteReviews = selectedReviewerResult.incompleteReviews.filter(review => review.gates);
       const selectedInternalFindings = selectedReviewerResult.findings;
+      // Reporting preserves each internal finding even when prompt deduplication
+      // prefers a gating finding from another reviewer or source.
+      for (const finding of selectedInternalFindings) {
+        internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
+      }
       const verdict = {
         approved: selectedReviewerResult.approved,
         blockingIssues: [] as VerdictReviewIssue[],
@@ -2246,8 +2251,9 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const summaryBlockingGates = reviewProcess.summaryBlockingGates;
       const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
       const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
-      for (const finding of reviewLedger) {
-        if (finding.source === "ai-implement-internal") internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
+      for (const issue of internalIssues) {
+        const finding = reviewIssueToLedgerFinding(issue);
+        internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
       }
       const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
