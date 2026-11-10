@@ -661,6 +661,43 @@ describe("ImplementationRun gap-fill ingress", () => {
     await drain.drainCommentGapfillQueue(optsFor());
     expect(submit).toHaveBeenCalledTimes(1);
   });
+  it("preserves a real reservation refusal before ingress acceptance returns", async () => {
+    seedOrigin();
+    const id = seedItem();
+    const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+    // Start with an already-deferred row and hold time constant to exercise
+    // multiple transitions within the same millisecond.
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    queue.markCommentGapfillProcessed(id, "pending");
+    const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
+    submit.mockImplementation(async (_key, input) => {
+      expect(admission.acquire({ dispatchId: "competing-run", mappingKey: "AII",
+        scope: { kind: "issue", issueScope: "AII", issueId: "other" },
+        kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 }).ok).toBe(true);
+      expect(await deps.reserve(input)).toBe(false);
+      return { status: "accepted" };
+    });
+    await drain.drainCommentGapfillQueue(optsFor(mapping));
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(queue.getCommentGapfillItem(id)?.status).toBe("pending");
+  });
+
+  it.each(["accepted", "conflict"] as const)("preserves workflow queue transitions before %s returns", async (status) => {
+    seedOrigin();
+    for (const workflowStatus of ["pending", "failed", "completed", "dispatched"] as const) {
+      const id = seedItem({ commentId: 9100 + ["pending", "failed", "completed", "dispatched"].indexOf(workflowStatus) });
+      submit.mockImplementationOnce(async () => {
+        queue.markCommentGapfillProcessed(id, workflowStatus);
+        return { status };
+      });
+      await drain.drainCommentGapfillQueue(optsFor());
+      expect(queue.getCommentGapfillItem(id)?.status).toBe(workflowStatus);
+      // Keep a pending row out of subsequent drain iterations.
+      queue.markCommentGapfillProcessed(id, "completed");
+    }
+  });
+
   it("workflow reservation refusal restores an accepted item to pending", async () => {
     seedOrigin();
     const id = seedItem();

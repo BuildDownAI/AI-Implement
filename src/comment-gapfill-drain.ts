@@ -11,7 +11,7 @@ import {
   acquire as acquireAdmission,
   release as releaseAdmission,
 } from "./dispatch-admission.js";
-import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
+import { claimPendingCommentGapfills, markCommentGapfillSubmitted, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, type Job } from "./log.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
@@ -427,7 +427,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         console.log(`[comment-gapfill] Gap-fill for PR #${item.prNumber} skipped: the ImplementationRun service is not registered`);
         continue;
       }
-      markCommentGapfillProcessed(item.id, "dispatched");
+      markCommentGapfillSubmitted(item);
       console.log(`[comment-gapfill] Submitted ImplementationRun for PR #${item.prNumber} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
       if (submitted.status === "conflict") {
         console.log(`[comment-gapfill] Existing ImplementationRun owns dispatch=${dispatchId}`);
