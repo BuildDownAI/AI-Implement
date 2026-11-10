@@ -76,7 +76,7 @@ it("preserves reviewFix in protected delivery and falls back to the managed disp
   const grant = {
     version: 1, audience: "model-auth", grantId: "grant-1", dispatchId: "d-1", projectKey: "AII",
     snapshotId: "snap-1", backend: "fly", expiresAt: Date.now() + 60_000, bearer: "test-bearer-0123456789abcdefghijklmnop",
-    bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 }],
+    bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription" }],
   };
   mocks.bootstrap.mockImplementation(async (args) => ({
     sealed: sealModelAuthBootstrap({ grant, protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: Buffer.alloc(32, 1) } }),
