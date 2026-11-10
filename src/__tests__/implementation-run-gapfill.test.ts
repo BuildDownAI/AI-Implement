@@ -3,6 +3,8 @@ import { makeMapping, makeJob } from "./helpers/builders.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../restate/implementation-run-production.js";
 vi.mock("../agent-run-preparation.js", async original => ({ ...await original<object>(), persistedPreparationState: vi.fn(() => "absent"), loadStoredSnapshot: vi.fn(() => null) }));
+vi.mock("../backend-run.js", () => ({ classifyFlyMachine: vi.fn(async () => "started"), stopBackendRun: vi.fn(async () => true), destroyMachineRecorded: vi.fn(async () => {}) }));
+import { classifyFlyMachine, stopBackendRun, destroyMachineRecorded } from "../backend-run.js";
 const intents = vi.hoisted(() => new Map<string, unknown>());
 // The ordinary launch path now persists its own recovery intent (AII-1555).
 const ordinaryIntents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: boolean }>());
@@ -20,7 +22,7 @@ vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...awa
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => intents.set(id, value)), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
 vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), setJobMachineId: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn(async () => ({ token: "TOKEN-SENTINEL" })) }));
@@ -379,7 +381,8 @@ it("recovers accepted dispatch after insert failure using reconstructed producti
 it("reconstructs bookkeeping for a reconciled run without staging", async () => {
   runs([88]);
   expect(await d.findExistingRun(run, 1000)).toBe("88");
-  expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "dispatch", contract: undefined }));
+  expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ dispatchId: "dispatch", phase: "gap-analysis" }));
+  expect(vi.mocked(appendLogIfAbsent).mock.calls[0]![0].contract).toBeUndefined();
 });
 
 it("failed adoption snapshot persistence leaves bookkeeping untouched", async () => {
@@ -417,7 +420,7 @@ const containerBackends = ["fly-machines", "local-docker"] as const;
 function configureContainer() {
   Object.assign(input.config, { flySessionsToken: "TOKEN-SENTINEL", flySessionsApp: "sessions", anthropicApiKey: "TOKEN-SENTINEL", sessionImage: "fly-image", localRunnerImage: "local-image" });
   vi.mocked(dispatchFlyGapfill).mockImplementation(async args => {
-    args.onBeforeLaunch({ cpuKind: "shared", cpus: 1, memoryMb: 1024 }, "NONCE-SENTINEL");
+    args.onBeforeLaunch({ cpuKind: "shared", cpus: 1, memoryMb: 1024 }, "NONCE-SENTINEL", "resolved-image");
     return { machine: { id: "machine", name: args.runName! }, resolvedImage: "resolved-image" };
   });
   vi.mocked(dispatchLocalGapfill).mockImplementation(async args => {
@@ -458,7 +461,7 @@ it.each(containerBackends.flatMap(backend => [false, true].flatMap(started => (b
   configureContainer();
   const decision = { kind: "launch", dispatchId: run.dispatchId } as ManagedDispatchDecision;
   vi.mocked(resolveManagedDecision).mockResolvedValueOnce(decision as never);
-  if (backend === "fly-machines") vi.mocked(dispatchFlyGapfill).mockImplementationOnce(async args => { if (started) args.onBeforeLaunch({ cpuKind: "shared", cpus: 1, memoryMb: 1024 }, "NONCE-SENTINEL"); throw new Error(error); });
+  if (backend === "fly-machines") vi.mocked(dispatchFlyGapfill).mockImplementationOnce(async args => { if (started) args.onBeforeLaunch({ cpuKind: "shared", cpus: 1, memoryMb: 1024 }, "NONCE-SENTINEL", "resolved-image"); throw new Error(error); });
   else vi.mocked(dispatchLocalGapfill).mockImplementationOnce(async args => { if (started) args.onBeforeLaunch?.("NONCE-SENTINEL"); throw new Error(error); });
   const outcome = !started || error.includes("422") ? "rejected" : "unknown";
   expect(await d.launch({ ...run, backend })).toEqual({ outcome });
@@ -484,17 +487,63 @@ it.each(containerBackends.flatMap(backend => ["row", "exact", "missing"].map(sou
   if (source === "row") { expect(listMachines).not.toHaveBeenCalled(); expect(findLocalContainerIdByName).not.toHaveBeenCalled(); }
   if (source === "exact") expect(setJobMachineId).toHaveBeenCalledWith(7, "machine");
 });
-it("lost Fly ack reconciles exact name after dependency reconstruction without relaunch", async () => {
+it.each(["accepted", "lost-ack", "crash-before-row"])("Fly %s recovery keeps the original app and resolved image", async mode => {
   configureContainer();
-  vi.mocked(dispatchFlyGapfill).mockImplementationOnce(async args => { args.onBeforeLaunch({ cpuKind: "shared", cpus: 1, memoryMb: 1024 }, "NONCE-SENTINEL"); throw new Error("transport lost ack"); });
+  vi.mocked(dispatchFlyGapfill).mockImplementationOnce(async args => {
+    args.onBeforeLaunch({ cpuKind: "shared", cpus: 1, memoryMb: 1024 }, "NONCE-SENTINEL", "repository-override");
+    if (mode === "lost-ack") throw new Error("transport lost ack");
+    return { machine: { id: "same-machine", name: args.runName! }, resolvedImage: "repository-override" };
+  });
+  if (mode === "crash-before-row") vi.mocked(appendLogIfAbsent).mockImplementationOnce(() => { throw new Error("crash before insert"); });
   const req = { ...run, backend: "fly-machines" as const };
-  expect(await d.launch(req)).toEqual({ outcome: "unknown" });
+  if (mode === "crash-before-row") await expect(d.launch(req)).rejects.toThrow("crash before insert");
+  else expect(await d.launch(req)).toEqual(mode === "accepted" ? { outcome: "accepted", jobId: "same-machine" } : { outcome: "unknown" });
+  expect(intents.get(run.dispatchId)).toMatchObject({ flyApp: "sessions", record: { sessionImage: "repository-override" } });
+  input.config.flySessionsApp = "changed-app";
+  input.config.sessionImage = "changed-image";
   createProductionImplementationRunServices(input);
   const recovered = captured.deps as ImplementationRunDependencies;
   vi.mocked(listMachines).mockResolvedValueOnce([{ id: "same-machine", name: "gap-fill-dispatch" }] as never);
+  vi.mocked(appendLogIfAbsent).mockClear();
+  if (mode === "accepted") vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "same-machine" }));
   expect(await recovered.findExistingRun(req, 1000)).toBe("same-machine");
+  if (mode !== "accepted") {
+    expect(listMachines).toHaveBeenLastCalledWith("TOKEN-SENTINEL", "sessions");
+    expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ sessionImage: "repository-override" }));
+  }
+  vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "same-machine", executionMode: "fly-machines", status: "running", approved: false, failure: null, failureCommentedAt: null, conclusion: null, groupingParent: false }));
+  vi.mocked(input.remediateStuckJob).mockImplementationOnce(async (_config, _provider, _job, _reason, stopRunner) => {
+    expect(await stopRunner!()).toBe(true);
+    return true;
+  });
+  await recovered.finishJob!(req.dispatchId, { kind: "deadline" });
+  expect(stopBackendRun).toHaveBeenLastCalledWith(expect.objectContaining({ flySessionsApp: "sessions" }), "fly-machines", "same-machine");
+  await recovered.readStatus(req, "same-machine");
+  await recovered.stop(req, "same-machine");
+  await recovered.cleanup(req, "same-machine");
+  expect(classifyFlyMachine).toHaveBeenLastCalledWith(expect.objectContaining({ flySessionsApp: "sessions" }), "same-machine");
+  expect(stopBackendRun).toHaveBeenLastCalledWith(expect.objectContaining({ flySessionsApp: "sessions" }), "fly-machines", "same-machine");
+  expect(destroyMachineRecorded).toHaveBeenLastCalledWith(expect.objectContaining({ flySessionsApp: "sessions" }), "same-machine", "monitor-stopped");
   expect(await recovered.launch(req)).toEqual({ outcome: "unknown" });
   expect(dispatchFlyGapfill).toHaveBeenCalledTimes(1);
+});
+it("local fallback image is persisted before an ambiguous launch and recovered", async () => {
+  configureContainer();
+  Object.assign(input.config, { localRunnerImage: undefined });
+  vi.mocked(dispatchLocalGapfill).mockImplementationOnce(async args => {
+    expect(args.image).toBe("ai-implement-runner:local");
+    args.onBeforeLaunch!("NONCE-SENTINEL");
+    throw new Error("lost ack");
+  });
+  const req = { ...run, backend: "local-docker" as const };
+  expect(await d.launch(req)).toEqual({ outcome: "unknown" });
+  expect(intents.get(run.dispatchId)).toMatchObject({ record: { sessionImage: "ai-implement-runner:local" } });
+  input.config.localRunnerImage = "changed";
+  createProductionImplementationRunServices(input);
+  vi.mocked(findLocalContainerIdByName).mockResolvedValueOnce("same-container");
+  vi.mocked(appendLogIfAbsent).mockClear();
+  expect(await (captured.deps as ImplementationRunDependencies).findExistingRun(req, 1000)).toBe("same-container");
+  expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ sessionImage: "ai-implement-runner:local" }));
 });
 
 import { testDb } from "./helpers/test-db.js";

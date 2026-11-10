@@ -343,7 +343,7 @@ describe("ImplementationRun durable workflow", () => {
       expect(args.runToken).toBe(SECRET_TOKEN);
       expect(args.decision).toBe(decision);
       expect(args.decision.kind === "launch" && args.decision.takeBootstrap()!.bearer).toBe(bootstrap);
-      args.onBeforeLaunch({} as never, nonce);
+      args.onBeforeLaunch({} as never, nonce, "runner:test");
       return { machine: { id: "fly-gapfill", nonce, bootstrap }, resolvedImage: "runner:test" } as unknown as Awaited<ReturnType<typeof gapfillLaunch.dispatchFlyGapfill>>;
     });
     const local = vi.spyOn(localGapfill, "dispatchLocalGapfill").mockImplementation(async args => {

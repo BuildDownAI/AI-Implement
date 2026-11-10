@@ -36,6 +36,17 @@ it("preserves defaults and returns only safe machine identity", async () => {
   expect(decodeRunConfig(config.config.env.AI_IMPLEMENT_RUN_CONFIG)).not.toHaveProperty("reviewFix");
   expect(result).toEqual({ machine: { id: "m", name: "session-aii-1" }, resolvedImage: "runner:latest" });
 });
+it("passes the resolved repository image to persistence before creating the machine", async () => {
+  const { resolveSessionImage } = await import("../repo-image.js");
+  vi.mocked(resolveSessionImage).mockResolvedValueOnce({ image: "repo:override", source: "override" });
+  const onBeforeLaunch = vi.fn();
+  mocks.create.mockImplementationOnce(async (_token, _app, config) => {
+    expect(onBeforeLaunch).toHaveBeenCalledWith(expect.any(Object), expect.any(String), "repo:override");
+    expect(config.config.image).toBe("repo:override");
+    throw new Error("lost acknowledgement");
+  });
+  await expect(dispatchFlyGapfill(input({ onBeforeLaunch }))).rejects.toThrow("lost acknowledgement");
+});
 it("carries the run name, dispatch metadata and backend-aware marker", async () => {
   const reviewFix = makeReviewFixRunConfig({ executionBackend: "fly-machines" }).reviewFix;
   await dispatchFlyGapfill(input({ runName: "review-d-1", dispatchId: "d-1", reviewFix }));

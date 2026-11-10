@@ -124,14 +124,15 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         if (run.backend === "fly-machines" && !staged && !row && (!config.flySessionsToken || !config.flySessionsApp)) return null;
         const name = `gap-fill-${run.dispatchId}`;
         const id = run.backend === "fly-machines"
-          ? (await listMachines(config.flySessionsToken!, config.flySessionsApp!)).find(machine => machine.name === name)?.id ?? null
+          ? (await listMachines(config.flySessionsToken!, staged?.flyApp ?? config.flySessionsApp!)).find(machine => machine.name === name)?.id ?? null
           : await findLocalContainerIdByName(name);
         if (!id) return null;
         if (!staged) {
           const record = await launchRecord(run, undefined, undefined, adoptionMapping);
           stageCommentGapfillLaunch(run.dispatchId, { record: { ...record, computeStartedAt: Date.now(),
-            sessionImage: run.backend === "fly-machines" ? config.sessionImage : config.localRunnerImage },
-            target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, accepted: true });
+            sessionImage: run.backend === "fly-machines" ? config.sessionImage : (config.localRunnerImage ?? "ai-implement-runner:local") },
+            target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+            ...(run.backend === "fly-machines" ? { flyApp: config.flySessionsApp! } : {}), accepted: true });
         }
         confirmCommentGapfillLaunch(run.dispatchId);
         await recordLaunch(run, undefined, row, undefined, id);
@@ -264,15 +265,18 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         return { outcome: "rejected" };
       }
       if (run.backend !== "github-actions") {
+        const flyApp = config.flySessionsApp;
+        const localImage = config.localRunnerImage ?? "ai-implement-runner:local";
         let launchStarted = false;
         let privateRecord: Parameters<typeof appendLogIfAbsent>[0] = { ...record,
-          sessionImage: run.backend === "fly-machines" ? config.sessionImage : config.localRunnerImage };
+          sessionImage: run.backend === "fly-machines" ? config.sessionImage : localImage };
         // The insert-once private intent captures the nonce at the launch boundary;
         // only the outcome and backend id may leave this step for Restate.
         const onBeforeLaunch = (nonce: string) => {
           privateRecord = { ...privateRecord, machineNonce: nonce, computeStartedAt: Date.now() };
           stageCommentGapfillLaunch(run.dispatchId, { record: privateRecord,
-            target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, accepted: false });
+            target: { owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile },
+            ...(run.backend === "fly-machines" ? { flyApp: flyApp! } : {}), accepted: false });
           launchStarted = true;
         };
         let machineId: string;
@@ -285,11 +289,11 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           if (run.backend === "fly-machines") {
             const result = await dispatchFlyGapfill({ ...common, issue, owner: mapping.owner, repo: mapping.repo,
               issueIdentifier: run.issueIdentifier, scopeKey: run.teamKey, allTeamKeys: Object.keys(getMappings()),
-              flySessionsToken: config.flySessionsToken!, flySessionsApp: config.flySessionsApp!,
+              flySessionsToken: config.flySessionsToken!, flySessionsApp: flyApp!,
               flySessionsRegion: config.flySessionsRegion, flyOrchestratorApp: config.flyOrchestratorApp,
               sessionImage: config.sessionImage, runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
               tenantId: config.tenantId, anthropicApiKey: config.anthropicApiKey, claudeOAuthToken: config.claudeOAuthToken,
-              decision, onBeforeLaunch: (size, nonce) => { privateRecord.machineSize = size; onBeforeLaunch(nonce); } });
+              decision, onBeforeLaunch: (size, nonce, image) => { privateRecord.machineSize = size; privateRecord.sessionImage = image; onBeforeLaunch(nonce); } });
             machineId = result.machine.id;
             privateRecord.sessionImage = result.resolvedImage;
           } else {
@@ -297,7 +301,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
             const result = await dispatchLocalGapfill({ ...common,
               issue: { id: issue.issueId, identifier: issue.issueIdentifier, title: issue.issueTitle ?? issue.issueId,
                 description: issue.issueTitle ?? issue.issueId },
-              image: config.localRunnerImage ?? "ai-implement-runner:local", orchestratorUrl: modelAuthUrl,
+              image: localImage, orchestratorUrl: modelAuthUrl,
               anthropicApiKey: decision.kind === "launch" ? undefined : config.anthropicApiKey,
               claudeOAuthToken: decision.kind === "launch" ? undefined : config.claudeOAuthToken,
               retryPolicy: getRetryPolicy(), onBeforeLaunch,

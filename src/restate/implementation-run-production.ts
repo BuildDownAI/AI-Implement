@@ -250,6 +250,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   function backendConfig(run: ImplementationRunInput): AppConfig {
+    const gapfill = run.gapFill && getCommentGapfillLaunch(run.dispatchId);
+    if (gapfill?.flyApp) return { ...config, flySessionsApp: gapfill.flyApp };
     const intent = implementationIntentStore().read<Intent>(run.dispatchId);
     return intent ? { ...config, flySessionsApp: intent.snapshot.flyApp } : config;
   }
@@ -577,7 +579,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
           input.finalizeImplementation(finalOutcome, await providerForJob(job), watchdogConfig, job, { ownerCall: true }),
         remediateStuck: async (job, reason) => {
           const backend = job.executionMode === GHA_BACKEND || !job.machineId ? undefined : job.executionMode;
-          const stopRunner = backend ? () => stopBackendRun(config, backend, job.machineId!) : undefined;
+          const flyApp = getCommentGapfillLaunch(dispatchId)?.flyApp ?? implementationIntentStore().read<Intent>(dispatchId)?.snapshot.flyApp ?? config.flySessionsApp;
+          const stopRunner = backend ? () => stopBackendRun({ ...config, flySessionsApp: flyApp }, backend, job.machineId!) : undefined;
           await input.remediateStuckJob(watchdogConfig, await providerForJob(job), job, reason, stopRunner, { ownerCall: true });
         },
         clearWorkingState: async (job) => {
