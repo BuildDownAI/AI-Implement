@@ -76,12 +76,14 @@ import {
  *  in `workflows/claude-implement.yml` for a run with no attempt token; a test reads that file and fails on a drift. */
 export const IMPLEMENTATION_RUN_TITLE_PREFIX = "Claude AI Implementation — ";
 
-/** `launchContext` keys the submitter sets for the launch (both optional). The submitter resolves the base
+/** Optional `launchContext` keys the submitter sets for the launch. The submitter resolves the base
  *  branch (field value, feature-branch chain, mapping default) once at dispatch; the launch never recomputes it. */
 export const IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY = "baseBranch";
 export const IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY = "baseBranchFieldValue";
 /** The global runner mode at dispatch, recorded on the job row. Absent: the mode at launch time. */
 export const IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY = "runnerMode";
+/** The poll's classification survives providers that omit hierarchy on findByKey. */
+export const IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY = "groupingParent";
 
 const GHA_BACKEND = "github-actions";
 type ContainerBackend = "fly-machines" | "local-docker";
@@ -214,6 +216,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     baseBranch: string;
     baseBranchFieldValue: string | null;
     runnerMode: string;
+    groupingParent: boolean;
     managedRuntime: ReturnType<typeof getModelAuthRuntime>;
     managedDecision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
   };
@@ -243,7 +246,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
   function saveIntent(run: ImplementationRunInput, ctx: Prelaunch, metadata: Omit<LaunchMetadata, "ghToken">) {
     implementationIntentStore().write(run.dispatchId, {
       context: { mapping: recoveryMapping(ctx.mapping), issue: ctx.issue, generation: ctx.generation, baseBranch: ctx.baseBranch, baseBranchFieldValue: ctx.baseBranchFieldValue, runnerMode: ctx.runnerMode },
-      metadata, accounting: trackerAccounting(ctx.mapping, ctx.provider, ctx.issue), groupingParent: input.isGroupingParentDispatch(ctx.issue),
+      metadata, accounting: trackerAccounting(ctx.mapping, ctx.provider, ctx.issue), groupingParent: ctx.groupingParent,
       dispatchedAt: readAdmission(run.dispatchId)?.createdAt ?? Date.now(), flyApp: config.flySessionsApp,
     } satisfies Intent);
   }
@@ -333,6 +336,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
       baseBranch: run.launchContext[IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY] || mapping.defaultBranch,
       baseBranchFieldValue: run.launchContext[IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY] || null,
       runnerMode: run.launchContext[IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY] || getRunnerMode().mode,
+      groupingParent: run.launchContext[IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY] === undefined
+        ? input.isGroupingParentDispatch(issue)
+        : run.launchContext[IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY] === "true",
     };
   }
 
@@ -410,7 +416,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
       }
       const args = {
         modelPrices, config, issue, mapping, baseBranch: ctx.baseBranch,
-        isGroupingParentDispatch: input.isGroupingParentDispatch,
+        isGroupingParentDispatch: () => ctx.groupingParent,
         input: {
           containerName: implementationLocalContainerName(run.dispatchId),
           sessionToken, machineNonce, runnerCallbackUrl,
@@ -504,7 +510,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         modelPrices, config, issue: ctx.issue, mapping: ctx.mapping, dispatchId: run.dispatchId,
         baseBranch: ctx.baseBranch, managedDecision: ctx.managedDecision, managedRuntime: ctx.managedRuntime,
         resolveRunnerImage: input.resolveRunnerImage,
-        isGroupingParentDispatch: input.isGroupingParentDispatch,
+        isGroupingParentDispatch: () => ctx.groupingParent,
       });
     } catch (err) {
       console.error(`[implementation-run] launch preparation failed dispatch=${run.dispatchId}:`, err);
