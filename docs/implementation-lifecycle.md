@@ -230,6 +230,11 @@ owner/backend, and retains on active/unknown/unreadable evidence. Confirmed end
 runs unfinished finalization, cleanup and outcome reporting before exact-generation
 release. Successful finalization and its result are persisted, so a later
 bookkeeping failure can retry without spending the stuck-attempt budget again.
+Deadline remediation commits its retry charge and private owner receipt in one
+SQLite transaction before awaiting tracker bookkeeping. Recovery resumes that
+same charge, including the original give-up decision after parking resets the
+shared counter. A completed cleanup receipt also survives later owner updates;
+no schema change or new retry budget is introduced.
 Cancellation escape persists its original finish intent before any backend search
 or stop; a second cancellation during that work cannot turn later no-callback
 recovery into `ended_without_callback`. The first intent wins, preserving deadline

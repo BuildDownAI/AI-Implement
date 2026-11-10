@@ -227,6 +227,8 @@ export function requeueGapfillAfterPushFailure(repoFull: string, prNumber: numbe
 export interface CommentGapfillLaunch {
   record: Parameters<typeof import("./log.js").appendLogIfAbsent>[0];
   target: { owner: string; repo: string; workflowFile: string };
+  /** Frozen Fly identity; optional for GHA, Docker and older intents. */
+  flyApp?: string;
   accepted: boolean;
   rejected?: { status: number };
 }

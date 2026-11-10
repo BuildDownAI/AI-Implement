@@ -255,6 +255,8 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   function backendConfig(run: ImplementationRunInput): AppConfig {
+    const gapfill = run.gapFill && getCommentGapfillLaunch(run.dispatchId);
+    if (gapfill?.flyApp) return { ...config, flySessionsApp: gapfill.flyApp };
     const intent = implementationIntentStore().read<Intent>(run.dispatchId);
     const preparation = implementationIntentStore().readPreparation(run.dispatchId);
     const owner = readImplementationRunOwner(run.dispatchId);
