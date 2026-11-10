@@ -2571,7 +2571,7 @@ describe("handleRunnerResult — gap-analysis disposition-gated resolution", () 
   const countLines = (spy: { mock: { calls: unknown[][] } }) =>
     spy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("[runner-callback] gap-analysis findings"));
 
-  it("snapshot path: resolves fixed/invalid, leaves the undisposed finding open, defers follow-up", async () => {
+  it("snapshot path: resolves fixed, rejects invalid, leaves the undisposed finding open, defers follow-up", async () => {
     const a = seed("a");
     const b = seed("b");
     const c = seed("c");
@@ -2596,9 +2596,9 @@ describe("handleRunnerResult — gap-analysis disposition-gated resolution", () 
     }
     expect(res.status).toBe(200);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("resolved=2 deferred_on_pr=1 left_open=1");
+    expect(lines[0]).toContain("resolved=1 deferred_on_pr=1 rejected=1 left_open=1");
     expect(status(a.id)).toBe("resolved");
-    expect(status(b.id)).toBe("resolved");
+    expect(status(b.id)).toBe("rejected");
     expect(status(c.id)).toBe("open");
     expect(status(d.id)).toBe("deferred");
     expect(status(outside.id)).toBe("open");
@@ -2626,9 +2626,9 @@ describe("handleRunnerResult — gap-analysis disposition-gated resolution", () 
     }
     expect(res.status).toBe(200);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("resolved=2 deferred_on_pr=0 left_open=1");
+    expect(lines[0]).toContain("resolved=1 deferred_on_pr=0 rejected=1 left_open=1");
     expect(status(a.id)).toBe("resolved");
-    expect(status(b.id)).toBe("resolved");
+    expect(status(b.id)).toBe("rejected");
     expect(status(c.id)).toBe("open");
     expect(status(late.id)).toBe("open");
   });
@@ -4705,6 +4705,49 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
     expect(res.status).toBe(200);
     expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [deferredKey])[0]?.status).toBe("deferred");
     expect(fake.recordedCalls().filter((c) => c.method === "postComment" && (c.args[1] as string).includes("deferred"))).toHaveLength(1);
+  });
+
+  it("rejects on a non-gap-analysis failure outcome too, as long as the job already has a PR", async () => {
+    const deferredId = reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 11,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const deferredKey = reviewStore.listOpenReviewFindings("org/repo", 11).find((f) => f.id === deferredId)!.findingKey;
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "still has findings",
+        prUrl: "https://github.com/org/repo/pull/11",
+        comments: [],
+        findingDispositions: [
+          { findingKey: deferredKey, disposition: "invalid", reason: "Not required by this issue." },
+        ],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [deferredKey])[0]?.status).toBe("rejected");
+    expect(fake.recordedCalls().filter((c) => c.method === "postComment" && (c.args[1] as string).includes("deferred"))).toHaveLength(0);
   });
 
   it("logs and swallows a postComment failure for the deferred-findings comment without changing the callback response", async () => {

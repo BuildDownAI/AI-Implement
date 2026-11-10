@@ -6339,7 +6339,7 @@ Checks:
     expect(dispositionsOnlyComment).toBeTruthy();
   });
 
-  it("keeps an invalid disposition's finding gating on the next iteration and does not resolve its thread (AC3)", async () => {
+  it("closes a repeated invalid finding and resolves its thread", async () => {
     writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
     const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
     const cleanInternalReview = { approved: true, findings: [], summary: "No internal issues found.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
@@ -6356,16 +6356,15 @@ Checks:
     const replyBody = replyCall!.find((a) => a.startsWith("body="));
     expect(replyBody).toContain("Not changed: The index already exists.");
     const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-    expect(resolveCall).toBeUndefined();
+    expect(resolveCall).toBeTruthy();
 
-    // Still gating on iteration 2: internal review is clean, so approval hinges entirely on
-    // whether the finding still gates. It does, so the run stops on the review cap instead.
-    expect(out.approved).toBe(false);
+    // A repeated key stays closed on iteration 2.
+    expect(out.approved).toBe(true);
     expect(out.terminationReason).not.toBe("external_review_pending");
     expect(invokePrompt(invoke, 2)).toContain(findingKey);
   });
 
-  it("still stops the loop as no_changes when an invalid disposition leaves the finding gating and the fix pass made no code changes", async () => {
+  it("handles an invalid disposition without code changes", async () => {
     writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
     const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
     const cleanInternalReview = { approved: true, findings: [], summary: "No internal issues found.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
@@ -6382,13 +6381,137 @@ Checks:
       { report: vi.fn(async () => undefined) },
     );
 
-    // The disposition is still processed (reply posted, thread left unresolved)...
+    // Reply and resolve even when there is no code change.
     const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-    expect(resolveCall).toBeUndefined();
-    // ...but since the finding still gates and no code changed, the pass fails as no_changes
-    // rather than silently looping.
-    expect(out.terminationReason).toBe("no_changes");
-    expect(out.approved).toBe(false);
+    expect(resolveCall).toBeTruthy();
+    // The dispositions-only branch re-reviews and approves.
+    expect(out.terminationReason).toBe("approved");
+    expect(out.approved).toBe(true);
+  });
+
+  it.each(["ai-implement", "claude-code-review"] as const)("%s approves a repeated rejected blocker alongside an undisposed minor finding", async (reviewProcess) => {
+    const blocker = { severity: "blocking" as const, body: "The index is missing." };
+    const minor = { severity: "minor" as const, body: "Consider renaming the index." };
+    const key = stableReviewFindingKey({ source: "review-contract", ...blocker });
+    const base = ghSpawnWithOneExternalFinding();
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      if (args.some(arg => arg.includes("commits/deadbeef/check-runs"))) return { stdout: JSON.stringify({ check_runs: [{ name: "Claude Code Review", app: { slug: "claude" }, status: "completed", conclusion: "success" }] }), exitCode: 0 };
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return {
+        stdout: JSON.stringify([{ user: { login: "claude[bot]", type: "Bot" }, body: [
+          "```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings: [blocker, minor] }), "```",
+        ].join("\n") }]), exitCode: 0,
+      };
+      if (args.includes("repos/:owner/:repo/pulls/42/comments?per_page=100")) return { stdout: "[]", exitCode: 0 };
+      // This fixture's unrelated thread must not contribute another open blocker.
+      if (args.some(arg => arg.includes("reviewThreads(first:"))) return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      return base.ghSpawn(args);
+    });
+    let fixPasses = 0;
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        fixPasses++;
+        writeDispositionsFile(workspaceDir, [{ findingKey: key, disposition: "invalid", reason: "The index already exists." }]);
+      }
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn(), reviewProcess }, { report: vi.fn(async () => undefined) });
+    expect(fixPasses).toBe(1);
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("approved");
+    expect(out.findingDispositions).toEqual([{ findingKey: key, disposition: "invalid", reason: "The index already exists." }]);
+    expect(base.ghComments.at(-1)).toContain("The index already exists.");
+    expect(publicationFetch.calls.some(call => JSON.parse(call.body).body.includes("second review approved"))).toBe(true);
+  });
+
+  it.each(["repeat", "none", "new"] as const)("rejects a thread finding with %s findings on the new head", async (next) => {
+    const base = ghSpawnWithOneExternalFinding();
+    let fixed = false;
+    const ghSpawn = vi.fn((args: string[]) => {
+      const result = base.ghSpawn(args);
+      if (fixed && args[1] === "graphql" && args.some((arg) => arg.includes("reviewThreads(first:"))) {
+        const payload = JSON.parse(result.stdout);
+        const threads = payload.data.repository.pullRequest.reviewThreads;
+        if (next === "none") threads.nodes = [];
+        if (next === "new") threads.nodes[0].comments.nodes[0].body = "A different defect.";
+        return { ...result, stdout: JSON.stringify(payload) };
+      }
+      return result;
+    });
+    const clean = { approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
+        fixed = true;
+      }
+      return structuredReviewResult(clean);
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(next !== "new");
+    const terminal = base.ghComments.at(-1)!;
+    expect(terminal).toContain("Rejected by the fix pass");
+    expect(terminal).toContain(findingKey);
+    expect(terminal).toContain("The index already exists.");
+    expect(publicationFetch.calls.some(call => JSON.parse(call.body).body.includes("second review approved"))).toBe(next !== "new");
+  });
+
+  it.each([false, true])("retains every rejection across two fix cycles (terminal blocker=%s)", async (blocked) => {
+    const bodies = ["Validate path params.", "Check database permissions."];
+    const reasons = ["Validation already happens upstream.", "The database enforces permissions."];
+    const keys = bodies.map(body => stableReviewFindingKey({ source: "claude-review-summary", severity: "blocking", body }));
+    let fixCycles = 0;
+    const comments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        // The next review repeats earlier rejected keys while adding a distinct finding.
+        const reported = bodies.slice(0, Math.min(fixCycles + 1, 2));
+        return { stdout: JSON.stringify([{ user: { login: "claude" }, body: `### Code Review\n\n## Blocking\n${reported.map(body => `- ${body}`).join("\n")}` }]), exitCode: 0 };
+      }
+      if (args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        writeDispositionsFile(workspaceDir, [{ findingKey: keys[fixCycles], disposition: "invalid", reason: reasons[fixCycles] }]);
+        fixCycles++;
+      }
+      const gates = blocked && fixCycles >= 2;
+      return structuredReviewResult({ approved: !gates, findings: gates ? [{ severity: "blocking", body: "Independent defect." }] : [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn: makeGitSpawn(), reviewers: [{ id: "code-review", gates: true }, { id: "claude-review-summary", gates: true }] }, { report: vi.fn(async () => undefined) });
+    expect(fixCycles).toBe(2);
+    expect(out.approved).toBe(!blocked);
+    const terminal = comments.at(-1)!;
+    expect(terminal).toContain("Rejected by the fix pass");
+    for (let i = 0; i < keys.length; i++) {
+      expect(terminal).toContain(keys[i]);
+      expect(terminal).toContain(reasons[i]);
+    }
+  });
+
+  it.each([false, true])("shows summary-only rejection without thread mutations (internal blocker=%s)", async (blocked) => {
+    const summaryBody = "Validate path params before database access.";
+    const key = stableReviewFindingKey({ source: "claude-review-summary", severity: "blocking", body: summaryBody });
+    const comments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return { stdout: JSON.stringify([{ user: { login: "claude" }, body: `### Code Review\n\n## Blocking\n- ${summaryBody}` }]), exitCode: 0 };
+      if (args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) writeDispositionsFile(workspaceDir, [{ findingKey: key, disposition: "invalid", reason: "Validation already happens upstream." }]);
+      return structuredReviewResult({ approved: !blocked, findings: blocked ? [{ severity: "blocking", body: "Independent defect." }] : [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn(), reviewers: [{ id: "code-review", gates: true }, { id: "claude-review-summary", gates: true }] }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(!blocked);
+    for (const comment of [comments.find(c => c.includes("fix-complete"))!, comments.at(-1)!]) {
+      expect(comment).toContain("Rejected by the fix pass");
+      expect(comment).toContain(key);
+      expect(comment).toContain("Validation already happens upstream.");
+    }
+    expect(ghSpawn.mock.calls.some(([args]) => args.some(a => a.includes("addPullRequestReviewThreadReply") || a.includes("resolveReviewThread")))).toBe(false);
   });
 
   it("posts no thread reply and deletes nothing when the fix-pass push fails (AC7)", async () => {
@@ -6415,8 +6538,7 @@ Checks:
 
   it("reports one disposition per key in outputs.findingDispositions, with the later one across pushes winning (AC5/AC9)", async () => {
     const { ghSpawn } = ghSpawnWithOneExternalFinding();
-    // Iteration 1's fix pass writes "invalid"; the finding still gates, so a second fix
-    // pass runs and this time writes "follow-up" for the same key — the later read wins.
+    // A fixed finding re-reported by the reviewer requires another fix pass.
     let fixPassCount = 0;
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
@@ -6429,7 +6551,7 @@ Checks:
         fixPassCount++;
         writeDispositionsFile(
           workspaceDir,
-          [{ findingKey, disposition: fixPassCount === 1 ? "invalid" : "follow-up", reason: `pass ${fixPassCount}` }],
+          [{ findingKey, disposition: fixPassCount === 1 ? "fixed" : "follow-up", reason: `pass ${fixPassCount}` }],
         );
       }
       return structuredReviewResult(cleanInternalReview);
@@ -6456,7 +6578,7 @@ Checks:
       .map((line) => JSON.parse(line));
     const fix1 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-1");
     const fix2 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-2");
-    expect(fix1.dispositions).toEqual([{ key: findingKey, disposition: "invalid" }]);
+    expect(fix1.dispositions).toEqual([{ key: findingKey, disposition: "fixed" }]);
     expect(fix2.dispositions).toEqual([{ key: findingKey, disposition: "follow-up" }]);
     expect(fix1.verdict).toMatchObject({ approved: null, reason: "fixed" });
     expect(fix1.outputCommitStatus).toBe("committed");

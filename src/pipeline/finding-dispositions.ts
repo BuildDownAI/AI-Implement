@@ -68,7 +68,7 @@ export function buildDispositionInstructions(): string {
 Give every listed finding exactly one disposition, keyed by its \`findingKey\`, and write a JSON array to \`${DISPOSITIONS_FILE}\`. Each entry has \`findingKey\`, \`disposition\`, and \`reason\`.
 
 - \`fixed\`: you changed the code to address it.
-- \`invalid\`: the finding is wrong about the code. Say why in one sentence.
+- \`invalid\`: the finding is wrong about the code. This closes the finding, including repeat reports with the same key. Use it only when the finding is wrong; explain why in one sentence. The reason is shown to a person in PR comments.
 - \`follow-up\`: the finding asks for behavior the issue does not require. Do not implement it. Say what it asks for in one sentence.
 
 A finding that reports a defect in lines this PR changed is always in scope. It can only be \`fixed\` or \`invalid\`, never \`follow-up\`.
@@ -123,6 +123,7 @@ export function replyToDispositionThreads(ghSpawn: GhSpawn, prNumber: string, di
     } else if (disposition.disposition === "invalid") {
       if (replyToThread(ghSpawn, thread.id, `${DISPOSITION_MARKER}\nNot changed: ${disposition.reason}`)) {
         replied++;
+        resolveThread(ghSpawn, thread.id);
       }
     }
   }
