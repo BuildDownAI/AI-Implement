@@ -1,4 +1,5 @@
 /** Fresh, attempt-owned containers using the established gap-fill transports (ADR 037). */
+import { redactAndCap } from "./pipeline/failure-classification.js";
 import { createHash } from "node:crypto";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { getDb } from "./dedup.js";
@@ -36,6 +37,28 @@ function containerName(attemptId: string): string {
   return `review-fix-${createHash("sha256").update(attemptId).digest("hex").slice(0, 48)}`;
 }
 
+/** Project evidence, never copy error text: bodies can echo tasks and one-shot credentials.
+ * Only called after ownership checks confirm a definitive rejection.
+ */
+function rejectionReason(backend: "fly-machines" | "local-docker", started: boolean, err: unknown): string {
+  let phase = "preparation";
+  let category = "PREPARATION_FAILED";
+  let explanation = "launch preparation failed";
+  if (backend === "fly-machines" && started && err instanceof Error) {
+    phase = "create";
+    const status = /\((\d{3})\)/.exec(err.message)?.[1];
+    category = status ? `HTTP_${status}` : "CREATE_REJECTED";
+    explanation = status === "401" || status === "403" ? "Fly authorization refused"
+      : status === "400" || status === "422" ? "Fly request validation refused"
+      : "Fly service refused machine creation";
+    // Recognize causes without retaining any backend-supplied values or fields.
+    if (status !== "401" && status !== "403" && /image.*(?:not found|unauthorized|invalid)|(?:invalid|unknown) image/i.test(err.message)) {
+      explanation = "Fly image validation refused";
+    }
+  }
+  return redactAndCap(`${backend} ${phase} rejected [${category}]: ${explanation}`, 320);
+}
+
 export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
   private readonly scopes;
   constructor(private readonly deps: ContainerReviewFixWorkerDeps) {
@@ -70,7 +93,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
         if (!runtime) return { status: "unknown" };
         decision = await prepareManagedDispatch({ dispatchId: plan.attemptId, projectKey: teamKey,
           backend, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, runtime);
-        if (decision.kind === "refuse") return { status: "rejected", reason: "Managed container review-fix preparation refused" };
+        if (decision.kind === "refuse") return { status: "rejected", reason: `${backend} preparation rejected [MANAGED_REFUSED]: managed dispatch preparation refused` };
         if (decision.kind !== "launch") return { status: "unknown" };
       }
       const runName = containerName(plan.attemptId);
@@ -121,7 +144,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
         } catch { status = "unknown"; }
       }
       if (runtime) settleLaunch(decision, created ? "accepted" : status, runtime);
-      return status === "rejected" ? { status, reason: "Container review-fix launch rejected" } : { status };
+      return status === "rejected" ? { status, reason: rejectionReason(backend, started, err) } : { status };
     }
   };
   reconcile: ReviewFixWorkerPort["reconcile"] = async (attemptId, scope) => {

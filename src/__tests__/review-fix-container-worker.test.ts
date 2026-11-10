@@ -288,11 +288,38 @@ for (const status of [400, 503, null]) it(`Fly launch error ${status}`, async ()
   expect(s.log.getJobByNonce("sentinel-nonce")).toEqual(status === 400 ? null : row);
   expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
 });
+for (const status of [400, 401, 403, 422]) it(`retains safe Fly create evidence for ${status}`, async () => {
+  const s = await setup("fly-machines");
+  const logs = ["log", "warn", "error"].map(method => vi.spyOn(console, method as "log" | "warn" | "error").mockImplementation(() => {}));
+  const secrets = ["sentinel-github", "sentinel-result", "sentinel-progress", "sentinel-publication", "sentinel-api", "sentinel-oauth", "sentinel-bootstrap"];
+  vi.mocked(s.fly.createMachine).mockRejectedValue(new Error(`Failed to create machine in sessions (${status}): invalid config: {"task":"private-task", "envelope":"private-envelope", "credentials":"${secrets.join(" ")}"}\n${"private-config".repeat(1000)}`));
+  const result = await s.instance.launch(s.plan);
+  expect(result).toMatchObject({ status: "rejected", reason: expect.stringContaining(`fly-machines create rejected [HTTP_${status}]`) });
+  if (result.status === "rejected") {
+    expect(result.reason.length).toBeLessThanOrEqual(320);
+    expect(result.reason).toContain(status === 401 || status === 403 ? "authorization" : "validation");
+  }
+  const evidence = JSON.stringify([result, ...logs.map(log => log.mock.calls)]);
+  for (const secret of [...secrets, "private-task", "private-envelope", "private-config"]) expect(evidence).not.toContain(secret);
+  expect(s.log.getJobByDispatchId(s.plan.attemptId)).toMatchObject({ status: "dispatch-failed", conclusion: "failure", machineNonce: null, machineId: null });
+  expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
+  logs.forEach(log => log.mockRestore());
+});
+for (const backend of backends) it(`${backend} preparation errors omit non-Error payloads`, async () => {
+  const s = await setup(backend);
+  vi.mocked(s.deps.credentials.resolve).mockRejectedValue({ task: "private-task", token: "sentinel-bootstrap" });
+  expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: `${backend} preparation rejected [PREPARATION_FAILED]: launch preparation failed` });
+});
+it("retains an allowlisted Fly image cause without echoed values", async () => {
+  const s = await setup("fly-machines");
+  vi.mocked(s.fly.createMachine).mockRejectedValue(new Error('create (422): image not found: private-image {"task":"private-task"}'));
+  expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: "fly-machines create rejected [HTTP_422]: Fly image validation refused" });
+});
 for (const started of [false, true]) it(`local error ${started ? "after" : "before"} launch boundary`, async () => {
   const s = await setup("local-docker");
   vi.mocked(s.docker.startLocalRunnerContainer).mockImplementation(async input => { if (started) input.onBeforeLaunch?.(); throw new Error("sentinel-bootstrap"); });
   const result = await s.instance.launch(s.plan);
-  expect(result.status).toBe(started ? "unknown" : "rejected");
+  expect(result).toEqual(started ? { status: "unknown" } : { status: "rejected", reason: "local-docker preparation rejected [PREPARATION_FAILED]: launch preparation failed" });
   expect(s.log.getJobByDispatchId(s.plan.attemptId)).toEqual(started ? expect.objectContaining({ status: "dispatched", machineNonce: "sentinel-nonce", completedAt: null }) : null);
   expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
   expect(JSON.stringify(result)).not.toContain("sentinel");
@@ -313,7 +340,7 @@ it("local reconciliation uses Docker's exact-name helper by default", async () =
 it("pre-launch persistence failure prevents external creation", async () => {
   const s = await setup("fly-machines");
   vi.spyOn(s.log, "appendLogIfAbsent").mockImplementationOnce(() => { throw new Error("(400) sentinel-nonce"); });
-  expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: "Container review-fix launch rejected" });
+  expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: "fly-machines preparation rejected [PREPARATION_FAILED]: launch preparation failed" });
   expect(s.fly.createMachine).not.toHaveBeenCalled();
 });
 
@@ -485,6 +512,24 @@ for (const backend of backends) describe(`managed ${backend}`, () => {
     expect(backend === "fly-machines" ? s.fly.createMachine : s.docker.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
     for (const secret of [bearer, "sentinel-api-key", "sentinel-access"])
       expect(JSON.stringify([launchResult, logs.mock.calls, errors.mock.calls, warnings.mock.calls])).not.toContain(secret);
+  });
+  if (backend === "fly-machines") it("omits managed bootstrap and credential payloads from definitive rejection evidence", async () => {
+    const s = await managedSetup(backend, "mixed");
+    const logs = ["log", "warn", "error"].map(method => vi.spyOn(console, method as "log" | "warn" | "error").mockImplementation(() => {}));
+    let bearer = "";
+    vi.mocked(s.fly.createMachine).mockImplementation(async () => {
+      const input = vi.mocked((await import("../fly-protection-key.js")).buildProtectedFlyBootstrap).mock.calls.at(-1)![0];
+      bearer = input.bootstrap.bearer;
+      throw new Error(`create (422): invalid config ${bearer} sentinel-api-key sentinel-access sentinel-bootstrap`);
+    });
+    const result = await s.instance.launch(s.plan);
+    expect(result).toEqual({ status: "rejected", reason: "fly-machines create rejected [HTTP_422]: Fly request validation refused" });
+    expect(bearer).toBeTruthy();
+    const evidence = JSON.stringify([result, ...logs.map(log => log.mock.calls)]);
+    for (const secret of [bearer, "sentinel-api-key", "sentinel-access", "sentinel-bootstrap"]) expect(evidence).not.toContain(secret);
+    expect(s.runtime.preparationDeps).toHaveBeenCalledTimes(1);
+    expect(s.admission.read(s.plan.attemptId)!.releasedAt).toBeNull();
+    logs.forEach(log => log.mockRestore());
   });
   it("refuses a disabled profile without creating an execution", async () => {
     const s = await managedSetup(backend, "api");
