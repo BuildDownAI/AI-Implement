@@ -435,8 +435,9 @@ function internalReviewerGates(
 export const EXTERNAL_REVIEW_PENDING_NEXT_STEP = "Open the pull request's checks to see the external review's status.";
 
 /**
- * `summaryBlockingGates` is set under the Claude Code Review process: a `blocking` finding from a
- * trusted Claude summary (a 🔴 heading) gates there, while minor and medium summary findings stay advisory.
+ * `summaryBlockingGates` is set under AI-Implement and the Claude Code Review processes:
+ * a `blocking` finding from a trusted Claude summary gates approval. Minor findings stay
+ * advisory; medium findings gate only when enabled by the reviewer selection.
  */
 export function isReviewLedgerFindingGating(
   finding: Pick<ReviewLedgerFinding, "source" | "severity" | "reviewerId" | "reviewerProvenance">,

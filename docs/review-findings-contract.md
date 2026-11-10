@@ -211,7 +211,9 @@ does not identify the comment as pipeline-authored.
 The selected trusted review supersedes older comments even when its contract is
 malformed or its review content cannot be parsed. Such a review reports findings
 as unavailable and prevents approval from a successful check alone. Blocking
-contract findings gate even with only a path and no line; minor findings remain
+contract findings gate even with only a path and no line. Recognized blocking
+heading-only findings also gate approval under `ai-implement`, without requiring
+`claude-review-summary` in the reviewer selection; minor findings remain
 advisory. The step logs the selected comment id and parse kind beside its review
 process verdict log. Top-level comments do not supply commit identity. The step uses the single matching
 check with a real review conclusion, fetched from the current head's check-runs
