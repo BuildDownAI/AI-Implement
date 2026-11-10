@@ -348,7 +348,7 @@ re-evaluated on the next poll rather than falling through to a fresh implementat
 unmerged** PR still gets a fresh implementation, on the assumption a human closed it to start over.
 This check only applies to implementation dispatches, never planning.
 
-## Post-run: the drain loop
+## Post-run: the Legacy drain loop
 
 `processReviewFixQueue` runs once per poll tick. For each pending item, in FIFO order:
 
@@ -362,7 +362,7 @@ This check only applies to implementation dispatches, never planning.
 
 A dispatch failure marks the row `failed` and surfaces a notification; the loop continues to the next item rather than aborting.
 
-**The drain loop dispatches through GitHub Actions specifically** — it calls `dispatchWorkflow` directly rather than going through runner-mode resolution. A project running on Fly Machines still gets its review-fix runs on GitHub Actions.
+**The Legacy drain loop dispatches through GitHub Actions specifically** — it calls `dispatchWorkflow` directly. A Fly project using Legacy still gets automatic review-fix runs on GitHub Actions. With the Restate lifecycle, automatic review-fix attempts use the resolved backend: GitHub Actions probes workflow capabilities, while Fly Machines requires an effective sessions app and token and a non-Bedrock provider. The admin save checks Fly configuration (`FLY_SESSIONS_APP` and `FLY_SESSIONS_TOKEN`) without probing a workflow; app configuration comes from the runner backend cache. Both modes retain the healthy, registered Restate endpoint and unreserved-job checks. Local Docker admission uses its configured local runner image (see the [pilot runbook](./restate-review-fix-pilot.md)).
 
 The synthesized issue title is `Review feedback fix for PR #<n>`, and the phase is reported as `gap-analysis` so the ticket's status does not regress to in-progress for what is a follow-up pass.
 
