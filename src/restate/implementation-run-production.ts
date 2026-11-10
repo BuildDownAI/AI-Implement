@@ -1,3 +1,5 @@
+import * as restate from "@restatedev/restate-sdk";
+import { requireImplementationRunOwner, updateImplementationRunOwner, readImplementationRunOwner, releaseImplementationRunOwner, claimImplementationStuckAttempt, completeImplementationStuckCleanup } from "./implementation-run-owner.js";
 import { getCommentGapfillLaunch } from "../comment-gapfill-queue.js";
 import { createImplementationGapfillDependencies } from "./implementation-run-gapfill.js";
 import { createHash } from "node:crypto";
@@ -15,7 +17,7 @@ import type { RepoMapping } from "../config.js";
 import { validateTicketingConfig } from "../providers/ticketing-config.js";
 import { getMappings } from "../config.js";
 import { acquireDispatch } from "../dispatch-gate.js";
-import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
+import { read as readAdmission } from "../dispatch-admission.js";
 import type { AppConfig } from "../index.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
 import { getRunnerMode } from "../runner-mode.js";
@@ -58,12 +60,13 @@ import type {
   prepareImplementationLaunch,
 } from "../implementation-launch.js";
 import type { ImplementationOutcome } from "../implementation-finalize.js";
-import type { StuckWatchdogConfig } from "../stuck-watchdog.js";
+import type { StuckWatchdogConfig, StuckCleanupProgress } from "../stuck-watchdog.js";
 import type { RestateService } from "./endpoint.js";
 import type { OwnedRunStatus } from "./owned-run-wait.js";
 import { finishImplementationJob } from "./implementation-run-finish.js";
 import {
   createImplementationRunWorkflow,
+  implementationRunInputSchema,
   type ImplementationLaunchResult,
   type ImplementationRunDependencies,
   type ImplementationRunInput,
@@ -116,7 +119,7 @@ export interface ImplementationRunProductionInput {
     provider: TicketingProvider | null,
     watchdogConfig: StuckWatchdogConfig,
     job: Job,
-    opts?: { ownerCall?: boolean },
+    opts?: { ownerCall?: boolean; stuckCleanup?: StuckCleanupProgress },
   ) => Promise<void>;
   /** `remediateStuckJob` from `src/stuck-watchdog.ts`. */
   remediateStuckJob: (
@@ -125,7 +128,7 @@ export interface ImplementationRunProductionInput {
     job: Job,
     lastRunStatus: string,
     stopRunner?: () => Promise<boolean>,
-    opts?: { ownerCall?: boolean },
+    opts?: { ownerCall?: boolean; stuckCleanup?: StuckCleanupProgress },
   ) => Promise<boolean>;
   /** `reportTerminalJob` from `src/index.ts`, called as an owner call: the completion notice, failure comment, and breaker count. */
   reportTerminalJob: (job: Job) => Promise<void>;
@@ -246,14 +249,20 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   function frozenMapping(run: ImplementationRunInput): RepoMapping {
-    return implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.context.mapping ?? requireMapping(getMapping, run.teamKey);
+    const mapping = implementationIntentStore().read<Intent>(run.dispatchId)?.snapshot.context.mapping ?? implementationIntentStore().readPreparation(run.dispatchId)?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
+    if (!mapping) throw new Error(`missing frozen implementation target: ${run.dispatchId}`);
+    return mapping;
   }
 
   function backendConfig(run: ImplementationRunInput): AppConfig {
     const gapfill = run.gapFill && getCommentGapfillLaunch(run.dispatchId);
     if (gapfill?.flyApp) return { ...config, flySessionsApp: gapfill.flyApp };
     const intent = implementationIntentStore().read<Intent>(run.dispatchId);
-    return intent ? { ...config, flySessionsApp: intent.snapshot.flyApp } : config;
+    const preparation = implementationIntentStore().readPreparation(run.dispatchId);
+    const owner = readImplementationRunOwner(run.dispatchId);
+    const flyApp = intent ? intent.snapshot.flyApp : preparation ? preparation.flyApp : owner?.flyApp;
+    if (run.backend === "fly-machines" && !flyApp) throw new Error(`missing frozen implementation Fly app: ${run.dispatchId}`);
+    return { ...config, flySessionsApp: flyApp ?? null };
   }
 
   /** Pure eligibility for a new launch; never evidence that an earlier launch is absent. */
@@ -535,6 +544,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   async function readStatus(run: ImplementationRunInput, jobId: string): Promise<OwnedRunStatus> {
+    const owner = requireImplementationRunOwner(run);
+    if (owner.jobId !== null && owner.jobId !== jobId) throw new Error(`implementation run identity mismatch: ${run.dispatchId}`);
+    updateImplementationRunOwner({ ...owner, jobId, state: "launching" });
     let status: OwnedRunStatus;
     if (run.backend === "fly-machines") status = await classifyFlyMachine(backendConfig(run), jobId);
     else if (run.backend === "local-docker") status = await classifyLocalContainer(jobId);
@@ -553,6 +565,9 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   async function stop(run: ImplementationRunInput, jobId: string): Promise<boolean> {
+    const owner = requireImplementationRunOwner(run);
+    if (owner.jobId !== null && owner.jobId !== jobId) throw new Error(`implementation run identity mismatch: ${run.dispatchId}`);
+    updateImplementationRunOwner({ ...owner, jobId, state: "launching" });
     if (containerBackend(run)) return stopBackendRun(backendConfig(run), run.backend, jobId);
     const mapping = (run.gapFill && getCommentGapfillLaunch(run.dispatchId)?.target) || frozenMapping(run);
     return cancelWorkflowRun(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
@@ -565,7 +580,17 @@ export function createProductionImplementationRunServices(input: ImplementationR
   }
 
   async function finishJob(dispatchId: string, outcome: Parameters<NonNullable<ImplementationRunDependencies["finishJob"]>>[1]) {
-    return finishImplementationJob(
+    const owner = readImplementationRunOwner(dispatchId);
+    if (owner?.finalized) return owner.finishResult ?? {};
+    if (owner) updateImplementationRunOwner({ ...owner, finishOutcome: owner.finishOutcome ?? outcome });
+    const ownerOptions = {
+      ownerCall: true,
+      ...(owner ? { stuckCleanup: {
+        claim: () => claimImplementationStuckAttempt(owner.input),
+        complete: () => completeImplementationStuckCleanup(owner.input),
+      } } : {}),
+    };
+    const result = await finishImplementationJob(
       {
         getJob: getJobByDispatchId,
         closeRow: (job, status, conclusion, opts) => updateJobStatus(job.id, status, conclusion, undefined, opts),
@@ -576,12 +601,16 @@ export function createProductionImplementationRunServices(input: ImplementationR
           return state?.merged === true;
         },
         finalize: async (finalOutcome, job) =>
-          input.finalizeImplementation(finalOutcome, await providerForJob(job), watchdogConfig, job, { ownerCall: true }),
+          input.finalizeImplementation(finalOutcome, await providerForJob(job), watchdogConfig, job, ownerOptions),
         remediateStuck: async (job, reason) => {
           const backend = job.executionMode === GHA_BACKEND || !job.machineId ? undefined : job.executionMode;
-          const flyApp = getCommentGapfillLaunch(dispatchId)?.flyApp ?? implementationIntentStore().read<Intent>(dispatchId)?.snapshot.flyApp ?? config.flySessionsApp;
-          const stopRunner = backend ? () => stopBackendRun({ ...config, flySessionsApp: flyApp }, backend, job.machineId!) : undefined;
-          await input.remediateStuckJob(watchdogConfig, await providerForJob(job), job, reason, stopRunner, { ownerCall: true });
+          // The job row alone cannot authorize destruction in the current configured app.
+          // Reuse the exact workflow owner and execution fence, including on retries.
+          const stopRunner = backend ? async () => {
+            if (!owner || owner.input.backend !== backend) throw new Error(`missing implementation stop authority: ${dispatchId}`);
+            return stop(owner.input, job.machineId!);
+          } : undefined;
+          await input.remediateStuckJob(watchdogConfig, await providerForJob(job), job, reason, stopRunner, ownerOptions);
         },
         clearWorkingState: async (job) => {
           const provider = await providerForJob(job);
@@ -589,8 +618,10 @@ export function createProductionImplementationRunServices(input: ImplementationR
         },
       },
       dispatchId,
-      outcome,
+      owner?.finishOutcome ?? outcome,
     );
+    if (owner) updateImplementationRunOwner({ ...owner, finishOutcome: owner.finishOutcome ?? outcome, finalized: true, finishResult: result });
+    return result;
   }
 
   async function cleanup(run: ImplementationRunInput, jobId: string): Promise<void> {
@@ -639,14 +670,39 @@ export function createProductionImplementationRunServices(input: ImplementationR
       backend: run.backend,
       lifecycleOwner: { kind: "restate", attemptId: run.dispatchId },
     }).ok;
+    if (held) {
+      requireImplementationRunOwner(run, "reserved");
+      const owner = requireImplementationRunOwner(run);
+      if (!owner.mapping) updateImplementationRunOwner({ ...owner, mapping: recoveryMapping(mapping), flyApp: config.flySessionsApp });
+    }
     if (held && input.afterReserve) await input.afterReserve(run);
     return held;
   }
 
-  const gapfill = createImplementationGapfillDependencies(input, getMapping);
+  const gapfill = createImplementationGapfillDependencies(input, getMapping, (run, mapping) => {
+    const owner = requireImplementationRunOwner(run);
+    if (!owner.mapping) updateImplementationRunOwner({ ...owner, mapping: recoveryMapping(mapping), flyApp: null });
+  });
   const deps: ImplementationRunDependencies = {
-    reserve: (run) => run.gapFill ? gapfill.reserve(run) : reserve(run),
+    ensureOwner: (run) => {
+      const admission = readAdmission(run.dispatchId);
+      if (admission?.releasedAt === null) requireImplementationRunOwner(run);
+    },
+    recordTerminationIntent: (run, outcome) => {
+      const owner = requireImplementationRunOwner(run);
+      if (!owner.finishOutcome) updateImplementationRunOwner({ ...owner, finishOutcome: outcome });
+    },
+    reserve: async (run) => {
+      const held = run.gapFill ? await gapfill.reserve(run) : await reserve(run);
+      if (held) requireImplementationRunOwner(run);
+      return held;
+    },
     findExistingRun: async (run, dispatchedAt) => {
+      if (readAdmission(run.dispatchId)?.releasedAt === null) {
+        const owner = requireImplementationRunOwner(run);
+        if (owner.state === "closed") return null;
+        if (owner.state === "reserved") updateImplementationRunOwner({ ...owner, state: "launching" });
+      }
       if (run.gapFill) return gapfill.findExistingRun(run, dispatchedAt);
       const stored = implementationIntentStore().read<Intent>(run.dispatchId);
       const preparation = stored ? null : implementationIntentStore().readPreparation(run.dispatchId);
@@ -661,9 +717,12 @@ export function createProductionImplementationRunServices(input: ImplementationR
           throw new Error(`managed preparation identity mismatch: ${run.dispatchId}`);
         }
       }
-      const frozenMapping = stored?.snapshot.context.mapping ?? preparation?.mapping;
-      const flyApp = stored ? stored.snapshot.flyApp ?? config.flySessionsApp : preparation ? preparation.flyApp : config.flySessionsApp;
-      const find = createImplementationFindExistingRun({ getMapping: frozenMapping ? () => frozenMapping : getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: flyApp }) });
+      const frozenMapping = stored?.snapshot.context.mapping ?? preparation?.mapping ?? readImplementationRunOwner(run.dispatchId)?.mapping;
+      const flyApp = backendConfig(run).flySessionsApp;
+      const find = createImplementationFindExistingRun({ getMapping: () => {
+        if (!frozenMapping) throw new Error(`missing frozen implementation target: ${run.dispatchId}`);
+        return frozenMapping;
+      }, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: flyApp }) });
       const id = await find(run, dispatchedAt);
       // Preparation freezes lookup identity, but carries no original callback nonce or
       // accounting authority. A candidate is uncertainty, never an adoptable execution.
@@ -685,6 +744,10 @@ export function createProductionImplementationRunServices(input: ImplementationR
           ...(run.backend === GHA_BACKEND ? { runId: Number(id) } : { machineId: id }),
         });
       }
+      const owner = readImplementationRunOwner(run.dispatchId);
+      if (id !== null && owner && readAdmission(run.dispatchId)?.releasedAt === null) {
+        updateImplementationRunOwner({ ...owner, jobId: id, state: "launching" });
+      }
       return id;
     },
     readModelPrices: async () => {
@@ -695,16 +758,85 @@ export function createProductionImplementationRunServices(input: ImplementationR
       if (!parsed.success || (body.fetchedAt !== null && typeof body.fetchedAt !== "number")) return undefined;
       return { prices: parsed.data.prices, fetchedAt: body.fetchedAt };
     },
-    launch: (run, prices) => run.gapFill ? gapfill.launch(run, prices) : launch(run, prices),
+    launch: async (run, prices) => {
+      let owner;
+      try { owner = requireImplementationRunOwner(run); } catch { return Promise.resolve({ outcome: "unknown" as const }); }
+      if (owner.state === "closed") return Promise.resolve({ outcome: "rejected" as const });
+      updateImplementationRunOwner({ ...owner, state: "launching" });
+      const result = await (run.gapFill ? gapfill.launch(run, prices) : launch(run, prices));
+      const current = requireImplementationRunOwner(run);
+      updateImplementationRunOwner({ ...current, ...(result.jobId ? { jobId: result.jobId } : {}),
+        state: result.outcome === "rejected" ? "closed" : "launching" });
+      return result;
+    },
+    reconcile: async (dispatchId) => {
+      const owner = readImplementationRunOwner(dispatchId);
+      if (!owner) throw new Error(`missing implementation recovery authority: ${dispatchId}`);
+      const admission = readAdmission(dispatchId);
+      if (admission?.releasedAt !== null && admission?.generation === owner.generation) {
+        const reason = admission.releaseReason;
+        return { reason: reason === "cancelled" || reason === "deadline_exceeded" || reason === "launch_rejected" ? reason : "finalized" };
+      }
+      requireImplementationRunOwner(owner.input);
+      if (owner.state === "reserved" || owner.state === "closed") {
+        updateImplementationRunOwner({ ...owner, state: "closed" });
+        releaseImplementationRunOwner(dispatchId, "launch_rejected");
+        return { reason: "launch_rejected" };
+      }
+      // Historical journals may have no frozen target yet. Recover only from original
+      // launch/preparation evidence or an exact-generation job; current settings are not evidence.
+      const intent = implementationIntentStore().read<Intent>(dispatchId);
+      const preparation = implementationIntentStore().readPreparation(dispatchId);
+      if (owner.input.backend === GHA_BACKEND && !owner.mapping && !intent && !preparation && !getCommentGapfillLaunch(dispatchId)?.target) {
+        const job = getJobByDispatchId(dispatchId);
+        const target = job?.repo?.split("/");
+        if (!job?.runId || !target || target.length !== 2) return { reason: "termination_unconfirmed" };
+        updateImplementationRunOwner({ ...owner, mapping: { teamKey: owner.input.teamKey, owner: target[0], repo: target[1] } as RepoMapping, jobId: String(job.runId) });
+      }
+      if (owner.input.backend === "fly-machines" && owner.flyApp === undefined && !intent && !preparation) return { reason: "termination_unconfirmed" };
+      let id: string | null;
+      try {
+        id = owner.jobId ?? await deps.findExistingRun(owner.input, owner.createdAt);
+        if (id === null || await readStatus(owner.input, id) !== "ended") return { reason: "termination_unconfirmed" };
+      } catch {
+        return { reason: "termination_unconfirmed" };
+      }
+      await finishJob(dispatchId, readImplementationRunOwner(dispatchId)?.finishOutcome ?? { kind: "run_ended" });
+      await cleanup(owner.input, id);
+      await onOutcome(dispatchId);
+      const finished = readImplementationRunOwner(dispatchId)!;
+      const reason = finished.finishResult?.release ?? (finished.finishOutcome?.kind === "deadline" ? "deadline_exceeded" : finished.finishOutcome?.kind === "cancelled" ? "cancelled" : "finalized");
+      releaseImplementationRunOwner(dispatchId, reason);
+      return { reason };
+    },
     readStatus,
     stop,
     finishJob,
     cleanup,
     onOutcome,
     release: (dispatchId, reason) => {
-      releaseByDispatchId(dispatchId, reason);
+      releaseImplementationRunOwner(dispatchId, reason);
     },
   };
 
-  return { services: [createImplementationRunWorkflow(deps)] };
+  // Exclusive object handlers serialize recovery attempts, including after run/journal expiry.
+  const workflow = createImplementationRunWorkflow(deps);
+  const recovery = restate.object({
+    name: "ImplementationRunRecovery",
+    handlers: {
+      reconcile: async (ctx: restate.ObjectContext, historicalInput?: ImplementationRunInput | null) => {
+        if (!readImplementationRunOwner(ctx.key) && historicalInput) {
+          const parsed = implementationRunInputSchema.parse(historicalInput);
+          if (parsed.dispatchId !== ctx.key) throw new restate.TerminalError("recovery dispatch id mismatch");
+          await ctx.run("reconstruct historical owner", () => { requireImplementationRunOwner(parsed); });
+        }
+        const status = await ctx.workflowClient(workflow, ctx.key).status();
+        if (status.step !== null && status.step !== "termination_unconfirmed" && status.step !== "released") {
+          return { reason: "termination_unconfirmed" as const };
+        }
+        return ctx.run("reconcile retained owner", () => deps.reconcile!(ctx.key), { maxRetryAttempts: 1 });
+      },
+    },
+  });
+  return { services: [workflow, recovery] };
 }

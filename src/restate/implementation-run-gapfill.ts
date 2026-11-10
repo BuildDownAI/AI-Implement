@@ -1,3 +1,4 @@
+import { requireImplementationRunOwner } from "./implementation-run-owner.js";
 /** Gap-fill-only launch dependencies. Credentials and instructions never leave a step. */
 import type { ImplementationRunProductionInput } from "./implementation-run-production.js";
 import { IMPLEMENTATION_RUN_TITLE_PREFIX } from "./implementation-run-production.js";
@@ -29,7 +30,7 @@ async function getTargetRepoToken(config: ImplementationRunProductionInput["conf
   return (await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner, { repositories: [repo] })).token;
 }
 
-export function createImplementationGapfillDependencies(input: ImplementationRunProductionInput, getMapping: (key: string) => RepoMapping | undefined): Pick<ImplementationRunDependencies, "reserve" | "launch" | "findExistingRun"> {
+export function createImplementationGapfillDependencies(input: ImplementationRunProductionInput, getMapping: (key: string) => RepoMapping | undefined, onReserved?: (run: ImplementationRunInput, mapping: RepoMapping) => void): Pick<ImplementationRunDependencies, "reserve" | "launch" | "findExistingRun"> {
   const { config } = input;
   const mappingFor = (run: ImplementationRunInput) => {
     const mapping = getMapping(run.teamKey);
@@ -97,6 +98,10 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         kind: "gap-fill", backend: run.backend, lifecycleOwner: { kind: "restate", attemptId: run.dispatchId },
         cap: mapping.maxInProgressAiIssues, prDispatchBudget: gap.prDispatchBudget, humanRequested: gap.humanRequested, parked: isParked(run.issueId, "gap-analysis") });
       if (!result.ok) markCommentGapfillProcessed(gap.queueItemId, "pending");
+      if (result.ok) {
+        requireImplementationRunOwner(run, "reserved");
+        onReserved?.(run, mapping);
+      }
       if (result.ok && input.afterReserve) await input.afterReserve(run);
       return result.ok;
     },

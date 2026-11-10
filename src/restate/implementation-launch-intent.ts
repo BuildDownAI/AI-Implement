@@ -22,6 +22,10 @@ export function implementationIntentStore() {
     writePreparation(dispatchId: string, identity: { generation: number; projectKey: string; backend: string; mapping: RepoMapping; flyApp: string | null }) {
       db.prepare("INSERT OR IGNORE INTO implementation_launch_intent (dispatch_id, snapshot) VALUES (?, ?)").run(`preparation:${dispatchId}`, JSON.stringify(identity));
     },
+    replacePrivateOwner(dispatchId: string, snapshot: unknown) {
+      if (!dispatchId.startsWith("owner:")) throw new Error("invalid private owner key");
+      db.prepare("UPDATE implementation_launch_intent SET snapshot = ? WHERE dispatch_id = ?").run(JSON.stringify(snapshot), dispatchId);
+    },
     accept(dispatchId: string) {
       db.prepare("UPDATE implementation_launch_intent SET snapshot = json_set(snapshot, '$.accepted', json('true')) WHERE dispatch_id = ?").run(dispatchId);
     },

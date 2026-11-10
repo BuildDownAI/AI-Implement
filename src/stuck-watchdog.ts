@@ -151,6 +151,11 @@ function imagePullCommentLines(
  * Does NOT stop the runner, update job status, or log — all of which vary
  * between the timeout and failure paths and are handled by each caller.
  */
+export interface StuckCleanupProgress {
+  claim(): { attempts: number; complete: boolean };
+  complete(): void;
+}
+
 async function boundedCleanup(
   config: StuckWatchdogConfig,
   provider: TicketingProvider | null,
@@ -158,8 +163,11 @@ async function boundedCleanup(
   runUrl: string | null,
   lastRunStatus: string,
   imagePullFailure?: ImagePullFailure,
+  progress?: StuckCleanupProgress,
 ): Promise<number> {
-  const attempts = incrementStuckAttempts(job.issueId!);
+  const receipt = progress?.claim();
+  const attempts = receipt?.attempts ?? incrementStuckAttempts(job.issueId!);
+  if (receipt?.complete) return attempts;
   const imagePullGiveUp = isImagePullGiveUp(imagePullFailure, attempts);
 
   if (!imagePullGiveUp && attempts <= STUCK_JOB_MAX_ATTEMPTS) {
@@ -244,6 +252,7 @@ async function boundedCleanup(
     }
   }
 
+  progress?.complete();
   return attempts;
 }
 
@@ -292,6 +301,7 @@ export async function remediateStuckJob(
     /** The `ImplementationRun` workflow running the handling for the job it owns. A Legacy monitor
      *  leaves this unset, because it must never re-arm a job that a workflow owns. */
     ownerCall?: boolean;
+    stuckCleanup?: StuckCleanupProgress;
   },
 ): Promise<boolean> {
   if (!job.issueId) return false;
@@ -359,7 +369,7 @@ export async function remediateStuckJob(
       "timed_out",
       "stuck_review_fix",
       undefined,
-      stopConfirmed ? { backendTerminated: true } : { skipAdmissionRelease: true },
+      stopConfirmed && !opts?.ownerCall ? { backendTerminated: true } : { skipAdmissionRelease: true },
     );
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m — review-fix run, ticket left unchanged`,
@@ -368,10 +378,10 @@ export async function remediateStuckJob(
     return stopConfirmed;
   }
 
-  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus, undefined, opts?.stuckCleanup);
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
-    if (stopConfirmed) {
+    if (stopConfirmed && !opts?.ownerCall) {
       updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
     } else {
       updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { skipAdmissionRelease: true });
@@ -381,7 +391,7 @@ export async function remediateStuckJob(
         `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — requeueing`,
     );
   } else {
-    if (stopConfirmed) {
+    if (stopConfirmed && !opts?.ownerCall) {
       updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     } else {
       updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { skipAdmissionRelease: true });
@@ -424,6 +434,7 @@ export async function remediateFailedJob(
     /** The runner started and reported the failure through its callback, so `Initialize containers`
      *  did not fail and the jobs lookup cannot match. */
     runnerReported?: boolean;
+    stuckCleanup?: StuckCleanupProgress;
   },
 ): Promise<void> {
   if (!job.issueId) return;
@@ -470,7 +481,7 @@ export async function remediateFailedJob(
     }
   }
 
-  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus, imagePullFailure);
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus, imagePullFailure, opts?.stuckCleanup);
 
   if (isImagePullGiveUp(imagePullFailure, attempts)) {
     console.warn(

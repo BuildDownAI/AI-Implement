@@ -41,6 +41,8 @@ export interface OwnedRunHandle {
 }
 
 export interface OwnedRunAdapter {
+  /** Admission contract keeps occupancy through unreadable termination (ImplementationRun). */
+  retainUnconfirmed?: boolean;
   /** Names the describe block. */
   name: string;
   /** The scenario numbers that apply to this run kind; all six when absent. The adapter's test file states why each other one does not apply. */
@@ -85,12 +87,15 @@ export function registerOwnedRunContract(
   const withoutStatus = (calls: string[]) => calls.filter((call) => call !== "status");
 
   describe(`owned-run contract: ${adapter.name}`, () => {
-    scenario(1)("1. a status read that fails on each attempt still reaches the deadline, stops the run, and releases (%s)", async (label) => {
+    scenario(1)("1. repeated read failures reach the deadline and apply the lifecycle admission policy (%s)", async (label) => {
       const run = begin(label, { faults: { failStatusRead: true }, totalMs: DEADLINE_MS });
       await run.done;
       const calls = adapter.calls(run.key);
       expect(calls.filter((call) => call === "status").length).toBeGreaterThanOrEqual(3);
-      expect(withoutStatus(calls)).toEqual(["reserve", "launch", "stop", ...cleanupCalls(run.runId), "outcome", "release"]);
+      expect(withoutStatus(calls)).toEqual(adapter.retainUnconfirmed
+        ? ["reserve", "launch", "stop"]
+        : ["reserve", "launch", "stop", ...cleanupCalls(run.runId), "outcome", "release"]);
+      if (adapter.retainUnconfirmed) expect((await run.read()).step).toBe("termination_unconfirmed");
     }, 30_000);
 
     scenario(2)("2. a crash after the launch step adopts the run and does not launch a second run (%s)", async (label) => {
@@ -119,13 +124,20 @@ export function registerOwnedRunContract(
       expect(calls.filter((call) => call === "launch" || call === "release" || call.startsWith("cleanup"))).toEqual([]);
     }, 30_000);
 
-    scenario(5)("5. a failed cleanup and a failed outcome still release (%s)", async (label) => {
+    scenario(5)("5. failed bookkeeping follows the owner release policy (%s)", async (label) => {
       const run = begin(label, { faults: { failCleanup: true, failOutcome: true }, totalMs: LONG_MS });
       await waitForStep(run.read, "waiting");
       await run.finish();
-      await run.done;
+      if (adapter.retainUnconfirmed) await run.done.catch(() => undefined);
+      else await run.done;
       const calls = withoutStatus(adapter.calls(run.key));
       expect(calls.some((call) => call === `cleanup:${run.runId}`)).toBe(true);
+      if (adapter.retainUnconfirmed) {
+        expect(calls).not.toContain("outcome");
+        expect(calls).not.toContain("release");
+        expect((await run.read()).step).toBe("termination_unconfirmed");
+        return;
+      }
       expect(calls).toContain("outcome");
       expect(calls[calls.length - 1]).toBe("release");
       expect(calls.filter((call) => call === "release")).toHaveLength(1);

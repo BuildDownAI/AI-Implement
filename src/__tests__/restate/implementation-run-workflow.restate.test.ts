@@ -76,6 +76,7 @@ interface Scenario {
   reserveTaken?: boolean;
   /** Parks the first `cleanup` call. */
   cleanupGate?: Gate;
+  outcomeGate?: Gate;
   /** Parks the first `stop` call. */
   stopGate?: Gate;
   reserveImpl?: (input: ImplementationRunInput) => Promise<boolean>;
@@ -86,6 +87,8 @@ interface Scenario {
   faults: OwnedRunFaults;
   /** `findExistingRun` throws on every attempt once the launch happened (the launch step's own lookup runs before). */
   findThrows?: boolean;
+  endOnStop?: boolean;
+  stopAccepted?: boolean;
   /** The `dispatch_log` row of the attempt as the runner callback left it. */
   row: Job;
   /** Calls the real finish decision made on its deps, in order. */
@@ -159,7 +162,8 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
       sc.stopCalls.push(jobId);
       sc.calls.push("stop");
       if (sc.stopGate && sc.stopCalls.length === 1) await sc.stopGate.wait();
-      return true;
+      if (sc.endOnStop) sc.status = "ended";
+      return sc.stopAccepted ?? true;
     },
     async cleanup(input, jobId) {
       const sc = scenarioOf(input.dispatchId);
@@ -172,6 +176,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
       const sc = scenarioOf(dispatchId);
       sc.calls.push("outcome");
       sc.events.push("outcome");
+      if (sc.outcomeGate) await sc.outcomeGate.wait();
       if (sc.faults.failOutcome) throw new Error("injected outcome failure");
     },
     async finishJob(dispatchId, outcome) {
@@ -480,41 +485,49 @@ describe("ImplementationRun durable workflow", () => {
     expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
   }, 60_000);
 
-  it.each(labels)("total_timeout with a known job id stops the run and releases within the stop margin (%s)", async (label) => {
+  it.each(labels)("total_timeout with a known job id retains an active run after cancellation acknowledgement (%s)", async (label) => {
     const w = begin(deadline, label, { status: "started", tickGate: gate("first tick") });
     await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
     w.sc.tickGate!.release();
 
-    expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
   }, 60_000);
 
-  it.each(labels)("bootstrap_timeout with no started evidence releases with deadline_exceeded (%s)", async (label) => {
+  it.each(labels)("a refused stop with an active backend retains occupancy (%s)", async (label) => {
+    const w = begin(deadline, label, { status: "started", stopAccepted: false });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    expect(w.sc.finishCalls).toEqual([]);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
+  }, 60_000);
+
+  it.each(labels)("bootstrap_timeout with no started evidence retains occupancy with termination_unconfirmed (%s)", async (label) => {
     // The backend never shows an id, so each tick looks for one; the first lookup is held past the bootstrap deadline.
     const w = begin(deadline, label, { launchResult: { outcome: "unknown" }, runId: null, tickGate: gate("first lookup") });
     await pastDeadlineAtTick(w.sc, DEADLINE.bootstrapMs, "the bootstrap deadline");
     w.sc.tickGate!.release();
 
-    expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
     expect(w.sc.stopCalls).toEqual([]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
   }, 60_000);
 
   it.each(labels)("a find that fails on each attempt counts as not found and the wait reaches its deadline (%s)", async (label) => {
     const w = begin(deadline, label, { launchResult: { outcome: "unknown" }, runId: null, findThrows: true });
-    expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
     expect(w.sc.stopCalls).toEqual([]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
-    // No run id was ever known, so there is nothing to clean up; the outcome still runs once.
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    // No run ID or terminal evidence: neither cleanup nor outcome reporting runs.
     expect(w.sc.calls.filter((c) => c.startsWith("cleanup"))).toEqual([]);
-    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
+    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(0);
   }, 60_000);
 
-  it.each(labels)("an invocation cancel after a launch stops the run, closes the row, and releases (%s)", async (label) => {
+  it.each(labels)("an invocation cancel after a launch retains an active run (%s)", async (label) => {
     const w = begin(slow, label, { status: "started" });
     await waitForStep(w.read, "wait");
     const env = slow.get(label)!;
@@ -525,18 +538,17 @@ describe("ImplementationRun durable workflow", () => {
     );
     await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
-    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(0);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
-  // The cancel reaches the workflow while a status read is in flight: the read stays parked on a gate
-  // until the release is seen. A bounded read that swallowed the cancellation (a TerminalError 409)
-  // would answer `unknown`, and the workflow would wait on and never release.
-  it.each(labels)("an invocation cancel during a status read still stops the run, closes the row, and releases (%s)", async (label) => {
+  // Cancellation during a read must reach escape. A fresh read after stop still
+  // reports active, so the reservation remains held.
+  it.each(labels)("an invocation cancel during a status read retains an active run (%s)", async (label) => {
     const w = begin(slow, label, { status: "started", readGate: gate("status read") });
     try {
       await w.sc.readGate!.reached();
@@ -547,11 +559,12 @@ describe("ImplementationRun durable workflow", () => {
         { label: "the run invocation" },
       );
       await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
-      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      w.sc.readGate!.release();
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
       expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
-      expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+      expect(w.sc.finishCalls).toEqual([]);
+      expect((await w.read()).step).toBe("termination_unconfirmed");
     } finally {
       w.sc.readGate!.release();
     }
@@ -568,9 +581,9 @@ describe("ImplementationRun durable workflow", () => {
     await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
   }
 
-  // A second cancel while `cleanup` runs in the escape path ends the escape with an exception; the release still runs once.
-  it.each(labels)("a second cancel during cleanup in the escape path still releases one time (%s)", async (label) => {
-    const w = begin(slow, label, { status: "started", cleanupGate: gate("cleanup") });
+  // A second cancellation interrupts cleanup, but cannot free capacity before recovery completes it.
+  it.each(labels)("a second cancel during cleanup in the escape path retains recovery authority (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started", endOnStop: true, cleanupGate: gate("cleanup") });
     try {
       await waitForStep(w.read, "wait");
       await cancelRun(slow, label, w.dispatchId);
@@ -580,31 +593,30 @@ describe("ImplementationRun durable workflow", () => {
       w.sc.cleanupGate!.release();
     }
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the second cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
-  // A cancel while `cleanup` runs on the normal path: the run ended, so the escape does not stop it, and the outcome runs once.
-  it.each(labels)("a cancel during cleanup on the normal path runs the outcome once, does not stop, and releases (%s)", async (label) => {
-    const w = begin(slow, label, { status: "ended", cleanupGate: gate("cleanup") });
+  it.each(labels.flatMap(label => (["cleanup", "outcome"] as const).map(effect => ({ label, effect }))))(
+    "a cancel during normal $effect retains occupancy ($label)", async ({ label, effect }) => {
+    const effectGate = gate(effect);
+    const w = begin(slow, label, { status: "ended", [effect === "cleanup" ? "cleanupGate" : "outcomeGate"]: effectGate });
     try {
-      await w.sc.cleanupGate!.reached();
+      await effectGate.reached();
       await cancelRun(slow, label, w.dispatchId);
+      await w.done.catch(() => undefined);
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
+      expect(w.sc.stopCalls).toEqual([]);
+      if (effect === "cleanup") expect(w.sc.calls.filter(c => c === "outcome")).toHaveLength(0);
     } finally {
-      w.sc.cleanupGate!.release();
+      effectGate.release();
     }
-    await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
-    expect(w.sc.stopCalls).toEqual([]);
-    expect(w.sc.calls.filter((c) => c.startsWith("cleanup"))).toHaveLength(1);
-    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
   }, 60_000);
 
   // A cancel while the deadline `stop` runs: the stop does not count as tried, so the escape stops the run again.
-  it.each(labels)("a cancel during the deadline stop tries the stop again in the escape path and releases (%s)", async (label) => {
+  it.each(labels)("a cancel during the deadline stop retries stop and retains an active run (%s)", async (label) => {
     const w = begin(deadline, label, { status: "started", tickGate: gate("first tick"), stopGate: gate("stop") });
     try {
       await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
@@ -615,10 +627,10 @@ describe("ImplementationRun durable workflow", () => {
       w.sc.stopGate!.release();
     }
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`, `job-${w.dispatchId}`]);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
   // The cancel reaches the workflow while the launch call is in flight; the call completes after the
@@ -632,27 +644,27 @@ describe("ImplementationRun durable workflow", () => {
       await eventually(() => w.sc.findCalls, (n) => n >= 2, { label: "the first lookup of the escape path" });
       expect(w.sc.stopCalls).toEqual([]);
       w.sc.launchGate!.release();
-      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
       expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
-      expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+      expect(w.sc.finishCalls).toEqual([]);
+      expect((await w.read()).step).toBe("termination_unconfirmed");
     } finally {
       w.sc.launchGate!.release();
     }
   }, 60_000);
 
-  it.each(labels)("an invocation cancel during a launch that never creates a run ends the escape after the fixed time (%s)", async (label) => {
+  it.each(labels)("an invocation cancel during a launch that never creates a run retains uncertainty after the fixed search time (%s)", async (label) => {
     const w = begin(slow, label, { launchGate: gate("launch call"), runId: null });
     try {
       await w.sc.launchGate!.reached();
       await cancelRun(slow, label, w.dispatchId);
       await eventually(() => w.sc.findCalls, (n) => n >= 2, { label: "the first lookup of the escape path" });
       w.sc.launchGate!.release();
-      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the escape time" });
-      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
       expect(w.sc.stopCalls).toEqual([]);
-      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
+      expect(w.sc.finishCalls).toEqual([]);
       // The escape looked more than one time before it gave up.
       expect(w.sc.findCalls).toBeGreaterThan(2);
     } finally {
@@ -675,19 +687,19 @@ describe("ImplementationRun durable workflow", () => {
     }
   }, 60_000);
 
-  it.each(labels)("a throw in finishJob still ends with one release (%s)", async (label) => {
+  it.each(labels)("a throw in finishJob retains admission for recovery (%s)", async (label) => {
     const w = begin(slow, label, { finishThrows: true });
     await waitForStep(w.read, "wait");
     w.sc.status = "ended";
     await expect(w.done).rejects.toThrow();
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the finishJob failure" });
-    expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
-    expect((await w.read()).step).toBe("released");
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
   const PR = "https://github.com/o/r/pull/7";
   const FAILURE = { code: "X", stage: "agent", category: "permanent", message: "m" } as unknown as Job["failure"];
-  const ENDED = { backendTerminated: true };
+  const ENDED = { skipAdmissionRelease: true };
 
   // One scenario per row of the final-state table (AII-1553). The row planted in `dispatch_log` is what the runner callback
   // left; `report` carries no payload, so the finish step reads it. Each row ends in exactly one final state: the finish step,
@@ -733,7 +745,7 @@ describe("ImplementationRun durable workflow", () => {
   });
 
   it.each(labels)("deadline reached: stop, then the bounded stuck cleanup, then one release (%s)", async (label) => {
-    const w = begin(deadline, label, { status: "started", tickGate: gate("first tick") });
+    const w = begin(deadline, label, { status: "started", endOnStop: true, tickGate: gate("first tick") });
     await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
     w.sc.tickGate!.release();
 
@@ -746,17 +758,17 @@ describe("ImplementationRun durable workflow", () => {
     expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
   }, 60_000);
 
-  it.each(labels)("the Restate cancel finishes the job failed through the finalizer and releases (%s)", async (label) => {
+  it.each(labels)("the Restate cancel retains occupancy without rearming an active runner (%s)", async (label) => {
     const w = begin(slow, label, { status: "started" });
     await waitForStep(w.read, "wait");
     await cancelRun(slow, label, w.dispatchId);
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+    await waitForStep(w.read, "termination_unconfirmed");
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-    expect(w.sc.closeCalls).toEqual([["failed", "workflow_cancelled", { skipAdmissionRelease: true }]]);
-    expect(w.sc.finalizeCalls).toEqual([{ kind: "failed", conclusion: "workflow_cancelled" }]);
-    expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
-    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+    expect(w.sc.closeCalls).toEqual([]);
+    expect(w.sc.finalizeCalls).toEqual([]);
+    expect(w.sc.events).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
   }, 60_000);
 
   it.each(labels)("a report before ended releases nothing until a status read confirms ended (%s)", async (label) => {
@@ -834,6 +846,7 @@ describe("ImplementationRun durable workflow", () => {
   // The contract suite (ADR 036). `ImplementationRun` takes the reservation in its first step, so the `reserve` dep records the call.
   const contractAdapter: OwnedRunAdapter = {
     name: "ImplementationRun",
+    retainUnconfirmed: true,
     start(_baseUrl, key, { faults, totalMs }) {
       const label = labels.find((l) => key.startsWith(`contract-${l}-`));
       if (!label) throw new Error(`no variant in key ${key}`);

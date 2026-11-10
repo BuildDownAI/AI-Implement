@@ -3,7 +3,7 @@ import type { Job } from "./log.js";
 import { resetStuckAttempts } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { prNumberFromUrl } from "./poll-merged-prs.js";
-import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
+import { remediateFailedJob, type StuckWatchdogConfig, type StuckCleanupProgress } from "./stuck-watchdog.js";
 
 /**
  * How an implementation run ended, as the backend monitors (and the `ImplementationRun`
@@ -24,6 +24,7 @@ export type ImplementationOutcome =
 export interface FinalizeImplementationOptions {
   /** The `ImplementationRun` workflow finalizing the job it owns. Legacy monitors never set it. */
   ownerCall?: boolean;
+  stuckCleanup?: StuckCleanupProgress;
 }
 
 /**
