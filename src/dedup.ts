@@ -408,6 +408,9 @@ export function getDb(): Database.Database {
     // the new version field as 1 for old rows without a rewrite or backfill.
     const findingColumns = new Set((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
       .map((column) => column.name));
+    if (!findingColumns.has("disposition")) {
+      db.exec("ALTER TABLE review_findings ADD COLUMN disposition TEXT");
+    }
     if (!findingColumns.has("revision")) {
       db.exec("ALTER TABLE review_findings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
     }

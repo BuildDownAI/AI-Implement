@@ -293,3 +293,32 @@ describe("review ledger store", () => {
     expect(rows.find((r) => r.findingKey === b.findingKey)?.status).toBe("open");
   });
 });
+
+
+it("migrates disposition idempotently without claiming historical fixes", async () => {
+  const fixture = await testDb({ modules: { dedup: () => import("../dedup.js") } });
+  let db = fixture.modules.dedup.getDb();
+  db.prepare(`INSERT INTO review_findings
+    (repo, pr_number, finding_key, source, severity, body, status, first_seen_at, last_seen_at)
+    VALUES ('org/repo', 1, 'old', 'github-review', 'blocking', 'old finding', 'resolved', 1, 1)`).run();
+  db.exec("ALTER TABLE review_findings DROP COLUMN disposition");
+  for (let boot = 0; boot < 2; boot++) {
+    const modules = await fixture.reopen();
+    db = modules.dedup.getDb();
+    expect(db.prepare("SELECT disposition FROM review_findings WHERE finding_key = 'old'").get()).toEqual({ disposition: null });
+  }
+});
+
+it("stores fixed evidence only after a guarded update and clears it on reopening", async () => {
+  const { getDb } = await import("../dedup.js");
+  const input = { repo: "org/repo", prNumber: 1, source: "github-review" as const, severity: "blocking" as const, body: "fix me" };
+  const id = store.upsertReviewFinding(input);
+  expect(store.markReviewFindingResolvedIfRevision(id, 0)).toBe(0);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: null });
+  expect(store.markReviewFindingResolvedIfRevision(id, 1)).toBe(1);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: "fixed" });
+  store.upsertReviewFinding(input);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: null });
+  store.markReviewFindingsResolvedForPr(input.repo, input.prNumber);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: null });
+});

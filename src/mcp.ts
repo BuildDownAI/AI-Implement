@@ -94,6 +94,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "get_issue_dispatch_status",
   "get_issue_report_card",
   "get_fleet_report",
+  "get_reviewer_scorecard",
   "get_deploy_posture",
   "get_kg_status",
   "get_review_fix_attempt",

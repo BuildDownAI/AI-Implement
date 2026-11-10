@@ -114,6 +114,8 @@ interface PostPushReviewOutputs extends Record<string, unknown> {
    *  prefix, so run-autonomous.ts can add it to the ticket-facing "Total cost" and agree with
    *  the report card (BAC-27201). */
   costUsd: number | null;
+  /** Internal findings collected across every review iteration. */
+  internalFindings?: ReviewLedgerFinding[];
   /** Every finding disposition read from the fix agent's dispositions file across every
    *  fix-pass push in this run, deduplicated by findingKey with the last one read winning. */
   findingDispositions: FindingDisposition[];
@@ -2017,6 +2019,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // readiness or reappearing in the next fix prompt. Per-run only (AII-751); a gap-fill run
     // starts with an empty set.
     const closedKeys = new Set<string>();
+    const internalFindingsByKey = new Map<string, ReviewLedgerFinding>();
     // Every disposition read from the fix agent's dispositions file across every push this
     // run, keyed by findingKey so a later push's entry for the same key overwrites an earlier one.
     const findingDispositionsByKey = new Map<string, FindingDisposition>();
@@ -2243,6 +2246,9 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const summaryBlockingGates = reviewProcess.summaryBlockingGates;
       const contractVerdict = externalFindingsResult.verdictSource === "review-contract" ? externalFindingsResult.verdict : undefined;
       const reviewLedger = buildReviewLedger(internalIssues, [...selectedInternalFindings, ...externalFindings], effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
+      for (const finding of reviewLedger) {
+        if (finding.source === "ai-implement-internal") internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
+      }
       const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
       };
@@ -2865,7 +2871,7 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was closed by operator while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         // No prior genuine failure — the operator cancel is the sole anomaly.
         terminationReason = "operator_cancelled";
@@ -2880,11 +2886,11 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was merged while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         terminationReason = "pr_merged";
         console.warn(`[post-push-review] PR #${prNumber} was merged under the run — exiting as pr_merged`);
-        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, findingDispositions: [...findingDispositionsByKey.values()] };
+        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: [...findingDispositionsByKey.values()] };
       }
       throw err;
     }
@@ -2896,6 +2902,7 @@ ${externalFindingsFixBlock}
       forcePushedRevisions: forcePushed,
       terminationReason,
       costUsd,
+      internalFindings: [...internalFindingsByKey.values()],
       findingDispositions: [...findingDispositionsByKey.values()],
       ...(reviewerFailure ? { failure: reviewerFailure } : {}),
       ...(terminationReason === "external_review_pending" && reviewedHeadSha ? { reviewedHeadSha } : {}),

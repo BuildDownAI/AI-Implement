@@ -55,6 +55,7 @@ export function upsertReviewFinding(input: UpsertReviewFindingInput): number {
       line = excluded.line,
       url = excluded.url,
       status = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.status ELSE 'open' END,
+      disposition = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.disposition ELSE NULL END,
       revision = review_findings.revision + 1,
       last_seen_at = excluded.last_seen_at,
       resolved_at = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.resolved_at ELSE NULL END
@@ -136,7 +137,7 @@ export function markReviewFindingsResolvedForPrSeenBefore(
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE repo = ? AND pr_number = ? AND status = 'open' AND last_seen_at <= ? AND finding_key IN (${placeholders})
     `)
     .run(Date.now(), Date.now(), repo, prNumber, seenBefore, ...keys);
@@ -161,7 +162,7 @@ export function markReviewFindingsResolvedByIds(
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE repo = ? AND pr_number = ? AND status = 'open' AND id IN (${placeholders}) AND finding_key IN (${keyPlaceholders})
     `)
     .run(Date.now(), Date.now(), repo, prNumber, ...findingIds, ...keys);
@@ -211,7 +212,7 @@ export function markReviewFindingResolvedIfRevision(id: number, revision: number
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE id = ? AND revision = ? AND status = 'open'
     `)
     .run(Date.now(), Date.now(), id, revision);

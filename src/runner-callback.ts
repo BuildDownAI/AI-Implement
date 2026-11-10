@@ -1,3 +1,5 @@
+import { recordReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { RESTATE_INGRESS_BASE_URL } from "./restate/server.js";
@@ -176,6 +178,8 @@ export interface RunnerResultBody {
   sources?: SourceResult[];
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
+  /** Internal findings collected across review iterations, validated before storage. */
+  internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
   /**
@@ -816,6 +820,7 @@ async function handleRunnerResultInternal(
     outcome?: unknown;
     comments?: unknown;
     failure?: unknown;
+    internalFindings?: unknown;
     findingDispositions?: unknown;
     cycleSummaries?: unknown;
     attribution?: unknown;
@@ -1147,6 +1152,31 @@ async function handleRunnerResultInternal(
     }
   }
 
+  // Internal findings arrive on the existing result callback; repeats must not reopen rows.
+  const internalJob = getJobByDispatchId(claims.dispatchId);
+  const findingPrUrl = internalJob?.prUrl ?? input.body.prUrl;
+  const findingTarget = findingPrUrl ? parsePrUrlTarget(findingPrUrl) : null;
+  const internalPr = findingTarget && `${findingTarget.owner}/${findingTarget.repo}` === internalJob?.repo
+    ? findingTarget.prNumber : null;
+  if (internalJob?.repo && internalPr !== null && Array.isArray(body.internalFindings)) {
+    for (const raw of body.internalFindings) {
+      if (!raw || typeof raw !== "object") continue;
+      const f = raw as ReviewLedgerFinding;
+      if (f.source !== "ai-implement-internal" || typeof f.body !== "string" || !f.body ||
+          !["blocking", "medium", "minor"].includes(f.severity) ||
+          (f.path !== undefined && typeof f.path !== "string") ||
+          (f.url !== undefined && typeof f.url !== "string") ||
+          (f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) ||
+          (f.reviewerId !== undefined && typeof f.reviewerId !== "string")) continue;
+      const key = stableReviewFindingKey(f);
+      const existing = getReviewFindingsByKeys(internalJob.repo, internalPr, [key])[0];
+      const id = existing?.id ?? recordReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr });
+      if ((!existing || (existing.status === "open" && existing.lastSeenAt <= internalJob.dispatchedAt)) && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
+        markReviewFindingResolvedIfRevision(id, existing?.revision ?? 1);
+      }
+    }
+  }
+
   // AII-756: a fixing agent may defer a finding as out-of-scope follow-up work. This must
   // run before any phase-specific resolution below (e.g. the gap-analysis snapshot
   // resolution) — resolving first would flip a just-deferred finding back to resolved.
@@ -1155,8 +1185,8 @@ async function handleRunnerResultInternal(
   const followUpDispositions = sanitizedFindingDispositions.filter((d) => d.disposition === "follow-up");
   let deferredCount = 0;
   if (followUpDispositions.length > 0) {
-    const dispositionJob = getJobByDispatchId(claims.dispatchId);
-    const dispositionPrNumber = parsePrNumber(dispositionJob?.prUrl ?? null);
+    const dispositionJob = internalJob;
+    const dispositionPrNumber = internalPr;
     if (dispositionJob?.repo && dispositionPrNumber !== null) {
       const keys = followUpDispositions.map((d) => d.findingKey);
       deferredCount = markReviewFindingsDeferredByKeys(dispositionJob.repo, dispositionPrNumber, keys);
@@ -1176,8 +1206,8 @@ async function handleRunnerResultInternal(
   const rejectedKeys = sanitizedFindingDispositions.filter((d) => d.disposition === "invalid").map((d) => d.findingKey);
   let rejectedCount = 0;
   if (rejectedKeys.length > 0) {
-    const job = getJobByDispatchId(claims.dispatchId);
-    const prNumber = parsePrNumber(job?.prUrl ?? null);
+    const job = internalJob;
+    const prNumber = internalPr;
     if (job?.repo && prNumber !== null) {
       rejectedCount = markReviewFindingsRejectedByKeys(job.repo, prNumber, rejectedKeys);
     }

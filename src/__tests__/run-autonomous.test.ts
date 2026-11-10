@@ -3782,13 +3782,14 @@ describe("runAutonomous", () => {
       const dispositions: FindingDisposition[] = [
         { findingKey: "a".repeat(64), disposition: "fixed", reason: "Addressed in this pass." },
       ];
+      const internalFindings = [{ source: "ai-implement-internal", severity: "blocking", body: "Fix validation" }];
       const fake = fakeFetch({ [RESULT]: resultAccepted });
       const { pipeline, runner } = makeStepsPipeline([
         ["feedback-loop", { run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs()) }],
         ["push", { run: vi.fn().mockResolvedValue(openedPr(1)) }],
         [
           "post-push-review",
-          { run: vi.fn().mockResolvedValue({ approved: true, findingDispositions: dispositions }) },
+          { run: vi.fn().mockResolvedValue({ approved: true, internalFindings, findingDispositions: dispositions }) },
         ],
       ]);
 
@@ -3803,8 +3804,10 @@ describe("runAutonomous", () => {
 
       expect(result.exitCode).toBe(0);
       const body = resultBody(fake) as {
+        internalFindings?: unknown;
         findingDispositions?: FindingDisposition[];
       };
+      expect(body.internalFindings).toEqual(internalFindings);
       expect(body.findingDispositions).toEqual(dispositions);
     });
 
