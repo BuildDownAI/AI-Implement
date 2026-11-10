@@ -16,7 +16,12 @@ import { EventEmitter } from "node:events";
 import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getDb } from "../../dedup.js";
-import { initMappingsTable } from "../../config.js";
+import * as githubAuth from "../../github-app-auth.js";
+import * as githubApi from "../../github.js";
+import * as workflowProbe from "../../workflow-probe.js";
+import * as managedAuth from "../../managed-dispatch-auth.js";
+import { makeMapping } from "../helpers/builders.js";
+import { initMappingsTable, upsertMapping, deleteMapping, type RepoMapping } from "../../config.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import {
   type AttemptId,
@@ -39,7 +44,7 @@ import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js"
 import { inspectPendingReviewFixFeedback, loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
 import { ContainerReviewFixWorker } from "../../review-fix-container-worker.js";
 import { ReviewFixWorker } from "../../review-fix-worker.js";
-import { createProductionFinalizer, withReviewFixCleanup } from "../../restate/review-fix-production.js";
+import { admitReviewFix, createProductionFinalizer, withReviewFixCleanup } from "../../restate/review-fix-production.js";
 import { createReviewFixFinalizer } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
@@ -510,6 +515,71 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     environments = await startVariants([pr, attemptWorkflow]);
   }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
+
+  it.each([
+    ["default", "fly-machines", {}, false, "admit"],
+    ["fly", "github-actions", {}, false, "admit"],
+    ["local", "github-actions", {}, false, "admit"],
+    ["fly", "github-actions", { flySessionsToken: null }, false, "fly_sessions_token_or_app_missing"],
+    ["fly", "github-actions", { flySessionsApp: null }, false, "fly_sessions_token_or_app_missing"],
+    ["local", "github-actions", { localRunnerImage: "" }, false, "local_runner_image_missing"],
+    ["fly", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["fly", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["local", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["local", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["default", "fly-machines", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["default", "fly-machines", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["fly", "github-actions", {}, true, "managed_backend_unsupported"],
+    ["local", "github-actions", {}, true, "managed_backend_unsupported"],
+    ["fly", "github-actions", {}, false, "provider=bedrock", { provider: "bedrock" }],
+    ["local", "github-actions", {}, false, "provider=bedrock", { provider: "bedrock" }],
+    ["gha", "github-actions", {}, false, "Filesystem project admission-test requires local runner mode", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["fly", "github-actions", {}, false, "Filesystem project admission-test requires local runner mode", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["local", "github-actions", {}, false, "admit", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["local", "github-actions", {}, false, "not_selected", { paused: true }],
+    ["gha", "github-actions", {}, false, "not_selected", { reviewFixLifecycle: "legacy" }],
+    ["local", "github-actions", { runnerTokenSecret: null }, false, "callback_unavailable"],
+    ["local", "github-actions", { runnerCallbackBaseUrl: null }, false, "callback_unavailable"],
+    ["fly", "github-actions", {}, false, "installation_mismatch"],
+    ["local", "github-actions", {}, false, "pr_not_open"],
+    ["fly", "github-actions", {}, false, "contract_unverified"],
+    ["gha", "github-actions", {}, false, "not_selected", { reviewFixLifecycle: null }],
+    ["gha", "github-actions", {}, false, "admit"],
+    ["shadow", "fly-machines", {}, false, "admit"],
+  ] as const)("production admission: %s/%s %j managed=%s => %s", async (mode, executionMode, overrides, managed, expected, mappingOverrides: Partial<RepoMapping> = {}) => {
+    vi.stubEnv("RUNNER_MODE", mode);
+    upsertMapping("admission-test", makeMapping({ owner: "admission-test", repo: "repo", reviewFixLifecycle: "restate", executionMode, ...(mappingOverrides ?? {}) }));
+    const token = vi.spyOn(githubAuth, "getInstallationToken").mockResolvedValue("token");
+    const installation = vi.spyOn(githubAuth, "getInstallationId").mockResolvedValue(123);
+    const prState = vi.spyOn(githubApi, "getPullRequestState").mockResolvedValue({ state: "open", merged: false } as never);
+    const probe = vi.spyOn(workflowProbe, "resolveWorkflowCapabilities").mockResolvedValue({ contract: "envelope",
+      supportsAttemptCorrelation: true, supportsRunPublicationToken: true } as never);
+    if (expected === "installation_mismatch") installation.mockResolvedValue(999);
+    if (expected === "pr_not_open") prState.mockResolvedValue({ state: "closed", merged: false } as never);
+    if (expected === "contract_unverified") token.mockRejectedValue(new Error("GitHub unavailable"));
+    const optIn = vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(managed);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const queueId = enqueueReviewFix({ issueId: "admission-test", issueIdentifier: "AII-1336", repo: "admission-test/repo",
+        prNumber: 1, reason: "changes_requested", sourceEventId: randomUUID() });
+      const request: ReviewFixAdmissionRequest = { scope: { installationId: 123, repository: "admission-test/repo", prNumber: 1 },
+        feedback: { taskText: "fix", findings: [], queueCursor: { queueId, eventId: 1 } }, jobTimeoutMinutes: 90 };
+      const store = { admit: vi.fn().mockResolvedValue({ status: "prepared" }) };
+      await admitReviewFix(request, { githubAppId: "1", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://callback",
+        runnerTokenSecret: "secret", sessionImage: "runner", runnerImageExplicit: false,
+        flySessionsApp: "sessions", flySessionsToken: "fly-token", localRunnerImage: "runner", ...overrides }, store);
+      expect(store.admit).toHaveBeenCalledTimes(expected === "admit" ? 1 : 0);
+      expect(probe).toHaveBeenCalledTimes(expected === "admit" && (mode === "gha" || mode === "shadow") ? 1 : 0);
+      if (expected !== "admit") {
+        expect(warning).toHaveBeenCalledTimes(expected === "not_selected" ? 0 : 1);
+        if (expected !== "not_selected") expect(warning).toHaveBeenCalledWith(expect.stringContaining(expected));
+        expect(getDb().prepare("SELECT status FROM review_fix_queue WHERE id = ?").get(queueId)).toEqual({ status: expected.startsWith("Filesystem") ? "skipped" : "pending" });
+      }
+    } finally {
+      token.mockRestore(); installation.mockRestore(); prState.mockRestore(); probe.mockRestore(); optIn.mockRestore(); warning.mockRestore();
+      deleteMapping("admission-test"); vi.unstubAllEnvs();
+    }
+  });
 
   function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
