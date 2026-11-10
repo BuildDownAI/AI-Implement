@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mapping = { owner: "acme", repo: "app", paused: false, workflowFile: "claude-implement.yml", defaultBranch: "main" };
 const getMappings = vi.fn();
+const resolveExecutionPath = vi.fn(() => "github-actions");
 const updateReviewFixStatus = vi.fn();
 const isManagedProject = vi.fn();
 const getInstallationToken = vi.fn(async () => "tok");
@@ -16,7 +17,7 @@ vi.mock("../config.js", () => ({
 }));
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
-  resolveExecutionPath: () => "github-actions",
+  resolveExecutionPath: () => resolveExecutionPath(),
 }));
 vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),
@@ -38,9 +39,30 @@ const config = { githubAppId: "1", githubAppPrivateKey: "k", runnerCallbackBaseU
 const request = { scope, feedback: { taskText: "t", findings: [], queueCursor: { queueId: 42, eventId: 1 } },
   jobTimeoutMinutes: 30 } as never;
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks();
+  resolveExecutionPath.mockReturnValue("github-actions");
+});
 
 describe("review-fix admission and model authentication", () => {
+  it.each(["fly-machines", "local-docker", "both"])(
+    "unsupported %s selection reserves nothing and performs no credential or GitHub lookup",
+    async (backend) => {
+      getMappings.mockReturnValue({ k: mapping });
+      isManagedProject.mockReturnValue(true);
+      resolveExecutionPath.mockReturnValue(backend);
+      const store = { admit: vi.fn() };
+      expect(await admitReviewFix(request, config, store)).toEqual({ status: "deferred", reason: "paused" });
+      expect(store.admit).not.toHaveBeenCalled();
+      expect(isManagedProject).not.toHaveBeenCalled();
+      expect(getInstallationToken).not.toHaveBeenCalled();
+      expect(getInstallationId).not.toHaveBeenCalled();
+      expect(resolveWorkflowCapabilities).not.toHaveBeenCalled();
+      expect(getPullRequestState).not.toHaveBeenCalled();
+      expect(updateReviewFixStatus).not.toHaveBeenCalled();
+    },
+  );
+
   it("refuses an opted-in project before any GitHub call, keyed by the mapping key", async () => {
     getMappings.mockReturnValue({ "proj-key": mapping });
     isManagedProject.mockReturnValue(true);

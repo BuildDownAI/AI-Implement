@@ -152,7 +152,10 @@ Projects drawer. Operator procedures, including the protected CLI steps, are in
 credentials anywhere. Existing Codex local-login users re-sign in through `chatgpt-plan-login`; the
 orchestrator does not read or copy an `auth.json`. Support is provisional: see
 [docs/codex-parity-validation.md](docs/codex-parity-validation.md) for what is verified and what is
-still pending.
+still pending. This checkout restricts Restate review-fix to opted-out GHA projects and rejects
+managed projects before reservation. Later operator-reported GHA Codex evidence and ordinary
+Fly/local acceptance are recorded in that ledger with their source boundaries; full Codex Restate
+backend and recovery parity remains blocked on prerequisite integration and validation.
 
 ### Exercise planning and implementation separately
 
