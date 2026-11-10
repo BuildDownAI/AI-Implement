@@ -444,8 +444,10 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
   it("withholds approval when the PR head moved after the evidence was published", async () => {
     const c = await runCase(57, { dispositions: "all" });
     heads.set(57, sha("someone-pushed"));
-    // The observed head no longer equals the accepted result's commit, so the attempt is not a success to approve.
-    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject({ status: "finalized", approval: "not_applicable" });
+    // The terminal head differs from the accepted result, so approval is explicitly withheld.
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject({
+      status: "finalized", approval: "withheld", approvalReason: "terminal_result_head_mismatch",
+    });
     expect(comments.get(57) ?? []).toHaveLength(0);
   }, 90_000);
 

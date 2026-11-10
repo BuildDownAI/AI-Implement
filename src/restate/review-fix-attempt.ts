@@ -81,7 +81,7 @@ type Wake =
   | { kind: "conflict" };
 
 export type ReviewFixAttemptCompletion =
-  | { status: "finalized"; terminal: WorkerTerminalOutcome; approval: "applied" | "withheld" | "not_applicable" }
+  | { status: "finalized"; terminal: WorkerTerminalOutcome; approval: "applied" | "withheld" | "not_applicable"; approvalReason?: "terminal_result_head_mismatch" }
   | { status: "launch_unresolved" }
   | { status: "launch_rejected" }
   | { status: "deadline_before_launch" }
@@ -297,6 +297,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     }
 
     let approval: Extract<ReviewFixAttemptCompletion, { status: "finalized" }>["approval"] = "not_applicable";
+    let approvalReason: Extract<ReviewFixAttemptCompletion, { status: "finalized" }>["approvalReason"];
     if (terminal.status === "succeeded" && validResult && !cancelled
       && terminal.outputCommit === validResult.outputCommit) {
       const recordedAt = await ctx.date.now();
@@ -319,6 +320,13 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
         approval = "withheld";
       }
     } else {
+      if (terminal.status === "succeeded" && validResult && !cancelled
+        && terminal.outputCommit !== validResult.outputCommit) {
+        // Preserve the backend fact and accepted callback separately. Neither
+        // head can authorize approval while these observations disagree.
+        approval = "withheld";
+        approvalReason = "terminal_result_head_mismatch";
+      }
       const recordedAt = await ctx.date.now();
       await ctx.run("record-terminal-outcome", () => finalizer.recordOutcome({
         attemptId, scope: attempt.scope, terminal,
@@ -328,7 +336,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     await ctx.run("release-confirmed-terminal", () => store.releaseOwner(
       attempt.owner, cancelled ? "cancelled" : "finalized",
     ));
-    return { completion: { status: "finalized", terminal, approval }, scope: attempt.scope };
+    return { completion: { status: "finalized", terminal, approval, ...(approvalReason ? { approvalReason } : {}) }, scope: attempt.scope };
   }
 
   async function run(ctx: WorkflowContext, input: { attemptId: string }): Promise<ReviewFixAttemptCompletion> {
