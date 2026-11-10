@@ -68,6 +68,8 @@ export interface ReviewFixAttemptDependencies {
   /** Test timing overrides; production uses a fixed 30-minute grace and five-minute backoff. */
   unknownLaunchGraceMs?: number;
   postDeadlineReconcileIntervalMs?: number;
+  /** Test seam for how often the workflow reads the run's status while it waits; production leaves it unset (60 s). */
+  runStatusTickMs?: number;
 }
 
 type Wake =
@@ -236,7 +238,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       signals: ["wake"],
       resultSignal: "wake",
       totalDeadlineAt: attempt.deadlineAt,
-      tickMs: RUN_STATUS_TICK_MS,
+      tickMs: deps.runStatusTickMs ?? RUN_STATUS_TICK_MS,
       readStatus: () => readOwnedRunStatus(ctx, `read-run-status-${readIndex++}`, async () => {
         const inspection = await worker.inspectTerminal(execution);
         return inspection.reached ? "ended" : "unknown";

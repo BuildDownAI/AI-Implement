@@ -336,13 +336,17 @@ export function createProductionReviewFixServices(
   store = new SqliteReviewFixAttemptStore(),
   submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
   runtime?: ModelAuthRuntime,
+  /** Test seam: the orchestrator passes nothing, so the 5 s collection window and the 60 s run-status tick apply. */
+  timing: { collectionWindowMs?: number; runStatusTickMs?: number } = {},
 ): RestateService[] {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = createProductionReviewFixWorker(config, store, runtime);
   const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
   const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
+  const { collectionWindowMs, runStatusTickMs } = timing;
   const pr = createReviewFixPR({
+    ...(collectionWindowMs === undefined ? {} : { collectionWindowMs: async () => collectionWindowMs }),
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
       admit: (request) => admitReviewFix(request, config, store, runtime),
@@ -376,7 +380,7 @@ export function createProductionReviewFixServices(
         jobTimeoutMinutes: mapping.maxJobMinutes ?? DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
     },
   });
-  const attempt = createReviewFixAttempt({ store, worker, finalizer, notifyPrOnCompletion: true,
+  const attempt = createReviewFixAttempt({ store, worker, finalizer, notifyPrOnCompletion: true, runStatusTickMs,
     loadApprovalEvidence: async (prepared, result) => {
       const findingDispositions = dispositionsFor(prepared, result);
       const required = new Set(prepared.findings.map((finding) => finding.findingKey));

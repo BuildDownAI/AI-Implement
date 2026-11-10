@@ -62,6 +62,8 @@ function fakeFly(idleTimeoutMsOverride?: number): FakeFly {
     fail404OnDestroy: false,
     failDestroyWith: null,
     idleTimeoutMsOverride,
+    // Production waits 2 + 4 + 8 + 10 s between the five scrub attempts; the scenarios assert the outcome, not those waits.
+    scrubInitialRetryMsOverride: 50,
     fly: {
       getMachine: async () => { throw new Error("unexpected getMachine"); },
       clearMachineEnv: async (id, metadata, settle, app) => {
