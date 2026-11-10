@@ -33,6 +33,12 @@ export interface BinaryEnvironmentOptions {
   storage?: "disk";
   /** Sign the server's calls with a fresh request identity key and have the endpoint verify it (AII-976). */
   requestIdentity?: boolean;
+  /**
+   * Server-wide invoker timeouts (humantime, such as "2s"), in place of the server's defaults of one minute each.
+   * A scenario that proves a handler's own `inactivityTimeout` / `abortTimeout` outlast the server's sets these short,
+   * so it waits seconds, not minutes. With `variant: "alwaysReplay"` the variant's `0s` inactivity timeout stays.
+   */
+  invokerTimeouts?: { inactivity: string; abort: string };
   /** Seam for the missing-binary path; defaults to the resolver RestateSidecar uses. */
   resolveBinary?: () => string | null;
 }
@@ -146,6 +152,10 @@ export async function startBinaryEnvironment(options: BinaryEnvironmentOptions):
     const identity = ensureRequestIdentityKey(baseDir);
     identityKey = identity.publicKey;
     childEnv.RESTATE_REQUEST_IDENTITY_PRIVATE_KEY_PEM_FILE = identity.privateKeyPath;
+  }
+  if (options.invokerTimeouts) {
+    childEnv.RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT = options.invokerTimeouts.inactivity;
+    childEnv.RESTATE_WORKER__INVOKER__ABORT_TIMEOUT = options.invokerTimeouts.abort;
   }
   // Same values the variant hooks set on a server.
   if (options.variant === "alwaysReplay") {

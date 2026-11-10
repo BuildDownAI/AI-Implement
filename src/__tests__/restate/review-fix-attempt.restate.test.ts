@@ -29,6 +29,9 @@ interface FakeAttempt {
   terminal: WorkerTerminalOutcome | null;
   outcome: WorkerTerminalOutcome | null;
   approvalEffects: number;
+  approvalCalls: number;
+  evidenceCalls: number;
+  outcomeCalls: number;
   releaseEffects: number;
   cancelCalls: number;
   holdBinding: Gate | null;
@@ -51,7 +54,7 @@ function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
     },
     mode, authority: true, occupied: true, intent: false, bound: false,
     launchEffects: 0, result: null, terminal: null, outcome: null,
-    approvalEffects: 0, releaseEffects: 0, cancelCalls: 0,
+    approvalEffects: 0, approvalCalls: 0, evidenceCalls: 0, outcomeCalls: 0, releaseEffects: 0, cancelCalls: 0,
     holdBinding: null, loadFailures: 0, loadCalls: 0,
   };
 }
@@ -170,6 +173,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     finalizer: {
       recordOutcome: async (outcome, now) => {
         const fake = get(outcome.attemptId);
+        fake.outcomeCalls++;
         if (fake.outcome) return { status: "already_recorded", outcome: {
           attemptId: outcome.attemptId, scope: outcome.scope, terminal: fake.outcome,
         } } as const;
@@ -178,6 +182,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       },
       applyApproval: async (input) => {
         const fake = get(input.attemptId);
+        fake.approvalCalls++;
         if (!input.currentAuthority || !fake.authority || !input.policyAllows
           || input.currentPrHeadSha !== input.result.outputCommit
           || input.findingDispositions.length !== fake.prepared.findings.length) {
@@ -188,9 +193,12 @@ describe("ReviewFixAttempt durable workflow", () => {
         return { status: "applied", effectId: input.attemptId } as const;
       },
     },
-    loadApprovalEvidence: async (attempt) => ({ currentPrHeadSha: SHA,
+    loadApprovalEvidence: async (attempt) => {
+      get(attempt.attemptId).evidenceCalls++;
+      return { currentPrHeadSha: SHA,
       findingDispositions: attempt.findings.map((finding) => ({ findingKey: finding.findingKey,
-        disposition: "addressed" as const })), policyAllows: true, dispositionsComplete: true }),
+        disposition: "addressed" as const })), policyAllows: true, dispositionsComplete: true };
+    },
   });
 
   let environments: Map<string, RestateEnvironment>;
@@ -331,6 +339,26 @@ describe("ReviewFixAttempt durable workflow", () => {
     fake.terminal = { status: "succeeded", outputCommit: SHA };
     expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "applied" });
     expect([fake.launchEffects, fake.approvalEffects, fake.releaseEffects, fake.occupied]).toEqual([1, 1, 1, false]);
+  }, 20_000);
+
+  it.each(VARIANTS.map(([label]) => label))("withholds approval when confirmed terminal and accepted result heads differ (%s)", async (label) => {
+    const fake = newFake("accepted", 60_000);
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = envFor(label);
+    const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId });
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
+    const accepted = resultOf(fake, { outputCommit: "b".repeat(40) });
+    expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", accepted))
+      .toMatchObject({ status: "stored", result: accepted });
+    expect([fake.occupied, fake.releaseEffects, fake.outcome]).toEqual([true, 0, null]);
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
+    expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "withheld",
+      approvalReason: "terminal_result_head_mismatch" });
+    expect(fake.result).toEqual(accepted);
+    expect(fake.outcome).toEqual(fake.terminal);
+    expect([fake.outcomeCalls, fake.releaseEffects, fake.occupied]).toEqual([1, 1, false]);
+    expect([fake.evidenceCalls, fake.approvalCalls, fake.approvalEffects]).toEqual([0, 0, 0]);
   }, 20_000);
 
   it.each(VARIANTS.map(([label]) => label))("success without a valid result never approves (%s)", async (label) => {

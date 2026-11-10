@@ -502,9 +502,11 @@ describe("SelfDeploy durable phase machine", () => {
       expect(fixture.state.held).toBe(false);
     } } finally { await stopAll(local); }
   }, 60_000);
-  it("keeps a build running beyond the default inactivity and abort timeouts in both variants", async () => {
+  it("keeps a build running beyond the server's inactivity and abort timeouts in both variants", async () => {
     const fixture = deployFixture(); fixture.config.kgSourceRepo = "owner/kg"; fixture.state.work = false;
-    const local = await startVariants([createSelfDeploy(fixture.deps)]);
+    // The server's timeouts default to one minute each. These servers use two seconds each, so the build outlasts
+    // both in seconds; only the `apply` handler's own timeouts (65 and 70 minutes) keep it alive.
+    const local = await startVariants([createSelfDeploy(fixture.deps)], { invokerTimeouts: { inactivity: "2s", abort: "2s" } });
     try { for (const env of local.values()) {
       fixture.machine.config.image = "old";
       const build = gate("long build");
@@ -512,8 +514,8 @@ describe("SelfDeploy durable phase machine", () => {
       await start(env); await build.reached();
       try {
         const started = Date.now();
-        // Default inactivity + abort timeouts are one minute each. The CLI stays opaque throughout.
-        await eventually(() => Date.now() - started, elapsed => elapsed >= 125_000, { timeoutMs: 130_000, intervalMs: 500, label: "build beyond default timeouts" });
+        // Twice the two timeouts together. The CLI stays opaque throughout.
+        await eventually(() => Date.now() - started, elapsed => elapsed >= 8_000, { timeoutMs: 12_000, intervalMs: 250, label: "build beyond the server's timeouts" });
         expect((await read(env))?.phase).toBe("applying");
         expect(fixture.state.held).toBe(true);
         expect(fixture.deps.flyctl).toHaveBeenCalledOnce();
@@ -522,7 +524,7 @@ describe("SelfDeploy durable phase machine", () => {
       expect(fixture.deps.flyctl).toHaveBeenCalledOnce();
       expect(fixture.state.held).toBe(false);
     } } finally { await stopAll(local); }
-  }, 300_000);
+  }, 60_000);
   it.each(VARIANTS)("a Fly 4xx ends failed and clears the hold (%s)", async label => {
     f = deployFixture(); const env = envs.get(label)!; f.state.work = false;
     vi.mocked(f.deps.fly.updateMachine).mockRejectedValue(Object.assign(new Error("denied"), { status: 403 }));

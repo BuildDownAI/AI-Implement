@@ -412,8 +412,11 @@ export function createProductionReviewFixWorker(
         runner_callback_url: config.runnerCallbackBaseUrl,
       };
     },
-    fly: { flySessionsToken: config.flySessionsToken ?? "", flySessionsApp: config.flySessionsApp ?? "",
-      flySessionsRegion: config.flySessionsRegion ?? null, flyOrchestratorApp: config.flyOrchestratorApp ?? null,
+    fly: { flySessionsToken: config.flySessionsToken ?? "",
+      // RunnerBackend cache loads after composition; resolve its values when used.
+      get flySessionsApp() { return config.flySessionsApp ?? ""; },
+      get flySessionsRegion() { return config.flySessionsRegion ?? null; },
+      flyOrchestratorApp: config.flyOrchestratorApp ?? null,
       tenantId: config.tenantId ?? null, sessionImage: config.sessionImage, runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       anthropicApiKey: config.anthropicApiKey ?? null, claudeOAuthToken: config.claudeOAuthToken ?? null },
     local: { image: config.localRunnerImage ?? config.sessionImage,
@@ -472,13 +475,17 @@ export function createProductionReviewFixServices(
   submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
   runtime?: ModelAuthRuntime,
   onBudgetExhausted?: OnBudgetExhausted,
+  /** Test seam: production keeps the default collection window and run-status tick. */
+  timing: { collectionWindowMs?: number; runStatusTickMs?: number } = {},
 ): RestateService[] {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = createProductionReviewFixWorker(config, store, runtime);
   const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
   const finalizer = withReviewFixCleanup(config, store, createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview }));
+  const { collectionWindowMs, runStatusTickMs } = timing;
   const pr = createReviewFixPR({
+    ...(collectionWindowMs === undefined ? {} : { collectionWindowMs: async () => collectionWindowMs }),
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
       admit: (request) => admitReviewFix(request, config, store, runtime, onBudgetExhausted),
@@ -512,7 +519,7 @@ export function createProductionReviewFixServices(
         jobTimeoutMinutes: mapping.maxJobMinutes ?? DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES };
     },
   });
-  const attempt = createReviewFixAttempt({ store, worker, finalizer, notifyPrOnCompletion: true,
+  const attempt = createReviewFixAttempt({ store, worker, finalizer, notifyPrOnCompletion: true, runStatusTickMs,
     loadApprovalEvidence: async (prepared, result) => {
       const findingDispositions = dispositionsFor(prepared, result);
       const required = new Set(prepared.findings.map((finding) => finding.findingKey));

@@ -44,9 +44,11 @@ jobs:
   # which is what gets it onto ai-implement/feature/** PRs (AII-467 pattern). No
   # `needs:` either: it runs in parallel with `unit-tests`. The suite runs three times
   # (AII-993 flake detector: a scenario that fails one run in three must fail
-  # the PR that adds it) as a three-job matrix rather than one serial step
-  # (AII-1157 wall time). fail-fast is off so the evidence of which passes
-  # failed survives. Checks: `restate-tests-binary (1)`, `(2)`, `(3)`.
+  # the PR that adds it), and each pass is split into two shards (vitest `--shard`,
+  # which divides the files by a hash of their paths), so six jobs run side by side
+  # and the wall time is that of the slower shard, not of the whole suite.
+  # fail-fast is off so the evidence of which passes failed survives.
+  # Checks: `restate-tests-binary (<pass>, <shard>)`, for example `restate-tests-binary (1, 2)`.
   restate-tests-binary:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -54,6 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         pass: [1, 2, 3]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -61,5 +64,5 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: npm run test:restate pass ${{ matrix.pass }} of 3
-        run: npm run test:restate
+      - name: npm run test:restate pass ${{ matrix.pass }} of 3, shard ${{ matrix.shard }} of 2
+        run: npm run test:restate -- --shard=${{ matrix.shard }}/2

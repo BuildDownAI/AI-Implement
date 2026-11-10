@@ -68,6 +68,8 @@ export interface FlyMachineProfileDeps {
   };
   /** Test seam for a short idle timeout; production leaves it unset. */
   idleTimeoutMsOverride?: number;
+  /** Test seam for the first wait between scrub attempts (production: 2 s, then doubling to 10 s); production leaves it unset. */
+  scrubInitialRetryMsOverride?: number;
 }
 
 export interface MachineHold {
@@ -322,7 +324,8 @@ export function createFlyMachineProfile(deps: FlyMachineProfileDeps) {
           if (err instanceof Error && err.message.includes(GONE_BEFORE_SCRUB)) throw new restate.TerminalError(err.message, { errorCode: 404 });
           throw err;
         }
-      }, SCRUB_RETRY);
+      }, deps.scrubInitialRetryMsOverride === undefined ? SCRUB_RETRY
+        : { ...SCRUB_RETRY, initialRetryInterval: { milliseconds: deps.scrubInitialRetryMsOverride } });
     } catch (err) {
       if (restate.internal.isSuspendedError(err)) throw err;
       scrubbed = false;

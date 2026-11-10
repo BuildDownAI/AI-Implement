@@ -186,7 +186,9 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", reviewFixLifecycle: "restate" }));
     expect(getMappings().AII?.reviewFixLifecycle).toBe("restate");
     store = new SqliteReviewFixAttemptStore();
-    const services = createProductionReviewFixServices(CONFIG, makeRegistry(), store, undefined, runtime);
+    const services = createProductionReviewFixServices(CONFIG, makeRegistry(), store, undefined, runtime, undefined,
+      // Production waits 5 s to collect feedback and reads the run's status every 60 s; neither wait is under test here.
+      { collectionWindowMs: 200, runStatusTickMs: 1_000 });
     env = await startRetryEnabled(services);
   }, 60_000);
 
@@ -442,8 +444,10 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
   it("withholds approval when the PR head moved after the evidence was published", async () => {
     const c = await runCase(57, { dispositions: "all" });
     heads.set(57, sha("someone-pushed"));
-    // The observed head no longer equals the accepted result's commit, so the attempt is not a success to approve.
-    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject({ status: "finalized", approval: "not_applicable" });
+    // The terminal head differs from the accepted result, so approval is explicitly withheld.
+    expect(await finish(c.attemptId, c.prepared, c.launch, c.commit)).toMatchObject({
+      status: "finalized", approval: "withheld", approvalReason: "terminal_result_head_mismatch",
+    });
     expect(comments.get(57) ?? []).toHaveLength(0);
   }, 90_000);
 
