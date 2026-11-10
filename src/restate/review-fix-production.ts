@@ -91,7 +91,7 @@ interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string; skip?
  * changed workflow, runner mode, missing callback credential, or GitHub outage
  * defers admission with the queue still pending. Containers check backend inputs
  * instead of probing a GHA workflow. A managed (opted-in) project is admitted only
- * on GHA when its workflow carries the managed capabilities and
+ * when backend prerequisites (and GHA workflow capabilities) hold and
  * the read-only agent readiness check passes; that check reserves, snapshots and mints
  * nothing, because launch preparation is the only place that freezes and grants. */
 export async function canAdmit(
@@ -117,7 +117,6 @@ async function decideAdmission(
   const path = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
   const managed = isManagedProject(key);
   if (path !== "github-actions") {
-    if (managed) return { verdict: "defer", reason: "managed_backend_unsupported" };
     if (Object.keys(mapping.extraEnv ?? {}).some(isEphemeralPolicyEnvName)) {
       return { verdict: "defer", reason: "ephemeral execution policy requires GitHub Actions; remove policy variables from extraEnv or select GHA execution" };
     }
@@ -133,8 +132,8 @@ async function decideAdmission(
         return { verdict: "defer", reason: "installation_mismatch" };
       }
       const pr = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
-      return pr?.state === "open" && !pr.merged ? { verdict: "admit", reason: path }
-        : { verdict: "defer", reason: "pr_not_open" };
+      if (pr?.state !== "open" || pr.merged) return { verdict: "defer", reason: "pr_not_open" };
+      return managed ? await managedReadiness(key, mapping, path, runtime) : { verdict: "admit", reason: path };
     } catch { return { verdict: "defer", reason: "contract_unverified" }; }
   }
   if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return { verdict: "defer", reason: "callback_unavailable" };
@@ -152,11 +151,16 @@ async function decideAdmission(
   if (selectsCodexImplementation(key) && capabilities.supportsExecutionPolicy !== true) {
     return { verdict: "configuration_error", reason: "execution_policy_missing" };
   }
+  return managedReadiness(key, mapping, path, runtime);
+}
+
+async function managedReadiness(key: string, mapping: RepoMapping, backend: "github-actions" | "fly-machines" | "local-docker", runtime?: ModelAuthRuntime): Promise<AdmissionDecision> {
+  if (!runtime) return { verdict: "defer", reason: "model_auth_unavailable" };
   const repository = `${mapping.owner}/${mapping.repo}`;
   let readiness;
   try {
     readiness = await inspectAgentReadiness({ dispatchId: `admission-readiness-${randomUUID()}`, projectKey: key,
-      backend: "github-actions", workflowRepository: repository, workflowFile: mapping.workflowFile,
+      backend, workflowRepository: repository, workflowFile: mapping.workflowFile,
     }, runtime.preparationDeps({ owner: mapping.owner, repo: mapping.repo, projectKey: key }));
   } catch { return { verdict: "defer", reason: "readiness_unavailable" }; }
   if (readiness.status === "legacy") return { verdict: "configuration_error", reason: "no_stage_configuration" };
@@ -398,7 +402,7 @@ export function createProductionReviewFixWorker(
       };
     },
   });
-  const container = new ContainerReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+  const container = new ContainerReviewFixWorker({ credentials, modelAuthRuntime: runtime, scopeStore: reviewFixAttemptStoreScopeStore(store),
     callbackInputs: async (attemptId) => {
       if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
       return {

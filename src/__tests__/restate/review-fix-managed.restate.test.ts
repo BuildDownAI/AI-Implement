@@ -35,13 +35,16 @@ import type { ReviewFixAttemptCompletion } from "../../restate/review-fix-attemp
 import { makeAppConfig, makeChatGptPlanRecord, makeMapping, makeRegistry, makeReviewFixResult, makeScopedPrIdentity } from "../helpers/builders.js";
 import { testDir } from "../helpers/test-dir.js";
 import type { RestateEnvironment } from "./harness.js";
-import { attachWorkflow, callWorkflow, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled } from "./harness.js";
+import { attachWorkflow, callWorkflow, eventually, journalEntries, journalText, journaledRunResult, queryInvocations, startRetryEnabled } from "./harness.js";
 
 const SECRET = "SYNTHETIC-managed-token-secret";
 const ACCESS = "SYNTHETIC-managed-model-access";
-const CONFIG = makeAppConfig({ runnerTokenSecret: SECRET, runnerCallbackBaseUrl: "https://orchestrator.example" });
+const CONFIG = makeAppConfig({ runnerTokenSecret: SECRET, runnerCallbackBaseUrl: "https://orchestrator.example", flySessionsToken: "synthetic-fly", flySessionsApp: "sessions", localRunnerImage: "runner" });
 
 const state = vi.hoisted(() => ({
+  containers: [] as Array<{ snapshot: unknown; bearer: string; backend: string; name: string }>,
+  fault: null as null | "lost acknowledgement" | "attachment failure",
+  recovering: false,
   dispatched: [] as Array<Record<string, unknown>>,
   nextRunId: 9_500,
   workflow: "",
@@ -61,6 +64,36 @@ vi.mock("../../github.js", async (importOriginal) => ({
   getDefaultBranchFileText: async (_t: string, _o: string, _r: string, file: string) =>
     file === ".github/workflows/claude-implement.yml" ? state.workflow : null,
   getPullRequestState: async () => ({ state: "open", merged: false }),
+}));
+
+// Synthetic container boundaries retain the real production worker, preparation and durable intent.
+vi.mock("../../gapfill-launch.js", async original => ({ ...await original<typeof import("../../gapfill-launch.js")>(),
+  dispatchFlyGapfill: async (input: import("../../gapfill-launch.js").DispatchFlyGapfillInput) => {
+    if (input.decision.kind !== "launch") throw new Error("expected managed Fly launch");
+    state.containers.push({ snapshot: input.decision.snapshot, bearer: input.decision.takeBootstrap()!.bearer, backend: "fly-machines", name: input.runName! });
+    input.onBeforeLaunch?.({ cpus: 2, memoryMb: 4096, cpuKind: "shared" }, "synthetic-container-nonce", "runner");
+    if (state.fault === "lost acknowledgement") throw new Error("lost acknowledgement");
+    return { machine: { id: `managed-fly-${state.containers.length}` } };
+  },
+}));
+vi.mock("../../local-gapfill.js", () => ({
+  dispatchLocalGapfill: async (input: import("../../local-gapfill.js").DispatchLocalGapfillInput) => {
+    const decision = input.managed!.decision;
+    state.containers.push({ snapshot: decision.snapshot, bearer: decision.takeBootstrap()!.bearer, backend: "local-docker", name: input.runName! });
+    input.onBeforeLaunch?.("synthetic-container-nonce");
+    if (state.fault === "lost acknowledgement") throw new Error("lost acknowledgement");
+    return { containerId: `managed-local-${state.containers.length}` };
+  },
+}));
+
+vi.mock("../../fly-machines.js", async original => ({ ...await original<typeof import("../../fly-machines.js")>(),
+  listMachines: async () => state.recovering ? state.containers.map((c, i) => ({ id: `managed-fly-${i + 1}`, name: c.name })) : [],
+}));
+vi.mock("../../local-docker.js", async original => ({ ...await original<typeof import("../../local-docker.js")>(),
+  findLocalContainerIdByName: async (name: string) => {
+    const i = state.containers.findIndex(c => c.name === name);
+    return state.recovering && i >= 0 ? `managed-local-${i + 1}` : null;
+  },
 }));
 
 const realFetch = globalThis.fetch;
@@ -529,4 +562,101 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
       expect(state.dispatched).toHaveLength(dispatchedBefore);
     } finally { state.workflow = good; __clearWorkflowProbeCacheForTests(); }
   }, 60_000);
+  it("freezes managed container selections across settings edits and Restate restarts", async () => {
+    const logs = vi.spyOn(console, "log");
+    const errors = vi.spyOn(console, "error");
+    let pr = 180;
+    for (const backend of ["fly-machines", "local-docker"] as const) {
+      for (const mode of ["api", "plan", "mixed"] as const) {
+        vi.stubEnv("RUNNER_MODE", backend === "local-docker" ? "local" : "default");
+        upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", executionMode: "fly-machines", reviewFixLifecycle: "restate" }));
+        profiles.saveAccountProfileRevision({ profileId: "api", identity: "api", revision: pr, agent: "codex", provider: "openai", authMode: "openai-api-key", metadata: { credentialRef: "model-account:api" } });
+        profiles.saveAccountProfileRevision({ profileId: "claude", identity: "claude", revision: pr, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:claude" } });
+        const { createModelProtectedSecrets } = await import("../../model-protected-secrets.js");
+        expect(createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } }).write("model-account:api", "SYNTHETIC-container-api-key").ok).toBe(true);
+        expect(createModelProtectedSecrets({ env: { RUNNER_TOKEN_SECRET: SECRET } }).write("model-account:claude", "SYNTHETIC-container-api-key").ok).toBe(true);
+        const stage = (id: string) => ({ agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", accountProfileId: id, invocationTimeoutMs: 60_000 });
+        profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
+          planning: stage(mode === "api" ? "api" : "cdx"), implementation: stage(mode === "plan" ? "cdx" : "api"), review: mode === "mixed" ? { ...stage("claude"), agent: "claude", provider: "anthropic" } : stage(mode === "api" ? "api" : "cdx"),
+        } });
+        profiles.setProjectOptIn("AII", true);
+        const before = state.containers.length;
+        const { attemptId } = await admit(pr);
+        await eventually(() => state.containers.length, n => n === before + 1, { timeoutMs: 20_000, label: "managed container launch" });
+        const launch = state.containers[before];
+        const { loadStoredSnapshot } = await import("../../agent-run-preparation.js");
+        const frozen = loadStoredSnapshot(attemptId);
+        expect(frozen).toEqual(launch.snapshot);
+        expect(launch.backend).toBe(backend);
+        profiles.setProjectOptIn("AII", false);
+        profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage("cdx"), implementation: stage("cdx"), review: stage("cdx") } });
+        await env.startedRestateServer.restart();
+        expect(loadStoredSnapshot(attemptId)).toEqual(frozen);
+        expect(state.containers).toHaveLength(before + 1);
+        expect(grants(attemptId)).toBe(1);
+        const text = await journalsOf(attemptId, pr);
+        for (const secret of [launch.bearer, ACCESS, SECRET, "SYNTHETIC-container-api-key"]) expect(JSON.stringify([text, logs.mock.calls, errors.mock.calls])).not.toContain(secret);
+        await store.releaseOwner(attemptId, "cancelled");
+        pr++;
+      }
+    }
+  }, 180_000);
+
+  for (const backend of ["fly-machines", "local-docker"] as const) {
+    for (const fault of ["lost acknowledgement", "attachment failure"] as const) {
+      it(`recovers managed ${backend} ${fault} through a Restate restart without relaunch`, async () => {
+        const logs = [vi.spyOn(console, "log"), vi.spyOn(console, "error"), vi.spyOn(console, "warn")];
+        const preparation = vi.spyOn(await import("../../managed-dispatch-auth.js"), "prepareManagedDispatch");
+        const log = await import("../../log.js");
+        const bind = log.setJobMachineId;
+        const attachment = vi.spyOn(log, "setJobMachineId").mockImplementation((...args) => {
+          if (state.fault === "attachment failure" && !state.recovering) throw new Error("attachment failed");
+          return bind(...args);
+        });
+        const pr = 200 + (backend === "local-docker" ? 2 : 0) + (fault === "attachment failure" ? 1 : 0);
+        state.fault = fault;
+        state.recovering = false;
+        try {
+          vi.stubEnv("RUNNER_MODE", backend === "local-docker" ? "local" : "default");
+          upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", executionMode: "fly-machines", reviewFixLifecycle: "restate" }));
+          const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", accountProfileId: "cdx", invocationTimeoutMs: 60_000 };
+          profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: { ...stage, accountProfileId: "api" }, review: stage } });
+          profiles.setProjectOptIn("AII", true);
+          const before = state.containers.length;
+          const { attemptId } = await admit(pr);
+          await eventually(() => state.containers.length, n => n === before + 1, { timeoutMs: 20_000 });
+          const launch = state.containers[before];
+          const revoked = () => (getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = ?").get(attemptId) as { revoked_at: number | null }).revoked_at;
+          await eventually(revoked, value => fault === "lost acknowledgement" ? value !== null : value === null);
+          await eventually(async () => {
+            const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}'`);
+            try { return journaledRunResult(await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string), "launch-once"); }
+            catch { return null; }
+          }, value => (value as { status?: string } | null)?.status === "unknown", { timeoutMs: 20_000, label: "unknown launch journaled before restart" });
+          await env.startedRestateServer.restart();
+          state.recovering = true;
+          const runRef = `managed-${backend === "fly-machines" ? "fly" : "local"}-${before + 1}`;
+          await eventually(() => log.getJobByDispatchId(attemptId)?.machineId, id => id === runRef, { timeoutMs: 30_000, label: "original resource reconciled after restart" });
+          await eventually(() => store.findPreparedAttemptByExecution({ backend, runRef }), value => value?.attemptId === attemptId,
+            { timeoutMs: 20_000, label: "workflow bound reconciled resource" });
+          expect(state.containers).toHaveLength(before + 1);
+          expect(preparation).toHaveBeenCalledTimes(1);
+          expect(grants(attemptId)).toBe(1);
+          expect(revoked()).toEqual(fault === "lost acknowledgement" ? expect.any(Number) : null);
+          // journalText decodes journal payloads, including ctx.run step outputs.
+          const journal = await journalsOf(attemptId, pr);
+          for (const secret of [launch.bearer, ACCESS, SECRET, "SYNTHETIC-container-api-key"])
+            expect(JSON.stringify([journal, ...logs.map(l => l.mock.calls)])).not.toContain(secret);
+          await store.releaseOwner(attemptId, "cancelled");
+        } finally {
+          state.fault = null;
+          state.recovering = false;
+          attachment.mockRestore();
+          preparation.mockRestore();
+          logs.forEach(l => l.mockRestore());
+        }
+      }, 90_000);
+    }
+  }
+
 });
