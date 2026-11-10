@@ -1,3 +1,4 @@
+import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { readOptionalModelPrices } from "../restate/implementation-run-workflow.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,6 +20,13 @@ vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationInt
   remove: (id: string) => intents.delete(id),
 }) }));
 vi.mock("../agent-run-preparation.js", () => ({ releaseRejectedLaunch: vi.fn(), loadStoredSnapshot: vi.fn().mockReturnValue(null), releaseUnusedManagedPreparation: vi.fn().mockReturnValue({ complete: true }) }));
+// Backend composition tests isolate the authority port; real SQLite fencing is covered separately.
+vi.mock("../restate/implementation-run-owner.js", () => ({
+  requireImplementationRunOwner: (input: ImplementationRunInput) => ({ input, generation: 3, createdAt: DISPATCHED_AT, jobId: null, state: "launching", ...(intents.get(`owner:${input.dispatchId}`)?.snapshot as object ?? {}) }),
+  updateImplementationRunOwner: vi.fn((owner) => { intents.set(`owner:${owner.input.dispatchId}`, { snapshot: owner, done: false }); }),
+  readImplementationRunOwner: (id: string) => intents.get(`owner:${id}`)?.snapshot ?? null,
+  releaseImplementationRunOwner: (id: string, reason: DispatchAdmissionReleaseReason) => releaseAdmission(id, { kind: "restate", attemptId: id }, 3, reason),
+}));
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../restate/implementation-run-workflow.js")>()),
@@ -50,7 +58,7 @@ vi.mock("../fly-machines.js", () => ({
   generateSessionToken: () => "SESSION-TOKEN", generateMachineNonce: () => "MACHINE-NONCE",
 }));
 vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn().mockResolvedValue(null) }));
-vi.mock("../dispatch-admission.js", () => ({ read: vi.fn(), releaseByDispatchId: vi.fn() }));
+vi.mock("../dispatch-admission.js", () => ({ read: vi.fn(), release: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../runner-tokens.js", () => ({
   mintLaunchTokens: vi.fn().mockReturnValue({ runToken: "RUN-TOKEN", runProgressToken: "PROGRESS-TOKEN", runPublicationToken: "PUBLICATION-TOKEN" }),
@@ -72,7 +80,7 @@ import { acquireDispatch } from "../dispatch-gate.js";
 import { cancelWorkflowRun, getPullRequestState, getWorkflowRunStatus } from "../github.js";
 import { appendLogIfAbsent, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
 import { markDispatched } from "../dedup.js";
-import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
+import { read as readAdmission, release as releaseAdmission } from "../dispatch-admission.js";
 import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
 import { classifyLaunchError, isManagedProject, prepareManagedDispatch, settleLaunch } from "../managed-dispatch-auth.js";
@@ -223,7 +231,7 @@ describe("production deps", () => {
   });
 
   it("returns a service", () => {
-    expect(createProductionImplementationRunServices(deps()).services).toHaveLength(1);
+    expect(createProductionImplementationRunServices(deps()).services).toHaveLength(2);
   });
 
   describe("reserve", () => {
@@ -279,7 +287,7 @@ describe("production deps", () => {
         };
         expect(await routes.run(ctx, { ...INPUT, backend })).toEqual({ reason: "refused" });
         expect(acquireDispatch).not.toHaveBeenCalled();
-        expect(releaseByDispatchId).not.toHaveBeenCalled();
+        expect(releaseAdmission).not.toHaveBeenCalled();
         expect(listMachines).not.toHaveBeenCalled();
         expect(input.prepareImplementationLaunch).not.toHaveBeenCalled();
         expect(input.launchImplementationRun).not.toHaveBeenCalled();
@@ -300,6 +308,7 @@ describe("production deps", () => {
     it.each(["fly-machines", "local-docker"] as const)("%s: workflow adopts a recorded run after configuration becomes ineligible", async (backend) => {
       const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
       vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "prior-run" }));
+      intents.set(`owner:${INPUT.dispatchId}`, { snapshot: { input: { ...INPUT, backend }, mapping: MAPPING, flyApp: "original-app" }, done: false });
       // Even without admission evidence, a recorded job must prevent the first-dispatch shortcut.
       vi.mocked(readAdmission).mockReturnValue(null);
       vi.mocked(acquireDispatch).mockReturnValue({ ok: true } as never);
@@ -348,7 +357,7 @@ describe("production deps", () => {
         }] as never);
         await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow("missing ordinary launch intent");
       }
-      expect(releaseByDispatchId).not.toHaveBeenCalled();
+      expect(releaseAdmission).not.toHaveBeenCalled();
     });
 
     it.each(BACKENDS)("%s: preserves managed, API and OAuth eligibility", async (backend) => {
@@ -494,7 +503,7 @@ describe("production deps", () => {
     it.each(BACKENDS)("%s: a pre-launch throw (mapping) returns rejected and releases nothing", async (backend) => {
       const { d } = compose();
       expect(await d.launch({ ...INPUT, teamKey: "NOPE", backend })).toEqual({ outcome: "rejected" });
-      expect(releaseByDispatchId).not.toHaveBeenCalled();
+      expect(releaseAdmission).not.toHaveBeenCalled();
     });
 
     it.each(BACKENDS)("%s: no active reservation returns rejected", async (backend) => {
@@ -606,7 +615,7 @@ describe("production deps", () => {
         vi.mocked(listMachines).mockRejectedValue(new Error("lookup failed"));
         await expect(d.findExistingRun(run, DISPATCHED_AT)).rejects.toThrow();
         expect(releaseUnusedManagedPreparation).not.toHaveBeenCalled();
-        expect(releaseByDispatchId).not.toHaveBeenCalled();
+        expect(releaseAdmission).not.toHaveBeenCalled();
       });
 
       it.each(["github-actions", "fly-machines"] as const)("%s existing execution prevents cleanup", async backend => {
@@ -646,6 +655,7 @@ describe("production deps", () => {
   });
 
   describe("readStatus (ended)", () => {
+    beforeEach(() => { intents.set(`owner:${INPUT.dispatchId}`, { snapshot: { input: INPUT, mapping: MAPPING, flyApp: "fly-app" }, done: false }); });
     it.each([["destroyed", "ended"], ["stopped", "ended"], ["started", "started"], ["starting", "unknown"]])("fly state %s is %s", async (state, expected) => {
       vi.mocked(getMachine).mockResolvedValue({ id: "m-1", state } as never);
       expect(await compose().d.readStatus({ ...INPUT, backend: "fly-machines" }, "m-1")).toBe(expected);
@@ -699,7 +709,7 @@ describe("production deps", () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ id: 7, dispatchId: "d-1", teamKey: "ENG", issueId: "i-1", status: "running", conclusion: null, failure: null, approved: false }));
       const { input, d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
-      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "ended_without_callback", undefined, { backendTerminated: true });
+      expect(updateJobStatus).toHaveBeenCalledWith(7, "failed", "ended_without_callback", undefined, { skipAdmissionRelease: true });
       expect(input.finalizeImplementation).toHaveBeenCalledWith(
         { kind: "failed", conclusion: "ended_without_callback" }, provider, expect.objectContaining({ githubAppId: "1" }), expect.objectContaining({ id: 7 }), { ownerCall: true },
       );
@@ -742,6 +752,7 @@ describe("production deps", () => {
   });
 
   describe("cleanup", () => {
+    beforeEach(() => { intents.set(`owner:${INPUT.dispatchId}`, { snapshot: { input: INPUT, mapping: MAPPING, flyApp: "fly-app" }, done: false }); });
     it("fly destroys the machine, local removes the container, GitHub does nothing", async () => {
       const { d } = compose();
       vi.mocked(getMachine).mockResolvedValue({ id: "m-1", state: "stopped", config: {} } as never);
@@ -779,7 +790,7 @@ describe("production deps", () => {
 
     it("release releases by dispatch id", async () => {
       await compose().d.release("d-1", "finalized");
-      expect(releaseByDispatchId).toHaveBeenCalledWith("d-1", "finalized");
+      expect(releaseAdmission).toHaveBeenCalledWith("d-1", { kind: "restate", attemptId: "d-1" }, 3, "finalized");
     });
   });
 });

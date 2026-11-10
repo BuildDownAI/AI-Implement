@@ -3,17 +3,24 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeIssue, makeMapping, makeProvider } from "../helpers/builders.js";
 import { testTempRoot } from "../helpers/test-dir.js";
 import { testDb } from "../helpers/test-db.js";
-import { callWorkflow, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled, type RestateEnvironment } from "./harness.js";
+import { callWorkflow, cancelInvocation, waitForStep, gate, type Gate, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled, type RestateEnvironment } from "./harness.js";
 import type { ImplementationRunDependencies, ImplementationRunInput } from "../../restate/implementation-run-workflow.js";
 import type { ImplementationRunProductionInput } from "../../restate/implementation-run-production.js";
 
-const captured = vi.hoisted(() => ({ deps: null as ImplementationRunDependencies | null }));
+const captured = vi.hoisted(() => ({ deps: null as ImplementationRunDependencies | null, deadline: false, stopGate: undefined as Gate | undefined, wrapGate: undefined as Gate | undefined, wrapEffect: "", historical: false }));
 vi.mock("../../restate/implementation-run-workflow.js", async (original) => {
   const actual = await original<typeof import("../../restate/implementation-run-workflow.js")>();
   return { ...actual, createImplementationRunWorkflow: (deps: ImplementationRunDependencies) => {
     captured.deps = deps;
-    return actual.createImplementationRunWorkflow({ ...deps, readModelPrices: async () => undefined,
-      retentionMs: 86_400_000, tickMs: 50, confirmTickMs: 50, bootstrapMs: 120_000, totalMs: 240_000,
+    return actual.createImplementationRunWorkflow({ ...deps,
+      // These values stand in for already-recorded historical effect outcomes. Their
+      // production callbacks did not run and therefore wrote no new owner/target data.
+      ...(captured.historical ? { reserve: async () => true, findExistingRun: async () => "historical-machine", launch: async () => ({ outcome: "accepted" as const, jobId: "historical-machine" }) } : {}),
+      readModelPrices: async () => undefined,
+      cleanup: async (run, id) => { if (captured.wrapEffect === "cleanup") await captured.wrapGate!.wait(); return deps.cleanup(run, id); },
+      onOutcome: async (id) => { if (captured.wrapEffect === "outcome") await captured.wrapGate!.wait(); return deps.onOutcome(id); },
+      stop: async (run, id) => { if (captured.stopGate) await captured.stopGate.wait(); return deps.stop(run, id); },
+      retentionMs: 86_400_000, tickMs: 50, confirmTickMs: 50, bootstrapMs: 120_000, totalMs: captured.deadline ? 1_200 : 240_000, stopMarginMs: 200,
     });
   } };
 });
@@ -21,12 +28,21 @@ vi.mock("../../github-app-auth.js", () => ({ getInstallationToken: async () => "
 vi.mock("node:child_process", async (original) => ({ ...(await original<typeof import("node:child_process")>()), execFile: vi.fn() }));
 
 let env: RestateEnvironment | undefined;
-afterEach(async () => { await env?.stop(); env = undefined; vi.restoreAllMocks(); });
+afterEach(async () => { captured.historical = false; captured.stopGate?.release(); captured.wrapGate?.release(); await env?.stop(); env = undefined; vi.restoreAllMocks(); });
 
 // Real production admission/log/intent/finder/callback/finalizer composition against the pinned Restate binary.
 // Only backend I/O and tracker writes are simulated; the local finder and docker launcher are real.
 describe("implementation lost acceptance recovery", () => {
-  it.each(["github-actions", "fly-machines", "local-docker"] as const)("%s: adopts once, accepts callbacks and finalizes", async (backend) => {
+  it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend => (backend === "fly-machines" ? ["normal", "cancelled", "deadline", "cleanup", "outcome", "historical"] : ["normal", "cancelled", "deadline", "cleanup", "outcome"]).map(mode => ({ backend, mode }))))("$backend $mode: adopts once and finalizes the exact retained owner", async ({ backend, mode }) => {
+    const historical = mode === "historical";
+    captured.historical = historical;
+    const cancelled = mode === "cancelled";
+    const deadline = mode === "deadline";
+    const wrap = mode === "cleanup" || mode === "outcome";
+    captured.wrapEffect = wrap ? mode : "";
+    captured.wrapGate = wrap ? gate(mode) : undefined;
+    captured.deadline = deadline || historical;
+    captured.stopGate = cancelled ? gate("escape stop before retained status") : undefined;
     testTempRoot("implementation-recovery");
     const db = await testDb({ modules: {
       production: () => import("../../restate/implementation-run-production.js"),
@@ -35,6 +51,7 @@ describe("implementation lost acceptance recovery", () => {
       launch: () => import("../../implementation-launch.js"),
       callback: () => import("../../runner-callback.js"),
       tokens: () => import("../../runner-tokens.js"),
+      watchdog: () => import("../../stuck-watchdog.js"),
     } });
     const { production, log, admission, launch, callback, tokens } = db.modules;
     const run: ImplementationRunInput = { dispatchId: `recover-${backend}`, issueId: "issue-1", issueIdentifier: "ENG-1", teamKey: "ENG", backend, maxJobMinutes: 60, launchContext: { runnerMode: "default" } };
@@ -56,6 +73,7 @@ describe("implementation lost acceptance recovery", () => {
         return Response.json({ id: 4242, status: ended ? "completed" : "in_progress", conclusion: ended ? "success" : null });
       }
       if (value.startsWith("https://api.machines.dev/")) {
+        if (historical) return new Response(null, { status: 404 });
         if (init?.method === "DELETE") return new Response(null, { status: 200 });
         const machine = { id: "machine-1", name: production.implementationFlyMachineName(run.issueIdentifier), created_at: new Date().toISOString(), state: ended ? "stopped" : "started", config: {} };
         return Response.json(value.endsWith("/machines") ? (accepted ? [machine] : []) : machine);
@@ -82,6 +100,12 @@ describe("implementation lost acceptance recovery", () => {
     const minted = tokens.mintLaunchTokens({ issueId: issue.id, mappingTeamKey: run.teamKey, phase: "implementation", dispatchId: run.dispatchId, repository: "Org/repo", ttlSeconds: 3600, secret: "test-secret" });
     const postDispatch = vi.fn(async () => { await provider.markImplementing(issue.id, issue.scopeKey); });
     const finalize = vi.fn(async () => {});
+    const remediate = vi.fn<ImplementationRunProductionInput["remediateStuckJob"]>(async (_config, _provider, job, _reason, _stop, opts) => {
+      log.updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { skipAdmissionRelease: opts?.ownerCall });
+      return true;
+    });
+    let failOutcome = false;
+    const reportTerminalJob = vi.fn(async () => { if (failOutcome) throw new Error("later bookkeeping failure"); });
     const changeConfiguration = () => {
       productionInput.config.anthropicApiKey = null;
       mapping.maxTurns = 999;
@@ -104,11 +128,25 @@ describe("implementation lost acceptance recovery", () => {
         nonce = args.input.machineNonce; runToken = args.input.runToken;
         return launch.launchImplementationLocalSession(args);
       },
-      postDispatch, finalizeImplementation: finalize, remediateStuckJob: async () => true, reportTerminalJob: async () => {},
+      postDispatch, finalizeImplementation: finalize, remediateStuckJob: backend === "fly-machines" && deadline ? vi.fn(db.modules.watchdog.remediateStuckJob) : remediate, reportTerminalJob,
     };
     const { services } = production.createProductionImplementationRunServices(productionInput);
+    if (historical) {
+      const { acquireDispatch } = await import("../../dispatch-gate.js");
+      expect(acquireDispatch({ dispatchId: run.dispatchId, issueId: run.issueId, issueIdentifier: run.issueIdentifier, kind: "implementation", teamKey: run.teamKey, backend, maxInProgressAiIssues: 5, lifecycleOwner: { kind: "restate", attemptId: run.dispatchId } }).ok).toBe(true);
+      productionInput.config.flySessionsApp = "replacement-app";
+    }
     env = await startRetryEnabled(services);
     const pending = callWorkflow<{ reason: string }>(env.baseUrl(), "ImplementationRun", run.dispatchId, "run", run);
+    if (historical) {
+      expect(await pending).toEqual({ reason: "termination_unconfirmed" });
+      expect(admission.read(run.dispatchId)!.releasedAt).toBeNull();
+      expect(await callWorkflow(env.baseUrl(), "ImplementationRunRecovery", run.dispatchId, "reconcile")).toEqual({ reason: "termination_unconfirmed" });
+      expect(admission.read(run.dispatchId)!.releasedAt).toBeNull();
+      expect(vi.mocked(globalThis.fetch).mock.calls.filter(([url]) => String(url).startsWith("https://api.machines.dev/"))).toEqual([]);
+      expect(finalize).not.toHaveBeenCalled();
+      return;
+    }
     await eventually(async () => log.getJobByDispatchId(run.dispatchId), (job) => Boolean(job), { label: "adopted row" });
     const row = log.getJobByDispatchId(run.dispatchId)!;
     expect(row.admissionGeneration).toBe(admission.read(run.dispatchId)!.generation);
@@ -125,18 +163,66 @@ describe("implementation lost acceptance recovery", () => {
     expect(provider.markImplementing).toHaveBeenCalledTimes(1);
     expect(launches).toBe(1);
     expect(provider.postComment).toHaveBeenCalledTimes(commentsBeforeRecovery);
-    const response = await callback.handleRunnerResult({ authorization: `Bearer ${runToken}`, secret: "test-secret", body: { phase: "implementation", outcome: "failure", comments: [], failureReason: "test implementation failure", failure: { category: "crash", code: "PROCESS_EXIT_NONZERO", stage: "feedback-loop", attempt: 1, retryable: false, message: "exit 1", evidence: { truncated: false } } }, resolveProvider: async () => provider,
-      checkImplementationAdmissionTermination: async () => { await callWorkflow(env!.baseUrl(), "ImplementationRun", run.dispatchId, "report"); return { status: "accepted" }; },
-    });
-    expect(response.status).toBe(200);
-    ended = true;
-    expect(await pending).toEqual({ reason: "finalized" });
-    expect(log.getJobByDispatchId(run.dispatchId)!.status).toBe("failed");
-    expect(finalize).toHaveBeenCalled();
+    if (!deadline && !cancelled && !wrap) {
+      const response = await callback.handleRunnerResult({ authorization: `Bearer ${runToken}`, secret: "test-secret", body: { phase: "implementation", outcome: "failure", comments: [], failureReason: "test implementation failure", failure: { category: "crash", code: "PROCESS_EXIT_NONZERO", stage: "feedback-loop", attempt: 1, retryable: false, message: "exit 1", evidence: { truncated: false } } }, resolveProvider: async () => provider,
+        checkImplementationAdmissionTermination: async () => { await callWorkflow(env!.baseUrl(), "ImplementationRun", run.dispatchId, "report"); return { status: "accepted" }; },
+      });
+      expect(response.status).toBe(200);
+    }
+    if (cancelled || deadline || wrap) {
+      if (wrap) {
+        ended = true;
+        await captured.wrapGate!.reached();
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${run.dispatchId}' AND target_handler_name = 'run'`);
+        await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+        await pending.catch(() => undefined);
+        // The interrupted effect remains parked: release must wait for recovery.
+        expect(admission.read(run.dispatchId)!.releasedAt).toBeNull();
+        captured.wrapGate!.release();
+      } else if (cancelled) {
+        const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${run.dispatchId}' AND target_handler_name = 'run'`);
+        await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+        await captured.stopGate!.reached();
+        // Interrupt escape before it can persist retained status. Reserve already
+        // established durable recovery authority, independent of this invocation.
+        await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
+        captured.stopGate!.release();
+        await pending.catch(() => undefined);
+      } else expect(await pending).toEqual({ reason: "termination_unconfirmed" });
+      await waitForStep(() => callWorkflow<{ step: string | null }>(env!.baseUrl(), "ImplementationRun", run.dispatchId, "status"), "termination_unconfirmed");
+      expect(admission.read(run.dispatchId)!.releasedAt).toBeNull();
+      if (!wrap) {
+        expect(await callWorkflow(env.baseUrl(), "ImplementationRunRecovery", run.dispatchId, "reconcile")).toEqual({ reason: "termination_unconfirmed" });
+        expect(finalize).not.toHaveBeenCalled();
+      }
+      ended = true;
+      failOutcome = true;
+      await expect(callWorkflow(env.baseUrl(), "ImplementationRunRecovery", run.dispatchId, "reconcile")).rejects.toThrow();
+      expect(admission.read(run.dispatchId)!.releasedAt).toBeNull();
+      const finalizations = finalize.mock.calls.length;
+      failOutcome = false;
+      const results = await Promise.all([1, 2].map(() => callWorkflow(env!.baseUrl(), "ImplementationRunRecovery", run.dispatchId, "reconcile")));
+      expect(results).toEqual([{ reason: deadline ? "deadline_exceeded" : cancelled ? "cancelled" : "finalized" }, { reason: deadline ? "deadline_exceeded" : cancelled ? "cancelled" : "finalized" }]);
+      expect(finalize).toHaveBeenCalledTimes(finalizations);
+    } else ended = true;
+    if (!cancelled && !deadline && !wrap) expect(await pending).toEqual({ reason: "finalized" });
+    expect(log.getJobByDispatchId(run.dispatchId)!.status).toBe(deadline ? "timed_out" : "failed");
+    if (cancelled || wrap) expect(log.getJobByDispatchId(run.dispatchId)!.conclusion).toBe(cancelled ? "workflow_cancelled" : "ended_without_callback");
+    if (wrap) expect(finalize).toHaveBeenCalledTimes(1);
+    if (deadline) {
+      expect(productionInput.remediateStuckJob).toHaveBeenCalledTimes(1);
+      if (backend === "fly-machines") {
+        expect(log.getStuckAttempts(run.issueId)).toBe(1);
+        // Deadline stop, real remediateStuckJob's callback, and final cleanup.
+        expect(vi.mocked(globalThis.fetch).mock.calls.filter(([url, init]) => String(url).startsWith("https://api.machines.dev/") && init?.method === "DELETE").length).toBeGreaterThanOrEqual(3);
+      }
+    }
+    else expect(finalize).toHaveBeenCalled();
     expect(admission.read(run.dispatchId)!.releasedAt).not.toBeNull();
+    expect(admission.read(run.dispatchId)!.releaseReason).toBe(deadline ? "deadline_exceeded" : cancelled ? "cancelled" : "finalized");
     const terminal = log.getJobByDispatchId(run.dispatchId)!;
     await captured.deps!.findExistingRun(run, terminal.dispatchedAt);
-    expect(log.getJobByDispatchId(run.dispatchId)!.status).toBe("failed");
+    expect(log.getJobByDispatchId(run.dispatchId)!.status).toBe(deadline ? "timed_out" : "failed");
     expect(postDispatch).toHaveBeenCalledTimes(1);
     expect(vi.mocked(globalThis.fetch).mock.calls.map(([url]) => String(url)).filter((url) => url.startsWith("https://api.")).some((url) => url.includes("changed-after-acceptance"))).toBe(false);
     const invocations = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${run.dispatchId}' AND target_handler_name = 'run'`);

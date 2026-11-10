@@ -359,7 +359,7 @@ export async function remediateStuckJob(
       "timed_out",
       "stuck_review_fix",
       undefined,
-      stopConfirmed ? { backendTerminated: true } : { skipAdmissionRelease: true },
+      stopConfirmed && !opts?.ownerCall ? { backendTerminated: true } : { skipAdmissionRelease: true },
     );
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m — review-fix run, ticket left unchanged`,
@@ -371,7 +371,7 @@ export async function remediateStuckJob(
   const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
-    if (stopConfirmed) {
+    if (stopConfirmed && !opts?.ownerCall) {
       updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { backendTerminated: true });
     } else {
       updateJobStatus(job.id, "timed_out", "stuck_requeued", undefined, { skipAdmissionRelease: true });
@@ -381,7 +381,7 @@ export async function remediateStuckJob(
         `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — requeueing`,
     );
   } else {
-    if (stopConfirmed) {
+    if (stopConfirmed && !opts?.ownerCall) {
       updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { backendTerminated: true });
     } else {
       updateJobStatus(job.id, "timed_out", "stuck_giveup", undefined, { skipAdmissionRelease: true });
