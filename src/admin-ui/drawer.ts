@@ -1031,8 +1031,9 @@ export const drawerScript = `
 
   // ---- Open in Restate UI link (AII-1262) ----
   //
-  // The orchestrator serves the Restate UI at /ui/, admin only. The service mirrors
-  // restateRefForRow in report-card.ts; a review-fix job counts only when the attempt
+  // The orchestrator serves the Restate UI at /ui/, admin only. Prefer the API
+  // reference from restateRefForJob in report-card.ts. For older orchestrators,
+  // the legacy service fallback counts a review-fix job only when the attempt
   // section just confirmed a Restate attempt for this dispatch id (pilotOwnedDispatchId),
   // so a legacy job shows no link.
 
@@ -1053,14 +1054,17 @@ export const drawerScript = `
   }
 
   function renderRestateLink(job) {
-    const service = window.isAdmin() ? journalServiceForJob(job) : null;
-    if (!service) {
+    const legacyService = job.restate === undefined ? journalServiceForJob(job) : null;
+    const ref = window.isAdmin()
+      ? (job.restate === undefined ? (legacyService ? { service: legacyService, key: job.dispatchId } : null) : job.restate)
+      : null;
+    if (!ref) {
       hideRestateLink();
       return;
     }
     const box = document.getElementById('drawer-restate-link');
-    box.innerHTML = '<a href="/ui/workflows/' + window.escAttr(encodeURIComponent(service)) + '/'
-      + window.escAttr(encodeURIComponent(job.dispatchId)) + '" target="_blank" rel="noopener noreferrer">Open in Restate UI</a>';
+    box.innerHTML = '<a href="/ui/workflows/' + window.escAttr(encodeURIComponent(ref.service)) + '/'
+      + window.escAttr(encodeURIComponent(ref.key)) + '" target="_blank" rel="noopener noreferrer">Open in Restate UI</a>';
     box.hidden = false;
   }
 
