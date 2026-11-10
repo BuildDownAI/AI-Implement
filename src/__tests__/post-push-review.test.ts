@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
 import { prepareScratchExclusion } from "../pipeline/scratch-exclude.js";
-import { EXTERNAL_REVIEW_PENDING_NEXT_STEP, isReviewLedgerFindingGating, postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { EXTERNAL_REVIEW_PENDING_NEXT_STEP, isReviewLedgerFindingGating, postPushReviewStep, reportReviewerSelectionFailure } from "../pipeline/steps/post-push-review.js";
 import type { LLMExecutor, PipelineContextData } from "../pipeline/types.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -1210,6 +1210,40 @@ describe("postPushReviewStep", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("includes readable rejections in the reviewer-selection failure reporter", async () => {
+    // Selection normally fails before any fix pass; exercise the reporter directly
+    // to keep its terminal-comment contract covered with accumulated rejections.
+    const finding = { source: "github-review-thread" as const, severity: "blocking" as const, path: "src/db.ts", line: 42, body: "The index is missing." };
+    const findingKey = stableReviewFindingKey(finding);
+    const reason = "The index already exists.";
+    const rejectedBlock = `\n\n### Rejected by the fix pass\n\n- ${finding.source} · ${finding.path}:${finding.line} — ${finding.body} — ${reason}`;
+    const comments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: githubReply(args) ?? "", exitCode: 0 };
+    });
+    const report = vi.fn(async () => undefined);
+
+    const out = await reportReviewerSelectionFailure(
+      { report }, ghSpawn, "42", "The reviewer selection for this project is empty.", rejectedBlock,
+    );
+
+    expect(out.terminationReason).toBe("invalid_review");
+    expect(report).toHaveBeenCalledWith(expect.objectContaining({ id: "post-push-review.selection", status: "failed" }));
+    expect(comments).toHaveLength(1);
+    const terminal = comments[0];
+    expect(terminal).toContain("reviewer-selection-invalid");
+    expect(terminal).toContain("Manual review required");
+    expect(terminal).toContain("Rejected by the fix pass");
+    expect(terminal).toContain(finding.source);
+    expect(terminal).toContain(`${finding.path}:${finding.line}`);
+    expect(terminal).toContain(finding.body);
+    expect(terminal).toContain(reason);
+    const visible = terminal.replace(/<!--[\s\S]*?-->/g, "");
+    expect(visible).not.toContain(findingKey);
+    expect(visible).not.toMatch(/[a-f0-9]{64}/);
   });
 
   it("fails closed for an empty reviewer selection and for an external-only selection", async () => {
@@ -6499,6 +6533,70 @@ Checks:
     expect(out.approved).toBe(true);
   });
 
+  it.each(["invalid", "wait-permission", "ci-permission"] as const)("retains readable rejections on a later %s terminal", async (failure) => {
+    const base = ghSpawnWithOneExternalFinding();
+    let fixed = false;
+    let checkReads = 0;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      if (args.some(arg => arg.includes("commits/deadbeef/check-runs"))) {
+        checkReads++;
+        if (fixed && (failure === "wait-permission" || (failure === "ci-permission" && checkReads % 2 === 0))) {
+          return { stdout: "", stderr: "HTTP 403: Resource not accessible by integration", exitCode: 1 };
+        }
+        return { stdout: JSON.stringify({ check_runs: [{ name: "Claude Code Review", status: "completed", conclusion: "success" }] }), exitCode: 0 };
+      }
+      if (fixed && args.some(arg => arg.includes("reviewThreads(first:"))) return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      return base.ghSpawn(args);
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
+        fixed = true;
+      }
+      if (fixed && failure === "invalid") return structuredReviewResult({ malformed: true });
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(out.terminationReason).toBe(failure === "invalid" ? "invalid_review" : "checks_permission_denied");
+    const terminal = base.ghComments.at(-1)!;
+    expect(terminal).toContain("Rejected by the fix pass");
+    expect(terminal).toContain("github-review-thread · src/db.ts:42");
+    expect(terminal).toContain(findingBody);
+    expect(terminal).toContain("The index already exists.");
+    expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toMatch(/[a-f0-9]{64}/);
+  });
+
+  it("renders bounded single-line excerpts with path-only and absent locations", async () => {
+    const findings = [
+      { severity: "blocking" as const, path: "src/api.ts", body: `First line.\nSecond line. ${"detail ".repeat(40)}` },
+      { severity: "blocking" as const, body: "A finding without a location." },
+    ];
+    const keys = findings.map(finding => stableReviewFindingKey({ source: "review-contract", ...finding }));
+    const base = ghSpawnWithOneExternalFinding();
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return {
+        stdout: JSON.stringify([{ user: { login: "claude[bot]", type: "Bot" }, body: [
+          "```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings }), "```",
+        ].join("\n") }]), exitCode: 0,
+      };
+      if (args.some(arg => arg.includes("reviewThreads(first:"))) return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      return base.ghSpawn(args);
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) writeDispositionsFile(workspaceDir, keys.map(findingKey => ({ findingKey, disposition: "invalid", reason: "Already handled." })));
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(base.ghComments[0]).not.toContain("Rejected by the fix pass");
+    const terminal = base.ghComments.at(-1)!;
+    const excerpt = findings[0].body.replace(/\s+/g, " ").trim().slice(0, 157) + "...";
+    expect(terminal).toContain(`- review-contract · src/api.ts — ${excerpt} — Already handled.`);
+    expect(terminal).toContain("- review-contract — A finding without a location. — Already handled.");
+    expect(terminal.match(/Already handled\./g)).toHaveLength(2);
+    expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toMatch(/[a-f0-9]{64}/);
+  });
+
   it.each(["ai-implement", "claude-code-review"] as const)("%s approves a repeated rejected blocker alongside an undisposed minor finding", async (reviewProcess) => {
     const blocker = { severity: "blocking" as const, body: "The index is missing." };
     const minor = { severity: "minor" as const, body: "Consider renaming the index." };
@@ -6560,7 +6658,9 @@ Checks:
     expect(out.approved).toBe(next !== "new");
     const terminal = base.ghComments.at(-1)!;
     expect(terminal).toContain("Rejected by the fix pass");
-    expect(terminal).toContain(findingKey);
+    expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toContain(findingKey);
+    expect(terminal).toContain("github-review-thread · src/db.ts:42");
+    expect(terminal).toContain(findingBody);
     expect(terminal).toContain("The index already exists.");
     expect(publicationFetch.calls.some(call => JSON.parse(call.body).body.includes("second review approved"))).toBe(next !== "new");
   });
@@ -6595,7 +6695,8 @@ Checks:
     const terminal = comments.at(-1)!;
     expect(terminal).toContain("Rejected by the fix pass");
     for (let i = 0; i < keys.length; i++) {
-      expect(terminal).toContain(keys[i]);
+      expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toContain(keys[i]);
+      expect(terminal).toContain(bodies[i]);
       expect(terminal).toContain(reasons[i]);
     }
   });
@@ -6618,7 +6719,8 @@ Checks:
     expect(out.approved).toBe(!blocked);
     for (const comment of [comments.find(c => c.includes("fix-complete"))!, comments.at(-1)!]) {
       expect(comment).toContain("Rejected by the fix pass");
-      expect(comment).toContain(key);
+      expect(comment.replace(/<!--[\s\S]*?-->/g, "")).not.toContain(key);
+      expect(comment).toContain(`claude-review-summary — ${summaryBody}`);
       expect(comment).toContain("Validation already happens upstream.");
     }
     expect(ghSpawn.mock.calls.some(([args]) => args.some(a => a.includes("addPullRequestReviewThreadReply") || a.includes("resolveReviewThread")))).toBe(false);
