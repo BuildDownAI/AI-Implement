@@ -153,7 +153,9 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", reviewFixLifecycle: "restate" }));
     expect(getMappings().AII?.reviewFixLifecycle).toBe("restate");
     store = new SqliteReviewFixAttemptStore();
-    const services = createProductionReviewFixServices(CONFIG, makeRegistry(), store, undefined, runtime);
+    const services = createProductionReviewFixServices(CONFIG, makeRegistry(), store, undefined, runtime,
+      // Production waits 5 s to collect feedback and reads the run's status every 60 s; neither wait is under test here.
+      { collectionWindowMs: 200, runStatusTickMs: 1_000 });
     env = await startRetryEnabled(services);
   }, 60_000);
 
