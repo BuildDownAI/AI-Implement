@@ -136,7 +136,7 @@ The TEST mapping was restored to fly-machines/Legacy via the supported admin UI 
 ephemeral opt-in is absent, autoMerge false and capacity 2 CPU / 4096 MB retained, other mappings untouched. The smokes used
 temporary GHA, so this restoration is cleanup and not live Fly acceptance.
 
-AII-1289 remains open (Backlog) with the AII-1336/1338 blockers. Managed review-fix admission is open on GitHub Actions only (AII-1444); the Fly and local guards stay intact, and the
+AII-1289 remains open (Backlog) with the AII-1770/1338 gates. Managed review-fix admission on Fly and local Docker is implemented by AII-1770, subject to explicit operator review of its concrete PR before merge; no live proof is claimed, and the
 sequence AII-1368 -> AII-1312 -> AII-1374 -> AII-1313 and D10 are not waived. No restart, cancel, retry or
 uncertain-launch proof is inferred from these normal successes.
 
@@ -353,7 +353,7 @@ repair through real Codex semantics and accepts the ordinary Legacy Fly path; au
 
 The supported admin UI refused TEST-7's planning-only Fly/Restate selection before dispatch:
 `reviewFixLifecycle "restate" requires executionMode "github-actions"`. The unsaved form was cancelled; TEST stayed on
-Fly/Legacy/empty-extraEnv/active. TEST-7 is blocked by AII-1336, and the existing administrative coupling is recorded there.
+Fly/Legacy/empty-extraEnv/active. Managed TEST-7 acceptance is gated by AII-1770 and explicit operator PR review; live proof and the existing administrative coupling remain separate.
 Synthetic Fly/local PlanningRun tests do not establish a selectable live configuration. Automatic Fly/local Restate
 review-fix and John's original D10/backend adoption remain gated.
 
@@ -424,7 +424,7 @@ until those are present.
 | Codex on Restate: expired-token resume | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate review-fix, live | Verified for TEST-5 GHA/ChatGPT normal completion | Exact attempt/run/snapshot/head and finalizer above |
 
-Managed Restate review-fix admission is open on GitHub Actions only (AII-1444): Codex API/ChatGPT and supported mixed selections admit when the workflow capabilities and read-only readiness hold. Fly and local Docker still refuse until AII-1336, managed Claude subscription stays refused, and no live proof exists yet. AII-1338 is generic Fly proof, not Codex-specific.
+Managed Restate review-fix admission on GitHub Actions (AII-1444) remains supported: Codex API/ChatGPT and supported mixed selections admit when the workflow capabilities and read-only readiness hold. AII-1770 adds managed Fly and local Docker admission with protected credentials, gated on explicit operator review of the concrete PR before merge. Claude subscription follows current Track D setup-token readiness. No live Fly/local proof exists yet. AII-1338 is generic Fly proof, not Codex-specific.
 AII-1289 owns the final Codex-specific evidence.
 
 ## Release order

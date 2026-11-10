@@ -10,13 +10,16 @@ import { listMachines } from "./fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer } from "./local-docker.js";
 import { readBackendRun, stopBackendRun } from "./backend-run.js";
 import { appendLogIfAbsent, getJobByDispatchId, getJobById, getJobByMachineId, setJobMachineId, updateJobStatus } from "./log.js";
-import { classifyLaunchError, isManagedProject } from "./managed-dispatch-auth.js";
+import { classifyLaunchError, isManagedProject, prepareManagedDispatch, settleLaunch, type ManagedDispatchDecision } from "./managed-dispatch-auth.js";
 import { githubActionsReviewFixWorkerTransport, inMemoryReviewFixWorkerScopeStore, type GithubReviewFixWorkerDeps } from "./review-fix-worker.js";
 import type { ReviewFixWorkerPort } from "./review-fix-ports.js";
 import type { WorkerExecutionIdentity } from "./review-fix-contract.js";
 
+import type { ModelAuthRuntime } from "./model-auth-runtime.js";
+
 type FlySettings = Pick<DispatchFlyGapfillInput, "flySessionsToken" | "flySessionsApp" | "flySessionsRegion" | "flyOrchestratorApp" | "sessionImage" | "runnerCallbackBaseUrl" | "tenantId" | "anthropicApiKey" | "claudeOAuthToken">;
 export interface ContainerReviewFixWorkerDeps {
+  modelAuthRuntime?: ModelAuthRuntime;
   credentials: GithubReviewFixWorkerDeps["credentials"];
   callbackInputs: NonNullable<GithubReviewFixWorkerDeps["callbackInputs"]>;
   scopeStore?: GithubReviewFixWorkerDeps["scopeStore"];
@@ -45,6 +48,8 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
   launch: ReviewFixWorkerPort["launch"] = async (plan) => {
     const backend = plan.executionBackend;
     if (backend !== "fly-machines" && backend !== "local-docker") return { status: "rejected", reason: "Container worker requires a container backend" };
+    let decision: ManagedDispatchDecision = { kind: "legacy" };
+    const runtime = this.deps.modelAuthRuntime;
     let started = false;
     let created = false;
     let staged: { id: number; nonce: string; generation: number } | undefined;
@@ -54,7 +59,6 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       const teamKey = admission.mappingKey;
       const mapping = getMappings()[teamKey];
       if (!mapping || admission.scope.kind !== "pr" || admission.scope.repository !== plan.scope.repository || `${mapping.owner}/${mapping.repo}` !== admission.scope.repository) return { status: "unknown" };
-      if (isManagedProject(teamKey, plan.attemptId)) return { status: "rejected", reason: `managed review-fix on ${backend} not supported yet` };
       // A durable launch intent must be reconciled, never launched again with a new nonce.
       if (getJobByDispatchId(plan.attemptId)) return { status: "unknown" };
       const credential = await this.deps.credentials.resolve(plan.scope);
@@ -62,6 +66,13 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       const tokens = await this.deps.callbackInputs(plan.attemptId);
       // Without a callback URL and result token, the runner cannot report an approvable result.
       if (!tokens.runner_callback_url?.trim() || !tokens.run_token?.trim()) return { status: "unknown" };
+      if (isManagedProject(teamKey, plan.attemptId)) {
+        if (!runtime) return { status: "unknown" };
+        decision = await prepareManagedDispatch({ dispatchId: plan.attemptId, projectKey: teamKey,
+          backend, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile }, runtime);
+        if (decision.kind === "refuse") return { status: "rejected", reason: "Managed container review-fix preparation refused" };
+        if (decision.kind !== "launch") return { status: "unknown" };
+      }
       const runName = containerName(plan.attemptId);
       const issue = { id: `review-fix:${plan.attemptId}`, identifier: `review-fix-${plan.scope.prNumber}`, title: `Review-fix for ${plan.scope.repository}#${plan.scope.prNumber}`, description: plan.taskText };
       const common = { mapping, prNumber: plan.scope.prNumber, githubToken: credential.token, runName, dispatchId: plan.attemptId,
@@ -75,14 +86,15 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       };
       let id: string;
       if (backend === "fly-machines") {
-        const result = await dispatchFlyGapfill({ ...this.deps.fly, ...common, issue: { issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title }, owner: mapping.owner, repo: mapping.repo, issueIdentifier: issue.identifier, scopeKey: teamKey, allTeamKeys: Object.keys(getMappings()), decision: { kind: "legacy" },
+        const result = await dispatchFlyGapfill({ ...this.deps.fly, ...common, issue: { issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title }, owner: mapping.owner, repo: mapping.repo, issueIdentifier: issue.identifier, scopeKey: teamKey, allTeamKeys: Object.keys(getMappings()), decision,
           runnerCallbackUrl: tokens.runner_callback_url ?? "", runToken: tokens.run_token ?? "", runProgressToken: tokens.run_progress_token ?? "", onBeforeLaunch: (size, n) => beforeLaunch(n, size) });
         id = result.machine.id;
       } else {
-        const result = await dispatchLocalGapfill({ ...this.deps.local, ...common, issue, retryPolicy: getRetryPolicy(), onBeforeLaunch: beforeLaunch });
+        const result = await dispatchLocalGapfill({ ...this.deps.local, ...common, issue, retryPolicy: getRetryPolicy(), ...(decision.kind === "launch" ? { managed: { decision, modelAuthUrl: tokens.runner_callback_url! } } : {}), onBeforeLaunch: beforeLaunch });
         id = result.containerId;
       }
       created = true;
+      if (runtime) settleLaunch(decision, "accepted", runtime);
       if (jobId === undefined) return { status: "unknown" };
       setJobMachineId(jobId, id);
       const execution = { backend, runRef: id } as const;
@@ -108,6 +120,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
           if (!settled) status = "unknown";
         } catch { status = "unknown"; }
       }
+      if (runtime) settleLaunch(decision, created ? "accepted" : status, runtime);
       return status === "rejected" ? { status, reason: "Container review-fix launch rejected" } : { status };
     }
   };
