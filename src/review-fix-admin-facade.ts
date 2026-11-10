@@ -18,6 +18,7 @@ interface AttemptRow {
   attempt_id: string; dispatch_id: string; installation_id: string; repository: string; pr_number: number;
   owner: string; state: string; deadline_at: number; authority_revoked_at: number | null;
   execution_backend: DispatchAdmissionBackend;
+  execution_ref: string | null;
   github_run_id: number | null; github_run_attempt: number | null;
   task_snapshot_json: string; finding_versions_json: string;
   terminal_outcome_json: string | null; result_conflict_at: number | null;
@@ -110,8 +111,11 @@ export function createReviewFixAdminFacade(
         ? JSON.parse(row.terminal_outcome_json) as ReviewFixImmutableOutcome : null;
       return { status: "ok", attempt: {
         attemptId, owner: { kind: "restate", attemptId: row.owner },
-        execution: row.github_run_id === null || row.github_run_attempt === null ? null
-          : { githubRunId: String(row.github_run_id), githubRunAttempt: row.github_run_attempt },
+        execution: row.execution_backend === "github-actions"
+          ? row.github_run_id === null || row.github_run_attempt === null ? null
+            : { backend: "github-actions", githubRunId: String(row.github_run_id), githubRunAttempt: row.github_run_attempt }
+          : row.execution_ref === null ? null
+            : { backend: row.execution_backend, runRef: row.execution_ref },
         deadlineAt: row.deadline_at,
         // An over-budget set is still pending feedback; the dashboard read must not throw on it.
         pendingFeedback: (() => { const found = inspectPendingReviewFixFeedback(scope, null);

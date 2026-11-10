@@ -621,7 +621,12 @@ export interface ReviewFixAttemptCaller {
   email: string | null;
 }
 
-export interface ReviewFixAttemptExecutionRef {
+export type ReviewFixAttemptExecutionRef =
+  | ({ backend: "github-actions" } & ReviewFixAttemptAdoptInput)
+  | { backend: "fly-machines" | "local-docker"; runRef: string };
+
+/** GitHub-only operator adoption body; independent of the read projection. */
+export interface ReviewFixAttemptAdoptInput {
   githubRunId: string;
   githubRunAttempt: number;
 }
@@ -721,7 +726,7 @@ export interface ReviewFixAttemptsFacade {
   reconcile(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
   /** Succeeds only when `execution` verifies as a genuine match for this attempt — an
    *  unverified reference must never flip ownership. */
-  adopt(attemptId: string, execution: ReviewFixAttemptExecutionRef, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  adopt(attemptId: string, execution: ReviewFixAttemptAdoptInput, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
   /**
    * Cancel is two explicit steps, called by the route handler in this order and never
    * collapsed into one call: authority is revoked before termination is even requested,
@@ -2542,7 +2547,7 @@ async function handleReviewFixAdopt(
     json(res, 400, { error: "Could not read request body" });
     return;
   }
-  let execution: ReviewFixAttemptExecutionRef;
+  let execution: ReviewFixAttemptAdoptInput;
   try {
     const parsed = JSON.parse(raw) as { githubRunId?: unknown; githubRunAttempt?: unknown };
     if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number" || !Number.isSafeInteger(parsed.githubRunAttempt) || parsed.githubRunAttempt < 1) {

@@ -4829,7 +4829,7 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
   const ATTEMPT_DETAIL: AdminModule.ReviewFixAttemptDetail = {
     attemptId: "attempt-1",
     owner: { kind: "restate", attemptId: "attempt-1" },
-    execution: { githubRunId: "123", githubRunAttempt: 1 },
+    execution: { backend: "github-actions", githubRunId: "123", githubRunAttempt: 1 },
     deadlineAt: 1_700_000_000_000,
     pendingFeedback: false,
     snapshot: { taskText: "fix the thing", findings: [{ findingKey: "f1", version: 2 }] },
@@ -4920,19 +4920,25 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       expect(res.statusCode).toBe(404);
     });
 
-    it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
+    it.each<AdminModule.ReviewFixAttemptExecutionRef | null>([
+      { backend: "github-actions", githubRunId: "9001", githubRunAttempt: 2 },
+      { backend: "fly-machines", runRef: "machine-123" },
+      { backend: "local-docker", runRef: "container-123" },
+      null,
+    ])("returns execution %j with explicit evidence fields", async (execution) => {
+      const detail = { ...ATTEMPT_DETAIL, execution };
       const token = await login("secret");
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1",
         "GET",
         token,
-        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: detail }) }) },
       );
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body).toHaveProperty("evidenceComplete", false);
       expect(body).toHaveProperty("terminationConfirmed", false);
-      expect(body).toEqual(ATTEMPT_DETAIL);
+      expect(body).toEqual(detail);
     });
 
     it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
@@ -5142,7 +5148,7 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
 
     it("passes the caller-supplied execution reference to the facade and answers 202 on a verified match", async () => {
       const token = await login("secret");
-      let capturedExecution: AdminModule.ReviewFixAttemptExecutionRef | undefined;
+      let capturedExecution: AdminModule.ReviewFixAttemptAdoptInput | undefined;
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1/adopt",
         "POST",
