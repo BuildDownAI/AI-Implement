@@ -841,6 +841,8 @@ describe("orchestratorTools (Restate)", () => {
       expect(kgRefreshArgs?.acceptNewBaseline?.type).toBe("boolean");
 
       const addProjectArgs = metadata.handlers.find((h) => h.name === "add_project")?.input_json_schema?.properties?.args?.properties;
+      expect(addProjectArgs).toBeDefined();
+      expect(addProjectArgs).not.toHaveProperty("reviewFixLifecycle");
       // AII-720: reviewers is now `.nullable()`, so zod's JSON schema wraps the array
       // variant in `anyOf` alongside `{ type: "null" }` instead of exposing `items` directly.
       const reviewers = addProjectArgs?.reviewers as
