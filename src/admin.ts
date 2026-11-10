@@ -116,7 +116,7 @@ import { GitHubApiError } from "./github-errors.js";
 import { listRepoBranchesAndTags, getRepoDefaultBranch, fetchRepoTarball } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
-import { getFleetReport } from "./report-card.js";
+import { getFleetReport, restateRefForJob } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { FilesystemProvider } from "./providers/filesystem.js";
@@ -1594,7 +1594,7 @@ async function handleGetJobSteps(
   const job = getJobById(jobId);
   if (!job) { json(res, 404, { error: "job not found" }); return; }
   const issueUrl = await resolveIssueUrl(registry, job.teamKey, job.issueId, job.issueIdentifier);
-  json(res, 200, { job: { ...job, issueUrl }, steps: getStepsByJobId(jobId) });
+  json(res, 200, { job: { ...job, issueUrl, restate: restateRefForJob(job.dispatchId, job.phase) }, steps: getStepsByJobId(jobId) });
 }
 
 async function handleGetLocalJobLogs(
