@@ -4357,6 +4357,32 @@ describe("postPushReviewStep", () => {
   const runs = (r: Array<{ name: string; status: string; conclusion: string | null }>) =>
     ({ stdout: JSON.stringify({ check_runs: r }), exitCode: 0 });
 
+  it.each([
+    { completesAt: 360_000, approved: true, elapsedAtEnd: 360_000 },
+    { completesAt: Infinity, approved: false, elapsedAtEnd: 600_000 },
+  ])("uses the production wait limit (completion at $completesAt ms)", async ({ completesAt, approved, elapsedAtEnd }) => {
+    let elapsed = 0;
+    const sleep = vi.fn(async (ms: number) => { elapsed += ms; });
+    const f = gateFixture(() => {
+      const done = elapsed >= completesAt;
+      return runs([{ name: "claude-review", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null }]);
+    });
+    const out = await runReview(
+      makeCtx(vi.fn(async () => structuredReviewResult(f.reviewerOutput))),
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: f.ghSpawn,
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(elapsed).toBe(elapsedAtEnd);
+    expect(out.approved).toBe(approved);
+    if (!approved) {
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(out.finalFeedback).toBe(EXTERNAL_REVIEW_PENDING_NEXT_STEP);
+      expect(f.reviewCalls.some((call) => call.some((arg) => arg.includes("approved this pull request")))).toBe(false);
+    }
+  });
+
   it("does not approve when the check-runs probe cannot be read", async () => {
     // A failed `gh api` used to map to "absent", which the caller fails OPEN on — so one
     // transient API failure auto-approved. A probe we could not read is not evidence that

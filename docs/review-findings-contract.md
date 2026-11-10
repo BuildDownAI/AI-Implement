@@ -190,3 +190,40 @@ A project whose review process is `claude-code-review` (ADR 038, `src/review-pro
 4. **No completed matching check** is `incomplete`.
 
 Inline comments count only from a trusted author of type `Bot`, on the head commit (or with no commit id). A body starting 🔴 is `blocking`, 🟡 is `minor`, 🟣 (pre-existing) adds no finding, and an untagged comment is recorded as `minor`, so a reviewer that emits no markers never blocks a merge by itself. The `claude` check is matched by app slug and name together: a check named `Claude Code Review` from `github-actions` is not the hosted one.
+
+## When the in-run step reads the outside verdict
+
+The `post-push-review` step starts its outside-review wait after the internal
+review returns. It polls the PR head's matching review checks every five seconds,
+for up to **ten minutes** (600,000 ms of requested sleeps). Time already spent
+on the outside review while the internal review ran is additional time in its
+favor; GitHub API latency does not consume the sleep budget. The limit is a
+constant, with no operator setting.
+
+The November 3–10, 2026 sample of 248 finished Claude GHA comments has a
+90th-percentile duration of 6m 22s. The 112 check jobs retrieved before GitHub's
+unauthenticated rate limit have a p90 of 6m 53s. Ten minutes gives that observed
+check p90 a 3m 7s margin. The check sample is incomplete; it does not establish
+the full window's check p90. Compared with the previous five-minute limit,
+this adds at most five minutes per wait; reviews that finish sooner return as
+soon as a poll sees completion.
+
+The wait preserves these outcomes:
+
+| State | Meaning and gate behavior |
+|---|---|
+| `completed` | A matching check finished with a real verdict. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
+| `running` | A review is still pending, or its check/head could not be read before the budget expired. Fail closed with `external_review_pending` and no approval. |
+| `absent` | No matching external check exists. Require two consecutive probes before failing open. Once a matching check has been seen, a later empty result is treated as unreadable and cannot fail open. A successfully read PR with no head SHA retains its immediate `absent` behavior. |
+| `no-real-verdict` | Matching checks finished without a usable verdict. Require two consecutive probes, then fail closed. |
+| `permission-denied` | The App cannot read checks. Stop immediately and fail closed with `CHECKS_PERMISSION_DENIED`. |
+
+An intervening running or unreadable probe resets the consecutive-probe
+settling rule for `absent` and `no-real-verdict`. A transient head-read failure
+is retried within the same budget. Non-default review processes keep their
+existing verdict readers: an incomplete contract keeps waiting, while a
+completed check without a readable real verdict fails closed. Reaching the
+limit does not turn a pending check into a completed review or approval.
+
+The post-run late-review rail can still consume a verdict that arrives after
+the in-run wait ends; see [review-fix-rail.md](review-fix-rail.md).

@@ -137,7 +137,9 @@ const FIX_MAX_TURNS = 45;
 const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
-const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
+// November 3–10, 2026: comment p90 6m22s; retrieved check-job p90 6m53s.
+// Ten minutes leaves over three minutes of margin while keeping the wait bounded.
+const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 600_000;
 const CLAUDE_REVIEW_SUMMARY_ID = "claude-review-summary";
 // Check-run names produced by the review workflows in this repository.
 // "review" comes from claude-review.yml (pull_request_target, resolves from the default branch).
@@ -703,9 +705,9 @@ type WarnOnce = (key: string, message: string) => void;
 /**
  * One wait's worth of warn-once state.
  *
- * The wait loop runs up to timeoutMs/pollMs times (60 at the defaults) per review iteration, and
+ * The wait loop runs about timeoutMs/pollMs times (120 at the defaults) per review iteration, and
  * up to maxIterations of those per run, so an unconditional warn describes one sustained outage
- * in sixty identical lines.
+ * in repeated identical lines.
  *
  * The key is the CONDITION, not the rendered message. Two of the three messages interpolate
  * something that moves during a wait — the gh stderr, and the joined names of every check run
