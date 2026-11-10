@@ -47,6 +47,8 @@ A live test on 2026-10-09 (Codex 0.159.2, runner image, model `gpt-6-luna`) prov
 
 **7. Claude subscription accounts keep the current reservation, checkpoint, and recovery design.** This ADR does not change Claude.
 
+Amended 2026-11-07 by ADR 049. See [ADR 049](049-claude-subscription-profiles-hold-a-setup-token.md): managed Claude subscription profiles hold a setup-token, without reservation, checkpoint, or recovery lifecycle.
+
 **8. Scope: personal and self-hosted use of the operator's own plan.** A hosted service for other people's plans needs OpenAI's interest form and is out of scope. Customer OpenAI runs use API keys.
 
 ## Alternatives considered

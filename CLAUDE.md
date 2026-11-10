@@ -272,6 +272,8 @@ Editable per mapping; blank means the default.
 
 **Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. On Fly, they are also excluded at the Fly boundary by default (process-level mode). **Extra Env** entries are passed through to the model process and are visible to the agent.
 
+Legacy `comment-trigger.yml` repositories still use repo variables `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, `AI_IMPLEMENT_MAX_JOB_MINUTES`, and `AI_IMPLEMENT_SKILLS_REPO` for caps and skills selection. The legacy runner reads the turn/iteration caps and skills repo from environment (`src/run-autonomous.ts`); job timeout is a workflow-level cap, passed separately as `job_timeout_minutes` by `src/github.ts`, rather than read by the runner. These legacy settings remain relevant until those repositories move to envelope generation.
+
 Caps apply to re-dispatches, not just initial runs. Branch prefix affects only the initial run — gap-fill commits to the existing PR branch. Sensitive-file globs travel **exclusively** in the envelope, so a repo must be on envelope generation before setting them.
 
 **Jira profiles** ride `run_config.profiles`, read from a multi-select custom field that must be named exactly `AI-Implement Profiles` unless `profilesFieldOverride` pins its ID. Option names must not contain commas — the contract is a comma-joined list. **No built-in step consumes profiles**; they exist as the contract surface for image-baked `custom/` steps.

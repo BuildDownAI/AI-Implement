@@ -522,3 +522,84 @@ describe("isAdminPathConfigured", () => {
     expect(isAdminPathConfigured(makeSetupCheckContext({ effectiveAllowlist: () => { throw new Error("unreadable"); } }))).toBe(true);
   });
 });
+
+describe("model.credentials-adopted", () => {
+  const stored = (mode: "configured" | "legacy"): ReturnType<SetupCheckContext["orchestratorDefaults"]> => ({
+    configRevisionId: "revision", revision: 1, config: { version: 1, mode, stages: {} },
+    createdAt: 0, createdBy: null, supersedesRevisionId: null,
+  });
+  const mappings = () => ({ ENG: makeMapping(), OPS: makeMapping(), READY: makeMapping() });
+
+  it.each(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])("warns to adopt %s before projects, for missing or legacy defaults", async (variable) => {
+    for (const defaults of [null, stored("legacy")]) {
+      const result = await run("model.credentials-adopted", {
+        env: { [variable]: "secret-sentinel" }, orchestratorDefaults: () => defaults, mappings,
+        projectStageConfig: () => { throw new Error("must not read projects before defaults are configured"); },
+      });
+      expect(result).toMatchObject([{ state: "warn", fix: expect.stringContaining("adopt-env") }]);
+      expect(JSON.stringify(result)).not.toContain("secret-sentinel");
+    }
+  });
+
+  it.each([{}, { ANTHROPIC_API_KEY: "secret-sentinel" }])("lists only mapped absent or legacy projects with configured defaults (%j)", async (env) => {
+    const projectStageConfig = vi.fn((key: string) => key === "ENG" ? null : stored(key === "READY" ? "configured" : "legacy"));
+    const result = await run("model.credentials-adopted", { env, mappings, orchestratorDefaults: () => stored("configured"), projectStageConfig });
+    expect(result).toMatchObject([{ state: "warn", detail: "Projects without configured model access: ENG, OPS", fix: expect.stringContaining("adopt-projects") }]);
+    expect(projectStageConfig.mock.calls.map(([key]) => key)).toEqual(["ENG", "OPS", "READY"]);
+    expect(JSON.stringify(result)).not.toContain("secret-sentinel");
+  });
+
+  it.each([false, true])("passes with all projects configured, noting unused environment credentials: %s", async (hasEnv) => {
+    const result = await run("model.credentials-adopted", {
+      env: hasEnv ? { CLAUDE_CODE_OAUTH_TOKEN: "secret-sentinel" } : {}, mappings,
+      orchestratorDefaults: () => stored("configured"), projectStageConfig: () => stored("configured"),
+    });
+    expect(result).toMatchObject([{ state: "pass" }]);
+    expect(result[0].detail?.includes("environment credential is unused")).toBe(hasEnv);
+    expect(JSON.stringify(result)).not.toContain("secret-sentinel");
+  });
+
+  it.each([null, stored("legacy")])("passes without credentials or mappings (%j)", async (defaults) => {
+    expect(await run("model.credentials-adopted", { env: { ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "" }, orchestratorDefaults: () => defaults })).toMatchObject([{ state: "pass" }]);
+  });
+
+  it.each([null, stored("legacy")])("fails with mappings but no credentials or configured defaults (%j)", async (defaults) => {
+    expect(await run("model.credentials-adopted", { mappings, orchestratorDefaults: () => defaults })).toMatchObject([{ state: "fail", detail: "no model access configured" }]);
+  });
+
+  it.each(["orchestratorDefaults", "projectStageConfig", "mappings"] as const)("reports a throwing %s reader as cannot-verify", async (reader) => {
+    const { runSetupChecks } = await import("../../setup-checks/index.js");
+    const check = ORCHESTRATOR_CONFIG_CHECKS.find((c) => c.id === "model.credentials-adopted")!;
+    const result = await runSetupChecks(makeSetupCheckContext({
+      mappings, orchestratorDefaults: () => stored("configured"),
+      [reader]: () => { throw new Error("unreadable"); },
+    }), [check]);
+    expect(result.results).toMatchObject([{ state: "cannot-verify", detail: "unreadable" }]);
+  });
+
+  it("does not write to the database through the production readers", async () => {
+    const { modules: { checks, db } } = await testDb({ modules: {
+      checks: () => import("../../setup-checks/index.js"), db: () => import("../../dedup.js"),
+    } });
+    const check = checks.SETUP_CHECKS.find((c) => c.id === "model.credentials-adopted")!;
+    const changes = () => db.getDb().prepare("SELECT total_changes() AS count").get();
+    const before = changes();
+    for (const env of [{}, { ANTHROPIC_API_KEY: "secret-sentinel" }]) {
+      await check.run(checks.createSetupCheckContext({ env, mappings, restateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }) }));
+    }
+    expect(changes()).toEqual(before);
+    // Seed fixture rows directly so the configured branch exercises the real project reader too.
+    db.getDb().prepare(`INSERT INTO stage_agent_config_revisions
+      (config_revision_id, scope_kind, scope_key, version, revision, config_json, created_at)
+      VALUES (?, ?, ?, 1, 1, ?, 0)`).run("defaults", "orchestrator", "default", JSON.stringify(stored("configured")!.config));
+    db.getDb().prepare(`INSERT INTO stage_agent_config_revisions
+      (config_revision_id, scope_kind, scope_key, version, revision, config_json, created_at)
+      VALUES (?, ?, ?, 1, 1, ?, 0)`).run("legacy", "project", "OPS", JSON.stringify(stored("legacy")!.config));
+    const configuredBefore = changes();
+    const result = await check.run(checks.createSetupCheckContext({ env: {}, mappings,
+      restateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }));
+    expect(result).toMatchObject([{ state: "warn", detail: "Projects without configured model access: ENG, OPS, READY" }]);
+    expect(changes()).toEqual(configuredBefore);
+  });
+});

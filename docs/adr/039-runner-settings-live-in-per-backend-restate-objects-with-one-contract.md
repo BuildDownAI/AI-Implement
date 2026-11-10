@@ -28,7 +28,7 @@ The Fly sessions app and region were an env var, else a `settings` row, read by 
 
 Re-checking §6 under standing rule 3: its pre-read env-then-row rule existed so a boot with Restate down could still dispatch. AII-1741 now holds dispatch until the registration hook has seeded and refreshed, so that reason no longer holds. The pre-read rule is removed: app and region always come from the cache, initially null, and a successful empty-object read loads null values. Environment variables and legacy rows remain boot seed inputs only; a later variable applies through the seed only at a boot where the object is empty. The token remains env-only.
 
-The serve-last-value outage rule stays: a thrown read preserves the cache and logs once per outage, re-armed by any successful read, including null. Before any successful read the warning says `nothing loaded yet`. The source label remains `fallback` until a successful read and `restate` afterward, including an empty read. If a boot seed fails and the object remains empty after refresh, Fly dispatch skips until a boot seeds it; the seed failure log names this outcome.
+The serve-last-value outage rule stays: a thrown read preserves the cache and logs once per outage, re-armed by any successful read, including null. Before any successful read the warning says `nothing loaded yet`. The source label is `not-loaded` until a successful read and `restate` afterward, including an empty read. If a boot seed fails and the object remains empty after refresh, Fly dispatch skips until a boot seeds it; the seed failure log names this outcome.
 
 ## What GitHub Actions does not let us control
 

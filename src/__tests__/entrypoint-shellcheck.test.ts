@@ -840,6 +840,89 @@ printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fa
     }
   });
 
+  const legacyIssue = { ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" };
+  const modelVars = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "AWS_BEDROCK_ROLE_ARN"];
+
+  it.each(["anthropic", "bedrock"])("phase alias cannot deliver model credentials to KG (%s)", (provider) => {
+    const r = run({
+      ...legacyIssue, RUNNER_PHASE: "implementation", SAN_RUNNER_PHASE: "kg-refresh", PROVIDER: provider,
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      ...Object.fromEntries(modelVars.map((name) => [name, "synthetic-repro-key"])),
+      ...Object.fromEntries(modelVars.map((name) => [`SAN_${name}`, "synthetic-alias-key"])),
+    });
+    expect(r.result.status).toBe(0);
+    const handoff = r.sections.find(s => s.startsWith("dbus-run-session ")) ?? "";
+    expect(handoff.includes("/app/dist/pipeline/kg-refresh-run.js")).toBe(true);
+    for (const name of modelVars) expect(new RegExp(`^(SAN_)?${name}=`, "m").test(handoff)).toBe(false);
+    expect(r.output.match(/kg-refresh: no model credential required/g)).toHaveLength(1);
+    for (const value of ["synthetic-repro-key", "synthetic-alias-key"]) expect(r.output.includes(value)).toBe(false);
+  });
+
+  it.each(["implementation", "planning", "review-fix"])("reverse KG alias validates %s before handoff", (phase) => {
+    const base = { ...legacyIssue, RUNNER_PHASE: "kg-refresh", SAN_RUNNER_PHASE: phase, AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_" };
+    const missing = run(base);
+    expect(missing.result.status).not.toBe(0);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.children).toBe("");
+    for (const name of modelVars.slice(0, 2)) {
+      const ok = run({ ...base, [name]: "synthetic-reverse-key" });
+      expect(ok.result.status).toBe(0);
+      expect(ok.output).toContain(`phase=${phase}, source=env`);
+      expect(ok.output.includes("synthetic-reverse-key")).toBe(false);
+    }
+  });
+
+  it.each(["anthropic", "bedrock"])("KG refresh bypasses %s validation and strips model credentials, including team aliases", (provider) => {
+    for (const credentials of [{}, Object.fromEntries(modelVars.map((name) => [name, "sentinel-model"]))]) {
+      const { result, sections, output } = run({
+        ...legacyIssue, RUNNER_PHASE: "kg-refresh", PROVIDER: provider, ...credentials,
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        ...Object.fromEntries(modelVars.map((name) => [`SAN_${name}`, "sentinel-alias"])),
+      });
+      expect(result.status, output).toBe(0);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain("/app/dist/pipeline/kg-refresh-run.js");
+      for (const name of modelVars) expect(handoff).not.toMatch(new RegExp(`^(SAN_)?${name}=`, "m"));
+      expect(output.match(/kg-refresh: no model credential required/g)).toHaveLength(1);
+    }
+  });
+
+  it.each(["implementation", "planning", "review-fix"])("preserves legacy credential requirements for %s", (phase) => {
+    const missing = run({ ...legacyIssue, RUNNER_PHASE: phase });
+    expect(missing.result.status).not.toBe(0);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.children).toBe("");
+    for (const name of modelVars.slice(0, 2)) {
+      const ok = run({ ...legacyIssue, RUNNER_PHASE: phase, [name]: "legacy-key" });
+      expect(ok.result.status, ok.output).toBe(0);
+      expect(ok.sections.find((s) => s.startsWith("dbus-run-session "))).toContain(`${name}=legacy-key`);
+      expect(ok.output).not.toContain("kg-refresh: no model credential required");
+    }
+  });
+
+  it.each([
+    ["kg-refresh", "planning", "kg-refresh", "env", "pipeline/kg-refresh-run.js"],
+    ["planning", "kg-refresh", "planning", "env", "run-planning.js"],
+    ["", "kg-refresh", "kg-refresh", "envelope", "pipeline/kg-refresh-run.js"],
+    ["", "", "implementation", "default", "run-autonomous.js"],
+    [undefined, undefined, "implementation", "default", "run-autonomous.js"],
+  ])("preserves phase precedence: env=%s envelope=%s", (envPhase, envelopePhase, phase, source, entry) => {
+    const r = run({
+      AI_IMPLEMENT_RUN_CONFIG: encode({ v: 1, issue, runnerPhase: envelopePhase }),
+      ...(envPhase === undefined ? {} : { RUNNER_PHASE: envPhase }), ANTHROPIC_API_KEY: "legacy-key",
+    });
+    expect(r.result.status, r.output).toBe(0);
+    expect(r.output).toContain(`phase=${phase}, source=${source}`);
+    expect(r.sections.find((s) => s.startsWith("dbus-run-session "))).toContain(`/app/dist/${entry}`);
+  });
+
+  it("still rejects malformed configured input when KG is selected", () => {
+    const r = run({ RUNNER_PHASE: "kg-refresh", AI_IMPLEMENT_RUN_CONFIG: "invalid" });
+    expect(r.result.status).toBe(1);
+    expect(r.output).toContain("Configured model-auth bootstrap is invalid or incomplete");
+    expect(r.children).toBe("");
+  });
+
   it("legacy bedrock still requires AWS_REGION and GHA mode", () => {
     const base = { PROVIDER: "bedrock", ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" };
     expect(run(base).output).toContain("provider=bedrock is supported only in GHA mode");

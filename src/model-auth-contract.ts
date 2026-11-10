@@ -67,7 +67,7 @@ export const MODEL_AUTH_AUTH_MODES: readonly AccountAuthMode[] = AUTH_MODE_LIST;
 /** Plan-based credential modes. Ownership checks use `RESERVED_AUTH_MODES` instead. */
 export const SUBSCRIPTION_AUTH_MODES: readonly AccountAuthMode[] = ["claude-subscription", "codex-subscription"];
 /** Modes that reserve an account (owner generation, session state, checkpoints). */
-export const RESERVED_AUTH_MODES: readonly AccountAuthMode[] = ["claude-subscription"];
+export const RESERVED_AUTH_MODES: readonly AccountAuthMode[] = [];
 export const MODEL_AUTH_BACKENDS = ["fly", "gha", "local"] as const;
 export type ModelAuthBackend = (typeof MODEL_AUTH_BACKENDS)[number];
 
@@ -193,7 +193,7 @@ export function isSubscriptionAuthMode(mode: AccountAuthMode): boolean {
   return SUBSCRIPTION_AUTH_MODES.includes(mode);
 }
 
-/** The one secret kind a checkout may carry for the mode. A codex-subscription secret is always an access token. */
+/** Default checkout secret kind for each auth mode. */
 export function expectedSecretKind(authMode: AccountAuthMode): ModelAuthSecret["kind"] {
   switch (authMode) {
     case "bedrock":
@@ -201,7 +201,7 @@ export function expectedSecretKind(authMode: AccountAuthMode): ModelAuthSecret["
     case "codex-subscription":
       return "chatgpt-access-token";
     case "claude-subscription":
-      return "session";
+      return "claude-oauth-token";
     default:
       return "api-key";
   }
@@ -534,11 +534,18 @@ export interface ChatGptAccessTokenSecret {
   readonly expiresAt: number;
 }
 
+/** Claude setup-token for subscription CLI authentication. Secret-bearing. */
+export interface ClaudeOauthTokenSecret {
+  readonly kind: "claude-oauth-token";
+  readonly token: string;
+}
+
 export type ModelAuthSecret =
   | ApiCredentialSecret
   | AwsBedrockSecret
   | SessionStateSecret
-  | ChatGptAccessTokenSecret;
+  | ChatGptAccessTokenSecret
+  | ClaudeOauthTokenSecret;
 
 /** Strict shape check; errors name fields only, never values. */
 function parseChatGptAccessTokenSecret(s: Record<string, unknown>): ValidationResult<ChatGptAccessTokenSecret> {
@@ -619,6 +626,18 @@ export function parseModelAuthCheckoutResponse(raw: unknown): ValidationResult<M
       profileId: profileId.value,
       authMode: authMode.value,
       secret: chatgpt.value,
+    });
+  }
+  if (authMode.value === "claude-subscription") {
+    if (r.ownerGeneration !== undefined) return err("ownerGeneration is only allowed for reserved auth modes");
+    const keys = rejectUnknownKeys(s, ["kind", "token"], "checkout secret");
+    if (!keys.ok) return keys;
+    if (s.kind !== "claude-oauth-token") return err("checkout secret kind must be 'claude-oauth-token' for claude-subscription");
+    const token = validateBoundedSecret(s.token, "token", MAX_API_CREDENTIAL_LENGTH);
+    if (!token.ok) return token;
+    return ok({
+      version: 1, ok: true, profileId: profileId.value, authMode: authMode.value,
+      secret: { kind: "claude-oauth-token", token: token.value },
     });
   }
   if (reservesModelAccount(authMode.value)) {

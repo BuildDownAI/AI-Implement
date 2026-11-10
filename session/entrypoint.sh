@@ -32,9 +32,13 @@ case "$(classify_run_config)" in
   configured) CONFIGURED=1 ;;
   *) fail "Configured model-auth bootstrap is invalid or incomplete" ;;
 esac
+resolve_runner_phase
 PROVIDER="${PROVIDER:-anthropic}"
 if [ "$CONFIGURED" = "1" ]; then
   log "Configured run: model credentials come from the selected-stage authentication path"
+elif [ "$RUNNER_PHASE" = "kg-refresh" ]; then
+  unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_USE_BEDROCK AWS_BEDROCK_ROLE_ARN
+  log "kg-refresh: no model credential required"
 else
   case "$PROVIDER" in
     bedrock) [ "$AI_IMPLEMENT_MODE" = "gha" ] || fail "provider=bedrock is supported only in GHA mode"; require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1; export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ;;
@@ -117,16 +121,11 @@ chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
 # ── 5.5. Remap per-team Fly secrets ─────────────────────────────────────────
 remap_team_secrets
+[ "$CONFIGURED" = "1" ] || [ "$RUNNER_PHASE" != "kg-refresh" ] || unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_USE_BEDROCK AWS_BEDROCK_ROLE_ARN
 
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
 export WORKSPACE_DIR
-RUNNER_PHASE_SOURCE="env"
-[ -z "${RUNNER_PHASE:-}" ] && RUNNER_PHASE_SOURCE="default"
-resolve_envelope_field RUNNER_PHASE runnerPhase
-[ "$RUNNER_PHASE_SOURCE" = "default" ] && [ -n "${RUNNER_PHASE:-}" ] && RUNNER_PHASE_SOURCE="envelope"
 resolve_envelope_field RUNNER_CALLBACK_URL runnerCallbackUrl
-RUNNER_PHASE="${RUNNER_PHASE:-implementation}"
-export RUNNER_PHASE
 # Managed gap-analysis is an implementation run with PR_NUMBER set, so it uses the default entry.
 RUNNER_ENTRY="$(select_runner_entry "$RUNNER_PHASE")"
 [ "$RUNNER_PHASE" = "kg-refresh" ] && export RUNNER_CALLBACK_URL RUN_PROGRESS_TOKEN

@@ -41,7 +41,6 @@ const subBinding: ModelAuthGrantBinding = {
   profileId: "prof-sub",
   profileRevision: 1,
   authMode: "claude-subscription",
-  ownerGeneration: 3,
 };
 
 function grant(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -120,7 +119,7 @@ describe("grant bootstrap", () => {
   });
 
   describe("owner generation by auth mode", () => {
-    it.each(["anthropic-api-key", "openai-api-key", "bedrock", "codex-subscription"])(
+    it.each(["anthropic-api-key", "openai-api-key", "bedrock", "codex-subscription", "claude-subscription"])(
       "%s rejects any generation",
       (authMode) => {
         const base = { ...apiBinding, authMode };
@@ -131,16 +130,9 @@ describe("grant bootstrap", () => {
         }
       },
     );
-    it("claude-subscription requires a positive integer", () => {
-      const base = { ...subBinding };
-      expect(parseModelAuthGrantBootstrap(grant({ bindings: [base] })).ok).toBe(true);
-      for (const ownerGeneration of [undefined, 0, -1, 1.5, "1", Number.NaN]) {
-        expect(parseModelAuthGrantBootstrap(grant({ bindings: [{ ...base, ownerGeneration }] })).ok).toBe(false);
-      }
-    });
     it("exposes the reservation class", () => {
-      expect(RESERVED_AUTH_MODES).toEqual(["claude-subscription"]);
-      expect(reservesModelAccount("claude-subscription")).toBe(true);
+      expect(RESERVED_AUTH_MODES).toEqual([]);
+      expect(reservesModelAccount("claude-subscription")).toBe(false);
       expect(reservesModelAccount("codex-subscription")).toBe(false);
       expect(isSubscriptionAuthMode("codex-subscription")).toBe(true);
       expect([...SUBSCRIPTION_AUTH_MODES]).toEqual(["claude-subscription", "codex-subscription"]);
@@ -149,7 +141,7 @@ describe("grant bootstrap", () => {
       expect(expectedSecretKind("anthropic-api-key")).toBe("api-key");
       expect(expectedSecretKind("openai-api-key")).toBe("api-key");
       expect(expectedSecretKind("bedrock")).toBe("aws-bedrock");
-      expect(expectedSecretKind("claude-subscription")).toBe("session");
+      expect(expectedSecretKind("claude-subscription")).toBe("claude-oauth-token");
       expect(expectedSecretKind("codex-subscription")).toBe("chatgpt-access-token");
     });
     it("rejects unsupported modes, stages, and revisions", () => {
@@ -203,24 +195,24 @@ describe("checkout", () => {
     expect(parseModelAuthCheckoutRequest("x").ok).toBe(false);
   });
 
-  it("discriminates API credential and session responses by auth mode", () => {
+  it("discriminates API credential and Claude token responses by auth mode", () => {
     const api = {
       version: 1, ok: true, profileId: "prof-api", authMode: "openai-api-key",
       secret: { kind: "api-key", apiKey: SECRET },
     };
     expect(parseModelAuthCheckoutResponse(api).ok).toBe(true);
     const sub = {
-      version: 1, ok: true, profileId: "prof-sub", authMode: "claude-subscription", ownerGeneration: 3,
-      secret: { kind: "session", sessionData: SECRET, stateSequence: 0 },
+      version: 1, ok: true, profileId: "prof-sub", authMode: "claude-subscription",
+      secret: { kind: "claude-oauth-token", token: SECRET },
     };
     expect(parseModelAuthCheckoutResponse(sub).ok).toBe(true);
     expect(parseModelAuthCheckoutResponse({ ...api, ownerGeneration: 1 }).ok).toBe(false);
-    expect(parseModelAuthCheckoutResponse({ ...sub, ownerGeneration: undefined }).ok).toBe(false);
+    expect(parseModelAuthCheckoutResponse({ ...sub, ownerGeneration: 3 }).ok).toBe(false);
     expect(parseModelAuthCheckoutResponse({ ...sub, secret: api.secret }).ok).toBe(false);
     expect(parseModelAuthCheckoutResponse({ ...api, secret: sub.secret }).ok).toBe(false);
     expect(parseModelAuthCheckoutResponse({ ...api, secret: { kind: "api-key", apiKey: "k".repeat(MAX_API_CREDENTIAL_LENGTH + 1) } }).ok).toBe(false);
     const oversize = errorOf(
-      parseModelAuthCheckoutResponse({ ...sub, secret: { ...sub.secret, sessionData: SECRET + "x".repeat(MAX_SESSION_DATA_LENGTH) } }),
+      parseModelAuthCheckoutResponse({ ...sub, secret: { ...sub.secret, token: SECRET + "x".repeat(MAX_SESSION_DATA_LENGTH) } }),
     );
     expect(oversize).not.toContain(SECRET);
     expect(parseModelAuthCheckoutResponse({ ...api, extra: 1 }).ok).toBe(false);
@@ -330,7 +322,7 @@ describe("bedrock checkout secret", () => {
 describe("checkout binding check", () => {
   const bindings = [apiBinding, subBinding];
   const apiResp = { profileId: "prof-api", authMode: "openai-api-key" as const };
-  const subResp = { profileId: "prof-sub", authMode: "claude-subscription" as const, ownerGeneration: 3 };
+  const subResp = { profileId: "prof-sub", authMode: "claude-subscription" as const };
   const codexBinding: ModelAuthGrantBinding = {
     stage: "review",
     profileId: "prof-codex",
@@ -362,12 +354,12 @@ describe("checkout binding check", () => {
     expect(checkCheckoutResponseAgainstBindings("prof-api", { ...apiResp, authMode: "bedrock" }, bindings).ok).toBe(false);
     expect(checkCheckoutResponseAgainstBindings("prof-sub", { ...subResp, authMode: "codex-subscription" }, bindings).ok).toBe(false);
     expect(checkCheckoutResponseAgainstBindings("prof-sub", { ...subResp, ownerGeneration: 4 }, bindings).ok).toBe(false);
-    expect(checkCheckoutResponseAgainstBindings("prof-sub", { ...subResp, ownerGeneration: undefined }, bindings).ok).toBe(false);
+
     expect(checkCheckoutResponseAgainstBindings("prof-api", { ...apiResp, ownerGeneration: 1 }, bindings).ok).toBe(false);
   });
 
   it("fails on conflicting bindings", () => {
-    const noGen = { ...subBinding, ownerGeneration: undefined };
+    const noGen = { ...subBinding, ownerGeneration: 3 };
     const strayGen = { ...apiBinding, ownerGeneration: 1 };
     expect(checkCheckoutResponseAgainstBindings("prof-sub", subResp, [noGen]).ok).toBe(false);
     expect(checkCheckoutResponseAgainstBindings("prof-api", { ...apiResp, ownerGeneration: 1 }, [strayGen]).ok).toBe(false);
@@ -378,7 +370,7 @@ describe("checkpoint", () => {
   const req = { version: 1, profileId: "prof-sub", ownerGeneration: 3, stateSequence: 4, sessionData: SECRET };
   it("parses subscription checkpoints", () => {
     expect(parseModelAuthCheckpointRequest(req).ok).toBe(true);
-    expect(parseModelAuthCheckpointRequest(req, [apiBinding, subBinding]).ok).toBe(true);
+    expect(parseModelAuthCheckpointRequest(req, [apiBinding, subBinding]).ok).toBe(false);
   });
   it("rejects codex, api-key, and bedrock bindings with the right message", () => {
     const codex: ModelAuthGrantBinding = { ...apiBinding, profileId: "prof-sub", authMode: "codex-subscription" };
@@ -493,4 +485,43 @@ describe("parseModelAuthContext (AII-1427)", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).not.toContain("orch.example.com");
   });
+});
+
+describe("Claude setup-token checkout", () => {
+  const token = "SENTINEL-claude-setup";
+  const response = (secret: unknown, authMode = "claude-subscription") => ({
+    version: 1, ok: true, profileId: "sub", authMode,
+    secret,
+  });
+  it("accepts bounded tokens and rejects invalid shapes without disclosure", () => {
+    for (const value of [token, "x".repeat(MAX_API_CREDENTIAL_LENGTH)]) {
+      expect(parseModelAuthCheckoutResponse(response({ kind: "claude-oauth-token", token: value })).ok).toBe(true);
+    }
+    for (const secret of [
+      { kind: "claude-oauth-token" },
+      { kind: "claude-oauth-token", token: "" },
+      { kind: "claude-oauth-token", token: 42 },
+      { kind: "claude-oauth-token", token: token + "x".repeat(MAX_API_CREDENTIAL_LENGTH) },
+      { kind: "claude-oauth-token", token, extra: token },
+    ]) {
+      const result = parseModelAuthCheckoutResponse(response(secret));
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result).includes(token)).toBe(false);
+    }
+  });
+  it("round-trips a generation-free checkout and rejects managed session or generation responses", () => {
+    const input = response({ kind: "claude-oauth-token", token });
+    expect(parseModelAuthCheckoutResponse(input)).toEqual({ ok: true, value: input });
+    for (const ownerGeneration of [1, 0, null]) {
+      expect(parseModelAuthCheckoutResponse({ ...input, ownerGeneration }).ok).toBe(false);
+    }
+    expect(parseModelAuthCheckoutResponse(response({ kind: "session", sessionData: token, stateSequence: 0 })).ok).toBe(false);
+  });
+  it.each(["codex-subscription", "openai-api-key", "anthropic-api-key", "bedrock"])(
+    "rejects tokens for %s", (mode) => {
+      const result = parseModelAuthCheckoutResponse(response({ kind: "claude-oauth-token", token }, mode));
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result).includes(token)).toBe(false);
+    },
+  );
 });

@@ -250,8 +250,7 @@ export interface KgRefreshProductionInput {
   config: Pick<AppConfig,
     "githubAppId" | "githubAppPrivateKey" | "sessionImage" | "runnerImageExplicit"
     | "runnerCallbackBaseUrl" | "runnerTokenSecret" | "flySessionsToken" | "flySessionsApp"
-    | "flySessionsRegion" | "localRunnerImage" | "localRunnerOrchestratorUrl" | "healthPort"
-    | "anthropicApiKey" | "claudeOAuthToken">;
+    | "flySessionsRegion" | "localRunnerImage" | "localRunnerOrchestratorUrl" | "healthPort">;
   mintToken: KgRailDeps["mintToken"];
   fetchTarball: KgRailDeps["fetchTarball"];
   fetchDefaultBranch: KgRailDeps["fetchDefaultBranch"];
