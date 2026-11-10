@@ -947,6 +947,90 @@ describe("finished Restate resource cleanup", () => {
     return { lifecycleOwner: { kind: "restate", attemptId: "owned" },
       releasedAt, generation, backend: "fly-machines" } as NonNullable<ReturnType<typeof readAdmission>>;
   }
+  it.each([
+    { count: 3, threshold: 2, alert: true },
+    { count: 2, threshold: 2, alert: false },
+    { count: 10, threshold: undefined, alert: false },
+    { count: 11, threshold: undefined, alert: true },
+  ])("counts Restate-only attempts: $count at threshold $threshold", async ({ count, threshold, alert }) => {
+    vi.mocked(listMachines).mockResolvedValue(Array.from({ length: count }, (_, i) => makeMachine(`owned-${i}`)) as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(job);
+    vi.mocked(readAdmission).mockReturnValue(admission(123));
+    await sweepOrphanedMachines(makeConfig(false, {
+      reaperAlertThreshold: threshold, notifyWebhookUrl: "https://hooks.example.com/burst",
+    }), makeHelpers());
+    expect(destroyMachine).toHaveBeenCalledTimes(count);
+    expect(recordReaperAction).toHaveBeenCalledTimes(count);
+    expect(notifyReaperBurst).toHaveBeenCalledTimes(alert ? 1 : 0);
+    if (alert) expect(notifyReaperBurst).toHaveBeenCalledWith("slack", "https://hooks.example.com/burst", {
+      count, threshold: threshold ?? 10,
+    });
+  });
+
+  it.each([false, true])("counts mixed attempts once, including failed destroys, dryRun=%s", async (dryRun) => {
+    const machines = [makeMachine("owned"), makeMachine("legacy"), makeMachine("orphan")];
+    vi.mocked(listMachines).mockResolvedValue(machines as never);
+    vi.mocked(getJobByMachineId).mockImplementation((id) => id === "orphan" ? null :
+      id === "owned" ? job : makeJob({ status: "completed", dispatchId: null }));
+    vi.mocked(readAdmission).mockReturnValue(admission(123));
+    vi.mocked(destroyMachine).mockRejectedValue(new Error("503 unavailable"));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const helpers = makeHelpers();
+    await sweepOrphanedMachines(makeConfig(dryRun, {
+      reaperAlertThreshold: 2, notifyWebhookUrl: "https://hooks.example.com/burst",
+    }), helpers);
+    expect(recordReaperAction).toHaveBeenCalledTimes(3);
+    for (const machine of machines) {
+      expect(recordReaperAction).toHaveBeenCalledWith(expect.objectContaining({ machineId: machine.id, dryRun }));
+      if (!dryRun) expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, machine.id);
+    }
+    expect(destroyMachine).toHaveBeenCalledTimes(dryRun ? 0 : 3);
+    expect(notifyReaperBurst).toHaveBeenCalledTimes(dryRun ? 0 : 1);
+    if (!dryRun) expect(notifyReaperBurst).toHaveBeenCalledWith("slack", "https://hooks.example.com/burst", { count: 3, threshold: 2 });
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(invalidateNonce).not.toHaveBeenCalled();
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
+  });
+
+  it("requires a webhook for Restate burst notifications", async () => {
+    vi.mocked(listMachines).mockResolvedValue([makeMachine("owned")] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(job);
+    vi.mocked(readAdmission).mockReturnValue(admission(123));
+    await sweepOrphanedMachines(makeConfig(false, { reaperAlertThreshold: 0 }), makeHelpers());
+    expect(destroyMachine).toHaveBeenCalledOnce();
+    expect(notifyReaperBurst).not.toHaveBeenCalled();
+  });
+
+  it.each(["held", "nonterminal", "wrong-generation", "wrong-backend", "outer-backend", "foreign", "untagged", "destroyed", "durable", "kept-KG"])(
+    "excludes %s resources from burst accounting", async (scenario) => {
+      const machine = makeMachine("leftover");
+      let record = admission(scenario === "held" ? null : 123, scenario === "wrong-generation" ? 8 : 7);
+      // Direct admission/job mismatch, distinct from the outer Fly sweep backend fence.
+      if (scenario === "wrong-backend") record = { ...record, backend: "local-docker" };
+      const candidate = { ...job, status: scenario === "nonterminal" ? "running" as const : job.status };
+      if (scenario === "outer-backend") {
+        candidate.executionMode = "local-docker";
+        record = { ...record, backend: "local-docker" };
+      }
+      if (scenario === "foreign") machine.config.metadata.orchestrator_app = "other";
+      if (scenario === "untagged") machine.config.metadata = {} as typeof machine.config.metadata;
+      if (scenario === "destroyed") machine.state = "destroyed";
+      if (scenario === "durable" || scenario === "kept-KG") {
+        machine.config.metadata = { ...machine.config.metadata, purpose: "durable-runner" } as typeof machine.config.metadata;
+        if (scenario === "kept-KG") candidate.phase = "kg-refresh";
+      }
+      vi.mocked(listMachines).mockResolvedValue([machine] as never);
+      vi.mocked(getJobByMachineId).mockReturnValue(candidate);
+      vi.mocked(readAdmission).mockReturnValue(record);
+      await sweepOrphanedMachines(makeConfig(false, {
+        reaperAlertThreshold: 0, notifyWebhookUrl: "https://hooks.example.com/burst",
+      }), makeHelpers());
+      expect(recordReaperAction).not.toHaveBeenCalled();
+      expect(destroyMachine).not.toHaveBeenCalled();
+      expect(notifyReaperBurst).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["completed", "failed", "review_failed", "timed_out", "dispatch-failed"] as const)("removes released %s sessions without finalizing", async (status) => {
     vi.mocked(listMachines).mockResolvedValue([makeMachine("leftover", { state: "stopped" })] as never);
     vi.mocked(getJobByMachineId).mockReturnValue({ ...job, status });

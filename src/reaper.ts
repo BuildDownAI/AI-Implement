@@ -43,7 +43,7 @@ export function canReapFinishedRestateJob(job: Job): boolean {
 /** Returns true for every Restate-owned job, retaining the fence even if cleanup
  * is ineligible. Boot and the periodic sweep share this resource-only path. */
 export async function reconcileRestateMachine(config: ReaperConfig, job: Job, machineId: string,
-  ageSeconds: number, reason = "stale-terminal-job"): Promise<boolean> {
+  ageSeconds: number, reason = "stale-terminal-job", onCleanup?: () => void): Promise<boolean> {
   if (!isRestateOwnedJob(job)) return false;
   if (job.executionMode === "fly-machines" && canReapFinishedRestateJob(job)) {
     recordReaperAction({ ruleMatched: reason, machineId, tenantId: job.teamKey,
@@ -51,6 +51,8 @@ export async function reconcileRestateMachine(config: ReaperConfig, job: Job, ma
     await safeDestroyMachine(config, machineId, reason, {
       tenantId: job.teamKey, issueIdentifier: job.issueIdentifier, ageSeconds,
     });
+    // Signal an eligible attempt, even when destruction failed, as Legacy does.
+    onCleanup?.();
   }
   return true;
 }
@@ -317,7 +319,9 @@ export async function sweepOrphanedMachines(
 
     // AII-791: Restate jobs never enter Legacy finalization; only released,
     // terminal resources may be removed by the shared reconciliation path.
-    if (await reconcileRestateMachine(config, job, machine.id, ageSeconds)) continue;
+    if (await reconcileRestateMachine(config, job, machine.id, ageSeconds, "stale-terminal-job", () => {
+      if (!config.reaperDryRun) destroyedCount++;
+    })) continue;
 
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";
