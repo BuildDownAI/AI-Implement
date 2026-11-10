@@ -493,80 +493,7 @@ describe("handleRunnerResult — planning", () => {
     expect(dispatchAdmission.count("ENG")).toBe(0);
   });
 
-  // AII-783 review, third round, on PR #681: updateJobStatus's "completed" write above
-  // drops the job out of getInFlightJobs()'s dispatched/running set, so the normal
-  // per-poll monitor never looks at it again — relying solely on sweepStaleAdmissions's
-  // 6-hour floor would strand every ordinary, already-finished planning run at full team
-  // capacity for hours. checkPlanningAdmissionTermination is the fast path that takes the
-  // monitor's place: this asserts the callback actually invokes it (with the right
-  // dispatchId) and that a backend the check confirms terminal is released well under the
-  // 6-hour sweep floor, not just eventually.
-  it("releases the admission reservation promptly via checkPlanningAdmissionTermination when the backend is already confirmed terminal", async () => {
-    const { token, dispatchId } = runnerTokens.mintRunToken({
-      issueId: "i",
-      mappingTeamKey: "ENG",
-      phase: "planning",
-      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
-      secret: SECRET,
-    });
-    const admitted = dispatchAdmission.acquire({
-      dispatchId,
-      mappingKey: "ENG",
-      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
-      kind: "planning",
-      backend: "github-actions",
-      lifecycleOwner: { kind: "legacy" },
-      cap: 1,
-    });
-    expect(admitted.ok).toBe(true);
-    log.appendLog({
-      issueId: "i",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Plan it",
-      teamKey: "ENG",
-      repo: "o/r",
-      dispatchId,
-      executionMode: "github-actions",
-      phase: "planning",
-    });
-
-    const checkPlanningAdmissionTermination = vi.fn(async (id: string) => {
-      // Simulates index.ts's tryFastReleasePlanningAdmission having independently
-      // confirmed the backend terminal and released the reservation.
-      dispatchAdmission.releaseByDispatchId(id, "finalized");
-    });
-
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: { phase: "planning", outcome: "success", comments: [] },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
-      checkPlanningAdmissionTermination,
-    });
-    expect(res.status).toBe(200);
-    expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
-
-    const released = dispatchAdmission.read(dispatchId);
-    expect(released?.releasedAt).not.toBeNull();
-    expect(dispatchAdmission.count("ENG")).toBe(0);
-
-    // Capacity is free again immediately — not gated behind the 6-hour sweep floor.
-    const competing = dispatchAdmission.acquire({
-      dispatchId: "competing-dispatch-2",
-      mappingKey: "ENG",
-      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
-      kind: "planning",
-      backend: "github-actions",
-      lifecycleOwner: { kind: "legacy" },
-      cap: 1,
-    });
-    expect(competing.ok).toBe(true);
-  });
-
-  // A still-uncertain backend must leave the reservation held even when the fast-path
-  // seam is present — checkPlanningAdmissionTermination is a no-op call for the caller,
-  // not an automatic release.
-  it("leaves the admission reservation held when checkPlanningAdmissionTermination cannot confirm termination", async () => {
+  it("leaves the admission reservation held when the planning hook has no Restate owner", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
@@ -594,10 +521,7 @@ describe("handleRunnerResult — planning", () => {
       phase: "planning",
     });
 
-    const checkPlanningAdmissionTermination = vi.fn(async () => {
-      // Backend still running / unconfirmable: a real no-op, mirroring
-      // tryFastReleasePlanningAdmission when confirmAdmissionTerminated resolves false.
-    });
+    const checkPlanningAdmissionTermination = vi.fn(async () => {});
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,

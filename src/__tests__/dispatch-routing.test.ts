@@ -1144,131 +1144,7 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
   });
 });
 
-// AII-783 review, third round, on PR #681: the planning callback marks its job row
-// "completed" with skipAdmissionRelease, which removes the job from getInFlightJobs()'s
-// dispatched/running set — so the normal per-poll GHA/Fly/local monitor never checks it
-// again. tryFastReleasePlanningAdmission is the fast path that takes the monitor's place:
-// one immediate confirmAdmissionTerminated check, right after the callback, instead of
-// stranding an already-finished planning run's capacity slot behind the 6-hour
-// stale-admission-sweep floor. Exercised here against the real dispatch_admissions table
-// with a mocked local-docker backend (no network calls needed to observe termination).
-describe("tryFastReleasePlanningAdmission — fast release path for the planning callback (AII-783 review, third round, on PR #681)", () => {
-  const loaders = {
-    dispatchAdmission: () => import("../dispatch-admission.js"),
-    log: () => import("../log.js"),
-    localDocker: () => import("../local-docker.js"),
-    indexModule: () => import("../index.js"),
-  };
-  let dispatchAdmission: typeof import("../dispatch-admission.js");
-  let log: typeof import("../log.js");
-  let indexModule: typeof import("../index.js");
-  let localDocker: typeof import("../local-docker.js");
-
-  const config = makeAppConfig();
-
-  beforeEach(async () => {
-    ({ dispatchAdmission, log, localDocker, indexModule } = (await testDb({ modules: loaders })).modules);
-    vi.mocked(localDocker.inspectLocalContainer).mockClear();
-  });
-
-  function acquireAndLog(dispatchId: string): void {
-    const admitted = dispatchAdmission.acquire({
-      dispatchId,
-      mappingKey: "AII",
-      scope: { kind: "issue", issueScope: "AII", issueId: "issue-1" },
-      kind: "planning",
-      backend: "local-docker",
-      lifecycleOwner: { kind: "legacy" },
-      cap: 1,
-    });
-    expect(admitted.ok).toBe(true);
-    if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
-    log.appendLog(makeAppendLogEntry({
-      issueIdentifier: "AII-1",
-      teamKey: "AII",
-      repo: "o/r",
-      dispatchId,
-      admissionGeneration: admitted.record.generation,
-      executionMode: "local-docker",
-      contract: undefined,
-      phase: "planning",
-      machineNonce: "nonce-1",
-      machineId: "container-1",
-    }));
-  }
-
-  it("releases the reservation once the backend is confirmed stopped", async () => {
-    acquireAndLog("dispatch-fast-1");
-    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
-
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-1");
-
-    const record = dispatchAdmission.read("dispatch-fast-1");
-    expect(record?.releasedAt).not.toBeNull();
-    expect(dispatchAdmission.count("AII")).toBe(0);
-  });
-
-  it("leaves the reservation held while the backend is still observed running", async () => {
-    acquireAndLog("dispatch-fast-2");
-    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
-
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-2");
-
-    const record = dispatchAdmission.read("dispatch-fast-2");
-    expect(record?.releasedAt).toBeNull();
-    expect(dispatchAdmission.count("AII")).toBe(1);
-  });
-
-  it("is a no-op when no reservation exists for the dispatch id", async () => {
-    await expect(indexModule.tryFastReleasePlanningAdmission(config, "never-reserved")).resolves.toBeUndefined();
-    expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
-  });
-
-  it("is a no-op when the reservation was already released", async () => {
-    acquireAndLog("dispatch-fast-3");
-    dispatchAdmission.releaseByDispatchId("dispatch-fast-3", "finalized");
-
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-3");
-
-    expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
-  });
-
-  it("does not release a replacement generation after a slow terminal check", async () => {
-    const dispatchId = "dispatch-fast-race";
-    acquireAndLog(dispatchId);
-    const original = dispatchAdmission.read(dispatchId);
-    expect(original).not.toBeNull();
-    if (!original) throw new Error("test admission missing");
-    vi.mocked(localDocker.inspectLocalContainer).mockImplementation(async () => {
-      dispatchAdmission.release(dispatchId, original.lifecycleOwner, original.generation, "finalized");
-      const replacement = dispatchAdmission.acquire({
-        dispatchId,
-        mappingKey: "AII",
-        scope: { kind: "issue", issueScope: "AII", issueId: "issue-2" },
-        kind: "planning",
-        backend: "local-docker",
-        lifecycleOwner: { kind: "legacy" },
-        cap: 1,
-      });
-      expect(replacement.ok).toBe(true);
-      return { status: "exited", running: false, exitCode: 0 };
-    });
-
-    await indexModule.tryFastReleasePlanningAdmission(config, dispatchId);
-
-    expect(dispatchAdmission.read(dispatchId)).toMatchObject({ generation: original.generation + 1, releasedAt: null });
-    expect(dispatchAdmission.count("AII")).toBe(1);
-  });
-});
-
-// AII-783 gap-fill (third and final round, on PR #681): the planning_callback fast path
-// above usually catches a planning run's reservation before the poll loop's own
-// reconciliation gets a chance to — but operator_cancelled has no fast path at all, and a
-// planning_callback whose backend was still shutting down at fast-path time falls through
-// to here too. reconcileTerminalCallbackAdmissions is wired into the poll loop right next
-// to sweepStaleAdmissions (index.ts); this exercises it end-to-end through the real
-// confirmAdmissionTerminated oracle against the real dispatch_admissions/dispatch_log
-// tables, the same way the fast-path block above does.
+// Terminal callbacks retain reservations until backend reconciliation confirms termination.
 describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for terminal callback conclusions (AII-783 gap-fill, third round, on PR #681)", () => {
   const loaders = {
     dispatchAdmission: () => import("../dispatch-admission.js"),
@@ -1349,13 +1225,14 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
     expect(dispatchAdmission.count("AII")).toBe(1);
   });
 
-  it("catches a planning_callback reservation the inline fast path missed (backend still running at fast-path time, terminal by the next poll)", async () => {
+  it("reconciles a planning_callback reservation once the backend stops", async () => {
     acquireLogAndFinalize("dispatch-pc-1", "issue-1", "planning_callback");
     vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
 
-    // Simulates the inline fast path (tryFastReleasePlanningAdmission) observing the
-    // backend still running right after the callback — it must be a no-op, not a release.
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-pc-1");
+    const pending = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+    expect(pending).toEqual([]);
     expect(dispatchAdmission.read("dispatch-pc-1")?.releasedAt).toBeNull();
 
     // By the next poll cycle, the backend has actually exited.

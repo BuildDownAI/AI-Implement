@@ -67,15 +67,13 @@ export function createPlanningRunIngressClient(
 
 export interface PlanningAdmissionTerminationHookDeps {
   ingress: Pick<PlanningRunIngressClient, "report">;
-  /** The Legacy fast release (`tryFastReleasePlanningAdmission` in `src/index.ts`). */
-  legacy: (dispatchId: string) => Promise<void>;
   /** Defaults to `dispatch-admission.read`; a seam for a caller with no database. */
   readAdmission?: (dispatchId: string) => Pick<DispatchAdmissionRecord, "lifecycleOwner"> | null;
 }
 
 /**
  * Has the signature of `checkPlanningAdmissionTermination`. A Restate-owned reservation gets a
- * `report` to its workflow (the workflow key is the dispatch id); anything else is Legacy-owned.
+ * `report` to its workflow (the workflow key is the dispatch id); other admissions are logged and left held.
  * Returns the ingress outcome to the callback so an unavailable report can be retried.
  */
 export function createPlanningAdmissionTerminationHook(
@@ -84,7 +82,7 @@ export function createPlanningAdmissionTerminationHook(
   const lookup = deps.readAdmission ?? readAdmission;
   return async (dispatchId, usage) => {
     if (lookup(dispatchId)?.lifecycleOwner.kind !== "restate") {
-      await deps.legacy(dispatchId);
+      console.log(`[planning-run] no Restate owner dispatch=${dispatchId}`);
       return;
     }
     const result = await (usage ? deps.ingress.report(dispatchId, { usage }, { idempotencyKey: dispatchId }) : deps.ingress.report(dispatchId));
