@@ -521,6 +521,7 @@ it.each(["accepted", "lost-ack", "crash-before-row"])("Fly %s recovery keeps the
     expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ sessionImage: "repository-override" }));
   }
   vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "same-machine", executionMode: "fly-machines", status: "running", approved: false, failure: null, failureCommentedAt: null, conclusion: null, groupingParent: false }));
+  ordinaryIntents.set(`owner:${req.dispatchId}`, { snapshot: { input: req, generation: 3, createdAt: 1000, jobId: "same-machine", state: "launching" }, done: false });
   vi.mocked(input.remediateStuckJob).mockImplementationOnce(async (_config, _provider, _job, _reason, stopRunner) => {
     expect(await stopRunner!()).toBe(true);
     return true;

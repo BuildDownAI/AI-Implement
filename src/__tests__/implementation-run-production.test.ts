@@ -744,8 +744,10 @@ describe("production deps", () => {
 
     it.each([false, true])("ordinary Fly remediation uses the persisted app when present: %s", async persisted => {
       vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ id: 7, dispatchId: "d-1", teamKey: "ENG", issueId: "i-1", status: "running", conclusion: null, failure: null, approved: false, executionMode: "fly-machines", machineId: "m-1" }));
+      intents.set("owner:d-1", { snapshot: { input: { ...INPUT, backend: "fly-machines" }, generation: 3, createdAt: DISPATCHED_AT, jobId: "m-1", state: "launching", flyApp: "fly-app" }, done: false });
       if (persisted) intents.set("d-1", { snapshot: { flyApp: "original-app" }, done: false });
       const { input, d } = compose();
+      input.config.flySessionsApp = "changed-app";
       vi.mocked(getMachine).mockResolvedValue({ id: "m-1", state: "stopped", config: {} } as never);
       await d.finishJob("d-1", { kind: "deadline" });
       const stopRunner = vi.mocked(input.remediateStuckJob).mock.calls[0][4];
