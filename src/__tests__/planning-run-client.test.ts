@@ -65,10 +65,8 @@ describe("PlanningRun report sender", () => {
   it("contract: PlanningRun.report — the hook's request is one the real handler accepts", async () => {
     const { token, dispatchId } = plantPlanningDispatch({ kind: "restate", attemptId: "attempt-1" });
     const ingress = fakeFetch({ [`POST /PlanningRun/${dispatchId}/report`]: [({ body }: FetchCall): ReplyInit => ({ status: 200, json: { status: "accepted", fingerprint: ownedRunReportFingerprint(JSON.parse(body)) } })] });
-    const legacy = vi.fn(async () => {});
     const hook = client.createPlanningAdmissionTerminationHook({
       ingress: client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
-      legacy,
     });
 
     const res = await runnerCallback.handleRunnerResult({
@@ -80,7 +78,6 @@ describe("PlanningRun report sender", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(legacy).not.toHaveBeenCalled();
     // Existing callback producers omit usage and retain the empty request body.
     const workflow = createPlanningRunWorkflow({} as never);
     expect(ingress.calls).toHaveLength(1);
@@ -102,7 +99,6 @@ describe("PlanningRun report sender", () => {
     const ingress = fakeFetch({ [`POST /PlanningRun/${dispatchId}/report`]: [({ body }: FetchCall): ReplyInit => ({ status: 200, json: { status: "accepted", fingerprint: ownedRunReportFingerprint(JSON.parse(body)) } })] });
     const hook = client.createPlanningAdmissionTerminationHook({
       ingress: client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
-      legacy: vi.fn(async () => {}),
     });
     const usage: RecordedUsage = {
       records: [{
@@ -119,28 +115,32 @@ describe("PlanningRun report sender", () => {
     await hook(dispatchId, usage);
     expect(ingress.calls).toHaveLength(1);
     expect(JSON.parse(ingress.calls[0].body)).toEqual({ usage });
+    expect(ingress.calls[0].headers.get("idempotency-key")).toBe(dispatchId);
   });
 
-  it("a Legacy-owned reservation calls legacy and sends no request", async () => {
-    const { token, dispatchId } = plantPlanningDispatch({ kind: "legacy" });
-    const ingress = fakeFetch({});
-    const legacy = vi.fn(async () => {});
-    const hook = client.createPlanningAdmissionTerminationHook({
-      ingress: client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
-      legacy,
-    });
+  it.each(["legacy", "missing"] as const)("%s admission logs once and leaves capacity held", async (owner) => {
+    const dispatchId = owner === "legacy"
+      ? plantPlanningDispatch({ kind: "legacy" }).dispatchId
+      : "missing-dispatch";
+    const report = vi.fn(async () => ({ status: "accepted" as const }));
+    const hook = client.createPlanningAdmissionTerminationHook({ ingress: { report } });
+    const info = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: { phase: "planning", outcome: "success", comments: [] },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
-      checkPlanningAdmissionTermination: hook,
-    });
+    await expect(hook(dispatchId)).resolves.toBeUndefined();
 
-    expect(res.status).toBe(200);
-    expect(legacy).toHaveBeenCalledWith(dispatchId);
-    expect(ingress.calls).toEqual([]);
+    expect(info).toHaveBeenCalledExactlyOnceWith(`[planning-run] no Restate owner dispatch=${dispatchId}`);
+    expect(report).not.toHaveBeenCalled();
+    expect(dispatchAdmission.count("ENG")).toBe(owner === "legacy" ? 1 : 0);
+    if (owner === "legacy") expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
+  });
+
+  it("reports without usage when called directly without usage", async () => {
+    const { dispatchId } = plantPlanningDispatch({ kind: "restate", attemptId: "attempt-1" });
+    const report = vi.fn(async () => ({ status: "accepted" as const }));
+    const hook = client.createPlanningAdmissionTerminationHook({ ingress: { report } });
+
+    await expect(hook(dispatchId)).resolves.toEqual({ status: "accepted" });
+    expect(report).toHaveBeenCalledExactlyOnceWith(dispatchId);
   });
 
   it("with the ingress unavailable the hook resolves, logs one warning, and does not throw", async () => {
@@ -153,7 +153,6 @@ describe("PlanningRun report sender", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const hook = client.createPlanningAdmissionTerminationHook({
       ingress: client.createPlanningRunIngressClient(INGRESS, { fetchImpl: ingress.fetch }),
-      legacy: vi.fn(async () => {}),
     });
 
     await expect(hook(dispatchId)).resolves.toEqual({ status: "unavailable" });

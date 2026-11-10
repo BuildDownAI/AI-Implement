@@ -79,14 +79,11 @@ export interface RepoMapping {
   /** Token scope for dependency access. NULL means off (default); "installation" grants read access to all repos the App can see. */
   dependencyTokenScope: "installation" | null;
   /**
-   * Which lifecycle coordinates this project's *automatic review-fix* runs.
-   * NULL (including an old row predating this column) means Legacy — see
-   * resolveReviewFixLifecycle(). Under "restate", the project's review webhook events (reviews,
-   * inline comments, review-summary issue comments) forward to ReviewFixPR.feedback and are
-   * admitted through Restate; the `/ai-implement` comment rail (comment_gapfill_queue) is
-   * unchanged. Eligible non-managed Fly and local Docker attempts also use Restate admission.
-   * Selecting "restate" is validated at save time (src/admin.ts's upsertMappingAction) and applies
-   * only to new attempts; it never changes the owner of an attempt already in flight.
+   * Retained lifecycle configuration, validated at save time (src/admin.ts).
+   * Every mapped project's review webhook intake and pending queue rows use
+   * ReviewFixPR and ReviewFixAttempt regardless of this value. Paused mappings
+   * remain pending until unpause. Planning and comment gap-fill also use Restate.
+   * Changing this value never changes the owner of an attempt already in flight.
    */
   reviewFixLifecycle: "legacy" | "restate" | null;
   /** Memory provider ID for this mapping. NULL means use the orchestrator default (sidecar). JSON-ready text column. */

@@ -263,8 +263,10 @@ it("first-time launch still calls existing launch helpers with the same argument
   expect(input.prepareImplementationLaunch).toHaveBeenCalledExactlyOnceWith({
     modelPrices: undefined, config: input.config, issue, mapping, dispatchId: "dispatch",
     baseBranch: mapping.defaultBranch, managedDecision: { kind: "legacy" }, managedRuntime: runtime,
-    resolveRunnerImage: input.resolveRunnerImage, isGroupingParentDispatch: input.isGroupingParentDispatch,
+    resolveRunnerImage: input.resolveRunnerImage, isGroupingParentDispatch: expect.any(Function),
   });
+  const launchArgs = vi.mocked(input.prepareImplementationLaunch).mock.calls[0]![0];
+  expect(launchArgs.isGroupingParentDispatch(launchArgs.issue)).toBe(false);
   expect(input.launchImplementationRun).toHaveBeenCalledExactlyOnceWith({
     config: input.config, provider, issue, mapping, launch: prepared, implSentBaseBranch: false,
     managedDecision: { kind: "legacy" }, managedRuntime: runtime, fireBreakerTrip: input.fireBreakerTrip,

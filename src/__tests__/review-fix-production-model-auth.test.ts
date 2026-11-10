@@ -15,7 +15,6 @@ const getPullRequestState = vi.fn(async () => ({ state: "open", merged: false })
 
 vi.mock("../config.js", () => ({
   getMappings: () => getMappings(),
-  resolveReviewFixLifecycle: () => "restate",
 }));
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
@@ -174,4 +173,17 @@ it.each(["fly-machines", "local-docker"])("checks managed readiness on %s withou
     expect(inspectAgentReadiness).toHaveBeenLastCalledWith(expect.objectContaining({ backend: path }), expect.anything());
   }
   expect(resolveWorkflowCapabilities).not.toHaveBeenCalled();
+});
+
+it.each([null, "legacy", "restate"])("admits lifecycle %s, defers while paused, then admits after unpause", async (reviewFixLifecycle) => {
+  const active = { ...mapping, reviewFixLifecycle };
+  getMappings.mockReturnValue({ k: { ...active, paused: true } });
+  const store = { admit: vi.fn(() => ({ status: "prepared" })) };
+  expect(await admitReviewFix(request, config, store as never)).toEqual({ status: "deferred", reason: "paused" });
+  expect(store.admit).not.toHaveBeenCalled();
+  expect(getInstallationToken).not.toHaveBeenCalled();
+  getMappings.mockReturnValue({ k: active });
+  isManagedProject.mockReturnValue(false);
+  expect(await admitReviewFix(request, config, store as never)).toEqual({ status: "prepared" });
+  expect(store.admit).toHaveBeenCalledTimes(1);
 });
