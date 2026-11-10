@@ -898,6 +898,23 @@ describe("orchestratorTools (Restate)", () => {
   );
 
   it.each(VARIANTS.map(([label]) => label))(
+    "add_project creates a Codex project and ignores a retired lifecycle through real ingress (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "add_project", {
+        caller: SYSTEM,
+        args: { teamKey: `CODEX-${label}`, owner: "BuildDownAI", repo: "codex-fixture", defaultBranch: "main",
+          reviewProcess: "codex-code-review", reviewFixLifecycle: "legacy" },
+      });
+      const result = JSON.parse(body?.content?.[0]?.text as string) as { status: number; body: Record<string, unknown> };
+      expect(result.status).toBe(202);
+      expect(result.body).toMatchObject({ reviewProcess: "codex-code-review", reviewFixLifecycle: null });
+      expect(result.body.syncJobId).toBeDefined();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
     "a user caller is refused a write tool over the real ingress and never runs the action (%s)",
     async (label) => {
       const env = environments.get(label);

@@ -79,11 +79,9 @@ export interface RepoMapping {
   /** Token scope for dependency access. NULL means off (default); "installation" grants read access to all repos the App can see. */
   dependencyTokenScope: "installation" | null;
   /**
-   * Retained lifecycle configuration, validated at save time (src/admin.ts).
-   * Every mapped project's review webhook intake and pending queue rows use
-   * ReviewFixPR and ReviewFixAttempt regardless of this value. Paused mappings
-   * remain pending until unpause. Planning and comment gap-fill also use Restate.
-   * Changing this value never changes the owner of an attempt already in flight.
+   * Historical lifecycle metadata retained for deploy rollback. Mapping saves ignore
+   * this input and preserve the stored value; every mapped run uses Restate.
+   * An attempt already in flight keeps its recorded owner.
    */
   reviewFixLifecycle: "legacy" | "restate" | null;
   /** Memory provider ID for this mapping. NULL means use the orchestrator default (sidecar). JSON-ready text column. */
@@ -98,7 +96,7 @@ export interface RepoMapping {
   prDispatchBudget?: number | null;
   /** Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (`ai-implement`, `ai-implement[bot]`, and the Claude logins — `github-actions[bot]` is trusted separately). NULL means built-ins only. */
   trustedReviewAuthors?: string[] | null;
-  /** The project's review process (ADR 038). NULL means `ai-implement`; read it through resolveReviewProcessId(). Applies to every project; only the forward to `ReviewFixPR.feedback` needs the Restate review-fix lifecycle. */
+  /** The project's review process (ADR 038). NULL means `ai-implement`; read it through resolveReviewProcessId(). Applies to every project; Restate coordinates AI-Implement fix attempts on every backend. */
   reviewProcess?: ReviewProcessId | null;
 }
 
@@ -136,17 +134,6 @@ export function resolveReviewerSelection(mapping: Pick<RepoMapping, "reviewers">
  */
 export function resolvePrDispatchBudget(mapping: { prDispatchBudget?: number | null }): number {
   return mapping.prDispatchBudget ?? DEFAULT_PR_DISPATCH_BUDGET;
-}
-
-/**
- * Resolves a mapping's stored review-fix lifecycle, applying the NULL-means-default rule:
- * NULL (or an old row that predates the column) resolves to "legacy", mirroring
- * resolveReviewerSelection() above.
- */
-export function resolveReviewFixLifecycle(
-  mapping: Pick<RepoMapping, "reviewFixLifecycle">,
-): "legacy" | "restate" {
-  return mapping.reviewFixLifecycle ?? "legacy";
 }
 
 /** Resolves a mapping's stored review process id; NULL or an unknown value resolves to `ai-implement`. */

@@ -1469,7 +1469,7 @@ export const addProjectArgsSchema = z.object({
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
   reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix", "codex-code-review"]).nullable().optional().describe(
-    "The project's review process. codex-code-review requires the Restate lifecycle. Omit to keep the stored value; pass null or \"ai-implement\" for the default. Claude and AI-Implement apply to every project; Codex Code Review is Restate-only.",
+    "The project's review process. Restate coordinates AI-Implement fixes for every project. Omit to keep the stored value; pass null or \"ai-implement\" for the default. All review processes apply to every project.",
   ),
 });
 

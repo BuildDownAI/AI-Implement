@@ -662,7 +662,7 @@ function releaseReasonForConclusion(conclusion: string | null): DispatchAdmissio
  * independently confirmed dead through the same `confirmTerminated` oracle
  * `sweepStaleAdmissions` uses before release; a still-running, unknown, or throwing check
  * leaves the reservation held. Idempotent: a
- * `dispatch_id` already released — by the planning fast path, a prior poll's call to this
+ * `dispatch_id` already released — by a prior poll's call to this
  * function, or the stale-admission sweep — simply has no unreleased row left to match.
  */
 export async function reconcileTerminalCallbackAdmissions(

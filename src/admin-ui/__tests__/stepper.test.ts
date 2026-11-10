@@ -141,11 +141,7 @@ describe("new-project stepper — filesystem ticketing behavior", () => {
     win.stepperNext();
     win.stepperNext();
     (doc.getElementById("np-review-process") as HTMLSelectElement).value = reviewProcess;
-    if (reviewProcess === "codex-code-review") {
-      await win.stepperSubmit();
-      expect(posts).toHaveLength(0);
-      (doc.getElementById("np-review-fix-lifecycle") as HTMLSelectElement).value = "restate";
-    }
+    expect(doc.getElementById("np-review-fix-lifecycle")).toBeNull();
     await win.stepperSubmit();
 
     expect(posts).toHaveLength(1);
@@ -162,8 +158,8 @@ describe("new-project stepper — filesystem ticketing behavior", () => {
       planningEnabled: true,
       autoApprovePlans: true,
       reviewProcess,
-      reviewFixLifecycle: reviewProcess === "codex-code-review" ? "restate" : "legacy",
     });
+    expect(posts[0]).not.toHaveProperty("reviewFixLifecycle");
     // The actual submitted key must also be usable by the filesystem provider.
     const { ProviderRegistry } = await import("../../providers/registry.js");
     const previousMode = process.env.RUNNER_MODE;
