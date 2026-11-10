@@ -353,3 +353,20 @@ The kg-refresh pipeline (`pipelines/kg-refresh.yml`) uses different step wiring 
 ## Stage executor selection (AII-959)
 
 `createStageExecutor` (`src/pipeline/stage-executor.ts`) returns the injected legacy executor untouched when no `ResolvedAgentSnapshotV1` is supplied. With a snapshot, each call must carry an explicit `agentStage` (`planning`, `implementation`, `review`); a missing or unknown value throws `AgentStageError` before any auth or executor call. The diagnostic `stage` label is never parsed. Model and `invocationTimeoutMs` always come from the snapshot. Claude runs inside one `auth.invoke` and receives the selected env through `ClaudeCliExecutor.invoke(params, { env })`; Codex wraps its own `auth.invoke`. One executor is cached per agent/profile, and the selector never finishes or disposes a profile. Results and rejected errors carry `InvocationAttributionV1` (Claude limit `max_turns`, Codex `timeout_ms`); `safeModelLabel` / `safeLimitLabel` format it for display. `CodexExecutor` derives its argv from `agentStage`: implementation `codex exec --sandbox workspace-write`, review `codex exec --sandbox read-only`, and planning a distinct native `codex app-server` argv (`sandbox_mode="read-only"`, `approval_policy="never"`, shell, unified exec, multi-agent and web search disabled) driven by `createCodexPlanningDriver`, whose host tools (`repo_read`, `repo_search`, `comments_write`) confine writes to `ai-output/comments`. `createStageExecutor` builds a separate planning executor per profile with that driver and never passes a Claude-only or bypass flag. As defence in depth, a `CodexExecutor` reached for planning without a protocol driver throws `CodexPlanningPolicyUnprovenError` before any auth checkout or spawn rather than fall back to the writable exec path. **Deadline.** `invocationTimeoutMs` bounds the whole invocation for both executors (every attempt and backoff). Backoff sleeps at most the remaining budget, the deadline is rechecked before every spawn (including after a scheduling delay or credential suspend), and an expired budget never spawns a zero-timeout child; it settles as a non-retryable `INVOCATION_TIMEOUT` carrying the telemetry accumulated so far. `ClaudeCliExecutor` stops a late child with SIGTERM then SIGKILL on its process group and restores the write credential only once the group is proven gone (`ESRCH`, or zombies only on Linux; unreadable `/proc` is never proof). **Recovery.** A Claude child that is not proven dead (`isPossiblyLiveChild`) keeps the `auth.invoke` callback pending — no checkpoint, release, reuse or dispose — while the caller gets a bounded `AgentRecoveryRequiredError`. The selector records such profiles, Codex `CodexRecoveryRequiredError` holds and uncertain checkpoints in `heldProfiles`, and refuses every later stage on a held profile (and every later Claude call after a possibly-live Claude child) before any auth call.
+
+## Codex parity and existing Restate ownership
+
+Configured Codex planning uses the existing PlanningRun owner; later review-fix belongs to
+ReviewFixPR/ReviewFixAttempt, without a second scheduler or a dependency on the future
+implementation-loop migration. In this checkout, `review-fix-production.ts#selectedEntry`
+selects only GHA and `canAdmit` refuses managed projects before reservation. Managed Codex
+review-fix therefore remains unavailable here, including on GHA. Ordinary Fly/local runs do
+not establish automatic Restate ownership or recovery.
+
+[Codex parity validation](codex-parity-validation.md) separates inspected source, synthetic
+coverage and later operator-reported live milestones. The October 17 GHA milestone applies to
+its recorded executable revision; it does not remove this source's admission restrictions.
+Final acceptance requires immutable snapshot/run/attempt/backend identity, accepted results and
+approval bound to the exact pushed head, plus termination and released occupancy. Unknown cost
+stays unavailable or partial. Preserve the existing backend/D10/John gates and active ownership
+through rollback; disabling opt-in affects new runs. AII-963 remains separate.

@@ -51,7 +51,8 @@ Integrated baseline: the feature lane after #1175 merged as commit `db554e08752d
 of the PR head `bdc8d26a`). These figures are operator-reported; this pipeline did not re-run them at that commit. They
 are source and synthetic evidence, not paid or live acceptance.
 
-Deployment and target workflow sync have not occurred.
+At the prerequisite baseline above, deployment and target workflow sync had not occurred. Later operator-reported
+deployment evidence is recorded separately below; it does not establish the runtime of this checkout.
 
 ## Opt-in native planning-skills proof
 
@@ -89,40 +90,122 @@ discovery/call/hook exclusion, and all five source-validation cases passed. Netw
 capabilities dropped, no-new-privileges, read-only root, owned tmpfs; no live credentials or paid calls. The pipeline
 itself did not run Docker. Paid/live and Codex-on-Restate acceptance remain pending.
 
-## Limited historical evidence
+## Source boundary and October 17 operator evidence
 
-TEST-2 supplies limited Fly/ChatGPT proof: exit 0 with error telemetry, then approval, with the original stream cause
-unknown. It is not the final matrix. A successful automatic Restate review-fix in this campaign ran on Claude/GHA; that does
-**not** prove Codex.
+Source inspected for this reconciliation: `3da438d30d3fa9502a9b17f8882ecb3473ab1627`.
+`src/restate/review-fix-production.ts#selectedEntry` selects only GitHub Actions;
+`canAdmit` returns `configuration_error` for managed projects before GitHub calls or reservation.
+Consequently **this checkout cannot launch managed Codex Restate review-fix on any backend**.
+Do not remove those guards as part of verification or infer support from a later deployed revision.
+AII-1335/1336 and the protected GHA preparation/admission increments must be integrated first.
 
-## Pending: paid/live acceptance
+The following is supplied operator evidence from AII-1289's October 17 status, not independently
+replayed or fetched in this reconciliation. Preserve it as historical evidence while reconciling
+source and artifacts before final acceptance. No live call, provisioning, deployment or workflow
+sync is authorized by this ledger.
 
-Each pending row needs an exact run ID, frozen snapshot ID and head SHA recorded when it is accepted. Nothing is accepted
-until those are present.
-
-| Case | Status | Required evidence |
+| Milestone | Supplied evidence | Limit |
 |---|---|---|
-| Docker x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
-| Docker x ChatGPT plan | Pending | Run ID, snapshot ID, head SHA |
-| Fly x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
-| Fly x ChatGPT plan | Pending | Run ID, snapshot ID, head SHA |
-| GHA x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
-| GHA x ChatGPT plan | Pending | Run ID, snapshot ID, head SHA |
-| Real Codex PlanningRun and a later ReviewFixAttempt | Pending | Both identifiers, snapshot ID, head SHA |
-| Mixed-stage runs (Claude and Codex across planning/implementation/review) | Pending | Run ID, snapshot ID, head SHA per stage |
-| Codex on Restate: restart recovery | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: cancel | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: uncertain launch | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: retry | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: lost launch acknowledgement | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: duplicate and stale callback | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: timeout | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: unavailable auth | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate: expired-token resume | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate review-fix, live | Pending | Live run ID, snapshot ID, head SHA |
+| Managed GHA / ChatGPT later review-fix | TEST-5, AI-Implement #1218/#1221; attempt `reviewfix-fa04fa31c7359e782c5a15041871d7ad12b8a6e136e0b3892852aeea27d86613`, runner `GHA39045579755`, snapshot `0456eef4-4717-4fcd-8b62-a866d9825130`, published head `4f10b595`; selected `codex/openai/gpt-6-luna/chatgpt-plan-test/codex-subscription`. [Bot finalizer](https://github.com/BuildDownAI/codex-sandbox-repo/pull/7#issuecomment-6235865381) reports addressed finding, termination and released occupancy. Private PR7 merged `73ebde8`. | Narrow normal GHA proof; cost unavailable; does not prove Fly/local or recovery. |
+| Fly / Legacy / ChatGPT | TEST-6 and fresh TEST-8: planning, configured implementation, restricted native review, callbacks, termination, post-push gap/code review and normal polling release; private PR8/9 merged. | Ordinary pipeline; no automatic Restate review-fix ownership. Full run/snapshot/head identifiers still need artifact readback. |
+| Local Docker / ChatGPT | AI-Implement #1229, source `e647e762`, full loop `c5d05ee7-ca11-4841-98cd-a903cf11202f`; 246 focused tests and nine source-bound Docker scenarios reported passing; container exit zero and lease released. | Ordinary pipeline; manual cancellation recovery is not automatic Restate recovery. Snapshot and pushed-head identifiers still need artifact readback. |
+| Codex PlanningRun / GHA | TEST-4 reported an actual configured Codex PlanningRun. | Workflow, run, snapshot and head identifiers must be transcribed from artifacts before final ledger acceptance. |
+| Available-profile validation | AII-1456 / AI-Implement #1229 merged as `dae8192b1b21037c3fa4f4e396d9e87fabdaa2e2`; executable `e647e762` reportedly deployed with Restate registered. | Deployment observation applies to that revision, not this checkout. |
 
-Managed Restate review-fix admission still refuses until AII-1335/1336. AII-1338 is generic Fly proof, not Codex-specific.
-AII-1289 owns the final Codex-specific evidence.
+TEST-2 remains limited historical Fly/ChatGPT proof: exit zero with error telemetry and later approval;
+the original stream cause is unknown. Preserve failed invocations even when a later review succeeds.
+A generic Claude/GHA or Claude/Fly run never supplies Codex-specific acceptance.
+
+## Remaining acceptance matrix
+
+“Reported” below means the operator milestone above exists; it does not fill missing artifact
+identifiers or bypass this checkout's source restrictions. All six rows require planning,
+implementation and structured review, the immutable stage snapshot, run/backend/runner identity,
+exact pushed head, and approval bound to that head. Later review-fix additionally requires the
+ReviewFixPR/workflow and ReviewFixAttempt identities, accepted result, confirmed termination and
+released occupancy. Do not include tokens, credential contents or auth journals in evidence.
+
+| Backend | OpenAI API key | ChatGPT plan |
+|---|---|---|
+| Docker | Blocked: existing permitted profile/live release required | Ordinary full loop reported; identifiers incomplete; Restate review-fix blocked |
+| Fly | Blocked: existing permitted profile/live release required | Ordinary pipeline reported; identifiers incomplete; Restate review-fix blocked by AII-1336/1338 |
+| GHA | Blocked: existing permitted profile/live release required | Initial native run TEST-3 and PlanningRun TEST-4 reported; TEST-5 later review-fix accepted by operator on later source; integration/readback required here |
+
+| Dimension | Remaining gate / evidence |
+|---|---|
+| Required children | PR mapping above records prerequisite history, not a current terminal-status audit. Verify all required children including AII-1424 and the existing AII-1334/1335/1336/1338 tree, with accepted evidence, before closing. |
+| Restate backend composition | Adopt delivered managed seams; production-composed synthetic GHA/Fly/local launch and correct-result acceptance remain unproven here. Unsupported combinations must reserve/launch nothing. |
+| Planning ownership | TEST-4 artifact identifiers and restart/cancel/retry proof preserving run and snapshot identity. |
+| Live Fly Restate | TEST-7 is reported blocked by the supported administrator refusing Fly + Restate before dispatch. Require Codex-specific PlanningRun and later ReviewFixAttempt; AII-1338 generic proof alone is insufficient. |
+| Recovery | Restart while running, uncertain launch/lost acknowledgement, duplicate/stale callback, cancellation, timeout, disabled/unavailable auth and expired-token resume. Prove no duplicate writer or secret journal, preserve identity, and confirm termination before occupancy release. Local SIGINT/manual operator recovery does not meet this gate. |
+| Mixed stages | Existing permitted Claude/Codex API/plan profiles and separately released live validation; record each stage's snapshot and invocation attribution. |
+| Administration | Retain synthetic preview above; record supported control readback, inherited/permitted values and next-run-only edits without mutating active snapshots. |
+| Trusted skills | Retain native/synthetic proof above; both planners use selected trusted skills, denied tools/writes remain denied. Only the selected trusted `.agents/skills` subtree is copied; unrelated host configuration/rules remain excluded. |
+| Token renewal | Executor-level synthetic coverage is not durable expired-token resume acceptance; require protected renewal through the existing owner. |
+| Reporting / compatibility | Agent/model/profile/auth/limit and available usage; missing/partial cost remains unavailable/partial, never fabricated zero. Preserve invocation failure separately from later approval; opted-out Claude unchanged and invalid/unauthorized settings never fall back. |
+| Shipped diagnostics | Verify AII-1415–1417 behavior in final smoke; reuse AII-394 for Linear visibility, without replacement issues. |
+
+The existing PlanningRun engine suite injects lifecycle dependencies. The review-fix pilot suite uses
+production coordinator/store/finalizer/GHA worker adapters but replaces admission eligibility and
+external edges. Passing those suites does not prove managed credential delivery or Fly/local
+composition. `review-fix-production-model-auth.test.ts` separately checks the current managed
+admission refusal. Do not relabel generic replay tests as Codex parity.
+
+AII-1289 remains open. Preserve D10/John backend gates. Managed Claude subscription lifecycle
+(AII-963) and the future implementation-loop Restate migration remain separate and cannot substitute
+for these existing PlanningRun and ReviewFixPR/ReviewFixAttempt paths.
+
+## Current-checkout verification (November 10, 2026)
+
+On baseline `3da438d30d3fa9502a9b17f8882ecb3473ab1627` plus the uncommitted
+documentation and admission-test changes, Node v24.22.2:
+
+- `npm run typecheck` and `npm run build` passed.
+- `npm test` passed: 319 files, 10,199 tests; database isolation guard passed.
+- The two requested PlanningRun/review-fix pilot Restate suites passed: 97 tests.
+- `review-fix-production-model-auth.test.ts` passed: eight tests, including
+  Fly, local and shadow selections returning deferred without reservation,
+  credential lookup, GitHub calls or queue mutation. These are rejection tests,
+  not managed-backend launch acceptance.
+- Focused image, workflow sync/input/shim, local-feedback command and admission guards passed:
+  `npx vitest run src/__tests__/codex-runner-image.test.ts src/__tests__/workflow-sync.test.ts src/__tests__/workflow-input-allowlist.test.ts src/__tests__/workflow-shim-structure.test.ts src/__tests__/local-feedback-command.test.ts src/__tests__/image-equiv-check.test.ts src/__tests__/review-fix-production-model-auth.test.ts`
+  — 247 tests across seven files. Source guards do not attest a built image.
+- Docker runtime validation is blocked: `docker version` returns command not
+  found. No image build, local Docker scenario or native image proof was performed.
+
+The reviewer requests remain integration blockers: PR references above are not a
+terminal child-status audit, and absent artifact identifiers cannot be inferred
+from issue titles or ordinary pipeline success. The supplied release explicitly
+withholds deployment, workflow sync and live credential provisioning. No live
+validation was attempted. Integrating the reviewed prerequisite backend/auth
+tree and obtaining authorized artifact readback are still necessary; removing
+admission guards would not establish parity.
+
+## Review findings and integration handoff (November 10, 2026)
+
+All four substantive review findings remain open. The checks above are regression
+evidence for the current restricted source, not acceptance of the missing integration.
+The two requested Restate suites are unchanged: adding a Codex label to their existing
+fakes would bypass precisely the production authentication/admission seam under review.
+
+| Finding | Observed blocker | Required completion evidence |
+|---|---|---|
+| 1 — integrated ledger | This checkout contains prerequisite history, but no current accepted terminal-child audit or complete six-row live artifacts. | Record each required child's terminal disposition, reviewed merge/source identity and accepted evidence link; complete each backend/auth row and the mixed-stage, configuration, renewal and compatibility dimensions. |
+| 2 — production composition and recovery | `createProductionReviewFixServices` constructs `GithubReviewFixWorker`; `selectedEntry` excludes Fly/local and `canAdmit` rejects managed GHA projects. No protected managed multi-backend seam is available here to exercise. | Integrate reviewed AII-1335/1336 and managed GHA preparation/admission prerequisites under their existing gates; then exercise production admission, protected auth and worker/result composition in the two requested suites, including every recovery fault listed above. Keep unsupported selections non-launching. |
+| 3 — live identity and Fly Restate | Supplied TEST-4 evidence omits identifiers; TEST-7 remains blocked. Ordinary Fly/local success cannot fill either missing Restate record. | Read back authorized artifact records for the actual PlanningRun and later Codex Fly ReviewFixAttempt, with exact pushed-head approval, accepted result, termination and released occupancy. |
+| 4 — images and local runtime | `docker version` fails because the executable is absent in this environment. | In a Docker-capable environment, run the source-bound synthetic gate in [local-feedback.md](local-feedback.md) and the native image proof above against the final integrated source; retain the dirty source diff, immutable image ID, commands and results. |
+
+For each live row, retain an artifact link and the executable source/image identity,
+backend/auth kind, stage agent/model/profile, workflow/dispatch/run/runner IDs, snapshot ID,
+ReviewFixPR/attempt ID where applicable, full pushed commit and approval commit, accepted
+outcome, termination and occupancy-release evidence. Mark unavailable fields explicitly;
+do not reconstruct missing IDs from abbreviated commits or replace them with a generic
+Claude run. Store only safe identifiers, never credential material.
+
+This handoff requests no deployment, workflow sync or credential provisioning. The
+existing release does not authorize those operations or new live calls. It also does
+not authorize replacing the prerequisite backend tree with an implementation inside
+this verification issue. AII-1289 cannot be reported complete from this checkout.
 
 ## Release order
 
