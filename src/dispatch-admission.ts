@@ -263,10 +263,6 @@ export function acquire(
       return { ok: false, reason: "occupied", count: capCount, cap };
     }
 
-    if (!request.humanRequested && request.parked) {
-      return { ok: false, reason: "parked", count: capCount, cap };
-    }
-
     if (!request.humanRequested && request.scope.kind === "pr" && request.prDispatchBudget !== undefined) {
       const since = Date.now() - PR_BUDGET_WINDOW_MS;
       const budgetRow = db
@@ -277,6 +273,12 @@ export function acquire(
       if (budgetRow.n >= request.prDispatchBudget) {
         return { ok: false, reason: "budget_exhausted", count: capCount, cap };
       }
+    }
+
+    // Budget refusal takes precedence over an issue park so callers can retry
+    // an owed budget notice (including a breaker-first park) without admitting.
+    if (!request.humanRequested && request.parked) {
+      return { ok: false, reason: "parked", count: capCount, cap };
     }
 
     if (request.kind !== "kg-refresh" && capCount >= cap) {

@@ -1,7 +1,7 @@
 /** Production composition for the opt-in review-fix pilot. Business state and
  * external calls live in SQLite/GitHub adapters; this file is the allowed SDK
  * boundary where those adapters become Restate services. */
-import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
+import { getMappings, resolvePrDispatchBudget, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { randomUUID } from "node:crypto";
 import { ContainerReviewFixWorker } from "../review-fix-container-worker.js";
 import { read as readAdmission } from "../dispatch-admission.js";
@@ -202,6 +202,9 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
 }
 
+export type OnBudgetExhausted = (mapping: RepoMapping, trackerIssueId: string | null,
+  repository: string, prNumber: number, budget: number) => Promise<void>;
+
 /** Reserve an attempt when the dispatch contract holds. Configuration errors fail their
  * queue row; filesystem projects outside local mode skip it. Other refusals stay pending. */
 export async function admitReviewFix(
@@ -209,9 +212,24 @@ export async function admitReviewFix(
   config: ReviewFixProductionConfig,
   store: Pick<SqliteReviewFixAttemptStore, "admit">,
   runtime?: ModelAuthRuntime,
+  onBudgetExhausted?: OnBudgetExhausted,
 ): Promise<ReviewFixAdmissionOutcome> {
   const { verdict, reason, skip } = await decideAdmission(request.scope, config, runtime);
-  if (verdict === "admit") return store.admit(request);
+  if (verdict === "admit") {
+    const outcome = await store.admit(request);
+    if (outcome.status === "deferred" && outcome.reason === "budget_exhausted" && onBudgetExhausted) {
+      const mapping = mappedEntry(request.scope)?.[1];
+      if (mapping) {
+        const cursor = request.feedback.queueCursor;
+        const queue = cursor ? getDb().prepare(`SELECT issue_id FROM review_fix_queue
+          WHERE id = ? AND repo = ? AND pr_number = ?`)
+          .get(cursor.queueId, request.scope.repository, request.scope.prNumber) as { issue_id: string | null } | undefined : undefined;
+        await onBudgetExhausted(mapping, queue?.issue_id || null, request.scope.repository,
+          request.scope.prNumber, resolvePrDispatchBudget(mapping));
+      }
+    }
+    return outcome;
+  }
   if (skip) {
     if (request.feedback.queueCursor) updateReviewFixStatus(request.feedback.queueCursor.queueId, "skipped");
     console.warn(`[review-fix] ${reason}`);
@@ -449,6 +467,7 @@ export function createProductionReviewFixServices(
   store = new SqliteReviewFixAttemptStore(),
   submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
   runtime?: ModelAuthRuntime,
+  onBudgetExhausted?: OnBudgetExhausted,
 ): RestateService[] {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
@@ -458,7 +477,7 @@ export function createProductionReviewFixServices(
   const pr = createReviewFixPR({
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
-      admit: (request) => admitReviewFix(request, config, store, runtime),
+      admit: (request) => admitReviewFix(request, config, store, runtime, onBudgetExhausted),
     },
     recordDelegated: async (scope, queueCursor) => recordDelegatedFix(scope, queueCursor),
     load: async (scope) => {

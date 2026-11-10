@@ -1153,6 +1153,23 @@ async function firePrBudgetPark(
   }
 }
 
+/** Preserve the proven park/notice mechanism for PRs with no tracker identity. */
+export async function parkRestatePrBudget(
+  config: AppConfig, registry: ProviderRegistry, mapping: RepoMapping,
+  trackerIssueId: string | null, repo: string, prNumber: number, budget: number,
+): Promise<void> {
+  // Only tracker delivery is suppressed. No provider needs to be configured for
+  // an issueless PR; the stable PR identity still owns its park and notice claim.
+  const noticeRegistry = trackerIssueId ? registry : new Proxy(registry, {
+    get(target, property, receiver) {
+      if (property === "forMapping") return async () => ({ postComment: async () => {} });
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  await firePrBudgetPark(config, noticeRegistry, mapping, trackerIssueId || `${repo}#${prNumber}`,
+    repo, prNumber, budget);
+}
+
 // ---------- Dispatch: GitHub Actions ----------
 
 /**
@@ -5293,7 +5310,8 @@ async function main(): Promise<void> {
   console.log(`[restate] retention ${getRestateRetentionDays()} days`);
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
-  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config));
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config),
+    (mapping, issueId, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, repo, prNumber, budget));
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
