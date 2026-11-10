@@ -133,7 +133,7 @@ A builder makes a value a test passes in. A harness makes something the code und
 | Job | Runs |
 |---|---|
 | `unit-tests` | `npm ci`; `npm test`; `npm run typecheck` (both passes, so every test file is type-checked) |
-| `restate-tests-binary` | `npm run test:restate`, once in each of three parallel passes |
+| `restate-tests-binary` | `npm run test:restate`, in three parallel passes, each split into two shards (`--shard=<n>/2`): six jobs |
 
 No job unsets anything before running tests: the scrub gives CI the same environment as every other machine.
 

@@ -7,7 +7,7 @@ import { createEndpointHandler } from "@restatedev/restate-sdk/node";
 import * as http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { startBinaryEnvironment } from "./binary-environment.js";
-import type { BinaryEnvironment } from "./binary-environment.js";
+import type { BinaryEnvironment, BinaryEnvironmentOptions } from "./binary-environment.js";
 
 /** The environment type the scenario files import: the binary environment. */
 export type RestateEnvironment = BinaryEnvironment;
@@ -21,9 +21,12 @@ type RestateServices = Array<
 // one-element tuple, `[label]`, which is the shape the scenario files destructure.
 export const VARIANTS = [["alwaysReplay"], ["disableRetries"]] as const satisfies ReadonlyArray<readonly ["alwaysReplay" | "disableRetries"]>;
 
-export async function startVariants(services: RestateServices): Promise<Map<string, RestateEnvironment>> {
+export async function startVariants(
+  services: RestateServices,
+  options: Pick<BinaryEnvironmentOptions, "invokerTimeouts"> = {},
+): Promise<Map<string, RestateEnvironment>> {
   const started = await Promise.all(
-    VARIANTS.map(async ([variant]) => [variant, await startBinaryEnvironment({ services, variant })] as const),
+    VARIANTS.map(async ([variant]) => [variant, await startBinaryEnvironment({ ...options, services, variant })] as const),
   );
   return new Map(started);
 }

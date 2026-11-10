@@ -13,7 +13,7 @@ A reference for the two test tiers that cover the Restate code under `src/restat
 | What it proves | The branch logic, the error mapping, the wire shapes, the time boundaries | What the engine does with the handler: serialisation, retry, idempotency, suspension, discovery metadata, ingress serde |
 | Cost | Milliseconds per test | About a second per scenario, plus one server boot per variant per file (seconds) |
 | Type-check | `npm run typecheck` | `npm run typecheck` (covers `src/__tests__/restate/` through `tsconfig.tests.json`; the `unit-tests` CI job runs it) |
-| CI job | `unit-tests` in `.github/workflows/unit-tests.yml` | `restate-tests-binary` (the binary runtime, the one production runs; three passes as a three-job matrix since AII-1158, kept from AII-993 so a scenario that fails one run in three fails the PR that adds it) in the same workflow, in parallel with `unit-tests`, on every PR to `testing`, `main`, and the grouping branches |
+| CI job | `unit-tests` in `.github/workflows/unit-tests.yml` | `restate-tests-binary` (the binary runtime, the one production runs; three passes since AII-1158, kept from AII-993 so a scenario that fails one run in three fails the PR that adds it; each pass is split into two shards with vitest `--shard`, so six jobs run side by side) in the same workflow, in parallel with `unit-tests`, on every PR to `testing`, `main`, and the grouping branches |
 
 The default suite excludes `src/__tests__/restate/**` in `vitest.config.ts`, so a dispatched runner never starts a Restate server for them.
 
@@ -400,6 +400,20 @@ did not test). Scenarios follow four rules, and
 `settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
 `setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a
 `// restate-test-allow: <reason>` marker on the same or the previous line.
+
+**A scenario does not wait out a production timer it does not test.** The suite's wall time is the sum of its waits, so a
+scenario shortens each production interval through a seam, and the production composition leaves the seam unset. No
+hygiene test enforces this; the seams in use are:
+
+| Production interval | Seam | Used by |
+|---|---|---|
+| Review-fix collection window (5 s) and run-status tick (60 s) | `timing` argument of `createProductionReviewFixServices` (`collectionWindowMs`, `runStatusTickMs`) | `review-fix-managed.restate.test.ts` |
+| Waits between scrub attempts (2 + 4 + 8 + 10 s) | `scrubInitialRetryMsOverride` on `FlyMachineProfileDeps` | `fly-machine-profile.restate.test.ts` |
+| Server invoker timeouts (one minute each by default) | `invokerTimeouts` option of `startVariants` / `startBinaryEnvironment` | `self-deploy.restate.test.ts`: the build outlasts two-second server timeouts, so only the `apply` handler's own timeouts keep it alive |
+
+A scenario that shortens the server's timeouts to prove a handler's own must fail when the handler's are removed: without
+`inactivityTimeout` and `abortTimeout` on `SelfDeploy.apply`, the server aborts the build and the scenario sees a second
+`flyctl` call.
 
 ## Driving the race
 
