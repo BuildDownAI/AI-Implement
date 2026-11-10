@@ -6,7 +6,7 @@ import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
 import { recordReviewFinding } from "./review-ledger-store.js";
 import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, reviewContractFindingGates, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
-import { getMappings, resolveReviewFixLifecycle } from "./config.js";
+import { getMappings } from "./config.js";
 import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
 import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
 import { isTrustedReviewAuthor, resolveReviewProcess } from "./review-process.js";
@@ -483,7 +483,7 @@ export async function handleGitHubWebhook(
 function resolveRepoReviewProcess(repoFullName: string) {
   const mapping = Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repoFullName);
   return {
-    restate: mapping !== undefined && resolveReviewFixLifecycle(mapping) === "restate",
+    restate: mapping !== undefined,
     process: resolveReviewProcess(mapping?.reviewProcess),
     extraAuthors: mapping?.trustedReviewAuthors ?? [],
   };
