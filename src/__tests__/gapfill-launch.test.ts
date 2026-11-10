@@ -36,6 +36,17 @@ it("preserves defaults and returns only safe machine identity", async () => {
   expect(decodeRunConfig(config.config.env.AI_IMPLEMENT_RUN_CONFIG)).not.toHaveProperty("reviewFix");
   expect(result).toEqual({ machine: { id: "m", name: "session-aii-1" }, resolvedImage: "runner:latest" });
 });
+it("passes the resolved repository image to persistence before creating the machine", async () => {
+  const { resolveSessionImage } = await import("../repo-image.js");
+  vi.mocked(resolveSessionImage).mockResolvedValueOnce({ image: "repo:override", source: "override" });
+  const onBeforeLaunch = vi.fn();
+  mocks.create.mockImplementationOnce(async (_token, _app, config) => {
+    expect(onBeforeLaunch).toHaveBeenCalledWith(expect.any(Object), expect.any(String), "repo:override");
+    expect(config.config.image).toBe("repo:override");
+    throw new Error("lost acknowledgement");
+  });
+  await expect(dispatchFlyGapfill(input({ onBeforeLaunch }))).rejects.toThrow("lost acknowledgement");
+});
 it("carries the run name, dispatch metadata and backend-aware marker", async () => {
   const reviewFix = makeReviewFixRunConfig({ executionBackend: "fly-machines" }).reviewFix;
   await dispatchFlyGapfill(input({ runName: "review-d-1", dispatchId: "d-1", reviewFix }));
@@ -65,7 +76,7 @@ it("preserves reviewFix in protected delivery and falls back to the managed disp
   const grant = {
     version: 1, audience: "model-auth", grantId: "grant-1", dispatchId: "d-1", projectKey: "AII",
     snapshotId: "snap-1", backend: "fly", expiresAt: Date.now() + 60_000, bearer: "test-bearer-0123456789abcdefghijklmnop",
-    bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription", ownerGeneration: 3 }],
+    bindings: [{ stage: "implementation", profileId: "sub", profileRevision: 1, authMode: "claude-subscription" }],
   };
   mocks.bootstrap.mockImplementation(async (args) => ({
     sealed: sealModelAuthBootstrap({ grant, protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: Buffer.alloc(32, 1) } }),
