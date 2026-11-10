@@ -33,7 +33,7 @@ Every path additionally requires a **matching dispatch record**: the orchestrato
 
 ### A human inline comment is recorded, not enqueued
 
-The rail collects a human reviewer's feedback and starts one run for it, not one per comment. A human's `pull_request_review_comment` writes its `github-review-thread` finding to the ledger and answers `{ recorded: true, reason: "awaiting_changes_requested", findingId }` without queueing a review-fix row or forwarding to `ReviewFixPR.feedback` — the same under both lifecycles. Any author whose `user.type` is not `Bot`, including a missing one, takes this path. Each recorded comment logs `[webhook] Recorded human inline comment on PR #<n> as finding #<id>`.
+The rail collects a human reviewer's feedback and starts one run for it, not one per comment. A human's `pull_request_review_comment` writes its `github-review-thread` finding to the ledger and answers `{ recorded: true, reason: "awaiting_changes_requested", findingId }` without queueing a review-fix row or forwarding to `ReviewFixPR.feedback` — independent of stored lifecycle. Any author whose `user.type` is not `Bot`, including a missing one, takes this path. Each recorded comment logs `[webhook] Recorded human inline comment on PR #<n> as finding #<id>`.
 
 A human starts the fix run in one of two ways, and both read every open finding on the PR, so the recorded comments ride it:
 
@@ -102,7 +102,7 @@ The queue's one-row-per-PR grain is deliberate. Enqueuing coalesces: a second ev
 
 ## Webhook intake: forward on Restate, write on Legacy (AII-1184)
 
-The three review webhook handlers (`handleReviewWebhook`, `handleReviewCommentWebhook`, and the `claude_review_summary` branch of `handleIssueCommentWebhook`, all in `src/webhook.ts`) share one front half: HMAC check, dispatch match, author and severity rules for the project's review process, and the `shouldEnqueueReviewEvent` gate (`self`, `stale_head`, `run_after_review`, `missing_fields`). A gated event answers 200 `{ ignored, reason }` and goes no further, whatever the lifecycle. The back half depends on `resolveReviewFixLifecycle(mapping)`:
+The three review webhook handlers (`handleReviewWebhook`, `handleReviewCommentWebhook`, and the `claude_review_summary` branch of `handleIssueCommentWebhook`, all in `src/webhook.ts`) share one front half: HMAC check, dispatch match, author and severity rules for the project's review process, and the `shouldEnqueueReviewEvent` gate (`self`, `stale_head`, `run_after_review`, `missing_fields`). A gated event answers 200 `{ ignored, reason }` and goes no further, whatever the lifecycle. Webhook intake still depends on `resolveReviewFixLifecycle(mapping)` (this cutover changes queue consumption only). These intake routes converge on Restate: SQLite queue rows are nudged by the poll drain for every mapped project:
 
 | Lifecycle | Handler writes SQLite | Forwards | Answers |
 | -- | -- | -- | -- |
@@ -266,7 +266,7 @@ The `claude-review`/`claude-code-review`/`claude` workflows pin `anthropics/clau
 
 ### Repository-fix process (AII-1252)
 
-Under `claude-code-review-repository-fix` the repository's own auto-fix is the only fixer for Claude's findings. Once Claude's review of the current commit has completed, the step branches before it would post the fix-pass comment: Claude blocking with a clean internal review ends the run `external_review_pending` with `reviewedHeadSha` (no fix pass), so `LateExternalReview` follows the auto-fix to its new commit; an internal blocking finding (including a failing CI check) with a clean Claude review runs the fix pass as under the other processes; both blocking ends the run unapproved (`REVIEW_UNAPPROVED`) for a person; neither approves. After the run, `ReviewFixPR.check` hands the fix to the repository (the process's fixer is `repository`); on the legacy lifecycle `processReviewFixQueue` does the same before any dispatch gate, marking the row `skipped` and logging it as delegated, so no AI-Implement gap-fill ever runs on the repository's branch (AII-1270). The ledger findings stay. Auto-merge holds a PR under this process unless the current head passes `headReviewedClean` (`src/review-head-clean.ts`): its review check completed with `success` (a `skipped` or `neutral` run does not count) and no open `blocking` finding was last seen at or after the head's commit time. See ADR 038 decision 8.
+Under `claude-code-review-repository-fix` the repository's own auto-fix is the only fixer for Claude's findings. Once Claude's review of the current commit has completed, the step branches before it would post the fix-pass comment: Claude blocking with a clean internal review ends the run `external_review_pending` with `reviewedHeadSha` (no fix pass), so `LateExternalReview` follows the auto-fix to its new commit; an internal blocking finding (including a failing CI check) with a clean Claude review runs the fix pass as under the other processes; both blocking ends the run unapproved (`REVIEW_UNAPPROVED`) for a person; neither approves. After the run, `ReviewFixPR.check` hands the fix to the repository (the process's fixer is `repository`); `recordDelegatedFix` marks the row `skipped`, so no AI-Implement gap-fill ever runs on the repository's branch (AII-1270). The ledger findings stay. Auto-merge holds a PR under this process unless the current head passes `headReviewedClean` (`src/review-head-clean.ts`): its review check completed with `success` (a `skipped` or `neutral` run does not count) and no open `blocking` finding was last seen at or after the head's commit time. See ADR 038 decision 8.
 
 ### The approval mark after a Restate attempt (AII-1307)
 
@@ -348,21 +348,19 @@ re-evaluated on the next poll rather than falling through to a fresh implementat
 unmerged** PR still gets a fresh implementation, on the assumption a human closed it to start over.
 This check only applies to implementation dispatches, never planning.
 
-## Post-run: the Legacy drain loop
+## Post-run: universal Restate routing
 
-`processReviewFixQueue` runs once per poll tick. For each pending item, in FIFO order:
+`processReviewFixQueue` runs once per poll tick. Every mapped project's pending rows go to `ReviewFixPR.feedback`, regardless of whether its stored lifecycle is NULL, `legacy`, or `restate`. The nudge idempotency key is `<queueId>.<eventId>.<30s bucket>`; repeated ticks in the same bucket reuse it.
 
-1. Find the mapping whose `owner/repo` matches. **No mapping → `skipped`.**
-2. **Paused project → `skipped`.**
-3. **Snapshot the currently-open finding ids.** This is what the dispatch is permitted to resolve; each still needs a `fixed` or `invalid` disposition (see Resolution).
-4. Fetch an installation token, then call `getPullRequestState`. **PR merged or closed → `skipped`** with one `[review-fix]` log line; no dispatch is made (`shouldSkipReviewFix` in `src/review-fix-queue.ts`). **PR state unavailable (HTTP error, network failure, or timeout) → keep `pending`** and retry on a later poll. Only a confirmed open PR proceeds to dispatch.
-5. Mint result and progress tokens (only when a runner callback is configured).
-6. Dispatch a `gap-analysis` phase run against the existing PR.
-7. Record the dispatch with its snapshot, then mark the queue row `dispatched`.
+1. No matching mapping marks the row `skipped`.
+2. A paused mapping leaves the row `pending`; it resumes after unpause.
+3. Missing callback URL or token secret, or an unavailable Restate endpoint, leaves the row `pending`.
+4. Unknown PR state leaves the row `pending`; a confirmed closed or merged PR marks it `skipped`.
+5. A row without review-fix events stays `pending`. Otherwise the latest event supplies the nudge identity.
 
-A dispatch failure marks the row `failed` and surfaces a notification; the loop continues to the next item rather than aborting.
+The poll drain never launches a runner, mints launch tokens, or reserves capacity. `ReviewFixPR` and `ReviewFixAttempt` own feedback loading, delegation, budget checks, admission and launch. Automatic attempts use the resolved backend: GitHub Actions probes workflow capabilities, Fly Machines requires a sessions app and token and a non-Bedrock provider, and Local Docker uses its configured image. See the [runbook](./restate-review-fix-pilot.md).
 
-**The Legacy drain loop dispatches through GitHub Actions specifically** — it calls `dispatchWorkflow` directly. A Fly project using Legacy still gets automatic review-fix runs on GitHub Actions. With the Restate lifecycle, automatic review-fix attempts use the resolved backend: GitHub Actions probes workflow capabilities, while Fly Machines requires an effective sessions app and token and a non-Bedrock provider. The admin save checks Fly configuration (`FLY_SESSIONS_APP` and `FLY_SESSIONS_TOKEN`) without probing a workflow; app configuration comes from the runner backend cache. Both modes retain the healthy, registered Restate endpoint and unreserved-job checks. Local Docker admission uses its configured local runner image (see the [pilot runbook](./restate-review-fix-pilot.md)).
+The Legacy drain and its helpers remain dormant for rollback until C7b removes them. Legacy runs already in flight retain their Legacy monitors. The cutover requires the operator's OK at the final roll-up.
 
 The synthesized issue title is `Review feedback fix for PR #<n>`, and the phase is reported as `gap-analysis` so the ticket's status does not regress to in-progress for what is a follow-up pass.
 
@@ -416,7 +414,7 @@ See [ADR 028](adr/028-the-fixing-agent-dispositions-each-finding-and-may-defer-o
 
 ## Task-text admission budgets (AII-1006)
 
-`prepareReviewFixTask` (`src/review-fix-queue.ts`) is the one admission contract for both the durable loader (`loadPendingReviewFixFeedback`) and the legacy `processReviewFixQueue` path. Review feedback is never clipped: a set over any budget is rejected whole, with a category.
+`prepareReviewFixTask` (`src/review-fix-queue.ts`) is the one admission contract for both the durable loader (`loadPendingReviewFixFeedback`) and the dormant Legacy drain. Review feedback is never clipped: a set over any budget is rejected whole, with a category.
 
 | Budget | Limit | Category |
 |---|---|---|
@@ -425,7 +423,7 @@ See [ADR 028](adr/028-the-fixing-agent-dispositions-each-finding-and-may-defer-o
 | Rendered feedback (headings, metadata, quote prefixes, URLs) | 19,000 chars | `aggregate` |
 | Whole rendered task, including up to 20,000 chars of issue context | 40,000 chars (run-config's description cap) | `envelope` |
 
-On overflow the durable loader throws `ReviewFixFeedbackIncompleteError` before `admit`, so no snapshot, attempt, token or dispatch exists and every finding version stays pending. The legacy loop logs a bounded warning and leaves the queue item `pending`. An over-limit set needs source reduction or a later batching capability. `GithubReviewFixWorker.launch` also decodes the encoded `run_config` and refuses to dispatch unless `issue.description` and `commentInstruction` equal the admitted task text. `dispatchFindingIds` and the durable snapshot are exactly the rendered findings (AII-758 invariant).
+On overflow the durable loader throws `ReviewFixFeedbackIncompleteError` before `admit`, so no snapshot, attempt, token or dispatch exists and every finding version stays pending. The dormant Legacy loop logs a bounded warning and leaves the queue item `pending`. An over-limit set needs source reduction or a later batching capability. `GithubReviewFixWorker.launch` also decodes the encoded `run_config` and refuses to dispatch unless `issue.description` and `commentInstruction` equal the admitted task text. `dispatchFindingIds` and the durable snapshot are exactly the rendered findings (AII-758 invariant).
 
 Non-launch reads of over-budget feedback (`inspectPendingReviewFixFeedback`) report `incomplete` instead of throwing: the admin attempt detail shows `pendingFeedback: true`, and the Restate `load()` resolves with no pending feedback and logs only the bounded category, so nothing is admitted, nothing is retried in a tight loop, and every finding stays pending until the set is reduced.
 
