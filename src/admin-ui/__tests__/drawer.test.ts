@@ -635,8 +635,67 @@ describe("job drawer restate attempt section", () => {
     win.closeJobDrawer();
   });
 
+  it.each([["fly-machines", "Fly machine"], ["local-docker", "Container"]])("shows the escaped %s execution reference without a workflow link", async (backend, label) => {
+    const runRef = 'machine-<img src=x onerror="alert(1)">&container';
+    const attempt = pilotAttemptFixture({ execution: { backend, runRef } });
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt });
+    await win.openJobDrawer(10);
+    const links = doc.getElementById("drawer-pilot-links")!;
+    expect(links.querySelector(".field-label")!.textContent).toBe(label);
+    expect(links.textContent).toContain(runRef);
+    expect(links.querySelector("img")).toBeNull();
+    expect(links.querySelector("a")).toBeNull();
+    expect(links.textContent).not.toContain("undefined");
+    win.closeJobDrawer();
+  });
+
+  it.each([
+    { name: "no execution", execution: null, label: "Execution", text: "launch state unknown — no execution recorded yet", hrefs: [] },
+    { name: "legacy GitHub", execution: { githubRunId: "12345", githubRunAttempt: 2 }, label: "Workflow run", text: "Run #12345", hrefs: ["https://github.com/org/repo/actions/runs/12345", "https://github.com/org/repo/actions/runs/12345/attempts/2"] },
+    { name: "GitHub", execution: { backend: "github-actions", githubRunId: "12345", githubRunAttempt: 1 }, label: "Workflow run", text: "Run #12345", hrefs: ["https://github.com/org/repo/actions/runs/12345"] },
+    { name: "Fly", execution: { backend: "fly-machines", runRef: "<img src=x onerror=alert(1)>" }, label: "Fly machine", text: "<img src=x onerror=alert(1)>", hrefs: [] },
+    { name: "Docker", execution: { backend: "local-docker", runRef: "container-123" }, label: "Container", text: "container-123", hrefs: [] },
+    { name: "unknown backend", execution: { backend: "future-<img src=x onerror=alert(1)>", runRef: "ref-<img src=x onerror=alert(1)>&" }, label: "Execution", text: "future-<img src=x onerror=alert(1)> ref-<img src=x onerror=alert(1)>&", hrefs: [] },
+  ])("renders the $name execution state", async ({ execution, label, text, hrefs }) => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture({ execution }) });
+    await win.openJobDrawer(10);
+    const links = doc.getElementById("drawer-pilot-links")!;
+    expect(links.querySelector(".field-label")!.textContent).toBe(label);
+    expect(links.textContent).toContain(text);
+    if (execution && "runRef" in execution) {
+      expect(links.querySelector(".mono")!.textContent).toBe(text);
+    }
+    expect(links.querySelector("img")).toBeNull();
+    expect(Array.from(links.querySelectorAll("a"), (link) => link.getAttribute("href"))).toEqual(hrefs);
+    for (const link of doc.querySelectorAll("a[href]")) {
+      expect(link.getAttribute("href")).not.toContain("undefined");
+    }
+    win.closeJobDrawer();
+  });
+
+  it.each([1, 2])("preserves GitHub run links for attempt %s", async (githubRunAttempt) => {
+    const attempt = pilotAttemptFixture({ execution: { backend: "github-actions", githubRunId: "12345", githubRunAttempt } });
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt });
+    await win.openJobDrawer(10);
+    const links = doc.querySelectorAll("#drawer-pilot-links a");
+    expect(links).toHaveLength(githubRunAttempt > 1 ? 2 : 1);
+    expect(links[0].textContent).toContain("Run #12345");
+    expect(links[0].getAttribute("href")).toBe("https://github.com/org/repo/actions/runs/12345");
+    if (githubRunAttempt > 1) expect(links[1].getAttribute("href")).toBe("https://github.com/org/repo/actions/runs/12345/attempts/2");
+    win.closeJobDrawer();
+  });
+
+  it("shows GitHub execution identity without a repository", async () => {
+    const attempt = pilotAttemptFixture({ execution: { backend: "github-actions", githubRunId: "12345", githubRunAttempt: 2 } });
+    const { win, doc } = mountPilotDrawer({ job: { ...PILOT_JOB, repo: null }, attemptStatus: 200, attempt });
+    await win.openJobDrawer(10);
+    expect(doc.getElementById("drawer-pilot-links")!.textContent).toContain("run 12345 · attempt 2");
+    expect(doc.querySelector("#drawer-pilot-links a")).toBeNull();
+    win.closeJobDrawer();
+  });
+
   it("escapes the final workflow URL attribute", async () => {
-    const attempt = pilotAttemptFixture({ execution: { githubRunId: '12" onmouseover="alert(1)', githubRunAttempt: 1 } });
+    const attempt = pilotAttemptFixture({ execution: { backend: 'github-actions', githubRunId: '12" onmouseover="alert(1)', githubRunAttempt: 1 } });
     const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt });
     await win.openJobDrawer(10);
     const link = doc.querySelector("#drawer-pilot-links a")!;
@@ -863,6 +922,7 @@ describe("job drawer restate attempt section", () => {
     await win.openJobDrawer(10);
 
     expect(doc.getElementById("drawer-pilot-links")!.textContent).toContain("launch state unknown");
+    expect(doc.querySelector("#drawer-pilot-links a")).toBeNull();
     const actionsHtml = doc.getElementById("drawer-pilot-actions")!.innerHTML;
     expect(actionsHtml).toContain("Reconcile");
     expect(actionsHtml).toContain("Adopt");

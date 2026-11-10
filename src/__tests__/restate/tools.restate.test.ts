@@ -481,7 +481,7 @@ describe("orchestratorTools (Restate)", () => {
       let reads = 0;
       const detail: ReviewFixAttemptDetail = {
         attemptId: "exact-attempt", owner: { kind: "restate", attemptId: "exact-attempt" },
-        execution: { githubRunId: "123", githubRunAttempt: 2 }, deadlineAt: 42,
+        execution: { backend: "github-actions", githubRunId: "123", githubRunAttempt: 2 }, deadlineAt: 42,
         pendingFeedback: true, snapshot: null, state: "running", evidenceComplete: false,
         terminationConfirmed: false, cycles: [],
         attribution: {

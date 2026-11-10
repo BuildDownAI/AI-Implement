@@ -3392,6 +3392,31 @@ describe("admin job-detail endpoint", () => {
     expect(Array.isArray(body.steps)).toBe(true);
   });
 
+  it.each(["restate", "legacy"] as const)("reports workflow ownership for a %s job", async (owner) => {
+    const token = await login("secret");
+    const dispatchId = `detail-${owner}`;
+    const admission = await import("../dispatch-admission.js");
+    expect(admission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "s", issueId: dispatchId },
+      kind: "implementation",
+      backend: "fly-machines",
+      lifecycleOwner: owner === "restate" ? { kind: owner, attemptId: "att-detail" } : { kind: owner },
+      cap: 5,
+    }).ok).toBe(true);
+    const id = log.appendLog({
+      issueId: dispatchId, issueIdentifier: "ENG-99", issueTitle: "Workflow",
+      teamKey: "ENG", repo: "org/repo", dispatchId, phase: "implementation",
+    });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.job.restate).toEqual(owner === "restate" ? { service: "ImplementationRun", key: dispatchId } : null);
+    expect(body.job.issueUrl).toBeNull();
+    expect(body.steps).toEqual([]);
+  });
+
   it("resolves the job's issueUrl through the mapping's ticketing provider", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -4829,7 +4854,7 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
   const ATTEMPT_DETAIL: AdminModule.ReviewFixAttemptDetail = {
     attemptId: "attempt-1",
     owner: { kind: "restate", attemptId: "attempt-1" },
-    execution: { githubRunId: "123", githubRunAttempt: 1 },
+    execution: { backend: "github-actions", githubRunId: "123", githubRunAttempt: 1 },
     deadlineAt: 1_700_000_000_000,
     pendingFeedback: false,
     snapshot: { taskText: "fix the thing", findings: [{ findingKey: "f1", version: 2 }] },
@@ -4920,19 +4945,25 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       expect(res.statusCode).toBe(404);
     });
 
-    it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
+    it.each<AdminModule.ReviewFixAttemptExecutionRef | null>([
+      { backend: "github-actions", githubRunId: "9001", githubRunAttempt: 2 },
+      { backend: "fly-machines", runRef: "machine-123" },
+      { backend: "local-docker", runRef: "container-123" },
+      null,
+    ])("returns execution %j with explicit evidence fields", async (execution) => {
+      const detail = { ...ATTEMPT_DETAIL, execution };
       const token = await login("secret");
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1",
         "GET",
         token,
-        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: detail }) }) },
       );
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body).toHaveProperty("evidenceComplete", false);
       expect(body).toHaveProperty("terminationConfirmed", false);
-      expect(body).toEqual(ATTEMPT_DETAIL);
+      expect(body).toEqual(detail);
     });
 
     it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
@@ -5142,7 +5173,7 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
 
     it("passes the caller-supplied execution reference to the facade and answers 202 on a verified match", async () => {
       const token = await login("secret");
-      let capturedExecution: AdminModule.ReviewFixAttemptExecutionRef | undefined;
+      let capturedExecution: AdminModule.ReviewFixAttemptAdoptInput | undefined;
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1/adopt",
         "POST",

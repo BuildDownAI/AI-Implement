@@ -2,13 +2,18 @@ import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { decodeRunConfig } from "../run-config.js";
 import { testDb } from "./helpers/test-db.js";
-import { makeMapping, makeScopedPrIdentity } from "./helpers/builders.js";
+import { makeMapping, makeScopedPrIdentity, makeChatGptPlanRecord } from "./helpers/builders.js";
 import type { ContainerReviewFixWorkerDeps } from "../review-fix-container-worker.js";
 import type { WorkerLaunchPlan } from "../review-fix-ports.js";
 
 vi.mock("../fly-machines.js", async (original) => ({ ...await original<typeof import("../fly-machines.js")>(), createMachine: vi.fn(), listMachines: vi.fn(), getMachine: vi.fn(), listAppSecrets: vi.fn().mockResolvedValue([]), generateMachineNonce: () => "sentinel-nonce" }));
 vi.mock("../repo-image.js", async (original) => ({ ...await original<typeof import("../repo-image.js")>(), resolveSessionImage: vi.fn().mockResolvedValue({ image: "runner", source: "default" }) }));
 vi.mock("../local-docker.js", async (original) => ({ ...await original<typeof import("../local-docker.js")>(), startLocalRunnerContainer: vi.fn(), inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn() }));
+vi.mock("../fly-protection-key.js", () => ({ buildProtectedFlyBootstrap: vi.fn(async input => {
+  const { sealModelAuthBootstrap } = await import("../model-auth-seal.js");
+  const { MODEL_AUTH_ENV } = await import("../model-auth-contract.js");
+  return { ...input, sealed: sealModelAuthBootstrap({ grant: input.bootstrap, protectionKey: { ref: MODEL_AUTH_ENV.protectionKey, key: Buffer.alloc(32, 1) } }), secret: { name: MODEL_AUTH_ENV.protectionKey, available: true, version: 1 } };
+}) }));
 vi.mock("../backend-run.js", async (original) => ({ ...await original<typeof import("../backend-run.js")>(), stopBackendRun: vi.fn() }));
 
 async function setup(backend: "fly-machines" | "local-docker", attemptId = "attempt-1", readmissions?: number) {
@@ -182,9 +187,9 @@ for (const backend of backends) describe(backend, () => {
       AII: makeMapping({ owner: "owner", repo: "repo" }),
     });
     const managed = vi.spyOn(s.managed, "isManagedProject").mockImplementation(key => key === "AII");
-    expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: `managed review-fix on ${backend} not supported yet` });
+    expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
     expect(managed).toHaveBeenCalledWith("AII", "attempt-1");
-    expect(s.deps.credentials.resolve).not.toHaveBeenCalled();
+    expect(s.fly.createMachine).not.toHaveBeenCalled();
   });
   it("refuses a mapping that no longer targets the admitted repository", async () => {
     const s = await setup(backend);
@@ -192,11 +197,11 @@ for (const backend of backends) describe(backend, () => {
     expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
     expect(s.deps.callbackInputs).not.toHaveBeenCalled();
   });
-  it("rejects managed launches before minting tokens", async () => {
+  it("holds managed launches without a runtime", async () => {
     const s = await setup(backend);
     vi.spyOn(s.managed, "isManagedProject").mockReturnValueOnce(true);
-    expect(await s.instance.launch(s.plan)).toEqual({ status: "rejected", reason: `managed review-fix on ${backend} not supported yet` });
-    expect(s.deps.callbackInputs).not.toHaveBeenCalled();
+    expect(await s.instance.launch(s.plan)).toEqual({ status: "unknown" });
+    expect(s.fly.createMachine).not.toHaveBeenCalled();
   });
   it("does not report an execution without a durable nonce row", async () => {
     const s = await setup(backend);
@@ -414,4 +419,88 @@ for (const backend of backends) describe(`${backend} terminal bookkeeping`, () =
     expect(await s.instance.inspectTerminal(s.execution)).toMatchObject({ reached: true });
     expect(s.log.getJobByDispatchId(s.plan.attemptId)).toMatchObject({ completedAt: expect.any(Number), machineNonce: null });
   });
+});
+
+async function managedSetup(backend: typeof backends[number], mode: "api" | "plan" | "mixed") {
+  const s = await setup(backend);
+  const profiles = await import("../agent-config-store.js");
+  const { createModelAuthRuntime } = await import("../model-auth-runtime.js");
+  const runtime = createModelAuthRuntime({ config: { githubAppId: "1", githubAppPrivateKey: "fake", sessionImage: "runner" }, env: { RUNNER_TOKEN_SECRET: "synthetic-runtime-secret" } });
+  runtime.credentials.resolveProtectedSecret = () => "sentinel-api-key";
+  runtime.preparationDeps = vi.fn(() => ({ ownership: runtime.ownership, credentials: runtime.credentials,
+    checkRunnerCapability: async () => true, readDefaultBranchWorkflows: async () => ({}) }));
+  profiles.saveAccountProfileRevision({ profileId: "api", identity: "api", revision: 1, agent: "codex", provider: "openai", authMode: "openai-api-key", metadata: { credentialRef: "model-account:api" } });
+  profiles.saveAccountProfileRevision({ profileId: "claude", identity: "claude", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:claude" } });
+  profiles.saveAccountProfileRevision({ profileId: "plan", identity: "plan", revision: 1, agent: "codex", provider: "openai", authMode: "codex-subscription" });
+  expect(runtime.sessionStore.writePlanRecord({ profileId: "plan", expectedSequence: null, sessionData: JSON.stringify(makeChatGptPlanRecord({ accessToken: "sentinel-access" })) }).ok).toBe(true);
+  const stage = (id: string) => ({ agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", fallbackModel: "gpt-5.4", accountProfileId: id, invocationTimeoutMs: 60000 });
+  profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage(mode === "api" ? "api" : "plan"), implementation: stage(mode === "plan" ? "plan" : "api"), review: mode === "mixed" ? { ...stage("claude"), agent: "claude", provider: "anthropic" } : stage(mode === "api" ? "api" : "plan") } });
+  profiles.setProjectOptIn("AII", true);
+  s.deps.modelAuthRuntime = runtime;
+  return { ...s, runtime, profiles };
+}
+for (const backend of backends) describe(`managed ${backend}`, () => {
+  it.each(["api", "plan", "mixed"] as const)("launches protected %s with one frozen snapshot", async mode => {
+    const s = await managedSetup(backend, mode);
+    const prepared = await s.instance.prepare({ ...s.plan, findings: [], owner: s.plan.attemptId });
+    const result = await s.instance.launch(prepared);
+    expect(result).toEqual({ status: "accepted", execution: s.execution });
+    const { loadStoredSnapshot } = await import("../agent-run-preparation.js");
+    const frozen = loadStoredSnapshot(s.plan.attemptId);
+    expect(frozen?.stages.implementation.accountProfileId).toBe(mode === "plan" ? "plan" : "api");
+    s.profiles.setProjectOptIn("AII", false);
+    expect(await new s.worker.ContainerReviewFixWorker(s.deps).launch(prepared)).toEqual({ status: "unknown" });
+    expect(loadStoredSnapshot(s.plan.attemptId)).toEqual(frozen);
+    expect(s.runtime.preparationDeps).toHaveBeenCalledTimes(1);
+    const protectedInput = backend === "fly-machines" ? vi.mocked((await import("../fly-protection-key.js")).buildProtectedFlyBootstrap).mock.calls.at(-1)?.[0] : vi.mocked(s.docker.startLocalRunnerContainer).mock.calls[0][0].protectedModelAuth;
+    expect(protectedInput).toBeDefined();
+    expect(protectedInput?.runConfig.agentConfig).toEqual(frozen);
+    expect(protectedInput?.runConfig.modelFallbacks).toEqual({ planning: "gpt-5.4", implementation: "gpt-5.4", review: "gpt-5.4" });
+    expect(JSON.stringify([prepared, result])).not.toMatch(/sentinel-(api-key|access|bootstrap)/);
+  });
+  it.each(["lost acknowledgement", "attachment failure"])("settles and reconciles %s without a second grant", async failure => {
+    const s = await managedSetup(backend, "mixed");
+    const logs = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+    if (failure === "lost acknowledgement") {
+      vi.mocked(s.fly.createMachine).mockRejectedValue(new Error("lost ack sentinel-api-key"));
+      vi.mocked(s.docker.startLocalRunnerContainer).mockImplementation(async input => { input.onBeforeLaunch?.(); throw new Error("lost ack sentinel-access"); });
+    } else vi.spyOn(s.log, "setJobMachineId").mockImplementationOnce(() => { throw new Error("attach failed"); });
+    const launchResult = await s.instance.launch(s.plan);
+    expect(launchResult).toEqual({ status: "unknown" });
+    const { getDb } = await import("../dedup.js");
+    expect(getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = ?").get(s.plan.attemptId)).toEqual({ revoked_at: failure === "lost acknowledgement" ? expect.any(Number) : null });
+    vi.mocked(s.fly.listMachines).mockResolvedValue([{ id: s.execution.runRef, name: expectedName(s.plan.attemptId) }] as Awaited<ReturnType<typeof s.fly.listMachines>>);
+    vi.mocked(s.docker.findLocalContainerIdByName).mockResolvedValue(s.execution.runRef);
+    const restarted = new s.worker.ContainerReviewFixWorker(s.deps);
+    expect(await restarted.launch(s.plan)).toEqual({ status: "unknown" });
+    expect(await restarted.reconcile(s.plan.attemptId, s.plan.scope)).toEqual({ status: "found", execution: s.execution });
+    expect(s.runtime.preparationDeps).toHaveBeenCalledTimes(1);
+    const protectedInput = backend === "fly-machines"
+      ? vi.mocked((await import("../fly-protection-key.js")).buildProtectedFlyBootstrap).mock.calls.at(-1)![0]
+      : vi.mocked(s.docker.startLocalRunnerContainer).mock.calls[0][0].protectedModelAuth!;
+    const bearer = protectedInput.bootstrap.bearer;
+    expect(bearer).toBeTruthy();
+    expect(backend === "fly-machines" ? s.fly.createMachine : s.docker.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
+    for (const secret of [bearer, "sentinel-api-key", "sentinel-access"])
+      expect(JSON.stringify([launchResult, logs.mock.calls, errors.mock.calls, warnings.mock.calls])).not.toContain(secret);
+  });
+  it("refuses a disabled profile without creating an execution", async () => {
+    const s = await managedSetup(backend, "api");
+    s.profiles.retireAccountProfile("api");
+    expect(await s.instance.launch(s.plan)).toMatchObject({ status: "rejected" });
+    expect(s.fly.createMachine).not.toHaveBeenCalled();
+    expect(s.docker.startLocalRunnerContainer).not.toHaveBeenCalled();
+  });
+  if (backend === "fly-machines") it("refuses repository image overrides before creating a machine", async () => {
+    const s = await managedSetup(backend, "api");
+    const images = await import("../repo-image.js");
+    vi.mocked(images.resolveSessionImage).mockResolvedValueOnce({ image: "untrusted", source: "override" });
+    expect(await s.instance.launch(s.plan)).toMatchObject({ status: "rejected" });
+    expect(s.fly.createMachine).not.toHaveBeenCalled();
+    const { getDb } = await import("../dedup.js");
+    expect(getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = ?").get(s.plan.attemptId)).toEqual({ revoked_at: expect.any(Number) });
+  });
+
 });

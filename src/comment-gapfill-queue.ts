@@ -75,8 +75,19 @@ export function claimPendingCommentGapfills(limit = 20): CommentGapfillQueueItem
 
 export function markCommentGapfillProcessed(id: number, status: CommentGapfillStatus): void {
   getDb()
-    .prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = ? WHERE id = ?")
+    .prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = MAX(?, COALESCE(processed_at + 1, 0)) WHERE id = ?")
     .run(status, Date.now(), id);
+}
+
+/** Complete the ingress handoff only if the workflow has not touched this row.
+ * processed_at advances on every transition, including pending -> pending refusals.
+ */
+export function markCommentGapfillSubmitted(item: CommentGapfillQueueItem): void {
+  getDb().prepare(`
+    UPDATE comment_gapfill_queue
+    SET status = 'dispatched', processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+    WHERE id = ? AND status = 'pending' AND processed_at IS ?
+  `).run(Date.now(), item.id, item.processedAt);
 }
 
 function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {

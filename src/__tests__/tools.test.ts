@@ -348,13 +348,18 @@ describe("review-fix read tools", () => {
     vi.restoreAllMocks();
   });
 
-  it("forwards get_review_fix_attempt to the injected facade and preserves status/detail fields", async () => {
+  it.each([
+    { backend: "github-actions" as const, githubRunId: "123", githubRunAttempt: 1 },
+    { backend: "fly-machines" as const, runRef: "machine-123" },
+    { backend: "local-docker" as const, runRef: "container-123" },
+    null,
+  ])("preserves execution %j through get_review_fix_attempt", async (execution) => {
     const getAttempt = vi.fn(async () => ({
       status: "ok" as const,
       attempt: {
         attemptId: "attempt-1",
         owner: { kind: "restate", attemptId: "attempt-1" },
-        execution: { githubRunId: "123", githubRunAttempt: 1 },
+        execution,
         deadlineAt: 123456,
         pendingFeedback: false,
         snapshot: { taskText: "fix it", findings: [{ findingKey: "F1", version: 2 }] },
@@ -375,6 +380,7 @@ describe("review-fix read tools", () => {
       status: "ok",
       attempt: expect.objectContaining({
         attemptId: "attempt-1",
+        execution,
         evidenceComplete: true,
         terminationConfirmed: true,
       }),
