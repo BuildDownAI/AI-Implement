@@ -6389,6 +6389,41 @@ Checks:
     expect(out.approved).toBe(true);
   });
 
+  it.each(["ai-implement", "claude-code-review"] as const)("%s approves a repeated rejected blocker alongside an undisposed minor finding", async (reviewProcess) => {
+    const blocker = { severity: "blocking" as const, body: "The index is missing." };
+    const minor = { severity: "minor" as const, body: "Consider renaming the index." };
+    const key = stableReviewFindingKey({ source: "review-contract", ...blocker });
+    const base = ghSpawnWithOneExternalFinding();
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      if (args.some(arg => arg.includes("commits/deadbeef/check-runs"))) return { stdout: JSON.stringify({ check_runs: [{ name: "Claude Code Review", app: { slug: "claude" }, status: "completed", conclusion: "success" }] }), exitCode: 0 };
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return {
+        stdout: JSON.stringify([{ user: { login: "claude[bot]", type: "Bot" }, body: [
+          "```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings: [blocker, minor] }), "```",
+        ].join("\n") }]), exitCode: 0,
+      };
+      if (args.includes("repos/:owner/:repo/pulls/42/comments?per_page=100")) return { stdout: "[]", exitCode: 0 };
+      // This fixture's unrelated thread must not contribute another open blocker.
+      if (args.some(arg => arg.includes("reviewThreads(first:"))) return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      return base.ghSpawn(args);
+    });
+    let fixPasses = 0;
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        fixPasses++;
+        writeDispositionsFile(workspaceDir, [{ findingKey: key, disposition: "invalid", reason: "The index already exists." }]);
+      }
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn(), reviewProcess }, { report: vi.fn(async () => undefined) });
+    expect(fixPasses).toBe(1);
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("approved");
+    expect(out.findingDispositions).toEqual([{ findingKey: key, disposition: "invalid", reason: "The index already exists." }]);
+    expect(base.ghComments.at(-1)).toContain("The index already exists.");
+    expect(publicationFetch.calls.some(call => JSON.parse(call.body).body.includes("second review approved"))).toBe(true);
+  });
+
   it.each(["repeat", "none", "new"] as const)("rejects a thread finding with %s findings on the new head", async (next) => {
     const base = ghSpawnWithOneExternalFinding();
     let fixed = false;

@@ -2271,19 +2271,16 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const hasGatingExternalFindings = gatingExternalFindings.length > 0;
       const advisoryExternalFindings = advisoryReviewFindings;
       const contractFindings = externalFindingsResult.findings.filter((finding) => finding.source === "review-contract");
-      const minorOnlyContractFindings = contractFindings.length > 0
-        && contractFindings.every((finding) => finding.severity === "minor");
-      const minorOnlyProcessFindings = processVerdict !== undefined && processVerdict.findings.length > 0
-        && processVerdict.findings.every((finding) => finding.severity === "minor");
-      // Missing/incomplete verdicts remain independent safeguards. A completed negative
-      // verdict must establish through its own findings that it is exclusively minor.
+      const allFindingsNonBlockingOrClosed = (findings: ReviewLedgerFinding[]): boolean =>
+        findings.length > 0 && findings.every((finding) =>
+          finding.severity === "minor" || closedKeys.has(stableReviewFindingKey(finding)));
+      // Missing/incomplete verdicts remain independent safeguards. Each finding in a
+      // completed negative verdict must be advisory or closed by an earlier fix pass.
       // Aggregate severity counts and empty negative verdicts remain blocking.
       const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
         && (externalFindingsResult.verdict === "incomplete"
-          || (externalFindingsResult.verdict === "changes_requested" && !minorOnlyContractFindings
-            && !(contractFindings.length > 0 && contractFindings.every((f) => closedKeys.has(stableReviewFindingKey(f)))))))
-        || (processVerdict?.verdict === "changes_requested" && !minorOnlyProcessFindings
-          && !(processVerdict.findings.length > 0 && processVerdict.findings.every((f) => closedKeys.has(stableReviewFindingKey(f)))));
+          || (externalFindingsResult.verdict === "changes_requested" && !allFindingsNonBlockingOrClosed(contractFindings))))
+        || (processVerdict?.verdict === "changes_requested" && !allFindingsNonBlockingOrClosed(processVerdict.findings));
       console.log(
         `[post-push-review] Review ledger findings: gating=${gatingReviewFindings.length} advisory=${advisoryReviewFindings.length}`,
       );
