@@ -627,11 +627,6 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
   }
 
-  function expectPlanningBootTokenSplit() {
-    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
-  }
-
   function flyConfigJson(): string {
     expect(flyMachines.createMachine).toHaveBeenCalledOnce();
     return JSON.stringify(vi.mocked(flyMachines.createMachine).mock.calls[0]![2]);
@@ -669,34 +664,12 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expect(json).not.toContain("broad-token");
   });
 
-  it.each([null, "legacy"] as const)("Fly planning boots with the scoped token (lifecycle %s)", async (reviewFixLifecycle) => {
-    planningIngress.submit.mockClear();
-    await indexModule.dispatchPlanning(config, provider, issue, { ...mapping, reviewFixLifecycle }, planningCtx("fly-machines"));
-    expect(planningIngress.submit).not.toHaveBeenCalled();
-
-    expectPlanningBootTokenSplit();
-    const json = flyConfigJson();
-    expect(json).toContain("scoped-token");
-    expect(json).not.toContain("broad-token");
-  });
-
   it("local implementation boots with the scoped token", async () => {
     await indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
 
     expectScopedOnly();
     expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
       expect.objectContaining({ githubToken: "scoped-token" }),
-    );
-  });
-
-  it.each([null, "legacy"] as const)("local planning boots with the scoped token (lifecycle %s)", async (reviewFixLifecycle) => {
-    planningIngress.submit.mockClear();
-    await indexModule.dispatchPlanning(config, provider, issue, { ...mapping, reviewFixLifecycle }, planningCtx("local-docker"));
-    expect(planningIngress.submit).not.toHaveBeenCalled();
-
-    expectPlanningBootTokenSplit();
-    expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
-      expect.objectContaining({ githubToken: "scoped-token", phase: "planning" }),
     );
   });
 
@@ -712,26 +685,19 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expectFreeSlot("fly-machines", "implementation");
   });
 
-  it("Fly planning: a narrow-mint failure launches nothing and falls back to nothing", async () => {
+  it.each(["fly-machines", "local-docker"] as const)("%s planning defers credential minting to the workflow", async (backend) => {
+    const status = await import("../restate/status.js");
+    status.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    onTestFinished(() => status.resetRestateStatus());
+    planningIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
     vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
-
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("fly-machines")).catch(() => undefined);
-
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx(backend));
+    expect(planningIngress.submit).toHaveBeenCalledOnce();
+    expect(githubAppAuth.getScopedInstallationToken).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
     expect(flyMachines.createMachine).not.toHaveBeenCalled();
-    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
-    expectFreeSlot("fly-machines", "planning");
-  });
-
-  it("local planning: a narrow-mint failure launches nothing and falls back to nothing", async () => {
-    vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
-
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("local-docker")).catch(() => undefined);
-
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
     expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
-    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
-    expectFreeSlot("local-docker", "planning");
+    expectFreeSlot(backend, "planning");
   });
 });
 
@@ -1534,8 +1500,8 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
   });
 });
 
-// GitHub Actions always submits PlanningRun; container backends retain the lifecycle switch.
-describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
+// Every backend submits PlanningRun regardless of the stored lifecycle.
+describe("dispatchPlanning — PlanningRun for every project", () => {
   const loaders = {
     dedup: () => import("../dedup.js"),
     admission: () => import("../dispatch-admission.js"),
@@ -1558,6 +1524,8 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   const ctxFor = (execPath: "github-actions" | "fly-machines" | "local-docker") => ({
     execPath, runnerMode: "default", resolvedPlanningBranch: "release/1.0", planningFieldValue: "release/1.0",
   });
+  const backends = ["github-actions", "fly-machines", "local-docker"] as const;
+  const cases = backends.flatMap((backend) => [null, "legacy", "restate"].map((reviewFixLifecycle) => ({ backend, reviewFixLifecycle: reviewFixLifecycle as RepoMapping["reviewFixLifecycle"] })));
   const activeRows = () =>
     (dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL").all() as { dispatch_id: string }[]);
 
@@ -1566,14 +1534,22 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     planningIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
     vi.mocked(github.postWorkflowDispatch).mockReset();
+    const fly = await import("../fly-machines.js");
+    const local = await import("../local-docker.js");
+    vi.mocked(fly.createMachine).mockClear();
+    vi.mocked(local.startLocalRunnerContainer).mockClear();
+    onTestFinished(() => {
+      expect(fly.createMachine).not.toHaveBeenCalled();
+      expect(local.startLocalRunnerContainer).not.toHaveBeenCalled();
+    });
   });
 
   afterEach(() => {
     restateStatus.resetRestateStatus();
   });
 
-  it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits without taking a reservation, and without launching (%s)", async (backend) => {
-    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor(backend));
+  it.each(cases)("submits without reservation or launch ($backend, $reviewFixLifecycle)", async ({ backend, reviewFixLifecycle }) => {
+    await indexModule.dispatchPlanning(config, provider, issue, { ...pilot, reviewFixLifecycle }, ctxFor(backend));
 
     expect(planningIngress.submit).toHaveBeenCalledTimes(1);
     const [dispatchId, input] = planningIngress.submit.mock.calls[0];
@@ -1587,10 +1563,10 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
-  it.each([null, "legacy", "restate"] as const)("with Restate not ready, lifecycle %s makes no reservation, submit, or launch", async (reviewFixLifecycle) => {
+  it.each(cases)("with Restate not ready, no reservation, submit, or launch ($backend, $reviewFixLifecycle)", async ({ backend, reviewFixLifecycle }) => {
     restateStatus.setRestateStatus({ sidecar: { state: "starting" } });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await indexModule.dispatchPlanning(config, provider, issue, { ...legacyMapping, reviewFixLifecycle }, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, { ...legacyMapping, reviewFixLifecycle }, ctxFor(backend));
     expect(logSpy.mock.calls.map((c) => c.join(" "))).toContain("[poll] Planning for AII-1100 skipped: Restate unavailable");
     logSpy.mockRestore();
     expect(planningIngress.submit).not.toHaveBeenCalled();
@@ -1605,10 +1581,10 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(activeRows()).toEqual([]);
   });
 
-  it("submit unavailable leaves no dispatch_admissions row", async () => {
+  it.each(backends)("submit unavailable leaves no dispatch_admissions row (%s)", async (backend) => {
     planningIngress.submit.mockResolvedValue({ status: "unavailable" });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor(backend));
     const lines = logSpy.mock.calls.map((c) => c.join(" "));
     logSpy.mockRestore();
     expect(lines).toContain("[poll] Planning for AII-1100 skipped: Restate unavailable");
@@ -1616,10 +1592,10 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
-  it("submit not-found logs that the service is not registered, with no row", async () => {
+  it.each(backends)("submit not-found logs that the service is not registered, with no row (%s)", async (backend) => {
     planningIngress.submit.mockResolvedValue({ status: "not-found" });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor(backend));
     const lines = logSpy.mock.calls.map((c) => c.join(" "));
     logSpy.mockRestore();
     expect(lines).toContain("[poll] Planning for AII-1100 skipped: the PlanningRun service is not registered");
@@ -1627,9 +1603,9 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
-  it("an issue the non-binding check refuses is not submitted", async () => {
+  it.each(backends)("an issue the non-binding check refuses is not submitted (%s)", async (backend) => {
     dedup.markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
-    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor(backend));
     expect(planningIngress.submit).not.toHaveBeenCalled();
     expect(activeRows()).toEqual([]);
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();

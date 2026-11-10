@@ -317,14 +317,14 @@ const implementation: Record<Backend, LaunchPath> = {
 };
 
 const planning = (execPath: Backend): LaunchPath => async (w) => {
+  const dispatchId = "parity-planning-1";
+  const reservation = w.gate.acquireDispatch({
+    dispatchId, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, kind: "planning",
+    teamKey: TEAM, maxInProgressAiIssues: MAPPING.maxInProgressAiIssues, backend: execPath,
+    lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+  });
+  if (!reservation.ok) throw new Error("planning reservation refused");
   if (execPath === "github-actions") {
-    const dispatchId = "parity-planning-1";
-    const reservation = w.gate.acquireDispatch({
-      dispatchId, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, kind: "planning",
-      teamKey: TEAM, maxInProgressAiIssues: MAPPING.maxInProgressAiIssues, backend: execPath,
-      lifecycleOwner: { kind: "restate", attemptId: dispatchId },
-    });
-    if (!reservation.ok) throw new Error("planning reservation refused");
     const p = provider();
     const fireBreakerTrip = async () => {};
     const prepared = await w.planningLaunch.preparePlanningLaunch({
@@ -340,11 +340,16 @@ const planning = (execPath: Backend): LaunchPath => async (w) => {
     });
     return;
   }
-  await w.index.dispatchPlanning(CONFIG, provider(), ISSUE, MAPPING, {
-    execPath,
-    runnerMode: "default",
-    resolvedPlanningBranch: BASE_BRANCH,
-    planningFieldValue: null,
+  await w.planningLaunch.launchPlanningSession({
+    config: CONFIG, provider: provider(), issue: ISSUE, mapping: MAPPING, execPath,
+    runnerMode: "default", resolvedPlanningBranch: BASE_BRANCH, planningFieldValue: null,
+    reservation: { dispatchId, admission: reservation },
+    deps: {
+      dispatchSession: w.index.dispatchSession,
+      isDefinitiveFlyRejectionError: () => false,
+      isDefinitiveLocalDockerLaunchFailure: () => false,
+      shouldReleaseAdmissionOnDispatchError: w.index.shouldReleaseAdmissionOnDispatchError,
+    },
   });
 };
 

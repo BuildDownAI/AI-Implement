@@ -4,11 +4,11 @@
 
 This pilot moves **automatic review-fix attempts on GitHub Actions, Fly Machines and local Docker** to Restate. The runner's internal review/fix cycles and human comment-triggered gap-fill runs stay on their existing lifecycle. SQLite owns accepted feedback, finding versions, attempt snapshots, reservations, and final outcomes. Restate owns durable coordination and waits. A project defaults to Legacy; a change selects only future automatic attempts. An active attempt keeps its recorded owner. See [ADR 030](./adr/030-share-atomic-dispatch-admission-across-run-owners.md), [ADR 031](./adr/031-control-review-fix-attempts-with-restate.md), and [ADR 018](./adr/018-adopt-restate-one-run-kind-at-a-time.md).
 
-## The switch also selects the planning lifecycle (AII-1021)
+## Planning always uses PlanningRun
 
-The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) selects who owns a planning reservation only on Fly Machines and local Docker. GitHub Actions planning always uses `PlanningRun`, regardless of the stored lifecycle. For GitHub Actions, or a container backend with `restate`, `dispatchPlanning` checks capacity without a reservation and submits `PlanningRun/{dispatchId}` through the loopback ingress. The workflow's `reserve` step takes the reservation (owner `restate:<dispatchId>`), launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches inline on these paths. With `legacy` or unset, Fly Machines and local Docker keep `launchPlanningSession`. Implementation, gap-fill, and review-fix dispatch are not affected by this part of the switch.
+Planning on GitHub Actions, Fly Machines and local Docker always uses `PlanningRun`, regardless of the project's stored `reviewFixLifecycle` value (NULL, `legacy` or `restate`). `dispatchPlanning` checks Restate readiness and capacity without a reservation, then submits `PlanningRun/{dispatchId}` with the resolved backend and planning context through the loopback ingress. The workflow's `reserve` step takes the reservation (owner `restate:<dispatchId>`), launches the run, waits, and releases the reservation (at the latest at the planning deadline). `dispatchPlanning` never launches inline. The existing **Review-fix & Planning Lifecycle** control no longer affects planning.
 
-**What an operator sees for a pilot planning run.** The result is the same as for a Legacy planning run:
+**What an operator sees for a planning run:**
 
 - **Completion notice:** one notice when the run ends, from the `outcome` step.
 - **Failure comment:** a failed run gets the failure comment on the ticket.
@@ -19,9 +19,9 @@ The project's **Review-fix & Planning Lifecycle** switch (`reviewFixLifecycle`) 
 See [restate.md](restate.md#the-planning-run) and [the fenced Legacy functions](restate.md#the-owned-run-lifecycle-kit).
 
 - **Restate unavailable** (sidecar not `ready` or endpoint not `registered`): no reservation and no dispatch. The poll logs `[poll] Planning for <key> skipped: Restate unavailable` and the ticket stays queued for the next poll. The poll loop takes no reservation for planning (the `PlanningRun` workflow reserves in its first step), so a `submit` that answers `unavailable` leaves nothing to release. A `conflict` answer leaves the reservation to the existing workflow.
-- **Fly Machines and local Docker:** a project can save Restate with execution mode `fly-machines` when the effective sessions app and token are configured and the provider is not Bedrock. Local Docker remains selected through the global runner mode (`/admin#runners` or `POST /api/runner-mode`). The `PlanningRun` input names the backend from the resolved execution path, and the same workflow owns the reservation there.
+- **Fly Machines and local Docker:** Fly planning requires the effective sessions app and token and a non-Bedrock provider; it does not require selecting Restate in the project lifecycle control. Local Docker remains selected through the global runner mode (`/admin#runners` or `POST /api/runner-mode`). The `PlanningRun` input names the backend from the resolved execution path, and the same workflow owns the reservation there.
 - **Self-deploy drain:** a pilot planning run in flight counts as an active owner, so a drain waits for it (at most the planning deadline).
-- **Rollback:** set the project's switch to `legacy`. A run already submitted keeps its workflow owner until it releases.
+- **Planning rollback:** drain active workflow owners before a deploy revert. Changing the project lifecycle switch does not change planning dispatch.
 
 ## Intake: `ReviewFixPR.feedback` accepts a review event (AII-1183)
 

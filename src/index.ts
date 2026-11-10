@@ -1511,64 +1511,49 @@ export async function submitImplementationRun(
   }
 }
 
-// Exported for direct testing of the GHA result-based admission release/hold branch —
-// see "dispatchPlanning GHA path" in dispatch-routing.test.ts. Not part of the module's
-// public API otherwise; the only production call site is poll(), via
-// preparePlanningDispatch's resolved context.
+// The poll submits safe context; PlanningRun owns reservation and launch on every backend.
 export async function dispatchPlanning(
-  config: AppConfig,
-  provider: TicketingProvider,
+  _config: AppConfig,
+  _provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
   ctx: PlanningDispatchContext,
 ): Promise<void> {
-  const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
+  const { execPath, resolvedPlanningBranch, planningFieldValue } = ctx;
 
-  // GitHub Actions always uses PlanningRun; container backends retain the lifecycle switch.
-  if (execPath === "github-actions" || resolveReviewFixLifecycle(mapping) === "restate") {
-    if (!restateCanServe()) {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
-      return;
-    }
-    const dispatchId = crypto.randomUUID();
-    const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
-    // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
-    const decision = canDispatch({
-      issueId: issue.id,
-      kind: "planning",
-      teamKey: issue.scopeKey,
-      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-    });
-    if (!decision.ok) return;
-    const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
-    if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
-    const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
-      dispatchId,
-      teamKey: issue.scopeKey,
-      issueId: issue.id,
-      issueIdentifier: issue.identifier,
-      backend,
-      planningContext,
-    });
-    if (submitted.status === "unavailable") {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
-      return;
-    }
-    if (submitted.status === "not-found") {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: the PlanningRun service is not registered`);
-      return;
-    }
-    console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+  if (!restateCanServe()) {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
     return;
   }
-
-  if (execPath === "fly-machines" || execPath === "local-docker") {
-    await launchPlanningSession({
-      config, provider, issue, mapping, execPath, runnerMode, resolvedPlanningBranch, planningFieldValue,
-      deps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
-    });
+  const dispatchId = crypto.randomUUID();
+  const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
+  // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
+  const decision = canDispatch({
+    issueId: issue.id,
+    kind: "planning",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+  });
+  if (!decision.ok) return;
+  const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
+  if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
+  const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
+    dispatchId,
+    teamKey: issue.scopeKey,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    backend,
+    planningContext,
+  });
+  if (submitted.status === "unavailable") {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
     return;
   }
+  if (submitted.status === "not-found") {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: the PlanningRun service is not registered`);
+    return;
+  }
+  console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
 }
 
 // ---------- Shared session-dispatch core ----------
