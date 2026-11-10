@@ -207,7 +207,7 @@ export const REVIEW_PROCESSES: Record<ReviewProcessId, ReviewProcessDefinition> 
     checkPairs: [GITHUB_ACTIONS_PAIR],
     readVerdict: (input) => readBlock(input.blocks) ?? noBlock(),
     fixer: "ai-implement",
-    summaryBlockingGates: false,
+    summaryBlockingGates: true,
   },
   "claude-code-review": {
     id: "claude-code-review",

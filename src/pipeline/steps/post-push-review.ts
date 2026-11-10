@@ -435,8 +435,9 @@ function internalReviewerGates(
 export const EXTERNAL_REVIEW_PENDING_NEXT_STEP = "Open the pull request's checks to see the external review's status.";
 
 /**
- * `summaryBlockingGates` is set under the Claude Code Review process: a `blocking` finding from a
- * trusted Claude summary (a 🔴 heading) gates there, while minor and medium summary findings stay advisory.
+ * `summaryBlockingGates` is set under AI-Implement and the Claude Code Review processes:
+ * a `blocking` finding from a trusted Claude summary gates approval. Minor findings stay
+ * advisory; medium findings gate only when enabled by the reviewer selection.
  */
 export function isReviewLedgerFindingGating(
   finding: Pick<ReviewLedgerFinding, "source" | "severity" | "reviewerId" | "reviewerProvenance">,
@@ -661,6 +662,8 @@ interface ParsedCheckRun {
   conclusion: string;
   appSlug: string;
   outputText: string | null;
+  startedAt: string;
+  completedAt: string;
 }
 
 function parseCheckRuns(stdout: string): ParsedCheckRun[] {
@@ -685,6 +688,8 @@ function parseCheckRuns(stdout: string): ParsedCheckRun[] {
       const outputText = recordProp(r, "output")?.text;
       if (name) {
         runs.push({
+          startedAt: stringProp(r, "started_at"),
+          completedAt: stringProp(r, "completed_at"),
           name,
           status,
           conclusion,
@@ -735,6 +740,7 @@ function createWarnOnce(): WarnOnce {
 type ExternalReviewProbeState = "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" | "permission-denied";
 
 interface ExternalReviewProbe {
+  reviewWindow?: { startedAt: string; completedAt: string };
   state: ExternalReviewProbeState;
   /** The review process's verdict, set only when its reader ran. */
   verdict?: ReviewVerdictResult;
@@ -800,7 +806,13 @@ function probeExternalReviewCheck(
   // neutral, timed_out, action_required, and any future conclusion GitHub adds all fail closed —
   // an unknown conclusion should never silently approve.
   const hasRealReview = matching.some((run) => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
-  if (hasRealReview) return { state: "completed" };
+  if (hasRealReview) {
+    // Multiple review jobs cannot unambiguously identify the top-level comment's run.
+    const realRuns = matching.filter(run => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
+    const run = realRuns.length === 1 ? realRuns[0] : undefined;
+    return { state: "completed", ...(run?.startedAt && run.completedAt
+      ? { reviewWindow: { startedAt: run.startedAt, completedAt: run.completedAt } } : {}) };
+  }
   // Every matching run is completed but none produced a real verdict. Return "no-real-verdict" so
   // the caller can fail closed immediately rather than approving as if no check existed.
   return { state: "no-real-verdict" };
@@ -912,7 +924,7 @@ async function waitForExternalReviewCompletion(
     process?: ReviewProcessDefinition;
     extraAuthors?: readonly string[];
   },
-): Promise<{ state: ExternalReviewState; headSha: string; reviewVerdict?: ReviewVerdictResult; issueComments?: SpawnResult }> {
+): Promise<{ state: ExternalReviewState; headSha: string; reviewVerdict?: ReviewVerdictResult; issueComments?: SpawnResult; reviewWindow?: { startedAt: string; completedAt: string } }> {
   const probeOpts = {
     configuredCheckNames: opts.configuredCheckNames,
     process: opts.process ?? resolveReviewProcess(null),
@@ -960,6 +972,7 @@ async function waitForExternalReviewCompletion(
       : { state: "unreadable" };
     const state = probe.state;
     const reviewVerdict = {
+      ...(probe.reviewWindow ? { reviewWindow: probe.reviewWindow } : {}),
       ...(probe.verdict ? { reviewVerdict: probe.verdict } : {}),
       ...(probe.issueComments ? { issueComments: probe.issueComments } : {}),
     };
@@ -2223,9 +2236,15 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         : collectExternalReviewFindingsFromGh(ghSpawn, prNumber, {
             process: reviewProcess,
             extraAuthors: trustedReviewAuthors,
+            ...(reviewProcess.id === "ai-implement" && externalReviewState === "completed"
+              ? { requireCurrentReview: true, reviewWindow: "reviewWindow" in externalReviewResult ? externalReviewResult.reviewWindow : undefined } : {}),
             ...(externalReviewResult.headSha && reviewProcess.id !== "ai-implement" ? { headSha: externalReviewResult.headSha } : {}),
             ...("issueComments" in externalReviewResult && externalReviewResult.issueComments ? { issueComments: externalReviewResult.issueComments } : {}),
           });
+      if ("selectedComment" in externalFindingsResult && externalFindingsResult.selectedComment) {
+        const selected = externalFindingsResult.selectedComment;
+        console.log(`[post-push-review] Claude review comment ${selected.id}: ${selected.kind}`);
+      }
       let externalFindings = externalFindingsResult.findings;
       if (processVerdict?.verdict === "changes_requested" && externalFindings.length === 0) {
         externalFindings = processVerdict.findings;

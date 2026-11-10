@@ -1,3 +1,5 @@
+import pr1546 from "./fixtures/claude-review-pr-1546.json";
+import pr1541 from "./fixtures/claude-review-pr-1541.json";
 import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import { REVIEW_PROCESSES } from "../review-process.js";
 import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../pipeline/review-publication-limits.js";
@@ -40,6 +42,28 @@ beforeEach(() => {
   workspaceDir = testDir("post-push-review");
   publicationFetch = fakeFetch({ "POST /runner/review-publication": { json: { status: "posted", reviewUrl: "https://github.com/acme/app/pull/42#pullrequestreview-80" } } }).install();
 });
+
+
+/** Add the current review's API timing evidence to legacy check-behavior fixtures. */
+function withCurrentReview(spawn: (args: string[]) => { stdout: string; exitCode: number; stderr?: string }) {
+  return (args: string[]) => {
+    const result = spawn(args);
+    if (result.exitCode !== 0) return result;
+    if (args.some(a => a.includes("/check-runs"))) {
+      const payload = JSON.parse(result.stdout);
+      for (const page of Array.isArray(payload) ? payload : [payload]) {
+        for (const run of page.check_runs ?? []) Object.assign(run, { started_at: "2026-11-10T20:00:00Z", completed_at: "2026-11-10T20:45:00Z" });
+      }
+      return { ...result, stdout: JSON.stringify(payload) };
+    }
+    if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+      const comments = result.stdout ? JSON.parse(result.stdout) : [];
+      if (!comments.length) comments.push({ user: { login: "github-actions[bot]", type: "Bot" }, body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' });
+      return { ...result, stdout: JSON.stringify(comments.map((c: object) => ({ created_at: "2026-11-10T20:44:00Z", ...c }))) };
+    }
+    return result;
+  };
+}
 
 function structuredReviewResult(structuredOutput: unknown, stdout = "ignored final text") {
   return {
@@ -2470,7 +2494,7 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).toContain("Missing UUID validation on path params.");
   });
 
-  it("approves when a Claude issue comment only contributes advisory prose findings", async () => {
+  it("blocks when a trusted Claude issue comment contributes blocking prose findings", async () => {
     const reviewerOutput = { approved: true, findings: [], summary: "Internal reviewer approves.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
@@ -2508,18 +2532,18 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(3);
     expect(ghSpawn).toHaveBeenCalledWith([
       "api",
       "--paginate",
       "--slurp",
       "repos/:owner/:repo/issues/42/comments?per_page=100",
     ]);
-    const reviewComment = ghComments.find((comment) => comment.includes("Approved"));
-    expect(reviewComment).toContain("Advisory external review findings (do not block merge):");
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("Unresolved external review findings:");
     expect(reviewComment).toContain("Validate path params before database access.");
-    expect(reviewComment).toContain("**Merge readiness:** Ready to merge.");
+    expect(reviewComment).not.toContain("Advisory external review findings");
   });
 
   it("blocks when an advisory prose finding and formal review thread share the same body", async () => {
@@ -2546,7 +2570,7 @@ describe("postPushReviewStep", () => {
               "",
               "### Review: PR #42",
               "",
-              "### Blocking",
+              "### Minor",
               "",
               "**Use the shared validator for path params.**",
             ].join("\n"),
@@ -2671,7 +2695,7 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).not.toContain("Advisory external review findings");
   });
 
-  it("approves the PR #557 prose-findings shape as advisory when internal review and CI are clean", async () => {
+  it("blocks the PR #557 prose-findings shape when internal review and CI are clean", async () => {
     const reviewerOutput = { approved: true, findings: [], summary: "Internal reviewer approves.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
@@ -2721,12 +2745,12 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(2);
-    const reviewComment = ghComments.find((comment) => comment.includes("Approved"));
-    expect(reviewComment).toContain("Advisory external review findings (do not block merge):");
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("Unresolved external review findings:");
     expect(reviewComment).toContain("Missing regression test for the actual vulnerability that was fixed.");
-    expect(reviewComment).toContain("**Merge readiness:** Ready to merge.");
+    expect(reviewComment).not.toContain("Advisory external review findings");
   });
 
   it("blocks on the same GitHub Actions prose shape when project settings opt prose into gating", async () => {
@@ -4300,14 +4324,15 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
     // Both names must be recognised as the external review gate (not absent), causing the step to wait.
     expect(sleep).toHaveBeenCalled();
     expect(checkProbes).toBeGreaterThanOrEqual(2);
-    expect(out.approved).toBe(true);
+    // Both completed jobs are ambiguous for top-level comment attribution.
+    expect(out.approved).toBe(false);
   });
 
   it("logs a warning when check runs are present but none match the external review gate", async () => {
@@ -4382,7 +4407,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(f.reviewerOutput)));
     return runReview(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir, maxIterations, ghSpawn: f.ghSpawn,
+      { prNumber: "42", workspaceDir, maxIterations, ghSpawn: withCurrentReview(f.ghSpawn),
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
         reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
@@ -4867,7 +4892,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5099,7 +5124,7 @@ describe("postPushReviewStep", () => {
       });
       const out = await runReview(
         makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
-        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
         { report: vi.fn(async () => undefined) },
       );
       return { out, ghComments };
@@ -5133,7 +5158,7 @@ describe("postPushReviewStep", () => {
     });
 
     it("does not approve on an approving block when the check itself failed", async () => {
-      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-11-10T20:44:00Z", "approve", [])] });
       expectVerdictUnavailableEnding(out, ghComments);
     });
 
@@ -5159,7 +5184,7 @@ describe("postPushReviewStep", () => {
     });
 
     it("approves on an approving block when the check succeeded", async () => {
-      const { out, ghComments } = await runGate({ conclusion: "success", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      const { out, ghComments } = await runGate({ conclusion: "success", comments: [contractComment("2026-11-10T20:44:00Z", "approve", [])] });
       expect(out.approved).toBe(true);
       expect(out.terminationReason).toBe("approved");
       expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(true);
@@ -5195,7 +5220,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5235,7 +5260,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5290,7 +5315,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5503,7 +5528,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -6623,7 +6648,7 @@ Checks:
       }
       return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
     });
-    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn(), reviewProcess }, { report: vi.fn(async () => undefined) });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: makeGitSpawn(), reviewProcess }, { report: vi.fn(async () => undefined) });
     expect(fixPasses).toBe(1);
     expect(out.approved).toBe(true);
     expect(out.terminationReason).toBe("approved");
@@ -7010,6 +7035,7 @@ describe("postPushReviewStep review process gate", () => {
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: SHA } }), exitCode: 0 };
       if (args[0] === "api" && args.some((a) => a.includes(`commits/${SHA}/check-runs`))) {
         return {
@@ -7645,5 +7671,74 @@ describe("uniform minor ledger gate", () => {
       { source: "ai-implement-internal", severity, reviewerId: "code-review" },
       [{ id: "code-review", gates: false }],
     )).toBe(false);
+  });
+});
+
+describe("Claude GHA comment incident replays", () => {
+  describe.each(["combined", "separate"] as const)("%s heading-only review", (format) => {
+    it.each([
+      ["Blocking issues", "github-actions[bot]", "Bot", false],
+      ["Minor issues", "github-actions[bot]", "Bot", true],
+      ["Blocking issues", "github-actions[bot]", "User", true],
+      ["Blocking issues", "untrusted-reviewer", "Bot", true],
+    ] as const)("handles %s from %s (%s), approved=%s", async (heading, login, type, approved) => {
+      const posted: string[] = [];
+      const reviewBody = `## Claude review\n### ${heading}\n- Fix the regression`;
+      const tracker = "**Claude is working…**";
+      const comments = [
+        { id: 99, user: { login: "github-actions[bot]", type: "Bot" }, body: '## Claude review\n```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' },
+        ...(format === "separate" ? [{ id: 100, user: { login: "github-actions[bot]", type: "Bot" }, body: tracker }] : []),
+        { id: 101, user: { login, type }, body: format === "combined" ? `${tracker}\n\n${reviewBody}` : reviewBody },
+      ].map(c => ({ ...c, created_at: "2026-11-10T20:44:11Z" }));
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return { stdout: JSON.stringify(comments), exitCode: 0 };
+        if (args.some(a => a.includes("/check-runs"))) return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion: "success", started_at: "2026-11-10T20:38:09Z", completed_at: "2026-11-10T20:44:14Z" }] }), exitCode: 0 };
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+        if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
+        return { stdout: "", exitCode: 0 };
+      });
+      const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "lgtm", checks: [{ check: "Diff review", result: "passed", evidence: "Read diff." }] }));
+      const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, reviewProcess: "ai-implement", ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) }, { report: vi.fn(async () => undefined) });
+      expect(out.approved).toBe(approved);
+      if (!approved) {
+        expect(posted.join("\n")).toContain("Unresolved external review findings");
+        expect(posted.join("\n")).toContain("Fix the regression");
+      } else if (heading === "Minor issues") {
+        expect(posted.join("\n")).toContain("Advisory external review findings");
+        expect(posted.join("\n")).toContain("Fix the regression");
+      } else {
+        expect(posted.join("\n")).not.toContain("Fix the regression");
+      }
+    });
+  });
+
+  it.each([
+    ["1546 blocking", pr1546, false],
+    ["stale approval", [...pr1546, { id: 997, user: { login: "github-actions[bot]", type: "Bot" }, created_at: "2026-11-10T19:00:00Z", updated_at: "2026-11-10T21:00:00Z", body: '## Claude review\n```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' }], false],
+    ["1541 advisory", pr1541, true],
+    ["missing association", pr1541, false],
+    ["unclassifiable", [{ id: 999, user: { login: "github-actions[bot]", type: "Bot" }, body: "## Claude review\nUnexpected review output." }], false],
+    ["malformed contract", [{ id: 998, user: { login: "github-actions[bot]", type: "Bot" }, body: "## Claude review\n```json review-findings\n{bad json}\n```" }], false],
+  ] as const)("handles %s with a successful review check", async (_label, comments, approved) => {
+    const posted: string[] = [];
+    const logs = vi.spyOn(console, "log");
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return { stdout: JSON.stringify(comments.map(c => ({ created_at: "2026-11-10T20:44:11Z", ...c }))), exitCode: 0 };
+      if (args.some(a => a.includes("/check-runs"))) return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion: "success", started_at: _label === "missing association" ? "" : _label === "1541 advisory" ? "2026-11-10T19:46:53Z" : "2026-11-10T20:38:09Z", completed_at: _label === "1541 advisory" ? "2026-11-10T19:52:23Z" : "2026-11-10T20:44:14Z" }] }), exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "lgtm", checks: [{ check: "Diff review", result: "passed", evidence: "Read diff." }] }));
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(approved);
+    const selectedId = (_label === "1546 blocking" || _label === "stale approval") ? 6778794145 : _label === "1541 advisory" ? 6777662566 : _label === "unclassifiable" ? 999 : 998;
+    const kind = _label === "unclassifiable" || _label === "malformed contract" ? "unavailable" : "review-contract";
+    if (_label !== "missing association") expect(logs).toHaveBeenCalledWith(`[post-push-review] Claude review comment ${selectedId}: ${kind}`);
+    if (approved) expect(posted.join("\n")).toContain("Advisory external review findings");
+    if (_label === "unclassifiable" || _label === "malformed contract" || _label === "missing association") expect(posted.join("\n")).toContain("verdict is not available");
+    logs.mockRestore();
   });
 });
