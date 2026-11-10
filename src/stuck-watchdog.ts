@@ -434,6 +434,7 @@ export async function remediateFailedJob(
     /** The runner started and reported the failure through its callback, so `Initialize containers`
      *  did not fail and the jobs lookup cannot match. */
     runnerReported?: boolean;
+    stuckCleanup?: StuckCleanupProgress;
   },
 ): Promise<void> {
   if (!job.issueId) return;
@@ -480,7 +481,7 @@ export async function remediateFailedJob(
     }
   }
 
-  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus, imagePullFailure);
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus, imagePullFailure, opts?.stuckCleanup);
 
   if (isImagePullGiveUp(imagePullFailure, attempts)) {
     console.warn(

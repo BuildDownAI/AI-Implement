@@ -119,7 +119,7 @@ export interface ImplementationRunProductionInput {
     provider: TicketingProvider | null,
     watchdogConfig: StuckWatchdogConfig,
     job: Job,
-    opts?: { ownerCall?: boolean },
+    opts?: { ownerCall?: boolean; stuckCleanup?: StuckCleanupProgress },
   ) => Promise<void>;
   /** `remediateStuckJob` from `src/stuck-watchdog.ts`. */
   remediateStuckJob: (
@@ -583,6 +583,13 @@ export function createProductionImplementationRunServices(input: ImplementationR
     const owner = readImplementationRunOwner(dispatchId);
     if (owner?.finalized) return owner.finishResult ?? {};
     if (owner) updateImplementationRunOwner({ ...owner, finishOutcome: owner.finishOutcome ?? outcome });
+    const ownerOptions = {
+      ownerCall: true,
+      ...(owner ? { stuckCleanup: {
+        claim: () => claimImplementationStuckAttempt(owner.input),
+        complete: () => completeImplementationStuckCleanup(owner.input),
+      } } : {}),
+    };
     const result = await finishImplementationJob(
       {
         getJob: getJobByDispatchId,
@@ -594,7 +601,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
           return state?.merged === true;
         },
         finalize: async (finalOutcome, job) =>
-          input.finalizeImplementation(finalOutcome, await providerForJob(job), watchdogConfig, job, { ownerCall: true }),
+          input.finalizeImplementation(finalOutcome, await providerForJob(job), watchdogConfig, job, ownerOptions),
         remediateStuck: async (job, reason) => {
           const backend = job.executionMode === GHA_BACKEND || !job.machineId ? undefined : job.executionMode;
           // The job row alone cannot authorize destruction in the current configured app.
@@ -603,13 +610,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
             if (!owner || owner.input.backend !== backend) throw new Error(`missing implementation stop authority: ${dispatchId}`);
             return stop(owner.input, job.machineId!);
           } : undefined;
-          await input.remediateStuckJob(watchdogConfig, await providerForJob(job), job, reason, stopRunner, {
-            ownerCall: true,
-            ...(owner ? { stuckCleanup: {
-              claim: () => claimImplementationStuckAttempt(owner.input),
-              complete: () => completeImplementationStuckCleanup(owner.input),
-            } } : {}),
-          });
+          await input.remediateStuckJob(watchdogConfig, await providerForJob(job), job, reason, stopRunner, ownerOptions);
         },
         clearWorkingState: async (job) => {
           const provider = await providerForJob(job);
