@@ -190,3 +190,35 @@ A project whose review process is `claude-code-review` (ADR 038, `src/review-pro
 4. **No completed matching check** is `incomplete`.
 
 Inline comments count only from a trusted author of type `Bot`, on the head commit (or with no commit id). A body starting 🔴 is `blocking`, 🟡 is `minor`, 🟣 (pre-existing) adds no finding, and an untagged comment is recorded as `minor`, so a reviewer that emits no markers never blocks a merge by itself. The `claude` check is matched by app slug and name together: a check named `Claude Code Review` from `github-actions` is not the hosted one.
+
+## Which Claude comments the pipeline reads
+
+For `ai-implement`, a completed review check triggers a separate findings read.
+The ledger first restricts eligible top-level comments to those created during the
+review check on the resolved PR head. It then selects the newest by `updated_at`
+(falling back to `created_at`, then API order for ties). It reads a fenced contract
+first, then legacy review headings. Both a combined tracking/review comment and a
+separate `## Claude review` comment are eligible; `**Claude finished**` is not
+required. Progress-only comments without a review heading or contract are ignored.
+
+Author eligibility is unchanged: contracts require the GitHub Actions identity
+(`github-actions` or `github-actions[bot]`, with API type `Bot`) or a Claude author
+trusted by the configured review process and extra-author allowlist. Heading-only
+reviews use those same identities. Pipeline comments whose trimmed body starts
+with `<!-- ai-implement` are excluded. A quoted marker elsewhere in review prose
+does not identify the comment as pipeline-authored.
+
+The selected trusted review supersedes older comments even when its contract is
+malformed or its review content cannot be parsed. Such a review reports findings
+as unavailable and prevents approval from a successful check alone. Blocking
+contract findings gate even with only a path and no line; minor findings remain
+advisory. The step logs the selected comment id and parse kind beside its review
+process verdict log. Top-level comments do not supply commit identity. The step uses the single matching
+check with a real review conclusion, fetched from the current head's check-runs
+endpoint, and its inclusive `started_at`–`completed_at` window. Comment creation
+must fall inside that window; editing an older head's approval cannot bring it
+into the current review. Missing/invalid check timing, multiple real review checks,
+missing comment creation time, no eligible comment in the window, or an eligible
+comment edited after completion makes the verdict unavailable. This intentionally
+fails closed for sticky comments created before the current review; inline threads
+retain their separate head-commit filtering.

@@ -50,6 +50,7 @@ export interface ExternalReviewFindingsResult {
   findingsUnavailable: boolean;
   verdict?: ReviewFindingsVerdict;
   verdictSource?: ReviewLedgerSource;
+  selectedComment?: { id: string | number; kind: string };
 }
 
 export interface ReviewLedgerOptions {
@@ -57,6 +58,9 @@ export interface ReviewLedgerOptions {
   extraAuthors: readonly string[];
   /** When set, a review thread whose latest comment was written on another commit is not a finding. */
   headSha?: string;
+  /** Require top-level comments created during the single review check on the resolved head. */
+  requireCurrentReview?: boolean;
+  reviewWindow?: { startedAt: string; completedAt: string };
   /** A successful `issues/{pr}/comments` read the caller already made; when set, the readers reuse it instead of fetching again. */
   issueComments?: GhResult;
 }
@@ -71,7 +75,7 @@ export function collectExternalReviewFindingsFromGh(
   options: ReviewLedgerOptions = DEFAULT_REVIEW_LEDGER_OPTIONS,
 ): ExternalReviewFindingsResult {
   const findings: ReviewLedgerFinding[] = [];
-  const out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict; verdictSource?: ReviewLedgerSource } = { findingsUnavailable: false };
+  const out: Omit<ExternalReviewFindingsResult, "findings"> = { findingsUnavailable: false };
 
   // A reviewer's latest formal verdict is authoritative: only reviewers currently in
   // CHANGES_REQUESTED state contribute blocking inline threads. Leftover nit threads from
@@ -83,6 +87,7 @@ export function collectExternalReviewFindingsFromGh(
   return {
     findings: dedupeReviewFindings(findings),
     findingsUnavailable: out.findingsUnavailable,
+    ...(out.selectedComment ? { selectedComment: out.selectedComment } : {}),
     ...(out.verdict !== undefined ? { verdict: out.verdict } : {}),
     ...(out.verdictSource !== undefined ? { verdictSource: out.verdictSource } : {}),
   };
@@ -684,7 +689,8 @@ export function classifyReviewIssueComment(
   // Heading-based extraction (backward compat with target repos using trusted-author
   // Claude App identity that posts without a verdict marker).
   if (isLikelyClaudeReviewComment(comment, options)) {
-    return { findings: extractClaudeSummaryFindings(comment.body, url), findingsUnavailable: false };
+    const findings = extractClaudeSummaryFindings(comment.body, url);
+    return { findings, findingsUnavailable: findings.length === 0 && extractGithubActionsClaudeReviewFindings(comment.body, url).findingsUnavailable };
   }
 
   if (isGithubActionsClaudeReviewComment(comment)) {
@@ -703,27 +709,46 @@ function collectClaudeIssueComments(
   ghSpawn: GhSpawn,
   prNumber: string,
   findings: ReviewLedgerFinding[],
-  out: { findingsUnavailable: boolean; verdict?: ReviewFindingsVerdict; verdictSource?: ReviewLedgerSource },
+  out: Omit<ExternalReviewFindingsResult, "findings">,
   options: ReviewLedgerOptions,
 ): void {
   const result = readIssueComments(ghSpawn, prNumber, options);
-  if (!result || result.exitCode !== 0) return;
+  if (!result || result.exitCode !== 0) {
+    if (options.requireCurrentReview) out.findingsUnavailable = true;
+    return;
+  }
 
   const comments = parseReviewPages(result.stdout)
     .map((comment, index) => ({ comment, index, timestamp: reviewCommentTimestamp(comment) }))
     .sort((a, b) => b.timestamp - a.timestamp || b.index - a.index)
     .map(({ comment }) => comment);
 
+  const start = Date.parse(options.reviewWindow?.startedAt ?? "");
+  const end = Date.parse(options.reviewWindow?.completedAt ?? "");
+  if (options.requireCurrentReview && !(Number.isFinite(start) && Number.isFinite(end) && start <= end)) {
+    out.findingsUnavailable = true;
+    return;
+  }
   // Top-level Claude review comments are revision verdicts, not an append-only ledger.
-  // The live action currently posts a new comment for each head instead of updating a
-  // sticky comment, so the newest recognized verdict supersedes older review summaries.
+  // A check window binds newly created comments to this head; updated_at only orders
+  // revisions inside that window, never promotes an older head's edited approval.
   // Formal CHANGES_REQUESTED reviews and unresolved threads remain independently collected.
   for (const comment of comments) {
     if (!isRecord(comment)) continue;
 
     const classified = classifyReviewIssueComment(comment, options);
     if (classified === null) continue;
+    if (options.requireCurrentReview) {
+      const created = Date.parse(typeof comment.created_at === "string" ? comment.created_at : "");
+      if (!Number.isFinite(created)) { out.findingsUnavailable = true; return; }
+      if (created < start || created > end) continue;
+      // An edit after this check finished cannot be attributed to that review.
+      if (reviewCommentTimestamp(comment) > end) { out.findingsUnavailable = true; return; }
+    }
 
+    if (typeof comment.id === "number" || typeof comment.id === "string") {
+      out.selectedComment = { id: comment.id, kind: classified.findingsUnavailable ? "unavailable" : classified.verdictSource ?? "claude-review-summary" };
+    }
     findings.push(...classified.findings);
     if (classified.findingsUnavailable) out.findingsUnavailable = true;
     if (classified.verdict !== undefined) {
@@ -732,6 +757,7 @@ function collectClaudeIssueComments(
     }
     return;
   }
+  if (options.requireCurrentReview) out.findingsUnavailable = true;
 }
 
 /** Trusted `review-findings` blocks on the PR's top-level comments, newest first. `null` when the read failed. */
@@ -1008,12 +1034,12 @@ function isLikelyClaudeReviewComment(
 function isGithubActionsClaudeReviewComment(comment: Record<string, unknown>): comment is Record<string, unknown> & { body: string } {
   if (typeof comment.body !== "string" || isAiImplementComment(comment.body)) return false;
   return isGithubActionsBotAuthor(comment)
-    && /\*\*Claude finished\b/i.test(comment.body)
     && hasClaudeReviewHeading(comment.body);
 }
 
 function isAiImplementComment(body: string): boolean {
-  return body.includes("<!-- ai-implement");
+  // Pipeline status comments lead with their marker. Review prose may quote one.
+  return body.trimStart().startsWith("<!-- ai-implement");
 }
 
 function isClaudeAuthor(comment: Record<string, unknown>, options: ReviewLedgerOptions): boolean {
