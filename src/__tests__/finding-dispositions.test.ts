@@ -3,6 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   DISPOSITIONS_FILE,
+  buildClosedFindingsMarker,
+  parseClosedFindingsMarkers,
+  readClosedFindingKeys,
   buildDispositionInstructions,
   readFindingDispositions,
   replyToDispositionThreads,
@@ -377,5 +380,38 @@ describe("replyToDispositionThreads", () => {
       (call) => call.includes("threadId=RT_5") && call.some((a) => a.includes("resolveReviewThread")),
     );
     expect(resolveCall).toBeTruthy();
+  });
+});
+
+
+describe("closed finding PR markers", () => {
+  const entry = (disposition: FindingDisposition["disposition"]): FindingDisposition => ({ findingKey: hexKey(1), disposition, reason: "Reason" });
+  it("round trips dispositions and ignores malformed, unsupported and invalid keys", () => {
+    for (const disposition of ["invalid", "follow-up", "fixed"] as const) {
+      expect(parseClosedFindingsMarkers(buildClosedFindingsMarker([entry(disposition)]))).toEqual([[{ ...entry(disposition), reason: "" }]]);
+    }
+    expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v2 {} -->')).toEqual([]);
+    expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v1 broken -->')).toEqual([]);
+    expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v1 {"rejected":["bad",null]} -->')).toEqual([[]]);
+  });
+  it("folds all pages and markers, reopening and closing by newest disposition", () => {
+    const comment = (disposition: FindingDisposition["disposition"]) => ({ user: { login: "deployment-bot" }, body: buildClosedFindingsMarker([entry(disposition)]) });
+    const spawn = vi.fn((_args: string[]) => ({ exitCode: 0, stdout: JSON.stringify([[comment("invalid")], [comment("fixed")]]) }));
+    expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
+    spawn.mockReturnValue({ exitCode: 0, stdout: JSON.stringify([[comment("fixed")], [{ ...comment("invalid"), body: comment("invalid").body + comment("follow-up").body }]]) });
+    expect([...readClosedFindingKeys(spawn, "42", "deployment-bot")]).toEqual([hexKey(1)]);
+    expect(spawn.mock.calls[0][0]).toEqual(["api", "--paginate", "--slurp", "repos/:owner/:repo/issues/42/comments?per_page=100"]);
+  });
+  it("rejects foreign authors and fails closed without identity or history", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const spawn = vi.fn((_args: string[]) => ({ exitCode: 0, stdout: JSON.stringify([{ user: { login: "attacker" }, body: buildClosedFindingsMarker([entry("invalid")]) }]) }));
+    expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    spawn.mockClear();
+    expect(readClosedFindingKeys(spawn, "42", undefined).size).toBe(0);
+    expect(spawn).not.toHaveBeenCalled();
+    spawn.mockReturnValue({ exitCode: 1, stdout: "[]" });
+    expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
+    warn.mockRestore();
   });
 });

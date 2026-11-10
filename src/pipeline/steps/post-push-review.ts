@@ -28,6 +28,8 @@ import {
 } from "../review-ledger.js";
 import {
   buildDispositionInstructions,
+  buildClosedFindingsMarker,
+  readClosedFindingKeys,
   DISPOSITIONS_FILE,
   readFindingDispositions,
   replyToDispositionThreads,
@@ -1094,7 +1096,7 @@ function assertPrWritable(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
   }
 }
 
-function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
+function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string): string | undefined {
   assertPrWritable(ghSpawn, prNumber);
   // Bound both GitHub character counts and command argument bytes (including body=).
   // Reserve space for continuation markers below Linux’s per-argument limit.
@@ -1158,6 +1160,7 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
     }
     throw new Error(`gh pr comment failed: ${resultMessage(created)}`);
   }
+  return created.stdout.trim();
 }
 
 async function submitPrReview(
@@ -2014,8 +2017,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let priorLlmFailure = false;
     // findingKeys the fix agent disposed as "follow-up" or "invalid": dropped from gatingExternalFindings
     // on every later iteration so an external reviewer's out-of-scope ask stops gating merge
-    // readiness or reappearing in the next fix prompt. Per-run only (AII-751); a gap-fill run
-    // starts with an empty set.
+    // readiness or reappearing in the next fix prompt. Seeded from trusted PR markers.
     const closedKeys = new Set<string>();
     // Every disposition read from the fix agent's dispositions file across every push this
     // run, keyed by findingKey so a later push's entry for the same key overwrites an earlier one.
@@ -2039,18 +2041,30 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       replyToDispositionThreads(ghSpawn, prNumber, dispositions);
       for (const disposition of dispositions) {
         if (disposition.disposition === "follow-up" || disposition.disposition === "invalid") closedKeys.add(disposition.findingKey);
+        else closedKeys.delete(disposition.findingKey);
       }
       return dispositions;
     }
 
     try {
     assertPrWritable(ghSpawn, prNumber);
-    postPrComment(
+    // Always create this comment: a marker-matched historical comment cannot establish identity.
+    const startCommentUrl = postPrComment(
       ghSpawn,
       prNumber,
       `${startMarker}\n🔍 Running post-implementation review...`,
-      startMarker,
     );
+    let ownLogin: string | undefined;
+    const startCommentId = startCommentUrl?.match(/#issuecomment-(\d+)$/)?.[1];
+    if (startCommentId) {
+      try {
+        const result = ghSpawn(["api", `repos/:owner/:repo/issues/comments/${startCommentId}`]);
+        const comment = result.exitCode === 0 ? JSON.parse(result.stdout) : undefined;
+        if (typeof comment?.user?.login === "string" && comment.user.login.trim()) ownLogin = comment.user.login;
+      } catch { /* Unreadable identity seeds nothing. */ }
+    }
+    for (const key of readClosedFindingKeys(ghSpawn, prNumber, ownLogin)) closedKeys.add(key);
+    console.log(`[post-push-review] seeded ${closedKeys.size} closed finding(s) from PR markers`);
 
     const configReviewerResolution = await resolveConfigReviewerDefinitions(
       inputs.reviewerDefinitions,
@@ -2711,8 +2725,7 @@ ${externalFindingsFixBlock}
           postPrComment(
             ghSpawn,
             prNumber,
-            `${marker}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
-            marker,
+            `${marker}\n${buildClosedFindingsMarker(noChangesDispositions)}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
           );
           writeCycleSummary(inputs.workspaceDir, {
             id: `post-push-review.fix-${iteration}`,
@@ -2734,8 +2747,7 @@ ${externalFindingsFixBlock}
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the second review.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
-          marker,
+          `${marker}\n${buildClosedFindingsMarker(noChangesDispositions)}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the second review.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
         );
         writeCycleSummary(inputs.workspaceDir, {
           id: `post-push-review.fix-${iteration}`,
@@ -2840,8 +2852,7 @@ ${externalFindingsFixBlock}
       postPrComment(
         ghSpawn,
         prNumber,
-        `${marker}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}${rejectedCommentBlock()}\n\n**Merge readiness:** Awaiting follow-up review.`,
-        marker,
+        `${marker}\n${buildClosedFindingsMarker(pushedDispositions)}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}${rejectedCommentBlock()}\n\n**Merge readiness:** Awaiting follow-up review.`,
       );
       writeCycleSummary(inputs.workspaceDir, {
         id: `post-push-review.fix-${iteration}`,

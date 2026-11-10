@@ -3475,7 +3475,7 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).toBe("invalid_review");
   });
 
-  it("updates an existing marker comment instead of posting a duplicate", async () => {
+  it("creates a fresh start comment instead of trusting an existing marker", async () => {
     const reviewerOutput = { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
@@ -3503,13 +3503,9 @@ describe("postPushReviewStep", () => {
     );
 
     expect(ghSpawn).toHaveBeenCalledWith([
-      "api",
-      "repos/:owner/:repo/issues/comments/123",
-      "-X",
-      "PATCH",
-      "-f",
-      expect.stringContaining("Running post-implementation review"),
+      "pr", "comment", "42", "--body", expect.stringContaining("Running post-implementation review"),
     ]);
+    expect(ghSpawn).not.toHaveBeenCalledWith(expect.arrayContaining(["PATCH"]));
   });
 
   it("passes reviewer issues through a guarded fix prompt", async () => {
@@ -6105,16 +6101,17 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
   // Shared review-thread fixture used both by the external-finding collector
   // (review-ledger.ts) at review time and by replyToDispositionThreads' own thread
   // lookup at post-push time — both read the same live PR thread.
-  function ghSpawnWithOneExternalFinding(opts: { onGraphqlMutation?: (args: string[]) => void } = {}) {
+  function ghSpawnWithOneExternalFinding(opts: { onGraphqlMutation?: (args: string[]) => void; history?: unknown[]; ownLogin?: string } = {}) {
     const ghComments: string[] = [];
     const graphqlCalls: string[][] = [];
     const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/issues/comments/999")) return { stdout: JSON.stringify({ user: { login: opts.ownLogin } }), exitCode: 0 };
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
         return { stdout: JSON.stringify([[]]), exitCode: 0 };
       }
       if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
-        return { stdout: JSON.stringify([]), exitCode: 0 };
+        return { stdout: JSON.stringify(opts.history ?? []), exitCode: 0 };
       }
       if (args[0] === "api" && args[1] === "graphql") {
         graphqlCalls.push(args);
@@ -6151,11 +6148,86 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
       }
       if (args[0] === "pr" && args[1] === "comment") {
         ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "https://github.com/owner/repo/pull/42#issuecomment-999", exitCode: 0 };
       }
       return { stdout: "", exitCode: 0 };
     });
     return { ghSpawn, ghComments, graphqlCalls };
   }
+
+  it.each([
+    ["invalid", "deployment-bot", "deployment-bot", true],
+    ["follow-up", "deployment-bot", "deployment-bot", true],
+    ["invalid", "attacker", "deployment-bot", false],
+    ["invalid", "deployment-bot", undefined, false],
+    ["fixed", "deployment-bot", "deployment-bot", false],
+  ] as const)("seeds %s from %s with own identity %s (approved %s)", async (disposition, author, ownLogin, approved) => {
+    const marker = (d: string) => `<!-- ai-implement closed-findings v1 ${JSON.stringify({ [d === "invalid" ? "rejected" : d === "follow-up" ? "deferred" : "fixed"]: [findingKey] })} -->`;
+    const log = vi.spyOn(console, "log");
+    const warn = vi.spyOn(console, "warn");
+    const { ghSpawn } = ghSpawnWithOneExternalFinding({ ownLogin, history: [
+      { user: { login: author }, body: marker("invalid") },
+      { user: { login: author }, body: marker(disposition) },
+    ] });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "Clean.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected diff." }] }));
+    const result = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(result.approved).toBe(approved);
+    expect(log).toHaveBeenCalledWith(`[post-push-review] seeded ${approved ? 1 : 0} closed finding(s) from PR markers`);
+    const rejectedMarkers = warn.mock.calls.filter(([message]) => String(message).includes("ignored closed-findings marker from untrusted author"));
+    expect(rejectedMarkers).toHaveLength(author !== ownLogin && ownLogin ? 2 : 0);
+    log.mockRestore();
+    warn.mockRestore();
+  });
+
+  it.each([false, true])("seeds only K, reopens it on fixed, and publishes all dispositions (pushed=%s)", async (pushed) => {
+    const otherBody = "Validate the exporter input before writing.";
+    const otherKey = stableReviewFindingKey({ source: "github-review-thread", severity: "medium", body: otherBody, path: findingPath, line: findingLine });
+    const deferredKey = "d".repeat(64);
+    const base = ghSpawnWithOneExternalFinding({ ownLogin: "deployment-bot", history: [{
+      user: { login: "deployment-bot" },
+      body: `<!-- ai-implement closed-findings v1 ${JSON.stringify({ rejected: [findingKey] })} -->`,
+    }] });
+    const ghSpawn = vi.fn((args: string[]) => {
+      const result = base.ghSpawn(args);
+      // Keep both findings visible on every iteration, even after thread resolution.
+      if (args.some(arg => arg.includes("reviewThreads(first:"))) {
+        const data = JSON.parse(result.stdout);
+        const threads = data.data.repository.pullRequest.reviewThreads.nodes;
+        threads.push({ ...threads[0], id: "RT_2", comments: { nodes: [{ body: otherBody, author: { login: "reviewer" } }] } });
+        return { ...result, stdout: JSON.stringify(data) };
+      }
+      return result;
+    });
+    const fixPrompts: string[] = [];
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        fixPrompts.push(params.prompt);
+        writeDispositionsFile(workspaceDir, [
+          { findingKey, disposition: "fixed", reason: "Reworked the index." },
+          { findingKey: otherKey, disposition: "invalid", reason: "Already validated." },
+          { findingKey: deferredKey, disposition: "follow-up", reason: "Separate work." },
+        ]);
+      }
+      return structuredReviewResult({ approved: true, findings: [], summary: "Clean.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected diff." }] });
+    });
+    const gitSpawn = pushed ? makeGitSpawn() : vi.fn((args: string[]) => ({ stdout: args[0] === "rev-parse" && args[1] === "--abbrev-ref" ? "ai-implement/aii-200-x\n" : "", exitCode: 0 }));
+    const log = vi.spyOn(console, "log");
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn }, { report: vi.fn(async () => undefined) });
+    expect(log).toHaveBeenCalledWith("[post-push-review] seeded 1 closed finding(s) from PR markers");
+    log.mockRestore();
+    expect(fixPrompts).toHaveLength(2);
+    expect(fixPrompts[0]).toContain(otherKey);
+    expect(fixPrompts[0]).not.toContain(findingKey);
+    expect(fixPrompts[1]).toContain(findingKey);
+    expect(fixPrompts[1]).not.toContain(otherKey);
+    expect(out.approved).toBe(false);
+    const comments = base.ghComments.filter(comment => pushed ? comment.includes("completed and pushed changes") : comment.includes("made no code changes") || comment.includes("completed with no file changes"));
+    expect(comments).toHaveLength(2);
+    for (const comment of comments) {
+      expect(comment.match(/<!-- ai-implement closed-findings v1 /g)).toHaveLength(1);
+      expect(comment).toContain(JSON.stringify({ rejected: [otherKey], deferred: [deferredKey], fixed: [findingKey] }));
+    }
+  });
 
   function makeGitSpawn(opts: { pushFails?: boolean } = {}) {
     return vi.fn((args: string[]) => {
@@ -6286,6 +6358,9 @@ Checks:
       { report: vi.fn(async () => undefined) },
     );
 
+    const fixComment = ghComments.find(comment => comment.includes("completed and pushed changes"));
+    expect(fixComment?.match(/<!-- ai-implement closed-findings v1 /g)).toHaveLength(1);
+    expect(fixComment).toContain(JSON.stringify({ rejected: [], deferred: [findingKey], fixed: [] }));
     const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
     expect(replyCall).toBeTruthy();
     const replyBody = replyCall!.find((a) => a.startsWith("body="));
@@ -6337,6 +6412,8 @@ Checks:
     expect(invoke).toHaveBeenCalledTimes(5);
     const dispositionsOnlyComment = ghComments.find((comment) => comment.includes("made no code changes"));
     expect(dispositionsOnlyComment).toBeTruthy();
+    expect(dispositionsOnlyComment?.match(/<!-- ai-implement closed-findings v1 /g)).toHaveLength(1);
+    expect(dispositionsOnlyComment).toContain(JSON.stringify({ rejected: [], deferred: [findingKey], fixed: [] }));
   });
 
   it("closes a repeated invalid finding and resolves its thread", async () => {
