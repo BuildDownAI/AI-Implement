@@ -23,7 +23,7 @@ import type { ReviewFixWorkerTransport } from "../review-fix-worker.js";
 import { buildLocalRunnerEnv } from "../local-docker.js";
 import { decodeRunConfig, buildKgRefreshRunConfig, type RunConfigV1 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
-import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError, githubFile } from "./helpers/replies/github.js";
 import { testDb, type LoadedModules } from "./helpers/test-db.js";
@@ -33,11 +33,11 @@ import { testDb, type LoadedModules } from "./helpers/test-db.js";
 // ---------------------------------------------------------------------------
 
 type Backend = "github-actions" | "fly-machines" | "local-docker";
-type Kind = "implementation" | "gap-fill" | "planning" | "review-fix-attempt" | "legacy-review-fix" | "kg-refresh";
+type Kind = "implementation" | "gap-fill" | "planning" | "review-fix-attempt" | "kg-refresh";
 type Audience = "result" | "progress" | "publication";
 
 const BACKENDS: readonly Backend[] = ["github-actions", "fly-machines", "local-docker"];
-const KINDS: readonly Kind[] = ["implementation", "gap-fill", "planning", "review-fix-attempt", "legacy-review-fix", "kg-refresh"];
+const KINDS: readonly Kind[] = ["implementation", "gap-fill", "planning", "review-fix-attempt", "kg-refresh"];
 
 /** The run kind sets the token set; the backend never does (AII-1311 decision, 2026-10-14).
  *  Planning never pushes, so it carries no publication token (src/publication-token-vending.ts:62-65). */
@@ -46,7 +46,6 @@ const EXPECTED_TOKENS: Record<Kind, readonly Audience[]> = {
   "gap-fill": ["result", "progress", "publication"],
   planning: ["result", "progress"],
   "review-fix-attempt": ["result", "progress", "publication"],
-  "legacy-review-fix": ["result", "progress", "publication"],
   "kg-refresh": ["result", "progress", "publication"],
 };
 
@@ -56,7 +55,6 @@ const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }
 
 /** Cells the test does not run, each with its reason. Every kind × backend pair is a cell or listed here. */
 const OUT_OF_SCOPE_CELLS: ReadonlyArray<{ kind: Kind; backend: Backend; reason: string }> = [
-  { kind: "legacy-review-fix", backend: "fly-machines", reason: "the legacy review-fix queue has no Fly branch" },
 ];
 
 /** Cells whose `image` check is not run, each with its reason. */
@@ -478,19 +476,6 @@ const containerReviewFixAttempt = (backend: "fly-machines" | "local-docker"): La
     taskText: "Address the reported findings", deadlineAt: Date.now() + 60 * 60_000 });
 };
 
-const legacyReviewFix: Partial<Record<Backend, LaunchPath>> = {
-  "github-actions": async (w) => runLegacyReviewFixQueue(w),
-  "local-docker": async (w) => runLegacyReviewFixQueue(w),
-};
-
-async function runLegacyReviewFixQueue(w: World): Promise<void> {
-  w.reviewFixQueue.enqueueReviewFix({
-    issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, repo: `${OWNER}/${REPO}`, prNumber: PR_NUMBER,
-    reason: "changes_requested", sourceEventId: "parity-event-1",
-  });
-  await w.index.processReviewFixQueue(CONFIG, makeRegistry({ provider: provider(), mappings: { [TEAM]: MAPPING } }));
-}
-
 function kgDeps(w: World, claim: boolean): KgRefreshSenderDeps {
   const fly: KeptMachineFly = {
     getMachine: async (id: string) => ({ id, state: "stopped" }) as unknown as Machine,
@@ -567,15 +552,13 @@ const CELLS: readonly Cell[] = [
   ...BACKENDS.map((backend): Cell => ({ kind: "planning", backend, run: planning(backend), reference: sameKind("planning"), imageRuns: [{}] })),
   {
     kind: "review-fix-attempt", backend: "github-actions", run: reviewFixAttempt, imageRuns: [{}],
-    // The attempt has no peer on another backend: it is compared with the legacy queue's GitHub Actions launch.
-    reference: { kind: "legacy-review-fix", ignore: ["issue", "commentInstruction", "reviewFix"] },
+    // Compare the attempt with the active gap-fill launch contract.
+    reference: { kind: "gap-fill", ignore: ["issue", "commentInstruction", "reviewFix"] },
   },
   ...(["fly-machines", "local-docker"] as const).map((backend): Cell => ({
     kind: "review-fix-attempt", backend, run: containerReviewFixAttempt(backend), imageRuns: [{}],
     reference: { kind: "review-fix-attempt", ignore: ["issue", "reviewFix"] },
   })),
-  { kind: "legacy-review-fix", backend: "github-actions", runnerMode: "gha", run: legacyReviewFix["github-actions"]!, reference: sameKind("legacy-review-fix"), imageRuns: [{}] },
-  { kind: "legacy-review-fix", backend: "local-docker", runnerMode: "local", run: legacyReviewFix["local-docker"]!, reference: sameKind("legacy-review-fix"), imageRuns: [{}] },
   ...BACKENDS.map((backend): Cell => ({
     kind: "kg-refresh", backend, run: kgRefresh(backend), reference: sameKind("kg-refresh"),
     // The kept Fly machine re-resolves its image at every claim, so the claim path is checked as well as the create.
@@ -728,7 +711,7 @@ describe("launch contract parity", () => {
   });
 
   // MAPPING sets maxJobMinutes 240: (240 + 15 grace) * 60 = 15300 s, above the 2 h floor.
-  const TTL_CELLS = CELLS.filter((c) => ["implementation", "gap-fill", "legacy-review-fix"].includes(c.kind));
+  const TTL_CELLS = CELLS.filter((c) => ["implementation", "gap-fill"].includes(c.kind));
   describe.each(TTL_CELLS.map((cell) => [`${cell.kind} · ${cell.backend}`, cell] as const))("callback token TTL: %s", (_name, cell) => {
     it("expires the minted tokens at the job timeout plus grace", { timeout: 60_000 }, async () => {
       let world: World | null = null;

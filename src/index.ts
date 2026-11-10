@@ -13,7 +13,6 @@ import {
   getMappings,
   initMappingsTable,
   resolvePrDispatchBudget,
-  resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { recordReaperAction, markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
@@ -3359,7 +3358,69 @@ function acquireGapfillAdmission(input: {
   });
 }
 
-export async function processReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+export async function processReviewFixQueue(config: AppConfig, _registry: ProviderRegistry): Promise<void> {
+  const pending = getPendingReviewFixes();
+  if (pending.length === 0) return;
+
+  console.log(`[review-fix] Processing ${pending.length} pending review fix run(s)`);
+
+  const teamRepoMap = getMappings();
+
+  for (const fix of pending) {
+    try {
+      const [fixOwner, fixRepo] = fix.repo.split("/");
+      const previousDispatch = getLatestDispatchForPr(fixOwner, fixRepo, fix.prNumber);
+      const mappingEntry = Object.entries(teamRepoMap).find(
+        ([key, mapping]) => `${mapping.owner}/${mapping.repo}` === fix.repo &&
+          (!previousDispatch?.teamKey || key === previousDispatch.teamKey),
+      );
+
+      if (!mappingEntry) {
+        console.warn(`[review-fix] No mapping found for repo ${fix.repo}, skipping review fix #${fix.id}`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
+      const [, mapping] = mappingEntry;
+      {
+        if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
+        if (!restateCanServe()) continue;
+        try {
+          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
+          if (!prState) continue;
+          if (shouldSkipReviewFix(prState)) {
+            updateReviewFixStatus(fix.id, "skipped");
+            continue;
+          }
+          const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const lastEvent = listReviewFixEvents(fix.id).at(-1);
+          if (!lastEvent) continue;
+          // Periodic, identity-stable nudges repair a missed signal or a project
+          // unpaused while the same queue row waits.
+          // ReviewFixPR's existing wake never extends its first 5-second window.
+          const nudge = await reviewFixIngressClient.feedback(
+            { installationId, repository: fix.repo, prNumber: fix.prNumber },
+            undefined,
+            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
+          );
+          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
+        } catch (err) {
+          console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
+        }
+        continue;
+      }
+    } catch (err) {
+      console.warn(`[review-fix] Could not process feedback for #${fix.id}; keeping pending:`, err);
+    }
+  }
+}
+
+// C7a rollback boundary: retained without a caller until C7b removes the Legacy drain.
+// Referencing the function keeps noUnusedLocals enabled without invoking it.
+void processLegacyReviewFixQueue;
+
+async function processLegacyReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const pending = getPendingReviewFixes();
   if (pending.length === 0) return;
 
@@ -3384,34 +3445,6 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
 
       const [scopeKey, mapping] = mappingEntry;
       const runnerMode = getRunnerMode().mode;
-      if (resolveReviewFixLifecycle(mapping) === "restate") {
-        if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
-        if (!restateCanServe()) continue;
-        try {
-          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
-          if (!prState) continue;
-          if (shouldSkipReviewFix(prState)) {
-            updateReviewFixStatus(fix.id, "skipped");
-            continue;
-          }
-          const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-          const lastEvent = listReviewFixEvents(fix.id).at(-1);
-          if (!lastEvent) continue;
-          // Periodic, identity-stable nudges repair a missed signal or a project
-          // toggled away from and back to Restate while the same queue row waits.
-          // ReviewFixPR's existing wake never extends its first 5-second window.
-          const nudge = await reviewFixIngressClient.feedback(
-            { installationId, repository: fix.repo, prNumber: fix.prNumber },
-            undefined,
-            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
-          );
-          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
-        } catch (err) {
-          console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
-        }
-        continue;
-      }
       // The repository's auto-fix owns the PR: the ledger findings stay for LateExternalReview, nothing dispatches.
       if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository") {
         updateReviewFixStatus(fix.id, "skipped");

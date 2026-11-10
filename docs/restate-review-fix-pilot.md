@@ -2,7 +2,7 @@
 
 **Status:** Live evaluation pending. No live pilot success or operating-period evidence has been recorded. Complete the preflight and the separate [AII-815 live evaluation](https://linear.app/eudoxus/issue/AII-815/run-and-evaluate-the-san-review-fix-pilot) before wider enablement.
 
-This pilot moves **automatic review-fix attempts on GitHub Actions, Fly Machines and local Docker** to Restate. The runner's internal review/fix cycles and human comment-triggered gap-fill runs stay on their existing lifecycle. SQLite owns accepted feedback, finding versions, attempt snapshots, reservations, and final outcomes. Restate owns durable coordination and waits. A project defaults to Legacy; a change selects only future automatic attempts. An active attempt keeps its recorded owner. See [ADR 030](./adr/030-share-atomic-dispatch-admission-across-run-owners.md), [ADR 031](./adr/031-control-review-fix-attempts-with-restate.md), and [ADR 018](./adr/018-adopt-restate-one-run-kind-at-a-time.md).
+This pilot moves **automatic review-fix attempts on GitHub Actions, Fly Machines and local Docker** to Restate. The runner's internal review/fix cycles and human comment-triggered gap-fill runs stay on their existing lifecycle. SQLite owns accepted feedback, finding versions, attempt snapshots, reservations, and final outcomes. Restate owns durable coordination and waits. After the AII-1773 cutover, every mapped project’s pending automatic review fixes use ReviewFixPR and ReviewFixAttempt, regardless of stored lifecycle (NULL, legacy or restate). The stored lifecycle still selects webhook intake; it no longer selects queue consumption. An active attempt keeps its recorded owner. See [ADR 030](./adr/030-share-atomic-dispatch-admission-across-run-owners.md), [ADR 031](./adr/031-control-review-fix-attempts-with-restate.md), and [ADR 018](./adr/018-adopt-restate-one-run-kind-at-a-time.md).
 
 ## Planning always uses PlanningRun
 
@@ -30,27 +30,27 @@ See [restate.md](restate.md#the-planning-run) and [the fenced Legacy functions](
 
 - **Admission:** `check` reads the review process's `fixer` in the `load-pending` snapshot (`resolveReviewProcess(mapping.reviewProcess).fixer`; a closed or unmapped PR keeps `ai-implement`). For `repository`, after `load-pending` and before the `active` read, it journals `record-delegated`, marks the snapshotted `review_fix_queue` row `skipped` (not `failed`: no dispatch fault occurred), logs `[review-fix] Project <owner>/<repo> delegates fixes to the repository (<process id>), skipping review fix #<queue id>`, and returns. No `admit` call, no `ReviewFixAttempt.run`. The findings stay `open` until a reviewer approval clears them or the PR closes. An active attempt keeps its owner and completes on its own (ADR 031); the `deferred` wake stops, and after `completed` the `release` check hands off. The human `/ai-implement` comment path uses `comment_gapfill_queue` and is untouched.
 - **A change applies to the next event:** a project that changes its review process is read at the next `check`. Rows already `skipped` stay skipped when the process moves back to `ai-implement`; open findings re-enter only on a new event.
-- **Legacy projects do not read it:** a Legacy project never reaches `ReviewFixPR`, so its review process does not select a fixer there; the Legacy drain is unchanged.
+- **Every mapped project reads it:** queue consumption reaches `ReviewFixPR` regardless of stored lifecycle, so the review process selects the fixer for Legacy, unset and Restate mappings alike. The Legacy drain is retained without a caller for a code-revert rollback; Legacy runs already in flight keep their existing monitors.
 
-## Enable the lifecycle for a project
+## Configure webhook intake for a project
 
-Use these steps for any project. The save at `/admin#projects` refuses when a prerequisite is missing, and each refusal names the action.
+These steps select direct Restate webhook intake, not automatic review-fix queue routing. Pause the mapping while preparing it: leaving the lifecycle at Legacy does not prevent Restate admission. The save at `/admin#projects` refuses when a prerequisite is missing, and each refusal names the action.
 
 1. Choose the project's execution mode: GitHub Actions or Fly Machines.
 2. For GitHub Actions, use **Sync workflows** and merge the PR on the dispatch ref. The workflow must declare `run_attempt_token` and `run_publication_token`; saving probes that ref. For Fly Machines, configure the effective sessions app in runner backend settings (`FLY_SESSIONS_APP` seeds it at boot) and `FLY_SESSIONS_TOKEN` in the orchestrator environment, and use a non-Bedrock provider. Fly saves do not probe a GitHub workflow.
 3. Check that the Restate sidecar is `ready` and the endpoint is `registered`. Read the `restate` field of `GET /` or of the `get_tenant_health` tool ([Health surfaces](restate.md#health-surfaces)).
 4. Save **Review-fix & Planning Lifecycle = Restate**.
 
-## Before enabling a project (SAN trial steps marked)
+## Before unpausing a project (SAN trial steps marked)
 
 1. Confirm the feature branch and all its child checks have landed in the deployment target. Use the [fault-coverage record](./restate-testing.md) to separate real-engine/SQLite evidence from mocked GitHub/tracker behavior. The container suite is a prerequisite, not a live recovery claim.
-2. SAN only: on the Projects page, find the mapping for `BuildDownAI/AI-Implement-Sandbox` (`SAN`). Select GitHub Actions or a configured, non-Bedrock Fly Machines backend and set the team capacity to **one**. Leave review-fix lifecycle at **Legacy** while preparing. Verify the target repository and dispatch ref; the workflow capability probe checks that ref, not merely the default branch.
+2. SAN only: on the Projects page, find the mapping for `BuildDownAI/AI-Implement-Sandbox` (`SAN`). Select GitHub Actions or a configured, non-Bedrock Fly Machines backend and set the team capacity to **one**. Keep the mapping **paused** while preparing; Legacy does not disable automatic Restate admission. Verify the target repository and dispatch ref; the workflow capability probe checks that ref, not merely the default branch.
 3. For GitHub Actions, use **Sync workflows** for SAN and merge the resulting workflow PR in the sandbox repository. Confirm the installed workflow and runner declare `run_attempt_token` and `run_publication_token` on the dispatch ref. The Projects save gate verifies these capabilities again for GitHub Actions. For Fly, verify the effective sessions app and token instead.
 4. Know the one refusal about running work. The save is refused only when a run in flight (not `kg-refresh`) has no active reservation. Each run that the current code dispatches takes a reservation, so this can occur only right after an upgrade from a version that had no reservation table. It ends by itself when those runs end. No manual drain is necessary: the refusal names the count, and you save again later. Do not invent reservations for old jobs or backfill a live attempt.
 5. Confirm the Restate sidecar is healthy and its endpoint registered. Check that the selected SAN PR has no active writer, no uncertain launch, and no unconfirmed stop. A green service check does not resolve one of those attempt states.
-6. Save SAN's **Review-fix lifecycle = Restate** on Projects. A rejected save is a preflight failure: read its explicit reason (missing Fly sessions app/token, unsupported Fly/Bedrock provider, endpoint health, a run in flight with no reservation, or a GitHub Actions workflow read/capability failure) and fix that prerequisite. Do not bypass it by editing SQLite.
+6. While SAN remains paused, save **Review-fix lifecycle = Restate** on Projects for direct webhook intake. A rejected save is a preflight failure: read its explicit reason (missing Fly sessions app/token, unsupported Fly/Bedrock provider, endpoint health, a run in flight with no reservation, or a GitHub Actions workflow read/capability failure) and fix that prerequisite. Do not bypass it by editing SQLite.
 
-After activation, use one SAN PR and one feedback delivery. Observe the attempt ID, immutable owner, SQLite reservation, exact backend execution identity (GitHub run ID and attempt number, or Fly app and machine ID), runner result, PR head, and finalizer decision in the job drawer and [live evaluation](https://linear.app/eudoxus/issue/AII-815/run-and-evaluate-the-san-review-fix-pilot). The first live trial must include a real restart/recovery window and a week of operating evidence before the next run-kind migration. Approval still requires a matching valid runner result, current authority, output commit matching the current PR head, finding dispositions, and the normal merge gates. GitHub success by itself cannot approve.
+After preflight and operator approval, unpause SAN and use one SAN PR and one feedback delivery. Observe the attempt ID, immutable owner, SQLite reservation, exact backend execution identity (GitHub run ID and attempt number, or Fly app and machine ID), runner result, PR head, and finalizer decision in the job drawer and [live evaluation](https://linear.app/eudoxus/issue/AII-815/run-and-evaluate-the-san-review-fix-pilot). The first live trial must include a real restart/recovery window and a week of operating evidence before the next run-kind migration. Approval still requires a matching valid runner result, current authority, output commit matching the current PR head, finding dispositions, and the normal merge gates. GitHub success by itself cannot approve.
 
 ## Read an attempt before acting
 
@@ -86,19 +86,18 @@ This describes the integrated protected-token path, not completion of the remain
 
 AII-1336 admits eligible **non-managed** Fly and local Docker attempts through Restate. Admission uses the resolved execution path (shadow resolves to authoritative GitHub Actions), rather than requiring a GHA workflow for containers. Every backend retains installation, open/unmerged-PR and callback checks. Container paths defer with an actionable warning when `extraEnv` contains GHA-only ephemeral execution policy variables, even if their values are empty; the row stays pending and no attempt budget or capacity is consumed.
 
-| Lifecycle | Resolved path / condition | Admission outcome |
+| Stored lifecycle | Resolved path / condition | Admission outcome |
 | --- | --- | --- |
-| Legacy or unset | Any | Existing Legacy queue routing |
-| Restate | GitHub Actions, including shadow | Existing workflow capability probe |
-| Restate | Fly Machines, sessions token and app configured, provider not Bedrock | Admit non-managed attempt |
-| Restate | Fly Machines, missing token/app or Bedrock | Defer; pending row and warning |
-| Restate | Local Docker, local runner image configured, provider not Bedrock | Admit non-managed attempt |
-| Restate | Local Docker, missing image or Bedrock | Defer; pending row and warning |
-| Restate | Managed Fly or local Docker | Defer with `managed_backend_unsupported` |
-| Restate | Filesystem ticketing outside local runner mode | Skip row; log `Filesystem project <key> requires local runner mode` |
-| Restate | Paused mapping | Not selected for admission |
+| Any (NULL, legacy, restate) | GitHub Actions, including shadow | Existing workflow capability probe |
+| Any (NULL, legacy, restate) | Fly Machines, sessions token and app configured, provider not Bedrock | Admit non-managed attempt |
+| Any (NULL, legacy, restate) | Fly Machines, missing token/app or Bedrock | Defer; pending row and warning |
+| Any (NULL, legacy, restate) | Local Docker, local runner image configured, provider not Bedrock | Admit non-managed attempt |
+| Any (NULL, legacy, restate) | Local Docker, missing image or Bedrock | Defer; pending row and warning |
+| Any (NULL, legacy, restate) | Managed Fly or local Docker | Require backend prerequisites and managed model-auth readiness; defer transient failures and fail permanent configuration errors |
+| Any (NULL, legacy, restate) | Filesystem ticketing outside local runner mode | Skip row; log `Filesystem project <key> requires local runner mode` |
+| Any (NULL, legacy, restate) | Paused mapping | Not selected; queue row stays pending until unpause |
 
-The poll loop nudges `ReviewFixPR` for every unpaused Restate mapping, including Fly and local Docker; local Restate work no longer falls through to Legacy dispatch. Managed container admission remains AII-1770. Admin saves now allow configured, non-Bedrock Fly projects without a workflow probe; attempt reads report the stored backend binding. GitHub run fields and the GitHub-only Adopt body apply to Actions attempts; use backend identity from the attempt details for containers. This admission change authorizes no live settings or credential adoption: AII-1338/1775 retain backend proof and deployment gates. See the [ADR 031 amendment](./adr/031-control-review-fix-attempts-with-restate.md#amendment-2026-11-09-admit-non-managed-review-fix-on-fly-and-local-docker).
+The poll loop nudges `ReviewFixPR` for every unpaused mapping, including Fly and local Docker, regardless of stored lifecycle. Missing callback configuration, unavailable Restate, unknown PR state or missing feedback events leave rows pending; closed or merged PRs are skipped. There is no fallback to Legacy dispatch. Managed container admission uses the AII-1770 readiness checks. Admin saves now allow configured, non-Bedrock Fly projects without a workflow probe; attempt reads report the stored backend binding. GitHub run fields and the GitHub-only Adopt body apply to Actions attempts; use backend identity from the attempt details for containers. This admission change authorizes no live settings or credential adoption: AII-1338/1775 retain backend proof and deployment gates. See the [ADR 031 amendment](./adr/031-control-review-fix-attempts-with-restate.md#amendment-2026-11-09-admit-non-managed-review-fix-on-fly-and-local-docker).
 
 ## Callback URL and the "run ended without a result" path (AII-1273)
 
@@ -134,7 +133,7 @@ calls or authorize rerunning work. Attribution is diagnostic and does not establ
 
 For an endpoint change that cannot be registered compatibly, close **new admission and new external invocations** on the old endpoint using the deployment drain control. Leave result/cancel delivery and already-running workflow completion available. Keep incoming review feedback in SQLite while delivery into that endpoint is held. Check the drain census for queued, running, suspended, and unresolved owned invocations; include unknown launches and unconfirmed terminations. A failed census is unknown occupancy, not an empty endpoint. Register the replacement only after the old deployment is proven drained; persistent Virtual Object state alone does not count as an active invocation. See [Restate endpoint operations](./restate.md) and [drain contract](../src/restate/drain.ts).
 
-To disable the pilot, first change SAN's project choice to **Legacy** for future automatic review-fix admissions. This does not transfer, cancel, or free active Restate owners. Drain each existing attempt to a verified terminal backend state and final outcome before replacing incompatible code or reverting the branch. Preserve SQLite records and the Restate journal so active ownership stays readable. A code revert with unresolved Restate-owned attempts is not a safe rollback.
+To stop new automatic review-fix admissions for SAN, first **pause its project mapping**. Pending rows remain pending and can run after unpause. Changing the stored lifecycle to Legacy only changes webhook intake and does not stop Restate admission. To roll back queue routing, revert the cutover code after draining active owners; the retained Legacy drain has no caller in this version. This does not transfer, cancel, or free active Restate owners. Drain each existing attempt to a verified terminal backend state and final outcome before replacing incompatible code or reverting the branch. Preserve SQLite records and the Restate journal so active ownership stays readable. A code revert with unresolved Restate-owned attempts is not a safe rollback.
 
 ## Evidence, limits, and evaluation record
 
