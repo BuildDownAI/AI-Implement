@@ -17,6 +17,13 @@ vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationInt
   complete: (id: string) => { const intent = ordinaryIntents.get(id); if (intent) intent.done = true; },
   remove: (id: string) => ordinaryIntents.delete(id),
 }) }));
+// Composition tests isolate ownership; the SQLite integration cases below restore the real port.
+vi.mock("../restate/implementation-run-owner.js", () => ({
+  requireImplementationRunOwner: (input: ImplementationRunInput) => ({ input, generation: 3, createdAt: 1000, jobId: null, state: "launching" }),
+  updateImplementationRunOwner: vi.fn(),
+  readImplementationRunOwner: (id: string) => ordinaryIntents.get(`owner:${id}`)?.snapshot ?? null,
+  releaseImplementationRunOwner: vi.fn(),
+}));
 const captured = vi.hoisted(() => ({ deps: undefined as unknown }));
 vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...await original<object>(), createImplementationRunWorkflow: (d: unknown) => { captured.deps = d; return {}; } }));
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
@@ -278,6 +285,8 @@ it("parked gap-analysis admission passes the parked flag", async () => {
 });
 it("absent gapFill preserves existing lookup calls and result", async () => {
   const first = { ...run, gapFill: undefined };
+  // Ordinary lookup needs the original target, just as a real admitted owner stores it.
+  ordinaryIntents.set(`owner:${first.dispatchId}`, { snapshot: { input: first, mapping }, done: false });
   const existing = createImplementationFindExistingRun({ getMapping: input.getMapping!,
     getToken: owner => getInstallationToken(input.config.githubAppId, input.config.githubAppPrivateKey, owner) });
   runs([88, 87]);
@@ -512,6 +521,7 @@ it.each(["accepted", "lost-ack", "crash-before-row"])("Fly %s recovery keeps the
     expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ sessionImage: "repository-override" }));
   }
   vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ machineId: "same-machine", executionMode: "fly-machines", status: "running", approved: false, failure: null, failureCommentedAt: null, conclusion: null, groupingParent: false }));
+  ordinaryIntents.set(`owner:${req.dispatchId}`, { snapshot: { input: req, generation: 3, createdAt: 1000, jobId: "same-machine", state: "launching" }, done: false });
   vi.mocked(input.remediateStuckJob).mockImplementationOnce(async (_config, _provider, _job, _reason, stopRunner) => {
     expect(await stopRunner!()).toBe(true);
     return true;
@@ -548,6 +558,8 @@ it("local fallback image is persisted before an ambiguous launch and recovered",
 
 import { testDb } from "./helpers/test-db.js";
 it("durably recovers accepted launch and shares terminal bookkeeping without duplicate jobs", async () => {
+  vi.doUnmock("../restate/implementation-run-owner.js");
+  vi.doUnmock("../restate/implementation-launch-intent.js");
   vi.doUnmock("../agent-run-preparation.js");
   vi.doUnmock("../dedup.js");
   vi.doUnmock("../dispatch-admission.js");
@@ -635,11 +647,11 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(vi.mocked(fetch).mock.calls.at(-1)?.[0]).toContain("Org/repo/actions/workflows/");
 
   // Persist an intent without calling dispatch, then close SQLite and reconstruct modules.
-  const preCall = { ...recoveryRun, dispatchId: "pre-call" };
+  const preCall = { ...recoveryRun, dispatchId: "pre-call", gapFill: { ...recoveryRun.gapFill!, prNumber: 43 } };
   expect(reserve("pre-call", 43).ok).toBe(true);
   const preCallAdmission = database.modules.admission.read("pre-call");
   queue.stageCommentGapfillLaunch(preCall.dispatchId, {
-    record: { issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "Frozen title", dispatchId: "pre-call", teamKey: "ENG", repo: "Org/repo", admissionGeneration: 3, phase: "gap-analysis", trigger: "comment", contract: "envelope" },
+    record: { issueId: "issue", issueIdentifier: "ENG-1", issueTitle: "Frozen title", dispatchId: "pre-call", teamKey: "ENG", repo: "Org/repo", admissionGeneration: preCallAdmission!.generation, phase: "gap-analysis", trigger: "comment", contract: "envelope" },
     target: { owner: "Org", repo: "repo", workflowFile: mapping.workflowFile }, accepted: false,
   });
   grant("pre-call");
@@ -668,7 +680,7 @@ it("durably recovers accepted launch and shares terminal bookkeeping without dup
   expect(reopened.dedup.getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE grant_id = 'pre-call'").get()).toEqual({ revoked_at: expect.any(Number) });
   expect(reopened.dedup.getDb().prepare("SELECT recovery_status FROM model_profile_reservations WHERE dispatch_id = 'pre-call'").get()).toEqual({ recovery_status: "released" });
   expect(reopened.admission.read("pre-call")).toEqual(preCallAdmission);
-  expect(reopened.log.getJobByDispatchId("pre-call")).toMatchObject({ issueTitle: "Frozen title", repo: "Org/repo", admissionGeneration: 3, contract: "envelope" });
+  expect(reopened.log.getJobByDispatchId("pre-call")).toMatchObject({ issueTitle: "Frozen title", repo: "Org/repo", admissionGeneration: preCallAdmission!.generation, contract: "envelope" });
   expect(dispatchGhaGapfill).toHaveBeenCalledTimes(1);
   expect(resolveManagedDecision).toHaveBeenCalledTimes(1);
 

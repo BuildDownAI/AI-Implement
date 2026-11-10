@@ -271,6 +271,10 @@ it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].flatMap
     finalize: () => import("../implementation-finalize.js"),
   } });
   const directory = testDir("intent-tracker");
+  // Production status comments are best effort and may outlive the launch effect.
+  // Drain their real provider writes before testDir removes the filesystem root.
+  const pendingComments: Promise<void>[] = [];
+  onTestFinished(async () => { await Promise.allSettled(pendingComments); });
   await writeFile(join(directory, "ENG-1.md"), "---\ntitle: Recovery\n---\nOriginal task\n");
   const mapping = makeMapping({
     ticketingProvider: tracker,
@@ -311,10 +315,14 @@ it.each(["jira", "filesystem"].flatMap(tracker => ["missing", "changed"].flatMap
   };
   // Make the original provider use the actual registry for bookkeeping, while avoiding a tracker issue lookup.
   input.resolveProvider = vi.fn<ImplementationRunProductionInput["resolveProvider"]>(async (m, scope) => {
-    if (scope) return registry.forRecovery(m, scope);
-    const provider = await registry.forMapping(m);
+    const provider = scope ? await registry.forRecovery(m, scope) : await registry.forMapping(m);
     return new Proxy(provider, { get(target, key) {
-      if (key === "findByKey") return async () => issue;
+      if (!scope && key === "findByKey") return async () => issue;
+      if (key === "postComment") return (id: string, body: string) => {
+        const pending = target.postComment(id, body);
+        pendingComments.push(pending);
+        return pending;
+      };
       const value = Reflect.get(target, key);
       return typeof value === "function" ? value.bind(target) : value;
     } });

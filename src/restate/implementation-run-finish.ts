@@ -15,7 +15,7 @@ const CALLBACK_OWNED_CONCLUSIONS = new Set(["operator_cancelled", "runner_approv
 
 export interface ImplementationFinishDependencies {
   getJob(dispatchId: string): Job | null;
-  /** `updateJobStatus`: writes the row and, with `backendTerminated`, releases the admission. */
+  /** `updateJobStatus`: owned terminal writes always defer admission release to the workflow. */
   closeRow(job: Job, status: JobStatus, conclusion: string, opts?: { backendTerminated?: boolean; skipAdmissionRelease?: boolean }): void;
   /** True when the PR is already merged (auto-merge beat the finish step). */
   isPrMerged(job: Job, prUrl: string): Promise<boolean>;
@@ -74,8 +74,7 @@ export async function finishImplementationJob(
     }
   }
 
-  const backendTerminated = outcome.kind === "run_ended";
-  const closeOpts = backendTerminated ? { backendTerminated: true } : { skipAdmissionRelease: true };
+  const closeOpts = { skipAdmissionRelease: true };
 
   if (!facts.reported) {
     // The backend ended and no callback came: the failure fix-up.
