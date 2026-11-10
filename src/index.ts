@@ -2299,50 +2299,6 @@ export async function confirmAdmissionTerminated(
   return false;
 }
 
-/**
- * Fast-path companion to `confirmAdmissionTerminated` for the planning callback
- * (AII-783 review, third round, on PR #681): the callback marks the job row
- * `completed` with `skipAdmissionRelease` because its own self-report is not proof the
- * backend has exited, but that write also drops the job out of `getInFlightJobs()`'s
- * `dispatched`/`running` set — the set every per-poll-cycle monitor (GHA run-status
- * poll, Fly/local monitor) reads from. Relying solely on `sweepStaleAdmissions`'s
- * 6-hour floor to eventually notice an already-finished backend would strand the common
- * case — a planning run that finishes in minutes — at full team capacity for hours,
- * reversing the very "accelerate the planning→implementation handoff" optimization the
- * callback exists for.
- *
- * This runs the same termination oracle once, immediately, right after the callback
- * records the job as completed. A backend already confirmed terminal releases the
- * reservation right away; a still-running or unconfirmable backend is a no-op here —
- * the reservation then stays held exactly as `skipAdmissionRelease` left it, for a
- * later monitor tick or the stale-admission sweep to resolve.
- */
-export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatchId: string): Promise<void> {
-  const record = readAdmission(dispatchId);
-  if (!record || record.releasedAt !== null) return;
-
-  let confirmed: boolean;
-  try {
-    confirmed = await confirmAdmissionTerminated(config, {
-      dispatchId: record.dispatchId,
-      mappingKey: record.mappingKey,
-      backend: record.backend,
-      lifecycleOwner: record.lifecycleOwner,
-      generation: record.generation,
-      ageMs: Date.now() - record.createdAt,
-    });
-  } catch (err) {
-    console.error(`[admission] Fast-path confirmAdmissionTerminated threw for dispatch=${dispatchId}:`, err);
-    return;
-  }
-  if (!confirmed) return;
-
-  const outcome = releaseAdmission(record.dispatchId, record.lifecycleOwner, record.generation, "finalized");
-  if (outcome.status === "released") {
-    console.log(`[admission] Fast-released planning admission dispatch=${dispatchId} mapping=${record.mappingKey}`);
-  }
-}
-
 // stuck_review_fix: remediateStuckJob already closed out a review-fix run and alerted the human.
 const TTL_STALE_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending", "stuck_review_fix"]);
 
@@ -4612,7 +4568,6 @@ function startServer(
           },
           checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({
             ingress: createPlanningRunIngressClient(),
-            legacy: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
           }),
           checkImplementationAdmissionTermination: createImplementationAdmissionTerminationHook({
             ingress: createImplementationRunIngressClient(),
