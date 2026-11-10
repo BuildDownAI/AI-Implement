@@ -42,6 +42,7 @@ vi.mock("../log.js", () => ({
   recordGhaRunCompleted: vi.fn(),
 }));
 vi.mock("../dedup.js", () => ({ markDispatched: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn().mockReturnValue(null) }));
 vi.mock("../dispatch-breaker.js", () => ({ recordDispatchFailure: vi.fn().mockReturnValue({ tripped: false, failures: 1 }) }));
 vi.mock("../base-branch.js", () => ({ postBranchComment: vi.fn() }));
 vi.mock("../status-events.js", () => ({ postStatusComment: vi.fn().mockResolvedValue(undefined) }));
@@ -729,6 +730,17 @@ describe("production deps", () => {
       await d.finishJob("d-1", { kind: "deadline" });
       expect(vi.mocked(input.remediateStuckJob).mock.calls[0][4]).toBeTypeOf("function");
       expect(vi.mocked(input.remediateStuckJob).mock.calls[0][5]).toEqual({ ownerCall: true });
+    });
+
+    it.each([false, true])("ordinary Fly remediation uses the persisted app when present: %s", async persisted => {
+      vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ id: 7, dispatchId: "d-1", teamKey: "ENG", issueId: "i-1", status: "running", conclusion: null, failure: null, approved: false, executionMode: "fly-machines", machineId: "m-1" }));
+      if (persisted) intents.set("d-1", { snapshot: { flyApp: "original-app" }, done: false });
+      const { input, d } = compose();
+      vi.mocked(getMachine).mockResolvedValue({ id: "m-1", state: "stopped", config: {} } as never);
+      await d.finishJob("d-1", { kind: "deadline" });
+      const stopRunner = vi.mocked(input.remediateStuckJob).mock.calls[0][4];
+      expect(await stopRunner!()).toBe(true);
+      expect(destroyMachine).toHaveBeenCalledWith("fly-token", persisted ? "original-app" : "fly-app", "m-1");
     });
 
     it("a merged PR finalizes as merged", async () => {

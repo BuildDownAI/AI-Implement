@@ -39,7 +39,7 @@ export interface DispatchFlyGapfillInput {
   commentInstruction?: string;
   decision: ManagedDispatchDecision;
   /** Called after preparation, immediately before the potentially ambiguous create. */
-  onBeforeLaunch: (machineSize: ReturnType<typeof guestSize>, machineNonce: string) => void;
+  onBeforeLaunch: (machineSize: ReturnType<typeof guestSize>, machineNonce: string, sessionImage: string) => void;
 }
 
 export interface DispatchFlyGapfillResult {
@@ -167,7 +167,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
     const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
     console.log(`[comment-gapfill] process-level secrets for ${prLog.issueIdentifier ?? prLog.issueId}: [${secretNames.join(", ")}]`);
   }
-  input.onBeforeLaunch(guestSize(machineConfig), machineNonce);
+  input.onBeforeLaunch(guestSize(machineConfig), machineNonce, resolvedImage);
   const machine = await createMachine(flyToken, flyApp, machineConfig);
   return { machine: { id: machine.id, name: machine.name }, resolvedImage };
 }
