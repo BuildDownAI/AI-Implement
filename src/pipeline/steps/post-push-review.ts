@@ -2012,14 +2012,18 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // (PrMergedError or OperatorCancelledError) thrown afterward while posting the failure
     // comment is suppressed so the genuine failure conclusion surfaces rather than being masked.
     let priorLlmFailure = false;
-    // findingKeys the fix agent disposed as "follow-up": dropped from gatingExternalFindings
+    // findingKeys the fix agent disposed as "follow-up" or "invalid": dropped from gatingExternalFindings
     // on every later iteration so an external reviewer's out-of-scope ask stops gating merge
     // readiness or reappearing in the next fix prompt. Per-run only (AII-751); a gap-fill run
     // starts with an empty set.
-    const deferredKeys = new Set<string>();
+    const closedKeys = new Set<string>();
     // Every disposition read from the fix agent's dispositions file across every push this
     // run, keyed by findingKey so a later push's entry for the same key overwrites an earlier one.
     const findingDispositionsByKey = new Map<string, FindingDisposition>();
+    // Keep rejection reasons even if a later fix pass writes another disposition for the key.
+    const rejectedFindingsByKey = new Map<string, FindingDisposition>();
+    const rejectedCommentBlock = (): string => rejectedFindingsByKey.size === 0 ? "" :
+      `\n\n### Rejected by the fix pass\n\n${[...rejectedFindingsByKey.values()].map((d) => `- Finding \`${d.findingKey}\`: ${d.reason}`).join("\n")}`;
     // Reads and applies the fix agent's dispositions file (reply to threads, defer follow-ups,
     // record for outputs), then deletes it so a later iteration never re-reads a stale file.
     // Called both after a successful push and when the fix pass made no pushable change —
@@ -2030,10 +2034,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       fs.rmSync(path.join(inputs.workspaceDir, DISPOSITIONS_FILE), { force: true });
       for (const disposition of dispositions) {
         findingDispositionsByKey.set(disposition.findingKey, disposition);
+        if (disposition.disposition === "invalid") rejectedFindingsByKey.set(disposition.findingKey, disposition);
       }
       replyToDispositionThreads(ghSpawn, prNumber, dispositions);
       for (const disposition of dispositions) {
-        if (disposition.disposition === "follow-up") deferredKeys.add(disposition.findingKey);
+        if (disposition.disposition === "follow-up" || disposition.disposition === "invalid") closedKeys.add(disposition.findingKey);
       }
       return dispositions;
     }
@@ -2252,10 +2257,10 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const advisoryReviewFindings = reviewLedger.filter((finding) => !findingGates(finding));
       // A finding the fix agent disposed as "follow-up" on an earlier iteration is dropped here,
       // before the merge-readiness decision and before it can reappear in the next fix prompt.
-      // An "invalid" disposition is not filtered — it stays gating so the next review decides.
+      // Rejected findings also stay closed when the reviewer repeats their key.
       const reportedGatingExternalFindings = gatingReviewFindings
         .filter((finding) => finding.source !== "ai-implement-internal")
-        .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+        .filter((finding) => !closedKeys.has(stableReviewFindingKey(finding)));
       let issues = internalIssuesFromReviewLedger(gatingReviewFindings);
       // While the external check on the current head is still running, the findings read above may
       // belong to an older head (a fix pass may already have fixed them). They do not gate; the
@@ -2275,8 +2280,10 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       // Aggregate severity counts and empty negative verdicts remain blocking.
       const externalReviewVerdictBlocks = (externalFindingsResult.verdictSource === "review-contract"
         && (externalFindingsResult.verdict === "incomplete"
-          || (externalFindingsResult.verdict === "changes_requested" && !minorOnlyContractFindings)))
-        || (processVerdict?.verdict === "changes_requested" && !minorOnlyProcessFindings);
+          || (externalFindingsResult.verdict === "changes_requested" && !minorOnlyContractFindings
+            && !(contractFindings.length > 0 && contractFindings.every((f) => closedKeys.has(stableReviewFindingKey(f)))))))
+        || (processVerdict?.verdict === "changes_requested" && !minorOnlyProcessFindings
+          && !(processVerdict.findings.length > 0 && processVerdict.findings.every((f) => closedKeys.has(stableReviewFindingKey(f)))));
       console.log(
         `[post-push-review] Review ledger findings: gating=${gatingReviewFindings.length} advisory=${advisoryReviewFindings.length}`,
       );
@@ -2340,7 +2347,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n🟠 The second review is not complete. At least one required reviewer did not finish.\n\n${reviewReportForComment(reviewUrl, feedback)}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; the review did not finish.`,
+          `${marker}\n🟠 The second review is not complete. At least one required reviewer did not finish.\n\n${reviewReportForComment(reviewUrl, feedback)}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required; the review did not finish.`,
           marker,
         );
         break;
@@ -2378,7 +2385,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
           postPrComment(
             ghSpawn,
             prNumber,
-            `${marker}\n⏳ Internal review passed. Claude's review found blocking issues; waiting for the repository's auto-fix. No AI-Implement fix pass will run.${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}\n\n**Merge readiness:** Not ready to merge; waiting for the repository's auto-fix.`,
+            `${marker}\n⏳ Internal review passed. Claude's review found blocking issues; waiting for the repository's auto-fix. No AI-Implement fix pass will run.${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge; waiting for the repository's auto-fix.`,
             marker,
           );
           break;
@@ -2394,7 +2401,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Both AI-Implement's review and Claude's review found blocking issues. No fix pass runs, so the repository's auto-fix and AI-Implement never push at once.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Manual review required.`,
+          `${marker}\n⚠️ Both AI-Implement's review and Claude's review found blocking issues. No fix pass runs, so the repository's auto-fix and AI-Implement never push at once.${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required.`,
           marker,
         );
         break;
@@ -2424,7 +2431,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But the external review check did not finish in the time limit. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}\n\n**Merge readiness:** Manual review required; the external review check did not finish.`,
+          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But the external review check did not finish in the time limit. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required; the external review check did not finish.`,
           marker,
         );
         break;
@@ -2462,7 +2469,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not approving here; the late external review now decides (a verdict whose findings are all deferred follow-ups does not hold the PR).${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}\n\n**Merge readiness:** Waiting for the late external review to decide.`,
+          `${marker}\n⚠️ Internal review passed, but the external review verdict was unavailable or incomplete. Not approving here; the late external review now decides (a verdict whose findings are all deferred follow-ups does not hold the PR).${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${rejectedCommentBlock()}\n\n**Merge readiness:** Waiting for the late external review to decide.`,
           marker,
         );
         break;
@@ -2491,7 +2498,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But AI-Implement cannot read the verdict of the external review. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Manual review required; the external review verdict is not available.`,
+          `${marker}\n⚠️ The AI-Implement reviewers found no problems. But AI-Implement cannot read the verdict of the external review. AI-Implement did not approve the change.${internalReviewSummaryBlock(reviewReportForComment(reviewUrl, verdict.feedback))}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${rejectedCommentBlock()}\n\n**Merge readiness:** Manual review required; the external review verdict is not available.`,
           marker,
         );
         break;
@@ -2526,7 +2533,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${reviewReportForComment(reviewUrl, feedback)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Ready to merge.`,
+          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${reviewReportForComment(reviewUrl, feedback)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${rejectedCommentBlock()}\n\n**Merge readiness:** Ready to merge.`,
           marker,
         );
         break;
@@ -2543,7 +2550,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ AI-Implement did not approve the change. ${terminationReasonSentence("iterations_exhausted", iteration)} ${reasonCodeTag("iterations_exhausted")}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ AI-Implement did not approve the change. ${terminationReasonSentence("iterations_exhausted", iteration)} ${reasonCodeTag("iterations_exhausted")}${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -2559,7 +2566,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 
@@ -2669,7 +2676,7 @@ ${externalFindingsFixBlock}
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} could not complete.\n\n${failure}\n\nNo automated fix was pushed in this pass.\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} could not complete.\n\n${failure}\n\nNo automated fix was pushed in this pass.${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         feedback = failure;
@@ -2698,7 +2705,7 @@ ${externalFindingsFixBlock}
       if (!status.stdout.trim()) {
         const noChangesDispositions = hasGatingExternalFindings ? applyFixPassDispositions() : [];
         const remainingGatingExternalFindings = gatingExternalFindings
-          .filter((finding) => !deferredKeys.has(stableReviewFindingKey(finding)));
+          .filter((finding) => !closedKeys.has(stableReviewFindingKey(finding)));
         if (hasGatingExternalFindings && issues.length === 0 && remainingGatingExternalFindings.length === 0) {
           // Every gating item was an external finding, and the fix agent dispositioned all
           // of them instead of touching code — a complete outcome with nothing to push. Let
@@ -2707,7 +2714,7 @@ ${externalFindingsFixBlock}
           postPrComment(
             ghSpawn,
             prNumber,
-            `${marker}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
+            `${marker}\nℹ️ Fix pass ${fixPassLabel(iteration, maxIterations)} made no code changes; disposed of ${gatingExternalFindings.length} external finding(s) instead.${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge; re-reviewing.`,
             marker,
           );
           writeCycleSummary(inputs.workspaceDir, {
@@ -2730,7 +2737,7 @@ ${externalFindingsFixBlock}
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the second review.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the second review.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${reviewFindingsCommentBlock(gatingExternalFindings)}${reviewFindingsCommentBlock(advisoryExternalFindings, { advisory: true })}${reviewerSummaryBlock(reviewReportForComment(reviewUrl, feedback), issues)}${rejectedCommentBlock()}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         writeCycleSummary(inputs.workspaceDir, {
@@ -2836,7 +2843,7 @@ ${externalFindingsFixBlock}
       postPrComment(
         ghSpawn,
         prNumber,
-        `${marker}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}\n\n**Merge readiness:** Awaiting follow-up review.`,
+        `${marker}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}${rejectedCommentBlock()}\n\n**Merge readiness:** Awaiting follow-up review.`,
         marker,
       );
       writeCycleSummary(inputs.workspaceDir, {

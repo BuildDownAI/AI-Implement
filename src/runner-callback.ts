@@ -39,6 +39,7 @@ import {
   getReviewFindingsByKeys,
   listOpenReviewFindings,
   markReviewFindingsDeferredByKeys,
+  markReviewFindingsRejectedByKeys,
   markReviewFindingsResolvedByIds,
   markReviewFindingsResolvedForPrSeenBefore,
   type StoredReviewFinding,
@@ -1171,6 +1172,17 @@ async function handleRunnerResultInternal(
     }
   }
 
+  // Rejections apply to every phase, before fixed-only snapshot resolution.
+  const rejectedKeys = sanitizedFindingDispositions.filter((d) => d.disposition === "invalid").map((d) => d.findingKey);
+  let rejectedCount = 0;
+  if (rejectedKeys.length > 0) {
+    const job = getJobByDispatchId(claims.dispatchId);
+    const prNumber = parsePrNumber(job?.prUrl ?? null);
+    if (job?.repo && prNumber !== null) {
+      rejectedCount = markReviewFindingsRejectedByKeys(job.repo, prNumber, rejectedKeys);
+    }
+  }
+
   if (input.body.outcome === "failure") {
     const job = getJobByDispatchId(claims.dispatchId);
     const isInitialRun = !job?.prUrl;
@@ -1419,11 +1431,11 @@ async function handleRunnerResultInternal(
     const prNumber = parsePrNumber(job?.prUrl ?? null);
     if (job?.repo && prNumber !== null) {
       const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
-      // Only findings the agent disposed `fixed` or `invalid` resolve; an
-      // undisposed finding stays open so the next fix run sees it. `follow-up` rows were
-      // deferred above and are no longer open.
+      // Only findings the agent disposed `fixed` resolve; an
+      // undisposed finding stays open so the next fix run sees it. Follow-ups and
+      // rejections were closed above and are no longer open.
       const resolveKeys = sanitizedFindingDispositions
-        .filter((d) => d.disposition === "fixed" || d.disposition === "invalid")
+        .filter((d) => d.disposition === "fixed")
         .map((d) => d.findingKey);
       const openNow = listOpenReviewFindings(snapshot?.repo ?? job.repo, snapshot?.prNumber ?? prNumber);
       const snapshotIds = snapshot ? new Set(snapshot.findingIds) : null;
@@ -1434,7 +1446,7 @@ async function handleRunnerResultInternal(
         ? markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds, resolveKeys)
         : markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt, resolveKeys);
       console.log(
-        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} left_open=${allowedCount - resolvedCount}`,
+        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} rejected=${rejectedCount} left_open=${allowedCount - resolvedCount}`,
       );
       // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.

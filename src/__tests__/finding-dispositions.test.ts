@@ -129,6 +129,8 @@ describe("buildDispositionInstructions", () => {
     expect(text).toContain("fixed");
     expect(text).toContain("follow-up");
     expect(text).toContain("invalid");
+    expect(text).toContain("This closes the finding");
+    expect(text).toContain("reason is shown to a person");
     expect(text).toMatch(/never.*follow-up/i);
   });
 });
@@ -241,7 +243,7 @@ describe("replyToDispositionThreads", () => {
     ];
   }
 
-  it("resolves a follow-up thread, replies without resolving on invalid, ignores fixed, and marks every reply", () => {
+  it("resolves a follow-up thread, replies and resolves on invalid, ignores fixed, and marks every reply", () => {
     const calls: string[][] = [];
     const ghSpawn: GhSpawn = (args) => {
       calls.push(args);
@@ -283,10 +285,22 @@ describe("replyToDispositionThreads", () => {
     const invalidResolveCall = calls.find(
       (call) => call.includes("threadId=RT_2") && call.some((a) => a.includes("resolveReviewThread")),
     );
-    expect(invalidResolveCall).toBeUndefined();
+    expect(invalidResolveCall).toBeTruthy();
+    expect(calls.indexOf(invalidResolveCall!)).toBeGreaterThan(calls.indexOf(invalidReplyCall!));
 
     const fixedCall = calls.find((call) => call.includes("threadId=RT_3"));
     expect(fixedCall).toBeUndefined();
+  });
+
+  it("does not resolve an invalid thread if its reply fails", () => {
+    const calls: string[][] = [];
+    replyToDispositionThreads((args) => {
+      calls.push(args);
+      if (args.some(a => a.includes("addPullRequestReviewThreadReply"))) return { exitCode: 1, stdout: "", stderr: "reply failed" };
+      return threadsResponse();
+    }, "42", [{ findingKey: invalidKey, disposition: "invalid", reason: "Already correct." }]);
+    expect(calls.some(args => args.some(a => a.includes("addPullRequestReviewThreadReply")))).toBe(true);
+    expect(calls.some(args => args.some(a => a.includes("resolveReviewThread")))).toBe(false);
   });
 
   it("does not throw when a gh call errors, and continues to the remaining threads", () => {

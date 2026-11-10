@@ -46,6 +46,19 @@ describe("review ledger store", () => {
     ]);
   });
 
+  it("keeps rejected findings closed on re-report while a new key stays open", () => {
+    const input = { repo: "org/repo", prNumber: 42, source: "claude-review-summary" as const, severity: "blocking" as const, body: "Already handled." };
+    const id = store.upsertReviewFinding(input);
+    const key = store.getReviewFindingById(id)!.findingKey;
+    expect(store.markReviewFindingsRejectedByKeys(input.repo, input.prNumber, [key])).toBe(1);
+    const closed = store.getReviewFindingById(id)!;
+    store.upsertReviewFinding(input);
+    expect(store.getReviewFindingById(id)).toMatchObject({ status: "rejected", resolvedAt: closed.resolvedAt, revision: closed.revision + 1 });
+    expect(store.listOpenReviewFindings(input.repo, input.prNumber)).toEqual([]);
+    store.upsertReviewFinding({ ...input, body: "A different defect." });
+    expect(store.listOpenReviewFindings(input.repo, input.prNumber)).toHaveLength(1);
+  });
+
   it("re-exports stableReviewFindingKey unchanged after the move to finding-dispositions.ts", () => {
     expect(
       store.stableReviewFindingKey({ source: "github-review", severity: "blocking", body: "Fix the validation." }),
