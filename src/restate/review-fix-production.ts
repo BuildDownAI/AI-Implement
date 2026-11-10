@@ -412,8 +412,11 @@ export function createProductionReviewFixWorker(
         runner_callback_url: config.runnerCallbackBaseUrl,
       };
     },
-    fly: { flySessionsToken: config.flySessionsToken ?? "", flySessionsApp: config.flySessionsApp ?? "",
-      flySessionsRegion: config.flySessionsRegion ?? null, flyOrchestratorApp: config.flyOrchestratorApp ?? null,
+    fly: { flySessionsToken: config.flySessionsToken ?? "",
+      // RunnerBackend cache loads after composition; resolve its values when used.
+      get flySessionsApp() { return config.flySessionsApp ?? ""; },
+      get flySessionsRegion() { return config.flySessionsRegion ?? null; },
+      flyOrchestratorApp: config.flyOrchestratorApp ?? null,
       tenantId: config.tenantId ?? null, sessionImage: config.sessionImage, runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
       anthropicApiKey: config.anthropicApiKey ?? null, claudeOAuthToken: config.claudeOAuthToken ?? null },
     local: { image: config.localRunnerImage ?? config.sessionImage,
