@@ -12,7 +12,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isDeepStrictEqual } from "node:util";
-import type { DrainCommentGapfillsInput } from "../comment-gapfill-drain.js";
+import type { ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
 import type { KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { StartLocalContainerInput } from "../local-docker.js";
@@ -233,7 +233,8 @@ const MODULES = {
   config: () => import("../config.js"),
   settings: () => import("../orchestrator-settings.js"),
   queue: () => import("../comment-gapfill-queue.js"),
-  drain: () => import("../comment-gapfill-drain.js"),
+  gapfill: () => import("../restate/implementation-run-gapfill.js"),
+  implementationLaunch: () => import("../implementation-launch.js"),
   reviewFixQueue: () => import("../review-fix-queue.js"),
   containerWorker: () => import("../review-fix-container-worker.js"),
   worker: () => import("../review-fix-worker.js"),
@@ -368,41 +369,35 @@ const gapFill = (runnerMode: "gha" | "fly" | "local"): LaunchPath => async (w) =
   w.admission.release(entry.dispatchId!, { kind: "legacy" }, taken.record.generation, "finalized");
   const jobId = w.log.appendLog({ ...entry, admissionGeneration: taken.record.generation });
   w.log.updateJobPrUrl(jobId, `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`);
-  const opts: DrainCommentGapfillsInput = {
-    getMappings: () => ({ [TEAM]: MAPPING }),
-    runnerMode,
-    notifyType: "slack",
-    notifyWebhookUrl: null,
-    runnerCallbackBaseUrl: CALLBACK_URL,
-    runnerTokenSecret: TOKEN_SECRET,
-    getInstallationToken: async () => "gh-token",
-    getTargetRepoToken: async () => "gh-token",
-    getInstallationId: async () => INSTALLATION_ID,
-    resolveRunnerImage: (mapping, token) => w.repoImage.resolveRunnerImageForDispatch({
+  const deps = w.gapfill.createImplementationGapfillDependencies({
+    config: CONFIG,
+    resolveProvider: async () => provider(),
+    resolveRunnerImage: (_config, mapping, token) => w.repoImage.resolveRunnerImageForDispatch({
       owner: mapping.owner, repo: mapping.repo, token,
       defaultImage: CONFIG.sessionImage, runnerImageExplicit: CONFIG.runnerImageExplicit,
     }),
-    checkContract: async () => CAPABILITIES,
-    dispatch: async (_token, _mapping, inputs) => {
-      w.rec.launches.push({ carrier: "workflow-inputs", inputs });
-      return ACCEPTED;
-    },
-    postComment: async () => undefined,
-    listPrComments: async () => [],
-    postTrackerComment: async () => undefined,
-    onDispatchFailure: async () => undefined,
-    flySessionsToken: CONFIG.flySessionsToken,
-    flySessionsApp: CONFIG.flySessionsApp,
-    flySessionsRegion: CONFIG.flySessionsRegion,
-    flyOrchestratorApp: null,
-    tenantId: null,
-    anthropicApiKey: CONFIG.anthropicApiKey,
-    claudeOAuthToken: null,
-    sessionImage: CONFIG.sessionImage,
-    localRunnerImage: CONFIG.localRunnerImage,
-    localRunnerOrchestratorUrl: CONFIG.localRunnerOrchestratorUrl,
+    isGroupingParentDispatch: () => false,
+    fireBreakerTrip: async () => {},
+    prepareImplementationLaunch: w.implementationLaunch.prepareImplementationLaunch,
+    launchImplementationRun: w.implementationLaunch.launchImplementationRun,
+    launchImplementationFlySession: w.implementationLaunch.launchImplementationFlySession,
+    launchImplementationLocalSession: w.implementationLaunch.launchImplementationLocalSession,
+    postDispatch: async () => {},
+    finalizeImplementation: async () => {},
+    remediateStuckJob: async () => false,
+    reportTerminalJob: async () => {},
+  }, () => MAPPING);
+  const run: ImplementationRunInput = {
+    dispatchId: "parity-gapfill", teamKey: TEAM, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier,
+    backend: runnerMode === "fly" ? "fly-machines" : runnerMode === "local" ? "local-docker" : "github-actions",
+    maxJobMinutes: MAPPING.maxJobMinutes!,
+    launchContext: { runnerMode },
+    gapFill: { queueItemId: w.queue.claimPendingCommentGapfills()[0]!.id,
+      repository: `${OWNER}/${REPO}`, installationId: String(INSTALLATION_ID), prNumber: PR_NUMBER,
+      prDispatchBudget: MAPPING.prDispatchBudget!, humanRequested: true },
   };
-  await w.drain.drainCommentGapfillQueue(opts);
+  expect(await deps.reserve(run)).toBe(true);
+  await deps.launch(run);
 };
 
 /** Seeds the prepared attempt `mintPreparedReviewFixToken` reads, as the Restate admission does. */

@@ -42,7 +42,8 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // orchestrator-settings.ts is the RunnerBackend cache's reader and boot seed: it reaches the object through the ingress client (AII-1243).
   // model-account-cli.ts is the operator command; it reaches ChatGptPlanAccount through the ingress client (AII-1204).
   // health-body.ts reads only the local status contract to report HTTP availability (AII-1750).
-  const ALLOWLIST = new Set(["src/health-body.ts", "src/model-account-cli.ts", "src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/oauth/routes.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/webhook.ts"]);
+  // comment-gapfill-drain.ts is the gap-fill submission door (AII-1554): ingress and readiness only.
+  const ALLOWLIST = new Set(["src/comment-gapfill-drain.ts", "src/health-body.ts", "src/model-account-cli.ts", "src/orchestrator-settings.ts", "src/mcp.ts", "src/mcp-oauth.ts", "src/oauth/routes.ts", "src/admin.ts", "src/index.ts", "src/deploy.ts", "src/runner-callback.ts", "src/reaper.ts", "src/webhook.ts"]);
 
   function listTsFiles(dir: string): string[] {
     const entries = readdirSync(dir, { withFileTypes: true });
@@ -91,6 +92,13 @@ describe("import allowlist: only the door adapters may import Restate from outsi
     expect(violations).toEqual([]);
   });
 
+  it("the comment gap-fill door imports only ImplementationRun ingress and local readiness", () => {
+    const imports = extractImportSpecifiers(readFileSync("src/comment-gapfill-drain.ts", "utf8"))
+      .filter((entry) => isRestateSpecifier(entry.source))
+      .map((entry) => entry.source).sort();
+    expect(imports).toEqual(["./restate/implementation-run-client.js", "./restate/status.js"]);
+  });
+
   it("src/health-body.ts imports only local Restate status, never the SDK or ingress", () => {
     const imports = extractImportSpecifiers(readFileSync("src/health-body.ts", "utf8"))
       .filter((entry) => isRestateSpecifier(entry.source))
@@ -120,7 +128,7 @@ describe("import allowlist: only the door adapters may import Restate from outsi
   // makes the first test above fail with that file listed in `violations`, confirmed by hand
   // and reverted before this PR — see the PR description for the before/after transcript.
   it("sanity: the allowlist contains only the documented door and deployment adapters", () => {
-    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/deploy.ts", "src/health-body.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/model-account-cli.ts", "src/oauth/routes.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/webhook.ts"]);
+    expect([...ALLOWLIST].sort()).toEqual(["src/admin.ts", "src/comment-gapfill-drain.ts", "src/deploy.ts", "src/health-body.ts", "src/index.ts", "src/mcp-oauth.ts", "src/mcp.ts", "src/model-account-cli.ts", "src/oauth/routes.ts", "src/orchestrator-settings.ts", "src/reaper.ts", "src/runner-callback.ts", "src/webhook.ts"]);
   });
 });
 

@@ -216,8 +216,7 @@ describe("filesystem tickets through the local PR loop", () => {
     await expect(provider.findByKey("FS-101")).resolves.toMatchObject({ title: "FS-101 real PR flow" });
   });
 
-  it("dispatches PR comment iteration through local Docker with reviewer config and no Actions dispatch", async () => {
-    const { decodeRunConfig } = await import("../run-config.js");
+  it("submits filesystem PR comment iteration to ImplementationRun on local Docker", async () => {
     const mapping = filesystemMapping({
       maxTurns: 31,
       maxIterations: 4,
@@ -249,7 +248,10 @@ describe("filesystem tickets through the local PR loop", () => {
     const dispatch = vi.fn<DrainModule.DrainCommentGapfillsInput["dispatch"]>(async () => ({ success: true, status: 204 }));
     const checkContract = vi.fn<DrainModule.DrainCommentGapfillsInput["checkContract"]>(async () => "envelope");
 
+    const submit = vi.fn<NonNullable<DrainModule.DrainCommentGapfillsInput["implementationRun"]>["submit"]>(async () => ({ status: "accepted" }));
     await drain.drainCommentGapfillQueue({
+      implementationRun: { submit },
+      restateCanServe: () => true,
       getMappings: () => ({ FS: mapping }),
       runnerMode: "local",
       notifyType: "slack",
@@ -280,41 +282,18 @@ describe("filesystem tickets through the local PR loop", () => {
 
     expect(dispatch).not.toHaveBeenCalled();
     expect(checkContract).not.toHaveBeenCalled();
-    expect(localDockerMock.startLocalRunnerContainer).toHaveBeenCalledTimes(1);
-    const dockerInput = localDockerMock.startLocalRunnerContainer.mock.calls[0]![0];
-    expect(dockerInput).toMatchObject({
-      image: "ai-implement-runner:local",
-      githubToken: "gh-token",
-      runnerCallbackUrl: "http://host.docker.internal:8080",
-      runToken: expect.any(String),
-      orchestratorUrl: "http://host.docker.internal:8080",
+    expect(localDockerMock.startLocalRunnerContainer).not.toHaveBeenCalled();
+    expect(submit).toHaveBeenCalledTimes(1);
+    const [dispatchId, input] = submit.mock.calls[0]!;
+    expect(input).toMatchObject({
+      dispatchId, teamKey: "FS", issueId: "FS-202", issueIdentifier: "FS-202",
+      backend: "local-docker", launchContext: { runnerMode: "local" },
+      gapFill: { repository: "BuildDownAI/AI-Implement", installationId: "778899",
+        prNumber: 9001, humanRequested: true },
     });
-    const runConfig = decodeRunConfig(dockerInput.extraEnv!.AI_IMPLEMENT_RUN_CONFIG);
-    expect(runConfig).toMatchObject({
-      runnerPhase: "gap-analysis",
-      prNumber: "9001",
-      commentInstruction: "Please address the reviewer feedback.",
-      maxTurns: 31,
-      maxIterations: 4,
-      branchPrefix: "local",
-      skillsRepo: "BuildDownAI/skills",
-      reviewers: [
-        { id: "code-review", gates: true },
-        { id: "branch-preview", gates: false },
-      ],
-    });
-    expect(dockerInput.runProgressToken).toEqual(expect.any(String));
-    expect(dockerInput.extraEnv).not.toHaveProperty("RUN_PROGRESS_TOKEN");
-
-    const jobs = log.listLog({ limit: 5 });
-    const gap = jobs.find((job) => job.phase === "gap-analysis");
-    expect(gap).toMatchObject({
-      issueId: "FS-202",
-      executionMode: "local-docker",
-      machineId: "local-container-1",
-      runnerMode: "local",
-      prUrl: "https://github.com/BuildDownAI/AI-Implement/pull/9001",
-    });
+    expect(queue.getCommentGapfillItem(input.gapFill!.queueItemId)?.status).toBe("dispatched");
+    // Launch and job-row creation belong to the workflow after acceptance.
+    expect(log.listLog({ limit: 5 }).some((job) => job.phase === "gap-analysis")).toBe(false);
   });
 
   it("does not dispatch filesystem PR comment iteration after leaving local runner mode", async () => {
