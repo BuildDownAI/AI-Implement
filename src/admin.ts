@@ -269,10 +269,6 @@ async function reviewFixLifecycleEnablementError(
   deps: AdminDeps,
 ): Promise<string | null> {
   const { executionMode, owner, repo, workflowFile, ref } = params;
-  if (executionMode !== "github-actions") {
-    return `reviewFixLifecycle "restate" requires executionMode "github-actions". Set the mode to GitHub Actions, or leave the lifecycle on Legacy.`;
-  }
-
   const restateStatus = deps.getRestateStatus?.();
   if (!restateStatus || restateStatus.sidecar.state !== "ready" || restateStatus.registration.state !== "registered") {
     return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available. Read the "restate" field of GET / or of the get_tenant_health tool (docs/restate.md, "Health surfaces"). Save again when the sidecar is "ready" and the endpoint is "registered".`;
@@ -291,6 +287,14 @@ async function reviewFixLifecycleEnablementError(
   if (unreservedLegacyJobs.length > 0) {
     const count = unreservedLegacyJobs.length;
     return `reviewFixLifecycle "restate" cannot be enabled while ${count} run${count === 1 ? "" : "s"} in flight ${count === 1 ? "has" : "have"} no dispatch reservation. An older version of the orchestrator started ${count === 1 ? "it" : "them"}. No action is necessary: ${count === 1 ? "this run must" : "these runs must"} end by ${count === 1 ? "itself" : "themselves"}. Save again later.`;
+  }
+
+  if (executionMode === "fly-machines") {
+    const fly = getFlySessionsConfig();
+    if (!fly.app || !fly.token) {
+      return `reviewFixLifecycle "restate" on Fly Machines requires FLY_SESSIONS_APP and FLY_SESSIONS_TOKEN. Configure the Fly sessions app in runner backend settings (FLY_SESSIONS_APP seeds it at boot) and the sessions token in the orchestrator environment, then save again.`;
+    }
+    return null;
   }
 
   let capabilities: Awaited<ReturnType<typeof resolveWorkflowCapabilities>>;
