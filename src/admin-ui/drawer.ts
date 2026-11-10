@@ -674,6 +674,11 @@ export const drawerScript = `
       el.innerHTML = '<div class="field"><div class="field-label">Execution</div><div style="font-size:12.5px" class="text-tertiary">launch state unknown — no execution recorded yet</div></div>';
       return;
     }
+    if (attempt.execution.backend === 'fly-machines' || attempt.execution.backend === 'local-docker') {
+      el.innerHTML = '<div class="field"><div class="field-label">Execution</div><div style="font-size:12.5px">'
+        + window.esc(attempt.execution.backend) + ' <span class="mono">' + window.esc(attempt.execution.runRef) + '</span></div></div>';
+      return;
+    }
     const repoParts = repoPartsForJob(job, null);
     let html = '<div class="field"><div class="field-label">Workflow run</div><div style="font-size:12.5px">';
     if (repoParts) {
