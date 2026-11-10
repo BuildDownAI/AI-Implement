@@ -5339,7 +5339,7 @@ async function main(): Promise<void> {
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
-  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every GitHub Actions run and container projects on the Restate lifecycle.
+  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every project on every backend.
   const planningRunServices = createProductionPlanningRunServices({
     config,
     resolveProvider: (mapping) => registry.forMapping(mapping),
@@ -5351,7 +5351,7 @@ async function main(): Promise<void> {
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
-  // The ImplementationRun workflow (AII-1557): registered; the poll submits first-time implementations for every project. Gap-fill routing follows in AII-1554.
+  // The ImplementationRun workflow (AII-1557): registered; the poll submits first-time implementations for every project; comment gap-fill also submits this workflow.
   const implementationRunServices = createProductionImplementationRunServices({
     config,
     resolveProvider: (mapping, recoveryScopeKey) => recoveryScopeKey ? registry.forRecovery(mapping, recoveryScopeKey) : registry.forMapping(mapping),

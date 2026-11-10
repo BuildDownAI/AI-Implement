@@ -79,14 +79,10 @@ export interface RepoMapping {
   /** Token scope for dependency access. NULL means off (default); "installation" grants read access to all repos the App can see. */
   dependencyTokenScope: "installation" | null;
   /**
-   * Selects review webhook intake, not automatic review-fix queue consumption.
-   * NULL (including old rows) resolves to Legacy via resolveReviewFixLifecycle():
-   * intake records feedback in SQLite. Under "restate", review events (reviews,
-   * inline comments, review-summary issue comments) forward to ReviewFixPR.feedback.
-   * Every mapped project's pending queue rows use ReviewFixPR and ReviewFixAttempt
-   * regardless of this value; paused mappings remain pending until unpause.
-   * Planning and the `/ai-implement` comment rail are unaffected by this setting.
-   * Selecting "restate" is validated at save time (src/admin.ts's upsertMappingAction).
+   * Retained lifecycle configuration, validated at save time (src/admin.ts).
+   * Every mapped project's review webhook intake and pending queue rows use
+   * ReviewFixPR and ReviewFixAttempt regardless of this value. Paused mappings
+   * remain pending until unpause. Planning and comment gap-fill also use Restate.
    * Changing this value never changes the owner of an attempt already in flight.
    */
   reviewFixLifecycle: "legacy" | "restate" | null;
