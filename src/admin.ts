@@ -247,8 +247,8 @@ function normalizeTrustedReviewAuthors(raw: unknown): string[] | null {
 
 /**
  * Returns the reason enabling reviewFixLifecycle="restate" is refused, or null when it may
- * proceed. Only automatic GitHub Actions review-fix runs ever move to Restate — local
- * review-fix and human comment-triggered runs stay on Legacy admission regardless.
+ * proceed. Review-fix dispatch uses Restate on every backend regardless of this stored
+ * setting; enabling it still validates backend prerequisites for configuration compatibility.
  *
  * Checks both real prerequisites and fails closed whenever either signal is unavailable or
  * ambiguous (AII-804) — this never guesses:
