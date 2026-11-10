@@ -236,5 +236,21 @@ existing verdict readers: an incomplete contract keeps waiting, while a
 completed check without a readable real verdict fails closed. Reaching the
 limit does not turn a pending check into a completed review or approval.
 
+After the wait, the step calls `collectExternalReviewFindingsFromGh` once per
+review iteration (unless external collection was skipped). It reuses the issue
+comments fetched by the last probe when available; otherwise the collector
+fetches them. The collector also reads formal reviews and unresolved review
+threads. For a review process other than `ai-implement`, the step passes the
+wait's head SHA to scope the findings read to that head. The `ai-implement`
+process does not pass this SHA filter, so its findings may belong to an older
+head: the wait follows the check run, not the comment. A check without a real
+verdict therefore cannot approve on the strength of older findings.
+
+If a recognized external review comment cannot be parsed into usable findings
+or an explicit clean verdict, the collector sets `findingsUnavailable`. This
+blocks approval even when the internal reviewers found no problems. In that
+case, the step reports “AI-Implement cannot read the verdict of the external
+review” and requires manual review, with no approval.
+
 The post-run late-review rail can still consume a verdict that arrives after
 the in-run wait ends; see [review-fix-rail.md](review-fix-rail.md).

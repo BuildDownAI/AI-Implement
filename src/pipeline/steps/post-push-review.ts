@@ -137,7 +137,7 @@ const FIX_MAX_TURNS = 45;
 const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
-// November 3–10, 2026: comment p90 6m22s; retrieved check-job p90 6m53s.
+// November 3–10, 2026: comment p90 6m14s; retrieved check-job p90 6m53s.
 // Ten minutes leaves over three minutes of margin while keeping the wait bounded.
 const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 600_000;
 const CLAUDE_REVIEW_SUMMARY_ID = "claude-review-summary";
