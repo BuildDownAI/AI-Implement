@@ -25,10 +25,19 @@ jobs:
     # re-runs, a maintainer must post `/claude-review` as a comment — forks must not
     # auto-run on synchronize because pull_request_target has repository-secret access
     # and that would be a priv-esc vector.
+    #
+    # A draft PR is skipped, with one exception: a push (synchronize) by the orchestrator
+    # bot. A gap-fill run pushes to a PR that an operator may hold in Draft; if the review
+    # skipped that head, LateExternalReview would wait its full 30 minutes and end
+    # `timed-out`, and the head would get no review until a person marked the PR ready.
+    # Auto-merge skips a draft PR, so the Draft gate still holds after an approval.
+    # The login is the `actor` GitHub records on this repo's bot-pushed runs.
     if: |
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.draft == false) ||
+       (github.event.pull_request.draft == false ||
+        (github.event.action == 'synchronize' &&
+         github.event.sender.login == 'ai-implement-orchestrator-bot[bot]'))) ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
        contains(github.event.comment.body, '/claude-review') &&
