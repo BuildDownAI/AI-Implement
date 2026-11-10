@@ -94,6 +94,25 @@ export function recordReviewFinding(input: UpsertReviewFindingInput): number {
   return upsertReviewFinding(input);
 }
 
+/** Records a new dispatch report once, retaining its revision across callback retries. */
+export function recordInternalReviewFinding(input: UpsertReviewFindingInput, dispatchId: string): { id: number; revision: number } {
+  const db = getDb();
+  return db.transaction(() => {
+    const previous = db.prepare(`
+      SELECT r.finding_id AS id, r.revision
+      FROM internal_review_finding_reports r
+      JOIN review_findings f ON f.id = r.finding_id
+      WHERE r.dispatch_id = ? AND f.repo = ? AND f.pr_number = ? AND f.finding_key = ?
+    `).get(dispatchId, input.repo, input.prNumber, stableReviewFindingKey(input)) as { id: number; revision: number } | undefined;
+    if (previous) return previous;
+    const id = recordReviewFinding(input);
+    const { revision } = db.prepare("SELECT revision FROM review_findings WHERE id = ?").get(id) as { revision: number };
+    db.prepare("INSERT INTO internal_review_finding_reports (dispatch_id, finding_id, revision) VALUES (?, ?, ?)")
+      .run(dispatchId, id, revision);
+    return { id, revision };
+  })();
+}
+
 export function upsertReviewFindings(repo: string, prNumber: number, findings: ReviewLedgerFinding[]): number[] {
   return findings.map((finding) => upsertReviewFinding({ repo, prNumber, ...finding }));
 }

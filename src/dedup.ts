@@ -416,6 +416,14 @@ export function getDb(): Database.Database {
     }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_findings_open ON review_findings(repo, pr_number, status)`);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS internal_review_finding_reports (
+        dispatch_id TEXT NOT NULL,
+        finding_id INTEGER NOT NULL REFERENCES review_findings(id),
+        revision INTEGER NOT NULL,
+        PRIMARY KEY (dispatch_id, finding_id)
+      )
+    `);
+    db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         issue_id TEXT NOT NULL,

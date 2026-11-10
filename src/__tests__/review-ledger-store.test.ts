@@ -13,6 +13,19 @@ afterEach(() => {
 });
 
 describe("review ledger store", () => {
+  it("retains dispatch revisions on retries, including after a later report reopens the finding", () => {
+    const finding = { repo: "org/repo", prNumber: 42, source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Recurring defect" };
+    const first = store.recordInternalReviewFinding(finding, "run-a");
+    expect(store.markReviewFindingResolvedIfRevision(first.id, first.revision)).toBe(1);
+    expect(store.recordInternalReviewFinding(finding, "run-a")).toEqual(first);
+    expect(store.getReviewFindingById(first.id)).toMatchObject({ status: "resolved", revision: 1 });
+    const second = store.recordInternalReviewFinding(finding, "run-b");
+    expect(second).toEqual({ id: first.id, revision: 2 });
+    expect(store.recordInternalReviewFinding(finding, "run-a")).toEqual(first);
+    expect(store.markReviewFindingResolvedIfRevision(first.id, first.revision)).toBe(0);
+    expect(store.getReviewFindingById(first.id)).toMatchObject({ status: "open", revision: 2, resolvedAt: null });
+  });
+
   it("upserts findings by stable key and lists open findings for a PR", () => {
     const first = store.upsertReviewFinding({
       repo: "org/repo",

@@ -1,4 +1,4 @@
-import { recordReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
+import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
 import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
@@ -1152,7 +1152,7 @@ async function handleRunnerResultInternal(
     }
   }
 
-  // Internal findings arrive on the existing result callback; repeats must not reopen rows.
+  // New dispatch reports reopen resolved findings; callback retries retain their original revision.
   const internalJob = getJobByDispatchId(claims.dispatchId);
   const findingPrUrl = internalJob?.prUrl ?? input.body.prUrl;
   const findingTarget = findingPrUrl ? parsePrUrlTarget(findingPrUrl) : null;
@@ -1170,9 +1170,9 @@ async function handleRunnerResultInternal(
           (f.reviewerId !== undefined && typeof f.reviewerId !== "string")) continue;
       const key = stableReviewFindingKey(f);
       const existing = getReviewFindingsByKeys(internalJob.repo, internalPr, [key])[0];
-      const id = existing?.id ?? recordReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr });
-      if ((!existing || (existing.status === "open" && existing.lastSeenAt <= internalJob.dispatchedAt)) && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
-        markReviewFindingResolvedIfRevision(id, existing?.revision ?? 1);
+      const report = recordInternalReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr }, claims.dispatchId);
+      if ((!existing || existing.status === "resolved" || existing.lastSeenAt <= internalJob.dispatchedAt) && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
+        markReviewFindingResolvedIfRevision(report.id, report.revision);
       }
     }
   }

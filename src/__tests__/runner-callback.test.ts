@@ -4735,7 +4735,7 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
       .toHaveLength(disposition === "follow-up" ? 1 : 0);
   });
 
-  it("records internal callback findings before dispositions and never reopens completed duplicates", async () => {
+  it.each([undefined, "invalid", "follow-up", "fixed"] as const)("reopens internal findings reported by a later dispatch with disposition %s", async (disposition) => {
     const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Handle missing input.", path: "src/example.ts", line: 4 };
     const key = reviewStore.stableReviewFindingKey(finding);
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -4751,12 +4751,17 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
           phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
           failureReason: "another finding remains", prUrl: "https://github.com/org/repo/pull/11",
           comments: [], internalFindings: [finding],
-          findingDispositions: attempt === 0 ? [{ findingKey: key, disposition: "fixed", reason: "addressed" }] : [],
+          findingDispositions: attempt === 0 || disposition ? [{ findingKey: key, disposition: attempt === 0 ? "fixed" : disposition!, reason: "addressed" }] : [],
         },
         secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
       });
       expect(res.status).toBe(200);
-      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status: "resolved", revision: 1 }]);
+      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{
+        status: attempt === 0 || disposition === "fixed" ? "resolved" : disposition === "invalid" ? "rejected" : disposition === "follow-up" ? "deferred" : "open",
+        revision: attempt + 1,
+      }]);
+      const row = dedup.getDb().prepare("SELECT disposition FROM review_findings WHERE finding_key = ?").get(key);
+      expect(row).toEqual({ disposition: attempt === 0 || disposition === "fixed" ? "fixed" : null });
     }
   });
 
