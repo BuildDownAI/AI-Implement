@@ -37,7 +37,7 @@ export interface KgRefreshSenderDeps {
   config: Pick<AppConfig,
     "githubAppId" | "githubAppPrivateKey" | "flySessionsToken" | "flySessionsApp" | "flySessionsRegion"
     | "localRunnerImage" | "localRunnerOrchestratorUrl" | "runnerCallbackBaseUrl" | "healthPort"
-    | "sessionImage" | "runnerImageExplicit" | "anthropicApiKey" | "claudeOAuthToken" | "kgSourceRepo">;
+    | "sessionImage" | "runnerImageExplicit" | "kgSourceRepo">;
   getInstallationToken: typeof getInstallationToken;
   mintToken: KgRailDeps["mintToken"];
   fetchDefaultBranch: (token: string, owner: string, repo: string) => Promise<string | null | undefined>;
@@ -113,8 +113,6 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       owner: repo.owner,
       repo: repo.repo,
       defaultBranch,
-      anthropicApiKey: config.anthropicApiKey ?? undefined,
-      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
       githubToken: bootToken,
       sessionToken,
       machineNonce,
@@ -134,6 +132,7 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       cpus: input.machine.cpus,
       memoryMb: input.machine.memoryMb,
       region: config.flySessionsRegion ?? undefined,
+      teamKey: "kg-refresh",
       purpose: "durable-runner",
       pipeline: "kg-refresh",
       dispatchId: input.dispatchId,
@@ -193,8 +192,6 @@ export function createKgRefreshSenders(deps: KgRefreshSenderDeps): Record<KgExec
       owner: repo.owner,
       repo: repo.repo,
       defaultBranch,
-      anthropicApiKey: config.anthropicApiKey ?? undefined,
-      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
       githubToken: bootToken,
       sessionToken,
       machineNonce,

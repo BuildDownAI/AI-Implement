@@ -378,7 +378,7 @@ describe("production managed GHA review-fix launch", () => {
     expect(sent).toHaveLength(0);
   });
 
-  it("refuses unsupported Claude subscription stages without dispatch or grant", async () => {
+  it("refuses a Claude subscription stage without a protected reference or grant", async () => {
     profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
       authMode: "claude-subscription", });
     profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage(), review: stage(),
@@ -492,7 +492,8 @@ describe("production managed GHA review-fix launch", () => {
     const sideEffects = () => ["run_agent_config_snapshots", "model_credential_grants"].map(count);
     const admit = (rt: ModelAuthRuntime | undefined = runtime) => production.canAdmit(SCOPE, CONFIG, rt);
 
-    it("admits a configured Codex selection read-only, then launches exactly once on the real worker", async () => {
+    it.each(["gha", "shadow"])("admits a configured Codex selection read-only in %s, then launches exactly once on the real worker", async (mode) => {
+      vi.stubEnv("RUNNER_MODE", mode);
       const before = sideEffects();
       expect(await admit()).toBe("admit");
       expect(sideEffects()).toEqual(before);
@@ -500,6 +501,8 @@ describe("production managed GHA review-fix launch", () => {
       expect((await worker.launch(plan)).status).toBe("accepted");
       expect(sent).toHaveLength(1);
       expect((await decode()).agentConfig?.stages.implementation.accountProfileId).toBe("cdx");
+      expect((await decode()).credentials?.modelAuthGrant).toBeDefined();
+      expect((await decode()).credentials?.executionPolicy).toMatchObject({ backend: "gha", dispatchId: prepared.attemptId });
     });
 
     async function writeKey(profileId: string, agent: "claude" | "codex", provider: "anthropic" | "openai", authMode: string) {
@@ -551,19 +554,19 @@ describe("production managed GHA review-fix launch", () => {
       expect(count("model_credential_grants")).toBe(0);
     });
 
-    it("admits a ready managed Claude subscription stage, then rejects launch without dispatch or grants", async () => {
-      profiles.saveAccountProfileRevision({ profileId: "sub", identity: "sub", revision: 1, agent: "claude", provider: "anthropic",
-        authMode: "claude-subscription", });
+    it("admits and launches with a ready managed Claude subscription planning stage", async () => {
+      await writeKey("sub", "claude", "anthropic", "claude-subscription");
       profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
         planning: { agent: "claude", provider: "anthropic", model: "claude-sonnet-5-5", accountProfileId: "sub", invocationTimeoutMs: 60_000 },
         implementation: stage(), review: stage(),
       } });
       expect(await admit()).toBe("admit");
       const { worker, plan } = await launch();
-      expect(await worker.launch(plan)).toEqual({ status: "rejected", reason: "review-fix managed preparation refused" });
-      expect(sent).toHaveLength(0);
-      expect(count("run_agent_config_snapshots")).toBe(0);
-      expect(count("model_credential_grants")).toBe(0);
+      expect((await worker.launch(plan)).status).toBe("accepted");
+      expect(sent).toHaveLength(1);
+      expect(count("run_agent_config_snapshots")).toBe(1);
+      expect(count("model_credential_grants")).toBe(1);
+      expect((await decode()).agentConfig!.profiles.planning.authMode).toBe("claude-subscription");
     });
 
     it.each(["private-run-config-v1", "stage-agent-config-v1", "stage-agent-launch-context-v1"])(

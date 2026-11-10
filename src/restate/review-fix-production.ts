@@ -9,6 +9,7 @@ import { destroyMachineRecorded } from "../backend-run.js";
 import { removeLocalContainer } from "../local-docker.js";
 import { getJobByDispatchId, updateJobStatus, invalidateNonce } from "../log.js";
 import { getDb } from "../dedup.js";
+import { isEphemeralPolicyEnvName } from "../model-auth-contract.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
 import { isManagedProject, selectsCodexImplementation, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
@@ -26,7 +27,7 @@ import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDispositio
 import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { mintPreparedReviewFixToken } from "../runner-tokens.js";
-import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
+import { getRunnerMode, resolvePlanningExecutionPath } from "../runner-mode.js";
 import { inspectAgentReadiness } from "../agent-run-preparation.js";
 import { resolveWorkflowCapabilities, type WorkflowCapabilities } from "../workflow-probe.js";
 import type { ProviderRegistry } from "../providers/registry.js";
@@ -67,7 +68,6 @@ function selectedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
   if (!entry) return null;
   const mapping = entry[1];
   return !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
-    && resolveExecutionPath(getRunnerMode().mode, mapping.executionMode) === "github-actions"
     ? entry : null;
 }
 
@@ -85,12 +85,13 @@ const DEFERRED_READINESS_CODES: ReadonlySet<string> = new Set([
   "resolution_unavailable",
 ]);
 
-interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string }
+interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string; skip?: boolean }
 
 /** Verify the dispatch-ref contract immediately before a new reservation. A
  * changed workflow, runner mode, missing callback credential, or GitHub outage
- * defers admission with the queue still pending. A managed (opted-in) project is
- * additionally admitted only when its workflow carries the managed capabilities and
+ * defers admission with the queue still pending. Containers check backend inputs
+ * instead of probing a GHA workflow. A managed (opted-in) project is admitted only
+ * on GHA when its workflow carries the managed capabilities and
  * the read-only agent readiness check passes; that check reserves, snapshots and mints
  * nothing, because launch preparation is the only place that freezes and grants. */
 export async function canAdmit(
@@ -109,7 +110,33 @@ async function decideAdmission(
   const entry = selectedEntry(scope);
   if (!entry) return { verdict: "defer", reason: "not_selected" };
   const [key, mapping] = entry;
+  if (mapping.ticketingProvider === "filesystem" && getRunnerMode().mode !== "local") {
+    return { verdict: "defer", reason: `Filesystem project ${key} requires local runner mode`, skip: true };
+  }
+  // Shadow launches its authoritative attempt on GHA, as resolvePlanningExecutionPath does.
+  const path = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
   const managed = isManagedProject(key);
+  if (path !== "github-actions") {
+    if (managed) return { verdict: "defer", reason: "managed_backend_unsupported" };
+    if (Object.keys(mapping.extraEnv ?? {}).some(isEphemeralPolicyEnvName)) {
+      return { verdict: "defer", reason: "ephemeral execution policy requires GitHub Actions; remove policy variables from extraEnv or select GHA execution" };
+    }
+    if (mapping.provider === "bedrock") return { verdict: "defer", reason: "provider=bedrock is GHA-only" };
+    if (path === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
+      return { verdict: "defer", reason: "fly_sessions_token_or_app_missing" };
+    }
+    if (path === "local-docker" && !config.localRunnerImage) return { verdict: "defer", reason: "local_runner_image_missing" };
+    if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return { verdict: "defer", reason: "callback_unavailable" };
+    try {
+      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) {
+        return { verdict: "defer", reason: "installation_mismatch" };
+      }
+      const pr = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
+      return pr?.state === "open" && !pr.merged ? { verdict: "admit", reason: path }
+        : { verdict: "defer", reason: "pr_not_open" };
+    } catch { return { verdict: "defer", reason: "contract_unverified" }; }
+  }
   if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return { verdict: "defer", reason: "callback_unavailable" };
   if (!managed) {
     return await verifyDispatchContract(scope, config, mapping) ? { verdict: "admit", reason: "legacy" }
@@ -175,16 +202,22 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
 }
 
-/** Reserve an attempt when the dispatch contract holds. A configuration error fails its queue row and
- * reserves nothing; every other non-admit defers with the queue still pending. */
+/** Reserve an attempt when the dispatch contract holds. Configuration errors fail their
+ * queue row; filesystem projects outside local mode skip it. Other refusals stay pending. */
 export async function admitReviewFix(
   request: ReviewFixAdmissionRequest,
   config: ReviewFixProductionConfig,
   store: Pick<SqliteReviewFixAttemptStore, "admit">,
   runtime?: ModelAuthRuntime,
 ): Promise<ReviewFixAdmissionOutcome> {
-  const { verdict, reason } = await decideAdmission(request.scope, config, runtime);
+  const { verdict, reason, skip } = await decideAdmission(request.scope, config, runtime);
   if (verdict === "admit") return store.admit(request);
+  if (skip) {
+    if (request.feedback.queueCursor) updateReviewFixStatus(request.feedback.queueCursor.queueId, "skipped");
+    console.warn(`[review-fix] ${reason}`);
+  } else if (verdict === "defer" && reason !== "not_selected") {
+    console.warn(`[review-fix] ${request.scope.repository}#${request.scope.prNumber} not launched: ${reason}`);
+  }
   if (verdict === "configuration_error") {
     const cursor = request.feedback.queueCursor;
     // A failed row is no longer pending, so the PR object stops rechecking.
@@ -308,7 +341,12 @@ export function createProductionReviewFixWorker(
       if (!entry) throw new Error("review-fix mapping unavailable");
       const [projectKey, mapping] = entry;
       if (!isManagedProject(projectKey, plan.attemptId)) return null;
-      if (!selectedEntry(plan.scope)) throw new Error("review-fix managed mapping unavailable");
+      // Mapping selection now includes containers; protected GHA preparation still
+      // requires the authoritative GHA path at launch time, including shadow.
+      if (!selectedEntry(plan.scope)
+        || resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode) !== "github-actions") {
+        throw new Error("review-fix managed mapping unavailable");
+      }
       if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");
       if (!runtime) throw new Error("review-fix model authentication unavailable");
       if (selectsCodexImplementation(projectKey, plan.attemptId) && capabilities.supportsExecutionPolicy !== true) {

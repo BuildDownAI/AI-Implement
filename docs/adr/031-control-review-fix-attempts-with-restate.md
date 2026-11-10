@@ -146,3 +146,9 @@ The reason for the inbox, "GitHub does not automatically redeliver a failed webh
 | Infer approval from GitHub success: “A successful execution does not establish the runner's review result.” | **still holds** — The valid-result approval contract above remains required regardless of lifecycle owner or backend. |
 
 **Rollback.** Revert this documentation amendment; the Stage 2 and Stage 3 implementation changes carry their own rollout and recovery contracts.
+
+## Amendment (2026-11-09): admit non-managed review-fix on Fly and local Docker
+
+AII-1336 implements the admission slice of AII-1308 branch 3, using the backend identity tree from AII-1332 (stored backend) and AII-1334 (backend-neutral results and publication). Eligible non-managed Restate projects can now admit on Fly Machines with a sessions token and app, or on local Docker with a configured image. Both require a non-Bedrock provider. GitHub Actions, including shadow mode's authoritative path, retains its workflow capability probe; every backend retains installation, open-PR and callback checks. Filesystem projects require local runner mode and otherwise have their queue row skipped.
+
+Under standing rule 3, this supersedes “additional execution backends” remaining outside the pilot and “Unsupported local execution remains on its existing path” for this admission slice. It implements part of the November 7 required-owner decision, without removing the lifecycle switch or Legacy drain. Managed Fly/local admission remains deferred as `managed_backend_unsupported` until AII-1770. Managed GHA admission, transport, uncertainty and existing shadow behavior remain unchanged. Admin saving, attempt display and budget parking remain AII-1766, AII-1767 and AII-1765 respectively. Live backend proof and deployment remain gated by AII-1338/1775; this amendment authorizes no live settings or credential adoption and no broader D10 release.

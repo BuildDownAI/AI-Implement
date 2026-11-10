@@ -5,6 +5,8 @@ import { makeMapping } from "../builders.js";
 
 /** Every secret variable a check could read, each set to a value that names itself, so a test can assert none reaches any output. */
 export const SECRET_SENTINELS = {
+  ANTHROPIC_API_KEY: "sentinel-anthropic-key",
+  CLAUDE_CODE_OAUTH_TOKEN: "sentinel-claude-token",
   GITHUB_APP_PRIVATE_KEY: "sentinel-app-key",
   ADMIN_ACCESS_CODE: "sentinel-access-code",
   RUNNER_TOKEN_SECRET: "sentinel-token-secret",
@@ -25,6 +27,8 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
   return {
     env: {},
     readSetting: () => null,
+    orchestratorDefaults: () => null,
+    projectStageConfig: () => null,
     runnerBackendSource: () => "restate",
     runnerMode: () => ({ mode: "default", source: "default" }),
     flySessions: () => ({ token: null, app: null, region: null, source: { app: null, region: null } }),
