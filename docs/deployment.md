@@ -406,7 +406,7 @@ The sidecar is probed at boot and on a failed proxied call (throttled). While it
 
 `RESTATE_DATA_DIR` is the one operator-facing knob (`.env.example`): unset, the embedded store lives under the dedup DB's directory (`/data/restate` on Fly), so a Fly volume that already covers `DEDUP_DB_PATH` covers it without a config change. The sidecar automatically selects TCP listeners on macOS, or on other platforms when the resolved absolute `<dataDir>/<hostname>/ingress.sock` path exceeds 100 UTF-8 bytes, so long checkout paths need no `RESTATE_DATA_DIR` workaround (full detail: [docs/restate.md](restate.md#boot-sequence) § "Boot sequence").
 
-**Required checks (operator step).** Mark `unit-tests`, `restate-tests-binary (1)`, `restate-tests-binary (2)`, `restate-tests-binary (3)`, and `orchestrator-image` as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
+**Required checks (operator step).** Mark `unit-tests`, the six `restate-tests-binary (<pass>, <shard>)` checks (passes 1 to 3, shards 1 and 2), and `orchestrator-image` as required checks on `testing` (Settings → Branches). The branch has no required status checks by default, so until this is done a red job does not block a merge.
 
 ### Local image boot check
 
