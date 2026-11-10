@@ -1,34 +1,28 @@
+import { createImplementationRunIngressClient, type ImplementationRunIngressClient } from "./restate/implementation-run-client.js";
+import { restateCanServe } from "./restate/status.js";
+import { normalizeGithubActionsJobTimeoutMinutes } from "./github-actions-watchdog.js";
 import crypto from "node:crypto";
 import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { canDispatch } from "./dispatch-gate.js";
-import { claimPrBudgetNotice, isParked, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
+import { claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
 import {
   acquire as acquireAdmission,
   release as releaseAdmission,
-  type DispatchAdmissionBackend,
 } from "./dispatch-admission.js";
-import { CONFLICT_COMMENTER, claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
-import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job, type MachineSize } from "./log.js";
+import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
+import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, type Job } from "./log.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
-import { mintLaunchTokens, implementationTtlSeconds } from "./runner-tokens.js";
 import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
 import { getPullRequestState, type DispatchResult } from "./github.js";
 import type { RunCredentialsV1 } from "./run-config.js";
-import { getRetryPolicy } from "./orchestrator-settings.js";
-import { dispatchFlyGapfill, prepareGhaGapfillLaunch, dispatchGhaGapfill } from "./gapfill-launch.js";
-import { dispatchLocalGapfill } from "./local-gapfill.js";
-import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { MAX_TASK_FINDINGS, formatTaskFinding, type ReviewFixTaskFinding } from "./review-fix-queue.js";
 import {
-  classifyLaunchError,
-  ghaLaunchOutcome,
   isManagedProject,
   prepareManagedDispatch,
   refusalText,
-  settleLaunch,
   type ManagedDispatchDecision,
 } from "./managed-dispatch-auth.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
@@ -99,6 +93,8 @@ export async function gapfillAccounting(
 }
 
 export interface DrainCommentGapfillsInput {
+  implementationRun?: Pick<ImplementationRunIngressClient, "submit">;
+  restateCanServe?: () => boolean;
   getMappings(): Record<string, RepoMapping>;
   runnerMode: RunnerMode;
   notifyType: string;
@@ -177,14 +173,6 @@ export async function resolveManagedDecision(
   console.log(`[comment-gapfill] ${refusalText(decision)} (${identifier})`);
   if (decision.kind === "refuse") markCommentGapfillProcessed(item.id, "failed");
   return null;
-}
-
-function settleManaged(
-  opts: DrainCommentGapfillsInput,
-  decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>,
-  outcome: "rejected" | "unknown",
-): void {
-  if (decision.kind === "launch" && opts.modelAuthRuntime) settleLaunch(decision, outcome, opts.modelAuthRuntime);
 }
 
 /** Grouping branch → the feature-node parent's identifier slug, or null for any other
@@ -293,45 +281,6 @@ async function firePrBudgetPark(
   }
 }
 
-/**
- * Final admission authority for gap-fill dispatch: one transaction reserves per-team
- * capacity and PR-scoped occupancy, and records the dispatch identity, before any
- * credential mint or launch call. `canDispatch` (checked earlier by the caller) is only
- * the non-transactional preview — this closes the race window between that preview and
- * the actual launch (AII-787), including local Docker.
- */
-function acquireGapfillAdmission(input: {
-  dispatchId: string;
-  issueId: string;
-  teamKey: string;
-  maxInProgressAiIssues: number;
-  backend: DispatchAdmissionBackend;
-  installationId: string;
-  repository: string;
-  prNumber: number;
-  prDispatchBudget?: number;
-  humanRequested?: boolean;
-}): ReturnType<typeof acquireAdmission> {
-  return acquireAdmission({
-    dispatchId: input.dispatchId,
-    mappingKey: input.teamKey,
-    scope: {
-      kind: "pr",
-      issueId: input.issueId,
-      installationId: input.installationId,
-      repository: input.repository,
-      prNumber: input.prNumber,
-    },
-    kind: "gap-fill",
-    backend: input.backend,
-    lifecycleOwner: { kind: "legacy" },
-    cap: input.maxInProgressAiIssues,
-    prDispatchBudget: input.prDispatchBudget,
-    humanRequested: input.humanRequested,
-    parked: isParked(input.issueId, "gap-analysis"),
-  });
-}
-
 export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput): Promise<void> {
   const pending = claimPendingCommentGapfills();
   if (pending.length === 0) return;
@@ -406,21 +355,6 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
 
       const [scopeKey, mapping] = mappingEntry;
-      // A conflict-resolution run only merges the grouping branch; review work in it could
-      // fail its review and lose the merge commit, so it carries no findings.
-      const commentInstruction = buildCommentGapfillInstruction(
-        item.instruction,
-        item.commenter === CONFLICT_COMMENTER ? [] : listOpenReviewFindings(fullRepo, item.prNumber).map((finding) => ({
-          finding_key: finding.findingKey,
-          source: finding.source,
-          severity: finding.severity,
-          path: finding.path ?? null,
-          line: finding.line ?? null,
-          body: finding.body,
-          url: finding.url ?? null,
-        })),
-      );
-
       if (mapping.paused) {
         console.log(`[comment-gapfill] Project ${fullRepo} is paused, skipping item #${item.id}`);
         markCommentGapfillProcessed(item.id, "skipped");
@@ -461,402 +395,42 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
-      let runnerCallbackUrl = "";
-      let runToken = "";
-      let runProgressToken = "";
-      let runPublicationToken: string | undefined;
-      let dispatchId: string | undefined;
-      if (opts.runnerCallbackBaseUrl && opts.runnerTokenSecret) {
-        dispatchId = crypto.randomUUID();
-        const minted = mintLaunchTokens({
-          issueId: prLog.issueId,
-          mappingTeamKey: scopeKey,
-          phase: "gap-analysis",
-          dispatchId,
-          ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes),
-          secret: opts.runnerTokenSecret,
-          repository: `${mapping.owner}/${mapping.repo}`,
-        });
-        runnerCallbackUrl = opts.runnerCallbackBaseUrl;
-        runToken = minted.runToken;
-        runProgressToken = minted.runProgressToken;
-        runPublicationToken = minted.runPublicationToken;
+      if (!(opts.restateCanServe ?? restateCanServe)()) {
+        console.log(`[comment-gapfill] Gap-fill for PR #${item.prNumber} skipped: Restate unavailable`);
+        continue;
       }
-
-      // Fly and local children boot with a token scoped to the target repository; a
-      // mint failure throws before any admission reservation and never falls back to
-      // the installation-wide token. GHA dispatch keeps the broad token (its workflow
-      // mints its own).
-      const ghToken = execPath === "github-actions" || execPath === "both"
-        ? await opts.getInstallationToken(item.owner)
-        : await opts.getTargetRepoToken(item.owner, item.repo);
       const installationId = String(await opts.getInstallationId(item.owner));
-
-      const gapFillIssue = {
-        id: prLog.issueId,
-        identifier: prLog.issueIdentifier ?? prLog.issueId,
-        title: prLog.issueTitle ?? prLog.issueId,
-        description: prLog.issueTitle ?? prLog.issueId,
-      };
-
-      if (execPath === "local-docker") {
-        if (mapping.provider === "bedrock") {
-          console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via local Docker: provider=bedrock not supported`);
-          markCommentGapfillProcessed(item.id, "failed");
-          continue;
-        }
-        if (!isManagedProject(scopeKey) && !opts.anthropicApiKey && !opts.claudeOAuthToken) {
-          console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via local Docker: no API key configured`);
-          markCommentGapfillProcessed(item.id, "failed");
-          continue;
-        }
-
-        if (!dispatchId) dispatchId = crypto.randomUUID();
-        const admission = acquireGapfillAdmission({
-          dispatchId,
-          issueId: prLog.issueId,
-          teamKey: scopeKey,
-          maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-          backend: "local-docker",
-          installationId,
+      const dispatchId = crypto.randomUUID();
+      const backend = execPath === "both" ? "github-actions" : execPath;
+      const submitted = await (opts.implementationRun ?? createImplementationRunIngressClient()).submit(dispatchId, {
+        dispatchId,
+        teamKey: scopeKey,
+        issueId: prLog.issueId,
+        issueIdentifier: prLog.issueIdentifier ?? prLog.issueId,
+        launchContext: { runnerMode: opts.runnerMode },
+        maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(mapping.maxJobMinutes),
+        backend,
+        gapFill: {
+          queueItemId: item.id,
           repository: fullRepo,
+          installationId,
           prNumber: item.prNumber,
           prDispatchBudget: prBudget,
           humanRequested,
-        });
-        if (!admission.ok) {
-          if (admission.reason === "budget_exhausted") {
-            await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
-          }
-          console.log(`[comment-gapfill] Deferring local item #${item.id} for PR #${item.prNumber}: ${admission.reason}`);
-          continue;
-        }
-        const localDecision = await resolveManagedDecision(
-          opts, item,
-          { dispatchId, projectKey: scopeKey, backend: "local-docker", owner: item.owner, repo: item.repo, workflowFile: mapping.workflowFile },
-          admission, gapFillIssue.identifier,
-        );
-        if (!localDecision) continue;
-        const localModelAuthUrl = opts.localRunnerOrchestratorUrl ?? opts.runnerCallbackBaseUrl ?? "";
-        let localMachineNonce: string | undefined;
-        let launchStarted = false;
-        let local: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
-        try {
-          local = await dispatchLocalGapfill({
-            mapping,
-            issue: gapFillIssue,
-            prNumber: item.prNumber,
-            githubToken: ghToken,
-            image: opts.localRunnerImage ?? "ai-implement-runner:local",
-            anthropicApiKey: localDecision.kind === "launch" ? undefined : (opts.anthropicApiKey ?? undefined),
-            claudeOAuthToken: localDecision.kind === "launch" ? undefined : (opts.claudeOAuthToken ?? undefined),
-            orchestratorUrl: opts.localRunnerOrchestratorUrl ?? opts.runnerCallbackBaseUrl ?? "",
-            runnerCallbackUrl: runnerCallbackUrl || undefined,
-            runToken: runToken || undefined,
-            runProgressToken: runProgressToken || undefined,
-            runPublicationToken,
-            commentInstruction,
-            retryPolicy: getRetryPolicy(),
-            onBeforeLaunch: (nonce) => { localMachineNonce = nonce; launchStarted = true; },
-            ...(localDecision.kind === "launch" ? { managed: { decision: localDecision, modelAuthUrl: localModelAuthUrl } } : {}),
-          });
-        } catch (err) {
-          settleManaged(opts, localDecision, classifyLaunchError("local-docker", launchStarted, err));
-          if (!launchStarted) releaseGapfillAdmission(admission);
-          throw err;
-        }
-
-        const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
-        const jobId = appendLog({
-          issueId: prLog.issueId,
-          issueIdentifier: prLog.issueIdentifier ?? undefined,
-          issueTitle: prLog.issueTitle ?? undefined,
-          teamKey: scopeKey,
-          repo: fullRepo,
-          dispatchId,
-          admissionGeneration: admission.record.generation,
-          dispatchNumber: prior.count + 1,
-          executionMode: "local-docker",
-          machineNonce: localMachineNonce,
-          machineId: local.containerId,
-          computeStartedAt: Date.now(),
-          runnerMode: opts.runnerMode,
-          sessionImage: opts.localRunnerImage,
-          phase: "gap-analysis",
-          trigger: "comment",
-          ...(await gapfillAccounting(opts, mapping, prLog)),
-        });
-        updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
-        suppressStaleNotifications(prLog.issueId, jobId);
-        markCommentGapfillProcessed(item.id, "dispatched");
-        console.log(`[comment-gapfill] Dispatched gap-fill for ${gapFillIssue.identifier} (PR #${item.prNumber} in ${fullRepo}, local-docker, container: ${local.containerId}, image: ${opts.localRunnerImage})`);
-
-      } else if (execPath === "fly-machines") {
-        if (!opts.flySessionsToken || !opts.flySessionsApp) {
-          console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via Fly Machines: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set`);
-          markCommentGapfillProcessed(item.id, "failed");
-          continue;
-        }
-        if (mapping.provider === "bedrock") {
-          console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via Fly Machines: provider=bedrock not supported`);
-          markCommentGapfillProcessed(item.id, "failed");
-          continue;
-        }
-        if (!isManagedProject(scopeKey) && !opts.anthropicApiKey && !opts.claudeOAuthToken) {
-          console.error(`[comment-gapfill] Cannot dispatch ${gapFillIssue.identifier} via Fly Machines: no API key configured`);
-          markCommentGapfillProcessed(item.id, "failed");
-          continue;
-        }
-
-        // Final admission authority: one transaction reserves team capacity and PR-scoped
-        // occupancy before any credential mint or launch call. gateDecision (checked above)
-        // is only the preview. Reuse a dispatchId already minted above (callback configured);
-        // otherwise mint one now so the reservation and this launch share one stable identity.
-        if (!dispatchId) dispatchId = crypto.randomUUID();
-        const admission = acquireGapfillAdmission({
-          dispatchId,
-          issueId: prLog.issueId,
-          teamKey: scopeKey,
-          maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-          backend: "fly-machines",
-          installationId,
-          repository: fullRepo,
-          prNumber: item.prNumber,
-          prDispatchBudget: prBudget,
-          humanRequested,
-        });
-        if (!admission.ok) {
-          if (admission.reason === "budget_exhausted") {
-            await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
-          }
-          console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${admission.reason}`);
-          continue;
-        }
-
-        const flyDecision = await resolveManagedDecision(
-          opts, item,
-          { dispatchId, projectKey: scopeKey, backend: "fly-machines", owner: item.owner, repo: item.repo, workflowFile: mapping.workflowFile },
-          admission, gapFillIssue.identifier,
-        );
-        if (!flyDecision) continue;
-        let machineNonce: string | undefined;
-        let launchAttempted = false;
-        let machineSize: MachineSize | undefined;
-        let launched: Awaited<ReturnType<typeof dispatchFlyGapfill>>;
-        try {
-          launched = await dispatchFlyGapfill({
-            mapping,
-            issue: prLog,
-            owner: item.owner,
-            repo: item.repo,
-            prNumber: item.prNumber,
-            issueIdentifier: gapFillIssue.identifier,
-            githubToken: ghToken,
-            scopeKey,
-            allTeamKeys: Object.keys(teamRepoMap),
-            flySessionsToken: opts.flySessionsToken,
-            flySessionsApp: opts.flySessionsApp,
-            flySessionsRegion: opts.flySessionsRegion,
-            flyOrchestratorApp: opts.flyOrchestratorApp,
-            sessionImage: opts.sessionImage,
-            runnerCallbackBaseUrl: opts.runnerCallbackBaseUrl,
-            tenantId: opts.tenantId,
-            anthropicApiKey: opts.anthropicApiKey,
-            claudeOAuthToken: opts.claudeOAuthToken,
-            runnerCallbackUrl,
-            runToken,
-            runProgressToken,
-            runPublicationToken,
-            commentInstruction,
-            decision: flyDecision,
-            onBeforeLaunch: (requestedSize, nonce) => {
-              machineNonce = nonce;
-              machineSize = requestedSize;
-              launchAttempted = true;
-            },
-          });
-        } catch (err) {
-          // A definitive 4xx never created a machine: free the admission. A 5xx or transport error is
-          // ambiguous, so the admission stays for reconciliation. Preparation errors always release it.
-          const outcome = launchAttempted ? classifyLaunchError("fly-machines", true, err) : "rejected";
-          settleManaged(opts, flyDecision, outcome);
-          if (outcome === "rejected") releaseGapfillAdmission(admission);
-          throw err;
-        }
-        const { machine, resolvedImage } = launched;
-
-        const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
-        const jobId = appendLog({
-          issueId: prLog.issueId,
-          issueIdentifier: prLog.issueIdentifier ?? undefined,
-          issueTitle: prLog.issueTitle ?? undefined,
-          teamKey: scopeKey,
-          repo: fullRepo,
-          dispatchId,
-          admissionGeneration: admission.record.generation,
-          dispatchNumber: prior.count + 1,
-          executionMode: "fly-machines",
-          machineNonce,
-          machineId: machine.id,
-          machineSize: machineSize ?? null,
-          computeStartedAt: Date.now(),
-          runnerMode: opts.runnerMode,
-          sessionImage: resolvedImage,
-          phase: "gap-analysis",
-          trigger: "comment",
-          ...(await gapfillAccounting(opts, mapping, prLog)),
-        });
-        updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
-        suppressStaleNotifications(prLog.issueId, jobId);
-        markCommentGapfillProcessed(item.id, "dispatched");
-        console.log(`[comment-gapfill] Dispatched gap-fill for ${gapFillIssue.identifier} (PR #${item.prNumber} in ${fullRepo}, fly-machines, machine: ${machine.id})`);
-
-      } else {
-        // GitHub Actions path (includes "both" shadow mode — GHA is primary)
-        // Final admission authority: one transaction reserves team capacity and PR-scoped
-        // occupancy before any credential mint or launch call. gateDecision (checked above)
-        // is only the preview. Reuse a dispatchId already minted above (callback configured);
-        // otherwise mint one now so the reservation and this launch share one stable identity.
-        if (!dispatchId) dispatchId = crypto.randomUUID();
-        const admission = acquireGapfillAdmission({
-          dispatchId,
-          issueId: prLog.issueId,
-          teamKey: scopeKey,
-          maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-          backend: "github-actions",
-          installationId,
-          repository: fullRepo,
-          prNumber: item.prNumber,
-          prDispatchBudget: prBudget,
-          humanRequested,
-        });
-        if (!admission.ok) {
-          if (admission.reason === "budget_exhausted") {
-            await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
-          }
-          console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${admission.reason}`);
-          continue;
-        }
-
-        // Managed model authentication (AII-1420): decided after admission and before any launch call.
-        const ghaDecision = await resolveManagedDecision(
-          opts, item,
-          { dispatchId, projectKey: scopeKey, backend: "github-actions", owner: item.owner, repo: item.repo, workflowFile: mapping.workflowFile },
-          admission, gapFillIssue.identifier,
-        );
-        if (!ghaDecision) continue;
-
-        // Everything below is pure prep — no launch call has fired yet. A throw anywhere in
-        // here (e.g. a workflow-capabilities probe failure) is by construction a definitive
-        // non-launch, so it releases the reservation and rethrows for the outer per-item catch
-        // to log and mark the item failed, unlike opts.dispatch below, whose failure is
-        // handled explicitly (release only on !result.success, held otherwise).
-        let runnerImage: string | undefined;
-        let contract: WorkflowContract;
-        let gapFillInputs: Record<string, string | undefined>;
-        try {
-          ({ runnerImage, contract, inputs: gapFillInputs } = await prepareGhaGapfillLaunch({
-            mapping,
-            issue: prLog,
-            item,
-            ghToken,
-            decision: ghaDecision,
-            runnerCallbackBaseUrl: opts.runnerCallbackBaseUrl,
-            runnerCallbackUrl,
-            runToken,
-            runProgressToken,
-            runPublicationToken,
-            commentInstruction,
-            resolveRunnerImage: opts.resolveRunnerImage,
-            checkContract: opts.checkContract,
-            getTrustedCredentials: opts.getTrustedCredentials,
-          }));
-        } catch (err) {
-          settleManaged(opts, ghaDecision, "rejected");
-          releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
-          throw err;
-        }
-
-        let result: Awaited<ReturnType<typeof opts.dispatch>>;
-        try {
-          result = await dispatchGhaGapfill({ ghToken, mapping, inputs: gapFillInputs, dispatch: opts.dispatch });
-        } catch (err) {
-          settleManaged(opts, ghaDecision, "unknown");
-          throw err;
-        }
-        if (!result.success) settleManaged(opts, ghaDecision, ghaLaunchOutcome(result) === "rejected" ? "rejected" : "unknown");
-
-        if (!result.success) {
-          if (result.outcome !== "rejected") {
-            const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
-            const jobId = appendLog({
-              issueId: prLog.issueId,
-              issueIdentifier: prLog.issueIdentifier ?? undefined,
-              issueTitle: prLog.issueTitle ?? undefined,
-              teamKey: scopeKey,
-              repo: fullRepo,
-              dispatchId,
-              admissionGeneration: admission.record.generation,
-              dispatchNumber: prior.count + 1,
-              executionMode: "github-actions",
-              runnerMode: "default",
-              contract,
-              phase: "gap-analysis",
-              trigger: "comment",
-              ...(await gapfillAccounting(opts, mapping, prLog)),
-            });
-            updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
-            suppressStaleNotifications(prLog.issueId, jobId);
-            console.warn(`[comment-gapfill] Unknown GitHub launch outcome for PR #${item.prNumber}; retained dispatch ${dispatchId} for reconciliation`);
-          }
-          if (result.outcome === "rejected") {
-            try {
-              await opts.onDispatchFailure(
-                result, opts.notifyType, opts.notifyWebhookUrl,
-                {
-                  site: "comment-gapfill",
-                  issueId: prLog.issueId,
-                  issueIdentifier: prLog.issueIdentifier ?? undefined,
-                  issueTitle: prLog.issueTitle ?? undefined,
-                  teamKey: scopeKey,
-                  repo: fullRepo,
-                  workflowFile: mapping.workflowFile,
-                  contract,
-                  phase: "gap-analysis",
-                  ...(await gapfillAccounting(opts, mapping, prLog)),
-                },
-              );
-            } catch (err) {
-              console.error(`[comment-gapfill] Failed to report rejected dispatch for PR #${item.prNumber}:`, err);
-            } finally {
-              releaseAdmission(admission.record.dispatchId, admission.record.lifecycleOwner, admission.record.generation, "launch_rejected");
-            }
-          }
-          markCommentGapfillProcessed(item.id, result.outcome === "rejected" ? "failed" : "dispatched");
-          continue;
-        }
-
-        const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
-        const jobId = appendLog({
-          issueId: prLog.issueId,
-          issueIdentifier: prLog.issueIdentifier ?? undefined,
-          issueTitle: prLog.issueTitle ?? undefined,
-          teamKey: scopeKey,
-          repo: fullRepo,
-          dispatchId,
-          admissionGeneration: admission.record.generation,
-          dispatchNumber: prior.count + 1,
-          executionMode: "github-actions",
-          runnerMode: "default",
-          contract,
-          phase: "gap-analysis",
-          trigger: "comment",
-          ...(await gapfillAccounting(opts, mapping, prLog)),
-        });
-        updateJobPrUrl(jobId, `https://github.com/${fullRepo}/pull/${item.prNumber}`);
-        suppressStaleNotifications(prLog.issueId, jobId);
-        markCommentGapfillProcessed(item.id, "dispatched");
-        console.log(`[comment-gapfill] Dispatched gap-fill for ${gapFillIssue.identifier} (PR #${item.prNumber} in ${fullRepo}, github-actions, image: ${runnerImage ?? "workflow-default"})`);
+        },
+      });
+      if (submitted.status === "unavailable") {
+        console.log(`[comment-gapfill] Gap-fill for PR #${item.prNumber} skipped: Restate unavailable`);
+        continue;
+      }
+      if (submitted.status === "not-found") {
+        console.log(`[comment-gapfill] Gap-fill for PR #${item.prNumber} skipped: the ImplementationRun service is not registered`);
+        continue;
+      }
+      markCommentGapfillProcessed(item.id, "dispatched");
+      console.log(`[comment-gapfill] Submitted ImplementationRun for PR #${item.prNumber} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+      if (submitted.status === "conflict") {
+        console.log(`[comment-gapfill] Existing ImplementationRun owns dispatch=${dispatchId}`);
       }
     } catch (err) {
       console.error(`[comment-gapfill] Error processing comment gap-fill #${item.id}:`, err);
