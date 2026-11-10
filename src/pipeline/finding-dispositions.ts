@@ -62,6 +62,54 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export const DISPOSITIONS_FILE = "ai-output/finding-dispositions.json";
 const DISPOSITION_MARKER = "<!-- ai-implement finding-disposition -->";
 
+/** Persist dispositions, including fixed tombstones, without human-authored reasons. */
+export function buildClosedFindingsMarker(dispositions: FindingDisposition[]): string {
+  const payload = { rejected: [] as string[], deferred: [] as string[], fixed: [] as string[] };
+  for (const d of dispositions) payload[d.disposition === "invalid" ? "rejected" : d.disposition === "follow-up" ? "deferred" : "fixed"].push(d.findingKey);
+  return `<!-- ai-implement closed-findings v1 ${JSON.stringify(payload)} -->`;
+}
+
+export function parseClosedFindingsMarkers(body: string): FindingDisposition[][] {
+  const markers: FindingDisposition[][] = [];
+  for (const match of body.matchAll(/<!-- ai-implement closed-findings v1 ([\s\S]*?) -->/g)) {
+    const payload = parseJson(match[1]);
+    if (!isRecord(payload)) continue;
+    const entries: FindingDisposition[] = [];
+    for (const [field, disposition] of [["rejected", "invalid"], ["deferred", "follow-up"], ["fixed", "fixed"]] as const) {
+      const keys = payload[field];
+      if (!Array.isArray(keys)) continue;
+      for (const key of keys) if (typeof key === "string" && FINDING_KEY_RE.test(key)) entries.push({ findingKey: key, disposition, reason: "" });
+    }
+    markers.push(entries);
+  }
+  return markers;
+}
+
+/** REST issue comments arrive oldest first; --slurp preserves page order. */
+export function readClosedFindingKeys(ghSpawn: GhSpawn, prNumber: string, ownLogin: string | undefined): Set<string> {
+  const closed = new Set<string>();
+  if (!ownLogin) return closed;
+  const result = safeGhSpawn(ghSpawn, ["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+  if (!result || result.exitCode !== 0) return closed;
+  const payload = parseJson(result.stdout);
+  if (!Array.isArray(payload)) return closed;
+  for (const comment of payload.flat()) {
+    if (!isRecord(comment) || typeof comment.body !== "string") continue;
+    const markers = parseClosedFindingsMarkers(comment.body);
+    for (const dispositions of markers) {
+      if (!isRecord(comment.user) || comment.user.login !== ownLogin) {
+        console.warn(`[post-push-review] ignored closed-findings marker from untrusted author on comment ${comment.id ?? "unknown"}`);
+        continue;
+      }
+      for (const d of dispositions) {
+        if (d.disposition === "fixed") closed.delete(d.findingKey);
+        else closed.add(d.findingKey);
+      }
+    }
+  }
+  return closed;
+}
+
 export function buildDispositionInstructions(): string {
   return `## Finding dispositions
 
