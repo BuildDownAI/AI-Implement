@@ -61,6 +61,11 @@ export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number
   return row.id;
 }
 
+export function getCommentGapfillItem(id: number): CommentGapfillQueueItem | null {
+  const row = getDb().prepare("SELECT * FROM comment_gapfill_queue WHERE id = ?").get(id) as CommentGapfillQueueRow | undefined;
+  return row ? mapRow(row) : null;
+}
+
 export function claimPendingCommentGapfills(limit = 20): CommentGapfillQueueItem[] {
   const rows = getDb()
     .prepare("SELECT * FROM comment_gapfill_queue WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT ?")
@@ -216,4 +221,36 @@ export function requeueGapfillAfterPushFailure(repoFull: string, prNumber: numbe
   });
   const after = db.prepare("SELECT COUNT(*) AS n FROM comment_gapfill_queue").get() as { n: number };
   return after.n > before.n;
+}
+
+/** Non-secret write-ahead intent. Absence from a backend listing never clears it. */
+export interface CommentGapfillLaunch {
+  record: Parameters<typeof import("./log.js").appendLogIfAbsent>[0];
+  target: { owner: string; repo: string; workflowFile: string };
+  /** Frozen Fly identity; optional for GHA, Docker and older intents. */
+  flyApp?: string;
+  accepted: boolean;
+  rejected?: { status: number };
+}
+function launchStore() {
+  const db = getDb();
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_gapfill_launch (
+    dispatch_id TEXT PRIMARY KEY, recovery_json TEXT NOT NULL
+  )`);
+  return db;
+}
+export function stageCommentGapfillLaunch(dispatchId: string, launch: CommentGapfillLaunch): void {
+  launchStore().prepare("INSERT OR IGNORE INTO comment_gapfill_launch VALUES (?, ?)").run(dispatchId, JSON.stringify(launch));
+}
+export function getCommentGapfillLaunch(dispatchId: string): CommentGapfillLaunch | null {
+  const row = launchStore().prepare("SELECT recovery_json FROM comment_gapfill_launch WHERE dispatch_id = ?").get(dispatchId) as { recovery_json: string } | undefined;
+  return row ? JSON.parse(row.recovery_json) as CommentGapfillLaunch : null;
+}
+export function confirmCommentGapfillLaunch(dispatchId: string): void {
+  const launch = getCommentGapfillLaunch(dispatchId);
+  if (launch && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, accepted: true }), dispatchId);
+}
+export function rejectCommentGapfillLaunch(dispatchId: string, status: number): void {
+  const launch = getCommentGapfillLaunch(dispatchId);
+  if (launch && !launch.accepted && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, rejected: { status } }), dispatchId);
 }

@@ -773,6 +773,33 @@ export function releaseRejectedLaunch(
   return { complete, results };
 }
 
+/** Positive persisted preparation evidence; consumed credentials require execution recovery. */
+export function persistedPreparationState(dispatchId: string): "absent" | "unused" | "consumed" {
+  const row = getDb().prepare("SELECT consumed_at FROM model_credential_grants WHERE dispatch_id = ? ORDER BY expires_at DESC, rowid DESC LIMIT 1").get(dispatchId) as { consumed_at: number | null } | undefined;
+  return !row ? "absent" : row.consumed_at === null ? "unused" : "consumed";
+}
+
+/** Settle an unconfirmed reconstructed launch using only its persisted owner identity.
+ * No grant means a legacy launch; conflicting bindings fail closed in the normal seam.
+ */
+export function releaseUnconfirmedLaunch(
+  dispatchId: string,
+  deps: Pick<AgentRunPreparationDeps, "ownership" | "now">,
+): CleanupOutcome {
+  const grant = readGrant(dispatchId);
+  if (!grant) return { complete: true, results: [] };
+  const owners = new Map<string, number>();
+  for (const binding of grant.bindings) {
+    if (binding.ownerGeneration === undefined) continue;
+    if (owners.has(binding.profileId) && owners.get(binding.profileId) !== binding.ownerGeneration) {
+      return { complete: false, results: [] };
+    }
+    owners.set(binding.profileId, binding.ownerGeneration);
+  }
+  return releaseRejectedLaunch(dispatchId,
+    [...owners].map(([profileId, generation]) => ({ profileId, generation })), deps);
+}
+
 /**
  * Release after confirmed termination. Delegates to the ownership probe and checkpoint
  * policy: heartbeat freshness never releases, and `pending`/`held` outcomes keep ownership.
@@ -791,4 +818,20 @@ export async function releaseTerminated(
   const complete = results.every((r) => r.result.status === "released");
   if (complete) revokeGrants(dispatchId, (deps.now ?? Date.now)());
   return { complete, results };
+}
+
+/** Settle an unused API-only preparation from its frozen identity, without resolving current config.
+ * No session ownership policy is inferred here; subscription bindings fail closed.
+ */
+export function releaseUnusedManagedPreparation(
+  request: Pick<AgentRunRequest, "dispatchId" | "projectKey" | "backend">,
+  deps: Pick<AgentRunPreparationDeps, "ownership" | "now">,
+): CleanupOutcome {
+  const grant = readGrant(request.dispatchId);
+  if (!grant) return { complete: true, results: [] };
+  const snapshot = readSnapshotRow(request.dispatchId);
+  if (!snapshot || snapshot.project_key !== request.projectKey ||
+      grant.row.project_key !== request.projectKey || grant.row.snapshot_id !== snapshot.snapshot_id ||
+      grant.row.backend !== GRANT_BACKENDS[request.backend]) return { complete: false, results: [] };
+  return releaseRejectedLaunch(request.dispatchId, [], deps);
 }

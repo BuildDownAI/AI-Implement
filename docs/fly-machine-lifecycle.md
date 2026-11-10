@@ -110,3 +110,26 @@ Revert the change. A kept machine left behind is destroyed by the reaper once it
 
 - A kept machine left in an old sessions app (the destroy answered 401 or 403) has no automated cleanup: the reaper's `durable-expired` backstop only sees the current app and token, so the operator destroys it by hand.
 - The resume path (attempt above 1) is AII-1032's; only attempt 1 is sent today.
+
+## Review-fix attempts
+
+Review-fix attempts use fresh session machines (`auto_destroy: false`), never a kept
+`FlyMachineProfile` machine. Production routes Fly and local attempts to the container
+worker, while new container admission remains gated off in `selectedEntry` pending
+its separate rollout. The worker reconciles uncertain launches by persisted identity
+or one exact attempt-name match and retains occupancy until terminal inspection
+confirms stop, including after a lost cancellation acknowledgement.
+
+The existing `recordOutcome` step validates execution ownership and admission
+generation, closes the dispatch row with admission release suppressed, invalidates
+the nonce, then calls `destroyMachineRecorded` (`backend-stop`) or removes the local
+container. It preserves callback outcomes. Fly 404 and Docker “No such container”
+are successful cleanup; other errors throw so the step retries. Replays skip row
+writes already done and repeat removal safely. The existing release step releases
+occupancy afterwards. GHA has no cleanup, and the workflow journal is unchanged,
+so live GHA attempts need no drain.
+
+An unbound `launch_unresolved` outcome records the unresolved launch without
+cleanup, even if the dispatch row already has a machine or container ID. There is
+no terminal confirmation: the resource, nonce and occupancy remain for operator
+recovery.

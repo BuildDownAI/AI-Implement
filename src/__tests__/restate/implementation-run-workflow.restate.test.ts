@@ -7,18 +7,34 @@
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
 import { getDb } from "../../dedup.js";
+import { initMappingsTable } from "../../config.js";
+import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
+import { initSettingsTable } from "../../runner-mode.js";
 import { initLogTable } from "../../log.js";
 import { toRecordedUsage } from "../../agent-usage.js";
 import type { OwnedRunReportResult } from "../../restate/owned-run-lifecycle.js";
 import type { RestateEnvironment } from "./harness.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi, onTestFinished } from "vitest";
 import type { DispatchAdmissionReleaseReason } from "../../dispatch-admission.js";
 import type { OwnedRunStatus } from "../../restate/owned-run-wait.js";
 import type { Job } from "../../log.js";
+import { createImplementationGapfillDependencies } from "../../restate/implementation-run-gapfill.js";
+import type { ImplementationRunProductionInput } from "../../restate/implementation-run-production.js";
+import * as gapfillLaunch from "../../gapfill-launch.js";
+import * as localGapfill from "../../local-gapfill.js";
+import * as gapfillDrain from "../../comment-gapfill-drain.js";
+import * as auth from "../../github-app-auth.js";
+import * as runnerTokens from "../../runner-tokens.js";
+import * as managedAuth from "../../managed-dispatch-auth.js";
+import * as admission from "../../dispatch-admission.js";
+import { enqueueCommentGapfill, getCommentGapfillItem } from "../../comment-gapfill-queue.js";
+import { getJobByDispatchId } from "../../log.js";
+import { makeMapping } from "../helpers/builders.js";
 import { makeJob } from "../helpers/builders.js";
 import { finishImplementationJob } from "../../restate/implementation-run-finish.js";
 import {
   createImplementationRunWorkflow,
+  implementationRunInputSchema,
   type ImplementationFinishOutcome,
   type ImplementationLaunchResult,
   type ImplementationRunDependencies,
@@ -60,14 +76,19 @@ interface Scenario {
   reserveTaken?: boolean;
   /** Parks the first `cleanup` call. */
   cleanupGate?: Gate;
+  outcomeGate?: Gate;
   /** Parks the first `stop` call. */
   stopGate?: Gate;
+  reserveImpl?: (input: ImplementationRunInput) => Promise<boolean>;
+  releaseImpl?: (dispatchId: string, reason: DispatchAdmissionReleaseReason) => void;
   launchImpl?: (input: ImplementationRunInput) => Promise<ImplementationLaunchResult>;
   /** Every effect call in order, one string per attempt (the shape the contract suite reads). */
   calls: string[];
   faults: OwnedRunFaults;
   /** `findExistingRun` throws on every attempt once the launch happened (the launch step's own lookup runs before). */
   findThrows?: boolean;
+  endOnStop?: boolean;
+  stopAccepted?: boolean;
   /** The `dispatch_log` row of the attempt as the runner callback left it. */
   row: Job;
   /** Calls the real finish decision made on its deps, in order. */
@@ -108,7 +129,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
         sc.reserveTaken = true;
         await sc.reserveGate.wait();
       }
-      return !sc.faults.refuseReservation;
+      return sc.reserveImpl ? sc.reserveImpl(input) : !sc.faults.refuseReservation;
     },
     async findExistingRun(input) {
       const sc = scenarioOf(input.dispatchId);
@@ -141,7 +162,8 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
       sc.stopCalls.push(jobId);
       sc.calls.push("stop");
       if (sc.stopGate && sc.stopCalls.length === 1) await sc.stopGate.wait();
-      return true;
+      if (sc.endOnStop) sc.status = "ended";
+      return sc.stopAccepted ?? true;
     },
     async cleanup(input, jobId) {
       const sc = scenarioOf(input.dispatchId);
@@ -154,6 +176,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
       const sc = scenarioOf(dispatchId);
       sc.calls.push("outcome");
       sc.events.push("outcome");
+      if (sc.outcomeGate) await sc.outcomeGate.wait();
       if (sc.faults.failOutcome) throw new Error("injected outcome failure");
     },
     async finishJob(dispatchId, outcome) {
@@ -173,6 +196,7 @@ function makeDeps(seams: typeof SLOW): ImplementationRunDependencies {
     async release(dispatchId, reason) {
       scenarios.get(dispatchId)?.calls.push("release");
       scenarios.get(dispatchId)?.events.push("release");
+      scenarioOf(dispatchId).releaseImpl?.(dispatchId, reason);
       releases.push({ dispatchId, reason });
     },
   };
@@ -201,6 +225,44 @@ const storedRows = (dispatchId: string) => getDb().prepare(
   "SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY invocation_id",
 ).all(dispatchId);
 
+describe("ImplementationRun input schema", () => {
+  const input = {
+    dispatchId: "implementation-schema", teamKey: "ENG", issueId: "issue-schema", issueIdentifier: "ENG-1",
+    launchContext: {}, maxJobMinutes: 90, backend: "github-actions",
+  };
+  const gapFill = {
+    queueItemId: 1, repository: "owner/repo", installationId: "installation-1",
+    prNumber: 2, prDispatchBudget: 0, humanRequested: false,
+  };
+
+  it("preserves an input without gapFill and the launchContext default", () => {
+    const parsed = implementationRunInputSchema.parse(input);
+    expect(parsed).toEqual(input);
+    expect(parsed).not.toHaveProperty("gapFill");
+    const { launchContext: _launchContext, ...withoutLaunchContext } = input;
+    expect(implementationRunInputSchema.parse(withoutLaunchContext)).toEqual(input);
+  });
+
+  it("preserves all six gapFill fields, including zero budget and false humanRequested", () => {
+    expect(implementationRunInputSchema.parse({ ...input, gapFill })).toEqual({ ...input, gapFill });
+  });
+
+  it.each([
+    { extra: true },
+    { repository: "repo" }, { repository: "/repo" }, { repository: "owner/" }, { repository: "owner/repo/extra" },
+    { queueItemId: 0 }, { queueItemId: -1 }, { queueItemId: 1.5 },
+    { prNumber: 0 }, { prNumber: -1 }, { prNumber: 1.5 },
+    { prDispatchBudget: -1 }, { prDispatchBudget: 0.5 },
+    { installationId: "" }, { humanRequested: "false" },
+  ])("rejects an invalid gapFill part: %j", (invalid) => {
+    expect(implementationRunInputSchema.safeParse({ ...input, gapFill: { ...gapFill, ...invalid } }).success).toBe(false);
+  });
+
+  it("continues to reject extra outer keys", () => {
+    expect(implementationRunInputSchema.safeParse({ ...input, gapFill, extra: true }).success).toBe(false);
+  });
+});
+
 describe("ImplementationRun durable workflow", () => {
   let slow: Map<string, RestateEnvironment>;
   let window: Map<string, RestateEnvironment>;
@@ -210,6 +272,9 @@ describe("ImplementationRun durable workflow", () => {
   beforeAll(async () => {
     getDb();
     initLogTable();
+    initDispatchBreakerTable();
+    initSettingsTable();
+    initMappingsTable();
     [slow, window, deadline] = await Promise.all([
       startVariants([createImplementationRunWorkflow(makeDeps(SLOW))]),
       startVariants([createImplementationRunWorkflow(makeDeps(WINDOW))]),
@@ -230,7 +295,7 @@ describe("ImplementationRun durable workflow", () => {
   }
 
   /** Registers a scenario and starts `ImplementationRun.run`; `done` settles with the run's result. */
-  function begin(envs: Map<string, RestateEnvironment>, label: string, overrides: Partial<Scenario> = {}) {
+  function begin(envs: Map<string, RestateEnvironment>, label: string, overrides: Partial<Scenario> = {}, inputOverrides: Partial<ImplementationRunInput> = {}) {
     const dispatchId = `implementation-${label}-${counter++}`;
     const sc: Scenario = {
       launchResult: { outcome: "accepted", jobId: `job-${dispatchId}` },
@@ -244,7 +309,7 @@ describe("ImplementationRun durable workflow", () => {
     scenarios.set(dispatchId, sc);
     const url = baseUrl(envs, label);
     const input: ImplementationRunInput = {
-      dispatchId, teamKey: "ENG", issueId: `issue-${dispatchId}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions",
+      dispatchId, teamKey: "ENG", issueId: `issue-${dispatchId}`, issueIdentifier: "ENG-1", launchContext: {}, maxJobMinutes: 90, backend: "github-actions", ...inputOverrides,
     };
     const done = callWorkflow<ImplementationRunResult>(url, "ImplementationRun", dispatchId, "run", input);
     // A scenario that expects `run` to fail reads `done` itself; keep the early rejection from being unhandled.
@@ -253,6 +318,77 @@ describe("ImplementationRun durable workflow", () => {
     const report = () => callWorkflow(url, "ImplementationRun", dispatchId, "report");
     return { dispatchId, sc, done, read, report };
   }
+
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("%s gap-fill finishes once and releases its reservation without journaling credentials", async backend => {
+    const label = labels[0]!;
+    const nonce = "NONCE-SENTINEL";
+    const bootstrap = "BOOTSTRAP-SENTINEL";
+    onTestFinished(() => { vi.restoreAllMocks(); });
+    const mapping = makeMapping({ owner: "Org", repo: "repo" });
+    const minted = vi.spyOn(runnerTokens, "mintLaunchTokens").mockReturnValue({ runToken: SECRET_TOKEN, runProgressToken: SECRET_TOKEN, runPublicationToken: SECRET_TOKEN });
+    vi.spyOn(auth, "getInstallationToken").mockResolvedValue(SECRET_TOKEN);
+    vi.spyOn(auth, "getScopedInstallationToken").mockResolvedValue({ token: SECRET_TOKEN } as Awaited<ReturnType<typeof auth.getScopedInstallationToken>>);
+    vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(true);
+    const takeBootstrap = vi.fn(() => ({ bearer: bootstrap }) as ReturnType<Extract<managedAuth.ManagedDispatchDecision, { kind: "launch" }>["takeBootstrap"]>);
+    const decision = { kind: "launch", dispatchId: "private", projectKey: "ENG", backend, snapshot: {} as never, fallbackModels: {}, grant: {} as never, takeBootstrap } as Extract<managedAuth.ManagedDispatchDecision, { kind: "launch" }>;
+    const managed = vi.spyOn(gapfillDrain, "resolveManagedDecision").mockResolvedValue(decision);
+    vi.spyOn(gapfillDrain, "gapfillAccounting").mockResolvedValue({ trackerKind: "linear", issueUrl: "https://tracker.test/ENG-1" });
+    const prepared = vi.spyOn(gapfillLaunch, "prepareGhaGapfillLaunch").mockImplementation(async args => {
+      expect(args.ghToken).toBe(SECRET_TOKEN);
+      expect(args.runToken).toBe(SECRET_TOKEN);
+      expect(args.decision).toBe(decision);
+      return { contract: "envelope", runnerImage: undefined, inputs: { token: args.runToken, nonce, bootstrap: takeBootstrap()!.bearer } };
+    });
+    const gha = vi.spyOn(gapfillLaunch, "dispatchGhaGapfill").mockImplementation(async args => {
+      expect(args.inputs).toEqual({ token: SECRET_TOKEN, nonce, bootstrap });
+      return { success: true, status: 200, runId: 987654 };
+    });
+    const fly = vi.spyOn(gapfillLaunch, "dispatchFlyGapfill").mockImplementation(async args => {
+      expect(args.githubToken).toBe(SECRET_TOKEN);
+      expect(args.runToken).toBe(SECRET_TOKEN);
+      expect(args.decision).toBe(decision);
+      expect(args.decision.kind === "launch" && args.decision.takeBootstrap()!.bearer).toBe(bootstrap);
+      args.onBeforeLaunch({} as never, nonce, "runner:test");
+      return { machine: { id: "fly-gapfill", nonce, bootstrap }, resolvedImage: "runner:test" } as unknown as Awaited<ReturnType<typeof gapfillLaunch.dispatchFlyGapfill>>;
+    });
+    const local = vi.spyOn(localGapfill, "dispatchLocalGapfill").mockImplementation(async args => {
+      expect(args.githubToken).toBe(SECRET_TOKEN);
+      expect(args.runToken).toBe(SECRET_TOKEN);
+      expect(args.managed?.decision).toBe(decision);
+      expect(args.managed!.decision.takeBootstrap()!.bearer).toBe(bootstrap);
+      args.onBeforeLaunch!(nonce);
+      return { containerId: "local-gapfill", containerName: args.runName!, runConfig: { bootstrap, nonce, token: SECRET_TOKEN } as never };
+    });
+    const production = createImplementationGapfillDependencies({ config: {
+      githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://callback.test", runnerTokenSecret: "secret",
+      flySessionsToken: SECRET_TOKEN, flySessionsApp: "sessions", sessionImage: "runner:test", localRunnerImage: "runner:test",
+    } } as ImplementationRunProductionInput, () => mapping);
+    const queueItemId = enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 900000 + counter, commenter: "human", instruction: "Fix review findings" });
+    const w = begin(slow, label, { status: "ended", row: makeJob({ status: "completed" }),
+      reserveImpl: async input => production.reserve(input),
+      releaseImpl: (id, reason) => { admission.releaseByDispatchId(id, reason); },
+      launchImpl: production.launch,
+    }, { backend, gapFill: { queueItemId, installationId: "123", repository: "Org/repo", prNumber: 42, prDispatchBudget: 5, humanRequested: true } });
+    expect(await w.done).toMatchObject({ reason: "finalized" });
+    expect(w.sc.finishCalls).toHaveLength(1);
+    expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
+    expect(admission.read(w.dispatchId)?.releasedAt).toEqual(expect.any(Number));
+    expect(getCommentGapfillItem(queueItemId)?.status).toBe("dispatched");
+    expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ executionMode: backend });
+    expect(minted).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ dispatchId: w.dispatchId }));
+    expect(managed).toHaveBeenCalledTimes(1);
+    expect(takeBootstrap).toHaveBeenCalledTimes(1);
+    expect(prepared).toHaveBeenCalledTimes(backend === "github-actions" ? 1 : 0);
+    expect(gha).toHaveBeenCalledTimes(backend === "github-actions" ? 1 : 0);
+    expect(fly).toHaveBeenCalledTimes(backend === "fly-machines" ? 1 : 0);
+    expect(local).toHaveBeenCalledTimes(backend === "local-docker" ? 1 : 0);
+    expect(w.sc.launchCalls).toBe(1);
+    const env = slow.get(label)!;
+    const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}'`);
+    expect(rows.length).toBeGreaterThan(0);
+    const text = (await Promise.all(rows.map(async row => journalText(await journalEntries(env.adminAPIBaseUrl(), String(row.id)))))).join("\n");
+    for (const sentinel of [SECRET_TOKEN, nonce, bootstrap]) expect(text).not.toContain(sentinel);
+  }, 60_000);
 
   it.each(labels)("accepts an empty HTTP report body (%s)", async (label) => {
     const w = begin(slow, label);
@@ -349,41 +485,49 @@ describe("ImplementationRun durable workflow", () => {
     expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
   }, 60_000);
 
-  it.each(labels)("total_timeout with a known job id stops the run and releases within the stop margin (%s)", async (label) => {
+  it.each(labels)("total_timeout with a known job id retains an active run after cancellation acknowledgement (%s)", async (label) => {
     const w = begin(deadline, label, { status: "started", tickGate: gate("first tick") });
     await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
     w.sc.tickGate!.release();
 
-    expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
   }, 60_000);
 
-  it.each(labels)("bootstrap_timeout with no started evidence releases with deadline_exceeded (%s)", async (label) => {
+  it.each(labels)("a refused stop with an active backend retains occupancy (%s)", async (label) => {
+    const w = begin(deadline, label, { status: "started", stopAccepted: false });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    expect(w.sc.finishCalls).toEqual([]);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
+  }, 60_000);
+
+  it.each(labels)("bootstrap_timeout with no started evidence retains occupancy with termination_unconfirmed (%s)", async (label) => {
     // The backend never shows an id, so each tick looks for one; the first lookup is held past the bootstrap deadline.
     const w = begin(deadline, label, { launchResult: { outcome: "unknown" }, runId: null, tickGate: gate("first lookup") });
     await pastDeadlineAtTick(w.sc, DEADLINE.bootstrapMs, "the bootstrap deadline");
     w.sc.tickGate!.release();
 
-    expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
     expect(w.sc.stopCalls).toEqual([]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
   }, 60_000);
 
   it.each(labels)("a find that fails on each attempt counts as not found and the wait reaches its deadline (%s)", async (label) => {
     const w = begin(deadline, label, { launchResult: { outcome: "unknown" }, runId: null, findThrows: true });
-    expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+    expect(await w.done).toEqual({ reason: "termination_unconfirmed" });
     expect(w.sc.stopCalls).toEqual([]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
-    // No run id was ever known, so there is nothing to clean up; the outcome still runs once.
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    // No run ID or terminal evidence: neither cleanup nor outcome reporting runs.
     expect(w.sc.calls.filter((c) => c.startsWith("cleanup"))).toEqual([]);
-    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
+    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(0);
   }, 60_000);
 
-  it.each(labels)("an invocation cancel after a launch stops the run, closes the row, and releases (%s)", async (label) => {
+  it.each(labels)("an invocation cancel after a launch retains an active run (%s)", async (label) => {
     const w = begin(slow, label, { status: "started" });
     await waitForStep(w.read, "wait");
     const env = slow.get(label)!;
@@ -394,18 +538,17 @@ describe("ImplementationRun durable workflow", () => {
     );
     await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-    expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
-    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+    expect(w.sc.finishCalls).toEqual([]);
+    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(0);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
-  // The cancel reaches the workflow while a status read is in flight: the read stays parked on a gate
-  // until the release is seen. A bounded read that swallowed the cancellation (a TerminalError 409)
-  // would answer `unknown`, and the workflow would wait on and never release.
-  it.each(labels)("an invocation cancel during a status read still stops the run, closes the row, and releases (%s)", async (label) => {
+  // Cancellation during a read must reach escape. A fresh read after stop still
+  // reports active, so the reservation remains held.
+  it.each(labels)("an invocation cancel during a status read retains an active run (%s)", async (label) => {
     const w = begin(slow, label, { status: "started", readGate: gate("status read") });
     try {
       await w.sc.readGate!.reached();
@@ -416,11 +559,12 @@ describe("ImplementationRun durable workflow", () => {
         { label: "the run invocation" },
       );
       await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
-      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      w.sc.readGate!.release();
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
       expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
-      expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+      expect(w.sc.finishCalls).toEqual([]);
+      expect((await w.read()).step).toBe("termination_unconfirmed");
     } finally {
       w.sc.readGate!.release();
     }
@@ -437,9 +581,9 @@ describe("ImplementationRun durable workflow", () => {
     await cancelInvocation(env.adminAPIBaseUrl(), String(rows[0].id));
   }
 
-  // A second cancel while `cleanup` runs in the escape path ends the escape with an exception; the release still runs once.
-  it.each(labels)("a second cancel during cleanup in the escape path still releases one time (%s)", async (label) => {
-    const w = begin(slow, label, { status: "started", cleanupGate: gate("cleanup") });
+  // A second cancellation interrupts cleanup, but cannot free capacity before recovery completes it.
+  it.each(labels)("a second cancel during cleanup in the escape path retains recovery authority (%s)", async (label) => {
+    const w = begin(slow, label, { status: "started", endOnStop: true, cleanupGate: gate("cleanup") });
     try {
       await waitForStep(w.read, "wait");
       await cancelRun(slow, label, w.dispatchId);
@@ -449,31 +593,30 @@ describe("ImplementationRun durable workflow", () => {
       w.sc.cleanupGate!.release();
     }
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the second cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
-  // A cancel while `cleanup` runs on the normal path: the run ended, so the escape does not stop it, and the outcome runs once.
-  it.each(labels)("a cancel during cleanup on the normal path runs the outcome once, does not stop, and releases (%s)", async (label) => {
-    const w = begin(slow, label, { status: "ended", cleanupGate: gate("cleanup") });
+  it.each(labels.flatMap(label => (["cleanup", "outcome"] as const).map(effect => ({ label, effect }))))(
+    "a cancel during normal $effect retains occupancy ($label)", async ({ label, effect }) => {
+    const effectGate = gate(effect);
+    const w = begin(slow, label, { status: "ended", [effect === "cleanup" ? "cleanupGate" : "outcomeGate"]: effectGate });
     try {
-      await w.sc.cleanupGate!.reached();
+      await effectGate.reached();
       await cancelRun(slow, label, w.dispatchId);
+      await w.done.catch(() => undefined);
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
+      expect(w.sc.stopCalls).toEqual([]);
+      if (effect === "cleanup") expect(w.sc.calls.filter(c => c === "outcome")).toHaveLength(0);
     } finally {
-      w.sc.cleanupGate!.release();
+      effectGate.release();
     }
-    await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
-    expect(w.sc.stopCalls).toEqual([]);
-    expect(w.sc.calls.filter((c) => c.startsWith("cleanup"))).toHaveLength(1);
-    expect(w.sc.calls.filter((c) => c === "outcome")).toHaveLength(1);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
   }, 60_000);
 
   // A cancel while the deadline `stop` runs: the stop does not count as tried, so the escape stops the run again.
-  it.each(labels)("a cancel during the deadline stop tries the stop again in the escape path and releases (%s)", async (label) => {
+  it.each(labels)("a cancel during the deadline stop retries stop and retains an active run (%s)", async (label) => {
     const w = begin(deadline, label, { status: "started", tickGate: gate("first tick"), stopGate: gate("stop") });
     try {
       await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
@@ -484,10 +627,10 @@ describe("ImplementationRun durable workflow", () => {
       w.sc.stopGate!.release();
     }
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-    expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`, `job-${w.dispatchId}`]);
-    expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
   // The cancel reaches the workflow while the launch call is in flight; the call completes after the
@@ -501,27 +644,27 @@ describe("ImplementationRun durable workflow", () => {
       await eventually(() => w.sc.findCalls, (n) => n >= 2, { label: "the first lookup of the escape path" });
       expect(w.sc.stopCalls).toEqual([]);
       w.sc.launchGate!.release();
-      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
-      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
       expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
-      expect(w.sc.calls[w.sc.calls.length - 1]).toBe("release");
+      expect(w.sc.finishCalls).toEqual([]);
+      expect((await w.read()).step).toBe("termination_unconfirmed");
     } finally {
       w.sc.launchGate!.release();
     }
   }, 60_000);
 
-  it.each(labels)("an invocation cancel during a launch that never creates a run ends the escape after the fixed time (%s)", async (label) => {
+  it.each(labels)("an invocation cancel during a launch that never creates a run retains uncertainty after the fixed search time (%s)", async (label) => {
     const w = begin(slow, label, { launchGate: gate("launch call"), runId: null });
     try {
       await w.sc.launchGate!.reached();
       await cancelRun(slow, label, w.dispatchId);
       await eventually(() => w.sc.findCalls, (n) => n >= 2, { label: "the first lookup of the escape path" });
       w.sc.launchGate!.release();
-      await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the escape time" });
-      expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+      await waitForStep(w.read, "termination_unconfirmed");
+      expect(releasesOf(w.dispatchId)).toEqual([]);
       expect(w.sc.stopCalls).toEqual([]);
-      expect(w.sc.finishCalls).toEqual([{ kind: "cancelled" }]);
+      expect(w.sc.finishCalls).toEqual([]);
       // The escape looked more than one time before it gave up.
       expect(w.sc.findCalls).toBeGreaterThan(2);
     } finally {
@@ -544,19 +687,19 @@ describe("ImplementationRun durable workflow", () => {
     }
   }, 60_000);
 
-  it.each(labels)("a throw in finishJob still ends with one release (%s)", async (label) => {
+  it.each(labels)("a throw in finishJob retains admission for recovery (%s)", async (label) => {
     const w = begin(slow, label, { finishThrows: true });
     await waitForStep(w.read, "wait");
     w.sc.status = "ended";
     await expect(w.done).rejects.toThrow();
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the finishJob failure" });
-    expect(releasesOf(w.dispatchId)).toEqual(["finalized"]);
-    expect((await w.read()).step).toBe("released");
+    await waitForStep(w.read, "termination_unconfirmed");
+    expect(releasesOf(w.dispatchId)).toEqual([]);
+    expect((await w.read()).step).toBe("termination_unconfirmed");
   }, 60_000);
 
   const PR = "https://github.com/o/r/pull/7";
   const FAILURE = { code: "X", stage: "agent", category: "permanent", message: "m" } as unknown as Job["failure"];
-  const ENDED = { backendTerminated: true };
+  const ENDED = { skipAdmissionRelease: true };
 
   // One scenario per row of the final-state table (AII-1553). The row planted in `dispatch_log` is what the runner callback
   // left; `report` carries no payload, so the finish step reads it. Each row ends in exactly one final state: the finish step,
@@ -602,7 +745,7 @@ describe("ImplementationRun durable workflow", () => {
   });
 
   it.each(labels)("deadline reached: stop, then the bounded stuck cleanup, then one release (%s)", async (label) => {
-    const w = begin(deadline, label, { status: "started", tickGate: gate("first tick") });
+    const w = begin(deadline, label, { status: "started", endOnStop: true, tickGate: gate("first tick") });
     await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
     w.sc.tickGate!.release();
 
@@ -615,17 +758,17 @@ describe("ImplementationRun durable workflow", () => {
     expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
   }, 60_000);
 
-  it.each(labels)("the Restate cancel finishes the job failed through the finalizer and releases (%s)", async (label) => {
+  it.each(labels)("the Restate cancel retains occupancy without rearming an active runner (%s)", async (label) => {
     const w = begin(slow, label, { status: "started" });
     await waitForStep(w.read, "wait");
     await cancelRun(slow, label, w.dispatchId);
     await w.done.catch(() => undefined);
-    await eventually(() => releasesOf(w.dispatchId), (reasons) => reasons.length >= 1, { label: "the release after the cancel" });
+    await waitForStep(w.read, "termination_unconfirmed");
     expect(w.sc.stopCalls).toEqual([`job-${w.dispatchId}`]);
-    expect(w.sc.closeCalls).toEqual([["failed", "workflow_cancelled", { skipAdmissionRelease: true }]]);
-    expect(w.sc.finalizeCalls).toEqual([{ kind: "failed", conclusion: "workflow_cancelled" }]);
-    expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
-    expect(releasesOf(w.dispatchId)).toEqual(["cancelled"]);
+    expect(w.sc.closeCalls).toEqual([]);
+    expect(w.sc.finalizeCalls).toEqual([]);
+    expect(w.sc.events).toEqual([]);
+    expect(releasesOf(w.dispatchId)).toEqual([]);
   }, 60_000);
 
   it.each(labels)("a report before ended releases nothing until a status read confirms ended (%s)", async (label) => {
@@ -703,6 +846,7 @@ describe("ImplementationRun durable workflow", () => {
   // The contract suite (ADR 036). `ImplementationRun` takes the reservation in its first step, so the `reserve` dep records the call.
   const contractAdapter: OwnedRunAdapter = {
     name: "ImplementationRun",
+    retainUnconfirmed: true,
     start(_baseUrl, key, { faults, totalMs }) {
       const label = labels.find((l) => key.startsWith(`contract-${l}-`));
       if (!label) throw new Error(`no variant in key ${key}`);

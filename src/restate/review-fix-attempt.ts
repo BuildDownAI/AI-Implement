@@ -5,6 +5,9 @@
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext, WorkflowSharedContext } from "@restatedev/restate-sdk";
 import {
+  normalizeExecutionIdentity,
+  resultMatchesExecution,
+  sameExecution,
   validateAttemptId,
   validateReviewFixResultMetadata,
   validateWorkerLaunchOutcome,
@@ -92,10 +95,6 @@ function validKey(key: string, attemptId: unknown): AttemptId {
   return result.value;
 }
 
-function sameExecution(a: WorkerExecutionIdentity, b: WorkerExecutionIdentity): boolean {
-  return a.githubRunId === b.githubRunId && a.githubRunAttempt === b.githubRunAttempt;
-}
-
 function sameScope(a: PreparedReviewFixAttempt, b: ReviewFixResultMetadataV1): boolean {
   return a.attemptId === b.attemptId && a.scope.installationId === b.installationId
     && a.scope.repository === b.repository && a.scope.prNumber === b.prNumber;
@@ -147,6 +146,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     const plan = await worker.prepare(attempt); // pure, deterministic adapter obligation
     if (plan.attemptId !== attemptId || plan.scope.installationId !== attempt.scope.installationId
       || plan.scope.repository !== attempt.scope.repository || plan.scope.prNumber !== attempt.scope.prNumber
+      || (plan.executionBackend ?? "github-actions") !== (attempt.executionBackend ?? "github-actions")
       || plan.deadlineAt !== attempt.deadlineAt || plan.taskText !== attempt.taskText) {
       throw new restate.TerminalError("worker launch plan differs from immutable prepared attempt");
     }
@@ -177,7 +177,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
 
     let execution: WorkerExecutionIdentity;
     if (launch.status === "accepted") {
-      execution = launch.execution;
+      execution = normalizeExecutionIdentity(launch.execution);
     } else {
       const unknownSince = await ctx.date.now();
       const unresolvedUntil = attempt.deadlineAt + (deps.unknownLaunchGraceMs ?? UNKNOWN_LAUNCH_GRACE_MS);
@@ -197,7 +197,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
         }
         const lookup = await ctx.run(`reconcile-${lookupIndex++}`, () => worker.reconcile(attemptId, attempt.scope));
         if (lookup.status === "found") {
-          execution = lookup.execution;
+          execution = normalizeExecutionIdentity(lookup.execution);
           break;
         }
         // Even an empty exact search cannot prove the dispatch never started.
@@ -225,7 +225,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
     const boundAt = await ctx.date.now();
     const bound = await ctx.run("bind-exact-execution", () => store.bindExecution(attemptId, execution, boundAt));
     if (bound.status === "not_owner") return { completion: { status: "not_owner" }, scope: attempt.scope };
-    if (bound.status === "already_bound" && !sameExecution(bound.execution, execution)) {
+    if (bound.status === "already_bound" && !sameExecution(normalizeExecutionIdentity(bound.execution), execution)) {
       const revokedAt = await ctx.date.now();
       await ctx.run("revoke-conflicting-execution", () => store.revokeAuthority(attemptId, revokedAt));
       await alert(ctx, attemptId, "different execution already bound; occupancy retained", "alert-conflicting-execution");
@@ -258,7 +258,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
 
     let validResult: ReviewFixResultMetadataV1 | null = null;
     if (wake.kind === "result" && sameScope(attempt, wake.result)
-      && sameExecution(execution, wake.result)) {
+      && resultMatchesExecution(wake.result, execution)) {
       validResult = wake.result;
     } else {
       const revokedAt = await ctx.date.now();

@@ -154,3 +154,53 @@ Running the change before `ensureAccountingTriggers()` is not enough for this ta
 4. If the change drops a column that a trigger names (or renames one), follow section 5.
 5. Read the deploy paths in [deployment.md](deployment.md#deploy-paths). Remember that a
    rollback keeps the schema change (section 3).
+
+## Gap-fill dispatch uncertainty
+
+`src/comment-gapfill-queue.ts` owns `comment_gapfill_launch`, keyed by
+`dispatch_id`, with `recovery_json` containing only the original job attribution,
+workflow target, confirmed-acceptance flag and optional rejected disposition
+(HTTP status only). It freezes issue title, mapping identity, admission generation,
+accounting and launch contract. Instructions,
+credentials, prepared inputs and grant/bootstrap secrets are never stored here.
+
+This table is intentionally initialized lazily with `CREATE TABLE IF NOT EXISTS`
+on access, including recovery reads, so older databases can recover without a new
+boot caller. No `src/index.ts` change is required. The intent commits before the
+external dispatch attempt; acceptance is recorded separately before job insertion.
+A uniquely matched run adopted without a prior intent also persists its validated
+original owner, repository and workflow plus explicitly selected job attribution,
+with acceptance, before job insertion, run binding or queue completion. Retries
+reuse this snapshot across restarts and project mapping changes or removal;
+status and cancellation continue to address the original repository. Failed
+snapshot persistence leaves adoption bookkeeping untouched. No intent is created
+for an empty, ambiguous or invalid initial lookup.
+A crash between intent and call is indistinguishable from an uncertain attempted
+call: both recover conservatively as unknown, retaining admission and preventing
+another preparation, grant or dispatch even when a successful listing is empty.
+Reconstructed recovery revokes an unconfirmed managed grant through exact-dispatch
+settlement using the grant’s persisted profile/generation bindings (deduplicated
+across stages). Incomplete settlement fails closed and is retried without another
+launch; confirmed acceptance or backend adoption preserves the grant.
+
+Definite rejection retains its disposition before settlement and creates no job.
+Exact-dispatch retries return rejected without preparing or dispatching again.
+Accepted and unknown intents must not be removed because a job or backend listing is absent. Coordinated
+retention with dispatch/admission records belongs to AII-1565; until that policy is
+implemented these intents are retained. Deadline/escape release policy remains
+AII-1787; this table does not change it. Schema deployment requires operator review;
+this change performs no live database migration.
+
+## Implementation launch recovery
+
+`implementation_launch_intent` is created idempotently on first ImplementationRun recovery access
+by `src/restate/implementation-launch-intent.ts`, using the shared connection. Its dispatch-keyed
+private snapshot is written before backend acceptance and never overwritten by retry preparation.
+`bookkeeping_done` suppresses repeated tracker dispatch effects after adoption. It is separate from
+`dispatch_log`, so definitive pre-launch rejection cannot leave a ghost in-flight job or dedup mark.
+
+Rows keyed `preparation:<dispatchId>` in the same table record the managed pre-grant phase:
+admission generation, project/backend, allowlisted mapping and frozen Fly app, without credentials.
+Finder recovery uses this identity only while the matching admission remains owned and unbound.
+These rows and ordinary intent rows require coordinated deletion with dispatch recovery data (AII-1565);
+this introduces no separate retention policy.

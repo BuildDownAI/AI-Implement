@@ -195,20 +195,22 @@ describe("processReviewFixQueue — owner selection", () => {
       repo: "acme/billing", prNumber: 42, reason: "changes_requested", sourceEventId: "event-pilot" });
   }
 
-  it("nudges Restate ingress once per 30 s bucket for selected automatic GHA work and leaves Legacy dispatch inert", async () => {
-    vi.stubEnv("RUNNER_MODE", "gha");
+  it.each(["gha", "shadow", "fly", "local"])("nudges Restate ingress in %s mode and leaves Legacy dispatch inert", async (mode) => {
+    vi.stubEnv("RUNNER_MODE", mode);
+    const warnings = vi.spyOn(console, "warn");
     configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     pulls({ 42: pullRequest("open") });
     const queueId = queueOne();
 
-    await indexModule.processReviewFixQueue(config, registry);
+    await indexModule.processReviewFixQueue({ ...config, flySessionsApp: "sessions", flySessionsToken: "fly-token" }, registry);
 
     expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
     expect(localGapfillMocks.dispatchLocalGapfill).not.toHaveBeenCalled();
     expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM dispatch_admissions").get() as { n: number }).n).toBe(0);
     const eventId = reviewFixQueue.listReviewFixEvents(queueId).at(-1)!.id;
     const bucket = Math.floor(Date.now() / 30_000);
+    expect(warnings).not.toHaveBeenCalledWith(expect.stringContaining("Restate pilot runner mode unavailable"));
     expect(ingressMocks.feedback).toHaveBeenCalledTimes(1);
     const [scope, event, opts] = ingressMocks.feedback.mock.calls[0]!;
     expect(scope).toEqual({ installationId: 778899, repository: "acme/billing", prNumber: 42 });
@@ -243,30 +245,22 @@ describe("processReviewFixQueue — owner selection", () => {
     expect(reviewFixQueue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
   });
 
-  it("keeps selected work pending when registration or the runner mode is unavailable", async () => {
+  it.each([true, false])("keeps selected work pending when paused=%s and registration unavailable", async (paused) => {
     vi.stubEnv("RUNNER_MODE", "gha");
-    configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
+    configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate", paused }));
     queueOne();
-    await indexModule.processReviewFixQueue(config, registry);
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
-    expect(ingressMocks.feedback).not.toHaveBeenCalled();
-
-    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
-    vi.stubEnv("RUNNER_MODE", "fly");
+    if (paused) restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     await indexModule.processReviewFixQueue(config, registry);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
     expect(ingressMocks.feedback).not.toHaveBeenCalled();
   });
 
-  it("keeps a local review-fix run on Legacy even when the project selects Restate for GHA", async () => {
+  it.each(["legacy", null] as const)("preserves Legacy local routing for lifecycle %s", async (reviewFixLifecycle) => {
     vi.stubEnv("RUNNER_MODE", "local");
-    configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle: "restate" }));
-    restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    configModule.upsertMapping("AII", acmeBilling({ reviewFixLifecycle }));
     pulls({ 42: pullRequest("open") });
     queueOne();
-
     await indexModule.processReviewFixQueue(config, registry);
-
     expect(localGapfillMocks.dispatchLocalGapfill).toHaveBeenCalledTimes(1);
     expect(ingressMocks.feedback).not.toHaveBeenCalled();
   });

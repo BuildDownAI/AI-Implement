@@ -327,6 +327,31 @@ describe("appendLog retains pilot-correlated rows beyond MAX_LOG_ENTRIES (AII-79
     expect(log.getJobById(id)).toBeNull();
   });
 
+  it.each(["fly-machines", "local-docker"])("prunes bound %s history and retains unbound history", (backend) => {
+    const db = dedup.getDb();
+    const old = Date.now() - SEVEN_DAYS_MS - 1_000;
+    const ids = [null, "execution-1"].map((executionRef, index) => {
+      const dispatchId = `dispatch-backend-${index}`;
+      const attemptId = `attempt-backend-${index}`;
+      const id = log.appendLog({ issueId: `backend-${index}`, dispatchId });
+      insertReviewFixAttempt(attemptId, dispatchId, old, { githubRunId: null, prNumber: 60 + index });
+      db.prepare("UPDATE review_fix_attempts SET execution_backend = ?, execution_ref = ? WHERE attempt_id = ?")
+        .run(backend, executionRef, attemptId);
+      db.prepare(`INSERT INTO dispatch_admissions
+        (dispatch_id, mapping_key, issue_scope, issue_id, lifecycle_owner, phase, backend, created_at, released_at)
+        VALUES (?, 'APP', 'pr', ?, 'restate', 'implementation', ?, 10, ?)`)
+        .run(dispatchId, `backend-${index}`, backend, old);
+      log.updateJobStatus(id, "completed");
+      db.prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(old, id);
+      db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(old, id);
+      ageOut(id);
+      return id;
+    });
+    floodWithUnrelatedJobs(501);
+    expect(log.getJobById(ids[0]!)).not.toBeNull();
+    expect(log.getJobById(ids[1]!)).toBeNull();
+  });
+
   it("holds old pilot history while ownership evidence remains unresolved", () => {
     const db = dedup.getDb();
     const old = Date.now() - SEVEN_DAYS_MS - 1_000;

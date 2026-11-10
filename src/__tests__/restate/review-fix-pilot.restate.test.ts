@@ -14,9 +14,14 @@
 import { randomUUID, createHash, createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { RestateEnvironment } from "./harness.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getDb } from "../../dedup.js";
-import { initMappingsTable } from "../../config.js";
+import * as githubAuth from "../../github-app-auth.js";
+import * as githubApi from "../../github.js";
+import * as workflowProbe from "../../workflow-probe.js";
+import * as managedAuth from "../../managed-dispatch-auth.js";
+import { makeMapping } from "../helpers/builders.js";
+import { initMappingsTable, upsertMapping, deleteMapping, type RepoMapping } from "../../config.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
 import {
   type AttemptId,
@@ -37,7 +42,9 @@ import { upsertReviewFinding } from "../../review-ledger-store.js";
 import { acceptReviewFixWebhookEvent, enqueueReviewFix, updateReviewFixStatus } from "../../review-fix-queue.js";
 import { REVIEW_PROCESSES, resolveReviewProcess } from "../../review-process.js";
 import { inspectPendingReviewFixFeedback, loadPendingReviewFixFeedback } from "../../review-fix-pending.js";
-import { createProductionFinalizer } from "../../restate/review-fix-production.js";
+import { ContainerReviewFixWorker } from "../../review-fix-container-worker.js";
+import { ReviewFixWorker } from "../../review-fix-worker.js";
+import { admitReviewFix, createProductionFinalizer, withReviewFixCleanup } from "../../restate/review-fix-production.js";
 import { createReviewFixFinalizer } from "../../review-fix-finalize.js";
 import type { ReviewFixGitHubAdapter } from "../../review-fix-finalize.js";
 import { createReviewFixGithubAdapter } from "../../review-fix-github-adapter.js";
@@ -161,6 +168,57 @@ interface GithubFixture {
   cancelImpl: (input: Parameters<ReviewFixWorkerTransport["cancelRun"]>[0]) => ReturnType<ReviewFixWorkerTransport["cancelRun"]>;
 }
 
+// External container edges only: the real container worker owns launch bookkeeping and terminal inspection.
+const resources = new Map<string, { fixture: GithubFixture; name: string }>();
+const containerEdges = vi.hoisted(() => ({
+  launch: undefined as unknown as (input: any) => Promise<any>,
+  read: undefined as unknown as (id: string) => any,
+  remove: undefined as unknown as (id: string) => Promise<void>,
+  stop: undefined as unknown as (id: string) => Promise<boolean>,
+  list: undefined as unknown as () => any[],
+}));
+vi.mock("../../gapfill-launch.js", () => ({ dispatchFlyGapfill: (input: any) => containerEdges.launch(input) }));
+vi.mock("../../local-gapfill.js", () => ({ dispatchLocalGapfill: (input: any) => containerEdges.launch(input) }));
+vi.mock("../../backend-run.js", async (original) => ({ ...await original<typeof import("../../backend-run.js")>(),
+  readBackendRun: async (_config: unknown, _backend: unknown, id: string) => containerEdges.read(id),
+  stopBackendRun: async (_config: unknown, _backend: unknown, id: string) => containerEdges.stop(id),
+  destroyMachineRecorded: async (_config: unknown, id: string) => containerEdges.remove(id),
+}));
+vi.mock("../../fly-machines.js", async (original) => ({ ...await original<typeof import("../../fly-machines.js")>(),
+  listMachines: async () => containerEdges.list(),
+}));
+vi.mock("../../local-docker.js", async (original) => ({ ...await original<typeof import("../../local-docker.js")>(),
+  inspectLocalContainer: async (id: string) => {
+    const read = containerEdges.read(id);
+    return { running: read.state !== "ended", status: read.state === "ended" ? "exited" : "running", exitCode: read.exit?.exitCode ?? null };
+  },
+  removeLocalContainer: async (id: string) => containerEdges.remove(id),
+}));
+containerEdges.launch = async (input) => {
+  const fixture = findFixture(input.reviewFix.repository);
+  // Mirror each transport's before-launch callback without changing worker bookkeeping.
+  if (input.flySessionsApp !== undefined) input.onBeforeLaunch(undefined, "container-nonce");
+  else input.onBeforeLaunch("container-nonce");
+  try { await fixture.dispatchImpl({} as never); }
+  finally {
+    if (fixture.runId !== null) resources.set(String(fixture.runId), { fixture, name: input.runName });
+  }
+  return { machine: { id: String(fixture.runId) }, containerId: String(fixture.runId) };
+};
+containerEdges.list = () => [...resources].map(([id, r]) => ({ id, name: r.name }));
+containerEdges.read = (id) => {
+  const fixture = resources.get(id)?.fixture;
+  if (!fixture) return { state: "ended", exit: null };
+  return { state: fixture.runDetail?.status === "completed" ? "ended" : "started",
+    exit: fixture.runDetail?.status === "completed" ? { exitCode: fixture.runDetail.conclusion === "success" ? 0 : 1 } : null };
+};
+containerEdges.stop = async (id) => {
+  const fixture = resources.get(id)!.fixture;
+  fixture.cancelCalls++;
+  return fixture.cancelImpl({} as never);
+};
+containerEdges.remove = async (id) => { resources.delete(id); };
+
 let ownerSeq = 0;
 const fixturesByRepo = new Map<string, GithubFixture>();
 const fixtureByAttempt = new Map<string, GithubFixture>();
@@ -231,7 +289,7 @@ function budgetEntryCount(repository: string, prNumber: number): number {
   return row.n;
 }
 
-function resultOf(fixture: GithubFixture, prepared: PreparedReviewFixAttempt, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+function resultOf(fixture: GithubFixture, prepared: PreparedReviewFixAttempt, overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   if (fixture.runId === null) throw new Error("test bug: no bound run id yet");
   return {
     version: 1, attemptId: prepared.attemptId, ...prepared.scope, deadlineAt: prepared.deadlineAt,
@@ -356,7 +414,7 @@ const github: ReviewFixGitHubAdapter = {
 };
 
 const LAUNCH_TOKEN_SECRET = "review-fix-launch-token-secret";
-const worker = new GithubReviewFixWorker({
+const ghaWorker = new GithubReviewFixWorker({
   credentials: fakeCredentials, transport, scopeStore: reviewFixAttemptStoreScopeStore(sqliteStore),
   // The same shape as `createProductionReviewFixServices`: the launch itself receives the three attempt tokens.
   callbackInputs: async (attemptId) => ({
@@ -367,11 +425,23 @@ const worker = new GithubReviewFixWorker({
   }),
 });
 
+const containerWorker = new ContainerReviewFixWorker({ credentials: fakeCredentials,
+  scopeStore: reviewFixAttemptStoreScopeStore(sqliteStore),
+  callbackInputs: async () => ({ runner_callback_url: "https://orchestrator.test", run_token: "result" }),
+  fly: { flySessionsToken: "fly", flySessionsApp: "sessions", flySessionsRegion: null, flyOrchestratorApp: null,
+    sessionImage: "runner", runnerCallbackBaseUrl: "https://orchestrator.test", tenantId: null, anthropicApiKey: null, claudeOAuthToken: null },
+  local: { image: "runner", orchestratorUrl: "https://orchestrator.test" },
+  localCandidates: async (name) => containerEdges.list().filter(r => r.name === name).map(r => r.id),
+  getPullRequestHeadSha: async ({ owner, repo }) => findFixture(`${owner}/${repo}`).headSha,
+});
+const worker = new ReviewFixWorker({ "github-actions": ghaWorker, "fly-machines": containerWorker, "local-docker": containerWorker }, sqliteStore);
+const cleanupConfig = { githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: null,
+  runnerTokenSecret: null, sessionImage: "runner", runnerImageExplicit: false, flySessionsToken: "fly", flySessionsApp: "sessions" };
 const baseFinalizer = createReviewFixFinalizer({ attemptStore: sqliteStore, github });
 // The production wrapper itself (review-fix-production.ts), with no late-review submit wired.
 const lateReviews: Array<{ dispatchId: string; prUrl: string; gapFill?: boolean; attemptId?: string }> = [];
-const finalizer = createProductionFinalizer({ store: sqliteStore, github, baseFinalizer,
-  submitLateExternalReview: async (input) => { lateReviews.push(input); return true; } });
+const finalizer = withReviewFixCleanup(cleanupConfig, sqliteStore, createProductionFinalizer({ store: sqliteStore, github, baseFinalizer,
+  submitLateExternalReview: async (input) => { lateReviews.push(input); return true; } }));
 
 const alerts: Array<{ attemptId: string; reason: string }> = [];
 
@@ -446,6 +516,71 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   }, 60_000);
   afterAll(async () => { if (environments) await stopAll(environments); });
 
+  it.each([
+    ["default", "fly-machines", {}, false, "admit"],
+    ["fly", "github-actions", {}, false, "admit"],
+    ["local", "github-actions", {}, false, "admit"],
+    ["fly", "github-actions", { flySessionsToken: null }, false, "fly_sessions_token_or_app_missing"],
+    ["fly", "github-actions", { flySessionsApp: null }, false, "fly_sessions_token_or_app_missing"],
+    ["local", "github-actions", { localRunnerImage: "" }, false, "local_runner_image_missing"],
+    ["fly", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["fly", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["local", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["local", "github-actions", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["default", "fly-machines", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "" } }],
+    ["default", "fly-machines", {}, false, "ephemeral execution policy requires GitHub Actions", { extraEnv: { AI_IMPLEMENT_EXECUTION_POLICY: "" } }],
+    ["fly", "github-actions", {}, true, "managed_backend_unsupported"],
+    ["local", "github-actions", {}, true, "managed_backend_unsupported"],
+    ["fly", "github-actions", {}, false, "provider=bedrock", { provider: "bedrock" }],
+    ["local", "github-actions", {}, false, "provider=bedrock", { provider: "bedrock" }],
+    ["gha", "github-actions", {}, false, "Filesystem project admission-test requires local runner mode", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["fly", "github-actions", {}, false, "Filesystem project admission-test requires local runner mode", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["local", "github-actions", {}, false, "admit", { ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/aii-tickets" } }],
+    ["local", "github-actions", {}, false, "not_selected", { paused: true }],
+    ["gha", "github-actions", {}, false, "not_selected", { reviewFixLifecycle: "legacy" }],
+    ["local", "github-actions", { runnerTokenSecret: null }, false, "callback_unavailable"],
+    ["local", "github-actions", { runnerCallbackBaseUrl: null }, false, "callback_unavailable"],
+    ["fly", "github-actions", {}, false, "installation_mismatch"],
+    ["local", "github-actions", {}, false, "pr_not_open"],
+    ["fly", "github-actions", {}, false, "contract_unverified"],
+    ["gha", "github-actions", {}, false, "not_selected", { reviewFixLifecycle: null }],
+    ["gha", "github-actions", {}, false, "admit"],
+    ["shadow", "fly-machines", {}, false, "admit"],
+  ] as const)("production admission: %s/%s %j managed=%s => %s", async (mode, executionMode, overrides, managed, expected, mappingOverrides: Partial<RepoMapping> = {}) => {
+    vi.stubEnv("RUNNER_MODE", mode);
+    upsertMapping("admission-test", makeMapping({ owner: "admission-test", repo: "repo", reviewFixLifecycle: "restate", executionMode, ...(mappingOverrides ?? {}) }));
+    const token = vi.spyOn(githubAuth, "getInstallationToken").mockResolvedValue("token");
+    const installation = vi.spyOn(githubAuth, "getInstallationId").mockResolvedValue(123);
+    const prState = vi.spyOn(githubApi, "getPullRequestState").mockResolvedValue({ state: "open", merged: false } as never);
+    const probe = vi.spyOn(workflowProbe, "resolveWorkflowCapabilities").mockResolvedValue({ contract: "envelope",
+      supportsAttemptCorrelation: true, supportsRunPublicationToken: true } as never);
+    if (expected === "installation_mismatch") installation.mockResolvedValue(999);
+    if (expected === "pr_not_open") prState.mockResolvedValue({ state: "closed", merged: false } as never);
+    if (expected === "contract_unverified") token.mockRejectedValue(new Error("GitHub unavailable"));
+    const optIn = vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(managed);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const queueId = enqueueReviewFix({ issueId: "admission-test", issueIdentifier: "AII-1336", repo: "admission-test/repo",
+        prNumber: 1, reason: "changes_requested", sourceEventId: randomUUID() });
+      const request: ReviewFixAdmissionRequest = { scope: { installationId: 123, repository: "admission-test/repo", prNumber: 1 },
+        feedback: { taskText: "fix", findings: [], queueCursor: { queueId, eventId: 1 } }, jobTimeoutMinutes: 90 };
+      const store = { admit: vi.fn().mockResolvedValue({ status: "prepared" }) };
+      await admitReviewFix(request, { githubAppId: "1", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://callback",
+        runnerTokenSecret: "secret", sessionImage: "runner", runnerImageExplicit: false,
+        flySessionsApp: "sessions", flySessionsToken: "fly-token", localRunnerImage: "runner", ...overrides }, store);
+      expect(store.admit).toHaveBeenCalledTimes(expected === "admit" ? 1 : 0);
+      expect(probe).toHaveBeenCalledTimes(expected === "admit" && (mode === "gha" || mode === "shadow") ? 1 : 0);
+      if (expected !== "admit") {
+        expect(warning).toHaveBeenCalledTimes(expected === "not_selected" ? 0 : 1);
+        if (expected !== "not_selected") expect(warning).toHaveBeenCalledWith(expect.stringContaining(expected));
+        expect(getDb().prepare("SELECT status FROM review_fix_queue WHERE id = ?").get(queueId)).toEqual({ status: expected.startsWith("Filesystem") ? "skipped" : "pending" });
+      }
+    } finally {
+      token.mockRestore(); installation.mockRestore(); prState.mockRestore(); probe.mockRestore(); optIn.mockRestore(); warning.mockRestore();
+      deleteMapping("admission-test"); vi.unstubAllEnvs();
+    }
+  });
+
   function envFor(label: string): RestateEnvironment {
     const env = environments.get(label);
     if (!env) throw new Error(`missing Restate variant ${label}`);
@@ -493,6 +628,137 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   // Admission: capacity, budget, pause, overflow, occupancy, re-reported
   // findings — all real store.admit()/acquireDispatchAdmission() SQLite logic.
   // -------------------------------------------------------------------------
+
+  it.each((["fly-machines", "local-docker"] as const).flatMap(backend =>
+    ["removed", "gone", "failure"].map(cleanup => ({ backend, cleanup }))))(
+    "$backend outcome cleanup: $cleanup is idempotent and preserves callback status", async ({ backend, cleanup }) => {
+      const fixture = freshScenario("cleanup");
+      getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?").run(backend, fixture.scope.repository.split("/")[0]);
+      const admitted = await sqliteStore.admit({ scope: fixture.scope, feedback: { taskText: "fix", findings: [] }, jobTimeoutMinutes: 90 });
+      if (admitted.status !== "prepared") throw new Error("admission failed");
+      const attemptId = admitted.attempt.attemptId;
+      const generation = (getDb().prepare("SELECT generation FROM dispatch_admissions WHERE dispatch_id = ?").get(attemptId) as { generation: number }).generation;
+      const id = `cleanup-${attemptId}`;
+      const jobId = appendLog({ issueId: attemptId, dispatchId: attemptId, admissionGeneration: generation,
+        machineId: id, machineNonce: "nonce", executionMode: backend });
+      await sqliteStore.bindExecution(attemptId, { backend, runRef: id }, Date.now());
+      updateJobStatus(jobId, "completed", "success", undefined, { skipAdmissionRelease: true });
+      const outcome = { attemptId, scope: fixture.scope, terminal: { status: "succeeded" as const, outputCommit: fixture.headSha } };
+      const original = containerEdges.remove;
+      let calls = 0;
+      containerEdges.remove = async () => {
+        calls++;
+        const row = getDb().prepare("SELECT machine_nonce FROM dispatch_log WHERE id = ?").get(jobId) as { machine_nonce: string | null };
+        expect(row.machine_nonce).toBeNull();
+        if (calls === 1 && cleanup === "failure") throw new Error("backend unavailable");
+        if (cleanup === "gone" || calls > 1) throw new Error(backend === "fly-machines" ? "Fly destroy (404)" : "No such container");
+      };
+      try {
+        if (cleanup === "failure") {
+          await expect(finalizer.recordOutcome(outcome, Date.now())).rejects.toThrow("backend unavailable");
+          expect(await sqliteStore.getRecordedOutcome(attemptId)).toBeNull();
+        }
+        await finalizer.recordOutcome(outcome, Date.now());
+        // Detect any second bookkeeping write, even one that leaves the same values.
+        getDb().exec(`CREATE TEMP TRIGGER no_cleanup_rewrite BEFORE UPDATE ON dispatch_log
+          WHEN OLD.id = ${jobId} BEGIN SELECT RAISE(ABORT, 'duplicate dispatch row write'); END`);
+        try { expect(await finalizer.recordOutcome(outcome, Date.now())).toMatchObject({ status: "already_recorded" }); }
+        finally { getDb().exec("DROP TRIGGER no_cleanup_rewrite"); }
+        const row = getDb().prepare("SELECT status, conclusion FROM dispatch_log WHERE id = ?").get(jobId);
+        expect(row).toMatchObject({ status: "completed", conclusion: "success" });
+        expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+      } finally {
+        containerEdges.remove = original;
+        await sqliteStore.releaseOwner(attemptId, "finalized");
+      }
+    });
+
+  it.each(["fly-machines", "local-docker"] as const)(
+    "%s: cancellation before reconciliation retains an unbound persisted resource", async (backend) => {
+      const fixture = freshScenario("unbound-container");
+      getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?")
+        .run(backend, fixture.scope.repository.split("/")[0]);
+      let finishLaunch!: () => void;
+      const launchPending = new Promise<void>(resolve => { finishLaunch = resolve; });
+      fixture.dispatchImpl = async () => {
+        fixture.dispatchCalls++;
+        fixture.runId = 990000 + ownerSeq;
+        // The transport persisted the resource ID, but its acknowledgement is lost.
+        getDb().prepare("UPDATE dispatch_log SET machine_id = ? WHERE repo = ?")
+          .run(String(fixture.runId), fixture.scope.repository);
+        await launchPending;
+        throw new Error("lost launch response");
+      };
+      const env = await startRetryEnabled([pr, attemptWorkflow]);
+      try {
+        await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+        await eventually(() => fixture.dispatchCalls, calls => calls === 1,
+          { timeoutMs: 8000, label: "persisted unbound launch" });
+        const attemptId = fixture.attemptId!;
+        await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+        finishLaunch();
+        expect(await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId))
+          .toMatchObject({ status: "launch_unresolved" });
+        expect(await sqliteStore.findPreparedAttemptByExecution({ backend, runRef: String(fixture.runId) })).toBeNull();
+        expect((await sqliteStore.getRecordedOutcome(attemptId))?.terminal.status).toBe("launch_unresolved");
+        expect(resources.has(String(fixture.runId))).toBe(true);
+        expect(getDb().prepare("SELECT completed_at, machine_nonce FROM dispatch_log WHERE dispatch_id = ?")
+          .get(attemptId)).toMatchObject({ completed_at: null, machine_nonce: "container-nonce" });
+        expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+        expect(fixture.cancelCalls).toBe(0);
+      } finally { finishLaunch(); await env.stop(); }
+    }, 30000);
+
+  it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend =>
+    ["accepted", "unknown-reconciled", "lost-cancel-ack", "restart", "approved"].map(scenario => ({ backend, scenario }))))(
+    "$backend: $scenario leaves no execution or in-flight row", async ({ backend, scenario }) => {
+      const fixture = freshScenario("backend-matrix");
+      getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?")
+        .run(backend, fixture.scope.repository.split("/")[0]);
+      const env = await startRetryEnabled([pr, attemptWorkflow]);
+      let replacement: Awaited<ReturnType<typeof replaceEndpoint>> | undefined;
+      try {
+        if (scenario === "unknown-reconciled") fixture.dispatchImpl = crashAfterFirstCall(fixture.dispatchImpl);
+        if (scenario === "lost-cancel-ack") fixture.cancelImpl = async () => { throw new Error("lost cancel acknowledgement"); };
+        await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+        await eventually(() => fixture.runId !== null, Boolean, { timeoutMs: 8000, label: "backend launch" });
+        const attemptId = fixture.attemptId!;
+        if (backend !== "github-actions") await eventually(() =>
+          (getDb().prepare("SELECT execution_ref FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { execution_ref: string | null }).execution_ref,
+          ref => ref !== null, { timeoutMs: 8000, label: "container execution binding" });
+        if (scenario === "lost-cancel-ack") {
+          await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
+          await eventually(() => fixture.cancelCalls > 0, Boolean, { timeoutMs: 8000, label: "cancel request" });
+          expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+          expect(await sqliteStore.getRecordedOutcome(attemptId)).toBeNull();
+        }
+        if (scenario === "restart") {
+          replacement = await replaceEndpoint(env, [pr, attemptWorkflow]);
+          await env.startedRestateServer.restart();
+          expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(1);
+        }
+        if (scenario !== "lost-cancel-ack") {
+          const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+          const result = backend === "github-actions" ? resultOf(fixture, prepared) : {
+            version: 1 as const, attemptId, ...prepared.scope, deadlineAt: prepared.deadlineAt,
+            executionBackend: backend, outputCommit: fixture.headSha,
+          };
+          expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result)).toMatchObject({ status: "stored" });
+        }
+        fixture.runDetail = { status: "completed", conclusion: scenario === "lost-cancel-ack" ? "cancelled" : "success", runAttempt: 1 };
+        expect(await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId)).toMatchObject({
+          status: "finalized", approval: scenario === "lost-cancel-ack" ? "not_applicable" : "applied",
+        });
+        expect(fixture.dispatchCalls).toBe(1);
+        expect(activeAdmissionCount(fixture.scope.repository.split("/")[0])).toBe(0);
+        if (backend !== "github-actions") {
+          expect(resources.has(String(fixture.runId))).toBe(false);
+          const row = getDb().prepare("SELECT completed_at, machine_nonce FROM dispatch_log WHERE dispatch_id = ?").get(attemptId) as { completed_at: number | null; machine_nonce: string | null };
+          expect(row.completed_at).not.toBeNull();
+          expect(row.machine_nonce).toBeNull();
+        }
+      } finally { replacement?.close(); await env.stop(); }
+    }, 60000);
 
   it.each(VARIANTS.map(([label]) => label))("mixed Legacy/Restate team capacity defers a Restate admission and release wakes it (%s)", async (label) => {
     const env = envFor(label);

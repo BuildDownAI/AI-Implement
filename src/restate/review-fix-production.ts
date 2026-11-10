@@ -1,9 +1,15 @@
 /** Production composition for the opt-in review-fix pilot. Business state and
  * external calls live in SQLite/GitHub adapters; this file is the allowed SDK
  * boundary where those adapters become Restate services. */
-import { getMappings, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
+import { getMappings, resolvePrDispatchBudget, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
 import { randomUUID } from "node:crypto";
+import { ContainerReviewFixWorker } from "../review-fix-container-worker.js";
+import { read as readAdmission } from "../dispatch-admission.js";
+import { destroyMachineRecorded } from "../backend-run.js";
+import { removeLocalContainer } from "../local-docker.js";
+import { getJobByDispatchId, updateJobStatus, invalidateNonce } from "../log.js";
 import { getDb } from "../dedup.js";
+import { isEphemeralPolicyEnvName } from "../model-auth-contract.js";
 import type { ModelAuthRuntime } from "../model-auth-runtime.js";
 import { isManagedProject, selectsCodexImplementation, prepareManagedDispatch, ghaManagedCredentials, settleLaunch } from "../managed-dispatch-auth.js";
 import { getInstallationId, getInstallationToken } from "../github-app-auth.js";
@@ -16,12 +22,12 @@ import { resolveReviewProcess, type ReviewFixer } from "../review-process.js";
 import { acceptReviewFixWebhookEvent, updateReviewFixStatus } from "../review-fix-queue.js";
 import { inspectPendingReviewFixFeedback } from "../review-fix-pending.js";
 import { SqliteReviewFixAttemptStore } from "../review-fix-attempt-store.js";
-import { GithubReviewFixWorker, ManagedReviewFixLaunchRefusedError, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
+import { GithubReviewFixWorker, ReviewFixWorker, ManagedReviewFixLaunchRefusedError, createGithubAppCredentialResolver, reviewFixAttemptStoreScopeStore } from "../review-fix-worker.js";
 import { DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES, type ReviewFixFindingDisposition } from "../review-fix-ports.js";
 import type { PreparedReviewFixAttempt, ReviewFixAdmissionOutcome, ReviewFixAdmissionRequest } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import { mintPreparedReviewFixToken } from "../runner-tokens.js";
-import { getRunnerMode, resolveExecutionPath } from "../runner-mode.js";
+import { getRunnerMode, resolvePlanningExecutionPath } from "../runner-mode.js";
 import { inspectAgentReadiness } from "../agent-run-preparation.js";
 import { resolveWorkflowCapabilities, type WorkflowCapabilities } from "../workflow-probe.js";
 import type { ProviderRegistry } from "../providers/registry.js";
@@ -39,6 +45,15 @@ export interface ReviewFixProductionConfig {
   runnerTokenSecret: string | null;
   sessionImage: string;
   runnerImageExplicit: boolean;
+  flySessionsToken?: string | null;
+  flySessionsApp?: string | null;
+  flySessionsRegion?: string | null;
+  flyOrchestratorApp?: string | null;
+  tenantId?: string | null;
+  anthropicApiKey?: string | null;
+  claudeOAuthToken?: string | null;
+  localRunnerImage?: string;
+  localRunnerOrchestratorUrl?: string | null;
 }
 
 /** Mapping identity stays available to already-admitted legacy GHA attempts across runner-mode changes. */
@@ -53,7 +68,6 @@ function selectedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
   if (!entry) return null;
   const mapping = entry[1];
   return !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
-    && resolveExecutionPath(getRunnerMode().mode, mapping.executionMode) === "github-actions"
     ? entry : null;
 }
 
@@ -71,12 +85,13 @@ const DEFERRED_READINESS_CODES: ReadonlySet<string> = new Set([
   "resolution_unavailable",
 ]);
 
-interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string }
+interface AdmissionDecision { verdict: ReviewFixAdmission; reason: string; skip?: boolean }
 
 /** Verify the dispatch-ref contract immediately before a new reservation. A
  * changed workflow, runner mode, missing callback credential, or GitHub outage
- * defers admission with the queue still pending. A managed (opted-in) project is
- * additionally admitted only when its workflow carries the managed capabilities and
+ * defers admission with the queue still pending. Containers check backend inputs
+ * instead of probing a GHA workflow. A managed (opted-in) project is admitted only
+ * on GHA when its workflow carries the managed capabilities and
  * the read-only agent readiness check passes; that check reserves, snapshots and mints
  * nothing, because launch preparation is the only place that freezes and grants. */
 export async function canAdmit(
@@ -95,7 +110,33 @@ async function decideAdmission(
   const entry = selectedEntry(scope);
   if (!entry) return { verdict: "defer", reason: "not_selected" };
   const [key, mapping] = entry;
+  if (mapping.ticketingProvider === "filesystem" && getRunnerMode().mode !== "local") {
+    return { verdict: "defer", reason: `Filesystem project ${key} requires local runner mode`, skip: true };
+  }
+  // Shadow launches its authoritative attempt on GHA, as resolvePlanningExecutionPath does.
+  const path = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
   const managed = isManagedProject(key);
+  if (path !== "github-actions") {
+    if (managed) return { verdict: "defer", reason: "managed_backend_unsupported" };
+    if (Object.keys(mapping.extraEnv ?? {}).some(isEphemeralPolicyEnvName)) {
+      return { verdict: "defer", reason: "ephemeral execution policy requires GitHub Actions; remove policy variables from extraEnv or select GHA execution" };
+    }
+    if (mapping.provider === "bedrock") return { verdict: "defer", reason: "provider=bedrock is GHA-only" };
+    if (path === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
+      return { verdict: "defer", reason: "fly_sessions_token_or_app_missing" };
+    }
+    if (path === "local-docker" && !config.localRunnerImage) return { verdict: "defer", reason: "local_runner_image_missing" };
+    if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return { verdict: "defer", reason: "callback_unavailable" };
+    try {
+      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      if (await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner) !== scope.installationId) {
+        return { verdict: "defer", reason: "installation_mismatch" };
+      }
+      const pr = await getPullRequestState(token, mapping.owner, mapping.repo, scope.prNumber);
+      return pr?.state === "open" && !pr.merged ? { verdict: "admit", reason: path }
+        : { verdict: "defer", reason: "pr_not_open" };
+    } catch { return { verdict: "defer", reason: "contract_unverified" }; }
+  }
   if (!config.runnerCallbackBaseUrl || !config.runnerTokenSecret) return { verdict: "defer", reason: "callback_unavailable" };
   if (!managed) {
     return await verifyDispatchContract(scope, config, mapping) ? { verdict: "admit", reason: "legacy" }
@@ -161,16 +202,40 @@ export function recordDelegatedFix(scope: ScopedPrIdentity, queueCursor: { queue
     + `(${resolveReviewProcess(mapping?.reviewProcess).id}), skipping review fix #${queueCursor.queueId}`);
 }
 
-/** Reserve an attempt when the dispatch contract holds. A configuration error fails its queue row and
- * reserves nothing; every other non-admit defers with the queue still pending. */
+export type OnBudgetExhausted = (mapping: RepoMapping, trackerIssueId: string | null,
+  repository: string, prNumber: number, budget: number) => Promise<void>;
+
+/** Reserve an attempt when the dispatch contract holds. Configuration errors fail their
+ * queue row; filesystem projects outside local mode skip it. Other refusals stay pending. */
 export async function admitReviewFix(
   request: ReviewFixAdmissionRequest,
   config: ReviewFixProductionConfig,
   store: Pick<SqliteReviewFixAttemptStore, "admit">,
   runtime?: ModelAuthRuntime,
+  onBudgetExhausted?: OnBudgetExhausted,
 ): Promise<ReviewFixAdmissionOutcome> {
-  const { verdict, reason } = await decideAdmission(request.scope, config, runtime);
-  if (verdict === "admit") return store.admit(request);
+  const { verdict, reason, skip } = await decideAdmission(request.scope, config, runtime);
+  if (verdict === "admit") {
+    const outcome = await store.admit(request);
+    if (outcome.status === "deferred" && outcome.reason === "budget_exhausted" && onBudgetExhausted) {
+      const mapping = mappedEntry(request.scope)?.[1];
+      if (mapping) {
+        const cursor = request.feedback.queueCursor;
+        const queue = cursor ? getDb().prepare(`SELECT issue_id FROM review_fix_queue
+          WHERE id = ? AND repo = ? AND pr_number = ?`)
+          .get(cursor.queueId, request.scope.repository, request.scope.prNumber) as { issue_id: string | null } | undefined : undefined;
+        await onBudgetExhausted(mapping, queue?.issue_id || null, request.scope.repository,
+          request.scope.prNumber, resolvePrDispatchBudget(mapping));
+      }
+    }
+    return outcome;
+  }
+  if (skip) {
+    if (request.feedback.queueCursor) updateReviewFixStatus(request.feedback.queueCursor.queueId, "skipped");
+    console.warn(`[review-fix] ${reason}`);
+  } else if (verdict === "defer" && reason !== "not_selected") {
+    console.warn(`[review-fix] ${request.scope.repository}#${request.scope.prNumber} not launched: ${reason}`);
+  }
   if (verdict === "configuration_error") {
     const cursor = request.feedback.queueCursor;
     // A failed row is no longer pending, so the PR object stops rechecking.
@@ -280,9 +345,9 @@ export function createProductionReviewFixWorker(
   config: ReviewFixProductionConfig,
   store: SqliteReviewFixAttemptStore,
   runtime?: ModelAuthRuntime,
-): GithubReviewFixWorker {
+): ReviewFixWorker {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
-  return new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+  const gha = new GithubReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
     runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
     retryPolicy: getRetryPolicy,
     requiresProtectedTransport: (plan) => {
@@ -294,7 +359,12 @@ export function createProductionReviewFixWorker(
       if (!entry) throw new Error("review-fix mapping unavailable");
       const [projectKey, mapping] = entry;
       if (!isManagedProject(projectKey, plan.attemptId)) return null;
-      if (!selectedEntry(plan.scope)) throw new Error("review-fix managed mapping unavailable");
+      // Mapping selection now includes containers; protected GHA preparation still
+      // requires the authoritative GHA path at launch time, including shadow.
+      if (!selectedEntry(plan.scope)
+        || resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode) !== "github-actions") {
+        throw new Error("review-fix managed mapping unavailable");
+      }
       if (capabilities.supportsStageAgentConfig !== true) throw new Error("review-fix managed workflow unavailable");
       if (!runtime) throw new Error("review-fix model authentication unavailable");
       if (selectsCodexImplementation(projectKey, plan.attemptId) && capabilities.supportsExecutionPolicy !== true) {
@@ -328,6 +398,67 @@ export function createProductionReviewFixWorker(
       };
     },
   });
+  const container = new ContainerReviewFixWorker({ credentials, scopeStore: reviewFixAttemptStoreScopeStore(store),
+    callbackInputs: async (attemptId) => {
+      if (!config.runnerTokenSecret || !config.runnerCallbackBaseUrl) throw new Error("pilot callbacks unavailable");
+      return {
+        run_token: mintPreparedReviewFixToken({ attemptId, audience: "result", secret: config.runnerTokenSecret }).token,
+        run_progress_token: mintPreparedReviewFixToken({ attemptId, audience: "progress", secret: config.runnerTokenSecret }).token,
+        run_publication_token: mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: config.runnerTokenSecret }).token,
+        runner_callback_url: config.runnerCallbackBaseUrl,
+      };
+    },
+    fly: { flySessionsToken: config.flySessionsToken ?? "", flySessionsApp: config.flySessionsApp ?? "",
+      flySessionsRegion: config.flySessionsRegion ?? null, flyOrchestratorApp: config.flyOrchestratorApp ?? null,
+      tenantId: config.tenantId ?? null, sessionImage: config.sessionImage, runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+      anthropicApiKey: config.anthropicApiKey ?? null, claudeOAuthToken: config.claudeOAuthToken ?? null },
+    local: { image: config.localRunnerImage ?? config.sessionImage,
+      orchestratorUrl: config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? "",
+      anthropicApiKey: config.anthropicApiKey, claudeOAuthToken: config.claudeOAuthToken },
+  });
+  return new ReviewFixWorker({ "github-actions": gha, "fly-machines": container, "local-docker": container }, store);
+}
+
+/** Runs inside the existing outcome journal entry, after terminal confirmation on bound paths. */
+export function withReviewFixCleanup(config: ReviewFixProductionConfig, store: SqliteReviewFixAttemptStore,
+  finalizer: ReviewFixFinalizer): ReviewFixFinalizer {
+  return { ...finalizer, recordOutcome: async (outcome, now) => {
+    // An unresolved launch has no bound identity or terminal confirmation. A
+    // transport may already have persisted a resource ID; retain it and occupancy
+    // for reconciliation/operator recovery rather than treating it as a stopped run.
+    if (outcome.terminal.status === "launch_unresolved") return finalizer.recordOutcome(outcome, now);
+    const attempt = await store.getPreparedAttempt(outcome.attemptId);
+    const backend = attempt?.executionBackend;
+    if (backend === "fly-machines" || backend === "local-docker") {
+      const row = getJobByDispatchId(outcome.attemptId);
+      if (row?.machineId) {
+        const bound = await store.findPreparedAttemptByExecution({ backend, runRef: row.machineId });
+        const admission = readAdmission(outcome.attemptId);
+        if (bound?.attemptId !== outcome.attemptId || !admission
+          || admission.lifecycleOwner.kind !== "restate" || admission.lifecycleOwner.attemptId !== outcome.attemptId
+          || admission.backend !== backend || row.executionMode !== backend
+          || row.admissionGeneration !== admission.generation) throw new Error("review-fix cleanup ownership mismatch");
+        getDb().transaction(() => {
+          const current = getJobByDispatchId(outcome.attemptId);
+          if (!current || current.id !== row.id || current.machineId !== row.machineId
+            || current.executionMode !== backend || current.admissionGeneration !== admission.generation) {
+            throw new Error("review-fix cleanup ownership changed");
+          }
+          // Preserve callback outcomes, including callbacks accepted during the binding lookup.
+          if (current.completedAt === null) updateJobStatus(current.id, "failed", "failure", undefined, { skipAdmissionRelease: true });
+          if (current.machineNonce !== null) invalidateNonce(current.id);
+        }).immediate();
+        try {
+          if (backend === "fly-machines") await destroyMachineRecorded({ flySessionsToken: config.flySessionsToken ?? null,
+            flySessionsApp: config.flySessionsApp ?? null }, row.machineId, "backend-stop");
+          else await removeLocalContainer(row.machineId);
+        } catch (err) {
+          if (!/\(404\)|no such container/i.test(err instanceof Error ? err.message : String(err))) throw err;
+        }
+      }
+    }
+    return finalizer.recordOutcome(outcome, now);
+  } };
 }
 
 export function createProductionReviewFixServices(
@@ -336,20 +467,21 @@ export function createProductionReviewFixServices(
   store = new SqliteReviewFixAttemptStore(),
   submitLateExternalReview?: (input: LateExternalReviewInput) => Promise<boolean | void>,
   runtime?: ModelAuthRuntime,
-  /** Test seam: the orchestrator passes nothing, so the 5 s collection window and the 60 s run-status tick apply. */
+  onBudgetExhausted?: OnBudgetExhausted,
+  /** Test seam: production keeps the default collection window and run-status tick. */
   timing: { collectionWindowMs?: number; runStatusTickMs?: number } = {},
 ): RestateService[] {
   const credentials = createGithubAppCredentialResolver(config.githubAppId, config.githubAppPrivateKey);
   const github = createReviewFixGithubAdapter({ credentials });
   const worker = createProductionReviewFixWorker(config, store, runtime);
   const baseFinalizer = createReviewFixFinalizer({ attemptStore: store, github });
-  const finalizer = createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview });
+  const finalizer = withReviewFixCleanup(config, store, createProductionFinalizer({ store, github, baseFinalizer, submitLateExternalReview }));
   const { collectionWindowMs, runStatusTickMs } = timing;
   const pr = createReviewFixPR({
     ...(collectionWindowMs === undefined ? {} : { collectionWindowMs: async () => collectionWindowMs }),
     recordFeedback: async (event) => acceptReviewFixWebhookEvent(event),
     attempts: {
-      admit: (request) => admitReviewFix(request, config, store, runtime),
+      admit: (request) => admitReviewFix(request, config, store, runtime, onBudgetExhausted),
     },
     recordDelegated: async (scope, queueCursor) => recordDelegatedFix(scope, queueCursor),
     load: async (scope) => {

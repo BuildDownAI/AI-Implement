@@ -420,6 +420,14 @@ describe("remediateStuckJob — Restate-owned job", () => {
     expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup", undefined, expect.anything());
   });
 
+  it.each([1, 4])("confirmed termination still defers admission release for ownerCall at attempt %s", async (attempt) => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(attempt);
+    const confirmed = await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1" }), "ttl_expired", async () => true, { ownerCall: true });
+    expect(confirmed).toBe(true);
+    expect(incrementStuckAttempts).toHaveBeenCalledOnce();
+    expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", attempt === 1 ? "stuck_requeued" : "stuck_giveup", undefined, { skipAdmissionRelease: true });
+  });
+
   it("ownerCall still skips kg-refresh and operator_cancelled jobs", async () => {
     expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", phase: "kg-refresh" }), "x", undefined, { ownerCall: true })).toBe(false);
     expect(await remediateStuckJob(mockConfig, provider, stuckJob({ dispatchId: "d-1", conclusion: "operator_cancelled" }), "x", undefined, { ownerCall: true })).toBe(false);

@@ -306,6 +306,8 @@ See [ADR 026](adr/026-one-writer-per-pr-and-an-open-pr-is-never-reimplemented.md
 
 Gap-fill dispatches on one PR are capped at `DEFAULT_PR_DISPATCH_BUDGET` (4) per rolling 24 hours, resolved per project by `resolvePrDispatchBudget` (`src/config.ts:18,122-124`); a project overrides it with the **PR Dispatch Budget** setting (blank means the default). [AII-757](https://linear.app/eudoxus/issue/AII-757/park-a-pr-at-its-dispatch-budget-and-ask-for-a-human) is the issue that turned this from a stored setting into an enforced one.
 
+The Restate review-fix admission path also parks on `deferred: budget_exhausted`. Its production services receive an `onBudgetExhausted` dependency, wired to the existing `firePrBudgetPark` mechanism with the mapping, the scoped queue cursor's tracker issue id, repository, PR number and resolved project budget. Atomic admission checks the PR budget before the issue park, so an exhausted parked PR still reaches this callback to retry failed delivery or post a budget notice after a breaker-first park. Admission remains blocked. Repeated refusals use the same notice claim and do not duplicate successful notices. If the cursor cannot resolve a tracker issue id, the stable `repository#prNumber` identity owns the park and PR notice, and the wrapper skips tracker delivery. Admission checks that fallback park too, so it persists after the rolling budget becomes available. Other deferrals (`paused`, `occupied`, `at_capacity`) do not post budget notices.
+
 When `canDispatch` returns `pr_budget` for a gap-fill dispatch, the caller (`firePrBudgetPark`, in `src/index.ts` for the poll/review-fix path and in `src/comment-gapfill-drain.ts` for the comment gap-fill drain) parks the issue with `parkIssue(issueId, "gap-analysis", "pr_budget")`. The gate checks the budget before the park, so it still returns `pr_budget` for a row the dispatch breaker parked first. `parkIssue` keeps an existing park's `last_conclusion`, so the breaker's reason stays visible at `/admin#runners`.
 
 The one-time **Needs Human** notice (`prBudgetParkMessage`, `src/dispatch-breaker.ts`) does not depend on who parked the row:
@@ -346,7 +348,7 @@ re-evaluated on the next poll rather than falling through to a fresh implementat
 unmerged** PR still gets a fresh implementation, on the assumption a human closed it to start over.
 This check only applies to implementation dispatches, never planning.
 
-## Post-run: the drain loop
+## Post-run: the Legacy drain loop
 
 `processReviewFixQueue` runs once per poll tick. For each pending item, in FIFO order:
 
@@ -360,7 +362,7 @@ This check only applies to implementation dispatches, never planning.
 
 A dispatch failure marks the row `failed` and surfaces a notification; the loop continues to the next item rather than aborting.
 
-**The drain loop dispatches through GitHub Actions specifically** — it calls `dispatchWorkflow` directly rather than going through runner-mode resolution. A project running on Fly Machines still gets its review-fix runs on GitHub Actions.
+**The Legacy drain loop dispatches through GitHub Actions specifically** — it calls `dispatchWorkflow` directly. A Fly project using Legacy still gets automatic review-fix runs on GitHub Actions. With the Restate lifecycle, automatic review-fix attempts use the resolved backend: GitHub Actions probes workflow capabilities, while Fly Machines requires an effective sessions app and token and a non-Bedrock provider. The admin save checks Fly configuration (`FLY_SESSIONS_APP` and `FLY_SESSIONS_TOKEN`) without probing a workflow; app configuration comes from the runner backend cache. Both modes retain the healthy, registered Restate endpoint and unreserved-job checks. Local Docker admission uses its configured local runner image (see the [pilot runbook](./restate-review-fix-pilot.md)).
 
 The synthesized issue title is `Review feedback fix for PR #<n>`, and the phase is reported as `gap-analysis` so the ticket's status does not regress to in-progress for what is a follow-up pass.
 
@@ -426,3 +428,11 @@ See [ADR 028](adr/028-the-fixing-agent-dispositions-each-finding-and-may-defer-o
 On overflow the durable loader throws `ReviewFixFeedbackIncompleteError` before `admit`, so no snapshot, attempt, token or dispatch exists and every finding version stays pending. The legacy loop logs a bounded warning and leaves the queue item `pending`. An over-limit set needs source reduction or a later batching capability. `GithubReviewFixWorker.launch` also decodes the encoded `run_config` and refuses to dispatch unless `issue.description` and `commentInstruction` equal the admitted task text. `dispatchFindingIds` and the durable snapshot are exactly the rendered findings (AII-758 invariant).
 
 Non-launch reads of over-budget feedback (`inspectPendingReviewFixFeedback`) report `incomplete` instead of throwing: the admin attempt detail shows `pendingFeedback: true`, and the Restate `load()` resolves with no pending feedback and logs only the bounded category, so nothing is admitted, nothing is retried in a tight loop, and every finding stays pending until the set is reduced.
+
+Review-fix execution binding uses the attempt's frozen execution backend. GitHub
+Actions identities bind the run ID and run attempt; Fly Machines and local Docker
+identities bind a backend-scoped `execution_ref`. Cross-backend binding is rejected
+without changing the attempt. Historical journal identities without a backend
+normalize to GitHub Actions. Result evidence and the operator adopt request remain
+GitHub-only; machine identities can bind and reach terminal completion without
+granting result-based approval.

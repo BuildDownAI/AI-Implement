@@ -235,7 +235,9 @@ describe("implementation session launches", () => {
   });
 
   it("local: starts the container after markLaunchAttempted and returns no token", async () => {
-    vi.mocked(startLocalRunnerContainer).mockImplementation(async () => {
+    vi.mocked(startLocalRunnerContainer).mockImplementation(async (localInput) => {
+      expect(markLaunchAttempted).not.toHaveBeenCalled();
+      localInput.onBeforeLaunch?.();
       expect(markLaunchAttempted).toHaveBeenCalledTimes(1);
       return { containerId: "c-1234567890123", containerName: "" } as never;
     });
@@ -244,6 +246,12 @@ describe("implementation session launches", () => {
     expect(result).toMatchObject({ machineId: "c-1234567890123", executionMode: "local-docker", statusComment: { machineName: "c-1234567890" } });
     expect(result.dispatchedLogLine).toContain("local-docker, container: c-1234567890123");
     expectNoToken(result);
+  });
+
+  it("local: preparation failure leaves the launch marker uncalled", async () => {
+    vi.mocked(startLocalRunnerContainer).mockRejectedValueOnce(new Error("env preparation failed"));
+    await expect(launchImplementationLocalSession(args)).rejects.toThrow("env preparation failed");
+    expect(markLaunchAttempted).not.toHaveBeenCalled();
   });
 
   it("local: a managed launch with no bootstrap is refused before the launch", async () => {
