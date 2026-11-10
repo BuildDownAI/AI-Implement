@@ -191,6 +191,40 @@ A project whose review process is `claude-code-review` (ADR 038, `src/review-pro
 
 Inline comments count only from a trusted author of type `Bot`, on the head commit (or with no commit id). A body starting 🔴 is `blocking`, 🟡 is `minor`, 🟣 (pre-existing) adds no finding, and an untagged comment is recorded as `minor`, so a reviewer that emits no markers never blocks a merge by itself. The `claude` check is matched by app slug and name together: a check named `Claude Code Review` from `github-actions` is not the hosted one.
 
+## Which Claude comments the pipeline reads
+
+For `ai-implement`, a completed review check triggers a separate findings read.
+The ledger first restricts eligible top-level comments to those created during the
+review check on the resolved PR head. It then selects the newest by `updated_at`
+(falling back to `created_at`, then API order for ties). It reads a fenced contract
+first, then legacy review headings. Both a combined tracking/review comment and a
+separate `## Claude review` comment are eligible; `**Claude finished**` is not
+required. Progress-only comments without a review heading or contract are ignored.
+
+Author eligibility is unchanged: contracts require the GitHub Actions identity
+(`github-actions` or `github-actions[bot]`, with API type `Bot`) or a Claude author
+trusted by the configured review process and extra-author allowlist. Heading-only
+reviews use those same identities. Pipeline comments whose trimmed body starts
+with `<!-- ai-implement` are excluded. A quoted marker elsewhere in review prose
+does not identify the comment as pipeline-authored.
+
+The selected trusted review supersedes older comments even when its contract is
+malformed or its review content cannot be parsed. Such a review reports findings
+as unavailable and prevents approval from a successful check alone. Blocking
+contract findings gate even with only a path and no line. Recognized blocking
+heading-only findings also gate approval under `ai-implement`, without requiring
+`claude-review-summary` in the reviewer selection; minor findings remain
+advisory. The step logs the selected comment id and parse kind beside its review
+process verdict log. Top-level comments do not supply commit identity. The step uses the single matching
+check with a real review conclusion, fetched from the current head's check-runs
+endpoint, and its inclusive `started_at`–`completed_at` window. Comment creation
+must fall inside that window; editing an older head's approval cannot bring it
+into the current review. Missing/invalid check timing, multiple real review checks,
+missing comment creation time, no eligible comment in the window, or an eligible
+comment edited after completion makes the verdict unavailable. This intentionally
+fails closed for sticky comments created before the current review; inline threads
+retain their separate head-commit filtering.
+
 ## When the in-run step reads the outside verdict
 
 The `post-push-review` step starts its outside-review wait after the internal
@@ -240,11 +274,12 @@ After the wait, the step calls `collectExternalReviewFindingsFromGh` once per
 review iteration (unless external collection was skipped). It reuses the issue
 comments fetched by the last probe when available; otherwise the collector
 fetches them. The collector also reads formal reviews and unresolved review
-threads. For a review process other than `ai-implement`, the step passes the
-wait's head SHA to scope the findings read to that head. The `ai-implement`
-process does not pass this SHA filter, so its findings may belong to an older
-head: the wait follows the check run, not the comment. A check without a real
-verdict therefore cannot approve on the strength of older findings.
+threads. For `ai-implement`, a completed check requires a current-review comment
+under [the comment rules above](#which-claude-comments-the-pipeline-reads). For
+a review process other than `ai-implement`, the step passes the wait's head SHA
+to scope the findings read to that head. The wait follows the check run; the separate
+findings read must still produce a usable verdict before approval. A check
+without a real verdict cannot approve on the strength of older findings.
 
 If a recognized external review comment cannot be parsed into usable findings
 or an explicit clean verdict, the collector sets `findingsUnavailable`. This
