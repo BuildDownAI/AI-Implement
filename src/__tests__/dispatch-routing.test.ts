@@ -1533,6 +1533,12 @@ describe("poll implementation submission — ImplementationRun for every project
   });
   afterEach(() => status.resetRestateStatus());
 
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("freezes a grouping parent's classification for %s", async (execPath) => {
+    const parent = { ...issue, featureBranchChain: [{ identifier: issue.identifier, mode: "feature" as const }] };
+    await indexModule.submitImplementationRun(config, parent, jiraMapping("AII"), { ...ctx, execPath });
+    expect(implementationIngress.submit.mock.calls[0]![1].launchContext.groupingParent).toBe("true");
+  });
+
   it.each(["github-actions", "fly-machines", "local-docker", "both"] as const)("submits %s with a schema-valid credential-free input", async (execPath) => {
     const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
     const { normalizeGithubActionsJobTimeoutMinutes } = await import("../github-actions-watchdog.js");
@@ -1545,7 +1551,7 @@ describe("poll implementation submission — ImplementationRun for every project
     const backend = execPath === "both" ? "github-actions" : execPath;
     expect(input).toEqual({ dispatchId: key, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier,
       backend, maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(42),
-      launchContext: { baseBranch: "feature/group", runnerMode: "default" } });
+      launchContext: { baseBranch: "feature/group", runnerMode: "default", groupingParent: "false" } });
     expect(JSON.stringify(input)).not.toContain("TOKEN_SENTINEL");
     expect(log).toHaveBeenCalledWith(`[poll] Submitted ImplementationRun for AII-1555 dispatch=${key} backend=${backend} (accepted)`);
     expect(rows()).toEqual([]);
@@ -1587,7 +1593,7 @@ describe("poll implementation submission — ImplementationRun for every project
       expect(input).toEqual({
         dispatchId, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier,
         backend: executionMode, maxJobMinutes: 42,
-        launchContext: { baseBranch: "release/poll", runnerMode },
+        launchContext: { baseBranch: "release/poll", runnerMode, groupingParent: "false" },
       });
       const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
       expect(implementationRunInputSchema.parse(input)).toEqual(input);
@@ -1644,7 +1650,7 @@ describe("poll implementation submission — ImplementationRun for every project
       ...ctx, runnerMode: "shadow", baseBranch: "release", baseBranchFieldValue: "release",
     });
     expect(implementationIngress.submit).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
-      launchContext: { baseBranch: "release", baseBranchFieldValue: "release", runnerMode: "shadow" },
+      launchContext: { baseBranch: "release", baseBranchFieldValue: "release", runnerMode: "shadow", groupingParent: "false" },
     }));
     expect(prepare).not.toHaveBeenCalled();
   });
