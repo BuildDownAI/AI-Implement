@@ -200,13 +200,24 @@ on the outside review while the internal review ran is additional time in its
 favor; GitHub API latency does not consume the sleep budget. The limit is a
 constant, with no operator setting.
 
-The November 3–10, 2026 sample of 248 finished Claude GHA comments has a
-90th-percentile duration of 6m 22s. The 112 check jobs retrieved before GitHub's
-unauthenticated rate limit have a p90 of 6m 53s. Ten minutes gives that observed
-check p90 a 3m 7s margin. The check sample is incomplete; it does not establish
-the full window's check p90. Compared with the previous five-minute limit,
-this adds at most five minutes per wait; reviews that finish sooner return as
-soon as a poll sees completion.
+The operator-supplied measurements below come from AII PR comments created
+3–10 November 2026 containing “Claude finished @ai-implement-orchestrator-bot[bot]'s
+task in Nm Ss” lines, measured on 2026-11-10. The check-job sample is retained
+separately because it is incomplete.
+
+| Sample | Runs | Median | p90 | p95 | Maximum | Over 5 min | Over 10 min |
+|---|---:|---|---|---|---|---:|---:|
+| Claude completion comments (operator-supplied) | 181 | 3 m 44 s | 6 m 14 s | 7 m 25 s | 12 m 50 s | 47 | 2 |
+| Check jobs retrieved before GitHub's unauthenticated rate limit (incomplete sample) | 112 | — | 6 m 53 s | — | — | — | — |
+
+The chosen limit is **600 000 ms**, giving the completion-comment p90 a
+**3 m 46 s** margin (and the observed check-job p90 a 3 m 7 s margin).
+The incomplete check sample does not establish the full window's check p90.
+Compared with the previous five-minute limit, this adds **at most 5 more minutes
+per wait, and only when the outside review is still running**; reviews that
+finish sooner return as soon as a poll sees completion.
+
+Tracking-comment hardening is skipped; AII-1820 handles Claude comment recognition.
 
 The wait preserves these outcomes:
 
@@ -214,7 +225,7 @@ The wait preserves these outcomes:
 |---|---|
 | `completed` | A matching check finished with a real verdict. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
 | `running` | A review is still pending, or its check/head could not be read before the budget expired. Fail closed with `external_review_pending` and no approval. |
-| `absent` | No matching external check exists. Require two consecutive probes before failing open. Once a matching check has been seen, a later empty result is treated as unreadable and cannot fail open. A successfully read PR with no head SHA retains its immediate `absent` behavior. |
+| `absent` | No matching external check exists. Require two consecutive probes before failing open. With no internal reviewer, an absent external check still fails closed because no review was obtained. Once a matching check has been seen, a later empty result is treated as unreadable and cannot fail open. A successfully read PR with no head SHA retains its immediate `absent` behavior. |
 | `no-real-verdict` | Matching checks finished without a usable verdict. Require two consecutive probes, then fail closed. |
 | `permission-denied` | The App cannot read checks. Stop immediately and fail closed with `CHECKS_PERMISSION_DENIED`. |
 
