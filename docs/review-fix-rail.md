@@ -102,6 +102,8 @@ The queue's one-row-per-PR grain is deliberate. Enqueuing coalesces: a second ev
 
 ## Webhook intake: forward every mapped repository to Restate (AII-1773)
 
+Restate is mandatory; project setup offers no lifecycle choice. The retired HTTP `reviewFixLifecycle` input is ignored and stored values are historical metadata. Saving configuration does not certify dispatch readiness.
+
 The three review webhook handlers (`handleReviewWebhook`, `handleReviewCommentWebhook`, and the `claude_review_summary` branch of `handleIssueCommentWebhook`, all in `src/webhook.ts`) share one front half: HMAC check, dispatch match, author and severity rules for the project's review process, and the `shouldEnqueueReviewEvent` gate (`self`, `stale_head`, `run_after_review`, `missing_fields`). A gated event answers 200 `{ ignored, reason }` and goes no further, regardless of repository mapping or lifecycle. `resolveRepoReviewProcess` forwards every mapped repository to Restate, including projects whose stored `reviewFixLifecycle` is `legacy` or unset. Only genuinely unmapped repositories retain the direct SQLite intake path. SQLite queue rows for mapped projects are nudged by the poll drain:
 
 | Repository / ingress | Handler writes SQLite | Forwards | Answers |

@@ -278,14 +278,6 @@ export const projectsHtml = `
             </div>
           </div>
           <div class="field">
-            <label class="field-label">Review-fix &amp; Planning Lifecycle</label>
-            <select class="select" id="md-review-fix-lifecycle">
-              <option value="legacy">Legacy</option>
-              <option value="restate">Restate (pilot)</option>
-            </select>
-            <div class="field-hint">Also selects the planning lifecycle: with Restate, each planning dispatch (any backend) is owned by a PlanningRun workflow with a deadline. Coordinates this project's automatic GitHub Actions review-fix runs. Local review-fix (the dev harness) and human comment-triggered gap-fill runs always stay on Legacy regardless of this selection &mdash; this control cannot move those paths to Restate. Changing this does not cancel or migrate anything already in flight: an attempt already dispatched keeps the lifecycle that dispatched it, and only future automatic dispatches follow the new selection. Restate needs the current workflow file in the target repo (use Sync workflows and merge its PR) and the GitHub Actions execution mode.</div>
-          </div>
-          <div class="field">
             <label class="field-label">Review process</label>
             <select class="select" id="md-review-process">
               <option value="ai-implement">AI-Implement</option>
@@ -293,7 +285,7 @@ export const projectsHtml = `
               <option value="codex-code-review">Codex Code Review</option>
               <option value="claude-code-review-repository-fix">Claude Code Review, repository auto-fix</option>
             </select>
-            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Applies to every project; only the forward to the Restate fix attempt needs the Restate lifecycle.</div>
+            <div class="field-hint">Who reviews this project's PRs and who fixes. Claude Code Review trusts claude[bot], reads the verdict from the review check run and Claude's inline comments, and keeps AI-Implement's fix attempt. Claude Code Review, repository auto-fix reads the same way but leaves Claude's findings to the repository's own auto-fix, and approves only when the auto-fix commit's review is clean. Applies to every project; Restate coordinates AI-Implement fix attempts on every backend.</div>
           </div>
           <div class="field">
             <label class="field-label">Trusted Review Authors</label>
@@ -1149,9 +1141,6 @@ export const projectsScript = `
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
     document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
     document.getElementById('md-dep-token-scope').value = m.dependencyTokenScope || '';
-    // Absent/null means the backend resolves it to "legacy" (resolveReviewFixLifecycle) —
-    // default the control to match rather than leaving it on whichever option is first.
-    document.getElementById('md-review-fix-lifecycle').value = m.reviewFixLifecycle || 'legacy';
     document.getElementById('md-review-process').value = m.reviewProcess || 'ai-implement';
     document.getElementById('md-trusted-review-authors').value = (m.trustedReviewAuthors || []).join('\\n');
     // slice() so editing the draft never mutates the cached mapping behind it.
@@ -1577,7 +1566,6 @@ export const projectsScript = `
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
       dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
-      reviewFixLifecycle: document.getElementById('md-review-fix-lifecycle').value,
       reviewProcess: document.getElementById('md-review-process').value,
       trustedReviewAuthors: (function(){ var l = document.getElementById('md-trusted-review-authors').value.split('\\n').map(function(x){ return x.trim(); }).filter(Boolean); return l.length ? l : null; })(),
       referenceRepos: refRepoValue(),

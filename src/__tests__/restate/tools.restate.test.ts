@@ -841,6 +841,8 @@ describe("orchestratorTools (Restate)", () => {
       expect(kgRefreshArgs?.acceptNewBaseline?.type).toBe("boolean");
 
       const addProjectArgs = metadata.handlers.find((h) => h.name === "add_project")?.input_json_schema?.properties?.args?.properties;
+      expect(addProjectArgs).toBeDefined();
+      expect(addProjectArgs).not.toHaveProperty("reviewFixLifecycle");
       // AII-720: reviewers is now `.nullable()`, so zod's JSON schema wraps the array
       // variant in `anyOf` alongside `{ type: "null" }` instead of exposing `items` directly.
       const reviewers = addProjectArgs?.reviewers as
@@ -894,6 +896,23 @@ describe("orchestratorTools (Restate)", () => {
       expect(result.status).toBe(202);
       expect(result.body.reviewers).toBeNull();
       expect(result.body.maxTurns).toBeNull();
+    },
+  );
+
+  it.each(VARIANTS.map(([label]) => label))(
+    "add_project creates a Codex project and ignores a retired lifecycle through real ingress (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const body = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "add_project", {
+        caller: SYSTEM,
+        args: { teamKey: `CODEX-${label}`, owner: "BuildDownAI", repo: "codex-fixture", defaultBranch: "main",
+          reviewProcess: "codex-code-review", reviewFixLifecycle: "legacy" },
+      });
+      const result = JSON.parse(body?.content?.[0]?.text as string) as { status: number; body: Record<string, unknown> };
+      expect(result.status).toBe(202);
+      expect(result.body).toMatchObject({ reviewProcess: "codex-code-review", reviewFixLifecycle: null });
+      expect(result.body.syncJobId).toBeDefined();
     },
   );
 
