@@ -635,17 +635,41 @@ describe("job drawer restate attempt section", () => {
     win.closeJobDrawer();
   });
 
-  it.each(["fly-machines", "local-docker"])("shows the escaped %s execution reference without a workflow link", async (backend) => {
+  it.each([["fly-machines", "Fly machine"], ["local-docker", "Container"]])("shows the escaped %s execution reference without a workflow link", async (backend, label) => {
     const runRef = 'machine-<img src=x onerror="alert(1)">&container';
     const attempt = pilotAttemptFixture({ execution: { backend, runRef } });
     const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt });
     await win.openJobDrawer(10);
     const links = doc.getElementById("drawer-pilot-links")!;
-    expect(links.textContent).toContain(backend);
+    expect(links.querySelector(".field-label")!.textContent).toBe(label);
     expect(links.textContent).toContain(runRef);
     expect(links.querySelector("img")).toBeNull();
     expect(links.querySelector("a")).toBeNull();
     expect(links.textContent).not.toContain("undefined");
+    win.closeJobDrawer();
+  });
+
+  it.each([
+    { name: "no execution", execution: null, label: "Execution", text: "launch state unknown — no execution recorded yet", hrefs: [] },
+    { name: "legacy GitHub", execution: { githubRunId: "12345", githubRunAttempt: 2 }, label: "Workflow run", text: "Run #12345", hrefs: ["https://github.com/org/repo/actions/runs/12345", "https://github.com/org/repo/actions/runs/12345/attempts/2"] },
+    { name: "GitHub", execution: { backend: "github-actions", githubRunId: "12345", githubRunAttempt: 1 }, label: "Workflow run", text: "Run #12345", hrefs: ["https://github.com/org/repo/actions/runs/12345"] },
+    { name: "Fly", execution: { backend: "fly-machines", runRef: "<img src=x onerror=alert(1)>" }, label: "Fly machine", text: "<img src=x onerror=alert(1)>", hrefs: [] },
+    { name: "Docker", execution: { backend: "local-docker", runRef: "container-123" }, label: "Container", text: "container-123", hrefs: [] },
+    { name: "unknown backend", execution: { backend: "future-<img src=x onerror=alert(1)>", runRef: "ref-<img src=x onerror=alert(1)>&" }, label: "Execution", text: "future-<img src=x onerror=alert(1)> ref-<img src=x onerror=alert(1)>&", hrefs: [] },
+  ])("renders the $name execution state", async ({ execution, label, text, hrefs }) => {
+    const { win, doc } = mountPilotDrawer({ job: PILOT_JOB, attemptStatus: 200, attempt: pilotAttemptFixture({ execution }) });
+    await win.openJobDrawer(10);
+    const links = doc.getElementById("drawer-pilot-links")!;
+    expect(links.querySelector(".field-label")!.textContent).toBe(label);
+    expect(links.textContent).toContain(text);
+    if (execution && "runRef" in execution) {
+      expect(links.querySelector(".mono")!.textContent).toBe(text);
+    }
+    expect(links.querySelector("img")).toBeNull();
+    expect(Array.from(links.querySelectorAll("a"), (link) => link.getAttribute("href"))).toEqual(hrefs);
+    for (const link of doc.querySelectorAll("a[href]")) {
+      expect(link.getAttribute("href")).not.toContain("undefined");
+    }
     win.closeJobDrawer();
   });
 
