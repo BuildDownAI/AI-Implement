@@ -259,7 +259,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
           lifecycleOwner: { kind: "restate", attemptId: dispatchId },
           cap: mapping.maxInProgressAiIssues,
           prDispatchBudget: resolvePrDispatchBudget(mapping),
-          parked: queueIssueId !== null && isParked(queueIssueId, "gap-analysis"),
+          parked: isParked(queueIssueId || issueId, "gap-analysis"),
         },
         () => {
           db.prepare(`
