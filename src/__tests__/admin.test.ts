@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { createModelSessionKeyProvider } from "../model-session-keys.js";
@@ -1708,17 +1708,84 @@ describe("admin mappings", () => {
     }
   });
 
-  it("rejects reviewFixLifecycle='restate' with an actionable, fail-closed 400 naming the missing execution-mode prerequisite", async () => {
+  it.each([false, true])("saves Restate on configured Fly (existing mapping: %s) without a workflow probe", async (existing) => {
     const token = await login("secret");
+    if (existing) {
+      expect((await request("/api/mappings", "POST", "secret", {
+        teamKey: "RFLFLY", owner: "org", repo: "app", defaultBranch: "main",
+      }, token)).statusCode).toBe(202);
+    }
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    vi.stubEnv("FLY_SESSIONS_TOKEN", "fly-token");
+    await modules.orchestratorSettings.refreshRunnerBackendCache({
+      readFlyMachines: async () => ({ app: "sessions-app", region: null }),
+    });
+    resolveWorkflowCapabilitiesMock.mockClear();
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLFLY", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "fly-machines", reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(202);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLFLY).toMatchObject({
+      executionMode: "fly-machines", reviewFixLifecycle: "restate",
+    });
+    expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["app", "token"])("rejects Restate on Fly without sessions %s and preserves the mapping", async (missing) => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLFLY", owner: "org", repo: "app", defaultBranch: "main",
+    }, token);
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    vi.stubEnv("FLY_SESSIONS_TOKEN", missing === "token" ? "" : "fly-token");
+    vi.stubEnv("FLY_SESSIONS_APP", "env-seed-is-not-effective-config");
+    await modules.orchestratorSettings.refreshRunnerBackendCache({
+      readFlyMachines: async () => ({ app: missing === "app" ? null : "sessions-app", region: null }),
+    });
+    resolveWorkflowCapabilitiesMock.mockClear();
+    const res = await requestWithDeps("/api/mappings", "POST", token, {
+      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
+    }, {
+      teamKey: "RFLFLY", owner: "org", repo: "app", defaultBranch: "main",
+      executionMode: "fly-machines", reviewFixLifecycle: "restate",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("FLY_SESSIONS_APP");
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RFLFLY).toMatchObject({
+      executionMode: "github-actions", reviewFixLifecycle: null,
+    });
+    expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects configured Fly when Restate is unavailable", async () => {
+    const token = await login("secret");
+    onTestFinished(() => { vi.unstubAllEnvs(); });
+    vi.stubEnv("FLY_SESSIONS_TOKEN", "fly-token");
+    await modules.orchestratorSettings.refreshRunnerBackendCache({
+      readFlyMachines: async () => ({ app: "sessions-app", region: null }),
+    });
     const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLFLY", owner: "org", repo: "app",
-      executionMode: "fly-machines",
-      reviewFixLifecycle: "restate",
+      teamKey: "RFLDOWN", owner: "org", repo: "app",
+      executionMode: "fly-machines", reviewFixLifecycle: "restate",
     }, token);
     expect(res.statusCode).toBe(400);
-    const error = JSON.parse(res.body).error;
-    expect(error).toContain("github-actions");
-    expect(error).toContain("leave the lifecycle on Legacy");
+    expect(JSON.parse(res.body).error).toContain("Restate endpoint");
+  });
+
+  it("rejects Restate on Fly with Bedrock", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RFLBED", owner: "org", repo: "app",
+      executionMode: "fly-machines", reviewFixLifecycle: "restate",
+      provider: "bedrock", awsRegion: "us-east-1",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("bedrock");
   });
 
   it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 when no Restate endpoint status is available (fail closed, deps.getRestateStatus unset)", async () => {
@@ -1777,7 +1844,7 @@ describe("admin mappings", () => {
     expect(JSON.parse(list.body).RFLOK.reviewFixLifecycle).toBe("restate");
   });
 
-  it("rejects initial Restate activation while an unreserved Legacy runner is active", async () => {
+  it.each(["github-actions", "fly-machines"])("rejects initial Restate activation with an unreserved runner on %s", async (executionMode) => {
     const token = await login("secret");
     resolveWorkflowCapabilitiesMock.mockClear();
     dedup.getDb().prepare(`
@@ -1788,7 +1855,7 @@ describe("admin mappings", () => {
       getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
     }, {
       teamKey: "RFLDRAIN", owner: "org", repo: "app", defaultBranch: "main",
-      executionMode: "github-actions", reviewFixLifecycle: "restate",
+      executionMode, reviewFixLifecycle: "restate",
     });
     expect(res.statusCode).toBe(400);
     const error = JSON.parse(res.body).error;
