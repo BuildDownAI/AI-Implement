@@ -194,8 +194,8 @@ Inline comments count only from a trusted author of type `Bot`, on the head comm
 ## Which Claude comments the pipeline reads
 
 For `ai-implement`, a completed review check triggers a separate findings read.
-The ledger first restricts eligible top-level comments to those created during the
-review check on the resolved PR head. It then selects the newest by `updated_at`
+The ledger first restricts eligible top-level comments to those created at or after
+the review check started on the resolved PR head. It then selects the newest by `updated_at`
 (falling back to `created_at`, then API order for ties). It reads a fenced contract
 first, then legacy review headings. Both a combined tracking/review comment and a
 separate `## Claude review` comment are eligible; `**Claude finished**` is not
@@ -217,11 +217,12 @@ heading-only findings also gate approval under `ai-implement`, without requiring
 advisory. The step logs the selected comment id and parse kind beside its review
 process verdict log. Top-level comments do not supply commit identity. The step uses the single matching
 check with a real review conclusion, fetched from the current head's check-runs
-endpoint, and its inclusive `started_at`–`completed_at` window. Comment creation
-must fall inside that window; editing an older head's approval cannot bring it
+endpoint, and validates its `started_at` and `completed_at` timestamps. Comment creation
+must be at or after `started_at`; editing an older head's approval cannot bring it
 into the current review. Missing/invalid check timing, multiple real review checks,
-missing comment creation time, no eligible comment in the window, or an eligible
-comment edited after completion makes the verdict unavailable. This intentionally
+missing comment creation time, or no eligible comment makes the verdict unavailable.
+Final comments and tracker edits may arrive after `completed_at`; unavailable or
+incomplete verdicts keep the existing wait pending until its time limit. This intentionally
 fails closed for sticky comments created before the current review; inline threads
 retain their separate head-commit filtering.
 
