@@ -382,7 +382,8 @@ export function createProductionReviewFixWorker(
         if (!managedCredentials) throw new Error("review-fix managed credentials unavailable");
         // Recheck the frozen result: configuration may change while asynchronous preparation runs.
         assertExecutionPolicyCapability(managedCredentials, capabilities, `${mapping.owner}/${mapping.repo}/${mapping.workflowFile}@${mapping.defaultBranch}`);
-        return { snapshot: decision.snapshot, fallbackModels: decision.fallbackModels, credentials: managedCredentials,
+        return { snapshot: decision.snapshot, fallbackModels: decision.fallbackModels,
+          accountFallbacks: decision.accountFallbacks, credentials: managedCredentials,
           settle: (outcome) => { settleLaunch(decision, outcome, runtime); } };
       } catch {
         settleLaunch(decision, "rejected", runtime);

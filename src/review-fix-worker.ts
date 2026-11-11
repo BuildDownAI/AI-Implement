@@ -462,6 +462,7 @@ export function reviewFixAttemptStoreScopeStore(source: ReviewFixWorkerAttemptSc
 export interface ManagedReviewFixLaunch {
   snapshot: ResolvedAgentSnapshotV1;
   fallbackModels?: Extract<ManagedDispatchDecision, { kind: "launch" }>["fallbackModels"];
+  accountFallbacks?: Extract<ManagedDispatchDecision, { kind: "launch" }>["accountFallbacks"];
   credentials: RunCredentialsV1;
   settle(outcome: "accepted" | "rejected" | "unknown"): void;
 }

@@ -377,3 +377,67 @@ describe("stored fallback models", () => {
     expect(dump()).toBe(before);
   });
 });
+
+describe("default account list writes", () => {
+  beforeEach(() => {
+    store.saveAccountProfileRevision(claudeProfile());
+    store.saveAccountProfileRevision(codexProfile());
+  });
+  it("flattens one entry", () => {
+    const config = defaults();
+    config.stages!.planning!.accounts = [{ accountProfileId: "claude-main", model: "chosen" }];
+    const saved = store.setOrchestratorDefaults(config);
+    expect(saved.config.stages!.planning).not.toHaveProperty("accounts");
+    expect(saved.config.stages!.planning!.model).toBe("chosen");
+  });
+  it.each([
+    { entries: {} as never, message: "planning.accounts[0] must be a non-empty account list" },
+    { entries: [null] as never, message: "planning.accounts[0] is malformed" },
+    { entries: [{ accountProfileId: "claude-main" }] as never, message: "planning.accounts[0] is malformed" },
+    { entries: [{ accountProfileId: "claude-main", model: "m", extra: true }] as never, message: "planning.accounts[0] is malformed" },
+    { entries: [], message: "planning.accounts[0] must be a non-empty account list" },
+    { entries: [{ accountProfileId: "missing", model: "m" }], message: "planning.accounts[0] does not resolve" },
+    { entries: [{ accountProfileId: "claude-main", model: "m" }, { accountProfileId: "claude-main", model: "m" }], message: "planning.accounts[1] repeats a profile" },
+    { entries: [{ accountProfileId: "claude-main", model: "m" }, { accountProfileId: "codex-main", model: "" }], message: "planning.accounts[1] requires a model for another agent" },
+  ])("refuses $message without writing", ({ entries, message }) => {
+    const config = defaults();
+    config.stages!.planning!.accounts = entries;
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error(message));
+    expect(dump()).toBe(before);
+  });
+  it("accepts Claude subscriptions and refuses paid entries after them", () => {
+    store.saveAccountProfileRevision(claudeProfile({ profileId: "plan", authMode: "claude-subscription" }));
+    const config = defaults();
+    config.stages!.planning!.accounts = [{ accountProfileId: "claude-main", model: "m" }, { accountProfileId: "plan", model: "" }];
+    expect(() => store.setOrchestratorDefaults(config)).not.toThrow();
+    config.stages!.planning!.accounts.reverse();
+    config.stages!.planning!.accounts[0].model = "m";
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error("planning.accounts[1] cannot use paid API after subscription"));
+    expect(dump()).toBe(before);
+  });
+});
+
+it("refuses disabled entries even when a preceding entry passes", () => {
+  store.saveAccountProfileRevision(claudeProfile());
+  store.saveAccountProfileRevision(codexProfile());
+  store.retireAccountProfile("codex-main");
+  const config = defaults();
+  config.stages!.planning!.accounts = [{ accountProfileId: "claude-main", model: "m" }, { accountProfileId: "codex-main", model: "codex" }];
+  const before = dump();
+  expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error("planning.accounts[1] does not resolve"));
+  expect(dump()).toBe(before);
+});
+
+
+it("refuses a historical incompatible profile without writing", () => {
+  store.saveAccountProfileRevision(claudeProfile());
+  dedup.getDb().exec("DROP TRIGGER trg_model_account_profile_revisions_immutable");
+  dedup.getDb().prepare("UPDATE model_account_profile_revisions SET provider = 'openai' WHERE profile_id = 'claude-main'").run();
+  const config = defaults();
+  config.stages!.planning!.accounts = [{ accountProfileId: "claude-main", model: "m" }];
+  const before = dump();
+  expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error("planning.accounts[0] does not resolve"));
+  expect(dump()).toBe(before);
+});

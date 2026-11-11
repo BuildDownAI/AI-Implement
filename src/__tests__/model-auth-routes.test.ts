@@ -32,7 +32,7 @@ let errSpy: ReturnType<typeof vi.spyOn>;
 
 const hash = (b: string) => crypto.createHash("sha256").update(b, "utf8").digest("hex");
 
-function seedDispatch(opts: { scope?: string; expiresAt?: number; revokedAt?: number | null; released?: boolean } = {}) {
+function seedDispatch(opts: { scope?: string; expiresAt?: number; revokedAt?: number | null; released?: boolean; fallbacks?: boolean } = {}) {
   const db = dedup.getDb();
   const profile = { id: "cdx1", identity: "id", revision: 4, agent: "codex", provider: "openai", authMode: "codex-subscription" };
   const stage = { agent: "codex", provider: "openai", model: "m", accountProfileId: "cdx1", invocationTimeoutMs: 1000 };
@@ -40,11 +40,16 @@ function seedDispatch(opts: { scope?: string; expiresAt?: number; revokedAt?: nu
   const stages = { planning: stage, implementation: stage, review: stage };
   const profiles = { planning: profile, implementation: profile, review: profile };
   const sources = { planning: src, implementation: src, review: src };
+  const accountFallbacks = opts.fallbacks ? { implementation: [
+    { accountProfileId: "cdx1", profileRevision: 4, agent: "codex", provider: "openai", authMode: "codex-subscription", model: "backup" },
+    { accountProfileId: "unbound", profileRevision: 4, agent: "codex", provider: "openai", authMode: "codex-subscription", model: "backup" },
+  ] } : undefined;
+  if (opts.fallbacks) { profile.id = "chosen"; stage.accountProfileId = "chosen"; }
   db.prepare(
     `INSERT INTO run_agent_config_snapshots (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    "s1", "d1", "proj", JSON.stringify({ stages, profiles }), JSON.stringify(sources),
+    "s1", "d1", "proj", JSON.stringify({ stages, profiles, accountFallbacks }), JSON.stringify(sources),
     JSON.stringify({ orchestratorDefault: { configRevisionId: "r1", revision: 1 }, project: { configRevisionId: "r2", revision: 1 } }),
     NOW,
   );
@@ -141,6 +146,18 @@ function noLeak() {
 }
 
 describe("model-auth routes over HTTP", () => {
+  it("selects frozen fallback metadata and permits checkout only with a grant binding", async () => {
+    seedDispatch({ fallbacks: true });
+    seedPlan(NOW + 600_000);
+    expect(routesMod.getSnapshotSelection("s1", "cdx1")).toEqual({ provider: "openai", revision: 4, authMode: "codex-subscription" });
+    expect(routesMod.getSnapshotSelection("s1", "unknown")).toBeUndefined();
+    const base = await start(false);
+    expect((await call(base, "checkout")).status).toBe(200);
+    const denied = await call(base, "checkout", { body: { version: 1, profileId: "unbound" } });
+    expect(await denied.json()).toMatchObject({ ok: false, category: "unauthorized" });
+    noLeak();
+  });
+
   it("matches only the three routes", async () => {
     await start(false);
     const r = routesMod.createModelAuthRoutes({ runtime, onFly: false, requestPlanRefresh: async () => undefined });

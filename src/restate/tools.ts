@@ -1,3 +1,5 @@
+import { importEnvironmentCredential } from "../model-account-cli.js";
+import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { modelPrices } from "./model-prices.js";
 // The tools service skeleton (AII-710): a tool() wrapper that attaches a zod input
 // schema, the fixed ToolResponse output shape, and the "mcp.type"/"mcp.role" metadata
@@ -1392,6 +1394,27 @@ export const getPipelineScheduleTool = tool(
   },
 );
 
+export const importEnvironmentCredentialTool = tool(
+  {
+    description: "Import the orchestrator environment credential into an account profile without changing stage defaults (admin role).",
+    input: z.object({}),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx): Promise<ToolResponse> => {
+    let reply;
+    try {
+      const body = await ctx.run("import-environment-credential", () => importEnvironmentCredential(process.env, createModelProtectedSecrets({ env: process.env })), { maxRetryAttempts: 1 });
+      reply = { status: body.result === "created" ? 201 : 200, body };
+    } catch (error) {
+      if (restate.internal.isSuspendedError(error)) throw error;
+      reply = { status: error instanceof restate.TerminalError ? error.code : 500,
+        body: { error: error instanceof restate.TerminalError ? error.message : "could not import the environment credential" } };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(reply, null, 2) }] };
+  },
+);
+
 export const PAUSE_PROJECT_DESCRIPTION =
   "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.";
 
@@ -1634,6 +1657,7 @@ export const orchestratorTools = restate.service({
     get_runner_backend: getRunnerBackendTool,
     set_pipeline_schedule: setPipelineScheduleTool,
     get_pipeline_schedule: getPipelineScheduleTool,
+    import_environment_credential: importEnvironmentCredentialTool,
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,
     add_project: addProjectTool,

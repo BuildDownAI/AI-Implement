@@ -5,12 +5,14 @@ import type { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { CODEX_SKILLS_SUBDIR } from "../pipeline/steps/install-skills.js";
-import { AgentRecoveryRequiredError, AgentStageError, createStageExecutor, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
+import { AgentRecoveryRequiredError, AgentStageError, createStageExecutor, nextAccount, safeLimitLabel, safeModelLabel } from "../pipeline/stage-executor.js";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 import { CodexRecoveryRequiredError } from "../pipeline/codex-executor.js";
 import { collectedInvocations, resetJobAccounting } from "../pipeline/job-accounting.js";
 import { normalizeInvocation } from "../agent-usage.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { classifyLlmResult } from "../pipeline/failure-classification.js";
+import { ModelAuthClientError } from "../model-auth-client.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
 import type { InvokeParams, LLMExecutor, LLMResult } from "../pipeline/types.js";
 import { testDir, testTempRoot } from "./helpers/test-dir.js";
@@ -647,5 +649,129 @@ describe("capacity fallback", () => {
     const ex = fakeExec({ ...ok, failure: { category: "crash", code, stage: "implementation", attempt: 1, retryable: false, message: "failed", evidence: { truncated: false } } });
     const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(), fallbackModels: code === "PROVIDER_OVERLOADED" ? {} : { implementation: "claude-fallback" }, createClaude: () => ex });
     for (let i = 0; i < 2; i++) expect(await executor.invoke({ ...base, agentStage: "implementation" })).toMatchObject({ failure: { code }, attribution: { model: "claude-impl" } });
+  });
+});
+
+describe("account fallback", () => {
+  const B = { accountProfileId: "B", profileRevision: 2, agent: "claude" as const, provider: "anthropic" as const, authMode: "anthropic-api-key" as const, model: "claude-next" };
+  const C = { ...B, accountProfileId: "C" };
+  it.each([
+    [undefined, ["A"], "ACCOUNT_USAGE_LIMIT", { kind: "exhausted", profiles: ["A"] }],
+    [[B, C], ["A"], "ACCOUNT_USAGE_LIMIT", { kind: "switch", to: B }],
+    [[B, C], ["A", "B"], "ACCOUNT_USAGE_LIMIT", { kind: "switch", to: C }],
+    [[B, C], ["A", "B", "C"], "ACCOUNT_USAGE_LIMIT", { kind: "exhausted", profiles: ["A", "B", "C"] }],
+    [[B, C], ["A", "B"], "AUTH_INVALID", { kind: "none" }],
+    [[B, C], ["A"], "PROVIDER_OVERLOADED", { kind: "none" }],
+    [[B, C], ["A"], "PROCESS_CRASH", { kind: "none" }],
+  ] as const)("decides %j with used=%j and code=%s", (fallbacks, used, code, expected) => {
+    expect(nextAccount(fallbacks, new Set(used), { code })).toEqual(expected);
+  });
+
+  it.each([true, false])("preserves executor-produced exhaustion evidence (fallback list: %s)", async withFallbacks => {
+    const primary = structuredClone(snapshot);
+    primary.stages.implementation.accountProfileId = "A";
+    primary.profiles.implementation.id = "A";
+    const claude = fakeExec();
+    claude.invoke.mockImplementation(async () => ({ ...ok, failure: classifyLlmResult({
+      ...ok, terminalStatus: { isError: true, subtype: "turn.failed" },
+      errorMessage: "You've hit your usage limit.",
+    }, { stage: "implement", attempt: 1, expectsStructuredOutput: false }) }));
+    const auth = fakeAuth();
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: primary,
+      auth, accountFallbacks: withFallbacks ? { implementation: [B, C] } : undefined, createClaude: () => claude });
+    const profiles = withFallbacks ? ["A", "B", "C"] : ["A"];
+    let last: LLMResult = ok;
+    for (const profile of profiles) {
+      last = await executor.invoke({ ...base, agentStage: "implementation" });
+      expect(last.attribution?.profileId).toBe(profile);
+    }
+    const message = `Usage limit reached on every account: ${profiles.join(", ")}`;
+    expect(last.failure).toMatchObject({ code: "ACCOUNT_USAGE_LIMIT", message,
+      evidence: { llmErrorMessage: message } });
+    expect(last.failure?.accountFallback).toBeUndefined();
+    expect(auth.invoke.mock.calls.map(call => call[0])).toEqual(profiles);
+  });
+
+  it("retains a fallback checkout failure without advancing to the next account", async () => {
+    const checkout = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValue(new ModelAuthClientError("profile_not_allowed"));
+    const auth = { async invoke<T>(id: string, run: (selected: ModelInvocation) => Promise<T>): Promise<T> {
+      await checkout(id);
+      return run({ env: {}, strippedKeys: [] });
+    } };
+    const claude = fakeExec({ ...ok, failure: classifyLlmResult({ ...ok, exitCode: 1,
+      errorMessage: "You've hit your usage limit." }, { stage: "implement", attempt: 1, expectsStructuredOutput: false }) });
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot,
+      auth, accountFallbacks: { implementation: [B, C] }, createClaude: () => claude });
+    expect((await executor.invoke({ ...base, agentStage: "implementation" })).failure?.accountFallback?.to).toBe("B");
+    await expect(executor.invoke({ ...base, agentStage: "implementation" })).rejects.toMatchObject({
+      failure: { code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", retryable: false }, attribution: { profileId: "B" },
+    });
+    expect(checkout.mock.calls).toEqual([["p-impl"], ["B"]]);
+    expect(claude.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not apply the Anthropic overload model after switching to Bedrock", async () => {
+    const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+    const claude = fakeExec();
+    claude.invoke.mockResolvedValueOnce({ ...ok, failure })
+      .mockResolvedValueOnce({ ...ok, failure: { ...failure, code: "PROVIDER_OVERLOADED" } });
+    const bedrock = { ...B, provider: "bedrock" as const, authMode: "bedrock" as const, model: "bedrock-model" };
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(),
+      accountFallbacks: { implementation: [bedrock] }, fallbackModels: { implementation: "anthropic-backup" }, createClaude: () => claude });
+    const params = { ...base, agentStage: "implementation" as const };
+    await executor.invoke(params);
+    const overloaded = await executor.invoke(params);
+    expect(overloaded.failure?.modelFallback).toBeUndefined();
+    const last = await executor.invoke(params);
+    expect(last.attribution).toMatchObject({ provider: "bedrock", model: "bedrock-model" });
+    expect(claude.invoke.mock.calls[2][0].model).toBe("bedrock-model");
+  });
+
+  it("routes a Codex primary to Claude through auth with effective attribution", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const primary = structuredClone(snapshot);
+    primary.stages.implementation = { ...primary.stages.review, accountProfileId: "A" };
+    primary.profiles.implementation = { ...primary.profiles.review, id: "A" };
+    const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+    resetJobAccounting();
+    const credential = "synthetic-selected-key-0000";
+    const grants = new Map([["A", "codex-subscription"], ["B", B.authMode]]);
+    const checkouts = new Map<string, Promise<void>>();
+    const checkout = vi.fn(async (profileId: string) => {
+      if (!grants.has(profileId)) throw new Error("profile_not_allowed");
+    });
+    // Equivalent to the configured-run wrapper: grant check on first use, cached per profile.
+    const auth = {
+      async invoke<T>(profileId: string, run: (selected: ModelInvocation) => Promise<T>): Promise<T> {
+        let pending = checkouts.get(profileId);
+        if (!pending) {
+          pending = checkout(profileId);
+          checkouts.set(profileId, pending);
+        }
+        await pending;
+        return run({ env: { ANTHROPIC_API_KEY: credential }, strippedKeys: [] });
+      },
+    };
+    const codex = fakeExec();
+    codex.invoke.mockImplementation(async () => auth.invoke("A", async () => ({ ...ok, failure })));
+    const claude = fakeExec();
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: primary, auth, accountFallbacks: { implementation: [B] }, fallbackModels: { implementation: "gpt-other" }, createCodex: () => codex, createClaude: () => claude });
+    const params = { ...base, agentStage: "implementation" as const };
+    const first = await executor.invoke(params);
+    expect(first.failure?.accountFallback).toEqual({ stage: "implementation", from: "A", to: "B" });
+    claude.invoke.mockResolvedValueOnce({ ...ok, failure: { ...failure, code: "PROVIDER_OVERLOADED" } });
+    const second = await executor.invoke(params);
+    const third = await executor.invoke(params);
+    for (const result of [second, third]) {
+      expect(result.attribution).toMatchObject({ profileId: "B", agent: "claude", provider: "anthropic", authMode: B.authMode, model: B.model });
+    }
+    expect(codex.invoke).toHaveBeenCalledTimes(1);
+    expect(claude.invoke).toHaveBeenCalledTimes(2);
+    expect(claude.invoke.mock.calls[0][0].model).toBe(B.model);
+    expect(checkout.mock.calls).toEqual([["A"], ["B"]]);
+    expect(log).toHaveBeenCalledExactlyOnceWith("[account-fallback] stage=implementation from=A to=B after=ACCOUNT_USAGE_LIMIT");
+    const recorded = collectedInvocations();
+    expect(recorded.slice(1).map(row => row.attribution.profileId)).toEqual(["B", "B"]);
+    expect(JSON.stringify({ results: [first, second, third], recorded, logs: log.mock.calls })).not.toContain(credential);
   });
 });

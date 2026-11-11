@@ -7,15 +7,24 @@ machine as `node dist/model-account-cli.js <command> --profile <id>`.
 
 ## Add an account profile
 
-On Models & providers an admin adds a profile with the form (`POST /api/model-accounts`). Add the profile first, then set its key or connect its plan account ([API credentials](#api-credentials), [ChatGPT plan accounts](#chatgpt-plan-accounts)). The form has six fields:
+On Models & providers an admin adds a profile with the form (`POST /api/model-accounts`). Add the profile first, then set its key or connect its plan account ([API credentials](#api-credentials), [ChatGPT plan accounts](#chatgpt-plan-accounts)). The form asks for:
 
 | Field | Meaning |
 |---|---|
-| Profile ID | The profile's name. Use lowercase letters, digits, `.`, `_` or `-`. The create route also accepts uppercase, but the fallback API-key reference `model-account:<profileId>` is lowercase-only (`MODEL_ACCOUNT_REF_PATTERN`, `src/model-credentials.ts`), so a mixed-case id cannot take a key unless the profile has its own `credentialRef` |
-| Identity | A label for the account behind the profile |
+| Name | A label for the account behind the profile, stored as `identity`. Nothing at run time depends on it, and it can be changed later |
 | Agent | `claude` or `codex` |
 | Provider | `anthropic`, `openai` or `bedrock` |
 | Authentication | `anthropic-api-key`, `openai-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
+
+The page makes the profile ID from the Name: lowercase, each run outside `[a-z0-9._-]` replaced by `-`, leading and trailing hyphens removed, then leading punctuation removed so the ID starts with a letter or digit. It cuts the result to 64 characters and uses `account` when nothing is left. When an ID is loaded already, it adds `-2`, `-3`, …, shortening the base so the entire ID stays within 64 characters. If another admin creates the same ID before submission, the form shows the route's error message.
+
+The ID is the profile's key and never changes. A caller of the route itself sends its own `profileId`; use lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit, because the fallback reference `model-account:<profileId>` is lowercase-only (`MODEL_ACCOUNT_REF_PATTERN`, `src/model-credentials.ts`).
+
+## Edit an account profile
+
+The table reads Name, Agent, Provider, Authentication, Status, Readiness and API key, with the immutable profile ID below the Name. For an admin, **Edit** changes the Name and status (`active`, `disabled` or `archived`); **Save** sends only changed `identity` and `status` fields to `PATCH /api/model-accounts/:id`, and **Cancel** discards the edit. Non-admins have no Edit action or add form. Name, Status, Save and Cancel are disabled while saving; a failed save keeps the draft available to retry. Stage edits, profile drafts and unsubmitted keys survive account refreshes, as do focus on profile editing controls and the Name selection.
+
+The admin-only route may accept `identity`, `agent`, `provider`, `authMode`, `credentialRef` and `status`; any other key is a 400. It copies the current head, applies the body, and saves a new revision (`handlePatchModelAccount`, `src/admin.ts`). The credential reference is kept unless the body sets `credentialRef` to `null`. The profile ID is the path and cannot change: stage defaults, credential references and run attribution store it. The same validation as create applies (`validateProfileInput`, `src/agent-config-store.ts`).
 
 - **Readiness.** Credential readiness comes from the profile's own credential status (`accountStatus`, `src/admin.ts`), whether or not any project uses it. Every active profile is usable by every project; disable or archive a profile to stop its use.
 - **Every stage needs a profile.** A project that opts into configured runs needs a usable profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown, disabled or archived profile, or one whose agent or provider does not match the stage, throws. A project that wants Codex only for review must still give planning and implementation a profile.
@@ -153,7 +162,18 @@ The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token
 
 ## Adopt an environment credential
 
-On the orchestrator, run `node dist/model-account-cli.js adopt-env` with no arguments.
+The admin tool `import_environment_credential` (no arguments, through MCP or
+`POST /api/tools/import_environment_credential` with `{ "args": {} }`) imports the
+credential as an ordinary account profile named `Adopted environment credential`.
+It does not change stage defaults, project grants, or project opt-ins. Repeating
+the import returns `already-imported` (200) without writing when the stored
+credential opens. If the stored credential is missing or unreadable, the tool
+reseals the value from the current orchestrator environment and returns `created`
+(201), as it does for a new import. Responses contain neither the credential
+value nor its stored reference.
+
+To also configure stage defaults, run `node dist/model-account-cli.js adopt-env`
+on the orchestrator with no arguments.
 It reads `CLAUDE_CODE_OAUTH_TOKEN` first, then `ANTHROPIC_API_KEY`. When both are
 present, the token wins and the command reports that the key was ignored. Bedrock
 is outside this migration. `RUNNER_TOKEN_SECRET` must be set before adoption can write.
@@ -177,7 +197,14 @@ Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode
 is `configured`, and all three stages name the adopted profile. Projects still
 need their own explicit opt-in. To roll back, revert the defaults and delete the
 profile on Models & providers; remove its encrypted credential with `secret-delete`
-if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it.
+if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
+with `secret-import`, the profile's credential editor, or
+`import_environment_credential` when the credential is still available in the
+orchestrator environment. The tool and `adopt-env` share the same import and
+repair logic. When replacing legacy defaults, `adopt-env` repairs a missing or
+unreadable credential from the environment before configuring the stages;
+already configured defaults remain a no-op, so use the tool to repair their
+credential.
 
 ## Adopting existing projects
 
@@ -195,3 +222,8 @@ Runner-only environment settings (for example, Fly secrets, image environment, o
 Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and explicit legacy opt-outs are skipped. After readiness, adoption rechecks that branch head before synchronously revalidating local inputs and writing. An observed push or disappeared branch reports `inputs_changed`; retry to inspect the new snapshot. A failed final revision check reports `repository_unavailable` without writing or replacing the checked candidate. Dry-run uses the same guard. This last GitHub observation does not lock remote pushes: a push after it is a later repository change. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
 
 After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, write an explicit legacy row on the project's **Agents** tab; future adoption runs preserve that opt-out.
+
+
+### Stage fallback accounts
+
+On Models & providers, use Add account and Move up/Move down in the Orchestrator stage defaults card, then Save. This sets the stage's ordered `accounts: [{ accountProfileId, model }]` list in the stage defaults configuration (see [stage agent configuration](stage-agent-configuration.md)). The first account is primary; later accounts are fallback candidates, in order. Profiles must be configured and authorized in the run grant. Implementation and review switch once per account after a usage limit, preserving workspace changes and reporting the account that actually ran. Planning does not switch. Exhaustion names all exhausted profile ids; a checkout failure stops with its own authentication or recovery error.

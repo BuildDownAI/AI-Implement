@@ -832,6 +832,7 @@ export { MODEL_AUTH_ENV };
 
 export interface ConfiguredRunOptions {
   modelFallbacks?: StageExecutorOptions["fallbackModels"];
+  accountFallbacks?: StageExecutorOptions["accountFallbacks"];
   /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */
   agentConfig?: ResolvedAgentSnapshotV1;
   /** Local runs: protected credential source. */
@@ -1101,7 +1102,9 @@ export async function prepareConfiguredRun(input: {
   const modelFallbacks = options.modelFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
     ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).modelFallbacks
     : undefined);
-  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks }, syntheticProvider, implementationFullAccess);
+  const accountFallbacks = options.accountFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
+    ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).accountFallbacks : undefined);
+  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks, accountFallbacks }, syntheticProvider, implementationFullAccess);
 }
 
 function buildConfiguredRun(
@@ -1112,6 +1115,9 @@ function buildConfiguredRun(
   implementationFullAccess = false,
 ): ConfiguredRun {
   const modes = new Map(STAGE_NAMES.map((s) => [snapshot.profiles[s].id, snapshot.profiles[s].authMode] as const));
+  for (const entries of Object.values(options.accountFallbacks ?? {})) {
+    for (const entry of entries) modes.set(entry.accountProfileId, entry.authMode);
+  }
   const checkouts = new Map<string, Promise<void>>();
   const checkedOut = new Set<string>();
   let held = false;
@@ -1153,6 +1159,7 @@ function buildConfiguredRun(
         },
         snapshot,
         fallbackModels: options.modelFallbacks,
+        accountFallbacks: options.accountFallbacks,
         auth,
         logLevel: args.logLevel,
         activityReporting: args.activityReporting,
@@ -1623,7 +1630,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // The verify hook still failed after the last iteration. Never a review verdict, so it gets
     // its own failureCode/wording; the hook's output tail rides in finalFeedback.
     const verifyFailed = terminationReason === "verify_failed";
-    const failureCode = verifyFailed
+    const accountUsageLimit = reviewerFailure?.code === "ACCOUNT_USAGE_LIMIT";
+    const failureCode = accountUsageLimit
+      ? "ACCOUNT_USAGE_LIMIT"
+      : verifyFailed
       ? "VERIFY_FAILED"
       : reviewerTurnsExhausted
       ? "REVIEWER_TURNS_EXHAUSTED"
@@ -1657,7 +1667,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const sentences = [lead, terminationReasonSentence(terminationReason, iterations), draft, reasonCodeTag(terminationReason)];
       return sentences.filter(Boolean).join(" ") + notes;
     };
-    const failureReason = verifyFailed
+    const failureReason = accountUsageLimit
+      ? reviewerFailure.message
+      : verifyFailed
       ? `The repository's verify hook still failed after ${iterations} iteration(s), so the review did not examine the last pass.\n\n${finalFeedback}`
       : reviewerTurnsExhausted
       ? `🟠 ${SECOND_REVIEW} did not finish. A reviewer used all of its permitted steps (${reviewMaxTurns}), so the review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
@@ -1678,7 +1690,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
-    disposition = verifyFailed
+    disposition = accountUsageLimit
+      ? `${prDisposition} — accounts reached their usage limit`
+      : verifyFailed
       ? `${prDisposition} — verify hook failed after ${iterations} iteration(s) (${terminationReason})`
       : reviewerTurnsExhausted
       ? `${prDisposition} — a reviewer used all of its permitted steps after ${iterations} iteration(s) (${terminationReason})`

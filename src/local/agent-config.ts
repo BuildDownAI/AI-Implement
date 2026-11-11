@@ -4,6 +4,7 @@ import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/p
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   resolveStageAgentConfig,
+  validateDefaultAccounts,
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
   type AccountAuthMode,
@@ -391,7 +392,7 @@ async function loadImpl(options: LocalAgentConfigOptions): Promise<LoadedLocalAg
   let resolution: StageConfigResolution;
   try {
     resolution = resolveStageAgentConfig({
-      orchestratorDefaults,
+      orchestratorDefaults: validateDefaultAccounts(orchestratorDefaults, parsed.map(p => p.profile)),
       projectConfig,
       accountProfiles: parsed.map((p) => p.profile),
       remainingJobMs: options.remainingJobMs,
