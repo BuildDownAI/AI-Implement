@@ -11,11 +11,19 @@ import { statSync } from "node:fs";
 import { isAllowlistReadAvailable, getEffectiveAllowlist, listAccessEntries, type AccessEntry, type EffectiveAllowlist } from "../access-entries.js";
 import { getMappings, type RepoMapping } from "../config.js";
 import { getDatabasePath, getDb, type DatabasePath } from "../dedup.js";
-import { getRunnerBackendSource, getFlySessionsConfig, type FlySessionsConfig } from "../orchestrator-settings.js";
+import { readKgSourceRepo } from "../deploy.js";
+import { getAppInstallation, getScopedInstallationToken, listInstallationRepositoryNames, readAppIdentity, type AppIdentityRead, type AppInstallation } from "../github-app-auth.js";
+import { readPublicRepository, readRepositoryFacts, type PublicRepositoryRead, type RepositoryFacts } from "../github.js";
+import { ORCHESTRATOR_INSTANCE_ID, readOrchestratorHealth, type HealthSetupChecks, type OrchestratorHealthRead } from "../health-body.js";
+import { runKgRefreshPreflight, type PreflightCheckResult } from "../kg-refresh.js";
+import { getRunnerBackendSource, getFlySessionsConfig, getOrchestratorSettings, type FlySessionsConfig } from "../orchestrator-settings.js";
 import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
 import type { TicketingProvider, TrackerSetupFacts } from "../providers/types.js";
 import { getRunnerMode, type RunnerModeStatus } from "../runner-mode.js";
-import { ORCHESTRATOR_CONFIG_CHECKS } from "./orchestrator-config.js";
+import { listRecentAppDeliveries, type RecentAppDeliveries } from "../webhook-redelivery.js";
+import { getWorkflowSyncByTeam, type WorkflowSyncJob } from "../workflow-sync-queue.js";
+import { GITHUB_CONFIG_CHECKS, ownerRepositoryRequests } from "./github-config.js";
+import { isAdminPathConfigured, ORCHESTRATOR_CONFIG_CHECKS } from "./orchestrator-config.js";
 import { TRACKER_CONFIG_CHECKS } from "./tracker-config.js";
 
 export type SetupCheckState = "pass" | "warn" | "fail" | "cannot-verify" | "not-applicable";
@@ -39,6 +47,7 @@ export const SETUP_CHECK_IDS = [
   "volume.database",
   "restate",
   "callback.config",
+  "callback.reachable",
   "runner.fly-sessions",
   "admin.path",
   "admin.providers",
@@ -58,6 +67,18 @@ export const SETUP_CHECK_IDS = [
   "tracker.jira.repo-option",
   "tracker.jira.jql",
   "tracker.filesystem.directory",
+  // github-config.ts
+  "github.app-identity",
+  "github.clock",
+  "github.installation",
+  "github.permissions",
+  "github.target-secrets",
+  "github.webhook-signature",
+  "github.kg-grants",
+  "github.workflow-default-branch",
+  "github.workflow-mapping-branch",
+  "github.reference-repos",
+  "github.skills-repo",
 ] as const;
 
 export type SetupCheckId = (typeof SETUP_CHECK_IDS)[number];
@@ -119,6 +140,88 @@ export interface SetupCheckContext {
   trackerProvider(providerId: string): Promise<TicketingProvider>;
   /** One provider's setup facts for its projects' teams, read once per context, or null when it reads none. */
   trackerSetupFacts(providerId: string): Promise<TrackerSetupFacts | null>;
+  /** The GitHub reads the `github` checks share, one set per context. */
+  githubSetupFacts(): GitHubSetupFacts;
+  /** The orchestrator's health endpoint at a base URL, read from this host the way a run reaches the orchestrator. */
+  orchestratorHealthAt(baseUrl: string): Promise<OrchestratorHealthRead>;
+  /** The identifier this orchestrator's own health body carries. */
+  orchestratorInstanceId(): string;
+}
+
+/** GitHub's side of the setup, read lazily: each read runs at its first call and is shared for the rest of the run. */
+export interface GitHubSetupFacts {
+  /** `GET /app` with the App's JWT. Throws when the App's ID or key is missing or cannot sign one. */
+  app(): Promise<AppIdentityRead>;
+  /** The App's installation on an owner, or null when it has none. */
+  installation(owner: string): Promise<AppInstallation | null>;
+  /** The lowercased names a selected-repositories installation includes, or null when it includes them all. Throws when the owner has no installation. */
+  installationRepositories(owner: string): Promise<Set<string> | null>;
+  /** What the installation's token sees of every repository projects read on an owner, keyed by lowercased name. */
+  repositories(owner: string): Promise<Map<string, RepositoryFacts>>;
+  /** An unauthenticated read of a repository, and of `ref` in it, for an owner the App is not installed on. */
+  publicRepository(owner: string, repo: string, ref?: string): Promise<PublicRepositoryRead>;
+  /** The App's webhook deliveries from the last day. */
+  deliveries(): Promise<RecentAppDeliveries>;
+  /** `KG_SOURCE_REPO` as self-deploy and the refresh read it, or null when it is unset or not an owner/repo name. */
+  kgSourceRepo(): string | null;
+  /** The knowledge-graph refresh preflight, or null when `kgSourceRepo()` is. */
+  kgPreflight(): Promise<PreflightCheckResult | null>;
+  /** A project's workflow sync row, or null when none was ever queued. */
+  workflowSync(teamKey: string): WorkflowSyncJob | null;
+}
+
+/** The production reads behind `githubSetupFacts`, each memoized by its arguments. */
+function createGitHubSetupFacts(ctx: SetupCheckContext): GitHubSetupFacts {
+  const reads = new Map<string, Promise<unknown>>();
+  const once = <T>(key: string, read: () => Promise<T>): Promise<T> => {
+    let pending = reads.get(key) as Promise<T> | undefined;
+    if (!pending) {
+      pending = read();
+      reads.set(key, pending);
+    }
+    return pending;
+  };
+  const app = () => {
+    const appId = ctx.env.GITHUB_APP_ID;
+    const privateKey = ctx.env.GITHUB_APP_PRIVATE_KEY;
+    if (!appId || !privateKey) throw new Error("GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY are not both set");
+    return { appId, privateKey };
+  };
+  // Reads only, with the least the repository reads need.
+  const ownerToken = (owner: string) => once(`token:${owner.toLowerCase()}`, async () => {
+    const { appId, privateKey } = app();
+    const minted = await getScopedInstallationToken(appId, privateKey, owner, { permissions: { contents: "read", pull_requests: "read", metadata: "read" } });
+    return minted.token;
+  });
+  const facts: GitHubSetupFacts = {
+    app: () => once("app", async () => {
+      const { appId, privateKey } = app();
+      return readAppIdentity(appId, privateKey);
+    }),
+    installation: (owner) => once(`installation:${owner.toLowerCase()}`, async () => {
+      const { appId, privateKey } = app();
+      return getAppInstallation(appId, privateKey, owner);
+    }),
+    installationRepositories: (owner) => once(`installation-repositories:${owner.toLowerCase()}`, async () => {
+      const installation = await facts.installation(owner);
+      if (!installation) throw new Error(`The GitHub App is not installed on ${owner}`);
+      return installation.repository_selection === "all" ? null : listInstallationRepositoryNames(await ownerToken(owner));
+    }),
+    repositories: (owner) => once(`repositories:${owner.toLowerCase()}`, async () =>
+      readRepositoryFacts(await ownerToken(owner), owner, ownerRepositoryRequests(ctx.mappings(), owner))),
+    publicRepository: (owner, repo, ref) => once(`public:${owner.toLowerCase()}/${repo.toLowerCase()}@${ref ?? ""}`, () =>
+      readPublicRepository(owner, repo, ref)),
+    deliveries: () => once("deliveries", async () => listRecentAppDeliveries(app())),
+    kgSourceRepo: () => readKgSourceRepo(ctx.env.KG_SOURCE_REPO, () => {}),
+    kgPreflight: () => once("kg-preflight", async () => {
+      const kgSourceRepo = facts.kgSourceRepo();
+      if (!kgSourceRepo) return null;
+      const { appId, privateKey } = app();
+      return runKgRefreshPreflight({ githubAppId: appId, githubAppPrivateKey: privateKey, kgSourceRepo, kgBaseRepo: getOrchestratorSettings().kgBaseRepo });
+    }),
+    workflowSync: getWorkflowSyncByTeam,
+  };
+  return facts;
 }
 
 /**
@@ -131,6 +234,8 @@ export function createSetupCheckContext(
 ): SetupCheckContext {
   const registry = new ProviderRegistry(providerConfigFromEnv(), () => ctx.mappings());
   const setupFacts = new Map<string, Promise<TrackerSetupFacts | null>>();
+  let githubFacts: GitHubSetupFacts | undefined;
+  let projects: Record<string, RepoMapping> | undefined;
   const ctx: SetupCheckContext = {
     env: process.env,
     // A database error throws, so the check reports cannot-verify instead of reading a missing row.
@@ -141,7 +246,8 @@ export function createSetupCheckContext(
     runnerMode: getRunnerMode,
     flySessions: getFlySessionsConfig,
     runnerBackendSource: getRunnerBackendSource,
-    mappings: getMappings,
+    // Read once, so every check in a run judges the same projects even when one is saved mid-run.
+    mappings: () => (projects ??= getMappings()),
     storedAccessEntries: listAccessEntries,
     effectiveAllowlist: getEffectiveAllowlist,
     allowlistReadAvailable: isAllowlistReadAvailable,
@@ -165,6 +271,9 @@ export function createSetupCheckContext(
       }
       return read;
     },
+    githubSetupFacts: () => (githubFacts ??= createGitHubSetupFacts(ctx)),
+    orchestratorHealthAt: (baseUrl) => readOrchestratorHealth(baseUrl),
+    orchestratorInstanceId: () => ORCHESTRATOR_INSTANCE_ID,
     ...overrides,
   };
   return ctx;
@@ -183,7 +292,7 @@ export interface SetupCheck {
   run(ctx: SetupCheckContext): SetupCheckOutcome[] | Promise<SetupCheckOutcome[]>;
 }
 
-export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS, ...TRACKER_CONFIG_CHECKS];
+export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS, ...TRACKER_CONFIG_CHECKS, ...GITHUB_CONFIG_CHECKS];
 
 /** Runs every check. A check that throws reports `cannot-verify` with its error, and the others still run. */
 export async function runSetupChecks(
@@ -220,6 +329,19 @@ export function summarizeSetupChecks(run: SetupCheckRun | null): SetupCheckSumma
     failingCore: countFailingCore(run),
     rows: run.results.map(({ id, title, state, project }) => ({ id, title, state, ...(project === undefined ? {} : { project }) })),
   };
+}
+
+/**
+ * The run as anyone may see it on `GET /`: the last run's time and failing core count, plus, while no admin path is
+ * configured, the ids of the failing admin-path checks, run afresh on each call (ADR 047's bootstrap mode).
+ */
+export async function setupChecksHealthField(run: SetupCheckRun | null, ctx: SetupCheckContext): Promise<HealthSetupChecks> {
+  const field: HealthSetupChecks = { checkedAt: run?.checkedAt ?? null, failingCore: run === null ? null : countFailingCore(run) };
+  if (!isAdminPathConfigured(ctx)) {
+    const live = await runSetupChecks(ctx, ORCHESTRATOR_CONFIG_CHECKS.filter((check) => check.onAdminPath));
+    field.failingOnAdminPath = live.results.filter((row) => row.state === "fail").map((row) => row.id);
+  }
+  return field;
 }
 
 // Process-local health snapshot, independent of Restate availability.

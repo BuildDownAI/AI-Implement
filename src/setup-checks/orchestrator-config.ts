@@ -4,13 +4,23 @@ import { dirname } from "node:path";
 import { allowlistFromEnv, hasAdminAddress } from "../access-entries.js";
 import { effectiveAccessCode } from "../admin-session.js";
 import { resolveProviders } from "../oauth/providers.js";
-import { parseAppPrivateKey } from "../github-app-auth.js";
+import { appCredentialsProblem } from "../github-app-auth.js";
 import { SEED_ONCE_SETTINGS } from "../seed-once-settings.js";
 import { MAX_POLL_INTERVAL_MS, parsePollIntervalMs } from "../poll-cycle.js";
 import { parseBreakerThreshold } from "../dispatch-breaker.js";
 import { FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveExecutionPath, resolveFlyProcessLevelSecrets, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
 import { missingRunnerCallbackConfig } from "../runner-callback.js";
+import { ORCHESTRATOR_HEALTH_TIMEOUT_MS } from "../health-body.js";
 import type { SetupCheck, SetupCheckContext } from "./index.js";
+
+/** A URL's host name, or null when it does not parse, so the fetch reports the malformed address. */
+function hostnameOf(url: string): string | null {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
 
 /** Configuration only: an allowlist outage must never expose bootstrap diagnostics. */
 export function isAdminPathConfigured({ env, effectiveAllowlist, allowlistReadAvailable }: Pick<SetupCheckContext, "env" | "effectiveAllowlist" | "allowlistReadAvailable">): boolean {
@@ -63,14 +73,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     tier: "core",
     onAdminPath: true,
     run: ({ env }) => {
-      const missing = ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY"].filter((name) => !env[name]);
-      const fix = "Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY. The private key is the PEM file from the GitHub App's settings page.";
-      if (missing.length > 0) return [{ state: "fail", detail: `${missing.join(" and ")} not set`, fix }];
-      try {
-        parseAppPrivateKey(env.GITHUB_APP_PRIVATE_KEY!);
-      } catch {
-        return [{ state: "fail", detail: "GITHUB_APP_PRIVATE_KEY does not parse as a private key", fix }];
-      }
+      const problem = appCredentialsProblem(env);
+      if (problem) return [{ state: "fail", detail: problem, fix: "Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY. The private key is the PEM file from the GitHub App's settings page." }];
       return [{ state: "pass", detail: "Both set, and the key parses" }];
     },
   },
@@ -273,6 +277,39 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       }
       const derived = callback.source === "local-default" ? ", derived for RUNNER_MODE=local" : "";
       return [{ state: "pass", detail: `Runs report to ${callback.url}${derived}` }];
+    },
+  },
+  {
+    id: "callback.reachable",
+    title: "Runner callback reachable",
+    group: "orchestrator",
+    tier: "core",
+    onAdminPath: false,
+    run: async ({ env, runnerMode, orchestratorHealthAt, orchestratorInstanceId }) => {
+      const { url } = resolveRunnerCallbackBaseUrl(env);
+      if (!url) return [{ state: "cannot-verify", detail: "No callback address is set, so there is none to reach", fix: "Clear callback.config first." }];
+      // A local runner reaches the orchestrator through host.docker.internal, which resolves inside its container only.
+      if (runnerMode().mode === "local") return [{ state: "not-applicable", detail: "The runner mode is local, so runs reach the orchestrator from containers on this host" }];
+      if (hostnameOf(url) === "host.docker.internal") return [{ state: "not-applicable", detail: `${url} resolves only inside a local runner's container` }];
+      const read = await orchestratorHealthAt(url);
+      if (read.outcome === "health-body") {
+        if (read.instanceId === orchestratorInstanceId()) return [{ state: "pass", detail: `${url} answered as this orchestrator, so runs can report their results there` }];
+        return [{
+          state: "fail",
+          detail: `${url} answered as a different orchestrator, which refuses this one's runs, so a finished run's results would be lost`,
+          fix: "Set RUNNER_CALLBACK_BASE_URL to this orchestrator's own public address.",
+        }];
+      }
+      const seen = read.outcome === "other-response"
+        ? `${url} answered HTTP ${read.status} without the orchestrator's health response, so it reaches a proxy, a tunnel, another site, or a path the orchestrator does not serve`
+        : read.timedOut
+          ? `Nothing answered at ${url} within ${ORCHESTRATOR_HEALTH_TIMEOUT_MS / 1000} seconds`
+          : `${url} could not be reached (${read.error})`;
+      return [{
+        state: "fail",
+        detail: `${seen}. Runs report their results there, so a finished run would report nowhere.`,
+        fix: "Check RUNNER_CALLBACK_BASE_URL for a typo, then that its DNS name, and any proxy or tunnel in front of it, lead to this orchestrator.",
+      }];
     },
   },
   {

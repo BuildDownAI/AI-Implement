@@ -325,6 +325,84 @@ describe("callback.config", () => {
   });
 });
 
+describe("callback.reachable", () => {
+  const PUBLIC = { RUNNER_CALLBACK_BASE_URL: "https://o.example.com" };
+  const answering = (read: Awaited<ReturnType<SetupCheckContext["orchestratorHealthAt"]>>) => vi.fn(async () => read);
+
+  // The fixture's own instance identifier is "this-orchestrator".
+  const ITSELF = { outcome: "health-body", status: 200, restate: {}, instanceId: "this-orchestrator" } as const;
+
+  it("asks the orchestrator's health endpoint at the callback address, and passes when it answers as itself", async () => {
+    const orchestratorHealthAt = answering(ITSELF);
+
+    expect(await run("callback.reachable", { env: PUBLIC, orchestratorHealthAt })).toEqual([
+      { state: "pass", detail: "https://o.example.com answered as this orchestrator, so runs can report their results there" },
+    ]);
+    expect(orchestratorHealthAt).toHaveBeenCalledExactlyOnceWith("https://o.example.com");
+  });
+
+  it("passes on its own health body answering 503 while Restate cannot serve, which the restate check reports", async () => {
+    const orchestratorHealthAt = answering({ ...ITSELF, status: 503 });
+
+    expect(await run("callback.reachable", { env: PUBLIC, orchestratorHealthAt })).toMatchObject([{ state: "pass" }]);
+  });
+
+  it("fails when the address answers as a different orchestrator, which refuses this one's runs", async () => {
+    const orchestratorHealthAt = answering({ ...ITSELF, instanceId: "another-orchestrator" });
+
+    expect(await run("callback.reachable", { env: PUBLIC, orchestratorHealthAt })).toEqual([{
+      state: "fail",
+      detail: "https://o.example.com answered as a different orchestrator, which refuses this one's runs, so a finished run's results would be lost",
+      fix: "Set RUNNER_CALLBACK_BASE_URL to this orchestrator's own public address.",
+    }]);
+  });
+
+  it("cannot verify with no callback address, and points at callback.config", async () => {
+    const orchestratorHealthAt = answering(ITSELF);
+
+    expect(await run("callback.reachable", { env: {}, orchestratorHealthAt })).toEqual([
+      { state: "cannot-verify", detail: "No callback address is set, so there is none to reach", fix: "Clear callback.config first." },
+    ]);
+    expect(orchestratorHealthAt).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the runner mode is local", { env: PUBLIC, runnerMode: () => ({ mode: "local" as const, source: "db" as const }) }, "The runner mode is local, so runs reach the orchestrator from containers on this host"],
+    ["the address is host.docker.internal", { env: { RUNNER_CALLBACK_BASE_URL: "http://host.docker.internal:8080" } }, "http://host.docker.internal:8080 resolves only inside a local runner's container"],
+    [
+      "the address is the one derived for RUNNER_MODE=local",
+      // getRunnerMode reads RUNNER_MODE too, so production meets the runner-mode skip first.
+      { env: { RUNNER_MODE: "local", PORT: "9090" }, runnerMode: () => ({ mode: "local" as const, source: "env" as const }) },
+      "The runner mode is local, so runs reach the orchestrator from containers on this host",
+    ],
+  ])("is not applicable, asking nothing, when %s", async (_case, overrides, detail) => {
+    const orchestratorHealthAt = answering(ITSELF);
+
+    expect(await run("callback.reachable", { ...overrides, orchestratorHealthAt })).toEqual([{ state: "not-applicable", detail }]);
+    expect(orchestratorHealthAt).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "another response",
+      { outcome: "other-response", status: 502 },
+      "https://o.example.com answered HTTP 502 without the orchestrator's health response, so it reaches a proxy, a tunnel, another site, or a path the orchestrator does not serve",
+    ],
+    ["a timeout", { outcome: "no-response", timedOut: true, error: "The operation was aborted due to timeout" }, "Nothing answered at https://o.example.com within 5 seconds"],
+    [
+      "a failed request",
+      { outcome: "no-response", timedOut: false, error: "fetch failed: getaddrinfo ENOTFOUND o.example.com" },
+      "https://o.example.com could not be reached (fetch failed: getaddrinfo ENOTFOUND o.example.com)",
+    ],
+  ] as const)("fails on %s, naming what was seen and its fix", async (_case, read, seen) => {
+    expect(await run("callback.reachable", { env: PUBLIC, orchestratorHealthAt: answering(read) })).toEqual([{
+      state: "fail",
+      detail: `${seen}. Runs report their results there, so a finished run would report nowhere.`,
+      fix: "Check RUNNER_CALLBACK_BASE_URL for a typo, then that its DNS name, and any proxy or tunnel in front of it, lead to this orchestrator.",
+    }]);
+  });
+});
+
 describe("runner.fly-sessions", () => {
   const configured = () => ({ token: "fly-token", app: "ai-sessions", region: null, source: { app: "restate" as const, region: null } });
   const unconfigured = () => ({ token: null, app: null, region: null, source: { app: null, region: null } });

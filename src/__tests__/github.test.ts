@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob } from "../github.js";
+import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob, readPublicRepository, readRepositoryFacts } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -1292,5 +1292,109 @@ describe("classifyPullReadiness", () => {
   it("clean requires mergeable === true", () => {
     expect(classifyPullReadiness({ ...base, mergeable: false }).ready).toBe(false);
     expect(classifyPullReadiness({ ...base, mergeable: null }).reason).toBe("unknown");
+  });
+});
+
+describe("readPublicRepository", () => {
+  it("reads a public repository and its ref without a token", async () => {
+    const fake = fakeFetch({ "GET /repos/o/r": { json: { default_branch: "main" } }, "GET /repos/o/r/commits": { json: [{ sha: "abc" }] } }).install();
+
+    expect(await readPublicRepository("o", "r", "v1")).toEqual({ status: 200, refExists: true });
+    expect(fake.calls.every((c) => !c.headers.has("authorization"))).toBe(true);
+    expect(fake.calls[1].url.searchParams.get("sha")).toBe("v1");
+  });
+
+  it("asks nothing about a ref when none is given, or when the repository is not public", async () => {
+    const fake = fakeFetch({ "GET /repos/o/r": { json: {} }, "GET /repos/o/private": githubError(404, "Not Found") }).install();
+
+    expect(await readPublicRepository("o", "r")).toEqual({ status: 200, refExists: null });
+    expect(await readPublicRepository("o", "private", "main")).toEqual({ status: 404, refExists: null });
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("reads 404 and 422 for the ref as a missing ref, and throws any other refusal", async () => {
+    fakeFetch({ "GET /repos/o/r": { json: {} }, "GET /repos/o/r/commits": [githubError(422, "No commit found"), githubError(404, "Not Found"), githubError(403, "API rate limit exceeded")] }).install();
+
+    expect(await readPublicRepository("o", "r", "nope")).toEqual({ status: 200, refExists: false });
+    expect(await readPublicRepository("o", "r", "nope")).toEqual({ status: 200, refExists: false });
+    await expect(readPublicRepository("o", "r", "nope")).rejects.toMatchObject({ name: "GitHubApiError", status: 403 });
+  });
+});
+
+describe("readRepositoryFacts", () => {
+  const GRAPHQL = "POST /graphql";
+  const request = {
+    repo: "app",
+    expressions: ["HEAD:.github/workflows/claude-implement.yml", "main:.github/workflows/claude-plan.yml"],
+    openPullRequestHeads: ["sync/ai-implement"],
+  };
+  // The shape GitHub answered for a repository the token sees (read against the live API at AII-1536).
+  const seen = { isPrivate: true, defaultBranchRef: { name: "main" }, e0: { __typename: "Blob" }, e1: null, p0: { nodes: [{ number: 12, url: "https://github.com/o/app/pull/12" }] } };
+
+  it("asks for every repository, expression and head in one query, each value a variable", async () => {
+    const fake = fakeFetch({ [GRAPHQL]: { json: { data: { r0: seen, r1: { defaultBranchRef: { name: "trunk" } } } } } }).install();
+
+    await readRepositoryFacts("ghs_t", "o", [request, { repo: "lib", expressions: [], openPullRequestHeads: [] }]);
+
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].headers.get("authorization")).toBe("Bearer ghs_t");
+    const { query, variables } = JSON.parse(fake.calls[0].body) as { query: string; variables: Record<string, string> };
+    expect(variables).toEqual({
+      owner: "o",
+      r0: "app",
+      r0e0: "HEAD:.github/workflows/claude-implement.yml",
+      r0e1: "main:.github/workflows/claude-plan.yml",
+      r0p0: "sync/ai-implement",
+      r1: "lib",
+    });
+    for (const value of Object.values(variables)) expect(query).not.toContain(`"${value}"`);
+    expect(query).toContain("orderBy: { field: CREATED_AT, direction: DESC }");
+    // Only an open sync pull request is one an operator can merge.
+    expect(query).toContain("pullRequests(states: OPEN,");
+  });
+
+  it("reads the default branch, each expression's existence and each head's open pull request", async () => {
+    fakeFetch({ [GRAPHQL]: { json: { data: { r0: { ...seen, p0: { nodes: [] } } } } } }).install();
+    const withoutPull = await readRepositoryFacts("t", "o", [request]);
+    expect(withoutPull.get("app")?.openPullRequests).toEqual({ "sync/ai-implement": null });
+
+    fakeFetch({ [GRAPHQL]: { json: { data: { r0: seen } } } }).install();
+    expect((await readRepositoryFacts("t", "o", [request])).get("app")).toEqual({
+      visible: true,
+      private: true,
+      defaultBranch: "main",
+      exists: { "HEAD:.github/workflows/claude-implement.yml": true, "main:.github/workflows/claude-plan.yml": false },
+      openPullRequests: { "sync/ai-implement": { number: 12, url: "https://github.com/o/app/pull/12" } },
+    });
+  });
+
+  it("reports a repository GitHub cannot resolve as not visible", async () => {
+    fakeFetch({
+      [GRAPHQL]: {
+        json: {
+          data: { r0: seen, r1: null },
+          errors: [{ type: "NOT_FOUND", path: ["r1"], message: "Could not resolve to a Repository with the name 'o/hidden'." }],
+        },
+      },
+    }).install();
+
+    const facts = await readRepositoryFacts("t", "o", [request, { repo: "hidden", expressions: ["HEAD:x"], openPullRequestHeads: [] }]);
+    expect(facts.get("app")?.visible).toBe(true);
+    expect(facts.get("hidden")).toEqual({ visible: false, private: false, defaultBranch: null, exists: {}, openPullRequests: {} });
+  });
+
+  it("throws on any other error, including a NOT_FOUND below a repository", async () => {
+    fakeFetch({ [GRAPHQL]: { json: { data: { r0: seen }, errors: [{ type: "NOT_FOUND", path: ["r0", "e0"], message: "nested" }] } } }).install();
+    await expect(readRepositoryFacts("t", "o", [request])).rejects.toThrow("readRepositoryFacts o failed: nested");
+
+    fakeFetch({ [GRAPHQL]: { json: { errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] } } }).install();
+    await expect(readRepositoryFacts("t", "o", [request])).rejects.toThrow("API rate limit exceeded");
+  });
+
+  it("throws a GitHubApiError when the request is refused", async () => {
+    fakeFetch({ [GRAPHQL]: githubError(401, "Bad credentials") }).install();
+
+    const error = await readRepositoryFacts("t", "o", [request]).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "GitHubApiError", status: 401, path: "/graphql" });
   });
 });

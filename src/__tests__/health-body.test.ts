@@ -1,14 +1,12 @@
 import type http from "node:http";
-import { withRequestErrorBoundary } from "../http-server.js";
-import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
+import { withRequestErrorBoundary } from "../http-server.js";
 import type { RestateStatus } from "../restate/status.js";
-import { buildHealthBody, type HealthBodyReaders } from "../health-body.js";
-import { getLastSetupCheckRun, recordSetupCheckRun, runSetupChecks, type SetupCheckRun } from "../setup-checks/index.js";
-import { ORCHESTRATOR_CONFIG_CHECKS } from "../setup-checks/orchestrator-config.js";
-import { makeSetupCheckContext } from "./helpers/fixtures/setup-checks.js";
-import { testDb } from "./helpers/test-db.js";
-import { fakeFetch } from "./helpers/fake-fetch.js";
+import { buildHealthBody, ORCHESTRATOR_INSTANCE_ID, readOrchestratorHealth, type HealthBodyReaders } from "../health-body.js";
+import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
+
+const SETUP_CHECKS = { checkedAt: 321, failingCore: 2, failingOnAdminPath: ["admin.path"] };
+const RESTATE = { sidecar: { state: "ready" }, registration: { state: "registered" } };
 
 function readers(): HealthBodyReaders {
   return {
@@ -18,8 +16,7 @@ function readers(): HealthBodyReaders {
     sidecarHealthFields: () => ({ kgUnavailable: true, sidecar: { reachable: false, toolsListed: false, lastError: "probe failed", checkedAt: 123 } }),
     restateStatus: () => ({ sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } }),
     deployHealth: () => ({ held: true, startedAt: 456 }),
-    lastSetupCheckRun: () => null,
-    setupCheckContext: () => makeSetupCheckContext(),
+    setupChecks: async () => SETUP_CHECKS,
   };
 }
 
@@ -50,7 +47,7 @@ describe("public health body", () => {
 
   it("lets the request boundary finish a failed health build without sending 200", async () => {
     const read = readers();
-    read.setupCheckContext = () => { throw new Error("context unavailable"); };
+    read.setupChecks = () => { throw new Error("setup checks unavailable"); };
     const res = {
       headersSent: false, writeHead: vi.fn(), end: vi.fn(), destroy: vi.fn(),
     } as unknown as http.ServerResponse;
@@ -72,13 +69,13 @@ describe("public health body", () => {
     expect(log).toHaveBeenCalledOnce();
   });
 
-  it("preserves every legacy field and adds the unknown-run summary", async () => {
+  it("preserves every legacy field and adds the setup checks' field and this process's identifier", async () => {
     expect(await buildHealthBody(readers())).toEqual({
-      status: "unavailable", sourceCommit: "abc123", polls: 42, kgDegraded: true,
+      status: "unavailable", sourceCommit: "abc123", instanceId: ORCHESTRATOR_INSTANCE_ID, polls: 42, kgDegraded: true,
       kgUnavailable: true, sidecar: { reachable: false, toolsListed: false, lastError: "probe failed", checkedAt: 123 },
       restate: { sidecar: { state: "exited", code: 1, signal: null }, registration: { state: "unreachable" } },
       deploy: { held: true, startedAt: 456 }, lastPollStartedAt: new Date(1000).toISOString(), lastPollFinishedAt: new Date(2000).toISOString(),
-      setupChecks: { checkedAt: null, failingCore: null, failingOnAdminPath: ["env.github-app", "admin.path"] },
+      setupChecks: SETUP_CHECKS,
     });
     const read = readers();
     read.sourceCommit = () => null;
@@ -87,156 +84,77 @@ describe("public health body", () => {
     expect(await buildHealthBody(read)).toMatchObject({ sourceCommit: null, polls: 0, lastPollStartedAt: null, lastPollFinishedAt: null });
     expect(await buildHealthBody(read)).not.toHaveProperty("sidecar");
   });
+});
 
-  it("uses only local checks with Restate down, refreshing ids but keeping the cached count", async () => {
-    const fake = fakeFetch({}).install();
-    const read = readers();
-    const ctx = makeSetupCheckContext({
-      env: { ADMIN_ACCESS_CODE: "your-secret-access-code", GOOGLE_OAUTH_CLIENT_ID: "partial", POLL_INTERVAL_MS: "bad" },
-      restateStatus: () => ({ sidecar: { state: "exited" }, registration: { state: "unreachable" } }),
-      databasePath: () => ({ path: "/tmp/db", configured: "/data/db", fellBack: true }),
-    });
-    const run = await runSetupChecks(ctx, ORCHESTRATOR_CONFIG_CHECKS, () => 123);
-    recordSetupCheckRun(run);
-    read.lastSetupCheckRun = getLastSetupCheckRun;
-    read.setupCheckContext = () => ctx;
-    expect((await buildHealthBody(read)).setupChecks).toEqual({
-      checkedAt: 123, failingCore: 7,
-      failingOnAdminPath: ["env.github-app", "env.admin-access-code", "volume.database", "restate", "admin.path"],
-    });
-    ctx.env = { GOOGLE_OAUTH_CLIENT_ID: "id", GOOGLE_OAUTH_CLIENT_SECRET: "secret" };
-    expect((await buildHealthBody(read)).setupChecks).toEqual({
-      checkedAt: 123, failingCore: 7,
-      failingOnAdminPath: ["env.github-app", "volume.database", "restate", "admin.redirect-url", "admin.allowlist"],
-    });
-    expect(fake.calls).toEqual([]);
+describe("ORCHESTRATOR_INSTANCE_ID", () => {
+  it("is a new random identifier each time the module loads, as in each orchestrator process", async () => {
+    const first = (await import("../health-body.js")).ORCHESTRATOR_INSTANCE_ID;
+    vi.resetModules();
+    const second = (await import("../health-body.js")).ORCHESTRATOR_INSTANCE_ID;
+
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).toMatch(/^[0-9a-f]{8}-/);
+    expect(second).not.toBe(first);
+  });
+});
+
+describe("readOrchestratorHealth", () => {
+  it.each([
+    ["https://o.example.com", "https://o.example.com/"],
+    ["https://o.example.com/", "https://o.example.com/"],
+    ["https://o.example.com/orchestrator", "https://o.example.com/orchestrator/"],
+  ])("asks GET / under the base URL %s, as a run joins its callback paths", async (baseUrl, asked) => {
+    const fake = fakeFetch({ "GET /": { json: { restate: RESTATE } }, "GET /orchestrator/": { json: { restate: RESTATE } } });
+
+    await readOrchestratorHealth(baseUrl, fake.fetch);
+
+    expect(fake.calls.map((c) => `${c.method} ${c.url.href}`)).toEqual([`GET ${asked}`]);
   });
 
-  it("counts only failing core rows in the recorded run", async () => {
-    const read = readers();
-    const results: SetupCheckRun["results"] = [
-      ["core", "fail"], ["core", "fail"], ["core", "pass"], ["core", "warn"],
-      ["core", "cannot-verify"], ["core", "not-applicable"], ["mode", "fail"], ["feature", "fail"],
-    ].map(([tier, state]) => ({
-      id: "restate", title: "Stored diagnostic", group: "orchestrator", onAdminPath: true,
-      tier: tier as SetupCheckRun["results"][number]["tier"],
-      state: state as SetupCheckRun["results"][number]["state"],
-    }));
-    recordSetupCheckRun({ checkedAt: 321, results });
-    read.lastSetupCheckRun = getLastSetupCheckRun;
-    expect((await buildHealthBody(read)).setupChecks).toEqual({
-      checkedAt: 321, failingCore: 2, failingOnAdminPath: ["env.github-app", "admin.path"],
-    });
+  it.each([200, 503])("reads a body carrying restate as the health body with its instance identifier, whatever its status (%i)", async (status) => {
+    const fake = fakeFetch({ "GET /": { status, json: { status: status === 200 ? "ok" : "unavailable", instanceId: "an-instance", restate: RESTATE } } });
+
+    expect(await readOrchestratorHealth("https://o.example.com", fake.fetch)).toEqual({ outcome: "health-body", status, restate: RESTATE, instanceId: "an-instance" });
   });
 
-  it("excludes cannot-verify local checks from bootstrap failures", async () => {
-    const read = readers();
-    read.setupCheckContext = () => makeSetupCheckContext({
-      databasePath: () => { throw new Error("sentinel-unreadable-database"); },
-    });
-    expect((await buildHealthBody(read)).setupChecks).toEqual({
-      checkedAt: null, failingCore: null, failingOnAdminPath: ["env.github-app", "admin.path"],
-    });
+  it.each([
+    ["the orchestrator's answer to a path it does not serve", { status: 404, json: { error: "Not found" } }, 404],
+    ["a proxy's error page", { status: 502, text: "<html>Bad Gateway</html>" }, 502],
+    ["a body whose restate is null", { json: { restate: null } }, 200],
+  ])("reads %s as another response", async (_case, reply, status) => {
+    const fake = fakeFetch({ "GET /": reply });
+
+    expect(await readOrchestratorHealth("https://o.example.com", fake.fetch)).toEqual({ outcome: "other-response", status });
   });
 
-  it("keeps an empty bootstrap list when no local check reports fail", async () => {
-    const read = readers();
-    const { privateKey } = generateKeyPairSync("ed25519");
-    let allowlistReads = 0;
-    read.setupCheckContext = () => makeSetupCheckContext({
-      env: {
-        GITHUB_APP_ID: "123",
-        GITHUB_APP_PRIVATE_KEY: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-        GOOGLE_OAUTH_CLIENT_ID: "client", GOOGLE_OAUTH_CLIENT_SECRET: "secret",
-        OAUTH_REDIRECT_BASE_URL: "https://example.com",
-      },
-      // The configuration read sees no admin. A subsequent local read fails rather than
-      // reporting a failing allowlist, so there are no failing ids to disclose.
-      effectiveAllowlist: () => {
-        if (++allowlistReads > 1) throw new Error("sentinel-allowlist-outage");
-        return { entries: [], source: "env" };
+  it("names a failed request's cause, which fetch keeps behind its bare message", async () => {
+    const fake = fakeFetch({
+      "GET /": () => {
+        throw new TypeError("fetch failed", { cause: new Error("getaddrinfo ENOTFOUND typo.example.invalid") });
       },
     });
-    expect((await buildHealthBody(read)).setupChecks).toEqual({
-      checkedAt: null, failingCore: null, failingOnAdminPath: [],
+
+    expect(await readOrchestratorHealth("https://o.example.com", fake.fetch)).toEqual({
+      outcome: "no-response",
+      timedOut: false,
+      error: "fetch failed: getaddrinfo ENOTFOUND typo.example.invalid",
     });
-    expect(allowlistReads).toBe(2);
   });
 
-  it("serializes only allowed keys with diagnostic sentinels in live bootstrap results", async () => {
-    const fake = fakeFetch({}).install();
-    const read = readers();
-    const ctx = makeSetupCheckContext({
-      env: { GITHUB_APP_ID: "sentinel-app-id", GITHUB_APP_PRIVATE_KEY: "sentinel-private-key",
-        GOOGLE_OAUTH_CLIENT_ID: "sentinel-client-id", GOOGLE_OAUTH_CLIENT_SECRET: "sentinel-client-secret" },
-      databasePath: () => ({ path: "sentinel-db-path", configured: "sentinel-db-configured", fellBack: true }),
-      restateStatus: () => { throw new Error("sentinel-restate-error"); },
+  it("names a failure with no cause by its own message", async () => {
+    const fake = fakeFetch({
+      "GET /": () => {
+        throw new TypeError("Failed to parse URL from not a url");
+      },
     });
-    const live = await runSetupChecks(ctx, ORCHESTRATOR_CONFIG_CHECKS.filter((check) => check.onAdminPath), () => 777);
-    expect(JSON.stringify(live)).toContain("sentinel-db-configured");
-    expect(JSON.stringify(live)).toContain("sentinel-restate-error");
-    const run: SetupCheckRun = { checkedAt: 777, results: live.results.map((row) => ({
-      ...row, title: "sentinel-title", detail: "sentinel-detail", fix: "sentinel-fix",
-      fixUrl: "sentinel-fix-url", project: "sentinel-project",
-    })) };
-    read.lastSetupCheckRun = () => run;
-    read.setupCheckContext = () => ctx;
-    const summary = (await buildHealthBody(read)).setupChecks;
-    expect(Object.keys(summary).sort()).toEqual(["checkedAt", "failingCore", "failingOnAdminPath"]);
-    expect(JSON.parse(JSON.stringify(summary))).toEqual({
-      checkedAt: 777, failingCore: 4,
-      failingOnAdminPath: ["env.github-app", "volume.database", "admin.redirect-url", "admin.allowlist"],
-    });
-    expect(JSON.stringify(summary)).not.toContain("sentinel-");
-    expect(fake.calls).toEqual([]);
+
+    expect(await readOrchestratorHealth("https://o.example.com", fake.fetch)).toMatchObject({ outcome: "no-response", timedOut: false, error: "Failed to parse URL from not a url" });
   });
 
-  it("exposes only counts and ids, and omits ids once configured or the allowlist is unreadable", async () => {
-    const read = readers();
-    const run: SetupCheckRun = { checkedAt: 999, results: [{ id: "admin.path", title: "PRIVATE TITLE", group: "orchestrator", tier: "core", state: "fail", onAdminPath: true, project: "PRIVATE PROJECT", detail: "PRIVATE DETAIL", fix: "PRIVATE FIX" }] };
-    read.lastSetupCheckRun = () => run;
-    for (const ctx of [makeSetupCheckContext({ env: { ADMIN_ACCESS_CODE: "PRIVATE CODE" } }), makeSetupCheckContext({ effectiveAllowlist: () => null })]) {
-      read.setupCheckContext = () => ctx;
-      expect((await buildHealthBody(read)).setupChecks).toEqual({ checkedAt: 999, failingCore: 1 });
-    }
-  });
+  it("gives up after five seconds when nothing answers, and says it timed out", async () => {
+    stubAbortTimeout(5_000);
+    const fake = fakeFetch({ "GET /": hangUntilAborted });
 
-  it.each(["", "example.com"])("suppresses bootstrap ids after a cached allowlist refresh fails (domain %s)", async (domain) => {
-    const { modules: { access, dedup, setup, health } } = await testDb({ modules: {
-      access: () => import("../access-entries.js"),
-      dedup: () => import("../dedup.js"),
-      setup: () => import("../setup-checks/index.js"),
-      health: () => import("../health-body.js"),
-    } });
-    vi.stubEnv("OAUTH_ALLOWED_EMAILS", "");
-    vi.stubEnv("OAUTH_ALLOWED_DOMAINS", domain);
-    const fake = fakeFetch({}).install();
-    const read = readers();
-    // Keep the real production allowlist readers, including their cache and availability state.
-    read.setupCheckContext = () => setup.createSetupCheckContext({
-      env: {}, restateStatus: () => ({ sidecar: { state: "exited" }, registration: { state: "unreachable" } }),
-    });
-    expect((await health.buildHealthBody(read)).setupChecks).toHaveProperty("failingOnAdminPath");
-    const cached = access.getEffectiveAllowlist();
-    expect(access.isAllowlistReadAvailable()).toBe(true);
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    dedup.getDb().exec("DROP TABLE access_entries");
-    access.refreshEffectiveAllowlist();
-    expect(access.getEffectiveAllowlist()).toBe(cached);
-    expect(access.isAllowlistReadAvailable()).toBe(false);
-    expect((await health.buildHealthBody(read)).setupChecks).toEqual({ checkedAt: null, failingCore: null });
-    // A successful read restores bootstrap behavior without a process restart.
-    access.initAccessEntriesTable();
-    access.refreshEffectiveAllowlist();
-    expect(access.isAllowlistReadAvailable()).toBe(true);
-    expect((await health.buildHealthBody(read)).setupChecks).toHaveProperty("failingOnAdminPath");
-    expect(fake.calls).toEqual([]);
-    warn.mockRestore();
-  });
-
-  it("keeps the eight admin-path ids explicit", () => {
-    expect(ORCHESTRATOR_CONFIG_CHECKS.filter((check) => check.onAdminPath).map((check) => check.id)).toEqual([
-      "env.github-app", "env.admin-access-code", "volume.database", "restate", "admin.path", "admin.providers", "admin.redirect-url", "admin.allowlist",
-    ]);
+    expect(await readOrchestratorHealth("https://o.example.com", fake.fetch)).toMatchObject({ outcome: "no-response", timedOut: true });
   });
 });

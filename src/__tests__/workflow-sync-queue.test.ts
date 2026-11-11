@@ -143,6 +143,39 @@ describe("workflow sync queue — lifecycle & dedup", () => {
   });
 });
 
+describe("a project's sync, as the setup checks read it", () => {
+  const setRow = (teamKey: string, status: string, updatedAt: number) =>
+    dedup.getDb().prepare("UPDATE workflow_sync_queue SET status = ?, updated_at = ? WHERE team_key = ?").run(status, updatedAt, teamKey);
+
+  it("reads a project's row by its key, or null when it was never queued", () => {
+    expect(queue.getWorkflowSyncByTeam("ENG")).toBeNull();
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    expect(queue.getWorkflowSyncByTeam("ENG")).toMatchObject({ id, teamKey: "ENG", status: "pending" });
+  });
+
+  it("is in progress while queued, or running inside the stale window, and not once stale or finished", () => {
+    const now = 1_000_000_000;
+    const at = (updatedAt: number, status: "pending" | "running" | "completed" | "failed") => queue.isWorkflowSyncInProgress({ status, updatedAt }, now);
+
+    expect(at(0, "pending")).toBe(true);
+    expect(at(now - queue.STALE_RUNNING_MS + 1, "running")).toBe(true);
+    expect(at(now - queue.STALE_RUNNING_MS, "running")).toBe(false);
+    expect(at(now, "completed")).toBe(false);
+    expect(at(now, "failed")).toBe(false);
+  });
+
+  it("agrees with enqueue's own rule for a live run", () => {
+    queue.enqueueWorkflowSync("ENG");
+    setRow("ENG", "running", Date.now() - queue.STALE_RUNNING_MS - 1);
+    expect(queue.isWorkflowSyncInProgress(queue.getWorkflowSyncByTeam("ENG")!)).toBe(false);
+    expect(queue.enqueueWorkflowSync("ENG").deduped).toBe(false);
+
+    setRow("ENG", "running", Date.now());
+    expect(queue.isWorkflowSyncInProgress(queue.getWorkflowSyncByTeam("ENG")!)).toBe(true);
+    expect(queue.enqueueWorkflowSync("ENG").deduped).toBe(true);
+  });
+});
+
 describe("runWorkflowSync executor", () => {
   it("marks the job completed with the sync result on success", async () => {
     seedMapping("ENG");

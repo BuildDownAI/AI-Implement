@@ -121,6 +121,20 @@ export function normalizeGitHubRepo(raw: string, field: string): string {
   return v;
 }
 
+/** The owner and name a stored repository URL points at, or null when it is not a `github.com/<owner>/<name>` URL. */
+export function githubRepoParts(url: string): { owner: string; repo: string } | null {
+  let path: string[];
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== "github.com") return null;
+    path = parsed.pathname.split("/").filter(Boolean);
+  } catch {
+    return null;
+  }
+  if (path.length < 2) return null;
+  return { owner: path[0], repo: path[1].replace(/\.git$/, "") };
+}
+
 /** Checks the normalized form as well as the raw one: a path can look contained and normalize outward. */
 function normalizePath(raw: string): string {
   const v = raw.trim();

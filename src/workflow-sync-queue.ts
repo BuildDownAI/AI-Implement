@@ -34,17 +34,27 @@ interface WorkflowSyncRow {
 // the poll-loop safety net assumes the orchestrator crashed mid-sync and re-runs it. 
 export const STALE_RUNNING_MS = 5 * 60 * 1000;
 
+/** A `running` row updated inside the stale window is a live run; an older one is a crashed run the safety net re-runs. */
+function isLiveRunning(status: WorkflowSyncStatus, updatedAt: number, now: number): boolean {
+  return status === "running" && now - updatedAt < STALE_RUNNING_MS;
+}
+
+/** True while a sync will still act on its own: queued, or running and not stale. */
+export function isWorkflowSyncInProgress(job: Pick<WorkflowSyncJob, "status" | "updatedAt">, now = Date.now()): boolean {
+  return job.status === "pending" || isLiveRunning(job.status, job.updatedAt, now);
+}
+
 // At most one in-flight sync per team.
 export function enqueueWorkflowSync(teamKey: string): { id: number; deduped: boolean } {
   const db = getDb();
   const now = Date.now();
-  
+
   const existing = db
   .prepare("SELECT id, status, updated_at FROM workflow_sync_queue WHERE team_key = ?")
   .get(teamKey) as { id: number; status: WorkflowSyncStatus; updated_at: number } | undefined;
-  
+
   // If a `running` row is fresh, reuse it (don't reset it to pending — that would let the safety net double-fire).
-  if (existing && existing.status === "running" && now - existing.updated_at < STALE_RUNNING_MS) {
+  if (existing && isLiveRunning(existing.status, existing.updated_at, now)) {
     return { id: existing.id, deduped: true };
   }
   
@@ -65,6 +75,12 @@ export function enqueueWorkflowSync(teamKey: string): { id: number; deduped: boo
 
 export function getWorkflowSyncById(id: number): WorkflowSyncJob | null {
   const row = getDb().prepare("SELECT * FROM workflow_sync_queue WHERE id = ?").get(id) as WorkflowSyncRow | undefined;
+  return row ? mapRow(row) : null;
+}
+
+/** A project's sync row, or null when none was ever queued. */
+export function getWorkflowSyncByTeam(teamKey: string): WorkflowSyncJob | null {
+  const row = getDb().prepare("SELECT * FROM workflow_sync_queue WHERE team_key = ?").get(teamKey) as WorkflowSyncRow | undefined;
   return row ? mapRow(row) : null;
 }
 
@@ -115,7 +131,7 @@ export async function runWorkflowSync(jobId: number, creds: WorkflowSyncCreds): 
   if (!job) return; // row vanished — nothing to run
   // A fresh `running` row means a live runner already owns this job. Bail rather than double-fire the sync.
   if (job.status === "running") {
-    if (Date.now() - job.updatedAt < STALE_RUNNING_MS) return;
+    if (isLiveRunning(job.status, job.updatedAt, Date.now())) return;
     // A stale `running` row is a crashed run, reclaim it before the hold check.
     updateWorkflowSyncStatus(jobId, "pending");
   }

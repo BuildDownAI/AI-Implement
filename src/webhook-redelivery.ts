@@ -1,4 +1,5 @@
 import { createAppJwt, githubAppHeaders } from "./github-app-auth.js";
+import { GitHubApiError } from "./github-errors.js";
 import { defaultFetchSignal } from "./github.js";
 
 /**
@@ -33,12 +34,23 @@ export interface RedeliveryResult {
   skipped: number;
 }
 
-interface Delivery {
+/** One App webhook delivery as GitHub lists it, narrowed to the fields the orchestrator reads. */
+export interface AppDelivery {
   id: number;
   guid: string;
   delivered_at: string;
+  /** "OK" when the orchestrator accepted it, otherwise GitHub's description of the failure. */
   status: string;
+  /** The HTTP status the orchestrator answered with. */
+  status_code: number;
   event: string;
+}
+
+export interface RecentAppDeliveries {
+  /** The newest attempt per delivery GUID inside the window. */
+  deliveries: AppDelivery[];
+  /** The HTTP status of a later page that ended the listing early, or null when it read to the window's end. */
+  endedEarlyWith: number | null;
 }
 
 function nextCursor(link: string | null): string | null {
@@ -57,6 +69,40 @@ function nextCursor(link: string | null): string | null {
 }
 
 /**
+ * The App's webhook deliveries from the last window, newest attempt per GUID. Reads only.
+ * Throws a GitHubApiError when GitHub refuses the first page. A later refused page ends the list there, reported in `endedEarlyWith`.
+ */
+export async function listRecentAppDeliveries(deps: RedeliveryDeps): Promise<RecentAppDeliveries> {
+  const doFetch = deps.fetchImpl ?? fetch;
+  const now = deps.now ?? Date.now;
+  const cutoff = now() - (deps.windowMs ?? DEFAULT_WINDOW_MS);
+  const jwt = createAppJwt(deps.appId, deps.privateKey.replace(/\\n/g, "\n"));
+  const newest = new Map<string, AppDelivery>();
+  let cursor: string | null = null;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const path = `/app/hook/deliveries?per_page=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+    const res = await doFetch(`${API}${path}`, { headers: githubAppHeaders(jwt), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      if (page === 0) throw new GitHubApiError({ status: res.status, path: "/app/hook/deliveries", bodyText: await res.text() });
+      return { deliveries: [...newest.values()], endedEarlyWith: res.status };
+    }
+    const items = (await res.json()) as AppDelivery[];
+    let reachedWindow = false;
+    for (const d of items) {
+      if (Date.parse(d.delivered_at) < cutoff) {
+        reachedWindow = true;
+        continue;
+      }
+      const prev = newest.get(d.guid);
+      if (!prev || Date.parse(d.delivered_at) > Date.parse(prev.delivered_at)) newest.set(d.guid, d);
+    }
+    cursor = nextCursor(res.headers.get("link"));
+    if (reachedWindow || !cursor || items.length === 0) break;
+  }
+  return { deliveries: [...newest.values()], endedEarlyWith: null };
+}
+
+/**
  * Asks GitHub to redeliver the App's failed deliveries of the four review-related events from the
  * last window. GitHub never retries on its own. The KG PR-check route and the review handlers on a
  * Restate-lifecycle project refuse a delivery with 503 while Restate is unavailable (see the module comment above). A redelivery keeps the delivery GUID, so Restate's
@@ -64,39 +110,21 @@ function nextCursor(link: string | null): string | null {
  */
 export async function redeliverFailedAppDeliveries(deps: RedeliveryDeps): Promise<RedeliveryResult> {
   const doFetch = deps.fetchImpl ?? fetch;
-  const now = deps.now ?? Date.now;
-  const cutoff = now() - (deps.windowMs ?? DEFAULT_WINDOW_MS);
-  const privateKey = deps.privateKey.replace(/\\n/g, "\n");
-  const newest = new Map<string, Delivery>();
+  let listed: RecentAppDeliveries;
+  try {
+    listed = await listRecentAppDeliveries(deps);
+  } catch (err) {
+    if (err instanceof GitHubApiError) console.warn(`[webhook-redelivery] list failed (${err.status})`);
+    else console.warn(`[webhook-redelivery] sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    return { scanned: 0, redelivered: 0, skipped: 0 };
+  }
+  if (listed.endedEarlyWith !== null) console.warn(`[webhook-redelivery] list failed (${listed.endedEarlyWith})`);
 
   try {
-    const jwt = createAppJwt(deps.appId, privateKey);
-    let cursor: string | null = null;
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const path = `/app/hook/deliveries?per_page=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
-      const res = await doFetch(`${API}${path}`, { headers: githubAppHeaders(jwt), signal: defaultFetchSignal() });
-      if (!res.ok) {
-        console.warn(`[webhook-redelivery] list failed (${res.status})`);
-        if (page === 0) return { scanned: 0, redelivered: 0, skipped: 0 };
-        break;
-      }
-      const items = (await res.json()) as Delivery[];
-      let reachedWindow = false;
-      for (const d of items) {
-        if (Date.parse(d.delivered_at) < cutoff) {
-          reachedWindow = true;
-          continue;
-        }
-        const prev = newest.get(d.guid);
-        if (!prev || Date.parse(d.delivered_at) > Date.parse(prev.delivered_at)) newest.set(d.guid, d);
-      }
-      cursor = nextCursor(res.headers.get("link"));
-      if (reachedWindow || !cursor || items.length === 0) break;
-    }
-
+    const jwt = createAppJwt(deps.appId, deps.privateKey.replace(/\\n/g, "\n"));
     let redelivered = 0;
     let skipped = 0;
-    for (const d of newest.values()) {
+    for (const d of listed.deliveries) {
       if (d.status === "OK") continue;
       if (!REDELIVERED_EVENTS.has(d.event)) {
         skipped++;
@@ -119,10 +147,10 @@ export async function redeliverFailedAppDeliveries(deps: RedeliveryDeps): Promis
         skipped++;
       }
     }
-    return { scanned: newest.size, redelivered, skipped };
+    return { scanned: listed.deliveries.length, redelivered, skipped };
   } catch (err) {
     console.warn(`[webhook-redelivery] sweep failed: ${err instanceof Error ? err.message : String(err)}`);
-    return { scanned: newest.size, redelivered: 0, skipped: 0 };
+    return { scanned: listed.deliveries.length, redelivered: 0, skipped: 0 };
   }
 }
 

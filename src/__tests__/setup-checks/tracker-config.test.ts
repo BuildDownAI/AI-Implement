@@ -358,11 +358,11 @@ describe("tracker.jira.credentials", () => {
     ]);
   });
 
-  it("fails OAuth mode, whose access token expires within the hour", async () => {
+  it("fails OAuth mode, whose short-lived access token is never refreshed", async () => {
     expect(await run("tracker.jira.credentials", onJira(acceptedJira(undefined, true)))).toEqual([
       {
         state: "fail",
-        detail: "Jira accepted the OAuth access token, but it expires within an hour and the orchestrator never refreshes it, so every Jira call fails after that",
+        detail: "Jira accepted the OAuth access token, but it is short-lived and the orchestrator never refreshes it, so every Jira call fails once it expires",
         fix: "Use Basic mode: set JIRA_EMAIL to the account's address and JIRA_TOKEN to an API token, then restart the orchestrator.",
       },
     ]);

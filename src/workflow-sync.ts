@@ -204,7 +204,7 @@ class GitHubClient {
   }
 }
 
-function buildSyncBranchName(prefix: string | null | undefined): string {
+export function buildSyncBranchName(prefix: string | null | undefined): string {
   const cleaned = (prefix ?? "").trim().replace(/^\/+|\/+$/g, "");
   return cleaned ? `${cleaned}/sync/ai-implement` : "sync/ai-implement";
 }

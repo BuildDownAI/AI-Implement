@@ -535,6 +535,17 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     expect(snap.needsPlanning[0].scopeKey).toBe("acme/x");
   });
 
+  it("searches with the one bucket query the setup check also runs, from the shared builder", async () => {
+    const fields = await import("../../providers/jira-fields.js");
+    const shared = vi.spyOn(fields, "buildBucketQuery").mockReturnValue("the poll's query");
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch({ when: /^the poll's query$/ }, inFlight()) }).install();
+
+    await makeProvider({ cacheScope: "c-shared-bucket", mappings: { "acme/x": jiraMapping() } }).fetchAIImplementSnapshot();
+
+    expect(shared).toHaveBeenCalledWith(expect.any(String), "customfield_10100");
+    expect(searchBodies(fake)[0].jql).toBe("the poll's query");
+  });
+
   it("references custom fields with cf[n] syntax in the JQL wrapper", async () => {
     const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [SEARCH]: jqlSearch(ready(), inFlight()) }).install();
 

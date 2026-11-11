@@ -24,13 +24,7 @@ not fail boot; it fails the feature that needs it, late and quietly (a 4xx insid
 | Issues | Read and write | PR comments go through GitHub's issue-comment endpoints: `postPrComment` / `updatePrComment` / `postOrUpdateStickyComment` (gap analysis, refresh PR, review verdicts, KG dry-run comment) and `addCommentReaction` on the `/ai-implement` comment rail — for every provider, on every envelope repo |
 | Metadata | Read-only | granted to every App automatically |
 
-Plus whatever the runner's own GitHub Actions workflows need on each project repo (those are
-declared in the workflow files, not here). The list above is the set of `permissions: {…}`
-scopes requested in `src/` plus the grants the per-run installation token relies on (it carries the
-App's full permission set scoped to one repository); a change that mints a token for a new permission must add a row
-here and grant it on the App before the feature is switched on (tracked for automation in
-AII-645: one declared table, probed on `get_tenant_health`, shown on the admin page, and an
-App manifest for new installs).
+Plus whatever the runner's own GitHub Actions workflows need on each project repo (those are declared in the workflow files, not here). The table is declared once, as `GITHUB_APP_PERMISSIONS` in `src/github-app-permissions.ts`: the set of `permissions: {…}` scopes requested in `src/`, the `permission-*` inputs the synced `claude-implement.yml` and `claude-plan.yml` pass to `create-github-app-token`, and the grants the per-run installation token relies on (it carries the App's full permission set scoped to one repository). `src/__tests__/github-app-permissions.test.ts` fails when a token request in `src/` or a synced workflow names a permission the declaration lacks, or a level above it, and when the table above stops matching it. So a change that mints a token for a new permission adds it to the declaration and this table, and grants it on the App before the feature is switched on. The `github.permissions` setup check compares each project owner's installation with the declaration, failing on a missing required permission and warning on a missing optional one.
 
 **Granting or widening a permission is two steps by an org owner, not a per-repository
 setting.** GitHub App permissions live on the App; each installation then has to accept the
@@ -42,9 +36,7 @@ change:
 2. The installation (`https://github.com/organizations/<org>/settings/installations/<id>`; ids
    from `gh api orgs/<org>/installations`) shows a review banner → **Review request** →
    **Accept new permissions**.
-3. Verify: `gh api orgs/<org>/installations --jq '.installations[] | select(.app_slug=="<app-slug>") | .permissions'`
-   lists the new level, and `get_tenant_health` shows the matching preflight row with
-   `status: 200` and no `hint`.
+3. Verify: the setup checks' `github.permissions` row passes for each project's owner. By hand, `gh api orgs/<org>/installations --jq '.installations[] | select(.app_slug=="<app-slug>") | .permissions'` lists the new level, and for the knowledge graph's repositories `get_tenant_health` shows the matching preflight row with `status: 200` and no `hint`.
 
 The App is created once per orchestrator (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` secrets);
 its webhook must point at the orchestrator's `/api/github/webhook` with the
@@ -359,15 +351,13 @@ To repair a degraded image, re-deploy with `--no-cache` and a working `--build-s
 
 ## The health body (`GET /`)
 
-`GET /` needs no authentication and answers HTTP 200 with `status: "ok"` only when
-Restate is `ready` and `registered`; otherwise it answers HTTP 503 with
-`status: "unavailable"` (`src/index.ts`). Both responses retain every diagnostic
-body field. Monitors should read the diagnostic body even on 503; it carries no secret.
+`GET /` needs no authentication and answers HTTP 200 with `status: "ok"` only when Restate is `ready` and `registered`; otherwise it answers HTTP 503 with `status: "unavailable"` (`src/index.ts`). Both responses retain every diagnostic body field. Monitors should read the diagnostic body even on 503; it carries no secret.
 
 | Field | Meaning |
 |---|---|
 | `status` | `"ok"` when Restate is `ready` and `registered`; otherwise `"unavailable"` |
 | `sourceCommit` | Full `AI_IMPLEMENT_SOURCE_COMMIT` build stamp, or `null` when unset |
+| `instanceId` | A random identifier for this orchestrator process, new at every start (`ORCHESTRATOR_INSTANCE_ID`, `src/health-body.ts`). `callback.reachable` compares it with the one its callback address answers, since a run's results are accepted only by the process that dispatched it |
 | `polls` | Poll cycles since boot |
 | `lastPollStartedAt`, `lastPollFinishedAt` | ISO times, or `null` before the first poll |
 | `kgDegraded` | Embeddings missing; search is lexical only |
@@ -378,17 +368,9 @@ body field. Monitors should read the diagnostic body even on 503; it carries no 
 | `setupChecks` | `{ checkedAt, failingCore, failingOnAdminPath? }`: last known run time (epoch milliseconds) and failing core count, both `null` before a run is known; optional bootstrap ids as described below |
 | `deploy` | `{ held, startedAt }`: a self-deploy hold, so a deploy is not mistaken for an outage (`startedAt` is epoch milliseconds, or `null` when nothing is held) |
 
-`setupChecks.failingOnAdminPath` appears only while no admin path is configured:
-it lists failing check ids on the path to an admin, with no titles, details, fixes or
-projects. An access code, complete SSO path with an admin address, or BuildDown
-with its redirect URL ends bootstrap mode; an unreadable allowlist also keeps it
-off. The count comes from the last known run, restored after Restate registration;
-bootstrap ids are checked locally on each request. `GET /` never calls Restate or
-any other network service, so it continues returning diagnostics during their
-outages, with HTTP 503 while Restate cannot serve.
+`setupChecks.failingOnAdminPath` appears only while no admin path is configured: it lists failing check ids on the path to an admin, with no titles, details, fixes or projects. An access code, complete SSO path with an admin address, or BuildDown with its redirect URL ends bootstrap mode; an unreadable allowlist also keeps it off. The count comes from the last known run, restored after Restate registration; bootstrap ids are checked locally on each request. `GET /` never calls Restate or any other network service, so it continues returning diagnostics during their outages, with HTTP 503 while Restate cannot serve.
 
-A healthy orchestrator shows `restate.sidecar.state: "ready"`,
-`restate.registration.state: "registered"`, and a recent `lastPollFinishedAt`.
+A healthy orchestrator shows `restate.sidecar.state: "ready"`, `restate.registration.state: "registered"`, and a recent `lastPollFinishedAt`.
 
 ## KG sidecar health
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { redeliverFailedAppDeliveries, sweepOnRegistered } from "../webhook-redelivery.js";
+import { listRecentAppDeliveries, redeliverFailedAppDeliveries, sweepOnRegistered, type AppDelivery } from "../webhook-redelivery.js";
+import { GitHubApiError } from "../github-errors.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -12,9 +13,10 @@ const APP_ID = "123456";
 const NOW = Date.parse("2026-10-09T12:00:00Z");
 const ago = (h: number) => new Date(NOW - h * 3600_000).toISOString();
 
-type D = { id: number; guid: string; delivered_at: string; status: string; event: string };
+type D = AppDelivery;
+// GitHub sends `status_code` with every delivery: 200 beside "OK", else the code its failure text names.
 const d = (id: number, guid: string, h: number, status: string, event = "pull_request_review"): D => ({
-  id, guid, delivered_at: ago(h), status, event,
+  id, guid, delivered_at: ago(h), status, status_code: status === "OK" ? 200 : Number(/\d{3}/.exec(status)?.[0] ?? 0), event,
 });
 
 const FAILED = "Invalid HTTP Response: 503";
@@ -97,6 +99,26 @@ describe("redeliverFailedAppDeliveries", () => {
     expect(await run(f)).toEqual({ scanned: 2, redelivered: 1, skipped: 1 });
   });
 
+  it("logs a refused first page as a failed list and redelivers nothing", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const f = deliveriesApi([], { list: { status: 401, json: { message: "Bad credentials" } } });
+    expect(await run(f)).toEqual({ scanned: 0, redelivered: 0, skipped: 0 });
+    expect(warn).toHaveBeenCalledWith("[webhook-redelivery] list failed (401)");
+  });
+
+  it("logs a refused later page as a failed list and still redelivers what was listed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const f = fakeFetch({
+      "GET /app/hook/deliveries": [
+        { json: [d(7, "a", 1, FAILED)], headers: { link: `<https://api.github.com/app/hook/deliveries?per_page=100&cursor=c1>; rel="next"` } },
+        { status: 502, json: {} },
+      ],
+      "POST /app/hook/deliveries/7/attempts": { status: 202, json: {} },
+    });
+    expect(await run(f)).toEqual({ scanned: 1, redelivered: 1, skipped: 0 });
+    expect(warn).toHaveBeenCalledWith("[webhook-redelivery] list failed (502)");
+  });
+
   it("authenticates with the App JWT only", async () => {
     const f = deliveriesApi([[d(1, "a", 1, FAILED)]]);
     await run(f);
@@ -105,6 +127,35 @@ describe("redeliverFailedAppDeliveries", () => {
       expect(JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString()).iss).toBe(APP_ID);
       expect(c.path).not.toContain("access_tokens");
     }
+  });
+});
+
+describe("listRecentAppDeliveries", () => {
+  const list = (f: FakeFetch) => listRecentAppDeliveries({ appId: APP_ID, privateKey, fetchImpl: f.fetch, now: () => NOW });
+
+  it("returns the newest attempt per GUID inside the window, across pages, and sends nothing but reads", async () => {
+    const f = deliveriesApi([[d(3, "a", 1, "Invalid HTTP Response: 401"), d(2, "a", 2, "OK")], [d(4, "b", 3, "OK"), d(1, "c", 25, FAILED)]]);
+    const { deliveries, endedEarlyWith } = await list(f);
+    expect(deliveries).toEqual([d(3, "a", 1, "Invalid HTTP Response: 401"), d(4, "b", 3, "OK")]);
+    expect(deliveries[0].status_code).toBe(401);
+    expect(endedEarlyWith).toBeNull();
+    expect(f.calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("returns what it listed, with the status that ended it, when a later page is refused", async () => {
+    const f = fakeFetch({
+      "GET /app/hook/deliveries": [
+        { json: [d(1, "a", 1, "OK")], headers: { link: `<https://api.github.com/app/hook/deliveries?per_page=100&cursor=c1>; rel="next"` } },
+        { status: 502, json: {} },
+      ],
+    });
+    expect(await list(f)).toEqual({ deliveries: [d(1, "a", 1, "OK")], endedEarlyWith: 502 });
+  });
+
+  it("throws GitHub's refusal of the first page", async () => {
+    const error = await list(deliveriesApi([], { list: { status: 401, json: { message: "Bad credentials" } } })).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GitHubApiError);
+    expect(error).toMatchObject({ status: 401, path: "/app/hook/deliveries" });
   });
 });
 

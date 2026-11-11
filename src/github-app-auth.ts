@@ -72,9 +72,21 @@ export function parseAppPrivateKey(raw: string): crypto.KeyObject {
   return parsePrivateKey(raw.replace(/\\n/g, "\n"));
 }
 
+/** Why the App's ID and key cannot sign a JWT, naming the variables, or null when both are set and the key parses. */
+export function appCredentialsProblem(env: Readonly<Record<string, string | undefined>>): string | null {
+  const missing = ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY"].filter((name) => !env[name]);
+  if (missing.length > 0) return `${missing.join(" and ")} not set`;
+  try {
+    parseAppPrivateKey(env.GITHUB_APP_PRIVATE_KEY!);
+    return null;
+  } catch {
+    return "GITHUB_APP_PRIVATE_KEY does not parse as a private key";
+  }
+}
+
 // exp is minted this many seconds below GitHub's 600s cap (and iat backdated the same)
 // so a host clock running ahead of GitHub still validates. Larger drift needs a clock resync (NTP).
-const CLOCK_SKEW_TOLERANCE_S = 300;
+export const CLOCK_SKEW_TOLERANCE_S = 300;
 
 /**
  * Creates a signed JWT for authenticating as a GitHub App.
@@ -107,15 +119,23 @@ export function githubAppHeaders(authValue: string): Record<string, string> {
   };
 }
 
+/** An owner's App installation as GitHub returns it, narrowed to the fields the orchestrator reads. */
+export interface AppInstallation {
+  id: number;
+  repository_selection: "all" | "selected";
+  /** Each permission the installation has accepted, with its level ("read" or "write"). */
+  permissions: Record<string, string>;
+}
+
 /**
- * Resolves the GitHub App installation ID for an owner.
+ * Resolves the GitHub App installation for an owner.
  * Tries the org endpoint first and falls back to the user endpoint on 404.
  * Throws GitHubApiError on any non-ok response.
  */
 async function resolveInstallationId(
   headers: Record<string, string>,
   owner: string,
-): Promise<{ id: number; repository_selection?: "all" | "selected" }> {
+): Promise<AppInstallation> {
   // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found.
   let installPath = `/orgs/${owner}/installation`;
   let installRes = await fetch(`https://api.github.com${installPath}`, { headers, signal: defaultFetchSignal() });
@@ -132,7 +152,18 @@ async function resolveInstallationId(
       message: `GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`,
     });
   }
-  return installRes.json() as Promise<{ id: number; repository_selection?: "all" | "selected" }>;
+  return installRes.json() as Promise<AppInstallation>;
+}
+
+/** The App's installation on an owner, or null when GitHub has none on either endpoint. Uncached and mints no token. */
+export async function getAppInstallation(appId: string, privateKey: string, owner: string): Promise<AppInstallation | null> {
+  const jwt = createAppJwt(appId, privateKey.replace(/\\n/g, "\n"));
+  try {
+    return await resolveInstallationId(githubAppHeaders(jwt), owner);
+  } catch (error) {
+    if (error instanceof GitHubApiError && error.status === 404) return null;
+    throw error;
+  }
 }
 
 /**
@@ -273,16 +304,12 @@ export async function getScopedInstallationToken(
 }
 
 /**
- * Whether the installation can see a given repo. Only meaningful when repositorySelection === "selected"
- * (an "all" install sees everything, so the caller skips this). 
- * 
- * Pages through GET /installation/repositories with the install token, short-circuiting as soon as the repo is found.
+ * Each page of the repository names a selected-repositories installation includes, lowercased, read through
+ * GET /installation/repositories with the installation's token. A caller that stops iterating stops the reads.
  */
-export async function installationIncludesRepo(token: string, repoName: string): Promise<boolean> {
+async function* installationRepositoryPages(token: string): AsyncGenerator<string[]> {
   const headers = githubAppHeaders(token);
   const perPage = 100;
-  const target = repoName.toLowerCase();
-
   for (let page = 1; ; page++) {
     const path = `/installation/repositories?per_page=${perPage}&page=${page}`;
     const res = await fetch(`https://api.github.com${path}`, { headers, signal: defaultFetchSignal() });
@@ -297,10 +324,31 @@ export async function installationIncludesRepo(token: string, repoName: string):
     }
 
     const data = (await res.json()) as { total_count: number; repositories: Array<{ name: string }> };
-    if (data.repositories.some((r) => r.name.toLowerCase() === target)) return true;
+    yield data.repositories.map((r) => r.name.toLowerCase());
     // Stop once this page was short (the last page) or we've already covered total_count.
-    if (data.repositories.length < perPage || page * perPage >= data.total_count) return false;
+    if (data.repositories.length < perPage || page * perPage >= data.total_count) return;
   }
+}
+
+/**
+ * Whether the installation can see a given repo. Only meaningful when repositorySelection === "selected"
+ * (an "all" install sees everything, so the caller skips this). Stops reading pages as soon as the repo is found.
+ */
+export async function installationIncludesRepo(token: string, repoName: string): Promise<boolean> {
+  const target = repoName.toLowerCase();
+  for await (const names of installationRepositoryPages(token)) {
+    if (names.includes(target)) return true;
+  }
+  return false;
+}
+
+/** Every repository name a selected-repositories installation includes, lowercased, read with that installation's token. */
+export async function listInstallationRepositoryNames(token: string): Promise<Set<string>> {
+  const names = new Set<string>();
+  for await (const page of installationRepositoryPages(token)) {
+    for (const name of page) names.add(name);
+  }
+  return names;
 }
 
 /**
@@ -312,24 +360,47 @@ export async function installationIncludesRepo(token: string, repoName: string):
 export async function getAppSlug(appId: string, privateKey: string): Promise<string> {
   if (cachedAppSlug) return cachedAppSlug;
 
-  const normalizedKey = privateKey.replace(/\\n/g, "\n");
-  const jwt = createAppJwt(appId, normalizedKey);
-  const path = "/app";
-  const res = await fetch(`https://api.github.com${path}`, { headers: githubAppHeaders(jwt), signal: defaultFetchSignal() });
-
-  if (!res.ok) {
-    const body = await res.text();
+  const app = await readAppIdentity(appId, privateKey);
+  if (app.slug === null) {
     throw new GitHubApiError({
-      status: res.status,
-      path,
-      bodyText: body,
-      message: `Failed to read GitHub App metadata (${res.status}): ${body}`,
+      status: app.status,
+      path: "/app",
+      bodyText: app.errorBody,
+      message: `Failed to read GitHub App metadata (${app.status}): ${app.errorBody}`,
     });
   }
-
-  const data = (await res.json()) as { slug: string };
-  cachedAppSlug = data.slug;
+  cachedAppSlug = app.slug;
   return cachedAppSlug;
+}
+
+/** What `GET /app` answered for the App's JWT, with GitHub's clock beside this host's. */
+export interface AppIdentityRead {
+  status: number;
+  /** Null when GitHub answered anything but 200: a refusal (`appCredentialsRefused`) or no judgment at all. */
+  slug: string | null;
+  /** The response body when GitHub refused, else "". */
+  errorBody: string;
+  /** GitHub's time from the response's `Date` header, in epoch milliseconds, or null when absent. */
+  githubTime: number | null;
+  /** This host's time when the response arrived, in epoch milliseconds. */
+  localTime: number;
+}
+
+/** Reads `GET /app` uncached. A refused JWT is an answer, not an error, so a caller can tell a bad key from a skewed clock. */
+export async function readAppIdentity(appId: string, privateKey: string): Promise<AppIdentityRead> {
+  const jwt = createAppJwt(appId, privateKey.replace(/\\n/g, "\n"));
+  const res = await fetch("https://api.github.com/app", { headers: githubAppHeaders(jwt), signal: defaultFetchSignal() });
+  const localTime = Date.now();
+  const date = Date.parse(res.headers.get("date") ?? "");
+  const githubTime = Number.isFinite(date) ? date : null;
+  if (!res.ok) return { status: res.status, slug: null, errorBody: await res.text(), githubTime, localTime };
+  const data = (await res.json()) as { slug: string };
+  return { status: res.status, slug: data.slug, errorBody: "", githubTime, localTime };
+}
+
+/** Whether GitHub refused the App's credentials: 401 for a bad key or a skewed clock, 404 for an App ID it does not know. Any other status is GitHub not answering normally. */
+export function appCredentialsRefused(read: Pick<AppIdentityRead, "status">): boolean {
+  return read.status === 401 || read.status === 404;
 }
 
 export interface SourceTokenResult {

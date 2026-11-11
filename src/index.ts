@@ -1,7 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
 import { buildHealthBody } from "./health-body.js";
-import { createSetupCheckContext, getLastSetupCheckRun } from "./setup-checks/index.js";
+import { createSetupCheckContext, getLastSetupCheckRun, setupChecksHealthField } from "./setup-checks/index.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
@@ -4252,8 +4252,7 @@ function startServer(
         sidecarHealthFields,
         restateStatus: getRestateStatus,
         deployHealth,
-        lastSetupCheckRun: getLastSetupCheckRun,
-        setupCheckContext: () => createSetupCheckContext({ restateStatus: getRestateStatus }),
+        setupChecks: () => setupChecksHealthField(getLastSetupCheckRun(), createSetupCheckContext({ restateStatus: getRestateStatus })),
       }).then((body) => {
         const json = JSON.stringify(body);
         res.writeHead(body.status === "unavailable" ? 503 : 200, { "Content-Type": "application/json" });
