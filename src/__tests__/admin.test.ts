@@ -6432,6 +6432,33 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(resolved.json.stages.planning.entries).toMatchObject([{ accountProfileId: "other", passes: false, reason: "resolution_failed" }]);
   });
 
+  it.each([
+    { model: "api-model", chosenModel: "api-model", source: "orchestrator-default" },
+    { model: "", chosenModel: "project-model", source: "project" },
+  ])("reports selected account provenance with a project model override ($source)", async ({ model, chosenModel, source }) => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+    for (const profile of [
+      { profileId: "brk", provider: "bedrock", authMode: "bedrock" },
+      { profileId: "cl-api", provider: "anthropic", authMode: "anthropic-api-key" },
+    ]) {
+      expect((await call("/api/model-accounts", "POST", t, profileBody({ ...profile, agent: "claude" }))).status).toBe(201);
+    }
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "primary" }, { accountProfileId: "cl-api", model }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, {
+      enabled: true, stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
+    }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json.stages.planning).toMatchObject({
+      values: { accountProfileId: "cl-api", agent: "claude", provider: "anthropic", model: chosenModel, invocationTimeoutMs: 700000 },
+      sources: { accountProfileId: "orchestrator-default", agent: "orchestrator-default", provider: "orchestrator-default", model: source, invocationTimeoutMs: "project" },
+      entries: [{ index: 0, passes: false, reason: "unsupported_combination" }, { index: 1, passes: true }],
+    });
+  });
+
   it("shows unsupported backend entries and project fallback suppression", async () => {
     const t = await seed();
     await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);

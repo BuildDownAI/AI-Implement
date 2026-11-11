@@ -362,6 +362,14 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       selection[stage] = { chosen: choice.chosen.index, skipped: choice.skipped };
       if (choice.fallbacks.length) accountFallbacks[stage] = choice.fallbacks;
     }
+    if (choice.chosen.index > 0) {
+      // Later entries supply their own profile fields; a blank model inherits
+      // the first candidate's effective model, including its project override.
+      for (const field of ["accountProfileId", "agent", "provider"] as const) {
+        resolved.sources[field] = "orchestrator-default";
+      }
+      if (entries[choice.chosen.index].model.trim()) resolved.sources.model = "orchestrator-default";
+    }
     for (const field of ["accountProfileId", "agent", "provider", "model"] as const) resolved.selection[field] = choice.chosen[field] as never;
     if (fallback === resolved.selection.model) {
       if (!defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null) {
