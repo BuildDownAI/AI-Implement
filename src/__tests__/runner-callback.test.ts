@@ -330,7 +330,7 @@ describe("handleRunnerResult — planning", () => {
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
 
-  it("a markPlanComplete throw answers 200, fails the row, parks the issue and writes Planning Failed with Jira's text", async () => {
+  it.each(["jira", "linear"])("a %s markPlanComplete throw answers 200, fails the row, parks and forwards the failure text", async (providerId) => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase: "planning", ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS, secret: SECRET,
     });
@@ -339,9 +339,12 @@ describe("handleRunnerResult — planning", () => {
       dispatchId, executionMode: "github-actions", phase: "planning",
     });
     const fake = new FakeProvider({ recordCalls: true, initialIssues: [makeIssue({ id: "i" })] });
-    vi.spyOn(fake, "markPlanComplete").mockRejectedValue(
-      new jiraClient.JiraApiError(400, "Option value 'Plan Approved' is not valid", "x"),
-    );
+    Object.defineProperty(fake, "id", { value: providerId });
+    const { LinearLabelWriteError, LinearGraphQLError } = await import("../providers/linear.js");
+    const error = providerId === "jira"
+      ? new jiraClient.JiraApiError(400, "Option value 'Plan Approved' is not valid", "x")
+      : new LinearLabelWriteError("Plan-Complete", "THR2", new LinearGraphQLError("issueLabelCreate", "access denied"));
+    vi.spyOn(fake, "markPlanComplete").mockRejectedValue(error);
     const failSpy = vi.spyOn(fake, "markPlanningFailed");
     const commentSpy = vi.spyOn(fake, "postComment");
     const res = await runnerCallback.handleRunnerResult({
@@ -356,8 +359,9 @@ describe("handleRunnerResult — planning", () => {
     const row = log.getJobByDispatchId(dispatchId);
     expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
     expect(row?.failure?.code).toBe("PLAN_STATUS_WRITE_FAILED");
-    expect(row?.failure?.message).toContain("Option value 'Plan Approved' is not valid");
+    expect(row?.failure?.message).toBe(runnerCallback.planCompleteFailureText(providerId, false, error));
     expect(row?.failure?.message).toContain("Unpark at /admin#runners");
+    expect(failSpy).toHaveBeenCalledWith("i", "ENG", row?.failure?.message);
     expect(row?.failureCommentedAt).toBeTruthy();
     expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
   });
@@ -384,6 +388,56 @@ describe("handleRunnerResult — planning", () => {
     expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
     expect(row?.failureCommentedAt ?? null).toBeNull();
     expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
+  });
+
+  describe("planCompleteFailureText", () => {
+    it.each([false, true])("uses exact provider-specific text (awaitApproval=%s)", async (awaitApproval) => {
+      const { LinearGraphQLError, LinearLabelWriteError } = await import("../providers/linear.js");
+      const graphql = new LinearGraphQLError("issueUpdate", "access denied");
+      const cases: [string, unknown, string][] = [
+        ["jira", new jiraClient.JiraApiError(400, "bad option", "x"),
+          `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. Jira answered 400: bad option. Fix the status field, then use Unpark at /admin#runners.`],
+        ["linear", new LinearLabelWriteError("Plan-Complete", "THR2", graphql),
+          'The plan was recorded, but Linear refused to create label "Plan-Complete" on team THR2: access denied. Create the label in the team by hand, or let the app create labels, then use Unpark at /admin#runners.'],
+        ["linear", graphql,
+          "The plan was recorded, but Linear refused the plan-complete label write (issueUpdate): access denied. Fix the app's access to the team, then use Unpark at /admin#runners."],
+        ["linear", new Error("offline"),
+          "The plan was recorded, but the plan-complete label write failed: offline. Then use Unpark at /admin#runners."],
+        ["linear", "odd",
+          "The plan was recorded, but the plan-complete label write failed: odd. Then use Unpark at /admin#runners."],
+        ...["filesystem", "unknown"].map((id): [string, unknown, string] => [id, new Error("offline"),
+          "The plan was recorded, but the tracker refused the plan-complete write: offline. Then use Unpark at /admin#runners."]),
+      ];
+      for (const [providerId, error, expected] of cases) {
+        const text = runnerCallback.planCompleteFailureText(providerId, awaitApproval, error);
+        expect(text).toBe(expected);
+        if (providerId === "linear") expect(text).not.toMatch(/Plan Approved|Awaiting Approval|status field/);
+      }
+    });
+
+    it("reports a real ensureTeamLabel refusal using the issue's actual team", async () => {
+      const { LinearProvider, LinearLabelWriteError } = await import("../providers/linear.js");
+      const auth = await import("../linear-app-auth.js");
+      auth.configureLinearAuth("client-id", "client-secret");
+      auth.__setLinearTokenForTest("test-token");
+      fakeFetch({ "POST /graphql": [
+        { json: { data: { issue: { labels: { nodes: [] } } } } },
+        { json: { data: { issue: { team: { key: "THR2" } } } } },
+        { json: { data: { teams: { nodes: [{ id: "team-thr2" }] } } } },
+        { json: { data: { issueLabels: { nodes: [] } } } },
+        { json: { errors: [{ message: "not allowed to take action" }] } },
+      ] }).install();
+      try {
+        const error = await new LinearProvider({}).markPlanComplete("i", "AII", { awaitApproval: false })
+          .catch((err: unknown) => err);
+        expect(error).toBeInstanceOf(LinearLabelWriteError);
+        expect(runnerCallback.planCompleteFailureText("linear", false, error)).toBe(
+          'The plan was recorded, but Linear refused to create label "Plan-Complete" on team THR2: not allowed to take action. Create the label in the team by hand, or let the app create labels, then use Unpark at /admin#runners.',
+        );
+      } finally {
+        auth.__resetLinearAuthForTest();
+      }
+    });
   });
 
   describe("describeTrackerWriteError", () => {

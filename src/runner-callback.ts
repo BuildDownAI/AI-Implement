@@ -34,6 +34,7 @@ import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.j
 import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
 import { getMappings } from "./config.js";
 import { parkIssue } from "./dispatch-breaker.js";
+import { LinearGraphQLError, LinearLabelWriteError } from "./providers/linear.js";
 import { JiraApiError } from "./providers/jira-client.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
@@ -765,6 +766,26 @@ export function describeTrackerWriteError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Describe the provider operation that failed after recording a plan. */
+export function planCompleteFailureText(providerId: string, awaitApproval: boolean, err: unknown): string {
+  if (providerId === "jira") {
+    return `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. ` +
+      `${describeTrackerWriteError(err)}. Fix the status field, then use Unpark at /admin#runners.`;
+  }
+  if (providerId === "linear") {
+    if (err instanceof LinearLabelWriteError) {
+      return `The plan was recorded, but Linear refused to create label "${err.label}" on team ${err.teamKey}: ${err.linearMessage}. ` +
+        "Create the label in the team by hand, or let the app create labels, then use Unpark at /admin#runners.";
+    }
+    if (err instanceof LinearGraphQLError) {
+      return `The plan was recorded, but Linear refused the plan-complete label write (${err.operation}): ${err.linearMessage}. ` +
+        "Fix the app's access to the team, then use Unpark at /admin#runners.";
+    }
+    return `The plan was recorded, but the plan-complete label write failed: ${describeTrackerWriteError(err)}. Then use Unpark at /admin#runners.`;
+  }
+  return `The plan was recorded, but the tracker refused the plan-complete write: ${describeTrackerWriteError(err)}. Then use Unpark at /admin#runners.`;
+}
+
 /**
  * Preserve callback-owned lifecycle outcomes, then deliver owned accounting through
  * the workflow intake. Persisted lifecycle completion skips effects on retry; the reusable
@@ -1372,9 +1393,7 @@ async function handleRunnerResultInternal(
       await provider.markPlanComplete(claims.issueId, mappingTeamKey, { awaitApproval });
     } catch (err) {
       warn("markPlanComplete", err);
-      planStatusFailure =
-        `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. ` +
-        `${describeTrackerWriteError(err)}. Fix the status field, then use Unpark at /admin#runners.`;
+      planStatusFailure = planCompleteFailureText(provider.id, awaitApproval, err);
     }
     if (planStatusFailure !== null) {
       // The plan comments are recorded, so the response stays 200. Local writes come first so the
