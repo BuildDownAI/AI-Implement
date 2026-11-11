@@ -33,7 +33,7 @@ export class LinearGraphQLError extends Error {
   ) {
     super(`Linear GraphQL error${operation ? ` (${operation})` : ""}: ${linearMessage}`);
     this.name = "LinearGraphQLError";
-    // A permanent permission refusal (forbidden/FORBIDDEN/403) cannot be helped by retrying.
+    // permanent is true when Linear reports a permission refusal (extensions.type forbidden, extensions.code FORBIDDEN, or extensions.statusCode 403), so a retry cannot help.
   }
 }
 
