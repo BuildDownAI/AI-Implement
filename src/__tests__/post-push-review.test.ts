@@ -870,7 +870,7 @@ describe("postPushReviewStep", () => {
     expect(out.iterations).toBe(2);
     expect(out.internalFindings).toEqual([expect.objectContaining({ body: "bug" })]);
     expect(out.findingDispositions).toEqual([expect.objectContaining({
-      findingKey: stableReviewFindingKey(out.internalFindings[0]!),
+      findingKey: stableReviewFindingKey({ source: "ai-implement-internal", severity: "blocking", body: "bug" }),
       disposition: "fixed",
     })]);
   });
