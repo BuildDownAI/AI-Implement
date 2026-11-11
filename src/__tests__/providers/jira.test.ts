@@ -1697,6 +1697,13 @@ describe("JiraProvider.listIssuesPage", () => {
   const provider = (scope: string) =>
     makeProvider({ cacheScope: scope, mappings: { "acme/x": jiraMapping() } });
 
+  it("filters review-child searches on the server", async () => {
+    const fake = jira([page([])]);
+    await provider("lip-filter").listIssuesPage(mapping(), null, { titlePrefix: "[roll-up-review]" });
+    const search = fake.calls.find(call => call.url.pathname.includes("search/jql"));
+    expect(JSON.parse(search!.body).jql).toContain("AND summary ~ " + JSON.stringify('"roll-up-review"'));
+  });
+
   const full = {
     id: "10001",
     key: "P-1",

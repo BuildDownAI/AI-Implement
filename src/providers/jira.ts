@@ -427,7 +427,7 @@ export class JiraProvider implements TicketingProvider {
    * issue whose embedded list is shorter than `total` costs an extra `listComments` call
    * (newest first, so the 100 kept are the newest). The embedded list is sorted newest first too.
    */
-  async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
     const cfg = mapping.ticketingConfig;
     if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
     const scopeKey = mapping.teamKey;
@@ -435,7 +435,7 @@ export class JiraProvider implements TicketingProvider {
 
     const fieldIds = await this.fields(scopeKey);
     const res = await this.client.searchJqlPage(
-      `(${cfg.jql})`,
+      `(${cfg.jql})${filter ? ' AND summary ~ ' + JSON.stringify('"' + filter.titlePrefix.replace(/[\[\]]/g, "") + '"') : ""}`,
       [
         "summary", "description", "status", "labels", "project", "parent", "issuelinks", "comment",
         fieldIds.repoFieldId,

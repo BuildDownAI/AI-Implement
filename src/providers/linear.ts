@@ -193,12 +193,12 @@ export class LinearProvider implements TicketingProvider {
     return fetchLinearPlanningContext({ issueId });
   }
 
-  async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
     if (!isLinearAuthConfigured()) throw new TrackerUnavailableError("Linear credential not configured");
     if (!mapping.teamKey) throw new TrackerUnavailableError("mapping carries no team key");
     const data = await this.linearMutation<{ issues?: { nodes: TrackerIssuePage["issues"]; pageInfo: TrackerIssuePage["pageInfo"] } }>(
-      `query($teamKey: String!, $first: Int!, $after: String) {
-        issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
+      `query($teamKey: String!, $first: Int!, $after: String, $title: String) {
+        issues(filter: { team: { key: { eq: $teamKey } }, title: { startsWith: $title } }, first: $first, after: $after, orderBy: updatedAt) {
           nodes {
             id identifier title description branchName
             state { name type }
@@ -211,7 +211,7 @@ export class LinearProvider implements TicketingProvider {
           pageInfo { hasNextPage endCursor }
         }
       }`,
-      { teamKey: mapping.teamKey, first: 50, after: cursor },
+      { teamKey: mapping.teamKey, first: 50, after: cursor, title: filter?.titlePrefix ?? "" },
     );
     return {
       issues: data.issues?.nodes ?? [],

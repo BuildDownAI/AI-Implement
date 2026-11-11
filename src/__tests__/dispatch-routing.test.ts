@@ -109,7 +109,9 @@ function jiraMapping(project: string, overrides: Partial<RepoMapping> = {}): Rep
 const CALLBACK_CONFIG = { runnerCallbackBaseUrl: "https://orchestrator.example", runnerTokenSecret: "secret" };
 
 function jiraProvider(): TicketingProvider {
-  return makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` });
+  return Object.assign(makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` }), {
+    listIssuesPage: vi.fn(async () => ({ issues: [], pageInfo: { hasNextPage: false, endCursor: null } })),
+  });
 }
 
 // No request is expected unless a test routes it.
@@ -1604,7 +1606,9 @@ describe("poll implementation submission — ImplementationRun for every project
     });
   });
 
-  it.each(["planning", "implementation"] as const)("parks a closed roll-up's pickup-ready child before %s selection", async kind => {
+  it.each(["planning", "implementation"].flatMap(kind =>
+    ["success", "lookup-null", "lookup-error", "park-rejected", "park-error"].map(outcome => ({ kind, outcome }))))(
+    "blocks $kind pickup when roll-up reconciliation outcome is $outcome", async ({ kind, outcome }) => {
     fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
     const store = await import("../config.js");
     const auth = await import("../github-app-auth.js");
@@ -1622,20 +1626,32 @@ describe("poll implementation submission — ImplementationRun for every project
       pageInfo: { hasNextPage: false, endCursor: null },
     })) });
     vi.mocked(provider.fetchLifecycleStates).mockResolvedValue(new Map([[child.id, "active"]]));
-    vi.mocked(provider.parkForHuman).mockImplementation(async () => { parked = true; return true; });
+    vi.mocked(provider.parkForHuman).mockImplementation(async () => {
+      if (outcome === "park-error") throw new Error("parking unavailable");
+      if (outcome === "park-rejected") return false;
+      parked = true; return true;
+    });
     vi.mocked(provider.fetchAIImplementSnapshot).mockImplementation(async () => ({
       needsPlanning: !parked && kind === "planning" ? [child] : [],
       readyForImplementation: !parked && kind === "implementation" ? [child] : [],
       inProgressCountsByScope: {}, parentsToFinalize: [],
     }));
     vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
-    vi.spyOn(github, "getPullRequestState").mockResolvedValue({ merged: false, state: "closed", headRef: null, headSha: null });
+    vi.spyOn(github, "getPullRequestState").mockImplementation(async () => {
+      if (outcome === "lookup-error") throw new Error("GitHub unavailable");
+      if (outcome === "lookup-null") return null;
+      return { merged: false, state: "closed", headRef: null, headSha: null };
+    });
     planningIngress.submit.mockClear();
 
     await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
 
-    expect(provider.parkForHuman).toHaveBeenCalledWith(child.id, "AII", "implementation");
-    expect(provider.postComment).toHaveBeenCalledWith(child.id, expect.stringContaining("re-file this fix against the base branch"));
+    if (outcome === "success") {
+      expect(provider.parkForHuman).toHaveBeenCalledWith(child.id, "AII", "implementation");
+      expect(provider.postComment).toHaveBeenCalledWith(child.id, expect.stringContaining("re-file this fix against the base branch"));
+    } else {
+      expect(provider.fetchAIImplementSnapshot).not.toHaveBeenCalled();
+    }
     expect(planningIngress.submit).not.toHaveBeenCalled();
     expect(implementationIngress.submit).not.toHaveBeenCalled();
   });

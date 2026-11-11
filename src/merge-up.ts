@@ -229,7 +229,7 @@ export async function listRollupReviewChildren(provider: TicketingProvider, mapp
   let cursor: string | null = null;
   const seen = new Set<string>();
   do {
-    const page = await provider.listIssuesPage(mapping, cursor);
+    const page = await provider.listIssuesPage(mapping, cursor, { titlePrefix: ROLLUP_REVIEW_CHILD_PREFIX });
     children.push(...page.issues.filter(i => i.parent && i.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} `)));
     if (!page.pageInfo.hasNextPage) return children;
     cursor = page.pageInfo.endCursor;
@@ -256,21 +256,24 @@ export async function reconcileRollupReviewChildren(provider: TicketingProvider,
   }
   const token = await getInstallationToken(credentials.githubAppId, credentials.githubAppPrivateKey, mapping.owner);
   for (const child of children) {
+    if (!states.has(child.id)) throw new Error(`Cannot verify lifecycle for ${child.identifier}`);
     if (states.get(child.id) !== "active") continue;
     const identity = child.title.match(/^\[roll-up-review\] ([^ ]+)#(\d+) ([a-f0-9]{40,64}) /);
     if (!identity || identity[1] !== `${mapping.owner}/${mapping.repo}`) continue;
     const pr = await getPullRequestState(token, mapping.owner, mapping.repo, Number(identity[2]));
-    if (!pr || (!pr.merged && pr.state !== "closed")) continue;
+    if (!pr) throw new Error(`Cannot verify roll-up PR state for ${child.identifier}`);
+    if (!pr.merged && pr.state !== "closed") continue;
     const marker = "<!-- roll-up-review parked -->";
     ensureSettingsTable();
     const parkedKey = `roll-up-review:parked:${provider.id}:${scopeKey}:${child.id}`;
     const alreadyCommented = getDb().prepare("SELECT 1 FROM settings WHERE key = ?").get(parkedKey) !== undefined ||
       child.comments.nodes.some(c => c.body.includes(marker));
     if (alreadyCommented) continue;
-    if (await provider.parkForHuman(child.id, scopeKey, "implementation")) {
-      await provider.postComment(child.id, `${marker}\nThe tree merged first or its roll-up PR was closed. A person should re-file this fix against the base branch \`${mapping.defaultBranch}\`. The feature branch may have been deleted.`);
-      getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(parkedKey, new Date().toISOString());
-      console.log(`[roll-up-review] Parked ${child.identifier}: roll-up #${identity[2]} closed`);
+    if (!await provider.parkForHuman(child.id, scopeKey, "implementation")) {
+      throw new Error(`Parking rejected for roll-up review child ${child.identifier}`);
     }
+    await provider.postComment(child.id, `${marker}\nThe tree merged first or its roll-up PR was closed. A person should re-file this fix against the base branch \`${mapping.defaultBranch}\`. The feature branch may have been deleted.`);
+    getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(parkedKey, new Date().toISOString());
+    console.log(`[roll-up-review] Parked ${child.identifier}: roll-up #${identity[2]} closed`);
   }
 }

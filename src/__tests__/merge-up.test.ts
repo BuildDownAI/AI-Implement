@@ -523,6 +523,7 @@ describe("roll-up review child cleanup", () => {
     await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
     await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
     expect(provider.recordedCalls().filter(c => c.method === "parkForHuman")).toHaveLength(1);
+    expect((provider as import("../providers/types.js").TicketingProvider).listIssuesPage).toHaveBeenCalledWith(mapping(), null, { titlePrefix: "[roll-up-review]" });
     expect(comment).toHaveBeenCalledOnce();
     expect(comment.mock.calls[0][1]).toContain("tree merged first");
     expect(comment.mock.calls[0][1]).toContain("base branch `testing`");

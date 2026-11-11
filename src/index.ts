@@ -575,9 +575,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     for (const provider of providers) {
       for (const [scopeKey, mapping] of Object.entries(getMappings())) {
         if (mapping.ticketingProvider !== provider.id) continue;
-        await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config).catch(err => {
-          console.error("[roll-up-review] Child reconciliation failed:", err);
-        });
+        await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config);
       }
     }
     const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
