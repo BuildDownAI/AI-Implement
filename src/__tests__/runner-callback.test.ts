@@ -4659,6 +4659,43 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
       .toHaveLength(disposition === "follow-up" ? 1 : 0);
   });
 
+  it("closes an internal finding omitted by the final review and preserves closure on callback retry", async () => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Early internal defect" };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+    // A current-head report may already exist after dispatch.
+    reviewStore.upsertReviewFinding({ ...finding, repo: "org/repo", prNumber: 11 });
+    dedup.getDb().prepare("UPDATE review_findings SET last_seen_at = ?").run(Date.now() + 1000);
+    for (let retry = 0; retry < 2; retry++) {
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+          failureReason: "another gate remains", prUrl: "https://github.com/org/repo/pull/11",
+          comments: [], internalFindings: [finding],
+          findingDispositions: [{ findingKey: key, disposition: "fixed", reason: "Absent from final complete internal review." }],
+        },
+        secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      });
+      expect(res).toMatchObject({ status: retry === 0 ? 200 : 409 });
+      expect(reviewStore.listOpenReviewFindings("org/repo", 11)).toEqual([]);
+      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status: "resolved", revision: 2 }]);
+      const { getReviewerScorecard } = await import("../report-card.js");
+      expect(getReviewerScorecard({ repo: "org/repo" })).toEqual([
+        expect.objectContaining({ source: "ai-implement-internal", total: 1, fixed: 1, ignored: 0 }),
+      ]);
+      const github = await import("../github.js");
+      vi.spyOn(github, "getCommitTime").mockResolvedValue(Date.now() - 1000);
+      const { headHasBlockingFinding } = await import("../review-head-clean.js");
+      expect(await headHasBlockingFinding("token", "org", "repo", 11, "head")).toBe(false);
+    }
+  });
+
   it.each([undefined, "invalid", "follow-up", "fixed"] as const)("reopens internal findings reported by a later dispatch with disposition %s", async (disposition) => {
     const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Handle missing input.", path: "src/example.ts", line: 4 };
     const key = reviewStore.stableReviewFindingKey(finding);

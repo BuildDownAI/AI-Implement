@@ -105,7 +105,7 @@ export function recordInternalReviewFinding(input: UpsertReviewFindingInput, dis
       WHERE r.dispatch_id = ? AND f.repo = ? AND f.pr_number = ? AND f.finding_key = ?
     `).get(dispatchId, input.repo, input.prNumber, stableReviewFindingKey(input)) as { id: number; revision: number } | undefined;
     if (previous) return previous;
-    const id = recordReviewFinding(input);
+    const id = upsertReviewFinding(input);
     const { revision } = db.prepare("SELECT revision FROM review_findings WHERE id = ?").get(id) as { revision: number };
     db.prepare("INSERT INTO internal_review_finding_reports (dispatch_id, finding_id, revision) VALUES (?, ?, ?)")
       .run(dispatchId, id, revision);

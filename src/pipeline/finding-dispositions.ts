@@ -71,7 +71,9 @@ export function buildClosedFindingsMarker(dispositions: FindingDisposition[]): s
 
 export function parseClosedFindingsMarkers(body: string): FindingDisposition[][] {
   const markers: FindingDisposition[][] = [];
-  for (const match of body.matchAll(/<!-- ai-implement closed-findings v1 ([\s\S]*?) -->/g)) {
+  const lines = body.split(/\r?\n/);
+  if (!/^<!-- ai-implement post-push [^\r\n]* -->$/.test(lines[0] ?? "")) return markers;
+  for (const match of (lines[1] ?? "").matchAll(/^<!-- ai-implement closed-findings v1 (.*?) -->$/g)) {
     const payload = parseJson(match[1]);
     if (!isRecord(payload)) continue;
     const entries: FindingDisposition[] = [];

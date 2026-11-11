@@ -215,11 +215,12 @@ contract findings gate even with only a path and no line. Recognized blocking
 heading-only findings also gate approval under `ai-implement`, without requiring
 `claude-review-summary` in the reviewer selection; minor findings remain
 advisory. The step logs the selected comment id and parse kind beside its review
-process verdict log. Top-level comments do not supply commit identity. The step uses the single matching
-check with a real review conclusion, fetched from the current head's check-runs
-endpoint, and validates its `started_at` and `completed_at` timestamps. Comment creation
+process verdict log. Top-level comments do not supply commit identity. The step uses all matching
+checks with real review conclusions, fetched from the current head's check-runs
+endpoint, and validates their `started_at` and `completed_at` timestamps. The review window spans
+the earliest start to the latest completion. Comment creation
 must be at or after `started_at`; editing an older head's approval cannot bring it
-into the current review. Missing/invalid check timing, multiple real review checks,
+into the current review. Missing/invalid check timing,
 missing comment creation time, or no eligible comment makes the verdict unavailable.
 Final comments and tracker edits may arrive after `completed_at`; unavailable or
 incomplete verdicts keep the existing wait pending until its time limit. This intentionally
@@ -298,3 +299,11 @@ review” and requires manual review, with no approval.
 
 The post-run late-review rail can still consume a verdict that arrives after
 the in-run wait ends; see [review-fix-rail.md](review-fix-rail.md).
+
+
+Internal findings remain in the run's report for reviewer attribution. An internal
+finding absent from the final complete internal review is fixed: the callback
+resolves its ledger revision with a fixed disposition, so scorecards count it as
+fixed rather than ignored. Findings reported again by the final review remain open.
+An incomplete final review cannot establish absence. Callback retries preserve the
+original dispatch revision and cannot reopen a resolved finding or close a newer report.

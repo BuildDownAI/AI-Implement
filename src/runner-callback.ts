@@ -1162,9 +1162,8 @@ async function handleRunnerResultInternal(
           (f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) ||
           (f.reviewerId !== undefined && typeof f.reviewerId !== "string")) continue;
       const key = stableReviewFindingKey(f);
-      const existing = getReviewFindingsByKeys(internalJob.repo, internalPr, [key])[0];
       const report = recordInternalReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr }, claims.dispatchId);
-      if ((!existing || existing.status === "resolved" || existing.lastSeenAt <= internalJob.dispatchedAt) && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
+      if (sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
         markReviewFindingResolvedIfRevision(report.id, report.revision);
       }
     }

@@ -52,7 +52,7 @@ function withCurrentReview(spawn: (args: string[]) => { stdout: string; exitCode
     if (args.some(a => a.includes("/check-runs"))) {
       const payload = JSON.parse(result.stdout);
       for (const page of Array.isArray(payload) ? payload : [payload]) {
-        for (const run of page.check_runs ?? []) Object.assign(run, { started_at: "2026-11-10T20:00:00Z", completed_at: "2026-11-10T20:45:00Z" });
+        for (const run of page.check_runs ?? []) Object.assign(run, { started_at: run.started_at ?? "2026-11-10T20:00:00Z", completed_at: run.completed_at ?? "2026-11-10T20:45:00Z" });
       }
       return { ...result, stdout: JSON.stringify(payload) };
     }
@@ -803,6 +803,9 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(approved);
     expect(out.iterations).toBe(3);
+    expect(out.internalFindings).toEqual([expect.objectContaining({ body: "bug" })]);
+    expect(out.findingDispositions.filter(d => d.disposition === "fixed")).toHaveLength(approved ? 1 : 0);
+
     expect(publicationFetch.calls.map(call => JSON.parse(call.body).iteration)).toEqual([1, 2, 3]);
     expect(gitPushCalls.length).toBe(2);
     expect(publicationsBeforeFix).toEqual([1, 2]);
@@ -810,6 +813,52 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 1/2"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 2/2"))).toBe(true);
     expect(ghComments.some((c) => approved ? c.includes("✅ Approved (3 iterations)") : (c.includes("The review examined the change 3 times and found problems each time.") && c.includes("(Code: `iterations_exhausted`)")))).toBe(true);
+  });
+
+  it("fixes an early internal finding when iteration two approves", async () => {
+    const approved = true;
+    const notApproved = { approved: false, findings: [{ severity: "blocking", body: "bug" }], summary: "fix the bug", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
+    const ghComments: string[] = [];
+    const gitPushCalls: string[][] = [];
+    const publicationsBeforePush: number[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "push") {
+        gitPushCalls.push(args);
+        publicationsBeforePush.push(publicationFetch.calls.length);
+      }
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tfile.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const publicationsBeforeFix: number[] = [];
+    const invoke = vi.fn(async (params) => {
+      if (params.stage.startsWith("post-push-review/fix-")) publicationsBeforeFix.push(publicationFetch.calls.length);
+      return structuredReviewResult(approved && /(?:gap-analysis|code-review)-review-2$/.test(params.stage)
+        ? { approved: true, findings: [], summary: "All fixed", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] }
+        : notApproved);
+    });
+    const ctx = makeCtx(invoke);
+
+    const out = await runReview(
+      ctx,
+      { prNumber: "42", workspaceDir, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(approved);
+    expect(out.iterations).toBe(2);
+    expect(out.internalFindings).toEqual([expect.objectContaining({ body: "bug" })]);
+    expect(out.findingDispositions).toEqual([expect.objectContaining({ disposition: "fixed" })]);
   });
 
   it("runs a fix pass when reviewer approves but reports actionable issues", async () => {
@@ -4313,8 +4362,8 @@ describe("postPushReviewStep", () => {
         return {
           stdout: JSON.stringify({
             check_runs: [
-              { name: "review", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
-              { name: "code-review-plugin", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
+              { name: "review", started_at: "2026-11-10T20:00:00Z", completed_at: "2026-11-10T20:10:00Z", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
+              { name: "code-review-plugin", started_at: "2026-11-10T20:45:00Z", completed_at: "2026-11-10T20:50:00Z", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
             ],
           }),
           exitCode: 0,
@@ -4333,8 +4382,9 @@ describe("postPushReviewStep", () => {
     // Both names must be recognised as the external review gate (not absent), causing the step to wait.
     expect(sleep).toHaveBeenCalled();
     expect(checkProbes).toBeGreaterThanOrEqual(2);
-    // Both completed jobs are ambiguous for top-level comment attribution.
-    expect(out.approved).toBe(false);
+    // Both completed jobs provide a current review window.
+    expect(out.approved).toBe(true);
+    expect(sleep.mock.calls.length).toBeLessThan(5);
   });
 
   it("logs a warning when check runs are present but none match the external review gate", async () => {
@@ -6282,7 +6332,8 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
     ["invalid", "deployment-bot", undefined, false],
     ["fixed", "deployment-bot", "deployment-bot", false],
   ] as const)("seeds %s from %s with own identity %s (approved %s)", async (disposition, author, ownLogin, approved) => {
-    const marker = (d: string) => `<!-- ai-implement closed-findings v1 ${JSON.stringify({ [d === "invalid" ? "rejected" : d === "follow-up" ? "deferred" : "fixed"]: [findingKey] })} -->`;
+    const marker = (d: string) => `<!-- ai-implement post-push iter=1 -->
+<!-- ai-implement closed-findings v1 ${JSON.stringify({ [d === "invalid" ? "rejected" : d === "follow-up" ? "deferred" : "fixed"]: [findingKey] })} -->`;
     const log = vi.spyOn(console, "log");
     const warn = vi.spyOn(console, "warn");
     const { ghSpawn } = ghSpawnWithOneExternalFinding({ ownLogin, history: [
@@ -6305,7 +6356,8 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
     const deferredKey = "d".repeat(64);
     const base = ghSpawnWithOneExternalFinding({ ownLogin: "deployment-bot", history: [{
       user: { login: "deployment-bot" },
-      body: `<!-- ai-implement closed-findings v1 ${JSON.stringify({ rejected: [findingKey] })} -->`,
+      body: `<!-- ai-implement post-push iter=1 -->
+<!-- ai-implement closed-findings v1 ${JSON.stringify({ rejected: [findingKey] })} -->`,
     }] });
     const ghSpawn = vi.fn((args: string[]) => {
       const result = base.ghSpawn(args);
