@@ -81,6 +81,8 @@ describe("Linear GraphQL failures", () => {
     [{ type: null, code: 42 }, undefined],
     [{ type: "unknown", code: "fallback" }, "unknown"],
     [{ code: "unknown" }, "unknown"],
+    [{ type: "FORBIDDEN", code: "forbidden", statusCode: "403" }, "FORBIDDEN"],
+    [{ http: { status: 403 } }, undefined],
     [{ type: 42, code: "fallback" }, "fallback"],
     ["malformed", undefined],
   ])("retains the first error and safely reads extensions %j", async (extensions, extensionsType) => {
@@ -95,6 +97,48 @@ describe("Linear GraphQL failures", () => {
       linearMessage: "not allowed to take action", extensionsType, permanent: false,
       message: "Linear GraphQL error (commentCreate): not allowed to take action",
     });
+  });
+
+  it("classifies the recorded scope refusal as permanent through label creation", async () => {
+    const refusal = { errors: [{
+      message: "Invalid scope: `write` required",
+      extensions: {
+        type: "forbidden", code: "FORBIDDEN", statusCode: 403,
+        userError: true, http: { status: 400 },
+      },
+    }] };
+    linear(
+      { json: refusal },
+      data({ issue: { team: { key: "THR2" } } }),
+      data({ teams: { nodes: [{ id: "team-thr2" }] } }),
+      data({ issueLabels: { nodes: [] } }),
+      { json: refusal },
+    );
+    const provider = new LinearProvider({});
+    const error = await provider.postComment("i", "b").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(LinearGraphQLError);
+    expect(error).toMatchObject({
+      permanent: true, extensionsType: "forbidden",
+      linearMessage: "Invalid scope: `write` required",
+    });
+    const labelError = await provider.markPlanningStarted("i", "AII").catch((err: unknown) => err);
+    expect(labelError).toBeInstanceOf(LinearLabelWriteError);
+    expect(labelError).toBeInstanceOf(LinearGraphQLError);
+    expect(labelError).toMatchObject({
+      operation: "issueLabelCreate", label: "AI-Planning", teamKey: "THR2", action: "create",
+      permanent: true, extensionsType: "forbidden",
+      linearMessage: "Invalid scope: `write` required",
+    });
+  });
+
+  it.each([
+    { type: "forbidden" },
+    { code: "FORBIDDEN" },
+    { statusCode: 403 },
+    { type: "unknown", code: "FORBIDDEN" },
+  ])("classifies structured permission refusals as permanent %j", async (extensions) => {
+    linear({ json: { errors: [{ message: "write refused", extensions }] } });
+    await expect(new LinearProvider({}).postComment("i", "b")).rejects.toMatchObject({ permanent: true });
   });
 
   it("adds label and actual team context to a refused create", async () => {

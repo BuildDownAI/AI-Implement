@@ -313,11 +313,15 @@ export class LinearProvider implements TicketingProvider {
       const error = json.errors[0];
       const extensions = error.extensions;
       let extensionsType: string | undefined;
+      let permanent = false;
       if (extensions && typeof extensions === "object") {
+        permanent = ("type" in extensions && extensions.type === "forbidden")
+          || ("code" in extensions && extensions.code === "FORBIDDEN")
+          || ("statusCode" in extensions && extensions.statusCode === 403);
         if ("type" in extensions && typeof extensions.type === "string") extensionsType = extensions.type;
         else if ("code" in extensions && typeof extensions.code === "string") extensionsType = extensions.code;
       }
-      throw new LinearGraphQLError(operation, error.message, extensionsType);
+      throw new LinearGraphQLError(operation, error.message, extensionsType, permanent);
     }
     if (!json.data) {
       throw new Error("Linear API returned no data");
