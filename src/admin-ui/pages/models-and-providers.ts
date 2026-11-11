@@ -59,6 +59,7 @@ export const modelsAndProvidersHtml = `
         </div>
         <div id="mp-account-empty" class="hidden text-tertiary" style="padding:12px">No account profiles yet. An operator provisions accounts on the host; see the instructions below.</div>
         <div id="mp-account-error" class="error hidden" style="padding:0 12px"></div>
+        <div id="mp-account-notice" class="text-tertiary hidden" style="padding:0 12px"></div>
         <div id="mp-pairing" class="hidden" style="padding:12px"></div>
         <div id="mp-account-form" class="hidden" style="padding:12px">
           <h3 style="font-size:13px;margin:0 0 6px">Add account profile</h3>
@@ -367,6 +368,12 @@ export const modelsAndProvidersScript = `(function () {
     el.classList.toggle('hidden', !msg);
   }
 
+  function mpAccountNotice(msg) {
+    const el = document.getElementById('mp-account-notice');
+    el.textContent = msg || '';
+    el.classList.toggle('hidden', !msg);
+  }
+
   function mpRenderPairing() {
     const el = document.getElementById('mp-pairing');
     if (!mpPairing) { el.classList.add('hidden'); el.textContent = ''; return; }
@@ -442,6 +449,7 @@ export const modelsAndProvidersScript = `(function () {
   async function mpImportCredential() {
     if (!mpCanEdit()) return;
     mpAccountError('');
+    mpAccountNotice('');
     try {
       const res = await window.api('/api/tools/import_environment_credential', {
         method: 'POST', body: JSON.stringify({ args: {} }),
@@ -461,7 +469,7 @@ export const modelsAndProvidersScript = `(function () {
       mpAccounts = Array.isArray(data.accounts) ? data.accounts : [];
       mpRenderAccounts();
       mpRerenderWithCompat();
-      mpAccountError(result.body.profileId + ': ' + (result.status === 201 ? 'created' : 'already imported'));
+      mpAccountNotice(result.body.profileId + ': ' + (result.status === 201 ? 'created' : 'already imported'));
     } catch (err) {
       mpAccountError('Import failed: ' + String(err));
     }

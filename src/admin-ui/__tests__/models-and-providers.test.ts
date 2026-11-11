@@ -187,7 +187,10 @@ describe("account profile names and editing", () => {
     win.registerPage = (_route: string, callback: () => void) => { activate = callback; };
     win.setInterval = (() => 0) as typeof win.setInterval;
     const api = vi.fn(async (path: string, options?: { method?: string; body?: string }) => {
-      if (options?.method === "PATCH") Object.assign(account, JSON.parse(options.body!).status ? { profileStatus: JSON.parse(options.body!).status } : JSON.parse(options.body!));
+      if (options?.method === "PATCH") {
+        const { status, ...fields } = JSON.parse(options.body!);
+        Object.assign(account, fields, status ? { profileStatus: status } : {});
+      }
       return { ok: !(conflict && options?.method === "POST"), status: 409, json: async () => conflict && options?.method === "POST" ? { error: "Profile already exists" } : path === "/api/model-accounts" ? { accounts: [account] } : { mode: "legacy", stages: {} } };
     });
     win.api = api;
@@ -290,6 +293,7 @@ describe("account profile names and editing", () => {
     try {
       click("edit-profile");
       change("[data-edit-name]", "Submitted name");
+      change("[data-edit-status]", "disabled");
       click("save-profile");
       const assertLocked = () => {
         for (const selector of ["[data-edit-name]", "[data-edit-status]", '[data-act="save-profile"]', '[data-act="cancel-profile"]']) {
@@ -307,10 +311,13 @@ describe("account profile names and editing", () => {
         if (success) {
           expect(win.document.querySelector("[data-edit-name]")).toBeNull();
           expect(win.document.querySelector("#mp-account-rows td")?.textContent).toContain("Submitted name");
+          expect(win.document.querySelector("#mp-account-rows td:nth-child(5) .badge")?.textContent).toBe("disabled");
         } else {
           const name = win.document.querySelector<HTMLInputElement>("[data-edit-name]")!;
           expect(name.disabled).toBe(false);
           expect(name.value).toBe("Submitted name");
+          expect(win.document.querySelector<HTMLSelectElement>("[data-edit-status]")?.value).toBe("disabled");
+          expect(win.document.querySelector<HTMLButtonElement>('[data-act="save-profile"]')?.disabled).toBe(false);
           expect(win.document.querySelector<HTMLSelectElement>("[data-edit-status]")?.disabled).toBe(false);
           expect(win.document.querySelector<HTMLButtonElement>('[data-act="cancel-profile"]')?.disabled).toBe(false);
           expect(win.document.querySelector("#mp-account-error")?.textContent).toContain("Save failed");
@@ -400,7 +407,7 @@ describe("Import orchestrator credential", () => {
       input.value = "unsaved-model";
       input.dispatchEvent(new win.Event("input", { bubbles: true }));
       win.document.getElementById("mp-import-credential")!.click();
-      await vi.waitFor(() => expect(win.document.getElementById("mp-account-error")!.textContent).toBe(`${profileId}: ${status === 201 ? "created" : "already imported"}`));
+      await vi.waitFor(() => expect(win.document.getElementById("mp-account-notice")!.textContent).toBe(`${profileId}: ${status === 201 ? "created" : "already imported"}`));
       expect(api.mock.calls.filter(([path]) => path === "/api/tools/import_environment_credential")).toEqual([
         ["/api/tools/import_environment_credential", { method: "POST", body: JSON.stringify({ args: {} }) }],
       ]);
@@ -408,7 +415,10 @@ describe("Import orchestrator credential", () => {
       expect(win.document.querySelector("#mp-account-rows td .mono")!.textContent).toBe(profileId);
       expect(win.document.querySelector<HTMLInputElement>('[data-stage="planning"][data-field="model"]')!.value).toBe("unsaved-model");
       expect(win.document.querySelector("img")).toBeNull();
-      expect(win.document.getElementById("mp-account-error")!.classList.contains("hidden")).toBe(false);
+      expect(win.document.getElementById("mp-account-notice")!.classList.contains("hidden")).toBe(false);
+      expect(win.document.getElementById("mp-account-notice")!.classList.contains("text-tertiary")).toBe(true);
+      expect(win.document.getElementById("mp-account-notice")!.classList.contains("error")).toBe(false);
+      expect(win.document.getElementById("mp-account-error")!.textContent).toBe("");
     } finally { win.close(); }
   });
 
@@ -423,6 +433,7 @@ describe("Import orchestrator credential", () => {
     try {
       const before = win.document.getElementById("mp-account-rows")!.innerHTML;
       await invoke();
+      expect(win.document.getElementById("mp-account-notice")!.textContent).toBe("");
       expect(win.document.getElementById("mp-account-error")!.textContent).toBe(message);
       expect(win.document.getElementById("mp-account-error")!.classList.contains("hidden")).toBe(false);
       expect(win.document.getElementById("mp-account-rows")!.innerHTML).toBe(before);
