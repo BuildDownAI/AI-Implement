@@ -43,6 +43,69 @@ describe("LinearProvider", () => {
   });
 });
 
+describe("LinearProvider.ensureLifecycleLabels", () => {
+  const names = ["AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review", "AI-Needs-Human"];
+  const team = () => data({ teams: { nodes: [{ id: "team-eng" }] } });
+  const found = (id: string) => data({ issueLabels: { nodes: [{ id, team: { id: "team-eng" } }] } });
+
+  it("reads all labels in order once and sends no requests when cached", async () => {
+    const fake = linear(team(), ...names.map(found));
+    const provider = new LinearProvider({});
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    expect(fake.calls).toHaveLength(6);
+    expect(variables(fake, 0)).toEqual({ key: "ENG" });
+    expect(fake.calls.slice(1).map((_, i) => variables(fake, i + 1))).toEqual(names.map(name => ({ name })));
+    expect(fake.calls.every(call => !JSON.parse(call.body).query.includes("mutation"))).toBe(true);
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    expect(fake.calls).toHaveLength(6);
+  });
+
+  it.each([true, false])("stops at a refused Plan-Complete create, forwarding permanent=%s, and retries there", async (permanent) => {
+    const fake = linear(
+      team(), found("planning"), data({ issueLabels: { nodes: [] } }),
+      { json: { errors: [{ message: "write refused", extensions: { type: permanent ? "forbidden" : "unknown" } }] } },
+      ...names.slice(1).map(found),
+    );
+    const provider = new LinearProvider({});
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({
+      ok: false, permanent, label: "Plan-Complete",
+      message: 'Linear refused to create label "Plan-Complete" on team ENG: write refused',
+    });
+    expect(fake.calls).toHaveLength(4);
+    expect(variables(fake, 2)).toEqual({ name: "Plan-Complete" });
+    expect(variables(fake, 3)).toEqual({ teamId: "team-eng", name: "Plan-Complete", color: "#10B981" });
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    expect(fake.calls.slice(4).map((_, i) => variables(fake, i + 4).name)).toEqual(names.slice(1));
+  });
+
+  it.each([new Error("network down"), "network down"])("returns a transient result for a request rejection: %s", async (error) => {
+    const fake = linear(team(), () => { throw error; });
+    await expect(new LinearProvider({}).ensureLifecycleLabels("ENG")).resolves.toEqual({
+      ok: false, permanent: false, label: "AI-Planning", message: "network down",
+    });
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("reuses a created label in its lifecycle verb without another search", async () => {
+    const fake = linear(
+      team(), data({ issueLabels: { nodes: [] } }),
+      data({ issueLabelCreate: { issueLabel: { id: "created-planning" } } }),
+      ...names.slice(1).map(found),
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ issue: { labels: { nodes: [] } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ issue: { state: { type: "completed" } } }),
+    );
+    const provider = new LinearProvider({});
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    const preparedCalls = fake.calls.length;
+    await provider.markPlanningStarted("issue-1", "ENG");
+    expect(fake.calls).toHaveLength(preparedCalls + 4);
+    expect(variables(fake, preparedCalls + 2)).toEqual({ issueId: "issue-1", labelIds: ["created-planning"] });
+    expect(fake.calls.slice(preparedCalls).every(call => !JSON.parse(call.body).query.includes("issueLabels"))).toBe(true);
+  });
+});
+
 describe("LinearProvider.postComment", () => {
   it("sends the GraphQL commentCreate mutation with issueId and body", async () => {
     const fake = linear(data({ commentCreate: { success: true } }));

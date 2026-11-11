@@ -4,6 +4,7 @@ import type {
   FeatureNodeRollUp,
   IssueLifecycleState,
   LinearSetupFacts,
+  LifecycleLabelsResult,
   TicketIssue,
   TicketingProvider,
   ProviderConfig,
@@ -904,6 +905,31 @@ export class LinearProvider implements TicketingProvider {
   }
 
   // ---------- lifecycle verbs ----------
+
+  async ensureLifecycleLabels(scopeKey: string): Promise<LifecycleLabelsResult> {
+    const caches: Record<keyof typeof LINEAR_LABELS, Map<string, string>> = {
+      planning: this.aiPlanningLabelCache,
+      planComplete: this.planCompleteLabelCache,
+      working: this.aiWorkingLabelCache,
+      readyForReview: this.readyForReviewLabelCache,
+      needsHuman: this.needsHumanLabelCache,
+    };
+    for (const key of Object.keys(LINEAR_LABELS) as Array<keyof typeof LINEAR_LABELS>) {
+      const label = LINEAR_LABELS[key];
+      try {
+        await this.ensureTeamLabel(scopeKey, label, caches[key]);
+      } catch (err) {
+        if (err instanceof LinearLabelWriteError) {
+          return { ok: false, permanent: err.permanent, label: err.label, message: err.message };
+        }
+        return {
+          ok: false, permanent: false, label: label.name,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+    return { ok: true };
+  }
 
   async markPlanningStarted(issueId: string, _scopeKey: string): Promise<void> {
     const teamKey = await this.getTeamKeyForIssue(issueId);

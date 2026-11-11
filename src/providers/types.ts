@@ -201,6 +201,10 @@ export type IssueLifecycleState = "active" | "completed" | "cancelled";
 
 export type ProviderId = "linear" | "jira" | (string & {});
 
+export type LifecycleLabelsResult =
+  | { ok: true }
+  | { ok: false; permanent: boolean; label: string; message: string };
+
 export interface TicketingProvider {
   readonly id: string;
 
@@ -210,6 +214,10 @@ export interface TicketingProvider {
   /** Recently-completed feature-node issues whose branch should roll up into its
    *  parent (feature-branch grouping merge-up). */
   fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]>;
+
+  /** Prepare lifecycle labels for a scope. May write by creating missing labels; safe
+   *  to call on every dispatch. Providers with nothing to prepare leave this out. */
+  ensureLifecycleLabels?(scopeKey: string): Promise<LifecycleLabelsResult>;
 
   // Lifecycle verbs.
   //

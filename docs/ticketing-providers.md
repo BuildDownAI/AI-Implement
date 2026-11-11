@@ -101,6 +101,8 @@ The poll matches the pickup label by its exact name (`labels: { name: { eq } }`)
 
 ### Lifecycle labels
 
+The optional `ensureLifecycleLabels(scopeKey)` provider verb prepares every lifecycle label for a scope and may create missing labels. It is safe to call on every dispatch; no caller is wired yet. Linear checks labels in `LINEAR_LABELS` order using the lifecycle verbs’ existing caches, stops at the first failure, and returns its label, message and permanence (other errors are transient). Once cached, preparation sends no requests. Providers with nothing to prepare, including Jira and filesystem, omit the verb.
+
 The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working`, once a PR opens `Ready for Review`, and, when the stuck watchdog gives up, `AI-Needs-Human`. The poll skips an issue carrying `AI-Needs-Human` before it counts capacity, so a park that added the marker but failed to remove `AI-Working` does not hold a slot. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
 
 ### Workflow states
