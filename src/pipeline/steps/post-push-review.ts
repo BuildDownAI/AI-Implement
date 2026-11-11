@@ -1,3 +1,4 @@
+import { IMPLEMENT_CONTINUATION_NOTE } from "../feedback-loop-core.js";
 import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../review-publication-limits.js";
 import { buildInlineReviewComments, inlineCommentBody } from "../review-inline-comments.js";
 import { removeScratchFromIndex } from "../scratch-exclude.js";
@@ -2741,8 +2742,8 @@ ${externalFindingsFixBlock}
       // commit the fix pass started from, reported as the cycle summary's `inputCommit`.
       const inputHead = leaseSha ? null : gitSpawn(["rev-parse", "HEAD"]);
       const fixCycleInputCommit = leaseSha ?? (inputHead?.exitCode === 0 && inputHead.stdout.trim() ? inputHead.stdout.trim() : null);
-      const invokeFix = () => context.llmExecutor.invoke({
-        prompt: fixPrompt,
+      const invokeFix = (continuation = false) => context.llmExecutor.invoke({
+        prompt: continuation ? `${fixPrompt}\n\n${IMPLEMENT_CONTINUATION_NOTE}` : fixPrompt,
         model,
         maxTurns: FIX_MAX_TURNS,
         stage: `post-push-review/fix-${iteration}`,
@@ -2765,10 +2766,10 @@ ${externalFindingsFixBlock}
           logs_url: null,
         });
         costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
-        fixResult = await invokeFix();
+        fixResult = await invokeFix(true);
       }
       costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
-      if (isLlmResultFailure(fixResult, false)) {
+      if (fixResult.exitCode !== 0 || (fixResult.telemetry?.outcome !== "max_turns" && isLlmResultFailure(fixResult, false))) {
         const fixFailure = fixResult.failure ?? classifyLlmResult(fixResult, {
           stage: `post-push-review/fix-${iteration}`, attempt: fixResult.attempts ?? 1, expectsStructuredOutput: false,
         });
