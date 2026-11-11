@@ -945,3 +945,16 @@ describe("autonomous pipeline step order", () => {
     expect(ids.indexOf("reference-repos")).toBeLessThan(ids.indexOf("dependency-auth"));
   });
 });
+
+it("skips all write and hook steps for review-only even when review approves", async () => {
+  const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+    existsSyncImpl: () => false, readFileSyncImpl: () => BUILTIN_PIPELINE_YAML,
+  });
+  const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [{ id: "integration-review", gates: true }] },
+    hooks: { setup: "setup.sh", verify: "verify.sh", teardown: "teardown.sh" } });
+  ctx.setOutputs("feedback-loop", { approved: true });
+  for (const id of ["install", "setup", "install-retry", "preflight", "push", "verify", "post-push-review"]) {
+    expect(await pipeline.steps.find(s => s.id === id)!.skip!(ctx)).toBeTruthy();
+  }
+  expect(await pipeline.steps.find(s => s.id === "feedback-loop")!.skip!(ctx)).toBe(false);
+});

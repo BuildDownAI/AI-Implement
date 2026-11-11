@@ -6533,3 +6533,29 @@ describe("owned result accounting boundary", () => {
     expect(runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false }).ok).toBe(false);
   });
 });
+
+it.each(["success", "failure"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
+  const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
+    ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET });
+  const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
+  log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
+  const findings = ["fixed", "invalid", "follow-up"].map(disposition => ({ source: "ai-implement-internal" as const,
+    severity: "blocking" as const, body: disposition }));
+  for (const finding of findings) reviewStore.recordInternalReviewFinding({ ...finding, repo: "org/repo", prNumber: 12 }, "prior");
+  const before = reviewStore.listOpenReviewFindings("org/repo", 12);
+  const submit = vi.fn();
+  const provider = new FakeProvider({ recordCalls: true });
+  const res = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
+    resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
+    body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [],
+      internalFindings: [...findings, { source: "ai-implement-internal", severity: "blocking", body: "new" }],
+      findingDispositions: findings.map((f, i) => ({ findingKey: reviewStore.stableReviewFindingKey(f),
+        disposition: (["fixed", "invalid", "follow-up"] as const)[i], reason: "test" })),
+      externalReviewPending: { headSha: "a".repeat(40) } },
+  });
+  expect(res.status).toBe(200);
+  expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual(before);
+  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome === "success" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
+  expect(submit).not.toHaveBeenCalled();
+  expect(provider.recordedCalls()).toHaveLength(0);
+});

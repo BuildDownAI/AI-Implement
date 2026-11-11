@@ -180,6 +180,7 @@ export interface RunnerResultBody {
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
   /** Internal findings collected across review iterations, validated before storage. */
+  reviewOnly?: boolean;
   internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
@@ -812,6 +813,7 @@ async function handleRunnerResultInternal(
   // otherwise burn a one-time-use token and lose any chance of retry from
   // the runner.
   const body = input.body as unknown as {
+    reviewOnly?: unknown;
     phase?: unknown;
     outcome?: unknown;
     comments?: unknown;
@@ -1125,6 +1127,13 @@ async function handleRunnerResultInternal(
       warn("checkImplementationAdmissionTermination", err);
     }
   };
+
+  if (body.reviewOnly === true) {
+    const job = getJobByDispatchId(claims.dispatchId);
+    if (job) updateJobStatus(job.id, body.outcome === "success" ? "completed" : "failed", "rollup_review", undefined, { skipAdmissionRelease: true });
+    await sendImplementationReport();
+    return { status: 200, body: { acknowledged: true, warnings } };
+  }
 
   for (const c of input.body.comments) {
     try {

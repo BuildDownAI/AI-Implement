@@ -472,3 +472,22 @@ production, intake admission, or publication. An old Fly/local runner drops the
 backend tag and, without GitHub IDs, reports no result; approval ends as
 `not_applicable` (fails closed). An old orchestrator with a newer runner retains
 the unchanged GitHub shape; machine launches remain a later slice.
+
+### Advisory review-only gap-fills
+
+`reviewOnly: { reviewers: ReviewerSelection[] }` selects a single internal review pass
+for an existing `prNumber` with `runnerPhase: "gap-analysis"`. The selection must be
+nonempty. Absent mode preserves the normal implement/fix gap-fill flow. Malformed
+mode fails decoding; it cannot be combined with `reviewFix`.
+
+GHA envelope dispatch, Fly and local Docker retain this payload. Legacy per-input
+GHA workflows reject the mode before launch. Use a runner image that supports it.
+The runner reads the PR's full base-to-head diff and invokes the selected internal
+reviewers once with read-only tools. It skips installs, repository hooks,
+implementation, fixes, preflight, commit/push, and external-review polling.
+
+It posts one advisory PR verdict comment marked `<!-- ai-implement rollup-review -->`,
+including finding severity, file:line and body (or an incomplete-review verdict on
+reviewer failure). The result carries `reviewOnly: true`. Its callback records the
+terminal dispatch status but writes no findings, dispositions or approval mark and
+never submits `LateExternalReview`. The verdict is not a merge gate.

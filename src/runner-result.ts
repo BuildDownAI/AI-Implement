@@ -161,6 +161,7 @@ export async function postRunnerResult(params: {
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
+  reviewOnly?: boolean;
   internalFindings?: ReviewLedgerFinding[];
   findingDispositions?: FindingDisposition[];
   /**
@@ -248,6 +249,7 @@ export async function postRunnerResult(params: {
   if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
     body.referenceRepoResults = params.referenceRepoResults;
   }
+  if (params.reviewOnly) body.reviewOnly = true;
   if (params.internalFindings) body.internalFindings = params.internalFindings;
   if (params.findingDispositions && params.findingDispositions.length > 0) {
     body.findingDispositions = params.findingDispositions;

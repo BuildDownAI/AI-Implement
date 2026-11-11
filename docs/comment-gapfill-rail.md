@@ -74,3 +74,24 @@ When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left 
 | PR cannot be read (null or throw) | "could not read this PR from GitHub just now … repost" | `failed` |
 | No dispatch row, no roll-up parent, no in-flight match | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
 | PR dispatch budget reached | budget park message (once per park, also when the dispatch breaker parked the PR first) | `pending` |
+
+### Roll-up review-only runs
+
+A programmatic queue row whose commenter is `ROLLUP_REVIEW_COMMENTER`
+(`ai-implement-rollup-review`) requests an advisory review of the existing PR.
+The drain uses the usual PR identity resolution, including recovery from a roll-up
+parent. Restate launch preparation sets the envelope's `reviewOnly` payload to
+`integration-review` plus the project's effective gating reviewers, deduplicated by
+id. An unset project selection uses the normal defaults; an empty selection still
+runs `integration-review`. Open ledger findings are not appended as fix instructions.
+
+The runner reviews the full PR diff once and posts one verdict comment marked
+`<!-- ai-implement rollup-review -->`, containing severity, file:line and body for
+each finding. Reviewer failure produces an incomplete verdict. No implement or fix
+pass, repository hook, commit, push, or external-review polling runs. The callback
+finishes the dispatch row with `rollup_review` and preserves the findings ledger,
+dispositions and approval marks; it does not submit `LateExternalReview`. Findings
+are advisory and cannot authorize merging. The owning workflow preserves successful
+and failed `rollup_review` results, including when a deadline follows the callback,
+and releases the reservation without implementation tracker transitions or stuck
+remediation. Ordinary comment gap-fills are unchanged.

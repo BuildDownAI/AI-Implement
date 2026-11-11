@@ -29,8 +29,8 @@ vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...awa
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
-vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), ROLLUP_REVIEW_COMMENTER: "ai-implement-rollup-review", CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-drain.js", async original => ({ ...await original<typeof import("../comment-gapfill-drain.js")>(), buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), setJobMachineId: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn(async () => ({ token: "TOKEN-SENTINEL" })) }));
 vi.mock("../github.js", async original => ({ ...await original<object>(), dispatchWorkflow: vi.fn(), getWorkflowRunStatus: vi.fn(async () => null), cancelWorkflowRun: vi.fn(async () => true) }));
@@ -934,4 +934,15 @@ it.each(["retarget", "remove"].flatMap(drift => ["insert", "binding"].map(failur
   expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
   expect(dispatchGhaGapfill).not.toHaveBeenCalled();
   expect(resolveManagedDecision).not.toHaveBeenCalled();
+});
+
+it("dispatches synthetic roll-up review without fix instructions", async () => {
+  const { ROLLUP_REVIEW_COMMENTER } = await import("../comment-gapfill-queue.js");
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: ROLLUP_REVIEW_COMMENTER });
+  expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
+  expect(buildCommentGapfillInstruction).toHaveBeenCalledWith(item.instruction, []);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({
+    reviewOnly: { reviewers: expect.arrayContaining([{ id: "integration-review", gates: true }]) },
+  }));
 });
