@@ -722,8 +722,9 @@ describe("ordered account preparation", () => {
     config.stages!.implementation = { invocationTimeoutMs: 60_000, accounts: [{ accountProfileId: "brk", model: "m" }, { accountProfileId: "api", model: "m" }] };
     store.setOrchestratorDefaults(config);
   }
-  it("grants more than sixteen stage/profile bindings and reuses all of them", async () => {
-    const accounts = ["api", ...Array.from({ length: 5 }, (_, i) => `fallback-${i}`)];
+  it.each([false, true])("fits frozen fallbacks into sixteen bindings (overflow=%s)", async overflow => {
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const accounts = ["api", ...Array.from({ length: 6 }, (_, i) => `fallback-${i}`)];
     for (const profileId of accounts.slice(1)) {
       store.saveAccountProfileRevision({
         profileId, identity: profileId, revision: 1, agent: "claude", provider: "anthropic",
@@ -734,23 +735,36 @@ describe("ordered account preparation", () => {
     for (const stage of ["planning", "implementation", "review"] as const) {
       config.stages![stage] = {
         invocationTimeoutMs: 60_000,
-        accounts: accounts.map(accountProfileId => ({ accountProfileId, model: "m" })),
+        accounts: (overflow ? accounts : accounts.slice(0, stage === "review" ? 6 : 5)).map(accountProfileId => ({ accountProfileId, model: "m" })),
       };
     }
     store.setOrchestratorDefaults(config);
     const first = ready(await prep.prepareAgentRun(request(), deps));
-    expect(first.grant.bindings).toHaveLength(18);
+    expect(first.grant.bindings).toHaveLength(16);
     expect(first.takeBootstrap()!.bindings).toEqual(first.grant.bindings);
     for (const stage of ["planning", "implementation", "review"] as const) {
-      expect(first.grant.bindings.filter(b => b.stage === stage).map(b => b.profileId)).toEqual(accounts);
-      expect(first.accountFallbacks?.[stage]?.map(b => b.accountProfileId)).toEqual(accounts.slice(1));
+      expect(first.grant.bindings.filter(b => b.stage === stage).map(b => b.profileId)).toEqual(accounts.slice(0, stage === "review" ? 6 : 5));
+      expect(first.accountFallbacks?.[stage]?.map(b => b.accountProfileId)).toEqual(accounts.slice(1, stage === "review" ? 6 : 5));
     }
     const bindings = rows("model_credential_grant_profiles");
-    expect(bindings).toHaveLength(18);
+    expect(bindings).toHaveLength(16);
+    expect(JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string).accountFallbacks).toEqual(first.accountFallbacks);
+    const drops = log.mock.calls.map(call => call[0] as string).filter(line => line.startsWith("Stage account fallback dropped "));
+    expect(drops).toEqual(overflow ? [
+      ["planning", "fallback-5"], ["implementation", "fallback-5"], ["review", "fallback-5"],
+      ["planning", "fallback-4"], ["implementation", "fallback-4"],
+    ].map(([stage, profileId]) => `Stage account fallback dropped ${JSON.stringify({ stage, profileId })}`) : []);
+    config.stages!.planning!.accounts = [{ accountProfileId: "api", model: "changed" }];
+    store.setOrchestratorDefaults(config);
+    store.retireAccountProfile("fallback-0");
+    const logCount = log.mock.calls.length;
     const again = ready(await prep.prepareAgentRun(request(), deps));
+    expect(log).toHaveBeenCalledTimes(logCount);
     expect(again.grant.bindings).toEqual(first.grant.bindings);
     expect(again.accountFallbacks).toEqual(first.accountFallbacks);
     expect(rows("model_credential_grant_profiles")).toEqual(bindings);
+    expect(bindings.map(b => `${b.stage}:${b.profile_id}`).sort()).toEqual(first.grant.bindings.map(b => `${b.stage}:${b.profileId}`).sort());
+    log.mockRestore();
   });
   it("grants every frozen fallback without proving its credentials and reuses the list", async () => {
     configure();

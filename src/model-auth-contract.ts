@@ -81,6 +81,7 @@ export const MODEL_AUTH_FAILURE_CATEGORIES = [
 ] as const;
 export type ModelAuthFailureCategory = (typeof MODEL_AUTH_FAILURE_CATEGORIES)[number];
 
+export const MAX_MODEL_AUTH_BINDINGS = 16;
 export const MAX_MODEL_AUTH_ID_LENGTH = 128;
 export const MIN_MODEL_AUTH_BEARER_LENGTH = 32;
 export const MAX_MODEL_AUTH_BEARER_LENGTH = 256;
@@ -271,9 +272,8 @@ export function validateModelAuthGrantBinding(raw: unknown): ValidationResult<Mo
 }
 
 function validateBindingList(raw: unknown): ValidationResult<readonly ModelAuthGrantBinding[]> {
-  // Account lists have no configured size limit; grant every frozen stage/profile.
-  if (!Array.isArray(raw) || raw.length === 0) {
-    return err("bindings must be a non-empty array");
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_MODEL_AUTH_BINDINGS) {
+    return err("bindings must be an array with 1-16 entries");
   }
   const bindings: ModelAuthGrantBinding[] = [];
   for (const item of raw) {

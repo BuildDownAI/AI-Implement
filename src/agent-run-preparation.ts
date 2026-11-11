@@ -50,6 +50,7 @@ import { getProjectOptIn, resolveCandidateProjectStageConfig, resolveProjectStag
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import {
   MODEL_AUTH_AUDIENCE,
+  MAX_MODEL_AUTH_BINDINGS,
   isSubscriptionAuthMode,
   reservesModelAccount,
   parseModelAuthGrantBootstrap,
@@ -303,8 +304,26 @@ function resolveForRequest(request: AgentRunRequest): Resolved {
 
 /** Persists the snapshot keyed by dispatch id; a concurrent writer's row wins and is what is returned. */
 function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapshotV1, fallbackModels: FallbackModels, metadata: SelectionMetadata): Resolved {
+  // Preserve each stage's chosen account and fallback prefix within the wire budget.
+  const accountFallbacks = { ...metadata.accountFallbacks };
+  for (const stage of STAGE_NAMES) {
+    if (accountFallbacks[stage]) accountFallbacks[stage] = [...accountFallbacks[stage]!];
+  }
+  const dropped: { stage: StageName; profileId: string }[] = [];
+  let count = STAGE_NAMES.length + Object.values(accountFallbacks).reduce((sum, entries) => sum + (entries?.length ?? 0), 0);
+  while (count > MAX_MODEL_AUTH_BINDINGS) {
+    for (const stage of STAGE_NAMES) {
+      if (count <= MAX_MODEL_AUTH_BINDINGS) break;
+      const entry = accountFallbacks[stage]?.pop();
+      if (entry) {
+        dropped.push({ stage, profileId: entry.accountProfileId });
+        count--;
+      }
+    }
+  }
+  metadata = { ...metadata, accountFallbacks };
   const db = getDb();
-  db.prepare(
+  const inserted = db.prepare(
     `INSERT OR IGNORE INTO run_agent_config_snapshots
        (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -317,6 +336,7 @@ function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapsh
     JSON.stringify(snapshot.configRevisions),
     Date.now(),
   );
+  if (inserted.changes) for (const entry of dropped) console.info(`Stage account fallback dropped ${JSON.stringify(entry)}`);
   const row = readSnapshotRow(request.dispatchId);
   const stored = row ? snapshotFromRow(row) : null;
   return stored ? { kind: "snapshot", snapshot: stored, stored: true, fallbackModels: fallbackModelsFromRow(row!), metadata: metadataFromRow(row!) } : { kind: "error", code: "snapshot_invalid" };
