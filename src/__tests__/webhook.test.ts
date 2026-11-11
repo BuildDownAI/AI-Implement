@@ -1,3 +1,4 @@
+import { inlineCommentBody } from "../pipeline/review-inline-comments.js";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -2410,6 +2411,38 @@ describe("bot review gate integration (AII-745)", () => {
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
     }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores its inline finding trailer from a trusted Bot on the current head after dispatch", async () => {
+    const jobId = appendDispatch({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/56");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: inlineCommentBody({ severity: "medium", body: "Add a null check.", path: "src/x.ts", line: 5 }),
+        html_url: "https://github.com/org/repo/pull/56#discussion_r103",
+        path: "src/x.ts",
+        line: 5,
+        user: { login: "ai-implement[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: new Date(Date.now() + 1_000).toISOString(),
+      },
+      pull_request: {
+        number: 56,
+        html_url: "https://github.com/org/repo/pull/56",
+        head: { ref: "ai-implement/aii-56-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 56)).toEqual([]);
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 

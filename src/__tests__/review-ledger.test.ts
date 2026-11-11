@@ -3,6 +3,7 @@ import pr1541 from "./fixtures/claude-review-pr-1541.json";
 import { describe, expect, it, vi } from "vitest";
 import { resolveReviewProcess } from "../review-process.js";
 import {
+  isAiImplementComment,
   classifyReviewIssueComment,
   collectClosedReviewThreadCommentUrls,
   collectExternalReviewFindingsFromGh,
@@ -15,6 +16,24 @@ import {
   type ReviewLedgerFinding,
   reviewContractFindingGates,
 } from "../pipeline/review-ledger.js";
+
+import { inlineCommentBody } from "../pipeline/review-inline-comments.js";
+
+describe("isAiImplementComment", () => {
+  const body = inlineCommentBody({ severity: "medium", body: "Add a null check." });
+
+  it.each([body, `${body} \n\t`])("recognizes an inline finding with optional trailing whitespace: %s", (comment) => {
+    expect(isAiImplementComment(comment)).toBe(true);
+  });
+
+  it("reads a review quoting the inline trailer in the middle", () => {
+    expect(isAiImplementComment(`The pipeline posted:\n${body}\nBut this still needs a fix.`)).toBe(false);
+  });
+
+  it("keeps recognizing a leading pipeline marker", () => {
+    expect(isAiImplementComment(" \n<!-- ai-implement finding-disposition -->\nResolved.")).toBe(true);
+  });
+});
 
 describe("extractClaudeSummaryFindings", () => {
   it("extracts normalized bullets from a blocking section only", () => {

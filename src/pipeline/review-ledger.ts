@@ -1,3 +1,4 @@
+import { AI_IMPLEMENT_INLINE_FINDING_TRAILER } from "./review-inline-comments.js";
 import { classifyClaudeInlineMarker, isTrustedReviewAuthor, resolveReviewProcess, type ReviewProcessDefinition } from "../review-process.js";
 
 export type ReviewLedgerSource =
@@ -1078,8 +1079,11 @@ function isGithubActionsClaudeReviewComment(comment: Record<string, unknown>): c
 }
 
 export function isAiImplementComment(body: string): boolean {
-  // Pipeline status comments lead with their marker. Review prose may quote one.
-  return body.trimStart().startsWith("<!-- ai-implement");
+  // Status comments lead with a marker; inline findings end with their exact trailer.
+  // Review prose may quote either marker in the middle.
+  const trimmed = body.trim();
+  return trimmed.startsWith("<!-- ai-implement")
+    || trimmed.endsWith(AI_IMPLEMENT_INLINE_FINDING_TRAILER);
 }
 
 function isClaudeAuthor(comment: Record<string, unknown>, options: ReviewLedgerOptions): boolean {
