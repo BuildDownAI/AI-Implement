@@ -64,6 +64,20 @@ describe("account usage-limit provider signatures", () => {
     }
   });
 
+  it.each([
+    { errorMessage: "You've hit your usage limit.", category: "auth", code: "ACCOUNT_USAGE_LIMIT" },
+    { stdout: "You've hit your usage limit.", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+    { stderr: "You've hit your usage limit.", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+    { errorMessage: "API Error: 429 overloaded_error", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+  ])("classifies exit-zero terminal errors using only provider usage-limit errors: %j", ({ category, code, ...text }) => {
+    const record = classifyLlmResult(llmResult({
+      exitCode: 0,
+      terminalStatus: { isError: true, subtype: "turn.failed" },
+      ...text,
+    }), CTX);
+    expect(record).toMatchObject({ category, code, retryable: false });
+  });
+
   it("does not classify bare limit text as an account usage limit", () => {
     expect(classifyThrown(new Error("limit"), CTX)).toMatchObject({ category: "unknown", code: "UNKNOWN" });
     expect(classifyLlmResult(llmResult({ exitCode: 1, errorMessage: "limit" }), CTX))
@@ -358,7 +372,7 @@ describe("classifyLlmResult", () => {
   });
 
   it("does not let a dropped reviewer verdict's mention of a transport error retry-classify a real structural failure (exit 0, missing structured output)", () => {
-    // PROVIDER_SIGNATURES must never be consulted when exitCode === 0: the model's own
+    // Provider signatures must never match stdout when exitCode === 0: the model's own
     // final text is part of the match input, so a reviewer verdict that got dropped
     // mid-stream (no structured_output) but happened to discuss "API Error 503" in its
     // prose must classify as the structural failure it is, not as a retryable transport

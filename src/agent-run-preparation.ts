@@ -75,7 +75,7 @@ import {
   type ReservedProfile,
   type TransitionResult,
 } from "./model-session-ownership.js";
-import { validateResolvedAgentSnapshot, type ResolvedAgentSnapshotV1 } from "./run-config.js";
+import { copyAccountFallbacks, validateResolvedAgentSnapshot, type AccountFallbacks, type ResolvedAgentSnapshotV1 } from "./run-config.js";
 
 /** Marker a synced `claude-implement.yml` must carry to execute an opted-in snapshot. Older templates ignore the snapshot. */
 export const AGENT_CONFIG_TEMPLATE_CAPABILITY = "ai-implement-capability: stage-agent-config-v1";
@@ -234,6 +234,23 @@ function snapshotFromRow(row: SnapshotRow): ResolvedAgentSnapshotV1 | null {
 export function loadStoredSnapshot(dispatchId: string): ResolvedAgentSnapshotV1 | null {
   const row = readSnapshotRow(dispatchId);
   return row ? snapshotFromRow(row) : null;
+}
+
+/** Trusted fallback entries frozen at dispatch, not runner-supplied account claims. */
+export function loadStoredAccountFallbacks(dispatchId: string): AccountFallbacks | undefined {
+  const row = readSnapshotRow(dispatchId);
+  if (!row) return undefined;
+  try {
+    return copyAccountFallbacks(JSON.parse(row.resolved_config_json).accountFallbacks);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Model fallbacks frozen with the dispatch; never authorize a runner-supplied model. */
+export function loadStoredFallbackModels(dispatchId: string): Partial<Record<StageName, string>> {
+  const row = readSnapshotRow(dispatchId);
+  return row ? fallbackModelsFromRow(row) : {};
 }
 
 type SelectionMetadata = Pick<ConfiguredStageResolution, "selection" | "accountFallbacks">;

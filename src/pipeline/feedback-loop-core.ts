@@ -326,7 +326,7 @@ export async function runFeedbackLoop(
         const invocationFailure = outputs.invocationFailure as FailureRecord | undefined;
         // Exit-zero fatal results normally retain partial work for review. A capacity
         // switch must instead reach the same retry rail as a thrown invocation failure.
-        if (invocationFailure?.modelFallback || (invocationFailure?.code === "PROVIDER_OVERLOADED" && fallbackOrigins.implementation)) {
+        if (invocationFailure?.accountFallback || invocationFailure?.code === "ACCOUNT_USAGE_LIMIT" || invocationFailure?.modelFallback || (invocationFailure?.code === "PROVIDER_OVERLOADED" && fallbackOrigins.implementation)) {
           throw Object.assign(new Error(invocationFailure.message), { failure: invocationFailure, telemetry: outputs.telemetry });
         }
         implementSubStep.status = "passed";
@@ -355,7 +355,7 @@ export async function runFeedbackLoop(
         const fallback = implementFailure.modelFallback;
         const fallbackRetry = fallback?.stage === "implementation" && !fallbackOrigins.implementation;
         if (fallbackRetry) fallbackOrigins.implementation = fallback.from;
-        const willRetryImplement = fallbackRetry || (isTransient && implementStageAttempt <= params.retryPolicy.stageRetries);
+        const willRetryImplement = implementFailure.accountFallback?.stage === "implementation" || fallbackRetry || (isTransient && implementStageAttempt <= params.retryPolicy.stageRetries);
         // A retried attempt's failure must not overwrite the canonical `implement.{iteration}`
         // row — that id is reserved for the final attempt (BAC-27134's "keep every attempt's
         // evidence"), so a retried attempt's failure record and telemetry are preserved under
@@ -644,7 +644,7 @@ export async function runFeedbackLoop(
         const fallback = reviewFailure.modelFallback;
         const fallbackRetry = fallback?.stage === "review" && !fallbackOrigins.review;
         if (fallbackRetry) fallbackOrigins.review = fallback.from;
-        const willRetryReview = fallbackRetry || (isTransient && reviewStageAttempt <= params.retryPolicy.stageRetries);
+        const willRetryReview = reviewFailure.accountFallback?.stage === "review" || fallbackRetry || (isTransient && reviewStageAttempt <= params.retryPolicy.stageRetries);
         // A retried attempt's failure must not overwrite the canonical `review.{iteration}`
         // row — see the matching implement-stage comment above (BAC-27134).
         if (willRetryReview) {
@@ -685,6 +685,8 @@ export async function runFeedbackLoop(
           effects.warn(
             `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
           );
+          // Preserve terminal usage-limit and checkout failures for the run's notice.
+          failureForOutputs = reviewFailure;
           feedback = `Review step failed and was skipped: ${String(err)}`;
           terminationReason = "review_error";
         }

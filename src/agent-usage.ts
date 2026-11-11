@@ -1,9 +1,9 @@
-import { loadStoredSnapshot } from "./agent-run-preparation.js";
+import { loadStoredAccountFallbacks, loadStoredFallbackModels, loadStoredSnapshot } from "./agent-run-preparation.js";
 import { getDb } from "./dedup.js";
 import { recordInvocationAttribution, recordPushedCommits, recordInvocationsComplete } from "./log.js";
 import { isFailureRecord } from "./pipeline/failure-classification.js";
 import type { AccountAuthMode, StageName } from "./agent-config.js";
-import type { ResolvedAgentSnapshotV1 } from "./run-config.js";
+import type { AccountFallbacks, ResolvedAgentSnapshotV1 } from "./run-config.js";
 import {
   sanitizeAttribution,
   sanitizeInvocationRecords,
@@ -23,8 +23,8 @@ import {
  * persists sanitized runner accounting against that same snapshot.
  *
  * Authority rules:
- *  - stage/agent/provider/model/profile/authMode/timeout come from the snapshot, never from a
- *    claimed attribution. A disagreeing claim is surfaced as a mismatch *field name* only.
+ *  - stage/agent/provider/model/profile/authMode/timeout come from the snapshot or its persisted
+ *    fallback entries, never from a claimed attribution. A disagreeing claim is surfaced as a mismatch *field name* only.
  *  - observed outcome, usage and actual limit come from telemetry (attribution fills gaps).
  *  - null usage stays null, a reported zero stays zero, and cost is never derived from tokens.
  *  - `tokensIn` already includes cache reads/creation; cache fields are reported beside it and
@@ -114,6 +114,8 @@ function availabilityOf(tokensIn: number | null, tokensOut: number | null): Usag
 export function normalizeInvocation(
   snapshot: ResolvedAgentSnapshotV1,
   obs: InvocationObservation,
+  accountFallbacks?: AccountFallbacks,
+  fallbackModels: Partial<Record<StageName, string>> = {},
 ): InvocationUsageRow | null {
   const telemetry = obs.telemetry;
   let claim = sanitizeAttribution(obs.attribution ?? telemetry?.attribution);
@@ -127,8 +129,20 @@ export function normalizeInvocation(
   const stage = isStage(snapshot, obs.stage) ? obs.stage : claim && isStage(snapshot, claim.stage) ? claim.stage : null;
   if (stage === null) return null;
 
-  const selection = snapshot.stages[stage];
-  const profile = snapshot.profiles[stage];
+  // Claims select only a complete matching, operator-approved entry. Identity and revision
+  // are copied from persisted metadata, never from the runner. A partial match stays a mismatch.
+  const account = claim?.stage === stage ? accountFallbacks?.[stage]?.find(entry =>
+    entry.accountProfileId === claim.profileId && entry.agent === claim.agent
+    && entry.provider === claim.provider && entry.authMode === claim.authMode
+    && (entry.model === claim.model || (entry.agent === snapshot.stages[stage].agent
+      && fallbackModels[stage] === claim.model)),
+  ) : undefined;
+  const selection = { ...snapshot.stages[stage], ...account,
+    ...(account && claim ? { model: claim.model } : {}),
+  };
+  const profile = account
+    ? { id: account.accountProfileId, revision: account.profileRevision, authMode: account.authMode }
+    : snapshot.profiles[stage];
   const mismatches: UsageMismatchField[] = [];
   const flag = (f: UsageMismatchField): void => {
     if (!mismatches.includes(f)) mismatches.push(f);
@@ -325,6 +339,8 @@ function recordResultInvocations(
   legacy: InvocationAttributionV1 | undefined,
   opts: { timedOut: boolean; accepts: (row: NonNullable<ReturnType<typeof normalizeInvocation>>) => boolean },
 ): number {
+  const accountFallbacks = loadStoredAccountFallbacks(dispatchId);
+  const fallbackModels = loadStoredFallbackModels(dispatchId);
   let mismatched = 0;
   const store = (attribution: InvocationAttributionV1, record: InvocationRecordV1 | undefined, timedOut: boolean): void => {
     const usage = attribution.usage;
@@ -341,7 +357,7 @@ function recordResultInvocations(
         cacheCreationTokens: record?.cacheCreationTokens ?? null,
       },
       ...(record ? { attempts: record.attempts } : {}),
-    });
+    }, accountFallbacks, fallbackModels);
     // A row with no invocation id cannot be stored, so it counts as unstored; a repeat of a stored row does not.
     if (row && row.invocationId !== null && opts.accepts(row)) recordInvocationAttribution(dispatchId, row, { timedOut });
     else mismatched++;

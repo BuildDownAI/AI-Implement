@@ -1,8 +1,8 @@
 import type { FailureRecord } from "./failure-classification.js";
 import { randomUUID } from "node:crypto";
-import { STAGE_NAMES, type StageName, type StageSelection } from "../agent-config.js";
+import { STAGE_NAMES, type StageName, type StageSelection, type StageAccount } from "../agent-config.js";
 import type { AccountFallbacks, ResolvedAgentSnapshotV1 } from "../run-config.js";
-import type { ModelAuthClient } from "../model-auth-client.js";
+import { ModelAuthClientError, type ModelAuthClient } from "../model-auth-client.js";
 import {
   ClaudeCliExecutor,
   type ActivityReportingConfig,
@@ -82,6 +82,16 @@ export interface StageExecutorOptions {
   createCodex?: (profileId: string) => LLMExecutor;
 }
 
+/** Decide account rotation from public metadata only. Used profiles retain insertion order. */
+export function nextAccount(fallbacks: readonly StageAccount[] | undefined, used: ReadonlySet<string>, failure?: Pick<FailureRecord, "code">):
+  | { kind: "switch"; to: StageAccount }
+  | { kind: "exhausted"; profiles: string[] }
+  | { kind: "none" } {
+  if (failure?.code !== "ACCOUNT_USAGE_LIMIT") return { kind: "none" };
+  const to = fallbacks?.find(entry => !used.has(entry.accountProfileId));
+  return to ? { kind: "switch", to } : { kind: "exhausted", profiles: [...used] };
+}
+
 /**
  * Returns `legacy` itself for a legacy run, or a decorator that selects the Claude or Codex
  * executor per call from the snapshot's stage selection. One executor instance is cached per
@@ -94,9 +104,42 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
   if (!options.auth) throw new AgentStageError("A stage snapshot requires a model auth client");
   const auth = options.auth;
 
+  const effectiveAccounts = new Map<StageName, StageAccount>();
+  const usedAccounts = new Map<StageName, Set<string>>();
+  const switchOnFailure = (stage: StageName, failure?: FailureRecord) => {
+    if (stage === "planning") {
+      switchOnOverload(stage, failure);
+      return;
+    }
+    const current = effectiveAccounts.get(stage)?.accountProfileId ?? snapshot.stages[stage].accountProfileId;
+    const used = usedAccounts.get(stage) ?? new Set([current]);
+    usedAccounts.set(stage, used);
+    const decision = nextAccount(options.accountFallbacks?.[stage], used, failure);
+    if (!failure) return;
+    if (decision.kind === "switch") {
+      // Validate the next public projection before it can enter a marker, notice or log.
+      const to = decision.to;
+      const selection = { ...snapshot.stages[stage], ...to };
+      const profile = { ...snapshot.profiles[stage], ...to, id: to.accountProfileId, revision: to.profileRevision };
+      if (!sanitizeAttribution(staticAttribution(snapshot, stage, selection, profile, "account-switch", null))) {
+        throw new AgentStageError("The fallback selection cannot be attributed safely; refusing to run it");
+      }
+      used.add(decision.to.accountProfileId);
+      effectiveAccounts.set(stage, decision.to);
+      effectiveModels.delete(stage);
+      failure.accountFallback = { stage, from: current, to: decision.to.accountProfileId };
+      console.log(`[account-fallback] stage=${stage} from=${current} to=${decision.to.accountProfileId} after=ACCOUNT_USAGE_LIMIT`);
+    } else if (decision.kind === "exhausted") {
+      failure.message = `Usage limit reached on every account: ${decision.profiles.join(", ")}`;
+      failure.evidence.llmErrorMessage = failure.message;
+    }
+    switchOnOverload(stage, failure);
+  };
   const effectiveModels = new Map<StageName, string>();
   const switchOnOverload = (stage: StageName, failure?: FailureRecord) => {
-    const from = snapshot.stages[stage].model;
+    const account = effectiveAccounts.get(stage);
+    if (account && account.agent !== snapshot.stages[stage].agent) return;
+    const from = account?.model ?? snapshot.stages[stage].model;
     const to = options.fallbackModels?.[stage];
     if (failure?.code !== "PROVIDER_OVERLOADED" || !to || to === from || effectiveModels.has(stage)) return;
     effectiveModels.set(stage, to);
@@ -168,8 +211,9 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
   return {
     async invoke(params: InvokeParams): Promise<LLMResult> {
       const stage = requireStage(params.agentStage);
-      const selection = { ...snapshot.stages[stage], model: effectiveModels.get(stage) ?? snapshot.stages[stage].model };
-      const profile = snapshot.profiles[stage];
+      const account = effectiveAccounts.get(stage);
+      const selection = { ...snapshot.stages[stage], ...account, model: effectiveModels.get(stage) ?? account?.model ?? snapshot.stages[stage].model };
+      const profile = account ? { ...snapshot.profiles[stage], ...account, id: account.accountProfileId, revision: account.profileRevision } : snapshot.profiles[stage];
       const invocationId = `${stage}-${randomUUID()}`;
       // Validate the static projection before any auth acquisition or spawn: a rejected model, id or limit
       // fails closed with a fixed message and never reaches a child or a result.
@@ -222,7 +266,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         } else {
           result = await getCodex(profileId, stage).invoke(call);
         }
-        switchOnOverload(stage, result.failure);
+        switchOnFailure(stage, result.failure);
         const attribution = attribute(result.failure ? "error" : "success", result.telemetry);
         recordInvocationOf(attribution, result.telemetry, result.attempts);
         return withAttribution(result, attribution);
@@ -234,8 +278,16 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
         if (category === "checkpoint_uncertain" || category === "checkpoint_rejected") {
           heldProfiles.set(selection.accountProfileId, err as Error);
         }
+        if (account && err instanceof ModelAuthClientError) {
+          // Checkout errors have fixed, public categories, never credential-bearing messages.
+          Object.assign(err, { failure: {
+            category: "auth", code: `MODEL_AUTH_${err.category.toUpperCase()}`,
+            stage, attempt: 1, retryable: false, message: err.message,
+            evidence: { truncated: false },
+          } satisfies FailureRecord });
+        }
         if (err instanceof Error || (typeof err === "object" && err !== null)) {
-          if (reachedExecutor) switchOnOverload(stage, (err as { failure?: FailureRecord }).failure);
+          if (reachedExecutor) switchOnFailure(stage, (err as { failure?: FailureRecord }).failure);
           const carried = (err as { telemetry?: RunTelemetry }).telemetry;
           const attribution = attribute("error", carried);
           Object.assign(err, { attribution });
