@@ -28,12 +28,14 @@ export const modelsAndProvidersHtml = `
         <div style="overflow-x:auto">
         <table class="tbl">
           <thead>
-            <tr><th>Stage</th><th>Agent</th><th>Provider</th><th>Model</th><th>Fallback model</th><th>Account profile</th><th>Elapsed time limit (ms)</th></tr>
+            <tr><th>Stage</th><th>Agent</th><th>Provider</th><th>Fallback model</th><th>Accounts (in order)</th><th>Elapsed time limit (ms)</th></tr>
           </thead>
           <tbody id="mp-stage-rows"></tbody>
         </table>
         </div>
         <div class="text-tertiary" style="font-size:11px;margin-top:6px">Blank fields inherit. The limit is an elapsed time in milliseconds for either agent. Claude turn caps are separate: Max Turns per project, and Review Max Turns under Retry Policy on the Settings page.</div>
+        <div class="field-hint">The first account is the stage account; later accounts are fallbacks. A fallback model may be blank only when its profile uses the same agent as the first account.</div>
+        <div class="field-hint">A project that overrides the account profile on its Agents tab runs without these fallbacks.</div>
         <div id="mp-stage-hints" class="text-tertiary" style="font-size:11px;margin-top:6px"></div>
         <div id="mp-stage-actions" style="display:flex;gap:6px;margin-top:8px">
           <button class="btn btn-primary btn-sm" onclick="saveStageDefaults()">Save</button>
@@ -169,34 +171,46 @@ export const modelsAndProvidersScript = `(function () {
     return html;
   }
 
-  function mpCompatibleProfiles(agent, provider) {
-    return mpAccounts.filter(function (a) {
-      if (a.profileStatus && a.profileStatus !== 'active') return false;
-      if (agent && a.agent !== agent) return false;
-      if (provider && a.provider !== provider) return false;
-      return true;
-    });
-  }
-
-  function mpProfileSelect(stage, agent, provider, current) {
-    const list = mpCompatibleProfiles(agent, provider);
-    let html = '<select class="input" data-stage="' + window.escAttr(stage) + '" data-field="accountProfileId"' + (mpCanEdit() ? '' : ' disabled') + '><option value="">(inherit)</option>';
+  function mpProfileSelect(stage, current) {
+    const list = mpAccounts.filter(function (a) { return a.profileStatus === 'active'; });
+    let html = '<select class="input" aria-label="Account profile for ' + window.escAttr(stage) + '" data-stage="' + window.escAttr(stage) + '" data-field="accountProfileId"' + (mpCanEdit() ? '' : ' disabled') + '><option value="">(inherit)</option>';
     let seen = false;
     for (const a of list) {
       if (a.profileId === current) seen = true;
-      html += '<option value="' + window.escAttr(a.profileId) + '"' + (a.profileId === current ? ' selected' : '') + '>' + window.esc(a.identity + ' (' + a.profileId + ', ' + mpAuthLabel(a.authMode) + ')') + '</option>';
+      html += '<option value="' + window.escAttr(a.profileId) + '"' + (a.profileId === current ? ' selected' : '') + '>' + window.esc(a.identity + ' (' + a.profileId + ')') + '</option>';
     }
     if (current && !seen) {
-      html += '<option value="' + window.escAttr(current) + '" selected>' + window.esc(current + ' (not compatible or not active)') + '</option>';
+      html += '<option value="' + window.escAttr(current) + '" selected>' + window.esc(current + ' (not active)') + '</option>';
     }
     return html + '</select>';
+  }
+
+  function mpAccountRow(stage, entry) {
+    const row = document.createElement('div');
+    row.setAttribute('data-account-row', '');
+    row.innerHTML = mpProfileSelect(stage, entry.accountProfileId || '') +
+      '<input class="input" data-stage="' + window.escAttr(stage) + '" data-field="model" aria-label="Account model for ' + window.escAttr(stage) + '" value="' + window.escAttr(entry.model || '') + '" placeholder="model"' + (mpCanEdit() ? '' : ' disabled') + '>' +
+      ['up', 'down', 'remove'].map(function (action) {
+        return '<button class="btn btn-sm" data-account-action="' + window.escAttr(action) + '">' + window.esc({ up: 'Move up', down: 'Move down', remove: 'Remove' }[action]) + '</button>';
+      }).join('');
+    return row;
+  }
+
+  function mpUpdateAccountButtons(list) {
+    const rows = Array.from(list.children);
+    rows.forEach(function (row, index) {
+      row.querySelector('[data-account-action="up"]').disabled = !mpCanEdit() || index === 0;
+      row.querySelector('[data-account-action="down"]').disabled = !mpCanEdit() || index === rows.length - 1;
+      row.querySelector('[data-account-action="remove"]').disabled = !mpCanEdit() || rows.length === 1;
+    });
   }
 
   function mpReadForm() {
     const stages = {};
     for (const stage of MP_STAGES) {
       const patch = {};
-      for (const el of document.querySelectorAll('#mp-stage-rows [data-stage="' + stage + '"]')) {
+      for (const el of document.querySelectorAll('#mp-stage-rows [data-stage="' + stage + '"][data-field]')) {
+        if (el.closest('[data-account-row]')) continue;
         const field = el.getAttribute('data-field');
         const raw = String(el.value || '').trim();
         if (raw === '') { patch[field] = null; continue; }
@@ -208,17 +222,19 @@ export const modelsAndProvidersScript = `(function () {
           patch[field] = raw;
         }
       }
+      const accounts = Array.from(document.querySelectorAll('[data-account-list="' + stage + '"] [data-account-row]')).map(function (row) {
+        return { accountProfileId: row.querySelector('[data-field="accountProfileId"]').value.trim(), model: row.querySelector('[data-field="model"]').value.trim() };
+      });
+      if (accounts.length > 1) patch.accounts = accounts;
+      else {
+        patch.accountProfileId = accounts[0].accountProfileId || null;
+        patch.model = accounts[0].model || null;
+        const profile = mpAccounts.find(function (a) { return a.profileId === patch.accountProfileId; });
+        if (profile) { patch.agent = profile.agent; patch.provider = profile.provider; }
+      }
       stages[stage] = patch;
     }
     return { stages: stages };
-  }
-
-  function mpSnapshotForm() {
-    const snap = {};
-    for (const el of document.querySelectorAll('#mp-stage-rows [data-stage]')) {
-      snap[el.getAttribute('data-stage') + '.' + el.getAttribute('data-field')] = el.value;
-    }
-    return snap;
   }
 
   function mpRenderStages() {
@@ -232,20 +248,23 @@ export const modelsAndProvidersScript = `(function () {
       const sel = stages[stage] || {};
       const limit = sel.invocationTimeoutMs === null || sel.invocationTimeoutMs === undefined ? '' : String(sel.invocationTimeoutMs);
       const attr = 'data-stage="' + window.escAttr(stage) + '"';
-      if (mpCompatibleProfiles(sel.agent || '', sel.provider || '').length === 0) {
-        hints.push(stage + ': no compatible active account profile' + (sel.agent || sel.provider ? ' for ' + [sel.agent, sel.provider].filter(Boolean).join('/') : '') + '. Provision one on the host or change the agent or provider.');
-      }
       html += '<tr>' +
         '<td><span class="mono">' + window.esc(stage) + '</span></td>' +
         '<td><select class="input" ' + attr + ' data-field="agent"' + dis + '>' + mpOptions(MP_AGENTS, sel.agent || '') + '</select></td>' +
         '<td><select class="input" ' + attr + ' data-field="provider"' + dis + '>' + mpOptions(MP_PROVIDERS, sel.provider || '') + '</select></td>' +
-        '<td><input class="input" ' + attr + ' data-field="model" value="' + window.escAttr(sel.model || '') + '" placeholder="inherit"' + dis + '></td>' +
         '<td><input class="input" ' + attr + ' data-field="fallbackModel" aria-label="Fallback model for ' + window.escAttr(stage) + '" value="' + window.escAttr(sel.fallbackModel || '') + '" placeholder="none"' + dis + '><div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div></td>' +
-        '<td>' + mpProfileSelect(stage, sel.agent || '', sel.provider || '', sel.accountProfileId || '') + '</td>' +
+        '<td><div data-account-list="' + window.escAttr(stage) + '"></div><button class="btn btn-sm" data-account-action="add" data-stage="' + window.escAttr(stage) + '"' + dis + '>Add account</button></td>' +
         '<td><input class="input" type="number" min="1" step="1" ' + attr + ' data-field="invocationTimeoutMs" value="' + window.escAttr(limit) + '" placeholder="inherit"' + dis + '></td>' +
         '</tr>';
     }
     rowsEl.innerHTML = html;
+    for (const stage of MP_STAGES) {
+      const sel = stages[stage] || {};
+      const list = rowsEl.querySelector('[data-account-list="' + stage + '"]');
+      const accounts = sel.accounts && sel.accounts.length ? sel.accounts : [{ accountProfileId: sel.accountProfileId, model: sel.model }];
+      accounts.forEach(function (entry) { list.appendChild(mpAccountRow(stage, entry)); });
+      mpUpdateAccountButtons(list);
+    }
     document.getElementById('mp-stage-hints').textContent = hints.join(' ');
     document.getElementById('mp-stage-actions').classList.toggle('hidden', !edit);
     const modeEl = document.getElementById('mp-stage-mode');
@@ -254,34 +273,22 @@ export const modelsAndProvidersScript = `(function () {
       : 'Defaults are saved but off (legacy). Turn them on in Settings.';
   }
 
-  function mpRerenderKeepingEdits() {
-    const snap = mpSnapshotForm();
-    mpRenderStages();
-    for (const el of document.querySelectorAll('#mp-stage-rows [data-stage]')) {
-      const key = el.getAttribute('data-stage') + '.' + el.getAttribute('data-field');
-      if (Object.prototype.hasOwnProperty.call(snap, key)) el.value = snap[key];
-    }
-  }
-
   function mpWatchDirty() {
     const rowsEl = document.getElementById('mp-stage-rows');
-    const mark = function (e) {
+    rowsEl.oninput = rowsEl.onchange = function () { mpDirty = true; };
+    rowsEl.onclick = function (event) {
+      const button = event.target.closest('[data-account-action]');
+      if (!button || button.disabled || !mpCanEdit()) return;
+      const action = button.getAttribute('data-account-action');
+      const row = button.closest('[data-account-row]');
+      const list = row ? row.parentElement : rowsEl.querySelector('[data-account-list="' + button.getAttribute('data-stage') + '"]');
+      if (action === 'add') list.appendChild(mpAccountRow(button.getAttribute('data-stage'), {}));
+      if (action === 'remove' && list.children.length > 1) row.remove();
+      if (action === 'up' && row.previousElementSibling) list.insertBefore(row, row.previousElementSibling);
+      if (action === 'down' && row.nextElementSibling) list.insertBefore(row.nextElementSibling, row);
+      mpUpdateAccountButtons(list);
       mpDirty = true;
-      // Changing agent or provider changes which profiles are compatible.
-      const f = e.target && e.target.getAttribute && e.target.getAttribute('data-field');
-      if (f === 'agent' || f === 'provider') mpRerenderWithCompat();
     };
-    rowsEl.oninput = mark;
-    rowsEl.onchange = mark;
-  }
-
-  function mpRerenderWithCompat() {
-    const form = mpReadForm();
-    if (form.error) { mpRerenderKeepingEdits(); return; }
-    const saved = mpDefaults;
-    mpDefaults = { mode: saved.mode, stages: form.stages, revision: saved.revision };
-    mpRenderStages();
-    mpDefaults = saved;
   }
 
   function mpRenderAccounts() {
@@ -551,6 +558,7 @@ export const modelsAndProvidersScript = `(function () {
   async function saveStageDefaults() {
     if (!mpCanEdit()) return;
     mpShowStageError('');
+    mpDirty = true;
     const form = mpReadForm();
     if (form.error) { mpShowStageError(form.error); return; }
     try {

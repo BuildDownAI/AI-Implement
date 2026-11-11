@@ -14,6 +14,8 @@ An account profile is a named account an operator creates on Models & providers.
 
 The orchestrator holds the default configuration, and each project may override it field by field (`stage_agent_config_revisions`, every write a new revision). In the defaults, each stage can hold an ordered list of account entries, `accounts: [{ accountProfileId, model }]`. The first entry supplies the stage's initial account; the later entries are candidates for fallbacks. An entry's agent and provider come from its profile, and a blank model means the first entry's model. The first entry must have a nonblank model. When both flat fields and `accounts` are supplied, the first account's profile and model take precedence. A stage with a single entry is stored in the flat shape (`agent`, `provider`, `model`, `accountProfileId`), for rollback compatibility. Configuration version remains 1.
 
+On Models & providers, the Orchestrator stage defaults card edits this list with Add account, Remove, Move up and Move down controls. Each row selects an active profile by Name and ID and supplies its model; row 1 supplies the stage model. A later model may be blank only for the same agent as row 1. Save displays server validation errors and keeps unsaved edits. A project that overrides the account profile on its Agents tab runs without these defaults fallbacks.
+
 - Projects do not store a list. A project that overrides `accountProfileId` runs with no fallbacks; a project that overrides other fields keeps the default's fallbacks.
 - `invocationTimeoutMs` and `fallbackModel` are stage fields, merged field by field.
 
