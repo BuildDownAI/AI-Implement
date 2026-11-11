@@ -1,5 +1,6 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { checkTrackerWrites } from "./tracker-write-gate.js";
 import { buildHealthBody } from "./health-body.js";
 import { createSetupCheckContext, getLastSetupCheckRun } from "./setup-checks/index.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
@@ -669,7 +670,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     const inFlightIssueIds = getInFlightIssueIds();
     const candidateScopeKeyById = new Map(allCandidates.map((issue) => [issue.id, issue.scopeKey]));
     const dispatchDecision = (issueId: string) => {
-      const kind: DispatchKind = needsPlanningIds.has(issueId) ? "planning" : "implementation";
+      const kind: DispatchKind = needsPlanningIds.has(issueId) && teamRepoMap[candidateScopeKeyById.get(issueId) ?? ""]?.planningEnabled ? "planning" : "implementation";
       const teamKey = candidateScopeKeyById.get(issueId) ?? "";
       const maxInProgressAiIssues = teamRepoMap[teamKey]?.maxInProgressAiIssues ?? 0;
       return { kind, decision: canDispatch({ issueId, kind, teamKey, maxInProgressAiIssues }) };
@@ -761,6 +762,12 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
         };
         const issueProvider = await registry.forMapping(mapping);
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
+
+        if (await checkTrackerWrites({
+          provider: issueProvider, issue, phase: isPlanning ? "planning" : "implementation",
+          park: parkIssue, comment: (id, body) => issueProvider.postComment(id, body),
+          log: (message) => console.log(message),
+        }) === "skip") continue;
 
         if (isPlanning) {
           const planningCtx = await preparePlanningDispatch(config, issueProvider, issue, mapping);
