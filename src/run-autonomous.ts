@@ -1115,6 +1115,9 @@ function buildConfiguredRun(
   implementationFullAccess = false,
 ): ConfiguredRun {
   const modes = new Map(STAGE_NAMES.map((s) => [snapshot.profiles[s].id, snapshot.profiles[s].authMode] as const));
+  for (const entries of Object.values(options.accountFallbacks ?? {})) {
+    for (const entry of entries) modes.set(entry.accountProfileId, entry.authMode);
+  }
   const checkouts = new Map<string, Promise<void>>();
   const checkedOut = new Set<string>();
   let held = false;

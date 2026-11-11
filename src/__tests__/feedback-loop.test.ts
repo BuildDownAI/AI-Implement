@@ -1,3 +1,5 @@
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { spawnSync } from "node:child_process";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { wrapWithPlanningGuard, assemblePlanningContext } from "../planning-context-assembly.js";
 import { makeContext } from "./helpers/builders.js";
@@ -334,4 +336,39 @@ describe("feedbackLoopStep — pass attribution (AII-971)", () => {
   it("leaves legacy passes without an attribution key", async () => {
     expect(await run()).toSatisfy((o: { passes: Array<Record<string, unknown>> }) => !("attribution" in o.passes[0]));
   });
+});
+
+describe("account-switch retries", () => {
+  it.each(["implementation", "review"] as const)("gives successive switches an attempt beyond the retry budget: %s", async stage => {
+    const failure = (from: string, to: string) => ({
+      category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage, attempt: 1, retryable: false,
+      message: "limit", evidence: { truncated: false }, accountFallback: { stage, from, to },
+    });
+    if (stage === "implementation") {
+      mockImplementRun.mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure("A", "B") })
+        .mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure("B", "C") });
+    } else {
+      mockReviewRun.mockRejectedValueOnce(Object.assign(new Error("limit"), { failure: failure("A", "B") }))
+        .mockRejectedValueOnce(Object.assign(new Error("limit"), { failure: failure("B", "C") }));
+    }
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+    const result = await feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) });
+    expect(result.approved).toBe(true);
+    if (stage === "implementation") expect(mockImplementRun.mock.calls[1][1].prompt).toContain("Continue from the current state; do not revert it.");
+    expect(stage === "implementation" ? mockImplementRun : mockReviewRun).toHaveBeenCalledTimes(3);
+  });
+});
+
+it("preserves a terminal review account failure for the notice", async () => {
+  const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "review", attempt: 1, retryable: false,
+    message: "Usage limit reached on every account: A, B, C", evidence: { truncated: false, llmErrorMessage: "Usage limit reached on every account: A, B, C" } };
+  mockReviewRun.mockRejectedValueOnce(Object.assign(new Error(failure.message), { failure }));
+  const result = await feedbackLoopStep.run(makeContext(),
+    { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 },
+    { report: vi.fn(async () => undefined) });
+  expect(result.failure).toMatchObject({ code: failure.code, message: failure.message, evidence: failure.evidence });
 });

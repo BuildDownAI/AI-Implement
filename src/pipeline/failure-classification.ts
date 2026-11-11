@@ -30,6 +30,7 @@ export interface ModelFallback { stage: "planning" | "implementation" | "review"
 
 export interface FailureRecord {
   modelFallback?: ModelFallback;
+  accountFallback?: ModelFallback;
   category: FailureCategory;
   /** Open-ended machine code, UPPER_SNAKE, e.g. PROVIDER_OVERLOADED, GIT_LEASE_REJECTED. */
   code: string;

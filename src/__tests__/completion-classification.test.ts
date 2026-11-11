@@ -801,3 +801,8 @@ describe("ACCOUNT_USAGE_LIMIT notice", () => {
     expect(rendered).not.toContain("Check the GitHub App and provider keys");
   });
 });
+
+it("renders all exhausted account profiles from terminal error evidence", () => {
+  const message = "Usage limit reached on every account: A, B, C";
+  expect(renderFailureRecord({ category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message, evidence: { truncated: false, llmErrorMessage: message } })).toContain("A, B, C");
+});

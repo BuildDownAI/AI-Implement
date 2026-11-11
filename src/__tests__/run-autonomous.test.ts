@@ -1,3 +1,4 @@
+import { ModelAuthClientError } from "../model-auth-client.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
@@ -4562,6 +4563,37 @@ describe("configured (opted-in) autonomous runs", () => {
     expect(client.checkout).toHaveBeenCalledTimes(1);
     expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
     expect(client.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])("checks out a fallback profile once and preserves checkout failures (refused=%s)", async refused => {
+    const client = fakeClient();
+    const injected = makeExecutor();
+    const checkoutFailure = { category: "auth" as const, code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", stage: "review", attempt: 1, retryable: false, message: "model-auth client error: profile_not_allowed", evidence: { truncated: false } };
+    if (refused) vi.mocked(client.checkout).mockResolvedValueOnce(undefined).mockRejectedValueOnce(new ModelAuthClientError("profile_not_allowed"));
+    const entries = [{ accountProfileId: "fallback-review", profileRevision: 2, agent: "claude" as const, provider: "anthropic" as const, authMode: "anthropic-api-key" as const, model: "claude-next" }];
+    const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "review", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+    vi.mocked(injected.invoke).mockResolvedValueOnce({ stdout: "", exitCode: 1, tokensUsed: 0, failure });
+    const { pipeline, runner } = makeSingleStepPipeline("capture", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        const params = { prompt: "p", model: "ignored", agentStage: "review" as const };
+        await ctx.llmExecutor.invoke(params);
+        if (refused) {
+          await expect(ctx.llmExecutor.invoke(params)).rejects.toMatchObject({ failure: checkoutFailure });
+          await expect(ctx.llmExecutor.invoke(params)).rejects.toMatchObject({ failure: checkoutFailure });
+        } else {
+          await ctx.llmExecutor.invoke(params);
+          await ctx.llmExecutor.invoke(params);
+        }
+        return {};
+      }),
+    });
+    await runAutonomousLocally({
+      workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline, runner, llmExecutor: injected,
+      configured: { agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() }, accountFallbacks: { review: entries } },
+    });
+    expect(client.checkout).toHaveBeenCalledTimes(2);
+    expect(client.checkout).toHaveBeenNthCalledWith(2, { profileId: "fallback-review", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(refused ? 1 : 3);
   });
 
   it("finishes and disposes once on success and as failed on a thrown step", async () => {
