@@ -153,7 +153,14 @@ The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token
 
 ## Adopt an environment credential
 
-On the orchestrator, run `node dist/model-account-cli.js adopt-env` with no arguments.
+The admin tool `import_environment_credential` (no arguments, through MCP or
+`POST /api/tools/import_environment_credential` with `{ "args": {} }`) imports the
+credential as an ordinary account profile named `Adopted environment credential`.
+It does not change stage defaults, project grants, or project opt-ins. Repeating
+the import returns `already-imported` without writing.
+
+To also configure stage defaults, run `node dist/model-account-cli.js adopt-env`
+on the orchestrator with no arguments.
 It reads `CLAUDE_CODE_OAUTH_TOKEN` first, then `ANTHROPIC_API_KEY`. When both are
 present, the token wins and the command reports that the key was ignored. Bedrock
 is outside this migration. `RUNNER_TOKEN_SECRET` must be set before adoption can write.
@@ -177,7 +184,11 @@ Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode
 is `configured`, and all three stages name the adopted profile. Projects still
 need their own explicit opt-in. To roll back, revert the defaults and delete the
 profile on Models & providers; remove its encrypted credential with `secret-delete`
-if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it.
+if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
+with `secret-import` or the profile's credential editor. The one-time
+`import_environment_credential` tool does not repair existing credentials.
+When replacing legacy defaults, `adopt-env` repairs a missing or unreadable
+credential from the environment before configuring the stages.
 
 ## Adopting existing projects
 
