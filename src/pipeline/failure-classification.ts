@@ -510,7 +510,8 @@ export function classifyLlmResult(
       // text is part of PROVIDER_SIGNATURES' match input (see signatureMatchText), so
       // a reviewer note like "treat API Error 503 as transient" appearing in a dropped
       // verdict's stdout must not turn a structural failure into a retryable transport
-      // one. PROVIDER_SIGNATURES is consulted only in the exitCode !== 0 branch below.
+      // one. Only a provider terminal error can identify account exhaustion here;
+      // no stdout/stderr text or other provider signature can override these checks.
       // Ordered so a genuinely absent result event (terminalStatus == null, which
       // also always means structuredOutput === undefined — both derive from the
       // same event) is never shadowed by the missing-structured-output check below:
@@ -527,8 +528,11 @@ export function classifyLlmResult(
         result.terminalStatus?.isError === true ||
         (ctx.expectsStructuredOutput && result.terminalStatus != null && result.terminalStatus.subtype !== "success")
       ) {
-        category = "invalid_output";
-        code = "LLM_TERMINAL_ERROR";
+        const usageLimit = result.terminalStatus?.isError === true
+          ? matchSignature(PROVIDER_SIGNATURES.filter(row => row.code === "ACCOUNT_USAGE_LIMIT"), errorMessage)
+          : null;
+        category = usageLimit?.category ?? "invalid_output";
+        code = usageLimit?.code ?? "LLM_TERMINAL_ERROR";
       } else if (
         ctx.expectsStructuredOutput &&
         result.telemetry?.outcome != null &&

@@ -1,3 +1,7 @@
+import { createStageExecutor } from "../pipeline/stage-executor.js";
+import { ModelAuthClientError, type ModelInvocation } from "../model-auth-client.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { classifyLlmResult } from "../pipeline/failure-classification.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { spawnSync } from "node:child_process";
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -339,6 +343,72 @@ describe("feedbackLoopStep — pass attribution (AII-971)", () => {
 });
 
 describe("account-switch retries", () => {
+  it("stops after an executor-produced fallback checkout failure", async () => {
+    const selection = { agent: "claude" as const, provider: "anthropic" as const,
+      model: "claude-test", accountProfileId: "A", invocationTimeoutMs: 1000 };
+    const profile = { id: "A", identity: "primary", revision: 1, agent: "claude" as const,
+      provider: "anthropic" as const, authMode: "anthropic-api-key" as const };
+    const snapshot: ResolvedAgentSnapshotV1 = {
+      version: 1, snapshotId: "test-snapshot",
+      configRevisions: { orchestratorDefault: { configRevisionId: "rev", revision: 1 }, project: { configRevisionId: "rev", revision: 1 } },
+      sources: {} as ResolvedAgentSnapshotV1["sources"],
+      stages: { planning: selection, implementation: selection, review: selection },
+      profiles: { planning: profile, implementation: profile, review: profile },
+    };
+    const checkout = vi.fn(async (id: string) => {
+      if (id === "B") throw new ModelAuthClientError("profile_not_allowed");
+    });
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0, failure: classifyLlmResult({
+      stdout: "", exitCode: 0, tokensUsed: 0, terminalStatus: { isError: true, subtype: "turn.failed" },
+      errorMessage: "You've hit your usage limit.",
+    }, { stage: "implement", attempt: 1, expectsStructuredOutput: false }) }));
+    const executor = createStageExecutor({ workspaceDir, snapshot, legacy: { invoke },
+      auth: { async invoke<T>(id: string, run: (selected: ModelInvocation) => Promise<T>): Promise<T> {
+        await checkout(id);
+        return run({ env: {}, strippedKeys: [] });
+      } },
+      createClaude: () => ({ invoke }),
+      accountFallbacks: { implementation: ["B", "C"].map(accountProfileId => ({
+        ...selection, accountProfileId, profileRevision: 1, authMode: profile.authMode,
+      })) },
+    });
+    mockImplementRun.mockImplementation(async () => {
+      const result = await executor.invoke({ prompt: "test", model: selection.model, agentStage: "implementation" });
+      return { ...IMPLEMENT_SUCCESS, invocationFailure: result.failure };
+    });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 3 };
+    const error = await feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) }).catch((err: unknown) => err);
+    expect(error).toMatchObject({
+      failure: { code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", retryable: false },
+    });
+    expect((error as { failure: { accountFallback?: unknown } }).failure.accountFallback).toBeUndefined();
+    expect(checkout.mock.calls).toEqual([["A"], ["B"]]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(mockImplementRun).toHaveBeenCalledTimes(2);
+    expect(mockReviewRun).not.toHaveBeenCalled();
+  });
+
+  it("gives a classified exit-zero usage-limit result an extra attempt for the next account", async () => {
+    const failure = classifyLlmResult({
+      stdout: "", stderr: "", exitCode: 0, tokensUsed: 0, attempts: 1,
+      terminalStatus: { isError: true, subtype: "turn.failed" },
+      errorMessage: "You've hit your usage limit.",
+    }, { stage: "implement", attempt: 1, expectsStructuredOutput: false });
+    expect(failure.code).toBe("ACCOUNT_USAGE_LIMIT");
+    failure.accountFallback = { stage: "implementation", from: "A", to: "B" };
+    mockImplementRun.mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure });
+    const ctx = makeContext();
+    ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+    const result = await feedbackLoopStep.run(ctx,
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
+      { report: vi.fn(async () => undefined) });
+    expect(result.approved).toBe(true);
+    expect(mockImplementRun).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["implementation", "review"] as const)("gives successive switches an attempt beyond the retry budget: %s", async stage => {
     const failure = (from: string, to: string) => ({
       category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage, attempt: 1, retryable: false,

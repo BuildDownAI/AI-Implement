@@ -11,6 +11,8 @@ import { CodexRecoveryRequiredError } from "../pipeline/codex-executor.js";
 import { collectedInvocations, resetJobAccounting } from "../pipeline/job-accounting.js";
 import { normalizeInvocation } from "../agent-usage.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { classifyLlmResult } from "../pipeline/failure-classification.js";
+import { ModelAuthClientError } from "../model-auth-client.js";
 import type { ModelAuthClient, ModelInvocation } from "../model-auth-client.js";
 import type { InvokeParams, LLMExecutor, LLMResult } from "../pipeline/types.js";
 import { testDir, testTempRoot } from "./helpers/test-dir.js";
@@ -663,6 +665,49 @@ describe("account fallback", () => {
     [[B, C], ["A"], "PROCESS_CRASH", { kind: "none" }],
   ] as const)("decides %j with used=%j and code=%s", (fallbacks, used, code, expected) => {
     expect(nextAccount(fallbacks, new Set(used), { code })).toEqual(expected);
+  });
+
+  it.each([true, false])("preserves executor-produced exhaustion evidence (fallback list: %s)", async withFallbacks => {
+    const primary = structuredClone(snapshot);
+    primary.stages.implementation.accountProfileId = "A";
+    primary.profiles.implementation.id = "A";
+    const claude = fakeExec();
+    claude.invoke.mockImplementation(async () => ({ ...ok, failure: classifyLlmResult({
+      ...ok, terminalStatus: { isError: true, subtype: "turn.failed" },
+      errorMessage: "You've hit your usage limit.",
+    }, { stage: "implement", attempt: 1, expectsStructuredOutput: false }) }));
+    const auth = fakeAuth();
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot: primary,
+      auth, accountFallbacks: withFallbacks ? { implementation: [B, C] } : undefined, createClaude: () => claude });
+    const profiles = withFallbacks ? ["A", "B", "C"] : ["A"];
+    let last: LLMResult = ok;
+    for (const profile of profiles) {
+      last = await executor.invoke({ ...base, agentStage: "implementation" });
+      expect(last.attribution?.profileId).toBe(profile);
+    }
+    const message = `Usage limit reached on every account: ${profiles.join(", ")}`;
+    expect(last.failure).toMatchObject({ code: "ACCOUNT_USAGE_LIMIT", message,
+      evidence: { llmErrorMessage: message } });
+    expect(last.failure?.accountFallback).toBeUndefined();
+    expect(auth.invoke.mock.calls.map(call => call[0])).toEqual(profiles);
+  });
+
+  it("retains a fallback checkout failure without advancing to the next account", async () => {
+    const checkout = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValue(new ModelAuthClientError("profile_not_allowed"));
+    const auth = { async invoke<T>(id: string, run: (selected: ModelInvocation) => Promise<T>): Promise<T> {
+      await checkout(id);
+      return run({ env: {}, strippedKeys: [] });
+    } };
+    const claude = fakeExec({ ...ok, failure: classifyLlmResult({ ...ok, exitCode: 1,
+      errorMessage: "You've hit your usage limit." }, { stage: "implement", attempt: 1, expectsStructuredOutput: false }) });
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot,
+      auth, accountFallbacks: { implementation: [B, C] }, createClaude: () => claude });
+    expect((await executor.invoke({ ...base, agentStage: "implementation" })).failure?.accountFallback?.to).toBe("B");
+    await expect(executor.invoke({ ...base, agentStage: "implementation" })).rejects.toMatchObject({
+      failure: { code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", retryable: false }, attribution: { profileId: "B" },
+    });
+    expect(checkout.mock.calls).toEqual([["p-impl"], ["B"]]);
+    expect(claude.invoke).toHaveBeenCalledTimes(1);
   });
 
   it("routes a Codex primary to Claude through auth with effective attribution", async () => {
