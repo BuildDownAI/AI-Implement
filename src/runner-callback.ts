@@ -1,3 +1,6 @@
+import { getDb } from "./dedup.js";
+import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { RESTATE_INGRESS_BASE_URL } from "./restate/server.js";
@@ -39,6 +42,7 @@ import {
   getReviewFindingsByKeys,
   listOpenReviewFindings,
   markReviewFindingsDeferredByKeys,
+  markReviewFindingsRejectedByKeys,
   markReviewFindingsResolvedByIds,
   markReviewFindingsResolvedForPrSeenBefore,
   type StoredReviewFinding,
@@ -175,6 +179,8 @@ export interface RunnerResultBody {
   sources?: SourceResult[];
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
+  /** Internal findings collected across review iterations, validated before storage. */
+  internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
   /**
@@ -810,6 +816,7 @@ async function handleRunnerResultInternal(
     outcome?: unknown;
     comments?: unknown;
     failure?: unknown;
+    internalFindings?: unknown;
     findingDispositions?: unknown;
     cycleSummaries?: unknown;
     attribution?: unknown;
@@ -1141,6 +1148,38 @@ async function handleRunnerResultInternal(
     }
   }
 
+  // New dispatch reports reopen resolved findings; callback retries retain their original revision.
+  const internalJob = getJobByDispatchId(claims.dispatchId);
+  const findingPrUrl = internalJob?.prUrl ?? input.body.prUrl;
+  const findingTarget = findingPrUrl ? parsePrUrlTarget(findingPrUrl) : null;
+  const internalPr = findingTarget && `${findingTarget.owner}/${findingTarget.repo}` === internalJob?.repo
+    ? findingTarget.prNumber : null;
+  if (internalJob?.repo && internalPr !== null && Array.isArray(body.internalFindings)) {
+    for (const raw of body.internalFindings) {
+      if (!raw || typeof raw !== "object") continue;
+      const f = raw as ReviewLedgerFinding;
+      if (f.source !== "ai-implement-internal" || typeof f.body !== "string" || !f.body ||
+          !["blocking", "medium", "minor"].includes(f.severity) ||
+          (f.path !== undefined && typeof f.path !== "string") ||
+          (f.url !== undefined && typeof f.url !== "string") ||
+          (f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) ||
+          (f.reviewerId !== undefined && typeof f.reviewerId !== "string")) continue;
+      const key = stableReviewFindingKey(f);
+      const existing = getReviewFindingsByKeys(internalJob.repo, internalPr, [key])[0];
+      // Reports have dispatch identity but no timestamp. When the row advanced after
+      // dispatch, only waive the time guard if this dispatch owns the current revision.
+      const canResolve = !existing || existing.status === "resolved" ||
+        existing.lastSeenAt <= internalJob.dispatchedAt || !getDb().prepare(`
+          SELECT 1 FROM internal_review_finding_reports
+          WHERE finding_id = ? AND revision = ? AND dispatch_id != ? LIMIT 1
+        `).get(existing.id, existing.revision, claims.dispatchId);
+      const report = recordInternalReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr }, claims.dispatchId);
+      if (canResolve && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
+        markReviewFindingResolvedIfRevision(report.id, report.revision);
+      }
+    }
+  }
+
   // AII-756: a fixing agent may defer a finding as out-of-scope follow-up work. This must
   // run before any phase-specific resolution below (e.g. the gap-analysis snapshot
   // resolution) — resolving first would flip a just-deferred finding back to resolved.
@@ -1149,8 +1188,8 @@ async function handleRunnerResultInternal(
   const followUpDispositions = sanitizedFindingDispositions.filter((d) => d.disposition === "follow-up");
   let deferredCount = 0;
   if (followUpDispositions.length > 0) {
-    const dispositionJob = getJobByDispatchId(claims.dispatchId);
-    const dispositionPrNumber = parsePrNumber(dispositionJob?.prUrl ?? null);
+    const dispositionJob = internalJob;
+    const dispositionPrNumber = internalPr;
     if (dispositionJob?.repo && dispositionPrNumber !== null) {
       const keys = followUpDispositions.map((d) => d.findingKey);
       deferredCount = markReviewFindingsDeferredByKeys(dispositionJob.repo, dispositionPrNumber, keys);
@@ -1163,6 +1202,17 @@ async function handleRunnerResultInternal(
       } catch (err) {
         warn("postComment(deferred-findings)", err);
       }
+    }
+  }
+
+  // Rejections apply to every phase, before fixed-only snapshot resolution.
+  const rejectedKeys = sanitizedFindingDispositions.filter((d) => d.disposition === "invalid").map((d) => d.findingKey);
+  let rejectedCount = 0;
+  if (rejectedKeys.length > 0) {
+    const job = internalJob;
+    const prNumber = internalPr;
+    if (job?.repo && prNumber !== null) {
+      rejectedCount = markReviewFindingsRejectedByKeys(job.repo, prNumber, rejectedKeys);
     }
   }
 
@@ -1414,11 +1464,11 @@ async function handleRunnerResultInternal(
     const prNumber = parsePrNumber(job?.prUrl ?? null);
     if (job?.repo && prNumber !== null) {
       const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
-      // Only findings the agent disposed `fixed` or `invalid` resolve; an
-      // undisposed finding stays open so the next fix run sees it. `follow-up` rows were
-      // deferred above and are no longer open.
+      // Only findings the agent disposed `fixed` resolve; an
+      // undisposed finding stays open so the next fix run sees it. Follow-ups and
+      // rejections were closed above and are no longer open.
       const resolveKeys = sanitizedFindingDispositions
-        .filter((d) => d.disposition === "fixed" || d.disposition === "invalid")
+        .filter((d) => d.disposition === "fixed")
         .map((d) => d.findingKey);
       const openNow = listOpenReviewFindings(snapshot?.repo ?? job.repo, snapshot?.prNumber ?? prNumber);
       const snapshotIds = snapshot ? new Set(snapshot.findingIds) : null;
@@ -1429,7 +1479,7 @@ async function handleRunnerResultInternal(
         ? markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds, resolveKeys)
         : markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt, resolveKeys);
       console.log(
-        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} left_open=${allowedCount - resolvedCount}`,
+        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} rejected=${rejectedCount} left_open=${allowedCount - resolvedCount}`,
       );
       // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.

@@ -1,5 +1,7 @@
 import type { ReviewerFinding } from "./reviewers/registry.js";
 
+export const AI_IMPLEMENT_INLINE_FINDING_TRAILER = "<!-- ai-implement review-finding:v1 -->";
+
 export interface InlineReviewComment {
   path: string;
   line: number;
@@ -14,7 +16,7 @@ export function inlineCommentBody(finding: ReviewerFinding): string {
   const title = /^(.*?[.!?])(?:\s|$)|^([^\n]*)/.exec(text);
   const heading = title?.[1] ?? title?.[2] ?? text;
   const rest = text.slice(heading.length).trim();
-  return `**[${finding.severity}]** **${heading}**${rest ? `\n\n${rest}` : ""}\n\n<!-- ai-implement review-finding:v1 -->`;
+  return `**[${finding.severity}]** **${heading}**${rest ? `\n\n${rest}` : ""}\n\n${AI_IMPLEMENT_INLINE_FINDING_TRAILER}`;
 }
 
 /** Git quotes unusual paths using C escapes, including octal UTF-8 bytes. */

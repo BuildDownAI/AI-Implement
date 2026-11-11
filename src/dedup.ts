@@ -408,10 +408,21 @@ export function getDb(): Database.Database {
     // the new version field as 1 for old rows without a rewrite or backfill.
     const findingColumns = new Set((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
       .map((column) => column.name));
+    if (!findingColumns.has("disposition")) {
+      db.exec("ALTER TABLE review_findings ADD COLUMN disposition TEXT");
+    }
     if (!findingColumns.has("revision")) {
       db.exec("ALTER TABLE review_findings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
     }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_findings_open ON review_findings(repo, pr_number, status)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS internal_review_finding_reports (
+        dispatch_id TEXT NOT NULL,
+        finding_id INTEGER NOT NULL REFERENCES review_findings(id),
+        revision INTEGER NOT NULL,
+        PRIMARY KEY (dispatch_id, finding_id)
+      )
+    `);
     db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

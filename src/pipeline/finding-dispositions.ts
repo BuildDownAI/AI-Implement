@@ -62,13 +62,63 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export const DISPOSITIONS_FILE = "ai-output/finding-dispositions.json";
 const DISPOSITION_MARKER = "<!-- ai-implement finding-disposition -->";
 
+/** Persist dispositions, including fixed tombstones, without human-authored reasons. */
+export function buildClosedFindingsMarker(dispositions: FindingDisposition[]): string {
+  const payload = { rejected: [] as string[], deferred: [] as string[], fixed: [] as string[] };
+  for (const d of dispositions) payload[d.disposition === "invalid" ? "rejected" : d.disposition === "follow-up" ? "deferred" : "fixed"].push(d.findingKey);
+  return `<!-- ai-implement closed-findings v1 ${JSON.stringify(payload)} -->`;
+}
+
+export function parseClosedFindingsMarkers(body: string): FindingDisposition[][] {
+  const markers: FindingDisposition[][] = [];
+  const lines = body.split(/\r?\n/);
+  if (!/^<!-- ai-implement post-push [^\r\n]* -->$/.test(lines[0] ?? "")) return markers;
+  for (const match of (lines[1] ?? "").matchAll(/^<!-- ai-implement closed-findings v1 (.*?) -->$/g)) {
+    const payload = parseJson(match[1]);
+    if (!isRecord(payload)) continue;
+    const entries: FindingDisposition[] = [];
+    for (const [field, disposition] of [["rejected", "invalid"], ["deferred", "follow-up"], ["fixed", "fixed"]] as const) {
+      const keys = payload[field];
+      if (!Array.isArray(keys)) continue;
+      for (const key of keys) if (typeof key === "string" && FINDING_KEY_RE.test(key)) entries.push({ findingKey: key, disposition, reason: "" });
+    }
+    markers.push(entries);
+  }
+  return markers;
+}
+
+/** REST issue comments arrive oldest first; --slurp preserves page order. */
+export function readClosedFindingKeys(ghSpawn: GhSpawn, prNumber: string, ownLogin: string | undefined): Set<string> {
+  const closed = new Set<string>();
+  if (!ownLogin) return closed;
+  const result = safeGhSpawn(ghSpawn, ["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+  if (!result || result.exitCode !== 0) return closed;
+  const payload = parseJson(result.stdout);
+  if (!Array.isArray(payload)) return closed;
+  for (const comment of payload.flat()) {
+    if (!isRecord(comment) || typeof comment.body !== "string") continue;
+    const markers = parseClosedFindingsMarkers(comment.body);
+    for (const dispositions of markers) {
+      if (!isRecord(comment.user) || comment.user.login !== ownLogin) {
+        console.warn(`[post-push-review] ignored closed-findings marker from untrusted author on comment ${comment.id ?? "unknown"}`);
+        continue;
+      }
+      for (const d of dispositions) {
+        if (d.disposition === "fixed") closed.delete(d.findingKey);
+        else closed.add(d.findingKey);
+      }
+    }
+  }
+  return closed;
+}
+
 export function buildDispositionInstructions(): string {
   return `## Finding dispositions
 
 Give every listed finding exactly one disposition, keyed by its \`findingKey\`, and write a JSON array to \`${DISPOSITIONS_FILE}\`. Each entry has \`findingKey\`, \`disposition\`, and \`reason\`.
 
 - \`fixed\`: you changed the code to address it.
-- \`invalid\`: the finding is wrong about the code. Say why in one sentence.
+- \`invalid\`: the finding is wrong about the code. This closes the finding, including repeat reports with the same key. Use it only when the finding is wrong; explain why in one sentence. The reason is shown to a person in PR comments.
 - \`follow-up\`: the finding asks for behavior the issue does not require. Do not implement it. Say what it asks for in one sentence.
 
 A finding that reports a defect in lines this PR changed is always in scope. It can only be \`fixed\` or \`invalid\`, never \`follow-up\`.
@@ -123,6 +173,7 @@ export function replyToDispositionThreads(ghSpawn: GhSpawn, prNumber: string, di
     } else if (disposition.disposition === "invalid") {
       if (replyToThread(ghSpawn, thread.id, `${DISPOSITION_MARKER}\nNot changed: ${disposition.reason}`)) {
         replied++;
+        resolveThread(ghSpawn, thread.id);
       }
     }
   }
