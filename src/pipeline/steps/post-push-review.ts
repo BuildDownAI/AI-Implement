@@ -2772,8 +2772,8 @@ ${externalFindingsFixBlock}
       const fixFailure = fixResult.failure ?? (isLlmResultFailure(fixResult, false) ? classifyLlmResult(fixResult, {
         stage: `post-push-review/fix-${iteration}`, attempt: fixResult.attempts ?? 1, expectsStructuredOutput: false,
       }) : null);
-      // Preserve partial work from exit-0 errors, except when usage-limit retries are exhausted.
-      if (fixResult.exitCode !== 0 || fixFailure?.code === "ACCOUNT_USAGE_LIMIT") {
+      // Preserve partial work from capped passes and exit-0 errors, except when usage-limit retries are exhausted.
+      if ((fixResult.exitCode !== 0 && fixResult.telemetry?.outcome !== "max_turns") || fixFailure?.code === "ACCOUNT_USAGE_LIMIT") {
         if (fixFailure?.code === "ACCOUNT_USAGE_LIMIT") reviewerFailure = fixFailure;
         priorLlmFailure = true;
         terminationReason = "fix_failed";
