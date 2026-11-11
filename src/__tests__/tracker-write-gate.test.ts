@@ -5,7 +5,7 @@ import { makeIssue } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 const issue = makeIssue({ scopeKey: "AII" });
-const refusal = { ok: false, permanent: true, label: "AI-Planning", message: "Permission denied" } as const;
+const refusal = { ok: false, permanent: true, label: "AI-Working", message: 'Linear refused to create label "AI-Working" on team AII: not allowed to take action' } as const;
 let breaker: typeof import("../dispatch-breaker.js");
 beforeEach(async () => {
   ({ modules: { breaker } } = await testDb({ modules: { breaker: () => import("../dispatch-breaker.js") } }));
@@ -36,6 +36,7 @@ it.each(["transient", "throw"])("skips and logs once without parking on %s", asy
   else ensureLifecycleLabels.mockResolvedValue({ ...refusal, permanent: false });
   expect(await checkTrackerWrites({ ...opts, provider: { ensureLifecycleLabels } })).toBe("skip");
   expect(opts.log).toHaveBeenCalledTimes(1);
+  expect(opts.log).toHaveBeenCalledWith(`[poll] ${issue.identifier} tracker setup deferred: ${kind === "throw" ? "Error: offline" : refusal.message}`);
   expect(opts.park).not.toHaveBeenCalled();
   expect(opts.comment).not.toHaveBeenCalled();
 });
@@ -48,7 +49,9 @@ it.each(["planning", "implementation"] as const)("parks %s and comments once acr
   expect(await check()).toBe("skip");
   expect(opts.park).toHaveBeenCalledWith(issue.id, phase, "tracker_setup_refused");
   expect(breaker.listParked()).toEqual([expect.objectContaining({ issueId: issue.id, phase, lastConclusion: "tracker_setup_refused" })]);
-  expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, 'AI-Implement did not start this issue. Linear refused to create the label "AI-Planning" in team AII: Permission denied. Create the label in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.');
+  expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, 'AI-Implement did not start this issue. Linear refused to create label "AI-Working" on team AII: not allowed to take action. Create the label "AI-Working" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.');
+  expect(opts.comment.mock.calls[0][1].match(/Linear refused/g)).toHaveLength(1);
+  expect(opts.log).toHaveBeenNthCalledWith(1, `[poll] ${issue.identifier} tracker_setup_refused: ${refusal.message}`);
   expect(opts.log).toHaveBeenCalledTimes(2);
   breaker.unpark(issue.id, phase);
   ensureLifecycleLabels.mockResolvedValue({ ok: true });
@@ -61,4 +64,13 @@ it("leaves the park intact when the comment fails, logging one additional line",
   expect(await checkTrackerWrites({ ...opts, provider: { ensureLifecycleLabels: vi.fn().mockResolvedValue(refusal) } })).toBe("skip");
   expect(breaker.isParked(issue.id, opts.phase)).toBe(true);
   expect(opts.log).toHaveBeenCalledTimes(2);
+});
+
+it("does not double the refusal sentence's trailing period", async () => {
+  const opts = options();
+  await checkTrackerWrites({
+    ...opts,
+    provider: { ensureLifecycleLabels: vi.fn().mockResolvedValue({ ...refusal, message: refusal.message + "." }) },
+  });
+  expect(opts.comment).toHaveBeenCalledExactlyOnceWith(issue.id, 'AI-Implement did not start this issue. Linear refused to create label "AI-Working" on team AII: not allowed to take action. Create the label "AI-Working" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.');
 });

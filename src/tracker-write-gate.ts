@@ -19,14 +19,14 @@ export async function checkTrackerWrites({ provider, issue, phase, park, comment
   }
   if (result.ok) return "dispatch";
   if (!result.permanent) {
-    log(`[poll] ${issue.identifier} tracker setup deferred: label "${result.label}" in team ${issue.scopeKey}: ${result.message}`);
+    log(`[poll] ${issue.identifier} tracker setup deferred: ${result.message}`);
     return "skip";
   }
   const newlyParked = park(issue.id, phase, "tracker_setup_refused");
-  log(`[poll] ${issue.identifier} tracker_setup_refused: label "${result.label}" in team ${issue.scopeKey}: ${result.message}`);
+  log(`[poll] ${issue.identifier} tracker_setup_refused: ${result.message}`);
   if (newlyParked) {
     try {
-      await comment(issue.id, `AI-Implement did not start this issue. Linear refused to create the label "${result.label}" in team ${issue.scopeKey}: ${result.message}. Create the label in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.`);
+      await comment(issue.id, `AI-Implement did not start this issue. ${result.message}${result.message.endsWith(".") ? "" : "."} Create the label "${result.label}" in the team by hand, or let the app create labels. Then unpark the issue at /admin#runners.`);
     } catch (err) {
       log(`[poll] ${issue.identifier} tracker_setup_refused comment failed: ${String(err)}`);
     }
