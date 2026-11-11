@@ -2040,6 +2040,19 @@ describe("shouldEnqueueReviewEvent", () => {
     ).toEqual({ enqueue: false, reason: "self" });
   });
 
+  it("enqueues a current-head Bot review quoting the self marker mid-body", () => {
+    expect(webhook.shouldEnqueueReviewEvent({
+      ...BASE,
+      body: "## Claude review\nThe guard skips comments quoting `<!-- ai-implement`.",
+    })).toEqual({ enqueue: true });
+  });
+
+  it.each(["", " \n\t"])("drops a leading self marker after whitespace %j", whitespace => {
+    expect(webhook.shouldEnqueueReviewEvent({
+      ...BASE, body: `${whitespace}<!-- ai-implement status -->\nDone.`,
+    })).toEqual({ enqueue: false, reason: "self" });
+  });
+
   it("enqueues a human author unconditionally (today's behavior)", () => {
     expect(webhook.shouldEnqueueReviewEvent({ ...BASE, authorType: "User" })).toEqual({ enqueue: true });
   });

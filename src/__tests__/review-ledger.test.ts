@@ -2324,6 +2324,21 @@ describe("trusted Claude review selection", () => {
   it.each([{ login: "random-user", type: "User" }, { login: "github-actions[bot]", type: "User" }])("ignores an untrusted review identity %j", user => {
     expect(classifyReviewIssueComment({ user, body: "## Claude review\nUnexpected output" })).toBeNull();
   });
+  it.each([
+    "## Claude review\n### Approved\nThe implementation satisfies the requirements and is ready to ship.",
+    "## Claude review\n### 🟣 Pre-existing\n- Legacy behavior outside this change.",
+    "## Claude review\n### Blocking\nNone.",
+  ])("accepts recognized clean trusted Claude App sections: %s", body => {
+    expect(classifyReviewIssueComment({ user: { login: "claude[bot]", type: "Bot" }, body }))
+      .toMatchObject({ findings: [], findingsUnavailable: false });
+  });
+  it("keeps a trusted Claude App blocking section blocking", () => {
+    const result = classifyReviewIssueComment({
+      user: { login: "claude[bot]", type: "Bot" },
+      body: "## Claude review\n### 🔴 Blocking\n- Fix the missing authorization check.",
+    });
+    expect(result).toMatchObject({ findingsUnavailable: false, findings: [{ severity: "blocking" }] });
+  });
   it("fails closed for an unclassifiable trusted Claude App review", () => {
     expect(classifyReviewIssueComment({ user: { login: "claude[bot]", type: "Bot" }, body: "## Claude review\nUnexpected output" })).toMatchObject({ findingsUnavailable: true });
   });

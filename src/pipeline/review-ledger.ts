@@ -289,6 +289,11 @@ export function extractReviewFindingsBlock(body: string, url?: string): ReviewFi
 }
 
 export function extractClaudeSummaryFindings(body: string, url?: string): ReviewLedgerFinding[] {
+  return extractClaudeSummaryResult(body, url).findings;
+}
+
+function extractClaudeSummaryResult(body: string, url?: string): ExternalReviewFindingsResult {
+  let recognizedSection = false;
   const items: string[] = [];
   let inBlockingSection = false;
   let currentItem: string | undefined;
@@ -316,6 +321,14 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
     if (heading) {
       flushCurrentItem();
       inBlockingSection = isClaudeBlockingHeading(heading[1]);
+      // A review title alone is insufficient. Recognize the summary parser's
+      // finding sections, marker sections (including pre-existing), and approvals.
+      if (inBlockingSection
+        || classifyClaudeFindingHeading(heading[1]) !== null
+        || /^[\s*_]*[🔴🟡🟣]/u.test(heading[1])
+        || /\b(?:approved|complete)\b/i.test(normalizeText(heading[1]))) {
+        recognizedSection = true;
+      }
       continue;
     }
 
@@ -346,12 +359,13 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
 
   flushCurrentItem();
 
-  return items.map((item) => ({
+  const findings: ReviewLedgerFinding[] = items.map((item) => ({
     source: "claude-review-summary",
     severity: "blocking",
     body: item,
     ...(url ? { url } : {}),
   }));
+  return { findings, findingsUnavailable: !recognizedSection };
 }
 
 // A leading 🔴/🟡 on a heading decides severity before the word rules, using
@@ -689,8 +703,7 @@ export function classifyReviewIssueComment(
   // Heading-based extraction (backward compat with target repos using trusted-author
   // Claude App identity that posts without a verdict marker).
   if (isLikelyClaudeReviewComment(comment, options)) {
-    const findings = extractClaudeSummaryFindings(comment.body, url);
-    return { findings, findingsUnavailable: findings.length === 0 && extractGithubActionsClaudeReviewFindings(comment.body, url).findingsUnavailable };
+    return extractClaudeSummaryResult(comment.body, url);
   }
 
   if (isGithubActionsClaudeReviewComment(comment)) {
@@ -1037,7 +1050,7 @@ function isGithubActionsClaudeReviewComment(comment: Record<string, unknown>): c
     && hasClaudeReviewHeading(comment.body);
 }
 
-function isAiImplementComment(body: string): boolean {
+export function isAiImplementComment(body: string): boolean {
   // Pipeline status comments lead with their marker. Review prose may quote one.
   return body.trimStart().startsWith("<!-- ai-implement");
 }
