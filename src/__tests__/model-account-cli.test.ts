@@ -362,6 +362,64 @@ describe("secret-import / secret-delete", () => {
 });
 
 
+describe("importEnvironmentCredential", () => {
+  const token = "SENTINEL-ENV-IMPORT";
+  const base = { RUNNER_TOKEN_SECRET: SECRET, CLAUDE_CODE_OAUTH_TOKEN: token };
+  it.each([
+    ["missing", {}, 404],
+    ["key unavailable", { CLAUDE_CODE_OAUTH_TOKEN: token }, 503],
+    ["token", base, 201],
+    ["both", { ...base, ANTHROPIC_API_KEY: "ignored-key" }, 201],
+    ["key", { RUNNER_TOKEN_SECRET: SECRET, ANTHROPIC_API_KEY: token }, 201],
+    ["repeat", base, 200],
+    ["disabled", base, 409],
+    ["other owner", base, 409],
+    ["orphan", base, 409],
+    ["incompatible", base, 409],
+  ] as const)("%s", (state, env, status) => {
+    const store = protectedSecrets.createModelProtectedSecrets({ env });
+    const id = "adopted-env-claude-subscription";
+    const ref = `model-account:${id}`;
+    if (state === "repeat" || state === "disabled") cli.importEnvironmentCredential(base, store);
+    if (state === "disabled") accounts.retireAccountProfile(id);
+    if (state === "other owner") accounts.saveAccountProfileRevision({ profileId: "other", identity: "Other", revision: 1,
+      agent: "claude", provider: "anthropic", authMode: "claude-subscription", metadata: { credentialRef: ref } });
+    if (state === "orphan") store.write(ref, token);
+    if (state === "incompatible") accounts.saveAccountProfileRevision({ profileId: id, identity: "Other", revision: 1,
+      agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+    const snapshot = () => ["model_account_profiles", "model_account_profile_revisions", "model_protected_secrets", "stage_agent_config_revisions"]
+      .map(table => dedup.getDb().prepare(`SELECT * FROM ${table}`).all());
+    const before = snapshot();
+    const write = vi.spyOn(store, "write");
+    if (status >= 400) {
+      try { cli.importEnvironmentCredential(env, store); throw new Error("expected refusal"); }
+      catch (error) { expect(error).toBeInstanceOf(cli.EnvironmentCredentialError); expect(error).toMatchObject({ status });
+        const expected = status === 404 ? "no model credential in the environment" : status === 503 ? "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it" :
+          state === "disabled" ? "adopted profile is disabled" : state === "incompatible" ? "adopted profile identifier is already in use" : "adopted credential reference is already in use";
+        expect((error as Error).message).toBe(expected);
+      }
+    } else {
+      const result = cli.importEnvironmentCredential(env, store);
+      expect(result).toEqual({ profileId: `adopted-env-${state === "key" ? "anthropic-api-key" : "claude-subscription"}`,
+        authMode: state === "key" ? "anthropic-api-key" : "claude-subscription", result: status === 200 ? "already-imported" : "created", keyIgnored: state === "both" });
+      expect(accounts.getAccountProfile(result.profileId)?.identity).toBe("Adopted environment credential");
+      expect(store.resolve(`model-account:${result.profileId}`)).toBe(token);
+      expect(JSON.stringify(result)).not.toContain(token);
+      expect(JSON.stringify(snapshot())).not.toContain(token);
+    }
+    if (status !== 201) { expect(snapshot()).toEqual(before); expect(write).not.toHaveBeenCalled(); }
+    expect(accounts.getOrchestratorDefaults()).toBeNull();
+  });
+  it("sanitizes secret-bearing storage exceptions and rolls back the profile", () => {
+    const store = protectedSecrets.createModelProtectedSecrets({ env: base });
+    vi.spyOn(store, "write").mockImplementation(() => { throw new Error(`${token} model-account:adopted-env-claude-subscription`); });
+    expect(() => cli.importEnvironmentCredential(base, store)).toThrow("could not import the environment credential");
+    expect(accounts.listAccountProfiles()).toEqual([]);
+    expect(accounts.getOrchestratorDefaults()).toBeNull();
+  });
+
+});
+
 describe("adopt-env", () => {
   const captureLogs = () => (["log", "error", "warn", "info", "debug"] as const)
     .map(method => vi.spyOn(console, method));

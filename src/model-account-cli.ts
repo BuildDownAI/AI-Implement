@@ -1,3 +1,4 @@
+import { TerminalError } from "@restatedev/restate-sdk";
 import { adoptProjects, type AdoptionDeps } from "./agent-config-adoption.js";
 import { getProjectStageConfig, readStageInputsFingerprint, setProjectStageConfig } from "./agent-config-store.js";
 import { getMappings } from "./config.js";
@@ -198,6 +199,54 @@ async function secretDelete(ref: string, deps: CliDeps): Promise<void> {
 /** Fixed identifiers make retries reuse the adopted profile rather than minting accounts. */
 const ADOPTED_IDS = ["adopted-env-claude-subscription", "adopted-env-anthropic-api-key"];
 
+/** Fixed messages only: failures may be persisted in a Restate journal. */
+export class EnvironmentCredentialError extends TerminalError {
+  constructor(public readonly status: number, message: string) { super(message, { errorCode: status }); }
+}
+
+/** Imports only the account and sealed credential; never changes stage defaults. */
+export function importEnvironmentCredential(env: NodeJS.ProcessEnv, secrets: ModelProtectedSecrets): {
+  profileId: string; authMode: "claude-subscription" | "anthropic-api-key";
+  result: "created" | "already-imported"; keyIgnored: boolean;
+} {
+  try {
+    return getDb().transaction(() => {
+      const token = env.CLAUDE_CODE_OAUTH_TOKEN;
+      const key = env.ANTHROPIC_API_KEY;
+      const value = token || key;
+      if (!value) throw new EnvironmentCredentialError(404, "no model credential in the environment");
+      if (!env.RUNNER_TOKEN_SECRET) throw new EnvironmentCredentialError(503, SECRET_FAILURES.key_unavailable);
+      const authMode: "claude-subscription" | "anthropic-api-key" = token ? "claude-subscription" : "anthropic-api-key";
+      const profileId = `adopted-env-${authMode}`;
+      const ref = `model-account:${profileId}`;
+      const profile = getAccountProfile(profileId);
+      if (profile && profile.status !== "active") throw new EnvironmentCredentialError(409, "adopted profile is disabled");
+      if (profile && (profile.agent !== "claude" || profile.provider !== "anthropic" || profile.authMode !== authMode ||
+          storedMetadataCredentialResolver.lookup(profileId, profile.revision) !== ref)) {
+        throw new EnvironmentCredentialError(409, "adopted profile identifier is already in use");
+      }
+      // Do not overwrite a reference owned by another profile or an orphaned import.
+      const owners = getDb().prepare("SELECT profile_id, metadata_json FROM model_account_profile_revisions").all() as Array<{ profile_id: string; metadata_json: string }>;
+      if (owners.some(row => row.profile_id !== profileId && JSON.parse(row.metadata_json).credentialRef === ref) ||
+          (!profile && getDb().prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(ref))) {
+        throw new EnvironmentCredentialError(409, "adopted credential reference is already in use");
+      }
+      if (!profile) saveAccountProfileRevision({
+        profileId, identity: "Adopted environment credential", revision: 1,
+        agent: "claude", provider: "anthropic", authMode, metadata: { credentialRef: ref },
+      });
+      if (!profile) {
+        const result = secrets.write(ref, value);
+        if (!result.ok) throw new EnvironmentCredentialError(result.code === "key_unavailable" ? 503 : 500, SECRET_FAILURES[result.code]);
+      }
+      return { profileId, authMode, result: profile ? "already-imported" as const : "created" as const, keyIgnored: Boolean(token && key) };
+    }).immediate();
+  } catch (error) {
+    if (error instanceof EnvironmentCredentialError) throw error;
+    throw new EnvironmentCredentialError(500, "could not import the environment credential");
+  }
+}
+
 function adoptEnv(deps: CliDeps): void {
   const config = getDb().transaction((): StageAgentConfigurationV1 => {
     const existing = getOrchestratorDefaults();
@@ -211,41 +260,13 @@ function adoptEnv(deps: CliDeps): void {
       deps.stdout("adopt-env defaults already configured; no changes");
       return existing.config;
     }
-    if (!deps.env.RUNNER_TOKEN_SECRET) throw new CliError(SECRET_FAILURES.key_unavailable);
-    const token = deps.env.CLAUDE_CODE_OAUTH_TOKEN;
-    const key = deps.env.ANTHROPIC_API_KEY;
-    const value = token || key;
-    if (!value) throw new CliError("no model credential in the environment");
-    const authMode = token ? "claude-subscription" : "anthropic-api-key";
-    const profileId = `adopted-env-${authMode}`;
-    const ref = `model-account:${profileId}`;
-    const profile = getAccountProfile(profileId);
-    if (profile && profile.status !== "active") throw new CliError("adopted profile is disabled");
-    if (profile && (profile.agent !== "claude" || profile.provider !== "anthropic" || profile.authMode !== authMode ||
-        storedMetadataCredentialResolver.lookup(profileId, profile.revision) !== ref)) {
-      throw new CliError("adopted profile identifier is already in use");
-    }
-    // Do not overwrite a reference owned by another profile or an orphaned import.
-    const owners = getDb().prepare("SELECT profile_id, metadata_json FROM model_account_profile_revisions").all() as Array<{ profile_id: string; metadata_json: string }>;
-    if (owners.some(row => row.profile_id !== profileId && JSON.parse(row.metadata_json).credentialRef === ref) ||
-        (!profile && getDb().prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(ref))) {
-      throw new CliError("adopted credential reference is already in use");
-    }
-    if (!profile) saveAccountProfileRevision({
-      profileId, identity: "Adopted environment credential", revision: 1,
-      agent: "claude", provider: "anthropic", authMode, metadata: { credentialRef: ref },
-    });
-    const secrets = deps.secrets();
-    if (!profile || secrets.open(ref).ok === false) {
-      const result = secrets.write(ref, value);
-      if (!result.ok) throw new CliError(SECRET_FAILURES[result.code]);
-    }
+    const { profileId, keyIgnored } = importEnvironmentCredential(deps.env, deps.secrets());
     const stage = { agent: "claude" as const, provider: "anthropic" as const, model: DEFAULT_MODEL,
       accountProfileId: profileId, invocationTimeoutMs: 90 * 60 * 1000 };
     const defaults: StageAgentConfigurationV1 = { version: 1, mode: "configured",
       stages: { planning: stage, implementation: stage, review: stage } };
     setOrchestratorDefaults(defaults, OPERATOR);
-    if (token && key) deps.stdout("ANTHROPIC_API_KEY ignored; CLAUDE_CODE_OAUTH_TOKEN takes precedence");
+    if (keyIgnored) deps.stdout("ANTHROPIC_API_KEY ignored; CLAUDE_CODE_OAUTH_TOKEN takes precedence");
     return defaults;
   }).immediate();
   for (const stage of STAGE_NAMES) deps.stdout(`${stage}: ${JSON.stringify(config.stages?.[stage])}`);
@@ -288,7 +309,7 @@ export async function main(argv: string[], deps: CliDeps = defaultDeps()): Promi
     if (rest.length) { deps.stderr(USAGE); return 2; }
     try { adoptEnv(deps); return 0; }
     catch (error) {
-      deps.stderr(`adopt-env failed: ${error instanceof CliError ? error.message : "unexpected failure"}`);
+      deps.stderr(`adopt-env failed: ${error instanceof CliError || error instanceof EnvironmentCredentialError ? error.message : "unexpected failure"}`);
       return 1;
     }
   }

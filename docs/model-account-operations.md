@@ -153,7 +153,14 @@ The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token
 
 ## Adopt an environment credential
 
-On the orchestrator, run `node dist/model-account-cli.js adopt-env` with no arguments.
+The admin tool `import_environment_credential` (no arguments, through MCP or
+`POST /api/tools/import_environment_credential` with `{ "args": {} }`) imports the
+credential as an ordinary account profile named `Adopted environment credential`.
+It does not change stage defaults, project grants, or project opt-ins. Repeating
+the import returns `already-imported` without writing.
+
+To also configure stage defaults, run `node dist/model-account-cli.js adopt-env`
+on the orchestrator with no arguments.
 It reads `CLAUDE_CODE_OAUTH_TOKEN` first, then `ANTHROPIC_API_KEY`. When both are
 present, the token wins and the command reports that the key was ignored. Bedrock
 is outside this migration. `RUNNER_TOKEN_SECRET` must be set before adoption can write.
