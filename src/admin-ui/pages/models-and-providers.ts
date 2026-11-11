@@ -311,12 +311,13 @@ export const modelsAndProvidersScript = `(function () {
       }
       const draft = mpCanEdit() && mpAccountEdits.get(a.profileId);
       const pid = window.escAttr(a.profileId);
-      const action = function (act, text) { return '<button class="btn btn-sm" data-act="' + window.escAttr(act) + '" data-profile="' + pid + '">' + window.esc(text) + '</button>'; };
+      const disabled = draft && draft.saving ? ' disabled' : '';
+      const action = function (act, text) { return '<button class="btn btn-sm" data-act="' + window.escAttr(act) + '" data-profile="' + pid + '"' + disabled + '>' + window.esc(text) + '</button>'; };
       const nameCell = draft
-        ? '<input class="input" aria-label="Name" data-edit-name="' + pid + '" value="' + window.escAttr(draft.identity) + '">'
+        ? '<input class="input" aria-label="Name" data-edit-name="' + pid + '" value="' + window.escAttr(draft.identity) + '"' + disabled + '>'
         : window.esc(a.identity);
       const statusCell = draft
-        ? '<select class="input" aria-label="Status" data-edit-status="' + pid + '">' + ['active', 'disabled', 'archived'].map(function (status) {
+        ? '<select class="input" aria-label="Status" data-edit-status="' + pid + '"' + disabled + '>' + ['active', 'disabled', 'archived'].map(function (status) {
             return '<option value="' + window.escAttr(status) + '"' + (status === draft.status ? ' selected' : '') + '>' + window.esc(status) + '</option>';
           }).join('') + '</select>'
         : '<span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span>';
@@ -331,19 +332,30 @@ export const modelsAndProvidersScript = `(function () {
         '<td>' + keyCell + '</td>' +
         '</tr>';
     }
-    // Carry typed (unsubmitted) key values and focus across the rebuild; values live only in the inputs.
+    // Carry unsubmitted keys and focused editing controls across the rebuild.
     const typed = {};
     rowsEl.querySelectorAll('input[data-key-for]').forEach(function (inp) {
       if (inp.value) typed[inp.getAttribute('data-key-for')] = inp.value;
     });
-    const focused = document.activeElement && document.activeElement.getAttribute
-      ? document.activeElement.getAttribute('data-key-for') : null;
+    const active = document.activeElement;
+    const focusAttribute = ['data-key-for', 'data-edit-name', 'data-edit-status'].find(function (attr) {
+      return active && rowsEl.contains(active) && active.hasAttribute(attr);
+    });
+    const focused = focusAttribute ? active.getAttribute(focusAttribute) : null;
+    const selection = focusAttribute === 'data-edit-name'
+      ? [active.selectionStart, active.selectionEnd, active.selectionDirection] : null;
     rowsEl.innerHTML = html;
     rowsEl.querySelectorAll('input[data-key-for]').forEach(function (inp) {
       const id = inp.getAttribute('data-key-for');
       if (Object.prototype.hasOwnProperty.call(typed, id)) inp.value = typed[id];
-      if (focused !== null && id === focused) inp.focus();
     });
+    if (focusAttribute) {
+      rowsEl.querySelectorAll('[' + focusAttribute + ']').forEach(function (control) {
+        if (control.getAttribute(focusAttribute) !== focused) return;
+        control.focus();
+        if (selection) control.setSelectionRange(selection[0], selection[1], selection[2]);
+      });
+    }
     document.getElementById('mp-account-form').classList.toggle('hidden', !mpCanEdit());
   }
 
@@ -451,11 +463,12 @@ export const modelsAndProvidersScript = `(function () {
     mpAccountError('');
     if (Object.keys(body).length) {
       draft.saving = true;
+      mpRenderAccounts();
       try {
         const res = await window.api('/api/model-accounts/' + encodeURIComponent(profileId), { method: 'PATCH', body: JSON.stringify(body) });
         if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to update account profile')); return; }
       } catch (_) { mpAccountError('Failed to update account profile'); return; }
-      finally { draft.saving = false; }
+      finally { draft.saving = false; mpRenderAccounts(); }
     }
     mpAccountEdits.delete(profileId);
     await loadStageConfig(false);
@@ -479,7 +492,7 @@ export const modelsAndProvidersScript = `(function () {
     };
     document.getElementById('mp-account-rows').onclick = async function (e) {
       const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
-      if (!btn || !mpCanEdit()) return;
+      if (!btn || btn.disabled || !mpCanEdit()) return;
       const profileId = btn.getAttribute('data-profile');
       const act = btn.getAttribute('data-act');
       if (act === 'edit-profile') {

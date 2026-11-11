@@ -22,7 +22,7 @@ The ID is the profile's key and never changes. A caller of the route itself send
 
 ## Edit an account profile
 
-The table reads Name, Agent, Provider, Authentication, Status, Readiness and API key, with the immutable profile ID below the Name. For an admin, **Edit** changes the Name and status (`active`, `disabled` or `archived`); **Save** sends only changed `identity` and `status` fields to `PATCH /api/model-accounts/:id`, and **Cancel** discards the edit. Non-admins have no Edit action or add form. Stage edits and unsubmitted keys survive account refreshes.
+The table reads Name, Agent, Provider, Authentication, Status, Readiness and API key, with the immutable profile ID below the Name. For an admin, **Edit** changes the Name and status (`active`, `disabled` or `archived`); **Save** sends only changed `identity` and `status` fields to `PATCH /api/model-accounts/:id`, and **Cancel** discards the edit. Non-admins have no Edit action or add form. Name, Status, Save and Cancel are disabled while saving; a failed save keeps the draft available to retry. Stage edits, profile drafts and unsubmitted keys survive account refreshes, as do focus on profile editing controls and the Name selection.
 
 The admin-only route may accept `identity`, `agent`, `provider`, `authMode`, `credentialRef` and `status`; any other key is a 400. It copies the current head, applies the body, and saves a new revision (`handlePatchModelAccount`, `src/admin.ts`). The credential reference is kept unless the body sets `credentialRef` to `null`. The profile ID is the path and cannot change: stage defaults, credential references and run attribution store it. The same validation as create applies (`validateProfileInput`, `src/agent-config-store.ts`).
 

@@ -275,6 +275,70 @@ describe("account profile names and editing", () => {
     } finally { win.close(); }
   });
 
+  it.each([true, false])("locks profile editing during a pending PATCH (success: %s)", async (success) => {
+    const { win, api, click, change } = await setup();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const original = api.getMockImplementation()!;
+    api.mockImplementation(async (path, options) => {
+      if (options?.method === "PATCH") {
+        await pending;
+        if (!success) return { ok: false, status: 500, json: async () => ({ error: "Save failed" }) };
+      }
+      return original(path, options);
+    });
+    try {
+      click("edit-profile");
+      change("[data-edit-name]", "Submitted name");
+      click("save-profile");
+      const assertLocked = () => {
+        for (const selector of ["[data-edit-name]", "[data-edit-status]", '[data-act="save-profile"]', '[data-act="cancel-profile"]']) {
+          expect(win.document.querySelector<HTMLInputElement>(selector)?.disabled).toBe(true);
+        }
+      };
+      assertLocked();
+      click("cancel-profile");
+      click("save-profile");
+      await win.loadModelsAndProviders();
+      assertLocked();
+      expect(api.mock.calls.filter(([, options]) => options?.method === "PATCH")).toHaveLength(1);
+      release();
+      await vi.waitFor(() => {
+        if (success) {
+          expect(win.document.querySelector("[data-edit-name]")).toBeNull();
+          expect(win.document.querySelector("#mp-account-rows td")?.textContent).toContain("Submitted name");
+        } else {
+          const name = win.document.querySelector<HTMLInputElement>("[data-edit-name]")!;
+          expect(name.disabled).toBe(false);
+          expect(name.value).toBe("Submitted name");
+          expect(win.document.querySelector<HTMLSelectElement>("[data-edit-status]")?.disabled).toBe(false);
+          expect(win.document.querySelector<HTMLButtonElement>('[data-act="cancel-profile"]')?.disabled).toBe(false);
+          expect(win.document.querySelector("#mp-account-error")?.textContent).toContain("Save failed");
+        }
+      });
+    } finally { release(); win.close(); }
+  });
+
+  it("preserves profile edit focus and Name selection across account refreshes", async () => {
+    const { win, click, change } = await setup();
+    try {
+      click("edit-profile");
+      change("[data-edit-name]", "Unsaved name");
+      const name = win.document.querySelector<HTMLInputElement>("[data-edit-name]")!;
+      name.focus();
+      name.setSelectionRange(2, 7, "backward");
+      await win.loadModelsAndProviders();
+      const refreshed = win.document.querySelector<HTMLInputElement>("[data-edit-name]")!;
+      expect(refreshed).not.toBe(name);
+      expect(win.document.activeElement).toBe(refreshed);
+      expect(refreshed.value).toBe("Unsaved name");
+      expect([refreshed.selectionStart, refreshed.selectionEnd, refreshed.selectionDirection]).toEqual([2, 7, "backward"]);
+      win.document.querySelector<HTMLSelectElement>("[data-edit-status]")!.focus();
+      await win.loadModelsAndProviders();
+      expect(win.document.activeElement).toBe(win.document.querySelector("[data-edit-status]"));
+    } finally { win.close(); }
+  });
+
   it("hides editing and the add form for non-admins", async () => {
     const { win } = await setup(false);
     try {
