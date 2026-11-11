@@ -20,7 +20,32 @@ import { DEFAULT_LINEAR_PICKUP_LABEL, getLinearPickupLabel } from "../orchestrat
 
 interface GraphQLResponse<T> {
   data?: T;
-  errors?: Array<{ message: string }>;
+  errors?: Array<{ message: string; extensions?: unknown }>;
+}
+
+/** A GraphQL refusal, retaining only the first error's message and structured type. */
+export class LinearGraphQLError extends Error {
+  constructor(
+    readonly operation: string | undefined,
+    readonly linearMessage: string,
+    readonly extensionsType?: string,
+    readonly permanent: boolean = false,
+  ) {
+    super(`Linear GraphQL error${operation ? ` (${operation})` : ""}: ${linearMessage}`);
+    this.name = "LinearGraphQLError";
+    // permanent is true when Linear reports a permission refusal (extensions.type forbidden, extensions.code FORBIDDEN, or extensions.statusCode 403), so a retry cannot help.
+  }
+}
+
+/** A refused label creation, with the issue's actual team and requested label. */
+export class LinearLabelWriteError extends LinearGraphQLError {
+  readonly action = "create" as const;
+
+  constructor(readonly label: string, readonly teamKey: string, error: LinearGraphQLError) {
+    super(error.operation, error.linearMessage, error.extensionsType, error.permanent);
+    this.name = "LinearLabelWriteError";
+    this.message = `Linear refused to create label "${label}" on team ${teamKey}: ${error.linearMessage}`;
+  }
 }
 
 /** How far back to scan completed feature nodes for roll-up (bounds the query). */
@@ -264,6 +289,7 @@ export class LinearProvider implements TicketingProvider {
   private async linearMutation<T>(
     query: string,
     variables: Record<string, unknown>,
+    operation?: string,
   ): Promise<T> {
     const res = await withLinearToken((token) =>
       fetch("https://api.linear.app/graphql", {
@@ -284,7 +310,18 @@ export class LinearProvider implements TicketingProvider {
 
     const json = (await res.json()) as GraphQLResponse<T>;
     if (json.errors?.length) {
-      throw new Error(`Linear GraphQL error: ${json.errors[0].message}`);
+      const error = json.errors[0];
+      const extensions = error.extensions;
+      let extensionsType: string | undefined;
+      let permanent = false;
+      if (extensions && typeof extensions === "object") {
+        permanent = ("type" in extensions && extensions.type === "forbidden")
+          || ("code" in extensions && extensions.code === "FORBIDDEN")
+          || ("statusCode" in extensions && extensions.statusCode === 403);
+        if ("type" in extensions && typeof extensions.type === "string") extensionsType = extensions.type;
+        else if ("code" in extensions && typeof extensions.code === "string") extensionsType = extensions.code;
+      }
+      throw new LinearGraphQLError(operation, error.message, extensionsType, permanent);
     }
     if (!json.data) {
       throw new Error("Linear API returned no data");
@@ -707,20 +744,28 @@ export class LinearProvider implements TicketingProvider {
       return reusableMatch.id;
     }
 
-    const createData = await this.linearMutation<{
-      issueLabelCreate: { issueLabel: { id: string } };
-    }>(
-      `mutation($teamId: String!, $name: String!, $color: String!) {
-        issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
-          issueLabel { id }
-        }
-      }`,
-      { teamId, name: label.name, color: label.color },
-    );
-    console.log(`[linear] Created '${label.name}' label for team ${teamId}`);
-    const id = createData.issueLabelCreate.issueLabel.id;
-    cache.set(teamKey, id);
-    return id;
+    try {
+      const createData = await this.linearMutation<{
+        issueLabelCreate: { issueLabel: { id: string } };
+      }>(
+        `mutation($teamId: String!, $name: String!, $color: String!) {
+          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
+            issueLabel { id }
+          }
+        }`,
+        { teamId, name: label.name, color: label.color },
+        "issueLabelCreate",
+      );
+      console.log(`[linear] Created '${label.name}' label for team ${teamId}`);
+      const id = createData.issueLabelCreate.issueLabel.id;
+      cache.set(teamKey, id);
+      return id;
+    } catch (error) {
+      if (error instanceof LinearGraphQLError) {
+        throw new LinearLabelWriteError(label.name, teamKey, error);
+      }
+      throw error;
+    }
   }
 
   private async getInProgressStateId(teamKey: string): Promise<string> {
@@ -781,6 +826,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, stateId },
+      "issueUpdate",
     );
   }
 
@@ -805,6 +851,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, labelIds: [...currentIds, labelId] },
+      "issueUpdate",
     );
   }
 
@@ -829,6 +876,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, labelIds: remaining.map((l) => l.id) },
+      "issueUpdate",
     );
   }
 
@@ -915,6 +963,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, labelIds: newLabelIds },
+      "issueUpdate",
     );
 
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
@@ -954,6 +1003,7 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, stateId, labelIds },
+      "issueUpdate",
     );
   }
 
@@ -996,6 +1046,6 @@ export class LinearProvider implements TicketingProvider {
     await this.linearMutation<{ commentCreate: { success: boolean } }>(query, {
       issueId,
       body,
-    });
+    }, "commentCreate");
   }
 }
