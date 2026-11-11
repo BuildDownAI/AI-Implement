@@ -82,7 +82,6 @@ export const MODEL_AUTH_FAILURE_CATEGORIES = [
 export type ModelAuthFailureCategory = (typeof MODEL_AUTH_FAILURE_CATEGORIES)[number];
 
 export const MAX_MODEL_AUTH_ID_LENGTH = 128;
-export const MAX_MODEL_AUTH_BINDINGS = 16;
 export const MIN_MODEL_AUTH_BEARER_LENGTH = 32;
 export const MAX_MODEL_AUTH_BEARER_LENGTH = 256;
 export const MAX_API_CREDENTIAL_LENGTH = 4096;
@@ -272,8 +271,9 @@ export function validateModelAuthGrantBinding(raw: unknown): ValidationResult<Mo
 }
 
 function validateBindingList(raw: unknown): ValidationResult<readonly ModelAuthGrantBinding[]> {
-  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_MODEL_AUTH_BINDINGS) {
-    return err(`bindings must be an array of 1-${MAX_MODEL_AUTH_BINDINGS} entries`);
+  // Account lists have no configured size limit; grant every frozen stage/profile.
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return err("bindings must be a non-empty array");
   }
   const bindings: ModelAuthGrantBinding[] = [];
   for (const item of raw) {
@@ -281,20 +281,22 @@ function validateBindingList(raw: unknown): ValidationResult<readonly ModelAuthG
     if (!b.ok) return b;
     bindings.push(b.value);
   }
-  for (let i = 0; i < bindings.length; i++) {
-    for (let j = 0; j < i; j++) {
-      const a = bindings[j]!;
-      const b = bindings[i]!;
-      if (a.profileId !== b.profileId) continue;
-      if (a.stage === b.stage) return err("bindings contain a duplicate stage/profile pair");
-      if (
-        a.profileRevision !== b.profileRevision ||
-        a.authMode !== b.authMode ||
-        a.ownerGeneration !== b.ownerGeneration
-      ) {
-        return err("bindings give one profile inconsistent revision, auth mode, or owner generation");
-      }
+  const profiles = new Map<string, ModelAuthGrantBinding>();
+  const stageProfiles = new Map<StageName, Set<string>>();
+  for (const binding of bindings) {
+    const seen = stageProfiles.get(binding.stage) ?? new Set<string>();
+    if (seen.has(binding.profileId)) return err("bindings contain a duplicate stage/profile pair");
+    seen.add(binding.profileId);
+    stageProfiles.set(binding.stage, seen);
+    const previous = profiles.get(binding.profileId);
+    if (previous && (
+      previous.profileRevision !== binding.profileRevision ||
+      previous.authMode !== binding.authMode ||
+      previous.ownerGeneration !== binding.ownerGeneration
+    )) {
+      return err("bindings give one profile inconsistent revision, auth mode, or owner generation");
     }
+    profiles.set(binding.profileId, binding);
   }
   return ok(bindings);
 }

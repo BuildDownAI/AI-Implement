@@ -71,6 +71,13 @@ describe("grant bootstrap", () => {
     if (r.ok) expect(r.value.bindings).toHaveLength(2);
   });
 
+  it("accepts all bindings from account lists without a fixed count cap", () => {
+    const bindings = Array.from({ length: 300 }, (_, i) => ({ ...apiBinding, profileId: `profile-${i}` }));
+    const result = parseModelAuthGrantBootstrap(grant({ bindings }));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.bindings).toEqual(bindings);
+  });
+
   it("allows one profile on several stages with identical pinning", () => {
     const r = parseModelAuthGrantBootstrap(
       grant({ bindings: [apiBinding, { ...apiBinding, stage: "review" }] }),

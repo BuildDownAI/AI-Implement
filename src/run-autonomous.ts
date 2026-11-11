@@ -832,6 +832,7 @@ export { MODEL_AUTH_ENV };
 
 export interface ConfiguredRunOptions {
   modelFallbacks?: StageExecutorOptions["fallbackModels"];
+  accountFallbacks?: StageExecutorOptions["accountFallbacks"];
   /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */
   agentConfig?: ResolvedAgentSnapshotV1;
   /** Local runs: protected credential source. */
@@ -1101,7 +1102,9 @@ export async function prepareConfiguredRun(input: {
   const modelFallbacks = options.modelFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
     ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).modelFallbacks
     : undefined);
-  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks }, syntheticProvider, implementationFullAccess);
+  const accountFallbacks = options.accountFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
+    ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).accountFallbacks : undefined);
+  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks, accountFallbacks }, syntheticProvider, implementationFullAccess);
 }
 
 function buildConfiguredRun(
@@ -1153,6 +1156,7 @@ function buildConfiguredRun(
         },
         snapshot,
         fallbackModels: options.modelFallbacks,
+        accountFallbacks: options.accountFallbacks,
         auth,
         logLevel: args.logLevel,
         activityReporting: args.activityReporting,
