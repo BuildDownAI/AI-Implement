@@ -519,6 +519,21 @@ describe("adopt-env", () => {
     expect([...out, ...err].join("\n")).not.toContain(TOKEN);
   });
 
+  it("leaves legacy defaults unchanged when repairing the credential fails", async () => {
+    expect(await adopt()).toBe(0);
+    accounts.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const cliDeps = deps("", env);
+    const secrets = cliDeps.secrets();
+    expect(secrets.delete("model-account:adopted-env-claude-subscription").ok).toBe(true);
+    cliDeps.secrets = () => secrets;
+    vi.spyOn(secrets, "write").mockReturnValue({ ok: false, code: "write_failed" });
+    const before = dump();
+
+    expect(await cli.main(["adopt-env"], cliDeps)).toBe(1);
+    expect(dump()).toEqual(before);
+    expect(err).toContain("adopt-env failed: could not write the credential");
+  });
+
   it.each([false, true])("refuses disabled adoption even with configured defaults=%s", async configured => {
     await adopt();
     if (!configured) accounts.setOrchestratorDefaults({ version: 1, mode: "legacy" });

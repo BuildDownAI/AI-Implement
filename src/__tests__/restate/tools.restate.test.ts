@@ -989,12 +989,17 @@ describe("orchestratorTools (Restate)", () => {
       expect(body).toContain("adopted-env-claude-subscription");
       const invocations = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'import_environment_credential'");
       expect(invocations.length).toBeGreaterThanOrEqual(3);
+      const journals: string[] = [];
       for (const invocation of invocations) {
         const entries = await journalEntries(env.adminAPIBaseUrl(), String(invocation.id));
         const text = journalText(entries);
+        journals.push(text);
         expect(text).not.toContain(token);
         expect(text).not.toContain(ref);
       }
+      // Prove the absence checks searched the decoded import result, not an empty journal.
+      expect(journals.join("\n")).toContain("adopted-env-claude-subscription");
+      expect(journals.join("\n")).toContain("import-environment-credential");
       expect(JSON.stringify([first, second, body])).not.toContain(token);
       expect(JSON.stringify([first, second, body])).not.toContain(ref);
       const metadata = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools/handlers/import_environment_credential`).then(r => r.json());
