@@ -184,7 +184,11 @@ Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode
 is `configured`, and all three stages name the adopted profile. Projects still
 need their own explicit opt-in. To roll back, revert the defaults and delete the
 profile on Models & providers; remove its encrypted credential with `secret-delete`
-if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it.
+if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
+with `secret-import` or the profile's credential editor. The one-time
+`import_environment_credential` tool does not repair existing credentials.
+When replacing legacy defaults, `adopt-env` repairs a missing or unreadable
+credential from the environment before configuring the stages.
 
 ## Adopting existing projects
 

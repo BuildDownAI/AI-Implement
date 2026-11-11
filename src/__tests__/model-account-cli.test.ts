@@ -410,6 +410,18 @@ describe("importEnvironmentCredential", () => {
     if (status !== 201) { expect(snapshot()).toEqual(before); expect(write).not.toHaveBeenCalled(); }
     expect(accounts.getOrchestratorDefaults()).toBeNull();
   });
+  it.each(["missing", "undecryptable"])("does not rewrite a previously imported %s secret", failure => {
+    cli.importEnvironmentCredential(base, protectedSecrets.createModelProtectedSecrets({ env: base }));
+    const env = failure === "undecryptable" ? { ...base, RUNNER_TOKEN_SECRET: "rotated-secret" } : base;
+    const store = protectedSecrets.createModelProtectedSecrets({ env });
+    const ref = "model-account:adopted-env-claude-subscription";
+    if (failure === "missing") store.delete(ref);
+    const write = vi.spyOn(store, "write");
+    expect(cli.importEnvironmentCredential(env, store).result).toBe("already-imported");
+    expect(write).not.toHaveBeenCalled();
+    expect(store.open(ref).ok).toBe(false);
+  });
+
   it("sanitizes secret-bearing storage exceptions and rolls back the profile", () => {
     const store = protectedSecrets.createModelProtectedSecrets({ env: base });
     vi.spyOn(store, "write").mockImplementation(() => { throw new Error(`${token} model-account:adopted-env-claude-subscription`); });
@@ -489,6 +501,22 @@ describe("adopt-env", () => {
     expect(await adopt()).toBe(0);
     expect(dump().slice(0, 2)).toEqual(profiles);
     expect(dump()[3]).toEqual(secret);
+  });
+
+  it.each(["missing", "undecryptable"])("repairs a %s secret before configuring legacy defaults", async failure => {
+    expect(await adopt()).toBe(0);
+    accounts.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const ref = "model-account:adopted-env-claude-subscription";
+    const repairEnv = failure === "undecryptable" ? { ...env, RUNNER_TOKEN_SECRET: "rotated-secret" } : env;
+    const secrets = protectedSecrets.createModelProtectedSecrets({ env: repairEnv });
+    if (failure === "missing") expect(secrets.delete(ref).ok).toBe(true);
+    expect(secrets.open(ref)).toMatchObject({ ok: false, code: failure === "missing" ? "row_missing" : "decrypt_failed" });
+    const profiles = dump().slice(0, 2);
+    expect(await adopt(repairEnv)).toBe(0);
+    expect(secrets.resolve(ref)).toBe(TOKEN);
+    expect(dump().slice(0, 2)).toEqual(profiles);
+    expect(accounts.getOrchestratorDefaults()?.config).toEqual({ version: 1, mode: "configured", stages: stages("adopted-env-claude-subscription") });
+    expect([...out, ...err].join("\n")).not.toContain(TOKEN);
   });
 
   it.each([false, true])("refuses disabled adoption even with configured defaults=%s", async configured => {

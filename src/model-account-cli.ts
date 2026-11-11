@@ -260,7 +260,15 @@ function adoptEnv(deps: CliDeps): void {
       deps.stdout("adopt-env defaults already configured; no changes");
       return existing.config;
     }
-    const { profileId, keyIgnored } = importEnvironmentCredential(deps.env, deps.secrets());
+    const secrets = deps.secrets();
+    const { profileId, keyIgnored, result } = importEnvironmentCredential(deps.env, secrets);
+    // The one-time tool import never rewrites an existing credential. The CLI
+    // also repairs unreadable credentials before switching legacy defaults.
+    const ref = `model-account:${profileId}`;
+    if (result === "already-imported" && !secrets.open(ref).ok) {
+      const written = secrets.write(ref, (deps.env.CLAUDE_CODE_OAUTH_TOKEN || deps.env.ANTHROPIC_API_KEY)!);
+      if (!written.ok) throw new CliError(SECRET_FAILURES[written.code]);
+    }
     const stage = { agent: "claude" as const, provider: "anthropic" as const, model: DEFAULT_MODEL,
       accountProfileId: profileId, invocationTimeoutMs: 90 * 60 * 1000 };
     const defaults: StageAgentConfigurationV1 = { version: 1, mode: "configured",
