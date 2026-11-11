@@ -33,7 +33,7 @@ export class LinearGraphQLError extends Error {
   ) {
     super(`Linear GraphQL error${operation ? ` (${operation})` : ""}: ${linearMessage}`);
     this.name = "LinearGraphQLError";
-    // Fail open until a sandbox refusal verifies Linear's permission extension value.
+    // A permanent permission refusal (forbidden/FORBIDDEN/403) cannot be helped by retrying.
   }
 }
 
