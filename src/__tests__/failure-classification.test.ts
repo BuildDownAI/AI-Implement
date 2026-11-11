@@ -27,6 +27,50 @@ function llmResult(overrides: Partial<LLMResult> = {}): LLMResult {
 
 const CTX = { stage: "implement", attempt: 1, expectsStructuredOutput: false };
 
+describe("account usage-limit provider signatures", () => {
+  const usageMessages = [
+    "Usage limit reached",
+    "reached your weekly usage limit",
+    "hit your usage limit",
+    "usage_limit_reached",
+    "workspace_member_usage_limit_reached",
+    "The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.",
+  ];
+
+  it.each(usageMessages.flatMap((text) => [text, text.toUpperCase(), `${text} 429`]))(
+    "classifies %s as a non-retryable account usage limit through both entry points",
+    (text) => {
+      for (const record of [
+        classifyThrown(new Error(text), CTX),
+        classifyLlmResult(llmResult({ exitCode: 1, errorMessage: text }), CTX),
+      ]) {
+        expect(record).toMatchObject({ category: "auth", code: "ACCOUNT_USAGE_LIMIT", retryable: false });
+      }
+    },
+  );
+
+  it.each([
+    ["rate_limit_error", "transient", "PROVIDER_RATE_LIMITED", true],
+    ["429", "transient", "PROVIDER_RATE_LIMITED", true],
+    ["at capacity", "transient", "PROVIDER_OVERLOADED", true],
+    ["401", "auth", "PROVIDER_AUTH", false],
+    ["invalid x-api-key", "auth", "PROVIDER_AUTH", false],
+  ] as const)("preserves classification for %s through both entry points", (text, category, code, retryable) => {
+    for (const record of [
+      classifyThrown(new Error(text), CTX),
+      classifyLlmResult(llmResult({ exitCode: 1, errorMessage: text }), CTX),
+    ]) {
+      expect(record).toMatchObject({ category, code, retryable });
+    }
+  });
+
+  it("does not classify bare limit text as an account usage limit", () => {
+    expect(classifyThrown(new Error("limit"), CTX)).toMatchObject({ category: "unknown", code: "UNKNOWN" });
+    expect(classifyLlmResult(llmResult({ exitCode: 1, errorMessage: "limit" }), CTX))
+      .toMatchObject({ category: "crash", code: "PROCESS_EXIT_NONZERO" });
+  });
+});
+
 describe("classifyLlmResult", () => {
   afterEach(() => vi.unstubAllEnvs());
 
