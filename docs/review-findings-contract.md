@@ -301,11 +301,16 @@ The post-run late-review rail can still consume a verdict that arrives after
 the in-run wait ends; see [review-fix-rail.md](review-fix-rail.md).
 
 
-Internal findings remain in the run's report for reviewer attribution. An internal
-finding absent from the final complete internal review is fixed: the callback
-resolves its ledger revision with a fixed disposition, so scorecards count it as
+Only gating internal reviewers' findings reach the ledger and contribute to
+`get_reviewer_scorecard` counts, including their minor findings. Findings from
+reviewers selected with `gates: false` or with branch provenance remain visible
+in PR comments but are not reported to the ledger.
+
+A gating internal finding absent from the final complete gating internal review
+is fixed: the callback resolves its ledger revision with a fixed disposition, so scorecards count it as
 fixed rather than ignored. Findings reported again by the final review remain open.
-Closure follows the complete internal review even when external review or CI check
-permissions prevent approval. An incomplete final review cannot establish absence.
+Closure follows the complete gating internal review even when external review or CI
+check permissions prevent approval. An incomplete gating review cannot establish
+absence; an incomplete advisory review does not prevent closure.
 Callback retries preserve the original dispatch revision and cannot reopen a resolved
 finding or close a newer report.

@@ -2202,12 +2202,14 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const selectedInternalFindings = selectedReviewerResult.findings;
       // Internal review completeness is independent of external approval gates, which
       // can terminate this iteration before the combined ledger is built.
-      finalInternalKeys = selectedReviewerResult.incompleteReviews.length === 0
-        ? new Set(selectedInternalFindings.map(stableReviewFindingKey))
+      const gatingInternalFindings = selectedInternalFindings.filter(finding =>
+        internalReviewerGates(finding.reviewerId, effectiveReviewerPolicy, finding.reviewerProvenance));
+      finalInternalKeys = gatingIncompleteReviews.length === 0
+        ? new Set(gatingInternalFindings.map(stableReviewFindingKey))
         : undefined;
-      // Reporting preserves each internal finding even when prompt deduplication
-      // prefers a gating finding from another reviewer or source.
-      for (const finding of selectedInternalFindings) {
+      // Report gating reviewers only, including minor findings, even when prompt
+      // deduplication prefers a finding from another reviewer or source.
+      for (const finding of gatingInternalFindings) {
         internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
       }
       const verdict = {
