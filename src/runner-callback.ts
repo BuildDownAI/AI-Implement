@@ -1,3 +1,4 @@
+import { getDb } from "./dedup.js";
 import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
 import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
@@ -1162,8 +1163,16 @@ async function handleRunnerResultInternal(
           (f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) ||
           (f.reviewerId !== undefined && typeof f.reviewerId !== "string")) continue;
       const key = stableReviewFindingKey(f);
+      const existing = getReviewFindingsByKeys(internalJob.repo, internalPr, [key])[0];
+      // Reports have dispatch identity but no timestamp. When the row advanced after
+      // dispatch, only waive the time guard if this dispatch owns the current revision.
+      const canResolve = !existing || existing.status === "resolved" ||
+        existing.lastSeenAt <= internalJob.dispatchedAt || !getDb().prepare(`
+          SELECT 1 FROM internal_review_finding_reports
+          WHERE finding_id = ? AND revision = ? AND dispatch_id != ? LIMIT 1
+        `).get(existing.id, existing.revision, claims.dispatchId);
       const report = recordInternalReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr }, claims.dispatchId);
-      if (sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
+      if (canResolve && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
         markReviewFindingResolvedIfRevision(report.id, report.revision);
       }
     }

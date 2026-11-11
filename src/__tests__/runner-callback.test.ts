@@ -28,6 +28,11 @@ import type {
 } from "../review-fix-contract.js";
 import { makeAppendLogEntry, makeIssue, makeMapping, makeReviewFixResult } from "./helpers/builders.js";
 import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
+import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
+import { testDir } from "./helpers/test-dir.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { makeContext } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
@@ -4659,32 +4664,64 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
       .toHaveLength(disposition === "follow-up" ? 1 : 0);
   });
 
-  it("closes an internal finding omitted by the final review and preserves closure on callback retry", async () => {
+  it.each([false, true])("closes an internal finding omitted by the final review and preserves closure on callback retry (historical report: %s)", async (historicalReport) => {
     const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Early internal defect" };
     const key = reviewStore.stableReviewFindingKey(finding);
+    fakeFetch({ "POST /runner/review-publication": { json: { status: "posted", reviewUrl: "https://github.com/org/repo/pull/11#pullrequestreview-80" } } }).install();
+    const output = await postPushReviewStep.run(
+      makeContext({ githubOwner: "org", githubRepo: "repo", githubToken: "token", nonce: "", orchestratorUrl: "", callbackUrl: "https://orchestrator.test/", progressToken: "progress" }, {
+        invoke: async ({ stage }) => ({
+          stdout: "", exitCode: 0, tokensUsed: 1,
+          structuredOutput: {
+            approved: /review-2$/.test(stage ?? ""),
+            findings: /review-2$/.test(stage ?? "") ? [] : [{ severity: finding.severity, body: finding.body }],
+            summary: "Review result",
+            checks: [{ check: "Diff review", result: "passed", evidence: "Inspected diff." }],
+          },
+          terminalStatus: { subtype: "success", isError: false },
+        }),
+      }),
+      {
+        prNumber: "11", workspaceDir: testDir("callback-final-review"), reviewers: DEFAULT_REVIEWER_SELECTION,
+        pushedSha: "head", reviewProviders: [], sleep: async () => undefined,
+        ghSpawn: (args) => ({ exitCode: 0, stdout: args.some(a => /^repos\/:owner\/:repo\/pulls\/11$/.test(a))
+          ? JSON.stringify({ state: "open", head: { sha: "head", ref: "branch" } })
+          : args.some(a => a.includes("/check-runs")) ? JSON.stringify([{ total_count: 0, check_runs: [] }])
+          : args[0] === "pr" && args[1] === "diff" ? "diff" : "" }),
+        gitSpawn: (args) => ({ exitCode: 0, stdout: args[0] === "status" ? "M file.ts\n" : args[0] === "show" ? "M\tfile.ts\n" : "head" }),
+      },
+      { report: async () => undefined },
+    );
+    expect(output.iterations).toBe(2);
+    expect(output.approved).toBe(true);
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
       ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
     });
-    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    if (historicalReport) {
+      const historicalTime = Date.now() - 2000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(historicalTime);
+      reviewStore.recordInternalReviewFinding({ ...finding, repo: "org/repo", prNumber: 11 }, "older-dispatch");
+      clock.mockRestore();
+    }
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, dispatchedAt: Date.now() - 1000 });
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
-    // A current-head report may already exist after dispatch.
-    reviewStore.upsertReviewFinding({ ...finding, repo: "org/repo", prNumber: 11 });
-    dedup.getDb().prepare("UPDATE review_findings SET last_seen_at = ?").run(Date.now() + 1000);
+    // A report already recorded by this dispatch must still be eligible for closure.
+    reviewStore.recordInternalReviewFinding({ ...finding, repo: "org/repo", prNumber: 11 }, dispatchId);
     for (let retry = 0; retry < 2; retry++) {
       const res = await runnerCallback.handleRunnerResult({
         authorization: `Bearer ${token}`,
         body: {
           phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
           failureReason: "another gate remains", prUrl: "https://github.com/org/repo/pull/11",
-          comments: [], internalFindings: [finding],
-          findingDispositions: [{ findingKey: key, disposition: "fixed", reason: "Absent from final complete internal review." }],
+          comments: [], internalFindings: output.internalFindings,
+          findingDispositions: output.findingDispositions,
         },
         secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
       });
       expect(res).toMatchObject({ status: retry === 0 ? 200 : 409 });
       expect(reviewStore.listOpenReviewFindings("org/repo", 11)).toEqual([]);
-      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status: "resolved", revision: 2 }]);
+      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status: "resolved", revision: historicalReport ? 2 : 1 }]);
       const { getReviewerScorecard } = await import("../report-card.js");
       expect(getReviewerScorecard({ repo: "org/repo" })).toEqual([
         expect.objectContaining({ source: "ai-implement-internal", total: 1, fixed: 1, ignored: 0 }),
@@ -4694,6 +4731,34 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
       const { headHasBlockingFinding } = await import("../review-head-clean.js");
       expect(await headHasBlockingFinding("token", "org", "repo", 11, "head")).toBe(false);
     }
+  });
+
+  it("keeps an internal finding open when another dispatch reports it after this dispatch started", async () => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Concurrent internal defect" };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    const dispatches = [0, 1].map(() => runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    }));
+    for (const { dispatchId } of dispatches) {
+      const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, dispatchedAt: Date.now() - 1000 });
+      log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+    }
+    // B reports first; A subsequently claims that its final review fixed the finding.
+    for (const index of [1, 0]) {
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${dispatches[index].token}`,
+        body: {
+          phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+          failureReason: "another gate remains", prUrl: "https://github.com/org/repo/pull/11",
+          comments: [], internalFindings: [finding],
+          findingDispositions: index === 0 ? [{ findingKey: key, disposition: "fixed", reason: "Absent from final review." }] : [],
+        },
+        secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      });
+      expect(res.status).toBe(200);
+    }
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status: "open" }]);
   });
 
   it.each([undefined, "invalid", "follow-up", "fixed"] as const)("reopens internal findings reported by a later dispatch with disposition %s", async (disposition) => {
