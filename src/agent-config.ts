@@ -93,6 +93,7 @@ export function validateDefaultAccounts(config: StageAgentConfigurationV1, profi
       seen.add(entry.accountProfileId);
       first ??= profile;
       if (profile.agent !== first.agent && !entry.model.trim()) throw new Error(`${context} requires a model for another agent`);
+      if (profile.provider !== first.provider && !entry.model.trim()) throw new Error(`${context} requires a model for another provider`);
       const isSubscription = profile.authMode.endsWith("subscription");
       if (subscription && !isSubscription) throw new Error(`${context} cannot use paid API after subscription`);
       subscription ||= isSubscription;
@@ -373,7 +374,10 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       if (entries[choice.chosen.index].model.trim()) resolved.sources.model = "orchestrator-default";
     }
     for (const field of ["accountProfileId", "agent", "provider", "model"] as const) resolved.selection[field] = choice.chosen[field] as never;
-    if (fallback === resolved.selection.model) {
+    if (choice.chosen.agent !== entries[0].agent || choice.chosen.provider !== entries[0].provider) {
+      delete fallbackModels[stage];
+      delete fallbackModelSources[stage];
+    } else if (fallback === resolved.selection.model) {
       if (!defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null) {
         throw new Error(`${stage}.fallbackModel must differ from model`);
       }

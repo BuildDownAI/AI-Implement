@@ -138,7 +138,7 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
   const effectiveModels = new Map<StageName, string>();
   const switchOnOverload = (stage: StageName, failure?: FailureRecord) => {
     const account = effectiveAccounts.get(stage);
-    if (account && account.agent !== snapshot.stages[stage].agent) return;
+    if (account && (account.agent !== snapshot.stages[stage].agent || account.provider !== snapshot.stages[stage].provider)) return;
     const from = account?.model ?? snapshot.stages[stage].model;
     const to = options.fallbackModels?.[stage];
     if (failure?.code !== "PROVIDER_OVERLOADED" || !to || to === from || effectiveModels.has(stage)) return;

@@ -710,6 +710,23 @@ describe("account fallback", () => {
     expect(claude.invoke).toHaveBeenCalledTimes(1);
   });
 
+  it("does not apply the Anthropic overload model after switching to Bedrock", async () => {
+    const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+    const claude = fakeExec();
+    claude.invoke.mockResolvedValueOnce({ ...ok, failure })
+      .mockResolvedValueOnce({ ...ok, failure: { ...failure, code: "PROVIDER_OVERLOADED" } });
+    const bedrock = { ...B, provider: "bedrock" as const, authMode: "bedrock" as const, model: "bedrock-model" };
+    const executor = createStageExecutor({ workspaceDir: "/tmp", legacy: fakeExec(), snapshot, auth: fakeAuth(),
+      accountFallbacks: { implementation: [bedrock] }, fallbackModels: { implementation: "anthropic-backup" }, createClaude: () => claude });
+    const params = { ...base, agentStage: "implementation" as const };
+    await executor.invoke(params);
+    const overloaded = await executor.invoke(params);
+    expect(overloaded.failure?.modelFallback).toBeUndefined();
+    const last = await executor.invoke(params);
+    expect(last.attribution).toMatchObject({ provider: "bedrock", model: "bedrock-model" });
+    expect(claude.invoke.mock.calls[2][0].model).toBe("bedrock-model");
+  });
+
   it("routes a Codex primary to Claude through auth with effective attribution", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     const primary = structuredClone(snapshot);

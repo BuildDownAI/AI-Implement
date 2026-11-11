@@ -1630,7 +1630,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // The verify hook still failed after the last iteration. Never a review verdict, so it gets
     // its own failureCode/wording; the hook's output tail rides in finalFeedback.
     const verifyFailed = terminationReason === "verify_failed";
-    const failureCode = verifyFailed
+    const accountUsageLimit = reviewerFailure?.code === "ACCOUNT_USAGE_LIMIT";
+    const failureCode = accountUsageLimit
+      ? "ACCOUNT_USAGE_LIMIT"
+      : verifyFailed
       ? "VERIFY_FAILED"
       : reviewerTurnsExhausted
       ? "REVIEWER_TURNS_EXHAUSTED"
@@ -1664,7 +1667,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const sentences = [lead, terminationReasonSentence(terminationReason, iterations), draft, reasonCodeTag(terminationReason)];
       return sentences.filter(Boolean).join(" ") + notes;
     };
-    const failureReason = verifyFailed
+    const failureReason = accountUsageLimit
+      ? reviewerFailure.message
+      : verifyFailed
       ? `The repository's verify hook still failed after ${iterations} iteration(s), so the review did not examine the last pass.\n\n${finalFeedback}`
       : reviewerTurnsExhausted
       ? `🟠 ${SECOND_REVIEW} did not finish. A reviewer used all of its permitted steps (${reviewMaxTurns}), so the review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
@@ -1685,7 +1690,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
-    disposition = verifyFailed
+    disposition = accountUsageLimit
+      ? `${prDisposition} — accounts reached their usage limit`
+      : verifyFailed
       ? `${prDisposition} — verify hook failed after ${iterations} iteration(s) (${terminationReason})`
       : reviewerTurnsExhausted
       ? `${prDisposition} — a reviewer used all of its permitted steps after ${iterations} iteration(s) (${terminationReason})`

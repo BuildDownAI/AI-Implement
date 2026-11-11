@@ -2621,6 +2621,65 @@ describe("runAutonomous", () => {
     expect(body.failure).toEqual(providerFailure);
   });
 
+  it.each(["review", "implement"])("publishes the draft and renders exhausted %s accounts as a usage limit", async stage => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const providerFailure = {
+      category: "auth" as const,
+      code: "ACCOUNT_USAGE_LIMIT",
+      stage,
+      attempt: 2,
+      retryable: false,
+      message: "Usage limit reached on every account: A, B",
+      evidence: { truncated: false },
+    };
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
+            approved: false,
+            finalFeedback: providerFailure.message,
+            terminationReason: stage === "review" ? "review_error" : "provider_unavailable",
+            failure: providerFailure,
+          })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12, { draft: true })) }],
+      ["post-push-review", { run: postPushReviewRun }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof providerFailure;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
+    expect(body.failureCode).toBe("ACCOUNT_USAGE_LIMIT");
+    expect(body.failureReason).not.toContain("did not approve");
+    // The stuck-job status cell and the give-up alert keep only the first line, so it names the usage limit.
+    expect(body.failureReason).toBe(providerFailure.message);
+    const { formatFailureComment } = await import("../runner-callback.js");
+    const comment = formatFailureComment(body.failureCode, body.failureReason, { failure: body.failure, prUrl: "https://github.com/o/r/pull/12" });
+    expect(comment).toMatch(/usage limit/i);
+    expect(comment).not.toContain("a review did not approve it");
+    expect(body.failure).toEqual(providerFailure);
+  });
+
   it("words the PROVIDER_UNAVAILABLE fallback reason as the AI service when the run has no feedback", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
