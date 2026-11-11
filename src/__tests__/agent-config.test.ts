@@ -427,6 +427,17 @@ describe("fallback models", () => {
     defaults.stages!.planning!.fallbackModel = "backup";
     expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: { model: "backup" } }), accountProfiles })).toThrow(/planning.*fallbackModel/);
   });
+
+  it("drops redundant fallback metadata only while an account list is active", () => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: "backup" }, { accountProfileId: "claude-bedrock", model: "other" }];
+    defaults.stages!.planning!.fallbackModel = "backup";
+    const result = resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles });
+    if (result.mode !== "configured") throw new Error("expected configured");
+    expect(result.fallbackModels).toEqual({});
+    expect(result.fallbackModelSources).toEqual({});
+    expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: { accountProfileId: "claude-api" } }), accountProfiles })).toThrow("planning.fallbackModel must differ from model");
+  });
 });
 
 describe("ordered stage accounts", () => {

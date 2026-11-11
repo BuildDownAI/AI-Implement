@@ -721,6 +721,20 @@ describe("ordered account preparation", () => {
     config.stages!.implementation = { invocationTimeoutMs: 60_000, accounts: [{ accountProfileId: "brk", model: "m" }, { accountProfileId: "api", model: "m" }] };
     store.setOrchestratorDefaults(config);
   }
+  it.each(["fly-machines", "github-actions"] as const)("omits a model fallback made redundant by account selection on %s", async backend => {
+    configure();
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.implementation!.accounts = [{ accountProfileId: "brk", model: "primary" }, { accountProfileId: "api", model: "backup" }];
+    config.stages!.implementation!.fallbackModel = "backup";
+    store.setOrchestratorDefaults(config);
+    deps.checkRunnerCapability = async () => true;
+    const first = ready(await prep.prepareAgentRun(request({ backend }), deps));
+    expect(first.snapshot.stages.implementation.model).toBe(backend === "fly-machines" ? "backup" : "primary");
+    expect(first.fallbackModels).toEqual(backend === "fly-machines" ? {} : { implementation: "backup" });
+    const persisted = JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string);
+    expect(persisted.fallbackModels ?? {}).toEqual(first.fallbackModels);
+    expect(ready(await prep.prepareAgentRun(request({ backend }), deps)).fallbackModels).toEqual(first.fallbackModels);
+  });
   it.each(["fly-machines", "github-actions"] as const)("freezes choices on %s and reuses them after retirement", async backend => {
     configure();
     deps.checkRunnerCapability = async () => true;

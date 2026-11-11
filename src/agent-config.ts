@@ -363,7 +363,14 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       if (choice.fallbacks.length) accountFallbacks[stage] = choice.fallbacks;
     }
     for (const field of ["accountProfileId", "agent", "provider", "model"] as const) resolved.selection[field] = choice.chosen[field] as never;
-    if (fallback === resolved.selection.model) throw new Error(`${stage}.fallbackModel must differ from model`);
+    if (fallback === resolved.selection.model) {
+      if (!defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null) {
+        throw new Error(`${stage}.fallbackModel must differ from model`);
+      }
+      // Backend selection can make the stage fallback redundant for this run.
+      delete fallbackModels[stage];
+      delete fallbackModelSources[stage];
+    }
     const profile = profileById.get(resolved.selection.accountProfileId);
     if (!profile) throw new Error(`${stage}.accountProfileId does not reference a known profile`);
     validateAgentProvider(stage, resolved.selection, profile);
