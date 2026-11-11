@@ -1,6 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
+import { githubRepoParts } from "./reference-repos.js";
 import { verifyRunToken } from "./runner-tokens.js";
 
 export interface HandleReferenceTokenInput {
@@ -68,17 +69,14 @@ export async function handleReferenceTokenRequest(
   // Group repository names by owner, preserving declaration order.
   const ownerRepos = new Map<string, string[]>();
   for (const entry of referenceRepos) {
-    // repo is normalized to https://github.com/owner/repo
-    const url = new URL(entry.repo);
-    const parts = url.pathname.replace(/^\//, "").split("/");
-    const owner = parts[0];
-    const repoName = parts[1];
-    if (!owner || !repoName) continue;
-    const existing = ownerRepos.get(owner);
+    // The parse the setup checks use, which drops a ".git" suffix: GitHub refuses to mint for a name that keeps it.
+    const parts = githubRepoParts(entry.repo);
+    if (!parts) continue;
+    const existing = ownerRepos.get(parts.owner);
     if (existing) {
-      existing.push(repoName);
+      existing.push(parts.repo);
     } else {
-      ownerRepos.set(owner, [repoName]);
+      ownerRepos.set(parts.owner, [parts.repo]);
     }
   }
 

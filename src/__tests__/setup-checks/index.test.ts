@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { FilesystemSetupFacts, JiraSetupFacts } from "../../providers/types.js";
@@ -6,6 +7,8 @@ import type { SetupCheck, SetupCheckContext, SetupCheckResult } from "../../setu
 import { makeAccessEntry, makeMapping, makeProvider } from "../helpers/builders.js";
 import { makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
+import { fakeFetch } from "../helpers/fake-fetch.js";
+import { githubError } from "../helpers/replies/github.js";
 
 let dedup: typeof DedupModule;
 let checks: typeof SetupChecksModule;
@@ -241,6 +244,21 @@ describe("runSetupChecks", () => {
   });
 });
 
+describe("the recorded run", () => {
+  it("keeps its own copy, so neither the run it was given nor one read back can change it", () => {
+    const row: SetupCheckResult = { id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "pass" };
+    const run = { checkedAt: 1, results: [row] };
+    checks.recordSetupCheckRun(run);
+
+    run.checkedAt = 2;
+    row.state = "fail";
+    const readBack = checks.getLastSetupCheckRun();
+    if (readBack) readBack.results[0].state = "warn";
+
+    expect(checks.getLastSetupCheckRun()).toEqual({ checkedAt: 1, results: [{ ...row, state: "pass" }] });
+  });
+});
+
 describe("createSetupCheckContext", () => {
   const restateStatus = () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } });
 
@@ -255,6 +273,30 @@ describe("createSetupCheckContext", () => {
     const { modules } = await testDb({ tables: "none", modules: { checks: () => import("../../setup-checks/index.js") } });
     const ctx = modules.checks.createSetupCheckContext({ restateStatus });
     expect(() => ctx.readSetting("runner_mode")).toThrow();
+  });
+
+  it("reads the health endpoint at the address given, and this process's own identifier, the one its health body carries", async () => {
+    const fake = fakeFetch({ "GET /": { json: { restate: restateStatus(), instanceId: "an-instance" } } }).install();
+    const ctx = checks.createSetupCheckContext({ restateStatus });
+    // Imported after testDb's module reset, so it is the copy the context's module loaded.
+    const { ORCHESTRATOR_INSTANCE_ID } = await import("../../health-body.js");
+
+    expect(await ctx.orchestratorHealthAt("https://o.example.com")).toMatchObject({ outcome: "health-body", instanceId: "an-instance" });
+    expect(fake.calls.map((c) => `${c.method} ${c.url.href}`)).toEqual(["GET https://o.example.com/"]);
+    expect(ctx.orchestratorInstanceId()).toBe(ORCHESTRATOR_INSTANCE_ID);
+  });
+
+  it("reads the projects once per context, so a save during a run cannot split what the run judges", async () => {
+    const { upsertMapping } = await import("../../config.js");
+    upsertMapping("ENG", makeMapping({ owner: "acme", repo: "app" }));
+    const ctx = checks.createSetupCheckContext({ restateStatus });
+    const first = ctx.mappings();
+
+    upsertMapping("OPS", makeMapping({ owner: "acme", repo: "ops" }));
+
+    expect(ctx.mappings()).toEqual(first);
+    expect(Object.keys(ctx.mappings())).toEqual(["ENG"]);
+    expect(Object.keys(checks.createSetupCheckContext({ restateStatus }).mappings()).sort()).toEqual(["ENG", "OPS"]);
   });
 
   it("keeps the caller's overrides and the default readers for the rest", () => {
@@ -302,6 +344,101 @@ describe("createSetupCheckContext", () => {
     linearAuth.configureLinearAuth("client-id", "client-secret");
     const configured = checks.createSetupCheckContext({ restateStatus, mappings });
     expect((await configured.trackerProvider("linear")).id).toBe("linear");
+  });
+
+  describe("githubSetupFacts", () => {
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
+    const env = { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey };
+    const installed = (id: number, selection: "all" | "selected" = "all") =>
+      ({ json: { id, repository_selection: selection, permissions: { contents: "write", pull_requests: "write", metadata: "read" } } });
+
+    it("is one set per context, and shares each read, a concurrent one included", async () => {
+      const api = fakeFetch({ "GET /app": { json: { slug: "app" } } }).install();
+      const ctx = checks.createSetupCheckContext({ env, restateStatus });
+
+      expect(ctx.githubSetupFacts()).toBe(ctx.githubSetupFacts());
+      const [first, second] = await Promise.all([ctx.githubSetupFacts().app(), ctx.githubSetupFacts().app()]);
+      await ctx.githubSetupFacts().app();
+      expect(first).toBe(second);
+      expect(api.calls).toHaveLength(1);
+    });
+
+    it("shares a failed read for the rest of the run instead of retrying it", async () => {
+      const api = fakeFetch({ "GET /orgs/o/installation": [githubError(500, "Server Error"), installed(1)] }).install();
+      const facts = checks.createSetupCheckContext({ env, restateStatus }).githubSetupFacts();
+
+      await expect(facts.installation("o")).rejects.toMatchObject({ status: 500 });
+      await expect(facts.installation("O")).rejects.toMatchObject({ status: 500 });
+      expect(api.calls).toHaveLength(1);
+    });
+
+    it("refuses every App read without both App credentials, and reads nothing", async () => {
+      const api = fakeFetch({}).install();
+      const facts = checks.createSetupCheckContext({ env: { GITHUB_APP_ID: "123456" }, restateStatus }).githubSetupFacts();
+
+      await expect(facts.app()).rejects.toThrow("GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY are not both set");
+      await expect(facts.deliveries()).rejects.toThrow("not both set");
+      expect(api.calls).toHaveLength(0);
+    });
+
+    it("reads an all-repositories installation's list as null, and refuses an owner without the App", async () => {
+      const api = fakeFetch({
+        "GET /orgs/o/installation": installed(1),
+        "GET /orgs/nobody/installation": githubError(404, "Not Found"),
+        "GET /users/nobody/installation": githubError(404, "Not Found"),
+      }).install();
+      const facts = checks.createSetupCheckContext({ env, restateStatus }).githubSetupFacts();
+
+      await expect(facts.installationRepositories("o")).resolves.toBeNull();
+      await expect(facts.installationRepositories("nobody")).rejects.toThrow("The GitHub App is not installed on nobody");
+      expect(api.calls.some((c) => c.path.includes("/installation/repositories"))).toBe(false);
+    });
+
+    it("lists a selected installation's repositories with a read-only owner token", async () => {
+      const api = fakeFetch({
+        "GET /orgs/o/installation": installed(1, "selected"),
+        "POST /app/installations/1/access_tokens": { status: 201, json: { token: "ghs_read", expires_at: new Date(Date.now() + 3600_000).toISOString() } },
+        "GET /installation/repositories": { json: { total_count: 1, repositories: [{ name: "App" }] } },
+      }).install();
+      const facts = checks.createSetupCheckContext({ env, restateStatus }).githubSetupFacts();
+
+      expect(await facts.installationRepositories("o")).toEqual(new Set(["app"]));
+      const mint = api.calls.find((c) => c.method === "POST");
+      expect(JSON.parse(mint!.body)).toEqual({ permissions: { contents: "read", pull_requests: "read", metadata: "read" } });
+      expect(api.calls.find((c) => c.path === "/installation/repositories")?.headers.get("authorization")).toBe("Bearer ghs_read");
+    });
+
+    it("reads each owner's repositories in one query, built from the projects' requests, shared by every later read", async () => {
+      const api = fakeFetch({
+        "POST /app/installations/1/access_tokens": { status: 201, json: { token: "ghs_read", expires_at: new Date(Date.now() + 3600_000).toISOString() } },
+        "GET /orgs/o/installation": installed(1),
+        "POST /graphql": { json: { data: { r0: { defaultBranchRef: { name: "main" }, e0: null, e1: null, p0: { nodes: [] } } } } },
+      }).install();
+      const mappings = () => ({ ENG: makeMapping({ owner: "o", repo: "app", planningEnabled: false }) });
+      const facts = checks.createSetupCheckContext({ env, restateStatus, mappings }).githubSetupFacts();
+
+      // A run's checks read one owner concurrently and again later, and must all judge the same answer.
+      const [read, concurrent] = await Promise.all([facts.repositories("o"), facts.repositories("O")]);
+      const later = await facts.repositories("o");
+      expect([...read.keys()]).toEqual(["app"]);
+      expect(concurrent).toBe(read);
+      expect(later).toBe(read);
+      const query = api.calls.filter((c) => c.path === "/graphql");
+      expect(query).toHaveLength(1);
+      expect(JSON.parse(query[0].body).variables.r0).toBe("app");
+    });
+
+    it("has no preflight without KG_SOURCE_REPO, and reads a project's sync row", async () => {
+      const api = fakeFetch({}).install();
+      const facts = checks.createSetupCheckContext({ env, restateStatus }).githubSetupFacts();
+      const queue = await import("../../workflow-sync-queue.js");
+
+      expect(await facts.kgPreflight()).toBeNull();
+      expect(facts.workflowSync("ENG")).toBeNull();
+      queue.enqueueWorkflowSync("ENG");
+      expect(facts.workflowSync("ENG")).toMatchObject({ teamKey: "ENG", status: "pending" });
+      expect(api.calls).toHaveLength(0);
+    });
   });
 
   it("requires the caller to supply the Restate status reader", () => {

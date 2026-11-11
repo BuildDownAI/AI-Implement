@@ -19,10 +19,15 @@ export interface ProbeInstallStateParams {
  *   - repo-not-selected: installed with "selected repositories" but this repo isn't included -> deep-link to add it
  *   - ready: installed and can see the repo ("all repositories", or this repo is selected)
  */
+/** The page GitHub serves for installing the App on an account, or for adding repositories to an installation. */
+export function appInstallUrl(slug: string): string {
+  return `https://github.com/apps/${slug}/installations/new`;
+}
+
 export async function probeInstallState(params: ProbeInstallStateParams): Promise<InstallState> {
   const { appId, privateKey, owner, repo } = params;
   const slug = await getAppSlug(appId, privateKey);
-  const installUrl = `https://github.com/apps/${slug}/installations/new`;
+  const installUrl = appInstallUrl(slug);
 
   let install: InstallationDetails;
   try {

@@ -9,6 +9,7 @@
  */
 
 import { useReadOnlyDb } from "./dedup.js";
+import { readOrchestratorHealth } from "./health-body.js";
 import { parseHealthPort } from "./http-server.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
@@ -20,11 +21,12 @@ export interface CheckSetupDependencies {
   useReadOnlyDb: () => void;
   /** Configures tracker credentials as boot does, so the tracker checks can build their providers. */
   configureTrackers: () => void;
-  createContext: (restateStatus: () => SetupCheckRestateStatus) => SetupCheckContext;
+  /** Builds the context with what only the running orchestrator's own health endpoint can say. */
+  createContext: (own: Pick<SetupCheckContext, "restateStatus" | "orchestratorInstanceId">) => SetupCheckContext;
   /** Fills the Fly sessions cache from Restate, as the server does each poll. */
   refreshRunnerBackend: () => Promise<void>;
   fetch: typeof fetch;
-  /** The orchestrator's own port, whose `GET /` reports its Restate status. */
+  /** The orchestrator's own port, whose `GET /` reports its Restate status and instance identifier. */
   port: number;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
@@ -36,15 +38,13 @@ const DEFAULT_DEPENDENCIES: CheckSetupDependencies = {
   configureTrackers: () => {
     configureLinearAuthFromEnv();
   },
-  createContext: (restateStatus) => createSetupCheckContext({ restateStatus }),
+  createContext: (own) => createSetupCheckContext(own),
   refreshRunnerBackend: refreshRunnerBackendCache,
   fetch: (input, init) => fetch(input, init),
   port: parseHealthPort(process.env.PORT),
   writeStdout: (text) => process.stdout.write(text),
   writeStderr: (text) => process.stderr.write(text),
 };
-
-const HEALTH_TIMEOUT_MS = 5_000;
 
 const STATE_LABELS: Record<SetupCheckResult["state"], string> = {
   pass: "PASS",
@@ -61,16 +61,12 @@ const USAGE = `Usage: node dist/check-setup.js [--json]
   --json  print the run as JSON instead of a table
 `;
 
-/** The orchestrator's own Restate status, or why it could not be read. */
-async function readRestateStatus(deps: CheckSetupDependencies): Promise<SetupCheckRestateStatus | Error> {
-  let response: Response;
-  try {
-    response = await deps.fetch(`http://127.0.0.1:${deps.port}/`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-  } catch {
-    return new Error(`The orchestrator is not answering on port ${deps.port}, so its Restate status cannot be read.`);
-  }
-  const body = (await response.json().catch(() => null)) as { restate?: SetupCheckRestateStatus } | null;
-  return body?.restate ?? new Error(`Port ${deps.port} answered without a Restate status, so it may not be this orchestrator.`);
+/** What the orchestrator's own health endpoint says of it, or why it could not be read. */
+async function readOwnHealth(deps: CheckSetupDependencies): Promise<{ restate: SetupCheckRestateStatus; instanceId: string } | Error> {
+  const read = await readOrchestratorHealth(`http://127.0.0.1:${deps.port}`, deps.fetch);
+  if (read.outcome === "no-response") return new Error(`The orchestrator is not answering on port ${deps.port}, so its health endpoint cannot be read.`);
+  if (read.outcome === "other-response") return new Error(`Port ${deps.port} answered without the orchestrator's health response, so it may not be this orchestrator.`);
+  return { restate: read.restate as SetupCheckRestateStatus, instanceId: read.instanceId as string };
 }
 
 /** One check's lines: its state, id and title, then its detail and fix beneath. The provisioning command prints its own checks this way too. */
@@ -111,13 +107,17 @@ export async function runCheckSetup(
 
   deps.useReadOnlyDb();
   deps.configureTrackers();
-  const restate = await readRestateStatus(deps);
+  const own = await readOwnHealth(deps);
   // The Fly sessions app can live only in Restate, so read it the way the server does once Restate answers.
-  if (!(restate instanceof Error) && restate.registration.state === "registered") await deps.refreshRunnerBackend();
+  if (!(own instanceof Error) && own.restate.registration.state === "registered") await deps.refreshRunnerBackend();
 
-  const context = deps.createContext(() => {
-    if (restate instanceof Error) throw restate;
-    return restate;
+  const ownOrThrow = () => {
+    if (own instanceof Error) throw own;
+    return own;
+  };
+  const context = deps.createContext({
+    restateStatus: () => ownOrThrow().restate,
+    orchestratorInstanceId: () => ownOrThrow().instanceId,
   });
   const run = await runSetupChecks(context, deps.checks);
   const failingCore = countFailingCore(run);

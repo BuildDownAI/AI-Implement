@@ -11,7 +11,7 @@ const REGISTERED: SetupCheckRestateStatus = { sidecar: { state: "ready" }, regis
 
 /** The orchestrator's `GET /`, answering with the Restate status given, as `src/index.ts`'s health route does. */
 function orchestratorAnswering(restate: SetupCheckRestateStatus = REGISTERED) {
-  return fakeFetch({ "GET /": { json: { status: "ok", restate } } });
+  return fakeFetch({ "GET /": { json: { status: "ok", instanceId: "the-server", restate } } });
 }
 
 /** Nothing listening on the port: `fetch` rejects as it does on a refused connection. */
@@ -44,7 +44,7 @@ function deps(overrides: Partial<CheckSetupDependencies> = {}, context: Partial<
     checks: [check()],
     useReadOnlyDb: vi.fn(),
     configureTrackers: vi.fn(),
-    createContext: (restateStatus) => makeSetupCheckContext({ ...context, restateStatus }),
+    createContext: (own) => makeSetupCheckContext({ ...context, ...own }),
     refreshRunnerBackend: vi.fn(async () => {}),
     fetch: orchestratorAnswering().fetch,
     port: 8080,
@@ -137,7 +137,7 @@ describe("Restate's status, from the orchestrator's own health route", () => {
     const d = deps({ fetch: notAnswering, checks: [RESTATE_CHECK] });
 
     expect(await runCheckSetup([], d.deps)).toBe(0);
-    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +The orchestrator is not answering on port 8080, so its Restate status cannot be read\./);
+    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +The orchestrator is not answering on port 8080, so its health endpoint cannot be read\./);
   });
 
   it.each([
@@ -147,7 +147,7 @@ describe("Restate's status, from the orchestrator's own health route", () => {
     const d = deps({ fetch: fakeFetch({ "GET /": reply }).fetch, checks: [RESTATE_CHECK] });
 
     expect(await runCheckSetup([], d.deps)).toBe(0);
-    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +Port 8080 answered without a Restate status, so it may not be this orchestrator\./);
+    expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +Port 8080 answered without the orchestrator's health response, so it may not be this orchestrator\./);
   });
 
   it("gives up on a health route that never answers after five seconds", async () => {
@@ -156,6 +156,25 @@ describe("Restate's status, from the orchestrator's own health route", () => {
 
     expect(await runCheckSetup([], d.deps)).toBe(0);
     expect(d.stdout()).toMatch(/CANNOT VERIFY +restate: .*\n +The orchestrator is not answering on port 8080/);
+  });
+});
+
+describe("the server's instance identifier, from the same health read", () => {
+  const INSTANCE_CHECK = check({ run: (ctx) => [{ state: "pass", detail: `instance ${ctx.orchestratorInstanceId()}` }] });
+
+  it("hands the checks the identifier the orchestrator's own GET / carries, not this process's own", async () => {
+    const d = deps({ checks: [INSTANCE_CHECK] });
+
+    await runCheckSetup([], d.deps);
+
+    expect(d.stdout()).toContain("instance the-server");
+  });
+
+  it("makes a check that asks for it cannot-verify, with the same reason as Restate's, when the orchestrator is not answering", async () => {
+    const d = deps({ fetch: notAnswering, checks: [INSTANCE_CHECK] });
+
+    expect(await runCheckSetup([], d.deps)).toBe(0);
+    expect(d.stdout()).toMatch(/CANNOT VERIFY +env\.github-app: .*\n +The orchestrator is not answering on port 8080, so its health endpoint cannot be read\./);
   });
 });
 

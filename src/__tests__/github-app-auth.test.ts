@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { getInstallationToken, getInstallationId, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
+import { getInstallationToken, getInstallationId, refreshInstallationToken, getInstallation, getAppInstallation, getAppSlug, readAppIdentity, appCredentialsRefused, installationIncludesRepo, listInstallationRepositoryNames, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
+import { GitHubApiError } from "../github-errors.js";
 import { fakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
 
@@ -25,8 +26,9 @@ const APP_ID = "123456";
 const orgInstallation = (owner: string) => `GET /orgs/${owner}/installation`;
 const userInstallation = (owner: string) => `GET /users/${owner}/installation`;
 const mint = (installationId: number) => `POST /app/installations/${installationId}/access_tokens`;
+// GitHub's installation schema requires `permissions`, so the default carries the grants a typical install accepted.
 const installation = (id: number, extra: Record<string, unknown> = {}): ReplyInit =>
-  ({ json: { id, repository_selection: "selected", ...extra } });
+  ({ json: { id, repository_selection: "selected", permissions: { contents: "write", metadata: "read" }, ...extra } });
 // GitHub answers a mint with 201 and a token that expires an hour later; the default expiry is read when the routes are built.
 const token = (value: string, expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()): ReplyInit =>
   ({ status: 201, json: { token: value, expires_at: expiresAt } });
@@ -302,6 +304,118 @@ describe("getAppSlug", () => {
     expect(api.calls).toHaveLength(1); // cached — GET /app hit once across both calls
     expect(api.calls[0].url.href).toBe("https://api.github.com/app");
   });
+
+  // A fresh module, since the slug cache outlives clearTokenCache and an earlier test may have filled it.
+  async function freshGetAppSlug() {
+    vi.resetModules();
+    return (await import("../github-app-auth.js")).getAppSlug;
+  }
+
+  it("throws GitHub's refusal with its status and body, and caches nothing", async () => {
+    const api = fakeFetch({ "GET /app": [githubError(401, "Bad credentials"), { json: { slug: "ai-implement" } }] }).install();
+    const getSlug = await freshGetAppSlug();
+
+    const error = await getSlug(APP_ID, privateKey).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "GitHubApiError", status: 401, path: "/app" });
+    expect((error as Error).message).toMatch(/^Failed to read GitHub App metadata \(401\): .*Bad credentials/);
+    await expect(getSlug(APP_ID, privateKey)).resolves.toBe("ai-implement");
+    expect(api.calls).toHaveLength(2);
+  });
+});
+
+describe("getAppInstallation", () => {
+  it("returns the org installation with its permissions, and mints no token", async () => {
+    const api = fakeFetch({
+      [orgInstallation("my-org")]: installation(70, { repository_selection: "all", permissions: { contents: "write", checks: "read" } }),
+    }).install();
+
+    await expect(getAppInstallation(APP_ID, privateKey, "my-org")).resolves.toMatchObject({
+      id: 70,
+      repository_selection: "all",
+      permissions: { contents: "write", checks: "read" },
+    });
+    expect(api.calls.map((c) => `${c.method} ${c.url.pathname}`)).toEqual(["GET /orgs/my-org/installation"]);
+  });
+
+  it("falls back to the user installation", async () => {
+    fakeFetch({ [orgInstallation("my-user")]: notFound, [userInstallation("my-user")]: installation(71) }).install();
+
+    await expect(getAppInstallation(APP_ID, privateKey, "my-user")).resolves.toMatchObject({ id: 71 });
+  });
+
+  it("answers null when neither endpoint has an installation", async () => {
+    fakeFetch({ [orgInstallation("no-app")]: notFound, [userInstallation("no-app")]: notFound }).install();
+
+    await expect(getAppInstallation(APP_ID, privateKey, "no-app")).resolves.toBeNull();
+  });
+
+  it("rethrows any other refusal, so a rejected JWT is never read as not installed", async () => {
+    fakeFetch({ [orgInstallation("my-org")]: githubError(401, "A JSON web token could not be decoded") }).install();
+
+    const error = await getAppInstallation(APP_ID, privateKey, "my-org").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GitHubApiError);
+    expect(error).toMatchObject({ status: 401 });
+  });
+});
+
+describe("readAppIdentity", () => {
+  const GITHUB_DATE = "Tue, 10 Nov 2026 02:42:14 GMT";
+
+  it("returns the slug and GitHub's clock beside this host's, read when the response arrived", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.parse("2026-11-10T02:40:00Z"));
+    try {
+      const responseArrives = Date.parse("2026-11-10T02:40:03Z");
+      fakeFetch({
+        "GET /app": () => {
+          vi.setSystemTime(responseArrives);
+          return { json: { slug: "ai-implement" }, headers: { Date: GITHUB_DATE } };
+        },
+      }).install();
+
+      await expect(readAppIdentity(APP_ID, privateKey)).resolves.toEqual({
+        status: 200,
+        slug: "ai-implement",
+        errorBody: "",
+        githubTime: Date.parse(GITHUB_DATE),
+        localTime: responseArrives,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns a refused JWT as an answer, with GitHub's clock still read", async () => {
+    fakeFetch({ "GET /app": { ...githubError(401, "'Expiration time' claim ('exp') is too far in the future"), headers: { Date: GITHUB_DATE } } }).install();
+
+    const read = await readAppIdentity(APP_ID, privateKey);
+    expect(read).toMatchObject({ status: 401, slug: null, githubTime: Date.parse(GITHUB_DATE) });
+    expect(read.errorBody).toContain("too far in the future");
+  });
+
+  it("reports no GitHub time when the response has no Date header", async () => {
+    fakeFetch({ "GET /app": { json: { slug: "ai-implement" } } }).install();
+
+    await expect(readAppIdentity(APP_ID, privateKey)).resolves.toMatchObject({ githubTime: null });
+  });
+
+  it("is uncached, so each call reads GitHub again", async () => {
+    const api = fakeFetch({ "GET /app": [{ json: { slug: "a" } }, { json: { slug: "b" } }] }).install();
+
+    expect((await readAppIdentity(APP_ID, privateKey)).slug).toBe("a");
+    expect((await readAppIdentity(APP_ID, privateKey)).slug).toBe("b");
+    expect(api.calls).toHaveLength(2);
+  });
+});
+
+describe("appCredentialsRefused", () => {
+  // Probed live at AII-1536: a bad key or a skewed clock answers 401, a wrong App ID 404 "Integration not found".
+  it.each([[401, true], [404, true], [200, false], [403, false], [429, false], [500, false], [503, false]])(
+    "reads HTTP %i from GET /app as refused: %s",
+    (status, refused) => {
+      expect(appCredentialsRefused({ status })).toBe(refused);
+    },
+  );
 });
 
 describe("installationIncludesRepo", () => {
@@ -344,11 +458,54 @@ describe("installationIncludesRepo", () => {
     expect(api.calls).toHaveLength(2);
   });
 
+  it("stops reading pages once it finds the repo, though more remain", async () => {
+    const fullPage = [{ name: "backend" }, ...Array.from({ length: 99 }, (_, i) => ({ name: "repo" + i }))];
+    const api = fakeFetch({ [REPOS]: [{ json: { total_count: 101, repositories: fullPage } }] }).install();
+
+    expect(await installationIncludesRepo("ghs_x", "backend")).toBe(true);
+    expect(api.calls).toHaveLength(1);
+  });
+
   it("throws a GitHubApiError on a non-ok response", async () => {
     fakeFetch({ [REPOS]: githubError(403, "Resource not accessible by integration") }).install();
 
     await expect(installationIncludesRepo("ghs_x", "backend"))
       .rejects.toThrow("Failed to list installation repositories");
+  });
+});
+
+describe("listInstallationRepositoryNames", () => {
+  const REPOS = "GET /installation/repositories";
+  const fullPage = Array.from({ length: 100 }, (_, i) => ({ name: `Repo${i}` }));
+
+  it("reads every page with the installation token, lowercasing each name", async () => {
+    const api = fakeFetch({
+      [REPOS]: [
+        { json: { total_count: 101, repositories: fullPage } },
+        { json: { total_count: 101, repositories: [{ name: "Backend" }] } },
+      ],
+    }).install();
+
+    const names = await listInstallationRepositoryNames("ghs_x");
+    expect(names.size).toBe(101);
+    expect(names.has("backend") && names.has("repo0")).toBe(true);
+    expect(api.calls.map((c) => c.url.searchParams.get("page"))).toEqual(["1", "2"]);
+    expect(api.calls[0].headers.get("authorization")).toBe("Bearer ghs_x");
+  });
+
+  it("stops after a full page that reaches total_count", async () => {
+    const api = fakeFetch({ [REPOS]: [{ json: { total_count: 100, repositories: fullPage } }] }).install();
+
+    expect((await listInstallationRepositoryNames("ghs_x")).size).toBe(100);
+    expect(api.calls).toHaveLength(1);
+  });
+
+  it("throws a GitHubApiError on a refused page", async () => {
+    fakeFetch({ [REPOS]: githubError(403, "Resource not accessible by integration") }).install();
+
+    const error = await listInstallationRepositoryNames("ghs_x").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GitHubApiError);
+    expect(error).toMatchObject({ status: 403 });
   });
 });
 

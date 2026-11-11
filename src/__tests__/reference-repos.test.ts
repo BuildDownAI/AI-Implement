@@ -1,5 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { normalizeGitHubRepo, normalizeReferenceRepos } from "../reference-repos.js";
+import { githubRepoParts, normalizeGitHubRepo, normalizeReferenceRepos } from "../reference-repos.js";
+
+describe("githubRepoParts", () => {
+  it("reads the owner and name from a stored URL, as normalizeGitHubRepo stores it", () => {
+    expect(githubRepoParts(normalizeGitHubRepo("acme/widgets", "repo"))).toEqual({ owner: "acme", repo: "widgets" });
+    expect(githubRepoParts("https://github.com/acme/widgets.git")).toEqual({ owner: "acme", repo: "widgets" });
+    expect(githubRepoParts("https://GitHub.com/acme/widgets/tree/main")).toEqual({ owner: "acme", repo: "widgets" });
+  });
+
+  it("is null for anything that is not a github.com owner and name", () => {
+    expect(githubRepoParts("https://gitlab.com/acme/widgets")).toBeNull();
+    expect(githubRepoParts("https://github.com/acme")).toBeNull();
+    expect(githubRepoParts("acme/widgets")).toBeNull();
+  });
+});
 
 describe("normalizeGitHubRepo", () => {
   it("expands owner/repo shorthand", () => {

@@ -235,6 +235,9 @@ function envOnlyContext(env: Record<string, string>): SetupCheckContext {
     onSeparateFilesystem: unavailable,
     trackerProvider: unavailable,
     trackerSetupFacts: unavailable,
+    githubSetupFacts: unavailable,
+    orchestratorHealthAt: unavailable,
+    orchestratorInstanceId: unavailable,
   };
 }
 

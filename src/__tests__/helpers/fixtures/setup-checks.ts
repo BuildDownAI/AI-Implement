@@ -1,6 +1,6 @@
 import { LINEAR_LABELS } from "../../../providers/linear.js";
 import type { FoundLabel, LinearSetupFacts } from "../../../providers/types.js";
-import type { SetupCheckContext } from "../../../setup-checks/index.js";
+import type { GitHubSetupFacts, SetupCheckContext } from "../../../setup-checks/index.js";
 import { makeMapping } from "../builders.js";
 
 /** Every secret variable a check could read, each set to a value that names itself, so a test can assert none reaches any output. */
@@ -42,6 +42,30 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
     trackerProvider: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
     // A provider that cannot be built has no facts to read either, as in createSetupCheckContext.
     trackerSetupFacts: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
+    githubSetupFacts: () => makeGitHubSetupFacts(),
+    // Nothing answers at any address, as on a refused connection.
+    orchestratorHealthAt: () => Promise.resolve({ outcome: "no-response", timedOut: false, error: "fetch failed: connect ECONNREFUSED" }),
+    orchestratorInstanceId: () => "this-orchestrator",
+    ...overrides,
+  };
+}
+
+/**
+ * GitHub's side for an orchestrator with no App credentials: every GitHub read refuses as the production reads do
+ * without them, and no project has ever been synced. A test overrides only the reads its check makes.
+ */
+export function makeGitHubSetupFacts(overrides: Partial<GitHubSetupFacts> = {}): GitHubSetupFacts {
+  const noApp = () => Promise.reject(new Error("GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY are not both set"));
+  return {
+    app: noApp,
+    installation: noApp,
+    installationRepositories: noApp,
+    repositories: noApp,
+    publicRepository: noApp,
+    deliveries: noApp,
+    kgSourceRepo: () => null,
+    kgPreflight: () => Promise.resolve(null),
+    workflowSync: () => null,
     ...overrides,
   };
 }
