@@ -1,0 +1,57 @@
+[
+  {
+    "id": 6778666841,
+    "body": "<!-- ai-implement post-push status=start -->\n\ud83d\udd0d Running post-implementation review...",
+    "user": {
+      "login": "ai-implement-orchestrator-bot[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-11-10T20:38:05Z",
+    "updated_at": "2026-11-10T20:38:05Z",
+    "html_url": "https://github.com/BuildDownAI/AI-Implement/pull/1546#issuecomment-6778666841"
+  },
+  {
+    "id": 6778672152,
+    "body": "**Claude finished @ai-implement-orchestrator-bot[bot]'s task in 5m 37s** \u2014\u2014 [View job](https://github.com/BuildDownAI/AI-Implement/actions/runs/42897219600)\n\n---\n### Review in progress <img src=\"https://github.com/user-attachments/assets/5ac382c7-e004-429b-8e35-7feb3e8f9c6f\" width=\"14px\" height=\"14px\" style=\"vertical-align: middle; margin-left: 4px;\" />\n\n- [ ] Gather context (diff, PR body)\n- [ ] Read all changed files in full\n- [ ] Trace callers/consumers/tests\n- [ ] Post review findings",
+    "user": {
+      "login": "github-actions[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-11-10T20:38:20Z",
+    "updated_at": "2026-11-10T20:44:10Z",
+    "html_url": "https://github.com/BuildDownAI/AI-Implement/pull/1546#issuecomment-6778672152"
+  },
+  {
+    "id": 6778794145,
+    "body": "## Claude review\n\n**Verdict:** changes_requested\n\nRead the full diff (`git diff origin/ai-implement/feature/aii-1811...HEAD`) and every changed file in full: `docs/review-fix-rail.md`, `src/pipeline/finding-dispositions.ts`, `src/pipeline/steps/post-push-review.ts`, `src/__tests__/finding-dispositions.test.ts`, `src/__tests__/post-push-review.test.ts`. Traced callers/consumers: all `closedKeys` usage sites in `post-push-review.ts` (the gating filters around lines 2277, 2290, 2719), `applyFixPassDispositions`, `postPrComment`'s marker-update path, and `extractCommentIdWithMarker` to confirm it's still used by other markers.\n\nThe change adds a `<!-- ai-implement closed-findings v1 ... -->` marker persisted on fix-pass PR comments (`buildClosedFindingsMarker` / `parseClosedFindingsMarkers` / `readClosedFindingKeys` in `finding-dispositions.ts`), so a gap-fill run seeds `closedKeys` from a prior run's rejected (\"invalid\")/deferred (\"follow-up\") dispositions instead of starting empty every run \u2014 fixing the AII-1815 gap described in the ticket, and complementing AII-1813's \"a later fixed reopens a closed key\" rule by also applying that reopening when seeding from history.\n\nThe trust model is sound and well thought through: the step always posts a brand-new \"Running post-implementation review...\" comment (no longer reusing/updating an old one via `startMarker`) specifically because a historical marker-matched comment cannot establish current posting identity; it then reads that fresh comment back via the GitHub API to learn its own `user.login`, and only accepts closed-findings markers authored by that exact login \u2014 foreign-author markers are warned about and ignored, and an unreadable identity or history seeds nothing (fail-closed). `readClosedFindingKeys` folds all PR comment pages oldest-first so the newest disposition per finding key wins, matching GitHub's default ascending comment order. The three disposition-carrying comments (`dispositions-only`, `no-changes`, `fix-complete`) were changed from update-in-place (keyed by a per-iteration marker) to always-append, which is necessary so a gap-fill run's reused iteration numbering doesn't silently overwrite an earlier run's disposition history \u2014 this is called out accurately in `docs/review-fix-rail.md`.\n\nI checked the regex used to extract the marker payload (`/<!-- ai-implement closed-findings v1 ([\\s\\S]*?) -->/g`) for injection/truncation risk: the JSON payload only ever contains 64-char hex finding keys (enforced by `FINDING_KEY_RE` on parse and by construction on build), so it can never contain a `-->` sequence that would prematurely close the non-greedy match. The new unit tests in `finding-dispositions.test.ts` (round-trip, multi-page folding, reopening by a later \"fixed\", foreign-author rejection, missing-identity/history fail-closed) and the new/updated integration tests in `post-push-review.test.ts` (the `it.each` identity-trust matrix, the seed/reopen/publish test, and the assertions on the no-changes/fix-complete comment bodies) are a faithful, well-targeted match for the implementation's branches \u2014 including the subtle case where `ownLogin` is `undefined` and no GitHub call is even made.\n\nOne thing outside the diff itself gave me pause: the PR description's own pre-push report states tests failed (`exit 1`), unlike the equivalent line in a recent sibling PR (#1541) that reported passing assertions. I could not find a logic bug in the diff that would explain this, and the `unit-tests` CI check was still running at review time, so I'm flagging it rather than blocking purely on code reading \u2014 see the finding below. Everything else in the change looks correct, consistent with the codebase's conventions, and adequately tested.\n\n### Findings\n\n- **[blocking]** (src/pipeline/steps/post-push-review.ts): The PR description's own pre-push test report says \"typecheck: passed, tests: failed (exit 1)\" (contrast a comparable recent PR, #1541, which reported \"tests: passed (649 assertions)\"). My static read of the diff did not surface a logic bug that explains a failure, but a self-reported `npm test` failure should not go unresolved into merge: it needs to be re-run and confirmed green (the `unit-tests` GitHub Actions check was still in_progress at review time), or the discrepancy explained if it is an unrelated flake. If the failure is real and caused by this change (e.g. a bug in the new tests, or an existing test elsewhere regressing from the added `closedKeys.delete` branch), merging without re-confirming leaves the branch red.\n\n```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"body\":\"The PR description's own pre-push test report says \\\"typecheck: passed, tests: failed (exit 1)\\\" (contrast a comparable recent PR, #1541, which reported \\\"tests: passed (649 assertions)\\\"). My static read of the diff did not surface a logic bug that explains a failure, but a self-reported `npm test` failure should not go unresolved into merge: it needs to be re-run and confirmed green (the `unit-tests` GitHub Actions check was still in_progress at review time), or the discrepancy explained if it is an unrelated flake. If the failure is real and caused by this change (e.g. a bug in the new tests, or an existing test elsewhere regressing from the added `closedKeys.delete` branch), merging without re-confirming leaves the branch red.\",\"path\":\"src/pipeline/steps/post-push-review.ts\"}]}\n```\n",
+    "user": {
+      "login": "github-actions[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-11-10T20:44:11Z",
+    "updated_at": "2026-11-10T20:44:11Z",
+    "html_url": "https://github.com/BuildDownAI/AI-Implement/pull/1546#issuecomment-6778794145"
+  },
+  {
+    "id": 6778797812,
+    "body": "<!-- ai-implement post-push iter=1 -->\n\u2705 Approved (1 iteration).\n\n[Full reviewer report](https://github.com/BuildDownAI/AI-Implement/pull/1546#pullrequestreview-5849049714)\n\n**Merge readiness:** Ready to merge.",
+    "user": {
+      "login": "ai-implement-orchestrator-bot[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-11-10T20:44:21Z",
+    "updated_at": "2026-11-10T20:44:21Z",
+    "html_url": "https://github.com/BuildDownAI/AI-Implement/pull/1546#issuecomment-6778797812"
+  },
+  {
+    "id": 6778833171,
+    "body": "**Post-merge smoke (build-down, AII-1811)** \u2014 \ud83d\udfe2 with one open question\n\nAuto-merge merged this PR into `ai-implement/feature/aii-1811` (`58a4a983`) before the smoke ran.\n\n- CI on the merged head `8b34d61`: unit-tests, all six restate-tests-binary shards, orchestrator-image and the private-envelope checks are green. The runner's own pre-push line \"tests: failed (exit 1)\" is therefore not reproduced by CI. The Claude review's one blocking finding asked exactly for this confirmation, so it is answered.\n- Open question for the build-down, not for this PR: the Claude review posted `changes_requested` with one `[blocking]` finding at 20:44:11Z, and the internal step approved 10 s later. Under the `ai-implement` process a Claude summary finding gates only when the reviewer selection makes it gate (`claudeReviewSummaryGates`). This is recorded on AII-1811 for a decision.",
+    "user": {
+      "login": "jodwyer",
+      "type": "User"
+    },
+    "created_at": "2026-11-10T20:46:02Z",
+    "updated_at": "2026-11-10T20:46:02Z",
+    "html_url": "https://github.com/BuildDownAI/AI-Implement/pull/1546#issuecomment-6778833171"
+  }
+]

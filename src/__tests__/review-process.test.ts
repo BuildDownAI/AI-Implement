@@ -50,7 +50,7 @@ describe("definitions", () => {
     expect(repoFix.classifyInline).toBe(classifyClaudeInlineMarker);
     expect(repoFix.summaryBlockingGates).toBe(true);
     expect(claude.fixer).toBe("ai-implement");
-    expect(aiImplement.summaryBlockingGates).toBe(false);
+    expect(aiImplement.summaryBlockingGates).toBe(true);
     expect(aiImplement.classifyInline).toBeUndefined();
   });
 
