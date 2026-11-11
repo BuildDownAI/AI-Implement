@@ -343,7 +343,8 @@ describe("feedbackLoopStep — pass attribution (AII-971)", () => {
 });
 
 describe("account-switch retries", () => {
-  it("stops after an executor-produced fallback checkout failure", async () => {
+  it.each([false, true])("stops after an executor-produced fallback checkout failure (dirty=%s)", async dirty => {
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from(dirty ? "M src/file.ts" : ""), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
     const selection = { agent: "claude" as const, provider: "anthropic" as const,
       model: "claude-test", accountProfileId: "A", invocationTimeoutMs: 1000 };
     const profile = { id: "A", identity: "primary", revision: 1, agent: "claude" as const,
@@ -378,16 +379,33 @@ describe("account-switch retries", () => {
     });
     const ctx = makeContext();
     ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 3 };
-    const error = await feedbackLoopStep.run(ctx,
+    const promise = feedbackLoopStep.run(ctx,
       { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} },
-      { report: vi.fn(async () => undefined) }).catch((err: unknown) => err);
-    expect(error).toMatchObject({
-      failure: { code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", retryable: false },
-    });
-    expect((error as { failure: { accountFallback?: unknown } }).failure.accountFallback).toBeUndefined();
+      { report: vi.fn(async () => undefined) });
+    const expectedFailure = { code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", retryable: false };
+    if (dirty) {
+      await expect(promise).resolves.toMatchObject({ approved: false, failure: expectedFailure });
+    } else {
+      await expect(promise).rejects.toMatchObject({ failure: expectedFailure });
+    }
+    const outcome = await promise.catch((error: unknown) => error);
+    expect((outcome as { failure: { accountFallback?: unknown } }).failure.accountFallback).toBeUndefined();
     expect(checkout.mock.calls).toEqual([["A"], ["B"]]);
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(mockImplementRun).toHaveBeenCalledTimes(2);
+    expect(mockReviewRun).not.toHaveBeenCalled();
+  });
+
+  it("rejects an auth failure without an account switch even with a dirty workspace", async () => {
+    vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+    const failure = { category: "auth" as const, code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", stage: "implement",
+      attempt: 1, retryable: false, message: "Profile not allowed", evidence: { truncated: false } };
+    mockImplementRun.mockRejectedValueOnce(Object.assign(new Error(failure.message), { failure }));
+    const promise = feedbackLoopStep.run(makeContext(),
+      { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 },
+      { report: vi.fn(async () => undefined) });
+    await expect(promise).rejects.toMatchObject({ failure: { ...failure, stage: "feedback-loop/implement-1" } });
+    expect(mockImplementRun).toHaveBeenCalledTimes(1);
     expect(mockReviewRun).not.toHaveBeenCalled();
   });
 

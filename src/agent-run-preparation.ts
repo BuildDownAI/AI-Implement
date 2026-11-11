@@ -320,13 +320,31 @@ function resolveForRequest(request: AgentRunRequest): Resolved {
 }
 
 /** Persists the snapshot keyed by dispatch id; a concurrent writer's row wins and is what is returned. */
-function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapshotV1, fallbackModels: FallbackModels, metadata: SelectionMetadata): Resolved {
+function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapshotV1, fallbackModels: FallbackModels, metadata: SelectionMetadata, deps: AgentRunPreparationDeps): Resolved {
   // Preserve each stage's chosen account and fallback prefix within the wire budget.
   const accountFallbacks = { ...metadata.accountFallbacks };
   for (const stage of STAGE_NAMES) {
     if (accountFallbacks[stage]) accountFallbacks[stage] = [...accountFallbacks[stage]!];
   }
-  const dropped: { stage: StageName; profileId: string }[] = [];
+  const dropped: { stage: StageName; profileId: string; reason?: string }[] = [];
+  for (const stage of STAGE_NAMES) {
+    accountFallbacks[stage] = accountFallbacks[stage]?.filter(entry => {
+      const request = { profileId: entry.accountProfileId, revision: entry.profileRevision,
+        provider: entry.provider, authMode: entry.authMode };
+      // Reserved subscriptions prove session readiness at checkout under their owner generation.
+      let reason: string | null | undefined;
+      try {
+        const result = reservesModelAccount(entry.authMode)
+          ? getCredentialStatus(request, deps.credentials)
+          : resolveModelCredential(request, deps.credentials);
+        reason = "ok" in result ? (result.ok ? null : result.code) : result.failure?.code;
+      } catch {
+        reason = "credential_unavailable";
+      }
+      if (reason) dropped.push({ stage, profileId: entry.accountProfileId, reason });
+      return !reason;
+    });
+  }
   let count = STAGE_NAMES.length + Object.values(accountFallbacks).reduce((sum, entries) => sum + (entries?.length ?? 0), 0);
   while (count > MAX_MODEL_AUTH_BINDINGS) {
     for (const stage of STAGE_NAMES) {
@@ -348,7 +366,7 @@ function persistSnapshot(request: AgentRunRequest, snapshot: ResolvedAgentSnapsh
     snapshot.snapshotId,
     request.dispatchId,
     request.projectKey,
-    JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles, ...(Object.keys(metadata.selection).length ? metadata : {}), ...(Object.keys(fallbackModels).length ? { fallbackModels } : {}) }),
+    JSON.stringify({ stages: snapshot.stages, profiles: snapshot.profiles, ...(Object.keys(metadata.selection).length ? metadata : {}), ...(Object.keys(fallbackModels).length ? { fallbackModels } : {}), ...(dropped.length ? { droppedAccountFallbacks: dropped.map(entry => ({ ...entry, reason: entry.reason ?? "binding_budget_full" })) } : {}) }),
     JSON.stringify(snapshot.sources),
     JSON.stringify(snapshot.configRevisions),
     Date.now(),
@@ -618,7 +636,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
   try {
     resolved = resolveForRequest(request);
     if (resolved.kind === "snapshot" && !resolved.stored) {
-      resolved = persistSnapshot(request, resolved.snapshot, resolved.fallbackModels, resolved.metadata);
+      resolved = persistSnapshot(request, resolved.snapshot, resolved.fallbackModels, resolved.metadata, deps);
       if (resolved.kind === "snapshot") for (const stage of STAGE_NAMES) {
         const choice = resolved.metadata.selection[stage];
         if (choice?.skipped.length) console.info(`Stage account selection ${JSON.stringify({ stage, chosen: choice.chosen, accountProfileId: resolved.snapshot.stages[stage].accountProfileId, skipped: choice.skipped })}`);
