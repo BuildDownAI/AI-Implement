@@ -6364,6 +6364,22 @@ describe("model accounts and stage configuration (AII-962)", () => {
     }
   });
 
+  it("names the stage when every default account is later disabled", async () => {
+    const t = await seed();
+    for (const profileId of ["review-1", "review-2"]) {
+      expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId }))).status).toBe(201);
+    }
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.review, { accounts: [{ accountProfileId: "review-1", model: "gpt-review" }, { accountProfileId: "review-2", model: "" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    for (const profileId of ["review-1", "review-2"]) {
+      expect((await call(`/api/model-accounts/${profileId}`, "PATCH", t, { status: "disabled" })).status).toBe(200);
+    }
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    expect(result.status).toBe(400);
+    expect(result.json.error).toBe("review.accounts: no entry resolves (resolution_failed)");
+  });
+
   it("stores singleton accounts flat, refuses project lists, and exposes failed entries", async () => {
     const t = await seed();
     const config = structuredClone(defaults);
