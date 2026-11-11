@@ -224,3 +224,68 @@ missing comment creation time, no eligible comment in the window, or an eligible
 comment edited after completion makes the verdict unavailable. This intentionally
 fails closed for sticky comments created before the current review; inline threads
 retain their separate head-commit filtering.
+
+## When the in-run step reads the outside verdict
+
+The `post-push-review` step starts its outside-review wait after the internal
+review returns. It polls the PR head's matching review checks every five seconds,
+for up to **ten minutes** (600,000 ms of requested sleeps). Time already spent
+on the outside review while the internal review ran is additional time in its
+favor; GitHub API latency does not consume the sleep budget. The limit is a
+constant, with no operator setting.
+
+The operator-supplied measurements below come from AII PR comments created
+3–10 November 2026 containing “Claude finished @ai-implement-orchestrator-bot[bot]'s
+task in Nm Ss” lines, measured on 2026-11-10. The check-job sample is retained
+separately because it is incomplete.
+
+| Sample | Runs | Median | p90 | p95 | Maximum | Over 5 min | Over 10 min |
+|---|---:|---|---|---|---|---:|---:|
+| Claude completion comments (operator-supplied) | 181 | 3 m 44 s | 6 m 14 s | 7 m 25 s | 12 m 50 s | 47 | 2 |
+| Check jobs retrieved before GitHub's unauthenticated rate limit (incomplete sample) | 112 | — | 6 m 53 s | — | — | — | — |
+
+The chosen limit is **600,000 ms**, giving the completion-comment p90 a
+**3 m 46 s** margin (and the observed check-job p90 a 3 m 7 s margin).
+The incomplete check sample does not establish the full window's check p90.
+Compared with the previous five-minute limit, this adds **at most 5 more minutes
+per wait, and only when the outside review is still running**; reviews that
+finish sooner return as soon as a poll sees completion.
+
+Tracking-comment hardening is skipped; AII-1820 handles Claude comment recognition.
+
+The wait preserves these outcomes:
+
+| State | Meaning and gate behavior |
+|---|---|
+| `completed` | A matching check finished with a real verdict. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
+| `running` | A review is still pending, or its check/head could not be read before the budget expired. Fail closed with `external_review_pending` and no approval. |
+| `absent` | No matching external check exists. Require two consecutive probes before failing open. With no internal reviewer, an absent external check still fails closed because no review was obtained. Once a matching check has been seen, a later empty result is treated as unreadable and cannot fail open. A successfully read PR with no head SHA retains its immediate `absent` behavior. |
+| `no-real-verdict` | Matching checks finished without a usable verdict. Require two consecutive probes, then fail closed. |
+| `permission-denied` | The App cannot read checks. Stop immediately and fail closed with `CHECKS_PERMISSION_DENIED`. |
+
+An intervening running or unreadable probe resets the consecutive-probe
+settling rule for `absent` and `no-real-verdict`. A transient head-read failure
+is retried within the same budget. Non-default review processes keep their
+existing verdict readers: an incomplete contract keeps waiting, while a
+completed check without a readable real verdict fails closed. Reaching the
+limit does not turn a pending check into a completed review or approval.
+
+After the wait, the step calls `collectExternalReviewFindingsFromGh` once per
+review iteration (unless external collection was skipped). It reuses the issue
+comments fetched by the last probe when available; otherwise the collector
+fetches them. The collector also reads formal reviews and unresolved review
+threads. For `ai-implement`, a completed check requires a current-review comment
+under [the comment rules above](#which-claude-comments-the-pipeline-reads). For
+a review process other than `ai-implement`, the step passes the wait's head SHA
+to scope the findings read to that head. The wait follows the check run; the separate
+findings read must still produce a usable verdict before approval. A check
+without a real verdict cannot approve on the strength of older findings.
+
+If a recognized external review comment cannot be parsed into usable findings
+or an explicit clean verdict, the collector sets `findingsUnavailable`. This
+blocks approval even when the internal reviewers found no problems. In that
+case, the step reports “AI-Implement cannot read the verdict of the external
+review” and requires manual review, with no approval.
+
+The post-run late-review rail can still consume a verdict that arrives after
+the in-run wait ends; see [review-fix-rail.md](review-fix-rail.md).
