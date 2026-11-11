@@ -296,6 +296,7 @@ export function makeProvider(overrides: Partial<TicketingProvider> = {}): Ticket
     clearWorkingState: vi.fn<TicketingProvider["clearWorkingState"]>(async () => true),
     parkForHuman: vi.fn<TicketingProvider["parkForHuman"]>(async () => true),
     markMerged: vi.fn<TicketingProvider["markMerged"]>(async () => {}),
+    createChildIssue: vi.fn<TicketingProvider["createChildIssue"]>(async () => ({ id: "child-id", identifier: "TEST-2" })),
     postComment: vi.fn<TicketingProvider["postComment"]>(async () => {}),
     fetchPlanningContext: vi.fn<TicketingProvider["fetchPlanningContext"]>(async () => ""),
     issueUrl: vi.fn<TicketingProvider["issueUrl"]>((issue) => `https://linear.app/issue/${issue.identifier}`),

@@ -1,4 +1,4 @@
-import { access, constants, link, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { access, constants, link, lstat, mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
@@ -8,11 +8,12 @@ import { testDir } from "../helpers/test-dir.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, access: vi.fn(actual.access), link: vi.fn(actual.link) };
+  return { ...actual, access: vi.fn(actual.access), link: vi.fn(actual.link), writeFile: vi.fn(actual.writeFile) };
 });
 
 afterEach(() => {
-  vi.mocked(link).mockClear();
+  vi.mocked(link).mockReset();
+  vi.mocked(writeFile).mockReset();
 });
 
 function mapping({ directory, ...overrides }: Partial<RepoMapping> & { directory: string }): RepoMapping {
@@ -628,4 +629,76 @@ describe("FilesystemProvider.fetchSetupFacts", () => {
 
     expect(Object.keys(facts.directories)).toEqual(["LOCAL"]);
   });
+});
+
+import { runChildIssueContract } from "./contract.js";
+
+for (const planningEnabled of [true, false]) {
+  runChildIssueContract(`FilesystemProvider planning=${planningEnabled}`, async () => {
+    const directory = testDir("fs-child-contract");
+    await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+    const mappings = { TEAM: mapping({ directory, planningEnabled }) };
+    return { provider: provider(mappings), parentId: "filesystem:TEAM:TEST-1", scopeKey: "TEAM", inspect: async (identity) => {
+      const restarted = provider(mappings);
+      const issue = (await restarted.findByKey(identity.identifier))!;
+      const snap = await restarted.fetchAIImplementSnapshot();
+      return { title: issue.title, body: issue.description!, parentId: `filesystem:TEAM:${issue.parentRef?.identifier}`,
+        scopeKey: issue.scopeKey, pickupReady: (planningEnabled ? snap.needsPlanning : snap.readyForImplementation).some((i) => i.id === identity.id) };
+    } };
+  });
+}
+
+it("creates concurrent filesystem children without overwriting tasks", async () => {
+  const directory = testDir("fs-child-concurrent");
+  await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+  const p = provider({ TEAM: mapping({ directory }) });
+  const identities = await Promise.all(Array.from({ length: 3 }, () =>
+    p.createChildIssue("filesystem:TEAM:TEST-1", "TEAM", { title: "Child", body: "Body" })));
+  expect(new Set(identities.map((i) => i.id)).size).toBe(3);
+  expect((await p.fetchAIImplementSnapshot()).needsPlanning).toHaveLength(4);
+  await expect(p.createChildIssue("missing", "TEAM", { title: "Child", body: "Body" })).rejects.toThrow(/parent/);
+});
+
+for (const fail of [false, true]) {
+  it(`keeps partial child output invisible while writing (failure=${fail})`, async () => {
+    const directory = testDir("fs-child-publication");
+    await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+    const p = provider({ TEAM: mapping({ directory }) });
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(writeFile).mockImplementationOnce(async (path, data, options) => {
+      await actual.writeFile(path, String(data).slice(0, String(data).indexOf("---\n", 4) + 4), options);
+      expect((await p.fetchAIImplementSnapshot()).needsPlanning.map((i) => i.identifier)).toEqual(["TEST-1"]);
+      if (fail) throw new Error("partial write failed");
+      await actual.writeFile(path, data);
+    });
+    const creation = p.createChildIssue("filesystem:TEAM:TEST-1", "TEAM", { title: "Child", body: "Complete body" });
+    if (fail) {
+      await expect(creation).rejects.toThrow("partial write failed");
+      expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
+      expect((await readdir(directory)).filter((f) => f !== ".state")).toEqual(["TEST-1.md"]);
+    } else {
+      const child = await creation;
+      expect((await p.findByKey(child.identifier))?.description).toBe("Complete body");
+      expect((await readdir(directory)).some((f) => f.endsWith(".tmp"))).toBe(false);
+    }
+    expect((await p.fetchAIImplementSnapshot()).needsPlanning).toHaveLength(fail ? 1 : 2);
+  });
+}
+
+it("does not overwrite a task that appears before child publication", async () => {
+  const directory = testDir("fs-child-collision");
+  await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  let destination = "";
+  vi.mocked(link).mockImplementationOnce(async (source, target) => {
+    destination = String(target);
+    await actual.writeFile(target, "Existing task");
+    return actual.link(source, target);
+  });
+  await expect(provider({ TEAM: mapping({ directory }) }).createChildIssue(
+    "filesystem:TEAM:TEST-1", "TEAM", { title: "Child", body: "Body" },
+  )).rejects.toThrow();
+  expect(await readFile(destination, "utf8")).toBe("Existing task");
+  expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
+  expect((await readdir(directory)).some((f) => f.endsWith(".tmp"))).toBe(false);
 });
