@@ -2065,3 +2065,38 @@ describe("JiraProvider.createChildIssue failures", () => {
     });
   }
 });
+
+describe("JiraProvider creates children above the subtask level", () => {
+  for (const simplified of [false, true]) {
+    it(`links a Story to an Epic in a ${simplified ? "team" : "company"}-managed project`, async () => {
+      const fake = fakeFetch({
+        [FIELDS]: { json: [
+          { id: "customfield_10100", name: "AI-Implement Status", custom: true },
+          { id: "customfield_10101", name: "AI-Implement Repo", custom: true },
+          { id: "customfield_10014", name: "Epic Link", custom: true },
+        ] },
+        [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+          project: { id: "p" }, issuetype: { hierarchyLevel: 1 }, customfield_10101: "acme/x",
+        } } },
+        // Jira create metadata need not include hierarchyLevel.
+        [`GET ${API}/issue/createmeta/p/issuetypes`]: { json: { values: [
+          { id: "epic", subtask: false }, { id: "story", subtask: false }, { id: "sub", subtask: true },
+        ] } },
+        [`GET ${API}/issuetype/project`]: { json: [
+          { id: "epic", hierarchyLevel: 1 }, { id: "story", hierarchyLevel: 0 }, { id: "sub", hierarchyLevel: -1 },
+        ] },
+        [`GET ${API}/project/p`]: { json: { simplified } },
+        [`POST ${API}/issue`]: { json: { id: "child", key: "P-2" } },
+      }).install();
+      const p = new JiraProvider({ client: stubClient(), cacheScope: `epic-child-${simplified}`, siteUrl: "https://x",
+        getMappings: () => ({ TEAM: jiraMapping(ALL_OVERRIDES) }) });
+      await expect(p.createChildIssue("parent", "TEAM", { title: "Child", body: "Body" }))
+        .resolves.toEqual({ id: "child", identifier: "P-2" });
+      const fields = JSON.parse(fake.calls.find((c) => c.method === "POST")!.body).fields;
+      expect(fields).toMatchObject({ project: { id: "p" }, issuetype: { id: "story" },
+        customfield_10100: { value: "Ready" }, customfield_10101: "acme/x" });
+      expect(fields.parent).toEqual(simplified ? { id: "parent" } : undefined);
+      expect(fields.customfield_10014).toBe(simplified ? undefined : "P-1");
+    });
+  }
+});

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   access,
+  open,
   constants,
   mkdir,
   readFile,
@@ -170,13 +171,28 @@ export class FilesystemProvider implements TicketingProvider {
     await checkStateDirectories(dirname(statePath));
     await mkdir(dirname(statePath), { recursive: true });
     await checkStateDirectories(dirname(statePath));
-    await writeFile(statePath, JSON.stringify({ ...defaultState(mapping.planningEnabled),
-      parentRef: { identifier: parent.issue.identifier } }), { flag: "wx", mode: 0o600 });
+    const temporaryPath = join(directory, `.${identifier}.${randomUUID()}.tmp`);
+    let stateCreated = false;
     try {
-      await writeFile(taskPath, `---\ntitle: ${JSON.stringify(content.title)}\nid: ${identifier}\n---\n${content.body}`, { flag: "wx" });
+      // Reserve state exclusively, but keep partial state writes inside the cleanup boundary.
+      const stateFile = await open(statePath, "wx", 0o600);
+      stateCreated = true;
+      try {
+        await stateFile.writeFile(JSON.stringify({ ...defaultState(mapping.planningEnabled),
+          parentRef: { identifier: parent.issue.identifier } }));
+      } finally {
+        await stateFile.close();
+      }
+      await writeFile(temporaryPath, `---\ntitle: ${JSON.stringify(content.title)}\nid: ${identifier}\n---\n${content.body}`, { flag: "wx" });
+      // link publishes the complete document atomically and refuses an existing destination.
+      await link(temporaryPath, taskPath);
     } catch (err) {
-      await unlink(statePath);
+      if (stateCreated) await unlink(statePath);
       throw err;
+    } finally {
+      await unlink(temporaryPath).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
     }
     return { id, identifier };
   }

@@ -214,6 +214,15 @@ export class JiraClient {
     }
   }
 
+  async listProjectIssueTypes(projectId: string): Promise<Array<{ id: string; hierarchyLevel: number }>> {
+    // Unlike create metadata, this endpoint includes each type's hierarchy level.
+    return this.requestJson("GET", `/rest/api/3/issuetype/project?projectId=${encodeURIComponent(projectId)}`);
+  }
+
+  async getProject(projectId: string): Promise<{ simplified: boolean }> {
+    return this.requestJson("GET", `/rest/api/3/project/${encodeURIComponent(projectId)}`);
+  }
+
   async createIssue(fields: Record<string, unknown>): Promise<{ id: string; key: string }> {
     return this.requestJson("POST", "/rest/api/3/issue", { fields });
   }

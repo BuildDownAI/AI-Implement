@@ -213,11 +213,15 @@ Linear reads the effective pickup label from settings on each call and requires
 an exact-name team or workspace label. Jira resolves the mapping's custom field
 IDs, sets AI-Implement Status to `Ready`, and inherits the parent's AI-Implement
 Repo value (text or select). It requires that Repo to match the mapping and
-chooses a project-supported native child issue type; unsupported hierarchies or
-required-field restrictions fail explicitly. A label does not replace Jira's
+chooses a creatable child type using the project issue-type hierarchy. Epic
+children use Epic Link in company-managed projects where that field exists,
+and native parent links otherwise. Unsupported hierarchies or required-field
+restrictions fail explicitly. A label does not replace Jira's
 pickup fields.
 
 Filesystem children are new task documents with a collision-resistant identity
-and exclusive file creation. Parent metadata is stored in provider-owned state
+and atomic publication without overwriting existing tasks. Incomplete documents
+remain invisible to polling, and failed writes remove temporary files and state.
+Parent metadata is stored in provider-owned state
 and survives restart; pickup follows the mapping's planning setting. The fake
 provider records the parent association and puts children in planning pickup.

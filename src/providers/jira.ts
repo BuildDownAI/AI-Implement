@@ -1047,11 +1047,21 @@ export class JiraProvider implements TicketingProvider {
     }
     const types = await this.client.listCreateIssueTypes(project.id);
     const level = parentType?.hierarchyLevel ?? 0;
-    const childType = types.find((t) => level === 0 ? t.subtask : t.hierarchyLevel === level - 1);
+    const projectTypes = level > 0 ? await this.client.listProjectIssueTypes(project.id) : [];
+    const childType = types.find((t) => level === 0 ? t.subtask :
+      projectTypes.some((pt) => pt.id === t.id && pt.hierarchyLevel === level - 1));
     if (!childType) throw new Error("Jira project has no compatible native child issue type");
     const repoValue = typeof repo === "string" ? repo : { value: readRepoFieldValue(repo) };
+    const classicEpic = level === 1 && !(await this.client.getProject(project.id)).simplified;
+    // Fully overridden mappings skip field discovery, so resolve Epic Link here too.
+    const epicLinkFieldId = classicEpic
+      ? ids.epicLinkFieldId ?? (await this.client.listFields()).find((f) => f.name === "Epic Link")?.id
+      : undefined;
+    const relationship = epicLinkFieldId
+      ? { [epicLinkFieldId]: parent.key }
+      : { parent: { id: parent.id } };
     const child = await this.client.createIssue({
-      project: { id: project.id }, parent: { id: parent.id }, issuetype: { id: childType.id },
+      project: { id: project.id }, ...relationship, issuetype: { id: childType.id },
       summary: content.title, description: markdownToAdf(content.body),
       [ids.statusFieldId]: { value: STATUS_VALUES.READY }, [ids.repoFieldId]: repoValue,
     });
