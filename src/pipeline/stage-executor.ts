@@ -1,7 +1,7 @@
 import type { FailureRecord } from "./failure-classification.js";
 import { randomUUID } from "node:crypto";
 import { STAGE_NAMES, type StageName, type StageSelection } from "../agent-config.js";
-import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import type { AccountFallbacks, ResolvedAgentSnapshotV1 } from "../run-config.js";
 import type { ModelAuthClient } from "../model-auth-client.js";
 import {
   ClaudeCliExecutor,
@@ -59,6 +59,7 @@ export class AgentRecoveryRequiredError extends Error {
 type ClaudeLike = { invoke(params: InvokeParams, options?: ClaudeInvokeOptions): Promise<LLMResult> };
 
 export interface StageExecutorOptions {
+  accountFallbacks?: AccountFallbacks;
   fallbackModels?: Partial<Record<StageName, string>>;
   workspaceDir: string;
   /** The injected legacy executor, returned untouched when no snapshot is supplied. */

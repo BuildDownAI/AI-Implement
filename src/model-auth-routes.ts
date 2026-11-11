@@ -29,7 +29,7 @@ import {
   type PersistedModelAuthGrant,
   type SnapshotProfileSelection,
 } from "./model-auth-server.js";
-import { validateResolvedAgentSnapshot } from "./run-config.js";
+import { copyAccountFallbacks, validateResolvedAgentSnapshot } from "./run-config.js";
 
 const PATHS: ReadonlySet<string> = new Set(Object.values(MODEL_AUTH_ROUTES));
 
@@ -107,7 +107,7 @@ function loadDispatchContext(dispatchId: string): PersistedDispatchContext | und
   return { dispatchId, snapshotId: row.snapshot_id, projectKey: row.project_key, backend };
 }
 
-function getSnapshotSelection(snapshotId: string, profileId: string): SnapshotProfileSelection | undefined {
+export function getSnapshotSelection(snapshotId: string, profileId: string): SnapshotProfileSelection | undefined {
   const row = getDb()
     .prepare(
       "SELECT resolved_config_json, source_map_json, config_revision_ids_json FROM run_agent_config_snapshots WHERE snapshot_id = ?",
@@ -117,7 +117,7 @@ function getSnapshotSelection(snapshotId: string, profileId: string): SnapshotPr
     | undefined;
   if (!row) return undefined;
   try {
-    const resolved = JSON.parse(row.resolved_config_json) as { stages: unknown; profiles: unknown };
+    const resolved = JSON.parse(row.resolved_config_json) as { stages: unknown; profiles: unknown; accountFallbacks?: unknown };
     // Same reconstruction as `snapshotFromRow` in agent-run-preparation.ts.
     const snapshot = validateResolvedAgentSnapshot({
       version: 1,
@@ -128,7 +128,10 @@ function getSnapshotSelection(snapshotId: string, profileId: string): SnapshotPr
       profiles: resolved.profiles,
     });
     const profile = Object.values(snapshot.profiles).find((p) => p.id === profileId);
-    if (!profile) return undefined;
+    if (!profile) {
+      const fallback = Object.values(copyAccountFallbacks(resolved.accountFallbacks) ?? {}).flat().find(p => p.accountProfileId === profileId);
+      return fallback ? { provider: fallback.provider, revision: fallback.profileRevision, authMode: fallback.authMode } : undefined;
+    }
     return { provider: profile.provider, revision: profile.revision, authMode: profile.authMode };
   } catch {
     return undefined;

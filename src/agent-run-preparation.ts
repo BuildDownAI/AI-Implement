@@ -169,7 +169,7 @@ export type AgentRunPreparation =
       readonly snapshot: ResolvedAgentSnapshotV1;
       readonly fallbackModels: Partial<Record<StageName, string>>;
       readonly selection: ConfiguredStageResolution["selection"];
-      readonly accountFallbacks: ConfiguredStageResolution["accountFallbacks"];
+      readonly accountFallbacks?: ConfiguredStageResolution["accountFallbacks"];
       readonly grant: SafeGrantMetadata;
       readonly reservations: readonly ReservedProfile[];
       /** False on the call that minted the grant, true on every repeat. */
@@ -452,12 +452,13 @@ function profileRequests(snapshot: ResolvedAgentSnapshotV1): ProfileRequest[] {
   return [...byId.values()];
 }
 
-function expectedBindings(snapshot: ResolvedAgentSnapshotV1, reservations: readonly ReservedProfile[]): ModelAuthGrantBinding[] {
+function expectedBindings(snapshot: ResolvedAgentSnapshotV1, reservations: readonly ReservedProfile[], accountFallbacks: ConfiguredStageResolution["accountFallbacks"]): ModelAuthGrantBinding[] {
   const generations = new Map(reservations.map((r) => [r.profileId, r.generation]));
-  return profileList(snapshot).map((p) => {
+  return profileList(snapshot).flatMap((p) => {
     // The snapshot's profile revision is the resolver's `revision`.
     const base = { stage: p.stage, profileId: p.profileId, profileRevision: p.revision, authMode: p.authMode };
-    return reservesModelAccount(p.authMode) ? { ...base, ownerGeneration: generations.get(p.profileId) } : base;
+    return [reservesModelAccount(p.authMode) ? { ...base, ownerGeneration: generations.get(p.profileId) } : base,
+      ...(accountFallbacks[p.stage] ?? []).map(entry => ({ stage: p.stage, profileId: entry.accountProfileId, profileRevision: entry.profileRevision, authMode: entry.authMode }))];
   });
 }
 
@@ -651,7 +652,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
     }
   }
 
-  const bindings = expectedBindings(snapshot, reservations);
+  const bindings = expectedBindings(snapshot, reservations, resolved.metadata.accountFallbacks);
   const reuseGrant = (existing: { row: GrantRow; bindings: StoredBinding[] }): AgentRunPreparation => {
     const { row } = existing;
     if (row.snapshot_id !== snapshot.snapshotId) return { status: "recovery-required", code: "grant_mismatch" };
@@ -706,7 +707,8 @@ function ready(
   let pending = bootstrap;
   return {
     status: "ready",
-    ...metadata,
+    selection: metadata.selection,
+    ...(Object.values(metadata.accountFallbacks).some(entries => entries?.length) ? { accountFallbacks: metadata.accountFallbacks } : {}),
     fallbackModels,
     dispatchId: request.dispatchId,
     snapshot,
