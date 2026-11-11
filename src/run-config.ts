@@ -136,6 +136,7 @@ export interface RunConfigV1 {
   accountFallbacks?: AccountFallbacks;
   v: 1;
   issue: { id: string; identifier: string; title: string; description: string };
+  reviewOnly?: { reviewers: ReviewerSelection[] };
   prNumber?: string;
   baseBranch?: string;
   runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
@@ -564,6 +565,7 @@ export interface RunConfigBuildInput {
   mapping: RepoMapping;
   baseBranch?: string;
   runnerCallbackUrl?: string;
+  reviewOnly?: { reviewers: ReviewerSelection[] };
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. */
   commentInstruction?: string;
@@ -608,6 +610,7 @@ export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
     ...(input.runnerCallbackUrl ? { runnerCallbackUrl: input.runnerCallbackUrl } : {}),
     ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
     ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+    ...(input.reviewOnly ? { reviewOnly: input.reviewOnly } : {}),
     ...(input.prNumber ? { prNumber: input.prNumber } : {}),
     ...(input.commentInstruction ? { commentInstruction: input.commentInstruction } : {}),
     ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
@@ -699,6 +702,13 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const accounts = copyAccountFallbacks(cfg.accountFallbacks);
   if (accounts) out.accountFallbacks = accounts;
   if (prNumber !== undefined) out.prNumber = prNumber;
+  if (cfg.reviewOnly !== undefined) {
+    if (!isRec(cfg.reviewOnly) || !isReviewerSelectionArray(cfg.reviewOnly.reviewers) || cfg.reviewOnly.reviewers.length === 0
+      || !prNumber || runnerPhase !== "gap-analysis" || reviewFix !== undefined) {
+      throw new Error("invalid run_config.reviewOnly");
+    }
+    out.reviewOnly = { reviewers: cfg.reviewOnly.reviewers };
+  }
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
   if (runnerPhase !== undefined) out.runnerPhase = runnerPhase;
   if (branchPrefix !== undefined) out.branchPrefix = branchPrefix;

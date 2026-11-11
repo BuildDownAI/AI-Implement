@@ -105,6 +105,8 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
   };
 }
 
+export const ROLLUP_REVIEW_COMMENTER = "ai-implement-rollup-review";
+
 export const CONFLICT_COMMENTER = "ai-implement-orchestrator";
 
 /** FNV-1a 32-bit, negated: synthetic ids never collide with real (positive) webhook comment ids. */

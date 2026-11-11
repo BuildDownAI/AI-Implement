@@ -451,6 +451,7 @@ export interface ResolvedRunnerInputs {
   issueIdentifier: string;
   issueTitle: string;
   issueDescription: string;
+  reviewOnly?: import("./run-config.js").RunConfigV1["reviewOnly"];
   prNumber: string;
   commentInstruction: string | null;
   runnerPhase: "implementation" | "gap-analysis";
@@ -697,6 +698,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     sensitiveFiles: cfg.sensitiveFiles,
     dependencyTokenScope: cfg.dependencyTokenScope,
     referenceRepos: cfg.referenceRepos,
+    reviewOnly: cfg.reviewOnly,
     reviewers: validReviewerSelectionArray(cfg.reviewers) ? cfg.reviewers : DEFAULT_REVIEWER_SELECTION,
     reviewProcess: cfg.reviewProcess ?? "ai-implement",
     trustedReviewAuthors: cfg.trustedReviewAuthors ?? [],
@@ -1260,6 +1262,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     claudeModel,
     groupingParent,
     retryPolicy,
+    reviewOnly,
     reviewFix,
     agentConfig,
     modelPrices,
@@ -1273,7 +1276,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     options: opts.configured,
   });
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
-  const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewers);
+  const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewOnly?.reviewers ?? reviewers);
 
   // Planning context is fetched from the orchestrator's provider-agnostic
   // endpoint using the reusable progress token — the runner never calls the
@@ -1376,6 +1379,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       sensitiveFiles,
       dependencyTokenScope,
       referenceRepos,
+      reviewOnly,
       reviewers,
       reviewProcess,
       trustedReviewAuthors,
@@ -1425,6 +1429,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 
     referenceRepoResults = readReferenceRepoResults();
 
+    if (reviewOnly) {
+      const review = context.getOutputs("feedback-loop");
+      await reportRunnerResult(undefined, null, process.env, {
+        workspaceDir, phase: runnerPhase, outcome: review.terminationReason === "review_error" ? "failure" : "success",
+        reviewOnly: true, callbackUrl, retryPolicy, fetchImpl: opts.fetchImpl,
+      });
+      runCompleted = true;
+      return { exitCode: 0 };
+    }
     const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
     const postPushReviewOutputs = context.getOutputs("post-push-review");
@@ -1764,7 +1777,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const { valid: findingDispositions } = readFindingDispositions(workspaceDir);
     const pushOutputsOnError = context.getOutputs("push");
     const pushFailed = Boolean(pushOutputsOnError.error);
-    if (prNumber && !pushFailed) {
+    if (prNumber && !pushFailed && !reviewOnly) {
       replyToDispositionThreads(ghSpawn, prNumber, findingDispositions);
     }
     // A step can throw after push already ran and published a commit (e.g. post-push-review
@@ -1776,6 +1789,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       phase: runnerPhase,
       ...attributionField(errorAttribution(err) ?? finalAttribution()),
       outcome: "failure",
+      ...(reviewOnly ? { reviewOnly: true } : {}),
       failureReason: err instanceof Error ? err.message : String(err),
       failureCode: err instanceof SensitiveFilesError ? err.code
         : err instanceof OperatorCancelledError ? err.code
@@ -1796,7 +1810,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     } catch (summaryErr) {
       console.error(`timing summary failed: ${summaryErr}`);
     }
-    if (teardownHook) {
+    if (teardownHook && !reviewOnly) {
       try {
         const result = await runHookScript("teardown", teardownHook, workspaceDir);
         if (result.exitCode !== 0) {

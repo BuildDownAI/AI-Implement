@@ -1735,7 +1735,7 @@ async function runSelectedInternalReviewers(params: {
         status: "failed",
         started_at: startedAt,
         ended_at: endedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { approved: false, complete: false, feedback, issues: [], blockingIssues: [], maxTurns, ...extraOutputs, ...(telemetry ? { telemetry } : {}) },
         logs_url: null,
@@ -1790,7 +1790,7 @@ async function runSelectedInternalReviewers(params: {
     let transientRetries = 0;
     let reviewStageClassified: FailureRecord | undefined;
     let invocationThrew = false;
-    while (reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
+    while (!params.context.data.reviewOnly && reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
       reviewStageClassified = reviewResult.failure ?? classifyLlmResult(reviewResult, {
         stage,
         attempt: reviewResult.attempts ?? 1,
@@ -1806,7 +1806,7 @@ async function runSelectedInternalReviewers(params: {
         status: "failed",
         started_at: reviewStartedAt,
         ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { failure: reviewStageClassified, maxTurns, telemetry: reviewResult.telemetry },
         logs_url: null,
@@ -1924,7 +1924,7 @@ async function runSelectedInternalReviewers(params: {
       status: "passed",
       started_at: reviewStartedAt,
       ended_at: reviewEndedAt,
-      parent_step_id: "post-push-review",
+      parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
       inputs: reportInputs,
       outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
       logs_url: null,
@@ -3037,3 +3037,46 @@ ${externalFindingsFixBlock}
 };
 
 export default postPushReviewStep;
+
+/** Single advisory pass. No native review, external polling, fix, commit or push. */
+export async function runReviewOnly(context: PipelineContext, workspaceDir: string, reporter: StepReporter, ghSpawn?: (args: string[]) => SpawnResult) {
+  const gh = ghSpawn ?? makeDefaultGhSpawn(workspaceDir);
+  const prNumber = context.data.prNumber!;
+  let findings: ReviewLedgerFinding[] = [];
+  let feedback = "";
+  let failed = false;
+  let approved = false;
+  let costUsd: number | null = null;
+  try {
+    // gh returns the entire base-to-head PR diff, including earlier commits and lockfiles.
+    const diff = gh(["pr", "diff", prNumber]);
+    if (diff.exitCode !== 0) throw new Error(`Cannot read PR diff: ${resultMessage(diff)}`);
+    const { fetchTrustedConfigReviewers } = await import("./install.js");
+    const trustedConfig = await fetchTrustedConfigReviewers({
+      owner: context.data.githubOwner, repo: context.data.githubRepo, token: context.data.githubToken,
+      reviewers: context.data.reviewOnly!.reviewers, trustedReviewerDefinitions: context.data.trustedReviewerDefinitions,
+    });
+    const definitions = await resolveConfigReviewerDefinitions([], context.data.trustedReviewerDefinitions, trustedConfig);
+    const resolved = await resolveSelectedInternalReviewers(context.data.reviewOnly!.reviewers, context.data.trustedReviewerDefinitions,
+      definitions.trustedDefinitions, definitions.branchDefinitions);
+    if (resolved.unresolvedIds.length) throw new Error(selectionFailureMessage("unresolved", resolved.unresolvedIds));
+    const result = await runSelectedInternalReviewers({ context, reporter, reviewers: resolved.reviewers,
+      retryPolicy: normalizeRetryPolicy(context.data.retryPolicy), prNumber, iteration: 1, diff: diff.stdout,
+      previousFindings: "", model: context.data.model ?? DEFAULT_MODEL, sleep: async () => {} });
+    findings = result.findings;
+    feedback = result.feedback;
+    failed = result.incompleteReviews.length > 0;
+    approved = result.approved;
+    costUsd = result.costUsd;
+  } catch (error) {
+    failed = true;
+    feedback = error instanceof Error ? error.message : String(error);
+  }
+  const verdict = failed ? "Review incomplete" : approved ? "Approved" : "Changes recommended";
+  const body = ["<!-- ai-implement rollup-review -->", `## Roll-up review: ${verdict}`, "Advisory only.", feedback,
+    ...findings.map(f => `- **${f.severity}** ${f.path ?? "(general)"}:${f.line ?? "?"} — ${f.body}`)].join("\n\n");
+  const posted = gh(["pr", "comment", prNumber, "--body", body]);
+  if (posted.exitCode !== 0) throw new Error(`Cannot post roll-up review: ${resultMessage(posted)}`);
+  return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
+    passes: [], extraCostUsd: costUsd };
+}

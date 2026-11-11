@@ -49,6 +49,7 @@ export interface PipelineContextData {
   /** Autonomous runner: fully rendered implementation prompt from WORKFLOW.md or fallback. */
   implementationPrompt?: string;
   /** Autonomous runner: existing PR number for gap-fill runs, "" if none. */
+  reviewOnly?: { reviewers: ReviewerSelection[] };
   prNumber?: string;
   /** Autonomous runner: target GitHub repo owner. */
   githubOwner?: string;

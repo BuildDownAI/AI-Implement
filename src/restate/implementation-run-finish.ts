@@ -11,7 +11,7 @@ import type { Job, JobStatus } from "../log.js";
 import type { ImplementationFinishOutcome, ImplementationFinishResult } from "./implementation-run-workflow.js";
 
 /** Conclusions a callback writes that a deadline must not overwrite (`TTL_STALE_CONCLUSIONS` in `src/index.ts`). */
-const CALLBACK_OWNED_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending"]);
+const CALLBACK_OWNED_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending", "rollup_review"]);
 
 export interface ImplementationFinishDependencies {
   getJob(dispatchId: string): Job | null;
@@ -37,6 +37,7 @@ function callbackFacts(job: Job) {
     || (job.conclusion !== null && CALLBACK_OWNED_CONCLUSIONS.has(job.conclusion));
   return {
     reported,
+    reviewOnly: job.conclusion === "rollup_review",
     operatorCancelled: job.conclusion === "operator_cancelled",
     // The callback's ticket move for an approved run, or one pending its external review.
     madeTransition: job.approved || job.conclusion === "external_review_pending",
@@ -52,6 +53,10 @@ export async function finishImplementationJob(
   const job = deps.getJob(dispatchId);
   if (!job) return {};
   const facts = callbackFacts(job);
+
+  // Advisory callbacks already recorded their terminal result. The owner only cleans up
+  // and releases admission; implementation finalization must never move their tracker issue.
+  if (facts.reviewOnly) return {};
 
   if (facts.operatorCancelled) {
     // The callback wrote `failed` / `operator_cancelled` and cleared the working state; clearing again is safe.

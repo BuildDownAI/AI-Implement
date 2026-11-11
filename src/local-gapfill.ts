@@ -16,6 +16,7 @@ export interface LocalGapfillIssue {
 export interface DispatchLocalGapfillInput {
   runName?: string;
   dispatchId?: string;
+  reviewOnly?: RunConfigV1["reviewOnly"];
   reviewFix?: RunConfigV1["reviewFix"];
   mapping: RepoMapping;
   issue: LocalGapfillIssue;
@@ -72,6 +73,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     commentInstruction: input.commentInstruction || undefined,
     runnerCallbackUrl: input.runnerCallbackUrl || undefined,
     retryPolicy: input.retryPolicy,
+    reviewOnly: input.reviewOnly,
     reviewFix: input.reviewFix,
   })));
   const runConfig: RunConfigV1 = input.managed ? { ...decoded, ...managedRunConfigFields(input.managed.decision) } : decoded;
