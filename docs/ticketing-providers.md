@@ -201,3 +201,23 @@ One instance can run Linear and Jira mappings together. Limits:
 - **Knowledge graph coverage includes both trackers.** `resolveKgScopeTeams` (`src/admin.ts`) puts every Linear and Jira mapping in the default export scope; a Jira mapping reads through `JiraProvider.listIssuesPage`.
 - **Dedup reconcile is per tracker.** Each tracker is asked only about its own `dispatched` rows; see [dispatch-dedup.md](dispatch-dedup.md) § "Reconcile loop".
 - **The kg-refresh failure report** (`kgRefreshReportIssue`) is looked up with `ProviderRegistry.findByKeyInAnyTracker`, which asks every tracker that has a mapping. One hit posts the comment. A key found in two trackers is `ambiguous` and the comment is skipped with a warning. No hit skips it too; providers that could not be checked (`failedProviderIds`) are named in the log.
+
+## Creating pickup-ready children
+
+`createChildIssue(parentId, scopeKey, { title, body })` returns
+`Promise<{ id: string; identifier: string }>`. The orchestrator calls it with
+its own tracker credentials. The child uses the parent's native team/project
+and parent association; tracker failures propagate to the caller.
+
+Linear reads the effective pickup label from settings on each call and requires
+an exact-name team or workspace label. Jira resolves the mapping's custom field
+IDs, sets AI-Implement Status to `Ready`, and inherits the parent's AI-Implement
+Repo value (text or select). It requires that Repo to match the mapping and
+chooses a project-supported native child issue type; unsupported hierarchies or
+required-field restrictions fail explicitly. A label does not replace Jira's
+pickup fields.
+
+Filesystem children are new task documents with a collision-resistant identity
+and exclusive file creation. Parent metadata is stored in provider-owned state
+and survives restart; pickup follows the mapping's planning setting. The fake
+provider records the parent association and puts children in planning pickup.

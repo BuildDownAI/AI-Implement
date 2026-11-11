@@ -141,6 +141,25 @@ export class LinearProvider implements TicketingProvider {
     return `${this.workspaceUrl}/issue/${issue.identifier}`;
   }
 
+  async createChildIssue(parentId: string, _scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    const { issue: parent } = await this.linearMutation<{ issue: { id: string; team: { id: string } } | null }>(
+      `query($parentId: String!) { issue(id: $parentId) { id team { id } } }`, { parentId },
+    );
+    if (!parent) throw new Error("Linear parent issue not found");
+    const name = getLinearPickupLabel();
+    const labels = await this.linearMutation<{ issueLabels: { nodes: Array<{ id: string; name: string; team: { id: string } | null }> } }>(
+      `query($name: String!) { issueLabels(filter: { name: { eq: $name } }) { nodes { id name team { id } } } }`, { name },
+    );
+    const label = reusableLabel(labels.issueLabels.nodes.filter((l) => l.name === name), (l) => l.team?.id ?? null, parent.team.id);
+    if (!label) throw new Error(`Linear pickup label "${name}" is unavailable for the parent's team`);
+    const result = await this.linearMutation<{ issueCreate: { success: boolean; issue: { id: string; identifier: string } | null } }>(
+      `mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier } } }`,
+      { input: { parentId: parent.id, teamId: parent.team.id, title: content.title, description: content.body, labelIds: [label.id] } },
+    );
+    if (!result.issueCreate.success || !result.issueCreate.issue) throw new Error("Linear child issue creation failed");
+    return result.issueCreate.issue;
+  }
+
   async findByKey(key: string): Promise<TicketIssue | null> {
     const match = /^([A-Z][A-Z0-9_]*)-(\d+)$/.exec(key);
     if (!match) return null;

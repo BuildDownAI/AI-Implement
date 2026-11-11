@@ -629,3 +629,31 @@ describe("FilesystemProvider.fetchSetupFacts", () => {
     expect(Object.keys(facts.directories)).toEqual(["LOCAL"]);
   });
 });
+
+import { runChildIssueContract } from "./contract.js";
+
+for (const planningEnabled of [true, false]) {
+  runChildIssueContract(`FilesystemProvider planning=${planningEnabled}`, async () => {
+    const directory = testDir("fs-child-contract");
+    await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+    const mappings = { TEAM: mapping({ directory, planningEnabled }) };
+    return { provider: provider(mappings), parentId: "filesystem:TEAM:TEST-1", scopeKey: "TEAM", inspect: async (identity) => {
+      const restarted = provider(mappings);
+      const issue = (await restarted.findByKey(identity.identifier))!;
+      const snap = await restarted.fetchAIImplementSnapshot();
+      return { title: issue.title, body: issue.description!, parentId: `filesystem:TEAM:${issue.parentRef?.identifier}`,
+        scopeKey: issue.scopeKey, pickupReady: (planningEnabled ? snap.needsPlanning : snap.readyForImplementation).some((i) => i.id === identity.id) };
+    } };
+  });
+}
+
+it("creates concurrent filesystem children without overwriting tasks", async () => {
+  const directory = testDir("fs-child-concurrent");
+  await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+  const p = provider({ TEAM: mapping({ directory }) });
+  const identities = await Promise.all(Array.from({ length: 3 }, () =>
+    p.createChildIssue("filesystem:TEAM:TEST-1", "TEAM", { title: "Child", body: "Body" })));
+  expect(new Set(identities.map((i) => i.id)).size).toBe(3);
+  expect((await p.fetchAIImplementSnapshot()).needsPlanning).toHaveLength(4);
+  await expect(p.createChildIssue("missing", "TEAM", { title: "Child", body: "Body" })).rejects.toThrow(/parent/);
+});

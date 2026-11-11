@@ -2018,3 +2018,50 @@ describe("JiraProvider.fetchSetupFacts", () => {
     expect(facts.credentials === "accepted" && Object.keys(facts.projects)).toEqual(["X"]);
   });
 });
+
+import { runChildIssueContract } from "./contract.js";
+import { adfToPlainText } from "../../providers/jira.js";
+
+for (const repo of ["acme/x", { id: "option", value: "acme/x" }]) {
+  runChildIssueContract(`JiraProvider Repo=${typeof repo}`, async () => {
+    const client = stubClient();
+    const fake = fakeFetch({
+      [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+        project: { id: "project" }, issuetype: { hierarchyLevel: 0 }, customfield_10101: repo,
+      } } },
+      [`GET ${API}/issue/createmeta/project/issuetypes`]: { json: { values: [
+        { id: "task", subtask: false }, { id: "subtask", subtask: true },
+      ] } },
+      [`POST ${API}/issue`]: { json: { id: "child", key: "P-2" } },
+    }).install();
+    const p = new JiraProvider({ client, cacheScope: "child-contract", siteUrl: "https://x",
+      getMappings: () => ({ TEAM: jiraMapping(ALL_OVERRIDES), OTHER: jiraMapping({ ...ALL_OVERRIDES, repoFieldValue: "other/repo" }) }) });
+    return { provider: p, parentId: "parent", scopeKey: "TEAM", inspect: async () => {
+      const fields = JSON.parse(fake.calls[2].body).fields;
+      expect(fields.issuetype).toEqual({ id: "subtask" });
+      expect(fields.customfield_10101).toEqual(typeof repo === "string" ? repo : { value: "acme/x" });
+      expect(fields.labels).toBeUndefined();
+      return { title: fields.summary, body: adfToPlainText(fields.description), parentId: fields.parent.id,
+        scopeKey: fields.project.id === "project" ? "TEAM" : "", pickupReady: fields.customfield_10100.value === "Ready" };
+    } };
+  });
+}
+
+describe("JiraProvider.createChildIssue failures", () => {
+  for (const failure of ["subtask-parent", "no-child-type", "repo-mismatch", "create-refused"]) {
+    it(`propagates ${failure} without returning success`, async () => {
+      const fake = fakeFetch({
+        [`GET ${API}/issue/parent`]: { json: { id: "parent", key: "P-1", fields: {
+          project: { id: "p" }, issuetype: { subtask: failure === "subtask-parent", hierarchyLevel: 0 },
+          customfield_10101: failure === "repo-mismatch" ? "wrong/repo" : "acme/x",
+        } } },
+        [`GET ${API}/issue/createmeta/p/issuetypes`]: { json: { issueTypes: failure === "no-child-type" ? [] : [{ id: "s", subtask: true }], total: 1 } },
+        [`POST ${API}/issue`]: { status: 400, text: "Required field missing" },
+      }).install();
+      const p = new JiraProvider({ client: stubClient(), cacheScope: "child-failure", siteUrl: "https://x",
+        getMappings: () => ({ TEAM: jiraMapping(ALL_OVERRIDES) }) });
+      await expect(p.createChildIssue("parent", "TEAM", { title: "Title", body: "Body" })).rejects.toThrow();
+      expect(fake.calls.filter((c) => c.method === "POST")).toHaveLength(failure === "create-refused" ? 1 : 0);
+    });
+  }
+});

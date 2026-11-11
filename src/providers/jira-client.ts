@@ -201,6 +201,23 @@ export class JiraClient {
     }
   }
 
+  async listCreateIssueTypes(projectId: string): Promise<Array<{ id: string; subtask: boolean; hierarchyLevel?: number }>> {
+    type IssueType = { id: string; subtask: boolean; hierarchyLevel?: number };
+    const types: IssueType[] = [];
+    for (;;) {
+      const page = await this.requestJson<{ issueTypes?: IssueType[]; values?: IssueType[]; total?: number; isLast?: boolean }>(
+        "GET", `/rest/api/3/issue/createmeta/${encodeURIComponent(projectId)}/issuetypes?startAt=${types.length}&maxResults=100`,
+      );
+      const batch = page.issueTypes ?? page.values ?? [];
+      types.push(...batch);
+      if (!batch.length || page.isLast === true || (page.total !== undefined ? types.length >= page.total : page.isLast !== false)) return types;
+    }
+  }
+
+  async createIssue(fields: Record<string, unknown>): Promise<{ id: string; key: string }> {
+    return this.requestJson("POST", "/rest/api/3/issue", { fields });
+  }
+
   async setField(issueKey: string, fieldId: string, value: unknown): Promise<void> {
     await this.request("PUT", `/rest/api/3/issue/${encodeURIComponent(issueKey)}`, {
       fields: { [fieldId]: value },

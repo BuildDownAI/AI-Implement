@@ -26,7 +26,7 @@ export interface TicketIssue {
   nativeStatus: string;
   /**
    * Immediate parent identifier, when this issue has a parent. Logging/informational only.
-   * Populated by the Linear and Jira providers; undefined for others.
+   * Populated when the provider knows the parent association.
    */
   parentRef?: { identifier: string };
   /**
@@ -249,6 +249,9 @@ export interface TicketingProvider {
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;
+
+  /** Create a native child in the parent's team/project, ready for pickup. */
+  createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }>;
 
   // Communication
   postComment(issueId: string, body: string): Promise<void>;
