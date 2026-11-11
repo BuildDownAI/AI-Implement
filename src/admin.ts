@@ -46,8 +46,11 @@ import {
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
   STORED_STAGE_SELECTION_FIELDS,
+  validateAccounts,
   type StageAgentConfigurationV1,
   type StageName,
+  type StageAccount,
+  type AccountFailure,
 } from "./agent-config.js";
 import {
   getAccountProfile,
@@ -58,6 +61,7 @@ import {
   readStageInputsFingerprint,
   resolveCandidateProjectStageConfig,
   resolveProjectStageConfig,
+  inspectProjectStageAccounts,
   saveAccountProfileRevision,
   setOrchestratorDefaults,
   setProjectStageConfig,
@@ -4211,13 +4215,18 @@ function storedConfigView(stored: { configRevisionId: string; revision: number; 
 }
 
 /** Validates the value types the store leaves to the resolver, so a legacy-mode write cannot park a malformed stage. */
-function validateStagesBody(stages: unknown): string | null {
+function validateStagesBody(stages: unknown, defaults = false): string | null {
   if (typeof stages !== "object" || stages === null || Array.isArray(stages)) return "stages must be an object";
   for (const [stage, patch] of Object.entries(stages)) {
     if (!(STAGE_NAMES as readonly string[]).includes(stage)) return "stages contains unknown key(s)";
     if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return `stages.${stage} must be an object`;
     for (const [field, value] of Object.entries(patch)) {
       if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) return `stages.${stage} contains unknown key(s)`;
+      if (field === "accounts") {
+        if (!defaults) return "accounts is only supported in orchestrator defaults";
+        try { validateAccounts(value, stage); } catch (err) { return (err as Error).message; }
+        continue;
+      }
       if (value === null) continue;
       if (field === "invocationTimeoutMs" ? !Number.isSafeInteger(value) || (value as number) <= 0 : typeof value !== "string" || value.trim() === "") {
         return `stages.${stage}.${field} is malformed`;
@@ -4240,7 +4249,7 @@ async function handlePutAgentDefaults(req: http.IncomingMessage, res: http.Serve
     return;
   }
   if (body.stages !== undefined) {
-    const bad = validateStagesBody(body.stages);
+    const bad = validateStagesBody(body.stages, true);
     if (bad) {
       json(res, 400, { error: bad });
       return;
@@ -4432,15 +4441,20 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
   }
   const stored = getProjectStageConfig(projectKey);
   const base = { projectKey, enabled: stored?.config.mode === "configured" };
+  const backends = backendsFor(getMappings()[projectKey]!);
+  const checkAccount = (entry: StageAccount): AccountFailure | null =>
+    entry.authMode === "bedrock" && backends.some(backend => backend !== "github-actions") ? "unsupported_combination" : null;
   let projection;
   try {
-    projection = resolveProjectStageConfig(projectKey);
+    projection = resolveProjectStageConfig(projectKey, undefined, checkAccount);
   } catch (err) {
     // Resolver messages are fixed text (disabled or incompatible profile); none carries a credential.
+    const accountEntries = inspectProjectStageAccounts(projectKey, checkAccount);
     json(res, 200, {
       ...base,
       mode: "configured",
       resolved: false,
+      stages: Object.fromEntries(STAGE_NAMES.map(stage => [stage, { entries: accountEntries[stage], fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null }])),
       error: { code: "resolution_failed", message: err instanceof Error ? err.message : "stage configuration does not resolve" },
     });
     return;
@@ -4455,6 +4469,8 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
     const profile = resolution.profiles[stage];
     const projectionProfile = getAccountProfile(profile.id);
     stages[stage] = {
+      entries: resolution.accountEntries?.[stage],
+      fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null,
       values: { ...resolution.stages[stage], fallbackModel: resolution.fallbackModels[stage] ?? null },
       sources: { ...resolution.sources[stage], fallbackModel: resolution.fallbackModelSources[stage] ?? null },
       profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },

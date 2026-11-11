@@ -6343,6 +6343,140 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 
+  it("preserves resolution failure diagnostics when defaults become legacy", async () => {
+    const t = await seed();
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+      enabled: true, stages: { planning: { model: "project-model" } },
+    }, readyDeps())).status).toBe(200);
+    expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy" })).status).toBe(200);
+
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json).toMatchObject({
+      enabled: true, mode: "configured", resolved: false,
+      error: {
+        code: "resolution_failed",
+        message: "project opted into stage configuration but orchestrator defaults are not configured",
+      },
+    });
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(resolved.json.stages[stage]).toEqual({ entries: [], fallbacksDropped: false });
+    }
+  });
+
+  it("stores singleton accounts flat, refuses project lists, and exposes failed entries", async () => {
+    const t = await seed();
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }] });
+    const singleton = await call("/api/agent-defaults", "PUT", t, config);
+    expect(singleton.status).toBe(200);
+    expect(singleton.json.stages.planning).not.toHaveProperty("accounts");
+    const refused = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { planning: { accounts: [] } } });
+    expect(refused.status).toBe(400);
+    expect(refused.json.error).toBe("accounts is only supported in orchestrator defaults");
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "oai-2" }));
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }, { accountProfileId: "oai-2", model: "" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.json.stages.planning.entries).toMatchObject([
+      { index: 0, accountProfileId: "oai-1", passes: false, reason: "resolution_failed" },
+      { index: 1, accountProfileId: "oai-2", passes: true, reason: null },
+    ]);
+  });
+
+  it.each([
+    { accounts: {}, message: "planning.accounts[0] must be a non-empty account list" },
+    { accounts: [], message: "planning.accounts[0] must be a non-empty account list" },
+    { accounts: [null], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "oai-1" }], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "oai-1", model: "m", extra: true }], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "disabled", model: "m" }], message: "planning.accounts[0] does not resolve" },
+    { accounts: [{ accountProfileId: "invalid", model: "m" }], message: "planning.accounts[0] does not resolve" },
+    { accounts: [{ accountProfileId: "plan", model: "m" }, { accountProfileId: "oai-1", model: "m" }], message: "planning.accounts[1] cannot use paid API after subscription" },
+  ])("rejects invalid defaults without appending a revision: $message", async ({ accounts, message }) => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "disabled" }));
+    await call("/api/model-accounts/disabled", "PATCH", t, { status: "disabled" });
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan", authMode: "codex-subscription" }));
+    // A historical incompatible profile must also be refused at the configuration boundary.
+    // Keep the valid paid profile separate from the incompatible one.
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "invalid" }));
+    dedup.getDb().exec("DROP TRIGGER trg_model_account_profile_revisions_immutable");
+    dedup.getDb().prepare("UPDATE model_account_profile_revisions SET agent = 'claude' WHERE profile_id = 'invalid'").run();
+    const before = count("stage_agent_config_revisions");
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts });
+    const result = await call("/api/agent-defaults", "PUT", t, config);
+    expect(result.status).toBe(400);
+    expect(result.json.error).toBe(message);
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it.each([
+    { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+    { agent: "claude", provider: "bedrock", authMode: "bedrock" },
+  ])("reports an incompatible account-only override ($provider)", async profile => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "other", ...profile }));
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "m" }, { accountProfileId: "other", model: "claude" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    // Simulate an existing project override; the save route correctly refuses this configuration.
+    modules.agentConfigStore.setProjectOptIn("APP", true);
+    dedup.getDb().prepare("INSERT INTO stage_agent_config_revisions (config_revision_id, scope_kind, scope_key, revision, version, config_json, created_at) VALUES ('override-test', 'project', 'APP', 2, 1, ?, ?)").run(
+      JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json.stages.planning.entries).toMatchObject([{ accountProfileId: "other", passes: false, reason: "resolution_failed" }]);
+  });
+
+  it.each([
+    { model: "api-model", chosenModel: "api-model", source: "orchestrator-default" },
+    { model: "", chosenModel: "project-model", source: "project" },
+  ])("reports selected account provenance with a project model override ($source)", async ({ model, chosenModel, source }) => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+    for (const profile of [
+      { profileId: "brk", provider: "bedrock", authMode: "bedrock" },
+      { profileId: "cl-api", provider: "anthropic", authMode: "anthropic-api-key" },
+    ]) {
+      expect((await call("/api/model-accounts", "POST", t, profileBody({ ...profile, agent: "claude" }))).status).toBe(201);
+    }
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "primary" }, { accountProfileId: "cl-api", model }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, {
+      enabled: true, stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
+    }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json.stages.planning).toMatchObject({
+      values: { accountProfileId: "cl-api", agent: "claude", provider: "anthropic", model: chosenModel, invocationTimeoutMs: 700000 },
+      sources: { accountProfileId: "orchestrator-default", agent: "orchestrator-default", provider: "orchestrator-default", model: source, invocationTimeoutMs: "project" },
+      entries: [{ index: 0, passes: false, reason: "unsupported_combination" }, { index: 1, passes: true }],
+    });
+  });
+
+  it("shows unsupported backend entries and project fallback suppression", async () => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "brk", agent: "claude", provider: "bedrock", authMode: "bedrock" }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-api", agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" }));
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "claude" }, { accountProfileId: "cl-api", model: "" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(resolved.json.stages.planning.entries).toMatchObject([{ passes: false, reason: "unsupported_combination" }, { passes: true }]);
+    expect(resolved.json.stages.planning.values.accountProfileId).toBe("cl-api");
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: { planning: { accountProfileId: "cl-api", provider: "anthropic" } } }, readyDeps())).status).toBe(200);
+    const overridden = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(overridden.json.stages.planning.fallbacksDropped).toBe(true);
+    expect(overridden.json.stages.planning.entries).toHaveLength(1);
+  });
+
   it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
     await seed();
     accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");

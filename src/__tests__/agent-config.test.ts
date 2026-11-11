@@ -427,4 +427,55 @@ describe("fallback models", () => {
     defaults.stages!.planning!.fallbackModel = "backup";
     expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: { model: "backup" } }), accountProfiles })).toThrow(/planning.*fallbackModel/);
   });
+
+  it("drops redundant fallback metadata only while an account list is active", () => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: "backup" }, { accountProfileId: "claude-bedrock", model: "other" }];
+    defaults.stages!.planning!.fallbackModel = "backup";
+    const result = resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles });
+    if (result.mode !== "configured") throw new Error("expected configured");
+    expect(result.fallbackModels).toEqual({});
+    expect(result.fallbackModelSources).toEqual({});
+    expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: { accountProfileId: "claude-api" } }), accountProfiles })).toThrow("planning.fallbackModel must differ from model");
+  });
+});
+
+describe("ordered stage accounts", () => {
+  it.each([
+    { name: "first passes", reasons: [null, null], chosen: 0, fallbacks: ["b"] },
+    { name: "second chosen", reasons: ["unsupported_combination", null], chosen: 1, fallbacks: [] },
+    { name: "first failure", reasons: ["resolution_failed", "unsupported_combination"], chosen: null, fallbacks: [] },
+    { name: "later split", reasons: [null, "resolution_failed", null], chosen: 0, fallbacks: ["c"] },
+    { name: "blank model", reasons: [null, null], chosen: 0, fallbacks: ["b"] },
+    { name: "singleton", reasons: [null], chosen: 0, fallbacks: [] },
+  ])("$name", async ({ reasons, chosen, fallbacks }) => {
+    const { chooseStageAccount } = await import("../agent-config.js");
+    const entries = reasons.map((_, index) => ({ accountProfileId: String.fromCharCode(97 + index), model: index ? "" : "model", profileRevision: 3, agent: "claude" as const, provider: "anthropic" as const, authMode: "anthropic-api-key" as const }));
+    const result = chooseStageAccount(entries, e => reasons[e.accountProfileId.charCodeAt(0) - 97] as import("../agent-config.js").AccountFailure | null);
+    expect(result.chosen?.index ?? null).toBe(chosen);
+    expect(result.fallbacks.map(e => e.accountProfileId)).toEqual(fallbacks);
+    expect(result.fallbacks.every(e => e.model === "model" && e.profileRevision === 3)).toBe(true);
+    if (chosen === null) expect(result.failure).toBe(reasons[0]);
+    if (chosen === 1) expect(result.skipped).toEqual([{ index: 0, accountProfileId: "a", reason: reasons[0] }]);
+  });
+
+  it("keeps default fallbacks for model overrides and drops them for account overrides", () => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: "first" }, { accountProfileId: "claude-subscription", model: "" }];
+    const resolve = (patch: import("../agent-config.js").StageSelectionPatch) => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: patch }), accountProfiles });
+    const model = resolve({ model: "override" });
+    expect(model.mode === "configured" && model.accountFallbacks.planning?.[0].accountProfileId).toBe("claude-subscription");
+    const account = resolve({ accountProfileId: "claude-api" });
+    expect(account.mode === "configured" && account.accountFallbacks).toEqual({});
+  });
+});
+
+it("refuses an unsupported profile combination on save and skips it during resolution", async () => {
+  const { validateDefaultAccounts } = await import("../agent-config.js");
+  const profiles = [...accountProfiles, { id: "invalid", identity: "Invalid", revision: 1, agent: "claude" as const, provider: "openai" as const, authMode: "openai-api-key" as const }];
+  const defaults = structuredClone(orchestratorDefaults);
+  defaults.stages!.planning!.accounts = [{ accountProfileId: "invalid", model: "m" }, { accountProfileId: "claude-api", model: "m" }];
+  expect(() => validateDefaultAccounts(defaults, profiles)).toThrow("planning.accounts[0] does not resolve");
+  const resolution = resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles: profiles });
+  expect(resolution.mode === "configured" && resolution.selection.planning).toEqual({ chosen: 1, skipped: [{ index: 0, accountProfileId: "invalid", reason: "resolution_failed" }] });
 });
