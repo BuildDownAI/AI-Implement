@@ -596,6 +596,7 @@ describe("postPushReviewStep", () => {
             }
             expect(out.costUsd).toBe(switches + (recovers ? 0 : 1) || null);
             if (!recovers) {
+              expect(out.terminationReason).toBe(agentStage === "implementation" ? "fix_failed" : "review_failed");
               expect(out.failure).toMatchObject({ code: "ACCOUNT_USAGE_LIMIT", evidence: { llmErrorMessage: "exhausted profiles" } });
               expect(report.mock.calls).toEqual(expect.arrayContaining([
                 [expect.objectContaining({ outputs: expect.objectContaining({ failure: expect.objectContaining({ code: "ACCOUNT_USAGE_LIMIT" }) }) })],
@@ -625,8 +626,27 @@ describe("postPushReviewStep", () => {
     });
 
     it.each([
+      { provider: "Claude", subtype: "error_during_execution" },
+      { provider: "Codex", subtype: "error" },
+    ])("commits and pushes an exit-0 $provider error and reviews again", async ({ subtype }) => {
+      gitSpawn.mockClear();
+      const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
+        ? { stdout: "partial fix", exitCode: 0, tokensUsed: 1,
+          terminalStatus: { subtype, isError: true },
+          telemetry: { ...NO_RESULT_TELEMETRY, outcome: "error" as const } }
+        : structuredReviewResult(params.stage.endsWith("review-2") ? { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] } : notApproved));
+      const out = await runReview(makeCtx(invoke), {
+        prNumber: "42", workspaceDir, maxIterations: 2,
+        reviewers: [{ id: "code-review", gates: true }], reviewProviders: [], ghSpawn, gitSpawn,
+      }, { report: vi.fn(async () => undefined) });
+      expect(out.approved).toBe(true);
+      expect(invoke.mock.calls.map(([p]) => p.agentStage)).toEqual(["review", "implementation", "review"]);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "commit")).toHaveLength(1);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "push")).toHaveLength(1);
+    });
+
+    it.each([
       { exitCode: 1, outcome: "max_turns" as const },
-      { exitCode: 0, outcome: "error" as const },
     ])("rejects fix errors with exit $exitCode and outcome $outcome", async ({ exitCode, outcome }) => {
       gitSpawn.mockClear();
       const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
