@@ -194,8 +194,8 @@ Inline comments count only from a trusted author of type `Bot`, on the head comm
 ## Which Claude comments the pipeline reads
 
 For `ai-implement`, a completed review check triggers a separate findings read.
-The ledger first restricts eligible top-level comments to those created during the
-review check on the resolved PR head. It then selects the newest by `updated_at`
+The ledger first restricts eligible top-level comments to those created at or after
+the review check started on the resolved PR head. It then selects the newest by `updated_at`
 (falling back to `created_at`, then API order for ties). It reads a fenced contract
 first, then legacy review headings. Both a combined tracking/review comment and a
 separate `## Claude review` comment are eligible; `**Claude finished**` is not
@@ -217,11 +217,12 @@ heading-only findings also gate approval under `ai-implement`, without requiring
 advisory. The step logs the selected comment id and parse kind beside its review
 process verdict log. Top-level comments do not supply commit identity. The step uses the single matching
 check with a real review conclusion, fetched from the current head's check-runs
-endpoint, and its inclusive `started_at`–`completed_at` window. Comment creation
-must fall inside that window; editing an older head's approval cannot bring it
+endpoint, and validates its `started_at` and `completed_at` timestamps. Comment creation
+must be at or after `started_at`; editing an older head's approval cannot bring it
 into the current review. Missing/invalid check timing, multiple real review checks,
-missing comment creation time, no eligible comment in the window, or an eligible
-comment edited after completion makes the verdict unavailable. This intentionally
+missing comment creation time, or no eligible comment makes the verdict unavailable.
+Final comments and tracker edits may arrive after `completed_at`; unavailable or
+incomplete verdicts keep the existing wait pending until its time limit. This intentionally
 fails closed for sticky comments created before the current review; inline threads
 retain their separate head-commit filtering.
 
@@ -251,13 +252,20 @@ Compared with the previous five-minute limit, this adds **at most 5 more minutes
 per wait, and only when the outside review is still running**; reviews that
 finish sooner return as soon as a poll sees completion.
 
-Tracking-comment hardening is skipped; AII-1820 handles Claude comment recognition.
+For `ai-implement`, a completed check also probes the trusted current-review
+comment. A standalone “Claude is working…” tracker keeps the wait pending; a
+combined tracker and readable final review counts as final. Missing comments
+and failed comment reads, incomplete verdicts, and temporarily unparseable reviews
+retry within the same budget. Comments must be created since the current head’s
+check started; final publication or tracker edits may follow check completion.
+Editing a comment created before that check cannot make it current. A newer trusted tracker
+supersedes an older verdict; foreign authors cannot supply either state.
 
 The wait preserves these outcomes:
 
 | State | Meaning and gate behavior |
 |---|---|
-| `completed` | A matching check finished with a real verdict. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
+| `completed` | A matching check finished with a real verdict and its current-review comment is final. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
 | `running` | A review is still pending, or its check/head could not be read before the budget expired. Fail closed with `external_review_pending` and no approval. |
 | `absent` | No matching external check exists. Require two consecutive probes before failing open. With no internal reviewer, an absent external check still fails closed because no review was obtained. Once a matching check has been seen, a later empty result is treated as unreadable and cannot fail open. A successfully read PR with no head SHA retains its immediate `absent` behavior. |
 | `no-real-verdict` | Matching checks finished without a usable verdict. Require two consecutive probes, then fail closed. |
@@ -277,8 +285,9 @@ fetches them. The collector also reads formal reviews and unresolved review
 threads. For `ai-implement`, a completed check requires a current-review comment
 under [the comment rules above](#which-claude-comments-the-pipeline-reads). For
 a review process other than `ai-implement`, the step passes the wait's head SHA
-to scope the findings read to that head. The wait follows the check run; the separate
-findings read must still produce a usable verdict before approval. A check
+to scope the findings read to that head. The wait follows both check completion and comment finality, and passes the
+last probe’s issue comments to the findings collector without another verdict
+fetch. The findings read must still produce a usable verdict before approval. A check
 without a real verdict cannot approve on the strength of older findings.
 
 If a recognized external review comment cannot be parsed into usable findings

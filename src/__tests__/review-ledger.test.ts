@@ -2348,6 +2348,21 @@ describe("trusted Claude review selection", () => {
 describe("current review comment association", () => {
   const blocker = pr1546.find(c => c.id === 6778794145)!;
   const stale = { ...blocker, id: 123, created_at: "2026-11-10T19:00:00Z", updated_at: "2026-11-10T21:00:00Z", body: '## Claude review\n```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' };
+  it.each(["new comment", "edited tracker"])("accepts a final %s published after check completion", mode => {
+    const comment = {
+      ...blocker,
+      created_at: mode === "new comment" ? "2026-11-10T20:45:00Z" : "2026-11-10T20:39:00Z",
+      updated_at: "2026-11-10T20:46:00Z",
+    };
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:38:00Z", completedAt: "2026-11-10T20:44:14Z" },
+      issueComments: { exitCode: 0, stdout: JSON.stringify([comment, stale]) },
+    });
+    expect(result.findingsUnavailable).toBe(false);
+    expect(result.selectedComment?.id).toBe(blocker.id);
+    expect(result.findings[0].severity).toBe("blocking");
+  });
   it.each([true, false])("keeps the current blocker with window evidence=%s", evidence => {
     const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
       process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
@@ -2369,7 +2384,6 @@ describe("unavailable current Claude review evidence", () => {
   const review = pr1546.find(c => c.id === 6778794145)!;
   it.each([
     { label: "missing creation time", comment: { ...review, created_at: "" }, exitCode: 0 },
-    { label: "edited after check", comment: { ...review, updated_at: "2026-11-10T21:00:00Z" }, exitCode: 0 },
     { label: "only stale review", comment: { ...review, created_at: "2026-11-10T19:00:00Z" }, exitCode: 0 },
     { label: "unreadable comments", comment: review, exitCode: 1 },
   ])("fails closed for $label", ({ comment, exitCode }) => {

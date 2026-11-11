@@ -51,6 +51,7 @@ export interface ExternalReviewFindingsResult {
   verdict?: ReviewFindingsVerdict;
   verdictSource?: ReviewLedgerSource;
   selectedComment?: { id: string | number; kind: string };
+  reviewPending?: boolean;
 }
 
 export interface ReviewLedgerOptions {
@@ -58,7 +59,7 @@ export interface ReviewLedgerOptions {
   extraAuthors: readonly string[];
   /** When set, a review thread whose latest comment was written on another commit is not a finding. */
   headSha?: string;
-  /** Require top-level comments created during the single review check on the resolved head. */
+  /** Require top-level comments created since the single review check on the resolved head started. */
   requireCurrentReview?: boolean;
   reviewWindow?: { startedAt: string; completedAt: string };
   /** A successful `issues/{pr}/comments` read the caller already made; when set, the readers reuse it instead of fetching again. */
@@ -87,6 +88,7 @@ export function collectExternalReviewFindingsFromGh(
   return {
     findings: dedupeReviewFindings(findings),
     findingsUnavailable: out.findingsUnavailable,
+    ...(out.reviewPending ? { reviewPending: true } : {}),
     ...(out.selectedComment ? { selectedComment: out.selectedComment } : {}),
     ...(out.verdict !== undefined ? { verdict: out.verdict } : {}),
     ...(out.verdictSource !== undefined ? { verdictSource: out.verdictSource } : {}),
@@ -718,6 +720,18 @@ export function classifyReviewIssueComment(
   return null;
 }
 
+/** Reads only the top-level verdict during a check probe; threads are collected after the wait. */
+export function collectClaudeReviewCommentFromGh(
+  ghSpawn: GhSpawn,
+  prNumber: string,
+  options: ReviewLedgerOptions,
+): ExternalReviewFindingsResult {
+  const findings: ReviewLedgerFinding[] = [];
+  const out: Omit<ExternalReviewFindingsResult, "findings"> = { findingsUnavailable: false };
+  collectClaudeIssueComments(ghSpawn, prNumber, findings, out, options);
+  return { ...out, findings };
+}
+
 function collectClaudeIssueComments(
   ghSpawn: GhSpawn,
   prNumber: string,
@@ -743,22 +757,32 @@ function collectClaudeIssueComments(
     return;
   }
   // Top-level Claude review comments are revision verdicts, not an append-only ledger.
-  // A check window binds newly created comments to this head; updated_at only orders
-  // revisions inside that window, never promotes an older head's edited approval.
+  // The current head's check start binds newly created comments to this head.
+  // Publication and tracker edits may follow check completion; updated_at only
+  // orders revisions and never promotes an older head's edited approval.
   // Formal CHANGES_REQUESTED reviews and unresolved threads remain independently collected.
   for (const comment of comments) {
     if (!isRecord(comment)) continue;
 
     const classified = classifyReviewIssueComment(comment, options);
-    if (classified === null) continue;
+    const pending = typeof comment.body === "string"
+      && isVerdictEligibleAuthor(comment, options)
+      && !isAiImplementComment(comment.body)
+      && /\*\*Claude is working[.…]/i.test(comment.body)
+      && (classified === null || classified.findingsUnavailable);
+    if (classified === null && !pending) continue;
     if (options.requireCurrentReview) {
       const created = Date.parse(typeof comment.created_at === "string" ? comment.created_at : "");
       if (!Number.isFinite(created)) { out.findingsUnavailable = true; return; }
-      if (created < start || created > end) continue;
-      // An edit after this check finished cannot be attributed to that review.
-      if (reviewCommentTimestamp(comment) > end) { out.findingsUnavailable = true; return; }
+      if (created < start) continue;
     }
 
+    if (pending) {
+      out.reviewPending = true;
+      out.findingsUnavailable = true;
+      return;
+    }
+    if (classified === null) continue;
     if (typeof comment.id === "number" || typeof comment.id === "string") {
       out.selectedComment = { id: comment.id, kind: classified.findingsUnavailable ? "unavailable" : classified.verdictSource ?? "claude-review-summary" };
     }
@@ -770,7 +794,7 @@ function collectClaudeIssueComments(
     }
     return;
   }
-  if (options.requireCurrentReview) out.findingsUnavailable = true;
+  if (options.requireCurrentReview) { out.findingsUnavailable = true; out.reviewPending = true; }
 }
 
 /** Trusted `review-findings` blocks on the PR's top-level comments, newest first. `null` when the read failed. */
