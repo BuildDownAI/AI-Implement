@@ -6451,7 +6451,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
   it.each([
     { model: "api-model", chosenModel: "api-model", source: "orchestrator-default" },
     { model: "", chosenModel: "project-model", source: "project" },
-  ])("reports selected account provenance with a project model override ($source)", async ({ model, chosenModel, source }) => {
+  ])("reports selected account provenance or refuses cross-provider model inheritance ($source)", async ({ model, chosenModel, source }) => {
     const t = await seed();
     await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
     for (const profile of [
@@ -6462,7 +6462,13 @@ describe("model accounts and stage configuration (AII-962)", () => {
     }
     const config = structuredClone(defaults);
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "primary" }, { accountProfileId: "cl-api", model }] });
-    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    const saved = await call("/api/agent-defaults", "PUT", t, config);
+    if (!model) {
+      expect(saved.status).toBe(400);
+      expect(saved.json.error).toContain("requires a model for another provider");
+      return;
+    }
+    expect(saved.status).toBe(200);
     expect((await call("/api/mappings/FLY/agent-config", "PUT", t, {
       enabled: true, stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
     }, readyDeps())).status).toBe(200);
@@ -6481,7 +6487,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "brk", agent: "claude", provider: "bedrock", authMode: "bedrock" }));
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-api", agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" }));
     const config = structuredClone(defaults);
-    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "claude" }, { accountProfileId: "cl-api", model: "" }] });
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "claude" }, { accountProfileId: "cl-api", model: "claude-api-model" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
     expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps())).status).toBe(200);
     const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);

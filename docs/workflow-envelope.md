@@ -445,13 +445,15 @@ error `invalid run_config.accountFallbacks`, without echoing input values. Older
 runners ignore the new optional field.
 
 The same credential grant binds the chosen profile and every fallback profile for
-each stage, with no binding-count cap so every configured account can be granted.
+each stage, within the 16-binding cap. Preparation trims fallback tails across
+stages to fit the cap while preserving each chosen account and fallback prefix.
 Preparation checks credential readiness only for the chosen profile;
 fallback credentials are issued only on checkout. The model-auth server authorizes
 fallbacks from the frozen row's provider, revision and auth mode after checking the
 grant binding. No credential values or credential references enter this list.
-The runner forwards it to stage executor options; account switching is not yet
-implemented.
+The runner forwards it to stage executor options. Implement and review switch to
+the next account when an account reaches its usage limit; exhausted accounts stop
+the stage, preserving partial work for a draft PR when available.
 
 
 ### Review-fix machine result contract

@@ -498,3 +498,26 @@ it("refuses an unsupported profile combination on save and skips it during resol
   const resolution = resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles: profiles });
   expect(resolution.mode === "configured" && resolution.selection.planning).toEqual({ chosen: 1, skipped: [{ index: 0, accountProfileId: "invalid", reason: "resolution_failed" }] });
 });
+
+it.each(["openai-api", "claude-api"])("drops fallback model metadata when dispatch selects another provider: %s", id => {
+  const defaults = structuredClone(orchestratorDefaults);
+  defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-bedrock", model: "bedrock-model" }, { accountProfileId: id, model: "selected-model" }];
+  defaults.stages!.planning!.fallbackModel = "claude-backup";
+  defaults.stages!.review!.accountProfileId = "claude-api";
+  defaults.stages!.review!.provider = "anthropic";
+  const result = resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles,
+    checkAccount: entry => entry.provider === "bedrock" ? "unsupported_combination" : null });
+  if (result.mode !== "configured") throw new Error("expected configured");
+  expect(result.stages.planning.accountProfileId).toBe(id);
+  expect(result.fallbackModels).toEqual({});
+  expect(result.fallbackModelSources).toEqual({});
+});
+
+it("refuses blank fallback models across providers while allowing same-provider inheritance", async () => {
+  const { validateDefaultAccounts } = await import("../agent-config.js");
+  const defaults = structuredClone(orchestratorDefaults);
+  defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: "claude-model" }, { accountProfileId: "claude-bedrock", model: "" }];
+  expect(() => validateDefaultAccounts(defaults, accountProfiles)).toThrow(/requires a model/);
+  defaults.stages!.planning!.accounts[1].accountProfileId = "claude-subscription";
+  expect(() => validateDefaultAccounts(defaults, accountProfiles)).not.toThrow();
+});

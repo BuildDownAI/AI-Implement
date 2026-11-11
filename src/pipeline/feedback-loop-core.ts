@@ -390,15 +390,15 @@ export async function runFeedbackLoop(
           continue;
         }
 
-        if (isTransient) {
+        if (isTransient || implementFailure.code === "ACCOUNT_USAGE_LIMIT") {
           const providerUnavailableFailure: FailureRecord = {
             ...implementFailure,
             stage: "implement",
-            code: "PROVIDER_UNAVAILABLE",
-            // Exhausted the stage-retry budget: this record is terminal, matching the
+            code: isTransient ? "PROVIDER_UNAVAILABLE" : "ACCOUNT_USAGE_LIMIT",
+            // Exhausted the account list or stage-retry budget: this record is terminal, matching the
             // convention push.ts's GIT_PUSH_RETRIES_EXHAUSTED states — an orchestrator
             // rail keying off `retryable` must not start a run again that already spent
-            // its whole stage-retry budget.
+            // its available accounts or whole stage-retry budget.
             retryable: false,
           };
           const dirtyFinal = effects.isRunDirty();
@@ -409,7 +409,7 @@ export async function runFeedbackLoop(
             implementProviderUnavailableTelemetry = implementErrTelemetry;
             break;
           }
-          // Clean tree: nothing to preserve — fail the run with PROVIDER_UNAVAILABLE.
+          // Clean tree: nothing to preserve — fail with the terminal failure code.
           if (typeof err === "object" && err !== null) {
             try {
               (err as Record<string, unknown>).failure = providerUnavailableFailure;
@@ -686,7 +686,9 @@ export async function runFeedbackLoop(
             `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
           );
           // Preserve terminal usage-limit and checkout failures for the run's notice.
-          failureForOutputs = reviewFailure;
+          if (reviewFailure.code === "ACCOUNT_USAGE_LIMIT" || reviewFailure.code.startsWith("MODEL_AUTH_")) {
+            failureForOutputs = reviewFailure;
+          }
           feedback = `Review step failed and was skipped: ${String(err)}`;
           terminationReason = "review_error";
         }

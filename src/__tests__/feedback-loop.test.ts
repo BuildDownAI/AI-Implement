@@ -442,3 +442,35 @@ it("preserves a terminal review account failure for the notice", async () => {
     { report: vi.fn(async () => undefined) });
   expect(result.failure).toMatchObject({ code: failure.code, message: failure.message, evidence: failure.evidence });
 });
+
+it.each([false, true])("preserves terminal implement usage limits only for dirty work (dirty=%s)", async dirty => {
+  const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+  vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from(dirty ? "M src/file.ts" : ""), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+  mockImplementRun.mockResolvedValueOnce({ ...IMPLEMENT_SUCCESS, invocationFailure: failure });
+  const promise = feedbackLoopStep.run(makeContext(), { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 }, { report: vi.fn(async () => undefined) });
+  if (dirty) expect(await promise).toMatchObject({ approved: false, failure: { code: failure.code } });
+  else await expect(promise).rejects.toMatchObject({ failure: { code: failure.code } });
+  expect(mockReviewRun).not.toHaveBeenCalled();
+});
+
+it("keeps changes after both implement accounts reach their usage limit with zero retries", async () => {
+  const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+  mockImplementRun.mockRejectedValueOnce(Object.assign(new Error("limit"), { failure: { ...failure, accountFallback: { stage: "implementation", from: "A", to: "B" } } }))
+    .mockRejectedValueOnce(Object.assign(new Error("limit"), { failure }));
+  vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: Buffer.from("M src/file.ts"), stderr: Buffer.from(""), pid: 0, output: [], signal: null });
+  const ctx = makeContext();
+  ctx.data.retryPolicy = { ...DEFAULT_RETRY_POLICY, stageRetries: 0 };
+  const result = await feedbackLoopStep.run(ctx, { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1, sleep: async () => {} }, { report: vi.fn(async () => undefined) });
+  expect(result).toMatchObject({ approved: false, failure: { code: failure.code } });
+  expect(mockImplementRun).toHaveBeenCalledTimes(2);
+  expect(mockReviewRun).not.toHaveBeenCalled();
+});
+
+it("retains the ordinary review error output shape", async () => {
+  const failure = { category: "llm" as const, code: "LLM_NO_STRUCTURED_OUTPUT", stage: "review", attempt: 1, retryable: false, message: "missing output", evidence: { truncated: false } };
+  mockReviewRun.mockRejectedValueOnce(Object.assign(new Error("missing output"), { failure }));
+  const result = await feedbackLoopStep.run(makeContext(), { workspaceDir, issueTitle: "T", issueDescription: "D", maxIterations: 1 }, { report: vi.fn(async () => undefined) });
+  expect(result.terminationReason).toBe("review_error");
+  expect(result.failure).toBeUndefined();
+  expect(result.finalFeedback).toContain("Review step failed and was skipped");
+});
