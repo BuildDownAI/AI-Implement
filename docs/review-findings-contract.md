@@ -251,13 +251,17 @@ Compared with the previous five-minute limit, this adds **at most 5 more minutes
 per wait, and only when the outside review is still running**; reviews that
 finish sooner return as soon as a poll sees completion.
 
-Tracking-comment hardening is skipped; AII-1820 handles Claude comment recognition.
+For `ai-implement`, a completed check also probes the trusted current-review
+comment. A standalone “Claude is working…” tracker keeps the wait pending; a
+combined tracker and readable final review counts as final. Missing comments
+and failed comment reads retry within the same budget. A newer trusted tracker
+supersedes an older verdict; foreign authors cannot supply either state.
 
 The wait preserves these outcomes:
 
 | State | Meaning and gate behavior |
 |---|---|
-| `completed` | A matching check finished with a real verdict. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
+| `completed` | A matching check finished with a real verdict and its current-review comment is final. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
 | `running` | A review is still pending, or its check/head could not be read before the budget expired. Fail closed with `external_review_pending` and no approval. |
 | `absent` | No matching external check exists. Require two consecutive probes before failing open. With no internal reviewer, an absent external check still fails closed because no review was obtained. Once a matching check has been seen, a later empty result is treated as unreadable and cannot fail open. A successfully read PR with no head SHA retains its immediate `absent` behavior. |
 | `no-real-verdict` | Matching checks finished without a usable verdict. Require two consecutive probes, then fail closed. |
@@ -277,8 +281,9 @@ fetches them. The collector also reads formal reviews and unresolved review
 threads. For `ai-implement`, a completed check requires a current-review comment
 under [the comment rules above](#which-claude-comments-the-pipeline-reads). For
 a review process other than `ai-implement`, the step passes the wait's head SHA
-to scope the findings read to that head. The wait follows the check run; the separate
-findings read must still produce a usable verdict before approval. A check
+to scope the findings read to that head. The wait follows both check completion and comment finality, and passes the
+last probe’s issue comments to the findings collector without another verdict
+fetch. The findings read must still produce a usable verdict before approval. A check
 without a real verdict cannot approve on the strength of older findings.
 
 If a recognized external review comment cannot be parsed into usable findings

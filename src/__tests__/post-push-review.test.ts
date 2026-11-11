@@ -7726,7 +7726,8 @@ describe("Claude GHA comment incident replays", () => {
       });
       const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "lgtm", checks: [{ check: "Diff review", result: "passed", evidence: "Read diff." }] }));
       const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, reviewProcess: "ai-implement", ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) }, { report: vi.fn(async () => undefined) });
-      expect(out.approved).toBe(approved);
+      const pendingTrustedTracker = format === "separate" && (type !== "Bot" || login !== "github-actions[bot]");
+      expect(out.approved).toBe(approved && !pendingTrustedTracker);
       if (!approved) {
         expect(posted.join("\n")).toContain("Unresolved external review findings");
         expect(posted.join("\n")).toContain("Fix the regression");
@@ -7766,5 +7767,40 @@ describe("Claude GHA comment incident replays", () => {
     if (approved) expect(posted.join("\n")).toContain("Advisory external review findings");
     if (_label === "unclassifiable" || _label === "malformed contract" || _label === "missing association") expect(posted.join("\n")).toContain("verdict is not available");
     logs.mockRestore();
+  });
+});
+
+describe("completed check comment finality", () => {
+  it.each(["approve", "blocking", "pending", "unreadable", "stale"] as const)("waits for %s comment evidence", async (mode) => {
+    let reads = 0;
+    let probing = false;
+    const posted: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      if (args.some(a => a.includes("/check-runs"))) { probing = true; return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion: "success", started_at: "2026-11-10T20:00:00Z", completed_at: "2026-11-10T20:05:00Z" }] }), exitCode: 0 }; }
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        if (!probing) return { stdout: "[]", exitCode: 0 };
+        reads++;
+        // A later status-comment lookup must not replace the final probe snapshot.
+        if (reads > 2 && (mode === "approve" || mode === "blocking")) return { stdout: "[]", exitCode: 0 };
+        if (mode === "unreadable") return { stdout: "unavailable", exitCode: 1 };
+        const final = reads > 1 && mode !== "pending";
+        return { stdout: JSON.stringify([{ id: 100, user: { login: "github-actions[bot]", type: "Bot" }, created_at: mode === "stale" ? "2026-11-09T20:01:00Z" : "2026-11-10T20:01:00Z", body: final
+          ? `## Claude review\n\`\`\`json review-findings\n${JSON.stringify({ schema: "review-findings/v1", verdict: mode === "blocking" ? "changes_requested" : "approve", findings: mode === "blocking" ? [{ severity: "blocking", body: "Fix the regression" }] : [] })}\n\`\`\``
+          : "**Claude is working…**" }]), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "lgtm", checks: [{ check: "Diff review", result: "passed", evidence: "Read diff." }] }));
+    const sleep = vi.fn(async () => undefined);
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(mode === "approve");
+    expect(sleep).toHaveBeenCalled();
+    if (mode === "approve" || mode === "blocking") expect(reads).toBe(3);
+    else expect(out.terminationReason).toBe("external_review_pending");
+    if (mode === "blocking") expect(posted.join("\n")).toContain("Fix the regression");
   });
 });

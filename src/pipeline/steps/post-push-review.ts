@@ -19,6 +19,7 @@ import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
   collectClosedReviewThreadCommentUrls,
   collectExternalReviewFindingsFromGh,
+  collectClaudeReviewCommentFromGh,
   collectReviewFindingsBlocksFromGh,
   formatReviewLedgerForPrompt,
   type ReviewFindingsVerdict,
@@ -812,8 +813,14 @@ function probeExternalReviewCheck(
     // Multiple review jobs cannot unambiguously identify the top-level comment's run.
     const realRuns = matching.filter(run => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
     const run = realRuns.length === 1 ? realRuns[0] : undefined;
-    return { state: "completed", ...(run?.startedAt && run.completedAt
-      ? { reviewWindow: { startedAt: run.startedAt, completedAt: run.completedAt } } : {}) };
+    const reviewWindow = run?.startedAt && run.completedAt
+      ? { startedAt: run.startedAt, completedAt: run.completedAt } : undefined;
+    const issueComments = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+    if (issueComments.exitCode !== 0) return { state: "unreadable" };
+    const comment = collectClaudeReviewCommentFromGh(ghSpawn, prNumber, {
+      process, extraAuthors: opts.extraAuthors, requireCurrentReview: true, reviewWindow, issueComments,
+    });
+    return { state: comment.reviewPending ? "running" : "completed", reviewWindow, issueComments };
   }
   // Every matching run is completed but none produced a real verdict. Return "no-real-verdict" so
   // the caller can fail closed immediately rather than approving as if no check existed.
