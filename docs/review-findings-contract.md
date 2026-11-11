@@ -190,3 +190,127 @@ A project whose review process is `claude-code-review` (ADR 038, `src/review-pro
 4. **No completed matching check** is `incomplete`.
 
 Inline comments count only from a trusted author of type `Bot`, on the head commit (or with no commit id). A body starting 🔴 is `blocking`, 🟡 is `minor`, 🟣 (pre-existing) adds no finding, and an untagged comment is recorded as `minor`, so a reviewer that emits no markers never blocks a merge by itself. The `claude` check is matched by app slug and name together: a check named `Claude Code Review` from `github-actions` is not the hosted one.
+
+## Which Claude comments the pipeline reads
+
+For `ai-implement`, a completed review check triggers a separate findings read.
+The ledger first restricts eligible top-level comments to those created at or after
+the review check started on the resolved PR head. It then selects the newest by `updated_at`
+(falling back to `created_at`, then API order for ties). It reads a fenced contract
+first, then legacy review headings. Both a combined tracking/review comment and a
+separate `## Claude review` comment are eligible; `**Claude finished**` is not
+required. Progress-only comments without a review heading or contract are ignored.
+
+Author eligibility is unchanged: contracts require the GitHub Actions identity
+(`github-actions` or `github-actions[bot]`, with API type `Bot`) or a Claude author
+trusted by the configured review process and extra-author allowlist. Heading-only
+reviews use those same identities. Pipeline comments whose trimmed body starts
+with `<!-- ai-implement` are excluded. A quoted marker elsewhere in review prose
+does not identify the comment as pipeline-authored.
+
+The selected trusted review supersedes older comments even when its contract is
+malformed or its review content cannot be parsed. Such a review reports findings
+as unavailable and prevents approval from a successful check alone. Blocking
+contract findings gate even with only a path and no line. Recognized blocking
+heading-only findings also gate approval under `ai-implement`, without requiring
+`claude-review-summary` in the reviewer selection; minor findings remain
+advisory. The step logs the selected comment id and parse kind beside its review
+process verdict log. Top-level comments do not supply commit identity. The step uses all matching
+checks with real review conclusions, fetched from the current head's check-runs
+endpoint, and validates their `started_at` and `completed_at` timestamps. The review window spans
+the earliest start to the latest completion. Comment creation
+must be at or after `started_at`; editing an older head's approval cannot bring it
+into the current review. Missing/invalid check timing,
+missing comment creation time, or no eligible comment makes the verdict unavailable.
+Final comments and tracker edits may arrive after `completed_at`; unavailable or
+incomplete verdicts keep the existing wait pending until its time limit. This intentionally
+fails closed for sticky comments created before the current review; inline threads
+retain their separate head-commit filtering.
+
+## When the in-run step reads the outside verdict
+
+The `post-push-review` step starts its outside-review wait after the internal
+review returns. It polls the PR head's matching review checks every five seconds,
+for up to **ten minutes** (600,000 ms of requested sleeps). Time already spent
+on the outside review while the internal review ran is additional time in its
+favor; GitHub API latency does not consume the sleep budget. The limit is a
+constant, with no operator setting.
+
+The operator-supplied measurements below come from AII PR comments created
+3–10 November 2026 containing “Claude finished @ai-implement-orchestrator-bot[bot]'s
+task in Nm Ss” lines, measured on 2026-11-10. The check-job sample is retained
+separately because it is incomplete.
+
+| Sample | Runs | Median | p90 | p95 | Maximum | Over 5 min | Over 10 min |
+|---|---:|---|---|---|---|---:|---:|
+| Claude completion comments (operator-supplied) | 181 | 3 m 44 s | 6 m 14 s | 7 m 25 s | 12 m 50 s | 47 | 2 |
+| Check jobs retrieved before GitHub's unauthenticated rate limit (incomplete sample) | 112 | — | 6 m 53 s | — | — | — | — |
+
+The chosen limit is **600,000 ms**, giving the completion-comment p90 a
+**3 m 46 s** margin (and the observed check-job p90 a 3 m 7 s margin).
+The incomplete check sample does not establish the full window's check p90.
+Compared with the previous five-minute limit, this adds **at most 5 more minutes
+per wait, and only when the outside review is still running**; reviews that
+finish sooner return as soon as a poll sees completion.
+
+For `ai-implement`, a completed check also probes the trusted current-review
+comment. A standalone “Claude is working…” tracker keeps the wait pending; a
+combined tracker and readable final review counts as final. Missing comments
+and failed comment reads, incomplete verdicts, and temporarily unparseable reviews
+retry within the same budget. Comments must be created since the current head’s
+check started; final publication or tracker edits may follow check completion.
+Editing a comment created before that check cannot make it current. A newer trusted tracker
+supersedes an older verdict; foreign authors cannot supply either state.
+
+The wait preserves these outcomes:
+
+| State | Meaning and gate behavior |
+|---|---|
+| `completed` | A matching check finished with a real verdict and its current-review comment is final. Read its findings and apply the normal approval gates. Completion alone does not grant approval. |
+| `running` | A review is still pending, or its check/head could not be read before the budget expired. Fail closed with `external_review_pending` and no approval. |
+| `absent` | No matching external check exists. Require two consecutive probes before failing open. With no internal reviewer, an absent external check still fails closed because no review was obtained. Once a matching check has been seen, a later empty result is treated as unreadable and cannot fail open. A successfully read PR with no head SHA retains its immediate `absent` behavior. |
+| `no-real-verdict` | Matching checks finished without a usable verdict. Require two consecutive probes, then fail closed. |
+| `permission-denied` | The App cannot read checks. Stop immediately and fail closed with `CHECKS_PERMISSION_DENIED`. |
+
+An intervening running or unreadable probe resets the consecutive-probe
+settling rule for `absent` and `no-real-verdict`. A transient head-read failure
+is retried within the same budget. Non-default review processes keep their
+existing verdict readers: an incomplete contract keeps waiting, while a
+completed check without a readable real verdict fails closed. Reaching the
+limit does not turn a pending check into a completed review or approval.
+
+After the wait, the step calls `collectExternalReviewFindingsFromGh` once per
+review iteration (unless external collection was skipped). It reuses the issue
+comments fetched by the last probe when available; otherwise the collector
+fetches them. The collector also reads formal reviews and unresolved review
+threads. For `ai-implement`, a completed check requires a current-review comment
+under [the comment rules above](#which-claude-comments-the-pipeline-reads). For
+a review process other than `ai-implement`, the step passes the wait's head SHA
+to scope the findings read to that head. The wait follows both check completion and comment finality, and passes the
+last probe’s issue comments to the findings collector without another verdict
+fetch. The findings read must still produce a usable verdict before approval. A check
+without a real verdict cannot approve on the strength of older findings.
+
+If a recognized external review comment cannot be parsed into usable findings
+or an explicit clean verdict, the collector sets `findingsUnavailable`. This
+blocks approval even when the internal reviewers found no problems. In that
+case, the step reports “AI-Implement cannot read the verdict of the external
+review” and requires manual review, with no approval.
+
+The post-run late-review rail can still consume a verdict that arrives after
+the in-run wait ends; see [review-fix-rail.md](review-fix-rail.md).
+
+
+Only gating internal reviewers' findings reach the ledger and contribute to
+`get_reviewer_scorecard` counts, including their minor findings. Findings from
+reviewers selected with `gates: false` or with branch provenance remain visible
+in PR comments but are not reported to the ledger.
+
+A gating internal finding absent from the final complete gating internal review
+is fixed: the callback resolves its ledger revision with a fixed disposition, so scorecards count it as
+fixed rather than ignored. Findings reported again by the final review remain open.
+Closure follows the complete gating internal review even when external review or CI
+check permissions prevent approval. An incomplete gating review cannot establish
+absence; an incomplete advisory review does not prevent closure.
+Callback retries preserve the original dispatch revision and cannot reopen a resolved
+finding or close a newer report.

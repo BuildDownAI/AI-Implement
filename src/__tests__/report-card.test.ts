@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { ModelPrice } from "../restate/model-prices.js";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as RcModule from "../report-card.js";
 import { testDb } from "./helpers/test-db.js";
@@ -1065,5 +1065,53 @@ describe("getIssueReportCard restate (AII-1129)", () => {
     });
     insertDispatch({ issueIdentifier: "AII-RF", phase: "gap-analysis", dispatchId });
     expect(rc.getIssueReportCard("AII-RF")!.runs[0].restate).toEqual({ service, key: dispatchId });
+  });
+});
+
+
+describe("getReviewerScorecard", () => {
+  it("returns zero fixed for a source containing only legacy resolved findings", () => {
+    const now = Date.now();
+    dedup.getDb().prepare(`INSERT INTO review_findings
+      (repo, pr_number, finding_key, source, severity, body, status, first_seen_at, last_seen_at)
+      VALUES ('org/legacy', 1, 'legacy', 'github-review', 'blocking', 'legacy', 'resolved', ?, ?)`).run(now, now);
+    expect(rc.getReviewerScorecard()).toEqual([{
+      source: "github-review", total: 1, fixed: 0, rejected: 0, deferred: 0, ignored: 1, rejectedRate: 0,
+    }]);
+  });
+
+  it("counts first-seen cohorts, explicit fixes and merged open rows across sources and repos", () => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const db = dedup.getDb();
+      const insert = db.prepare(`INSERT INTO review_findings
+        (repo, pr_number, finding_key, source, severity, body, status, disposition, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, 'blocking', 'finding', ?, ?, ?, ?)`);
+      let key = 0;
+      const sources = ["claude-review-summary", "github-review-thread", "ai-implement-internal"];
+      for (const source of sources) {
+        for (const repo of ["org/a", "org/b"]) {
+          for (const [status, disposition, pr] of [
+            ["resolved", "fixed", 1], ["resolved", null, 1], ["rejected", null, 1],
+            ["deferred", null, 1], ["open", null, 1], ["open", null, 2],
+          ] as const) insert.run(repo, pr, String(++key), source, status, disposition, now - 86_400_000, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now - 86_400_001, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now + 1, now);
+          db.prepare("INSERT OR IGNORE INTO pr_merge_capture (repo, pr_number, merged_at, captured_at) VALUES (?, 1, ?, ?)").run(repo, now, now);
+        }
+      }
+      expect(rc.getReviewerScorecard({ days: 1 })).toEqual([...sources].sort().map(source => ({
+        source, total: 12, fixed: 2, rejected: 2, deferred: 2, ignored: 4, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ days: 1, repo: "org/a" })).toEqual([...sources].sort().map(source => ({
+        source, total: 6, fixed: 1, rejected: 1, deferred: 1, ignored: 2, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ repo: "missing" })).toEqual([]);
+      db.exec("DROP TABLE pr_merge_capture");
+      expect(rc.getReviewerScorecard({ days: 1 })[0]!.ignored).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

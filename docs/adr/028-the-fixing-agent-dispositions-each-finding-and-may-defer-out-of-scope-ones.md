@@ -77,3 +77,18 @@ stayed. The run ended `invalid_review` with no approval mark, and the PR waited 
   the merge. So does a `changes_requested` verdict that lists no findings (`changes_requested-empty`).
 
 The alternatives rejected above still hold; none relied on the verdict-level behavior.
+
+## Amendment (2026-11-10): invalid findings are closed as rejected
+
+[AII-1811](https://linear.app/eudoxus/issue/AII-1811/review-process-fixes-a-fix-pass-can-reject-an-outside-finding-the-step)
+and [AII-1813](https://linear.app/eudoxus/issue/AII-1813/a-fix-pass-closes-an-outside-finding-it-rejects-and-the-record-keeps)
+extend decision point 4 to `invalid`: the runner replies with the fixing agent's reason and
+resolves the review thread. The finding stops gating immediately and the orchestrator stores it
+as `rejected`. Like `deferred`, `rejected` never reopens when the same finding is reported again.
+Every terminal run comment lists the findings rejected by the fix pass with their source,
+location when available, a short body excerpt, and reason so a person can inspect what did not count.
+
+The 2026-10-28 verdict rule now accepts either closed state: `LateExternalReview` does not hold a
+`changes_requested` verdict whose listed findings are all `deferred` or `rejected`. Each finding
+still needs a ledger row; a missing row or a `changes_requested` verdict with no findings still
+holds the merge. The current-head requirement and the handoff from the in-run gate are unchanged.

@@ -13,6 +13,28 @@ afterEach(() => {
 });
 
 describe("review ledger store", () => {
+  it("retains dispatch revisions on retries, including after a later report reopens the finding", () => {
+    const finding = { repo: "org/repo", prNumber: 42, source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Recurring defect" };
+    const first = store.recordInternalReviewFinding(finding, "run-a");
+    expect(store.markReviewFindingResolvedIfRevision(first.id, first.revision)).toBe(1);
+    expect(store.recordInternalReviewFinding(finding, "run-a")).toEqual(first);
+    expect(store.getReviewFindingById(first.id)).toMatchObject({ status: "resolved", revision: 1 });
+    const second = store.recordInternalReviewFinding(finding, "run-b");
+    expect(second).toEqual({ id: first.id, revision: 2 });
+    expect(store.recordInternalReviewFinding(finding, "run-a")).toEqual(first);
+    expect(store.markReviewFindingResolvedIfRevision(first.id, first.revision)).toBe(0);
+    expect(store.getReviewFindingById(first.id)).toMatchObject({ status: "open", revision: 2, resolvedAt: null });
+  });
+
+  it("does not let an older dispatch close a newer report of an open internal finding", () => {
+    const finding = { repo: "org/repo", prNumber: 42, source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Still present" };
+    const first = store.recordInternalReviewFinding(finding, "old");
+    const second = store.recordInternalReviewFinding(finding, "new");
+    expect(second.revision).toBe(first.revision + 1);
+    expect(store.markReviewFindingResolvedIfRevision(first.id, first.revision)).toBe(0);
+    expect(store.getReviewFindingById(second.id)?.status).toBe("open");
+  });
+
   it("upserts findings by stable key and lists open findings for a PR", () => {
     const first = store.upsertReviewFinding({
       repo: "org/repo",
@@ -44,6 +66,19 @@ describe("review ledger store", () => {
         status: "open",
       },
     ]);
+  });
+
+  it("keeps rejected findings closed on re-report while a new key stays open", () => {
+    const input = { repo: "org/repo", prNumber: 42, source: "claude-review-summary" as const, severity: "blocking" as const, body: "Already handled." };
+    const id = store.upsertReviewFinding(input);
+    const key = store.getReviewFindingById(id)!.findingKey;
+    expect(store.markReviewFindingsRejectedByKeys(input.repo, input.prNumber, [key])).toBe(1);
+    const closed = store.getReviewFindingById(id)!;
+    store.upsertReviewFinding(input);
+    expect(store.getReviewFindingById(id)).toMatchObject({ status: "rejected", resolvedAt: closed.resolvedAt, revision: closed.revision + 1 });
+    expect(store.listOpenReviewFindings(input.repo, input.prNumber)).toEqual([]);
+    store.upsertReviewFinding({ ...input, body: "A different defect." });
+    expect(store.listOpenReviewFindings(input.repo, input.prNumber)).toHaveLength(1);
   });
 
   it("re-exports stableReviewFindingKey unchanged after the move to finding-dispositions.ts", () => {
@@ -279,4 +314,33 @@ describe("review ledger store", () => {
     expect(rows.find((r) => r.findingKey === a.findingKey)?.status).toBe("deferred");
     expect(rows.find((r) => r.findingKey === b.findingKey)?.status).toBe("open");
   });
+});
+
+
+it("migrates disposition idempotently without claiming historical fixes", async () => {
+  const fixture = await testDb({ modules: { dedup: () => import("../dedup.js") } });
+  let db = fixture.modules.dedup.getDb();
+  db.prepare(`INSERT INTO review_findings
+    (repo, pr_number, finding_key, source, severity, body, status, first_seen_at, last_seen_at)
+    VALUES ('org/repo', 1, 'old', 'github-review', 'blocking', 'old finding', 'resolved', 1, 1)`).run();
+  db.exec("ALTER TABLE review_findings DROP COLUMN disposition");
+  for (let boot = 0; boot < 2; boot++) {
+    const modules = await fixture.reopen();
+    db = modules.dedup.getDb();
+    expect(db.prepare("SELECT disposition FROM review_findings WHERE finding_key = 'old'").get()).toEqual({ disposition: null });
+  }
+});
+
+it("stores fixed evidence only after a guarded update and clears it on reopening", async () => {
+  const { getDb } = await import("../dedup.js");
+  const input = { repo: "org/repo", prNumber: 1, source: "github-review" as const, severity: "blocking" as const, body: "fix me" };
+  const id = store.upsertReviewFinding(input);
+  expect(store.markReviewFindingResolvedIfRevision(id, 0)).toBe(0);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: null });
+  expect(store.markReviewFindingResolvedIfRevision(id, 1)).toBe(1);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: "fixed" });
+  store.upsertReviewFinding(input);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: null });
+  store.markReviewFindingsResolvedForPr(input.repo, input.prNumber);
+  expect(getDb().prepare("SELECT disposition FROM review_findings WHERE id = ?").get(id)).toEqual({ disposition: null });
 });
