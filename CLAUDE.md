@@ -96,6 +96,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Per-review-cycle evidence (input/output commit, dispositions, tests, verdict, usage) | `src/pipeline/cycle-summary.ts` | [docs/cycle-summary-evidence.md](docs/cycle-summary-evidence.md) |
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
 | Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
+| Stage agents, account lists, defaults and project overrides | `src/agent-config.ts`, `src/agent-run-preparation.ts` | [docs/stage-agent-configuration.md](docs/stage-agent-configuration.md) |
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
 | Runner context settings (skills repo, reference repositories, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/reference-repos.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
 | Private npm registry auth in the `install` step | `src/pipeline/steps/install.ts` | [docs/private-npm-registry.md](docs/private-npm-registry.md) |

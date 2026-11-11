@@ -10,6 +10,10 @@ import {
   STAGE_NAMES,
   STORED_STAGE_SELECTION_FIELDS,
   validateFallbackModel,
+  validateDefaultAccounts,
+  validateAccounts,
+  inspectStageAccounts,
+  type ResolveStageAgentConfigInput,
   resolveStageAgentConfig,
   type AccountAuthMode,
   type AccountProfile,
@@ -187,6 +191,10 @@ function assertConfigShape(config: StageAgentConfigurationV1, name: string): voi
   for (const [stage, patch] of Object.entries(config.stages)) {
     if (!(STAGE_NAMES as readonly string[]).includes(stage)) throw new Error(`${name}.stages contains unknown key(s)`);
     if (typeof patch !== "object" || patch === null || Array.isArray(patch)) throw new Error(`${name}.stages.${stage} must be an object`);
+    if (patch.accounts !== undefined) {
+      if (name === "projectConfig") throw new Error("accounts is only supported in orchestrator defaults");
+      validateAccounts(patch.accounts, stage);
+    }
     validateFallbackModel(patch.fallbackModel, stage);
     if (Object.keys(patch).some((f) => !(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(f))) {
       throw new Error(`${name}.stages.${stage} contains unknown key(s)`);
@@ -417,6 +425,7 @@ export function setOrchestratorDefaults(config: StageAgentConfigurationV1, creat
   const db = getDb();
   return db
     .transaction(() => {
+      config = validateDefaultAccounts(config, loadProfiles(db));
       if (config.mode === "configured") {
         // Complete, compatible and enabled for every stage.
         resolveStageAgentConfig({
@@ -470,6 +479,7 @@ export function resolveCandidateProjectStageConfig(
   projectKey: string,
   candidate: StageAgentConfigurationV1,
   remainingJobMs?: number,
+  checkAccount?: ResolveStageAgentConfigInput["checkAccount"],
 ): ProjectStageResolution {
   assertNonEmptyProjectKey(projectKey);
   assertConfigShape(candidate, "projectConfig");
@@ -482,6 +492,7 @@ export function resolveCandidateProjectStageConfig(
       projectConfig: candidate,
       accountProfiles: loadProfiles(db),
       remainingJobMs,
+      checkAccount,
     });
     if (resolution.mode !== "configured") return { resolution, configRevisionIds: [] };
     if (!defaultsRow) throw new Error("configured resolution requires orchestrator config row");
@@ -571,7 +582,7 @@ export function setProjectOptIn(projectKey: string, optedIn: boolean, createdBy:
  * Resolves a project's stage configuration from current heads. Legacy (no row or mode=legacy) resolves as such;
  * a disabled, archived, or unknown profile throws.
  */
-export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: number): ProjectStageResolution {
+export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: number, checkAccount?: ResolveStageAgentConfigInput["checkAccount"]): ProjectStageResolution {
   assertNonEmptyProjectKey(projectKey);
   const db = getDb();
   return db.transaction(() => {
@@ -582,6 +593,7 @@ export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: n
       projectConfig: parseConfig(projectRow),
       accountProfiles: loadProfiles(db),
       remainingJobMs,
+      checkAccount,
     });
     if (resolution.mode !== "configured") return { resolution, configRevisionIds: [] };
     if (!defaultsRow || !projectRow) throw new Error("configured resolution requires orchestrator and project config rows");
@@ -595,4 +607,10 @@ export function resolveProjectStageConfig(projectKey: string, remainingJobMs?: n
       configRevisionIds: [configReferences.orchestratorDefault.configRevisionId, configReferences.project.configRevisionId],
     };
   })();
+}
+
+export function inspectProjectStageAccounts(projectKey: string, checkAccount?: ResolveStageAgentConfigInput["checkAccount"]) {
+  return inspectStageAccounts({ orchestratorDefaults: getOrchestratorDefaults()?.config ?? LEGACY_CONFIG,
+    projectConfig: getProjectStageConfig(projectKey)?.config,
+    accountProfiles: loadProfiles(getDb()), checkAccount });
 }

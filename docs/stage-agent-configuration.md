@@ -1,0 +1,30 @@
+# Stage agent configuration
+
+Stage agent configuration decides, for each stage of a run, which agent runs, through which provider, on which model, with which account's credential. A project uses it once it is opted in; a project that is not opted in runs on the legacy path, which reads the model credential from the target repository's secrets or the orchestrator's environment.
+
+## Stages and selections
+
+There are three stages: `planning`, `implementation` and `review` (`STAGE_NAMES`, `src/agent-config.ts`). Each stage resolves to one selection: `agent` (`claude` or `codex`), `provider` (`anthropic`, `bedrock` or `openai`), `model`, `accountProfileId` and `invocationTimeoutMs`.
+
+## Account profiles
+
+An account profile is a named account an operator creates on Models & providers. Its revisions are immutable (`model_account_profile_revisions`): each change saves a new revision. A profile has an agent, a provider, an auth mode (`anthropic-api-key`, `openai-api-key`, `bedrock`, `codex-subscription`, `claude-subscription`) and a status (`active`, `disabled`, `archived`). Every active profile is usable by every project. Its credential lives encrypted on the orchestrator; a profile names it by `credentialRef`, and no read returns it. See [model-account-operations.md](model-account-operations.md).
+
+## Defaults, overrides and the account list
+
+The orchestrator holds the default configuration, and each project may override it field by field (`stage_agent_config_revisions`, every write a new revision). In the defaults, each stage can hold an ordered list of account entries, `accounts: [{ accountProfileId, model }]`. The first entry supplies the stage's initial account; the later entries are candidates for fallbacks. An entry's agent and provider come from its profile, and a blank model means the first entry's model. The first entry must have a nonblank model. When both flat fields and `accounts` are supplied, the first account's profile and model take precedence. A stage with a single entry is stored in the flat shape (`agent`, `provider`, `model`, `accountProfileId`), for rollback compatibility. Configuration version remains 1.
+
+- Projects do not store a list. A project that overrides `accountProfileId` runs with no fallbacks; a project that overrides other fields keeps the default's fallbacks.
+- `invocationTimeoutMs` and `fallbackModel` are stage fields, merged field by field.
+
+Saving refuses an entry that does not resolve, a profile listed twice, an entry of another agent with a blank model, and an API-key or Bedrock entry after a subscription entry: a run never moves from subscription use to paid API use by itself. Errors name the stage and account index (starting at zero). The local harness uses these same rules for `stages`; its project-like `selections` block refuses lists.
+
+## Run preparation and the snapshot
+
+When a run is prepared (`prepareAgentRun`, `src/agent-run-preparation.ts`, called inside the ImplementationRun prelaunch), `chooseStageAccount` takes each stage's first entry that passes the configuration checks (its profile resolves, and its backend is supported) and lists the later passing entries as fallbacks. Bedrock is supported only on GitHub Actions. The chosen entries become the run's snapshot, stored once per dispatch in `run_agent_config_snapshots` and never updated; a retried preparation reuses it. Beside it, `resolved_config_json` records per stage the chosen index, each entry passed over with its reason, and the fallback list, including profile revision and auth mode. When no entry passes, the run fails with the first entry's failure.
+
+The credential is checked after the choice, on the chosen entry only. A missing or unreadable credential fails the run as `authentication-required` and never moves the run to the next entry. Runner delivery and switching accounts during a run are separate work.
+
+## Where to see it
+
+`GET /api/mappings/:key/agent-config/resolved` shows each stage's entries in order, whether each passes the configuration checks now, and the reason when it does not. It also shows whether a project account override drops the default fallbacks. These diagnostics check profile compatibility and support on the project's current dispatch backend(s). Preparation checks the backend of its actual request. If a stage cannot form a complete selection, its entries are empty and the route preserves the structured resolution error. The Reports page shows the profile each invocation used.
