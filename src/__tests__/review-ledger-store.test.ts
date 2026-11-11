@@ -26,6 +26,15 @@ describe("review ledger store", () => {
     expect(store.getReviewFindingById(first.id)).toMatchObject({ status: "open", revision: 2, resolvedAt: null });
   });
 
+  it("does not let an older dispatch close a newer report of an open internal finding", () => {
+    const finding = { repo: "org/repo", prNumber: 42, source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Still present" };
+    const first = store.recordInternalReviewFinding(finding, "old");
+    const second = store.recordInternalReviewFinding(finding, "new");
+    expect(second.revision).toBe(first.revision + 1);
+    expect(store.markReviewFindingResolvedIfRevision(first.id, first.revision)).toBe(0);
+    expect(store.getReviewFindingById(second.id)?.status).toBe("open");
+  });
+
   it("upserts findings by stable key and lists open findings for a PR", () => {
     const first = store.upsertReviewFinding({
       repo: "org/repo",

@@ -810,11 +810,14 @@ function probeExternalReviewCheck(
   // an unknown conclusion should never silently approve.
   const hasRealReview = matching.some((run) => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
   if (hasRealReview) {
-    // Multiple review jobs cannot unambiguously identify the top-level comment's run.
     const realRuns = matching.filter(run => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
-    const run = realRuns.length === 1 ? realRuns[0] : undefined;
-    const reviewWindow = run?.startedAt && run.completedAt
-      ? { startedAt: run.startedAt, completedAt: run.completedAt } : undefined;
+    const validTiming = realRuns.every(run => run.startedAt && run.completedAt &&
+      Number.isFinite(Date.parse(run.startedAt)) && Number.isFinite(Date.parse(run.completedAt)) &&
+      Date.parse(run.startedAt) <= Date.parse(run.completedAt));
+    const reviewWindow = validTiming ? {
+      startedAt: new Date(Math.min(...realRuns.map(run => Date.parse(run.startedAt!)))).toISOString(),
+      completedAt: new Date(Math.max(...realRuns.map(run => Date.parse(run.completedAt!)))).toISOString(),
+    } : undefined;
     const issueComments = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
     if (issueComments.exitCode !== 0) return { state: "unreadable" };
     const comment = collectClaudeReviewCommentFromGh(ghSpawn, prNumber, {
@@ -2048,6 +2051,19 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     // readiness or reappearing in the next fix prompt. Seeded from trusted PR markers.
     const closedKeys = new Set<string>();
     const internalFindingsByKey = new Map<string, ReviewLedgerFinding>();
+    let finalInternalKeys: Set<string> | undefined;
+    const finalDispositions = (): FindingDisposition[] => {
+      const dispositions = new Map(findingDispositionsByKey);
+      for (const key of internalFindingsByKey.keys()) {
+        // Only a complete final review can establish absence. A re-report wins over
+        // any earlier fix-agent disposition for an internal finding.
+        dispositions.delete(key);
+        if (finalInternalKeys && !finalInternalKeys.has(key)) {
+          dispositions.set(key, { findingKey: key, disposition: "fixed", reason: "Not reported by the final internal review." });
+        }
+      }
+      return [...dispositions.values()];
+    };
     // Every disposition read from the fix agent's dispositions file across every push this
     // run, keyed by findingKey so a later push's entry for the same key overwrites an earlier one.
     const findingDispositionsByKey = new Map<string, FindingDisposition>();
@@ -2179,6 +2195,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       if (selectedReviewerResult.priorLlmFailure) priorLlmFailure = true;
       const gatingIncompleteReviews = selectedReviewerResult.incompleteReviews.filter(review => review.gates);
       const selectedInternalFindings = selectedReviewerResult.findings;
+      // Internal review completeness is independent of external approval gates, which
+      // can terminate this iteration before the combined ledger is built.
+      finalInternalKeys = selectedReviewerResult.incompleteReviews.length === 0
+        ? new Set(selectedInternalFindings.map(stableReviewFindingKey))
+        : undefined;
       // Reporting preserves each internal finding even when prompt deduplication
       // prefers a gating finding from another reviewer or source.
       for (const finding of selectedInternalFindings) {
@@ -2315,6 +2336,10 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       for (const issue of internalIssues) {
         const finding = reviewIssueToLedgerFinding(issue);
         internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
+      }
+      // Preserve current CI findings in the same internal ledger snapshot.
+      for (const issue of internalIssues) {
+        finalInternalKeys?.add(stableReviewFindingKey(reviewIssueToLedgerFinding(issue)));
       }
       const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);
@@ -2935,7 +2960,7 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was closed by operator while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: finalDispositions(), ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         // No prior genuine failure — the operator cancel is the sole anomaly.
         terminationReason = "operator_cancelled";
@@ -2950,11 +2975,11 @@ ${externalFindingsFixBlock}
             `[post-push-review] PR #${prNumber} was merged while posting failure comment — ` +
               `genuine failure surfaces as ${terminationReason}`,
           );
-          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: [...findingDispositionsByKey.values()], ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason, costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: finalDispositions(), ...(reviewerFailure ? { failure: reviewerFailure } : {}) };
         }
         terminationReason = "pr_merged";
         console.warn(`[post-push-review] PR #${prNumber} was merged under the run — exiting as pr_merged`);
-        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: [...findingDispositionsByKey.values()] };
+        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged", costUsd, internalFindings: [...internalFindingsByKey.values()], findingDispositions: finalDispositions() };
       }
       throw err;
     }
@@ -2967,7 +2992,7 @@ ${externalFindingsFixBlock}
       terminationReason,
       costUsd,
       internalFindings: [...internalFindingsByKey.values()],
-      findingDispositions: [...findingDispositionsByKey.values()],
+      findingDispositions: finalDispositions(),
       ...(reviewerFailure ? { failure: reviewerFailure } : {}),
       ...(terminationReason === "external_review_pending" && reviewedHeadSha ? { reviewedHeadSha } : {}),
     };

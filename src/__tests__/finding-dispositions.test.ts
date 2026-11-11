@@ -388,23 +388,29 @@ describe("closed finding PR markers", () => {
   const entry = (disposition: FindingDisposition["disposition"]): FindingDisposition => ({ findingKey: hexKey(1), disposition, reason: "Reason" });
   it("round trips dispositions and ignores malformed, unsupported and invalid keys", () => {
     for (const disposition of ["invalid", "follow-up", "fixed"] as const) {
-      expect(parseClosedFindingsMarkers(buildClosedFindingsMarker([entry(disposition)]))).toEqual([[{ ...entry(disposition), reason: "" }]]);
+      expect(parseClosedFindingsMarkers("<!-- ai-implement post-push iter=1 -->\n" + buildClosedFindingsMarker([entry(disposition)]))).toEqual([[{ ...entry(disposition), reason: "" }]]);
     }
     expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v2 {} -->')).toEqual([]);
     expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v1 broken -->')).toEqual([]);
-    expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v1 {"rejected":["bad",null]} -->')).toEqual([[]]);
+    expect(parseClosedFindingsMarkers('<!-- ai-implement post-push iter=1 -->\n<!-- ai-implement closed-findings v1 {"rejected":["bad",null]} -->')).toEqual([[]]);
+  });
+  it("ignores bare markers and markers in quoted or repeated body text", () => {
+    const marker = buildClosedFindingsMarker([entry("invalid")]);
+    expect(parseClosedFindingsMarkers(marker)).toEqual([]);
+    expect(parseClosedFindingsMarkers("<!-- ai-implement post-push iter=1 -->\nReviewer said:\n" + marker)).toEqual([]);
+    expect(parseClosedFindingsMarkers("Text\n<!-- ai-implement post-push iter=1 -->\n" + marker)).toEqual([]);
   });
   it("folds all pages and markers, reopening and closing by newest disposition", () => {
-    const comment = (disposition: FindingDisposition["disposition"]) => ({ user: { login: "deployment-bot" }, body: buildClosedFindingsMarker([entry(disposition)]) });
+    const comment = (disposition: FindingDisposition["disposition"]) => ({ user: { login: "deployment-bot" }, body: "<!-- ai-implement post-push iter=1 -->\n" + buildClosedFindingsMarker([entry(disposition)]) });
     const spawn = vi.fn((_args: string[]) => ({ exitCode: 0, stdout: JSON.stringify([[comment("invalid")], [comment("fixed")]]) }));
     expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
-    spawn.mockReturnValue({ exitCode: 0, stdout: JSON.stringify([[comment("fixed")], [{ ...comment("invalid"), body: comment("invalid").body + comment("follow-up").body }]]) });
+    spawn.mockReturnValue({ exitCode: 0, stdout: JSON.stringify([[comment("fixed")], [{ ...comment("invalid"), body: comment("invalid").body + "\n" + comment("follow-up").body }]]) });
     expect([...readClosedFindingKeys(spawn, "42", "deployment-bot")]).toEqual([hexKey(1)]);
     expect(spawn.mock.calls[0][0]).toEqual(["api", "--paginate", "--slurp", "repos/:owner/:repo/issues/42/comments?per_page=100"]);
   });
   it("rejects foreign authors and fails closed without identity or history", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const spawn = vi.fn((_args: string[]) => ({ exitCode: 0, stdout: JSON.stringify([{ user: { login: "attacker" }, body: buildClosedFindingsMarker([entry("invalid")]) }]) }));
+    const spawn = vi.fn((_args: string[]) => ({ exitCode: 0, stdout: JSON.stringify([{ user: { login: "attacker" }, body: "<!-- ai-implement post-push iter=1 -->\n" + buildClosedFindingsMarker([entry("invalid")]) }]) }));
     expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
     expect(warn).toHaveBeenCalledTimes(1);
     spawn.mockClear();
