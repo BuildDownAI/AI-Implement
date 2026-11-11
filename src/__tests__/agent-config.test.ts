@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   describeInvocationLimit,
+  StageAccountError,
   resolveStageAgentConfig,
   type AccountProfile,
   type StageAgentConfigurationV1,
@@ -441,6 +442,24 @@ describe("fallback models", () => {
 });
 
 describe("ordered stage accounts", () => {
+  it.each(["resolution_failed", "unsupported_combination"] as const)("names the stage and preserves %s when no account resolves", code => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: "first" }, { accountProfileId: "claude-subscription", model: "" }];
+    const resolve = () => resolveStageAgentConfig({
+      orchestratorDefaults: defaults,
+      projectConfig: configuredProject(),
+      accountProfiles: accountProfiles.map(profile => ({ ...profile, disabled: code === "resolution_failed" && profile.id.startsWith("claude-") })),
+      checkAccount: () => code === "unsupported_combination" ? code : null,
+    });
+    expect(resolve).toThrow(StageAccountError);
+    expect(resolve).toThrow(`planning.accounts: no entry resolves (${code})`);
+    try {
+      resolve();
+    } catch (error) {
+      expect(error).toHaveProperty("code", code);
+    }
+  });
+
   it.each([
     { name: "first passes", reasons: [null, null], chosen: 0, fallbacks: ["b"] },
     { name: "second chosen", reasons: ["unsupported_combination", null], chosen: 1, fallbacks: [] },

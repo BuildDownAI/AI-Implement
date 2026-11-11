@@ -47,7 +47,9 @@ export interface StageAccount extends AccountEntry {
 export type AccountFailure = "resolution_failed" | "unsupported_combination";
 export interface StageAccountSelection { chosen: number; skipped: { index: number; accountProfileId: string; reason: AccountFailure }[] }
 export class StageAccountError extends Error {
-  constructor(public code: AccountFailure) { super(code); }
+  constructor(stage: StageName, public code: AccountFailure) {
+    super(`${stage}.accounts: no entry resolves (${code})`);
+  }
 }
 /** Evaluate each candidate once so selection and fallbacks share exactly the same checks. */
 export function chooseStageAccount(entries: readonly StageAccount[], check: (entry: StageAccount) => AccountFailure | null) {
@@ -356,7 +358,7 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
         if (!p) throw new Error(`${stage}.accountProfileId does not reference a known profile`);
         validateAgentProvider(stage, resolved.selection, p);
       }
-      throw new StageAccountError(choice.failure);
+      throw new StageAccountError(stage, choice.failure);
     }
     if (defaults?.accounts) {
       selection[stage] = { chosen: choice.chosen.index, skipped: choice.skipped };
