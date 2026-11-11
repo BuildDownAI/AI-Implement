@@ -1895,6 +1895,8 @@ describe("runAutonomous", () => {
       ["push", { run: vi.fn().mockResolvedValue({}) }],
     ]);
 
+    // Real gh can launch background send-telemetry, which writes .local after cleanup.
+    const ghSpawn = vi.fn(noReviewThreads);
     await runAutonomous({
       workspaceDir,
       pipeline,
@@ -1902,7 +1904,11 @@ describe("runAutonomous", () => {
       reporter: new NoopStepReporter(),
       llmExecutor: makeExecutor(),
       fetchImpl: fake.fetch,
+      ghSpawn,
     });
+
+    expect(ghSpawn).toHaveBeenCalledTimes(1);
+    expect(ghSpawn.mock.calls[0][0]).toEqual(expect.arrayContaining(["api", "graphql"]));
 
     const body = resultBody(fake) as { failureReason: string };
     expect(body.failureReason).toContain(
