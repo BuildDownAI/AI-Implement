@@ -527,6 +527,56 @@ describe("postPushReviewStep", () => {
     const run = (ctx: any, maxIterations: number) =>
       runReview(ctx, { prNumber: "42", workspaceDir, maxIterations, ghSpawn, gitSpawn }, { report: vi.fn(async () => undefined) });
 
+    describe("usage-limit account rotation", () => {
+      const approvedVerdict = { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
+
+      it.each([
+        { agentStage: "review", exitCode: 1 },
+        { agentStage: "review", exitCode: 0 },
+        { agentStage: "implementation", exitCode: 1 },
+        { agentStage: "implementation", exitCode: 0 },
+      ] as const)("retries $agentStage with exitCode=$exitCode only for actual switches and preserves exhaustion", async ({ agentStage, exitCode }) => {
+        for (const switches of [0, 2]) {
+          for (const recovers of [false, true]) {
+            gitSpawn.mockClear();
+            const report = vi.fn(async (_report: unknown) => undefined);
+            let attempts = 0;
+            const invoke = vi.fn<LLMExecutor["invoke"]>(async (params) => {
+              if (params.agentStage !== agentStage) return structuredReviewResult(notApproved);
+              attempts++;
+              if (recovers && attempts > switches) return structuredReviewResult(approvedVerdict);
+              return {
+                stdout: "", exitCode, tokensUsed: 1,
+                terminalStatus: { subtype: "error_during_execution", isError: true },
+                telemetry: { ...NO_RESULT_TELEMETRY, costUsd: 1 },
+                failure: {
+                  category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: params.stage!, attempt: 1,
+                  retryable: false, message: "All accounts exhausted", evidence: { llmErrorMessage: "exhausted profiles", truncated: false },
+                  ...(attempts <= switches ? { accountFallback: { stage: agentStage, from: `p${attempts}`, to: `p${attempts + 1}` } } : {}),
+                },
+              };
+            });
+            const out = await runReview(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
+              prNumber: "42", workspaceDir, maxIterations: agentStage === "review" ? 1 : 2,
+              reviewers: [{ id: "code-review", gates: true }], reviewProviders: [], ghSpawn, gitSpawn,
+            }, { report });
+            const targetCalls = invoke.mock.calls.filter(([p]) => p.agentStage === agentStage);
+            // Two review cycles run after a successful fix; the failed fix itself is retried exactly once per switch.
+            expect(targetCalls).toHaveLength(switches + 1);
+            for (const [params] of targetCalls) expect(params).toEqual(targetCalls[0]![0]);
+            expect(out.costUsd).toBe(switches + (recovers ? 0 : 1) || null);
+            if (!recovers) {
+              expect(out.failure).toMatchObject({ code: "ACCOUNT_USAGE_LIMIT", evidence: { llmErrorMessage: "exhausted profiles" } });
+              expect(report.mock.calls).toEqual(expect.arrayContaining([
+                [expect.objectContaining({ outputs: expect.objectContaining({ failure: expect.objectContaining({ code: "ACCOUNT_USAGE_LIMIT" }) }) })],
+              ]));
+            } else if (agentStage === "review") expect(out.approved).toBe(true);
+            expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "push")).toHaveLength(agentStage === "implementation" && recovers ? 1 : 0);
+          }
+        }
+      });
+    });
+
     it("stamps review on reviewers and implementation on the fix call", async () => {
       const invoke = vi.fn()
         .mockResolvedValueOnce(structuredReviewResult(notApproved))
