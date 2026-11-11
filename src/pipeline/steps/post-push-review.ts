@@ -818,7 +818,12 @@ function probeExternalReviewCheck(
       startedAt: new Date(Math.min(...realRuns.map(run => Date.parse(run.startedAt!)))).toISOString(),
       completedAt: new Date(Math.max(...realRuns.map(run => Date.parse(run.completedAt!)))).toISOString(),
     } : undefined;
-    const issueComments = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+    let issueComments: SpawnResult;
+    try {
+      issueComments = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`]);
+    } catch {
+      return { state: "unreadable" };
+    }
     if (issueComments.exitCode !== 0) return { state: "unreadable" };
     const comment = collectClaudeReviewCommentFromGh(ghSpawn, prNumber, {
       process, extraAuthors: opts.extraAuthors, requireCurrentReview: true, reviewWindow, issueComments,
