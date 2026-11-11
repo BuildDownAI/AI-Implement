@@ -51,7 +51,7 @@ import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
-import { getIssueReportCard, getFleetReport } from "../report-card.js";
+import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
@@ -636,6 +636,17 @@ export const getFleetReportTool = tool(
     const result = getFleetReport({ days });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
+);
+
+export const getReviewerScorecardTool = tool(
+  {
+    description: "Counts findings per source over a first-seen look-back window (days default 30), optionally filtered by repo. Returns total, fixed (explicit disposition), rejected, deferred, ignored (open on a merged PR or resolved without fixed evidence), and rejectedRate (rejected / total). Active open findings count only in total. No paging.",
+    input: z.object({ days: z.number().finite().nonnegative().optional(), repo: z.string().optional() }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => ({
+    content: [{ type: "text", text: JSON.stringify(getReviewerScorecard(input.args), null, 2) }],
+  }),
 );
 
 /** What `get_deploy_posture` serves: the posture plus the SelfDeploy record (null when none or unreadable). */
@@ -1636,6 +1647,7 @@ export const orchestratorTools = restate.service({
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,
+    get_reviewer_scorecard: getReviewerScorecardTool,
     get_deploy_posture: getDeployPostureTool,
     get_kg_status: getKgStatusTool,
     get_review_fix_attempt: getReviewFixAttemptTool,

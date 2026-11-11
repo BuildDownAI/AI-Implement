@@ -1,3 +1,4 @@
+import type { WorkflowContext } from "@restatedev/restate-sdk";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../github.js", () => ({
@@ -15,21 +16,27 @@ vi.mock("../log.js", () => ({
   stampJobApproved: vi.fn(),
 }));
 vi.mock("../config.js", () => ({ getMappings: vi.fn(() => ({})) }));
-vi.mock("../review-ledger-store.js", () => ({
+vi.mock("../review-ledger-store.js", async () => ({
+  stableReviewFindingKey: (await import("../pipeline/finding-dispositions.js")).stableReviewFindingKey,
   listOpenReviewFindings: vi.fn(),
+  getReviewFindingsByKeys: vi.fn(() => []),
 }));
 
 import { getCombinedChecksState, getCommitTime, getPullRequestState, listPrComments, postPrComment } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
 import { getJobByDispatchId, stampJobApproved } from "../log.js";
-import { listOpenReviewFindings, type StoredReviewFinding } from "../review-ledger-store.js";
+import { getReviewFindingsByKeys, listOpenReviewFindings, type StoredReviewFinding } from "../review-ledger-store.js";
 import type { ReviewLedgerSeverity } from "../pipeline/review-ledger.js";
 import {
   createProductionLateExternalReviewDependencies,
+  createLateExternalReviewWorkflow,
+  lateExternalReviewWorkflowKey,
   heldCommentBody,
   LATE_EXTERNAL_APPROVAL_MARKER,
   type LateExternalReviewInput,
 } from "../restate/late-external-review.js";
+import { classifyReviewIssueComment } from "../pipeline/review-ledger.js";
+import { stableReviewFindingKey } from "../pipeline/finding-dispositions.js";
 import { makeJob } from "./helpers/builders.js";
 
 const input: LateExternalReviewInput & { headSha: string } = {
@@ -92,6 +99,52 @@ describe("readTick", () => {
     expect(getCommitTime).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(getCombinedChecksState).toHaveBeenCalledWith("tok", "owner", "repo", "sha-a");
     expect(listOpenReviewFindings).toHaveBeenCalledWith("owner/repo", 12);
+  });
+
+  it.each(["rejected", "deferred", "open", "missing", "empty"] as const)("handles changes_requested with %s findings", async (status) => {
+    const findings = status === "empty" ? [] : [
+      { severity: "blocking", body: "First objection." },
+      { severity: "blocking", body: "Second objection." },
+    ];
+    const comment = {
+      id: 1, user: { login: "claude" }, updatedAt: new Date(2000).toISOString(),
+      body: "```json review-findings\n" + JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings }) + "\n```",
+    };
+    const classified = classifyReviewIssueComment(comment)!;
+    vi.mocked(getReviewFindingsByKeys).mockReturnValue(classified.findings.flatMap((f, i) => status === "missing" && i === 1 ? [] : [{
+      ...finding(f.severity), ...f, findingKey: stableReviewFindingKey(f), status: i === 0 ? "deferred" : status === "open" ? "open" : "rejected",
+    }]));
+    vi.mocked(getPullRequestState).mockResolvedValue(prState("open", "sha-a"));
+    vi.mocked(getCombinedChecksState).mockResolvedValue("success");
+    vi.mocked(getCommitTime).mockResolvedValue(1000);
+    vi.mocked(listOpenReviewFindings).mockReturnValue([]);
+    vi.mocked(listPrComments).mockResolvedValue([comment]);
+    const tick = await deps.readTick(input);
+    // Exercise the workflow with the production ledger/comment read, through publication.
+    vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ id: 7, approved: false, status: "completed" }));
+    const ctx = {
+      key: lateExternalReviewWorkflowKey(input),
+      date: { now: async () => 3000 },
+      run: async (_name: string, effect: () => Promise<unknown>) => effect(),
+      set: vi.fn(), console: { log: vi.fn() },
+    } as unknown as WorkflowContext;
+    // The SDK exposes handlers at runtime while its definition type hides them.
+    const workflow = createLateExternalReviewWorkflow(deps) as unknown as {
+      workflow: { run(ctx: WorkflowContext, input: LateExternalReviewInput): Promise<{ outcome: string }> };
+    };
+    const result = await workflow.workflow.run(ctx, input);
+    const closesEveryFinding = status === "rejected" || status === "deferred";
+    expect(result.outcome).toBe(closesEveryFinding ? "approved" : "findings");
+    if (closesEveryFinding) {
+      expect(stampJobApproved).toHaveBeenCalledExactlyOnceWith(7, input.prUrl);
+      expect(postPrComment).toHaveBeenCalledWith("tok", "owner", "repo", 12, expect.stringContaining(LATE_EXTERNAL_APPROVAL_MARKER));
+    } else {
+      expect(stampJobApproved).not.toHaveBeenCalled();
+      expect(vi.mocked(postPrComment).mock.calls.some(call => call[4].includes(LATE_EXTERNAL_APPROVAL_MARKER))).toBe(false);
+    }
+    expect(tick.checks).toBe("success");
+    expect(tick.blockingLastSeenAtMs.length).toBe(status === "rejected" || status === "deferred" ? 0 : 1);
+    expect(tick.heldBy).toBe(status === "rejected" || status === "deferred" ? undefined : status === "empty" ? "changes_requested-empty" : "changes_requested");
   });
 
   it("throws when the head commit is unreadable", async () => {

@@ -204,3 +204,15 @@ admission generation, project/backend, allowlisted mapping and frozen Fly app, w
 Finder recovery uses this identity only while the matching admission remains owned and unbound.
 These rows and ordinary intent rows require coordinated deletion with dispatch recovery data (AII-1565);
 this introduces no separate retention policy.
+
+## Reviewer scorecard evidence
+
+`review_findings.disposition` is nullable TEXT, added at boot only when absent.
+Existing rows keep NULL; there is no backfill. Guarded fixed-disposition updates
+write `fixed`; reopening clears it. Bulk PR resolution does not claim a fix, so
+the scorecard counts historical resolved rows without evidence as ignored.
+
+`internal_review_finding_reports` records `(dispatch_id, finding_id, revision)`
+with a primary key on dispatch and finding. Ingestion writes it atomically with
+the finding so callback retries reuse the original revision, while a new dispatch
+can reopen a resolved finding and clear stale fixed credit.

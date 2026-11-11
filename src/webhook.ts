@@ -5,7 +5,7 @@ import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
 import { recordReviewFinding } from "./review-ledger-store.js";
-import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, reviewContractFindingGates, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, classifyReviewIssueComment, isAiImplementComment, reviewContractFindingGates, type ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { getMappings } from "./config.js";
 import type { ReviewFixIngressClient } from "./restate/review-fix-client.js";
 import { REVIEW_FIX_EVENT_BODY_MAX_BYTES, type ReviewFixFeedbackEvent } from "./restate/review-fix-pr.js";
@@ -1217,7 +1217,7 @@ export function shouldEnqueueReviewEvent(input: {
   eventAt: number | undefined;
   latestRunDispatchedAt: number | null;
 }): { enqueue: true } | { enqueue: false; reason: "self" | "stale_head" | "run_after_review" | "missing_fields" } {
-  if (input.body.includes("<!-- ai-implement")) {
+  if (isAiImplementComment(input.body)) {
     return { enqueue: false, reason: "self" };
   }
 
