@@ -257,16 +257,9 @@ export interface HandleRunnerResultInput {
   /** `KG_SOURCE_REPO`, from which the `KgRepo` key is derived. Null/absent → 503. */
   kgSourceRepo?: string | null;
   /**
-   * Immediate one-shot backend-termination check for a planning callback's admission
-   * reservation (AII-783 review, third round, on PR #681). The planning branch below
-   * marks the job `completed` with `skipAdmissionRelease` because the callback's own
-   * self-report is not proof the backend has exited — but that write also removes the
-   * job from `getInFlightJobs()`'s `dispatched`/`running` set, so the normal per-poll
-   * monitor never looks at it again. Wired to `tryFastReleasePlanningAdmission` in
-   * index.ts: when the backend is already confirmed terminal it releases the
-   * reservation right away; otherwise it is a no-op and the reservation stays held for
-   * the stale-admission sweep. Absent in tests that don't need it — the reservation
-   * then simply stays held, matching pre-fast-path behavior.
+   * Reports planning completion and usage to the workflow for a Restate-owned admission.
+   * Admissions without a Restate owner are logged and left held for later backend
+   * reconciliation or the stale-admission sweep.
    */
   checkPlanningAdmissionTermination?: (dispatchId: string, usage?: RecordedUsage) => Promise<void | PlanningIngressResult>;
   /**

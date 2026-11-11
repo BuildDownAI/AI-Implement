@@ -128,6 +128,53 @@ A tool that the BuildDown control plane calls with its `service` token (for exam
 * **Recorded exchanges:** a test calls the real handler through the real route for each scenario and writes the request and response bodies to `docs/contracts/<tool>/<scenario>.json`. It fails when the output differs, and rewrites only with an explicit environment variable. The control plane copies these files and its fake answers only from them.
 * **Changes:** a change to the request, the response or a rule regenerates the files, and the PR names the Control-Plane issue that takes the new files. Ship this repo first, then the control plane.
 
+### Monitor tools: health and fleet
+
+Both tools accept `POST /api/tools/<name>` with a read-scoped service token and
+return HTTP 200 with an MCP envelope: `{ "content": [{ "type": "text", "text":
+"<JSON report>" }] }`. Parse `content[0].text` as JSON. Neither report is paginated.
+
+`get_tenant_health` takes `{ "args": {} }` (no arguments). Its report contains
+`runnerMode: { mode, source }`, the counts `inFlightJobCount`,
+`awaitingDecisionCount`, `pendingGapfillCount`, and `projectCount`, `kgDegraded`
+(embeddings degraded), `kgUnavailable` (last sidecar probe failed), `sidecar`
+(`reachable`, `toolsListed`, `lastError`, `checkedAt`), and `restate` (`sidecar`
+and `registration` status). `checkedAt` is epoch milliseconds or `null` before a
+probe; `lastError` is `null` without a probe error. `restateRetentionDays` and
+`volumeSnapshotRetentionDays` are days. `kgRefreshPreflight` is `null` without a
+configured KG source repo; `setupChecks` is `null` before the first setup-check
+run, otherwise the summary described in [setup-checks.md](setup-checks.md).
+See the [argument schema](contracts/get_tenant_health/args.schema.json) and
+recorded [healthy](contracts/get_tenant_health/healthy.json) and
+[KG degraded](contracts/get_tenant_health/degraded.json) exchanges.
+
+`get_fleet_report` takes `{ "args": {} }` for the default 30-day look-back, or
+`{ "args": { "days": 7 } }` for seven days. `days` is an optional number;
+there are currently no integer or positive bounds. Unknown argument keys are
+stripped by both tools' inputs. The published schemas describe their parsed
+arguments. The fleet window includes dispatches at or after the cutoff and
+excludes `test-org/%` repos. The response has:
+
+* `byRepo`: per-repo `repo`, `jobs`, `issues`, `completed`, `failed`, `merged`,
+  `avgPasses`, and `costUsd` (USD).
+* `oneShotPct` and `eventualPct`: first-pass approval per eligible implementation
+  dispatch and eventual approval per distinct implementation issue.
+* `planning`: `planned` and `unplanned` cohorts, each with `jobs`, `oneShotPct`,
+  `avgPasses`, `avgCostUsd`, and `mergedPct`.
+* `escapeRate`: review escapes among captured merges; `runaways`: ranked entries
+  with `issueIdentifier`, `repo`, `dispatches`, and `consecutiveFailures`.
+
+Despite the `Pct` suffix, rates are fractions from 0 to 1. Rates with no eligible
+denominator and missing pass/cost measurements are `null`, not zero; empty
+collections are `[]`. Counts and a measured zero rate can be zero.
+See the [argument schema](contracts/get_fleet_report/args.schema.json),
+[default window](contracts/get_fleet_report/default-days.json),
+[seven-day window](contracts/get_fleet_report/seven-days.json), and
+[invalid arguments](contracts/get_fleet_report/invalid-args.json) recordings.
+A string `days` fails ingress deserialization: the route preserves its actual
+HTTP status in the recording and returns MCP `isError: true` with the ingress
+400 error in the text.
+
 ### Recording a tool contract
 
 Add a scenario to `src/__tests__/<tool>-contract.test.ts`. Initialize its database and

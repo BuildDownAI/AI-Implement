@@ -235,6 +235,43 @@ describe("production deps", () => {
     expect(createProductionImplementationRunServices(deps()).services).toHaveLength(2);
   });
 
+  describe.each(BACKENDS)("grouping-parent context on %s", (backend) => {
+    it.each([
+      ["true", false, true],
+      ["false", true, false],
+      ["false", false, false],
+      [undefined, true, true],
+      [undefined, false, false],
+    ] as const)("frozen %s, provider classification %s yields %s", async (frozen, providerParent, expected) => {
+      const { d, input } = compose({ isGroupingParentDispatch: () => providerParent });
+      // Real container helpers persist intent immediately before creating the backend run.
+      if (backend === "fly-machines") {
+        const launch = vi.mocked(input.launchImplementationFlySession);
+        const implementation = launch.getMockImplementation()!;
+        launch.mockImplementationOnce(async (args) => {
+          args.input.markLaunchAttempted?.();
+          return implementation(args);
+        });
+      } else if (backend === "local-docker") {
+        const launch = vi.mocked(input.launchImplementationLocalSession);
+        const implementation = launch.getMockImplementation()!;
+        launch.mockImplementationOnce(async (args) => {
+          args.input.markLaunchAttempted?.();
+          return implementation(args);
+        });
+      }
+
+      const launchContext: Record<string, string> = frozen === undefined ? {} : { groupingParent: frozen };
+      expect(await d.launch({ ...INPUT, backend, launchContext })).toMatchObject({ outcome: "accepted" });
+      const helper = backend === "github-actions" ? input.prepareImplementationLaunch
+        : backend === "fly-machines" ? input.launchImplementationFlySession : input.launchImplementationLocalSession;
+      const args = vi.mocked(helper).mock.calls[0]![0];
+      expect(args.isGroupingParentDispatch(args.issue)).toBe(expected);
+      expect(appendLogIfAbsent).toHaveBeenCalledWith(expect.objectContaining({ groupingParent: expected }));
+      expect((intents.get(INPUT.dispatchId)?.snapshot as { groupingParent: boolean }).groupingParent).toBe(expected);
+    });
+  });
+
   describe("reserve", () => {
     const grant = { ok: true, admissionGeneration: 1, release: () => {} };
 

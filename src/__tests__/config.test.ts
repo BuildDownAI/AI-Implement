@@ -16,7 +16,7 @@ beforeEach(async () => {
 });
 
 describe("config", () => {
-  it("adds a nullable review-fix lifecycle column on fresh and repeated initialization, resolving to Legacy", () => {
+  it("adds a nullable review-fix lifecycle column on fresh and repeated initialization, retained as historical metadata", () => {
     config.initMappingsTable();
     config.initMappingsTable();
     const db = new Database(dbPath);
@@ -29,11 +29,10 @@ describe("config", () => {
       expect(db.prepare("SELECT review_fix_lifecycle FROM mappings WHERE team_key = ?").get("NEW"))
         .toEqual({ review_fix_lifecycle: null });
       expect(config.getMappings().NEW.reviewFixLifecycle).toBeNull();
-      expect(config.resolveReviewFixLifecycle(config.getMappings().NEW)).toBe("legacy");
     } finally { db.close(); }
   });
 
-  it("migrates old mappings twice without enabling Restate or losing stored rows", () => {
+  it("migrates old mappings twice without changing historical metadata or losing rows", () => {
     const db = new Database(dbPath);
     db.exec(`CREATE TABLE mappings (
       team_key TEXT PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL,
@@ -52,7 +51,6 @@ describe("config", () => {
       expect((reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }> )
         .filter((item) => item.name === "review_fix_lifecycle")).toHaveLength(1);
       expect(config.getMappings().LEG.reviewFixLifecycle).toBeNull();
-      expect(config.resolveReviewFixLifecycle(config.getMappings().LEG)).toBe("legacy");
     } finally { reopened.close(); }
   });
 
@@ -60,7 +58,6 @@ describe("config", () => {
     config.initMappingsTable();
     config.upsertMapping("RES", makeMapping({ owner: "org", repo: "res", reviewFixLifecycle: "restate" }));
     expect(config.getMappings().RES.reviewFixLifecycle).toBe("restate");
-    expect(config.resolveReviewFixLifecycle(config.getMappings().RES)).toBe("restate");
   });
 
   it("initialises an empty mappings table", () => {

@@ -201,10 +201,12 @@ export function tool<I extends z.ZodType>(
 export const GET_TENANT_HEALTH_DESCRIPTION =
   "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
 
+export const GetTenantHealthArgsSchema = z.object({});
+
 export const getTenantHealth = tool(
   {
     description: GET_TENANT_HEALTH_DESCRIPTION,
-    input: z.object({}),
+    input: GetTenantHealthArgsSchema,
     role: "user",
   },
   async (ctx): Promise<ToolResponse> => {
@@ -619,10 +621,12 @@ export const getIssueReportCardTool = tool(
 export const GET_FLEET_REPORT_DESCRIPTION =
   "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.";
 
+export const GetFleetReportArgsSchema = z.object({ days: z.number().optional() });
+
 export const getFleetReportTool = tool(
   {
     description: GET_FLEET_REPORT_DESCRIPTION,
-    input: z.object({ days: z.number().optional() }),
+    input: GetFleetReportArgsSchema,
     role: "user",
   },
   async (_ctx, input): Promise<ToolResponse> => {
@@ -1480,7 +1484,7 @@ export const addProjectArgsSchema = z.object({
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
   reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix", "codex-code-review"]).nullable().optional().describe(
-    "The project's review process. codex-code-review requires the Restate lifecycle. Omit to keep the stored value; pass null or \"ai-implement\" for the default. Claude and AI-Implement apply to every project; Codex Code Review is Restate-only.",
+    "The project's review process. Restate coordinates AI-Implement fixes for every project. Omit to keep the stored value; pass null or \"ai-implement\" for the default. All review processes apply to every project.",
   ),
 });
 

@@ -1167,7 +1167,7 @@ describe("job drawer Open in Restate UI link", () => {
     win.closeJobDrawer();
   });
 
-  it("renders no link for a legacy review-fix job, an implementation job, or a job without a dispatch id", async () => {
+  it("renders no link for a legacy review-fix job, a legacy implementation job, or a job without a dispatch id", async () => {
     for (const job of [
       { ...PILOT_JOB, id: 22, phase: "review-fix", dispatchId: "legacy-22" },
       { ...KG_JOB, phase: "implementation" },
@@ -1180,6 +1180,48 @@ describe("job drawer Open in Restate UI link", () => {
     }
   });
 
+  it("links a Restate-owned implementation using the supplied reference", async () => {
+    const { win, link } = mountLink({
+      ...KG_JOB, phase: "implementation", dispatchId: "impl-20",
+      restate: { service: "ImplementationRun", key: "impl-20" },
+    });
+    await win.openJobDrawer(20);
+    expect(link()?.getAttribute("href")).toBe("/ui/workflows/ImplementationRun/impl-20");
+    win.closeJobDrawer();
+  });
+
+  it("links a gap-fill to its owning ImplementationRun using the supplied key", async () => {
+    const { win, link } = mountLink({
+      ...KG_JOB, phase: "gap-analysis",
+      restate: { service: "ImplementationRun", key: "owner-19" },
+    });
+    await win.openJobDrawer(20);
+    expect(link()?.getAttribute("href")).toBe("/ui/workflows/ImplementationRun/owner-19");
+    win.closeJobDrawer();
+  });
+
+  it("suppresses legacy fallbacks when the Restate reference is explicitly null", async () => {
+    for (const phase of ["planning", "kg-refresh"]) {
+      const { win, link } = mountLink({ ...KG_JOB, phase, restate: null });
+      await win.openJobDrawer(20);
+      expect(link()).toBeNull();
+      win.closeJobDrawer();
+    }
+  });
+
+  it("encodes and attribute-escapes both supplied reference segments", async () => {
+    const { win, doc, link } = mountLink({
+      ...KG_JOB,
+      restate: { service: 'Service"/<>', key: "key' onclick='bad\"/<" },
+    });
+    const markup = vi.spyOn(doc.getElementById("drawer-restate-link")!, "innerHTML", "set");
+    await win.openJobDrawer(20);
+    expect(link()?.getAttribute("href")).toBe("/ui/workflows/Service%22%2F%3C%3E/key'%20onclick%3D'bad%22%2F%3C");
+    expect(markup.mock.calls.some(([html]) => String(html).includes("key&#39;%20onclick%3D&#39;bad%22%2F%3C"))).toBe(true);
+    expect(link()?.hasAttribute("onclick")).toBe(false);
+    win.closeJobDrawer();
+  });
+
   it("escapes each segment of the href", async () => {
     const { win, link } = mountLink({ ...KG_JOB, dispatchId: 'a"/<b' });
     await win.openJobDrawer(20);
@@ -1188,7 +1230,9 @@ describe("job drawer Open in Restate UI link", () => {
   });
 
   it("hides the link from a non-admin session", async () => {
-    const { win, link } = mountLink(KG_JOB);
+    const { win, link } = mountLink({
+      ...KG_JOB, restate: { service: "ImplementationRun", key: "impl-20" },
+    });
     win.isAdmin = () => false;
     await win.openJobDrawer(20);
     expect(link()).toBeNull();

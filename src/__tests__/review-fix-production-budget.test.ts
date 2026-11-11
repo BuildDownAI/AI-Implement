@@ -18,7 +18,6 @@ const getPullRequestState = vi.fn(async () => ({ state: "open", merged: false })
 vi.mock("../config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../config.js")>()),
   getMappings: () => getMappings(),
-  resolveReviewFixLifecycle: () => "restate",
 }));
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),

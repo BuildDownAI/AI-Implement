@@ -1,7 +1,7 @@
-/** Production composition for the opt-in review-fix pilot. Business state and
+/** Production composition for the review-fix services. Business state and
  * external calls live in SQLite/GitHub adapters; this file is the allowed SDK
  * boundary where those adapters become Restate services. */
-import { getMappings, resolvePrDispatchBudget, resolveReviewFixLifecycle, type RepoMapping } from "../config.js";
+import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "../config.js";
 import { randomUUID } from "node:crypto";
 import { ContainerReviewFixWorker } from "../review-fix-container-worker.js";
 import { read as readAdmission } from "../dispatch-admission.js";
@@ -62,13 +62,12 @@ function mappedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
     `${candidate.owner}/${candidate.repo}` === scope.repository) ?? null;
 }
 
-/** The selected mapping with its `getMappings()` key, which opt-in lookup is keyed by. */
+/** The active mapping with its `getMappings()` key for managed credential lookup. */
 function selectedEntry(scope: ScopedPrIdentity): [string, RepoMapping] | null {
   const entry = mappedEntry(scope);
   if (!entry) return null;
   const mapping = entry[1];
-  return !mapping.paused && resolveReviewFixLifecycle(mapping) === "restate"
-    ? entry : null;
+  return mapping.paused ? null : entry;
 }
 
 function selectedMapping(scope: ScopedPrIdentity): RepoMapping | null {
