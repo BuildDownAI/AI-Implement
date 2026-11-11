@@ -32,7 +32,7 @@ describe("advisory roll-up review", () => {
         expect(args[3]).toBe("--body-file");
         body = readFileSync(args[4], "utf8");
       }
-      return { stdout: args[1] === "diff" ? diff : "", exitCode: 0 };
+      return { stdout: args[1] === "diff" ? diff : args[1] === "view" ? "a".repeat(40) : "https://github.com/org/repo/pull/42#issuecomment-99", exitCode: 0 };
     });
     const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [
       { id: "integration-review", gates: true }, { id: "code-review", gates: true },
@@ -52,6 +52,7 @@ describe("advisory roll-up review", () => {
     let body = "";
     const realSpawn = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawnSync;
     const spawn = vi.mocked(childProcess.spawnSync).mockImplementation(((_command: string, args: string[]) => {
+      if (args[1] === "view") return { status: 0, stdout: Buffer.from("a".repeat(40)), stderr: Buffer.from("") };
       if (args[1] === "diff") return { status: null, stdout: Buffer.from("partial diff"),
         stderr: Buffer.from(""), error: new Error("spawnSync gh ENOBUFS") };
       body = readFileSync(args[4], "utf8");
@@ -79,7 +80,7 @@ describe("advisory roll-up review", () => {
     let body = "";
     const gh = vi.fn((args: string[]) => {
       if (args[1] === "comment") body = readFileSync(args[4], "utf8");
-      return { stdout: args[1] === "diff" ? diff : "", exitCode: 0 };
+      return { stdout: args[1] === "diff" ? diff : args[1] === "view" ? "a".repeat(40) : "https://github.com/org/repo/pull/42#issuecomment-99", exitCode: 0 };
     });
     const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [
       { id: "integration-review", gates: true }, { id: "code-review", gates: true },
@@ -91,8 +92,8 @@ describe("advisory roll-up review", () => {
       expect(params.agentStage).toBe("review");
       expect(params.builtinTools).toEqual(["Read", "Glob", "Grep"]);
     }
-    expect(gh.mock.calls.map(([args]) => args.slice(0, 2))).toEqual([["pr", "diff"], ["pr", "comment"]]);
-    expect(existsSync(gh.mock.calls[1][0][4])).toBe(false);
+    expect(gh.mock.calls.map(([args]) => args.slice(0, 2))).toEqual([["pr", "view"], ["pr", "diff"], ["pr", "view"], ["pr", "comment"]]);
+    expect(existsSync(gh.mock.calls[3][0][4])).toBe(false);
     expect(body).toContain("<!-- ai-implement rollup-review -->");
     expect(body).toContain(kind === "failure" ? "Review incomplete" : kind === "clean" ? "Approved" : "Changes recommended");
     if (kind === "findings") {
@@ -101,6 +102,8 @@ describe("advisory roll-up review", () => {
       expect(body).toContain("Missing shared contract");
     }
     expect(result.terminationReason).toBe(kind === "failure" ? "review_error" : "approved");
+    expect(result.rollupReview).toEqual({ headSha: "a".repeat(40), verdictUrl: "https://github.com/org/repo/pull/42#issuecomment-99" });
+    expect(result.internalFindings.length).toBe(kind === "findings" ? 2 : 0);
   });
 });
 
@@ -140,6 +143,7 @@ describe("review-only pipeline integration", () => {
     const spawn = vi.mocked(childProcess.spawnSync).mockImplementation(((command: string, args: string[], options: childProcess.SpawnSyncOptions) => {
       commands.push([command, ...args]);
       if (command === "gh") {
+        if (args[0] === "pr" && args[1] === "view") return { status: 0, stdout: head, stderr: "" };
         if (args.join(" ") === "pr diff 42") {
           // Model GitHub's PR diff using the actual committed base and head.
           return realSpawn("git", ["diff", `${base}...HEAD`], options);
@@ -198,7 +202,7 @@ describe("review-only pipeline integration", () => {
         expect(params.builtinTools).toEqual(["Read", "Glob", "Grep"]);
       }
       expect(commands.filter(([command]) => command === "gh").map(([, ...args]) => args.slice(0, 2)))
-        .toEqual([["pr", "diff"], ["pr", "comment"]]);
+        .toEqual([["pr", "view"], ["pr", "diff"], ["pr", "view"], ["pr", "comment"]]);
       expect(commands.filter(([command, action]) => command === "git" && ["commit", "push"].includes(action))).toEqual([]);
       expect(comments).toHaveLength(1);
       expect(comments[0]).toContain("<!-- ai-implement rollup-review -->");

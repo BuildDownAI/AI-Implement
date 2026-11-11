@@ -274,6 +274,28 @@ whenever polling observes a new head SHA on that open PR. Each head is queued on
 once, even after its review finishes. The review is advisory: it does not merge or
 modify the branch. Its verdict appears as a comment in the roll-up PR conversation.
 
+Blocking findings on an open roll-up also produce **one pickup-ready child** under
+that tree's parent, containing all blockers and the reviewed head, PR, and verdict
+links in the Problem / Task / Files / Acceptance Criteria template. Minor findings
+stay in the verdict comment. Titles start with `[roll-up-review]` and identify the
+repository, PR, and head. Each head gets at most one child; each PR gets at most
+two, including completed or cancelled children. The second child's verdict notice
+announces the limit and leaves further fixes to a person. Existing settings rows
+reserve creation attempts atomically, including ambiguous tracker failures (which
+require a person to check the tracker); no new table is used. Tracker enumeration
+must finish successfully before filing, so an unreadable page cannot reset the cap.
+
+A separate poll sweep finds marked children even when an active child excludes its
+parent from roll-up discovery, or the tree already has a handled marker. If its
+roll-up has merged or closed, a nonterminal child is parked for a person and gets
+a comment explaining that the tree merged first or closed and the fix should be
+re-filed against the base branch. The sweep runs before fetching planning and
+implementation pickup snapshots, so a child parked in this poll cannot be dispatched
+from a stale snapshot. Closure is also checked immediately after creation.
+The verdict remains advisory to merge gates: review-only results never write
+`review_findings`, dispositions, approval marks, or `LateExternalReview` submissions.
+Filing and parking emit `[roll-up-review]` log lines.
+
 **`/ai-implement` on the roll-up PR.** Merge-up opens the top-of-tree PR directly, never
 through a dispatch, so it has no `dispatch_log` row of its own and the comment-gapfill drain's
 `getLatestDispatchForPr` lookup finds nothing. Rather than refuse with "AI-Implement has no

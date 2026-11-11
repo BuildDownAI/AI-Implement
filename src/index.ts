@@ -131,7 +131,7 @@ import { pickPrForRun } from "./monitor-status.js";
 import { type RunCredentialsV1 } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
-import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
+import { runMergeUps, reconcileRollupReviewChildren, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
@@ -570,6 +570,16 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
   }
 
   try {
+    // Parking changes pickup eligibility. Reconcile before taking either planning or
+    // implementation snapshots so this poll cannot dispatch a child just handed to a person.
+    for (const provider of providers) {
+      for (const [scopeKey, mapping] of Object.entries(getMappings())) {
+        if (mapping.ticketingProvider !== provider.id) continue;
+        await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config).catch(err => {
+          console.error("[roll-up-review] Child reconciliation failed:", err);
+        });
+      }
+    }
     const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
     for (const { providerId, error } of failed) {
       console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);

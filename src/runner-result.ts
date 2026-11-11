@@ -162,6 +162,7 @@ export async function postRunnerResult(params: {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
   reviewOnly?: boolean;
+  rollupReview?: { headSha: string; verdictUrl: string };
   internalFindings?: ReviewLedgerFinding[];
   findingDispositions?: FindingDisposition[];
   /**
@@ -250,6 +251,7 @@ export async function postRunnerResult(params: {
     body.referenceRepoResults = params.referenceRepoResults;
   }
   if (params.reviewOnly) body.reviewOnly = true;
+  if (params.rollupReview) body.rollupReview = params.rollupReview;
   if (params.internalFindings) body.internalFindings = params.internalFindings;
   if (params.findingDispositions && params.findingDispositions.length > 0) {
     body.findingDispositions = params.findingDispositions;

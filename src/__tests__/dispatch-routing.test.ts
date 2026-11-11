@@ -1604,6 +1604,42 @@ describe("poll implementation submission — ImplementationRun for every project
     });
   });
 
+  it.each(["planning", "implementation"] as const)("parks a closed roll-up's pickup-ready child before %s selection", async kind => {
+    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    const github = await import("../github.js");
+    const mapping = jiraMapping("AII", { planningEnabled: true });
+    store.upsertMapping("AII", mapping);
+    const child = makeIssue({ ...issue, title: `[roll-up-review] ${mapping.owner}/${mapping.repo}#7 ${"a".repeat(40)} Fix blockers` });
+    const provider = jiraProvider();
+    let parked = false;
+    Object.assign(provider, { listIssuesPage: vi.fn(async () => ({
+      issues: [{ id: child.id, identifier: child.identifier, title: child.title,
+        description: "body", parent: { identifier: "AII-1500" },
+        state: { name: "Ready", type: "unstarted" }, labels: { nodes: [] },
+        project: null, comments: { nodes: [] }, relations: { nodes: [] } }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    })) });
+    vi.mocked(provider.fetchLifecycleStates).mockResolvedValue(new Map([[child.id, "active"]]));
+    vi.mocked(provider.parkForHuman).mockImplementation(async () => { parked = true; return true; });
+    vi.mocked(provider.fetchAIImplementSnapshot).mockImplementation(async () => ({
+      needsPlanning: !parked && kind === "planning" ? [child] : [],
+      readyForImplementation: !parked && kind === "implementation" ? [child] : [],
+      inProgressCountsByScope: {}, parentsToFinalize: [],
+    }));
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    vi.spyOn(github, "getPullRequestState").mockResolvedValue({ merged: false, state: "closed", headRef: null, headSha: null });
+    planningIngress.submit.mockClear();
+
+    await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
+
+    expect(provider.parkForHuman).toHaveBeenCalledWith(child.id, "AII", "implementation");
+    expect(provider.postComment).toHaveBeenCalledWith(child.id, expect.stringContaining("re-file this fix against the base branch"));
+    expect(planningIngress.submit).not.toHaveBeenCalled();
+    expect(implementationIngress.submit).not.toHaveBeenCalled();
+  });
+
   it("skips unavailable Restate without admission or dedup", async () => {
     status.setRestateStatus({ sidecar: { state: "starting" } });
     const log = vi.spyOn(console, "log");

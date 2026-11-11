@@ -1433,7 +1433,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const review = context.getOutputs("feedback-loop");
       await reportRunnerResult(undefined, null, process.env, {
         workspaceDir, phase: runnerPhase, outcome: review.terminationReason === "review_error" ? "failure" : "success",
-        reviewOnly: true, callbackUrl, retryPolicy, fetchImpl: opts.fetchImpl,
+        reviewOnly: true, internalFindings: review.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[],
+        rollupReview: review.rollupReview as { headSha: string; verdictUrl: string },
+        callbackUrl, retryPolicy, fetchImpl: opts.fetchImpl,
       });
       runCompleted = true;
       return { exitCode: 0 };
