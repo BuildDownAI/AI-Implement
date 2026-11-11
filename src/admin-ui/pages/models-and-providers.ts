@@ -505,8 +505,11 @@ export const modelsAndProvidersScript = `(function () {
       try {
         const res = await window.api('/api/model-accounts/' + encodeURIComponent(profileId), { method: 'PATCH', body: JSON.stringify(body) });
         if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to update account profile')); return; }
+        mpAccountEdits.delete(profileId);
+        await loadStageConfig(false);
       } catch (_) { mpAccountError('Failed to update account profile'); return; }
       finally { draft.saving = false; mpRenderAccounts(); }
+      return;
     }
     mpAccountEdits.delete(profileId);
     await loadStageConfig(false);

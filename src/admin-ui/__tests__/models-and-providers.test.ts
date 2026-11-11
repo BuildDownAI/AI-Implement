@@ -278,17 +278,25 @@ describe("account profile names and editing", () => {
     } finally { win.close(); }
   });
 
-  it.each([true, false])("locks profile editing during a pending PATCH (success: %s)", async (success) => {
+  it.each(["success", "server error", "network error"])("locks profile editing during a pending PATCH (%s)", async (outcome) => {
     const { win, api, click, change } = await setup();
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
     const original = api.getMockImplementation()!;
+    let patchCompleted = false;
+    const refreshControls: boolean[] = [];
     api.mockImplementation(async (path, options) => {
       if (options?.method === "PATCH") {
         await pending;
-        if (!success) return { ok: false, status: 500, json: async () => ({ error: "Save failed" }) };
+        if (outcome === "network error") throw new Error("Connection lost");
+        if (outcome === "server error") return { ok: false, status: 500, json: async () => ({ error: "Save failed" }) };
       }
-      return original(path, options);
+      if (path === "/api/model-accounts" && patchCompleted) {
+        win.document.querySelectorAll<HTMLInputElement>('[data-edit-name], [data-edit-status], [data-act="save-profile"], [data-act="cancel-profile"]').forEach(control => refreshControls.push(control.disabled));
+      }
+      const response = await original(path, options);
+      if (options?.method === "PATCH") patchCompleted = true;
+      return response;
     });
     try {
       click("edit-profile");
@@ -308,7 +316,8 @@ describe("account profile names and editing", () => {
       expect(api.mock.calls.filter(([, options]) => options?.method === "PATCH")).toHaveLength(1);
       release();
       await vi.waitFor(() => {
-        if (success) {
+        if (outcome === "success") {
+          expect(refreshControls).toEqual([true, true, true, true]);
           expect(win.document.querySelector("[data-edit-name]")).toBeNull();
           expect(win.document.querySelector("#mp-account-rows td")?.textContent).toContain("Submitted name");
           expect(win.document.querySelector("#mp-account-rows td:nth-child(5) .badge")?.textContent).toBe("disabled");
@@ -320,7 +329,7 @@ describe("account profile names and editing", () => {
           expect(win.document.querySelector<HTMLButtonElement>('[data-act="save-profile"]')?.disabled).toBe(false);
           expect(win.document.querySelector<HTMLSelectElement>("[data-edit-status]")?.disabled).toBe(false);
           expect(win.document.querySelector<HTMLButtonElement>('[data-act="cancel-profile"]')?.disabled).toBe(false);
-          expect(win.document.querySelector("#mp-account-error")?.textContent).toContain("Save failed");
+          expect(win.document.querySelector("#mp-account-error")?.textContent).toContain(outcome === "server error" ? "Save failed" : "Failed to update account profile");
         }
       });
     } finally { release(); win.close(); }
