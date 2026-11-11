@@ -305,5 +305,7 @@ Internal findings remain in the run's report for reviewer attribution. An intern
 finding absent from the final complete internal review is fixed: the callback
 resolves its ledger revision with a fixed disposition, so scorecards count it as
 fixed rather than ignored. Findings reported again by the final review remain open.
-An incomplete final review cannot establish absence. Callback retries preserve the
-original dispatch revision and cannot reopen a resolved finding or close a newer report.
+Closure follows the complete internal review even when external review or CI check
+permissions prevent approval. An incomplete final review cannot establish absence.
+Callback retries preserve the original dispatch revision and cannot reopen a resolved
+finding or close a newer report.

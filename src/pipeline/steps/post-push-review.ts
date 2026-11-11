@@ -2195,7 +2195,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       if (selectedReviewerResult.priorLlmFailure) priorLlmFailure = true;
       const gatingIncompleteReviews = selectedReviewerResult.incompleteReviews.filter(review => review.gates);
       const selectedInternalFindings = selectedReviewerResult.findings;
-      finalInternalKeys = undefined;
+      // Internal review completeness is independent of external approval gates, which
+      // can terminate this iteration before the combined ledger is built.
+      finalInternalKeys = selectedReviewerResult.incompleteReviews.length === 0
+        ? new Set(selectedInternalFindings.map(stableReviewFindingKey))
+        : undefined;
       // Reporting preserves each internal finding even when prompt deduplication
       // prefers a gating finding from another reviewer or source.
       for (const finding of selectedInternalFindings) {
@@ -2333,11 +2337,9 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         const finding = reviewIssueToLedgerFinding(issue);
         internalFindingsByKey.set(stableReviewFindingKey(finding), finding);
       }
-      if (selectedReviewerResult.incompleteReviews.length === 0) {
-        finalInternalKeys = new Set([
-          ...selectedInternalFindings,
-          ...internalIssues.map(reviewIssueToLedgerFinding),
-        ].map(stableReviewFindingKey));
+      // Preserve current CI findings in the same internal ledger snapshot.
+      for (const issue of internalIssues) {
+        finalInternalKeys?.add(stableReviewFindingKey(reviewIssueToLedgerFinding(issue)));
       }
       const findingGates = (finding: PostPushReviewLedgerFinding): boolean => {
         return isReviewLedgerFindingGating(finding, effectiveReviewerPolicy, summaryBlockingGates, contractVerdict);

@@ -815,7 +815,9 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => approved ? c.includes("✅ Approved (3 iterations)") : (c.includes("The review examined the change 3 times and found problems each time.") && c.includes("(Code: `iterations_exhausted`)")))).toBe(true);
   });
 
-  it("fixes an early internal finding when iteration two approves", async () => {
+  it.each(["none", "wait", "ci"] as const)("fixes an early internal finding despite a later %s permission failure", async (permissionFailure) => {
+    let secondReview = false;
+    let secondReviewCheckReads = 0;
     const approved = true;
     const notApproved = { approved: false, findings: [{ severity: "blocking", body: "bug" }], summary: "fix the bug", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const ghComments: string[] = [];
@@ -834,6 +836,13 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ghSpawn = vi.fn((args: string[]) => {
+      if (secondReview && args.some(arg => arg.includes("/check-runs"))) {
+        secondReviewCheckReads++;
+        // Two empty probes settle the external review as absent; CI reads next.
+        if (permissionFailure === "wait" || (permissionFailure === "ci" && secondReviewCheckReads === 3)) {
+          return { stdout: "", stderr: "HTTP 403: Resource not accessible by integration", exitCode: 1 };
+        }
+      }
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "pr" && args[1] === "comment") {
         ghComments.push(args[args.indexOf("--body") + 1]);
@@ -843,6 +852,7 @@ describe("postPushReviewStep", () => {
     const publicationsBeforeFix: number[] = [];
     const invoke = vi.fn(async (params) => {
       if (params.stage.startsWith("post-push-review/fix-")) publicationsBeforeFix.push(publicationFetch.calls.length);
+      if (/(?:gap-analysis|code-review)-review-2$/.test(params.stage)) secondReview = true;
       return structuredReviewResult(approved && /(?:gap-analysis|code-review)-review-2$/.test(params.stage)
         ? { approved: true, findings: [], summary: "All fixed", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] }
         : notApproved);
@@ -855,10 +865,14 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(approved);
+    expect(out.approved).toBe(permissionFailure === "none");
+    expect(out.terminationReason).toBe(permissionFailure === "none" ? "approved" : "checks_permission_denied");
     expect(out.iterations).toBe(2);
     expect(out.internalFindings).toEqual([expect.objectContaining({ body: "bug" })]);
-    expect(out.findingDispositions).toEqual([expect.objectContaining({ disposition: "fixed" })]);
+    expect(out.findingDispositions).toEqual([expect.objectContaining({
+      findingKey: stableReviewFindingKey(out.internalFindings[0]!),
+      disposition: "fixed",
+    })]);
   });
 
   it("runs a fix pass when reviewer approves but reports actionable issues", async () => {
