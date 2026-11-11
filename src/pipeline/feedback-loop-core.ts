@@ -167,7 +167,7 @@ function buildImplementPrompt(
   return prompt;
 }
 
-const IMPLEMENT_CONTINUATION_NOTE =
+export const IMPLEMENT_CONTINUATION_NOTE =
   "A previous attempt was interrupted by a provider error. The working tree contains its partial changes. Continue from the current state; do not revert it.";
 
 /** Structural view of `implementStep`'s outputs — only what the loop reads. */

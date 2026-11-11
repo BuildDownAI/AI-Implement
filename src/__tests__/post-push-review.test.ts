@@ -1,3 +1,4 @@
+import { IMPLEMENT_CONTINUATION_NOTE } from "../pipeline/feedback-loop-core.js";
 import pr1546 from "./fixtures/claude-review-pr-1546.json";
 import pr1541 from "./fixtures/claude-review-pr-1541.json";
 import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
@@ -587,7 +588,12 @@ describe("postPushReviewStep", () => {
             const targetCalls = invoke.mock.calls.filter(([p]) => p.agentStage === agentStage);
             // Two review cycles run after a successful fix; the failed fix itself is retried exactly once per switch.
             expect(targetCalls).toHaveLength(switches + 1);
-            for (const [params] of targetCalls) expect(params).toEqual(targetCalls[0]![0]);
+            for (const [index, [params]] of targetCalls.entries()) {
+              const first = targetCalls[0]![0];
+              const continuation = agentStage === "implementation" && index > 0;
+              expect(params).toEqual({ ...first, prompt: continuation ? `${first.prompt}\n\n${IMPLEMENT_CONTINUATION_NOTE}` : first.prompt });
+              expect(params.prompt.split(IMPLEMENT_CONTINUATION_NOTE)).toHaveLength(continuation ? 2 : 1);
+            }
             expect(out.costUsd).toBe(switches + (recovers ? 0 : 1) || null);
             if (!recovers) {
               expect(out.failure).toMatchObject({ code: "ACCOUNT_USAGE_LIMIT", evidence: { llmErrorMessage: "exhausted profiles" } });
@@ -599,6 +605,38 @@ describe("postPushReviewStep", () => {
           }
         }
       });
+    });
+
+    it.each([false, true])("commits and pushes a turn-capped fix and reviews again (configured stages: %s)", async (configured) => {
+      gitSpawn.mockClear();
+      const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
+        ? { stdout: "partial fix", exitCode: 0, tokensUsed: 1,
+          terminalStatus: { subtype: "error_max_turns", isError: true },
+          telemetry: { ...NO_RESULT_TELEMETRY, outcome: "max_turns" as const } }
+        : structuredReviewResult(params.stage.endsWith("review-2") ? { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] } : notApproved));
+      const out = await runReview(makeCtx(invoke, configured ? { agentConfig: makeSnapshot() } : {}), {
+        prNumber: "42", workspaceDir, maxIterations: 2,
+        reviewers: [{ id: "code-review", gates: true }], reviewProviders: [], ghSpawn, gitSpawn,
+      }, { report: vi.fn(async () => undefined) });
+      expect(out.approved).toBe(true);
+      expect(invoke.mock.calls.map(([p]) => p.agentStage)).toEqual(["review", "implementation", "review"]);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "commit")).toHaveLength(1);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "push")).toHaveLength(1);
+    });
+
+    it.each([
+      { exitCode: 1, outcome: "max_turns" as const },
+      { exitCode: 0, outcome: "error" as const },
+    ])("rejects fix errors with exit $exitCode and outcome $outcome", async ({ exitCode, outcome }) => {
+      gitSpawn.mockClear();
+      const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
+        ? { stdout: "", exitCode, tokensUsed: 0,
+          terminalStatus: { subtype: "error_during_execution", isError: true },
+          telemetry: { ...NO_RESULT_TELEMETRY, outcome } }
+        : structuredReviewResult(notApproved));
+      const out = await run(makeCtx(invoke), 2);
+      expect(out.terminationReason).toBe("fix_failed");
+      expect(gitSpawn.mock.calls.some(([args]) => args[0] === "push")).toBe(false);
     });
 
     it("stamps review on reviewers and implementation on the fix call", async () => {
