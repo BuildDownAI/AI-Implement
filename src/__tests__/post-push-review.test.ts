@@ -530,7 +530,12 @@ describe("postPushReviewStep", () => {
     describe("usage-limit account rotation", () => {
       const approvedVerdict = { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
 
-      it.each(["review", "implementation"] as const)("retries %s only for actual switches and preserves exhaustion", async (agentStage) => {
+      it.each([
+        { agentStage: "review", exitCode: 1 },
+        { agentStage: "review", exitCode: 0 },
+        { agentStage: "implementation", exitCode: 1 },
+        { agentStage: "implementation", exitCode: 0 },
+      ] as const)("retries $agentStage with exitCode=$exitCode only for actual switches and preserves exhaustion", async ({ agentStage, exitCode }) => {
         for (const switches of [0, 2]) {
           for (const recovers of [false, true]) {
             gitSpawn.mockClear();
@@ -541,7 +546,8 @@ describe("postPushReviewStep", () => {
               attempts++;
               if (recovers && attempts > switches) return structuredReviewResult(approvedVerdict);
               return {
-                stdout: "", exitCode: 1, tokensUsed: 1,
+                stdout: "", exitCode, tokensUsed: 1,
+                terminalStatus: { subtype: "error_during_execution", isError: true },
                 telemetry: { ...NO_RESULT_TELEMETRY, costUsd: 1 },
                 failure: {
                   category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: params.stage!, attempt: 1,
