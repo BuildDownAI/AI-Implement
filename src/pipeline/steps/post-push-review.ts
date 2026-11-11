@@ -5,6 +5,7 @@ import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
@@ -209,13 +210,13 @@ interface FixSummary {
   notes: string;
 }
 
-function makeDefaultGhSpawn(cwd: string) {
+function makeDefaultGhSpawn(cwd: string, maxBuffer?: number) {
   return (args: string[]) => {
-    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"], ...(maxBuffer === undefined ? {} : { maxBuffer }) });
     return {
       stdout: r.stdout?.toString() ?? "",
-      stderr: r.stderr?.toString() ?? "",
-      exitCode: r.status ?? 1,
+      stderr: r.error ? `${r.error.message}\n${r.stderr?.toString() ?? ""}` : r.stderr?.toString() ?? "",
+      exitCode: r.error ? 1 : r.status ?? 1,
     };
   };
 }
@@ -3038,9 +3039,35 @@ ${externalFindingsFixBlock}
 
 export default postPushReviewStep;
 
+// Keep one comment below GitHub's 65,536-character limit. Allocate finding
+// space before summaries, and make any omitted detail explicit.
+function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLedgerFinding[]): string {
+  const limit = 65_000;
+  const clip = (value: string, size: number) => {
+    if (value.length <= size) return value;
+    let end = Math.max(0, size - 15);
+    // Avoid cutting a Unicode surrogate pair when shortening reviewer text.
+    if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
+    return `${value.slice(0, end)}… [truncated]`;
+  };
+  const header = `<!-- ai-implement rollup-review -->\n\n## Roll-up review: ${verdict}\n\nAdvisory only.`;
+  const shown = findings.slice(0, 100);
+  const findingBudget = 50_000;
+  const perFinding = Math.floor(findingBudget / Math.max(1, shown.length));
+  const details = shown.map(f => {
+    const location = `${clip(f.path ?? "(general)", Math.floor(perFinding / 3))}:${f.line ?? "?"}`;
+    const prefix = `- **${f.severity}** ${location} — `;
+    return prefix + clip(f.body, Math.max(30, perFinding - prefix.length - 2));
+  }).join("\n\n");
+  const omitted = findings.length > shown.length ? `\n\n${findings.length - shown.length} additional findings omitted from this comment.` : "";
+  const body = [header, details + omitted].filter(Boolean).join("\n\n");
+  return `${body}\n\n${clip(feedback, limit - body.length - 2)}`;
+}
+
 /** Single advisory pass. No native review, external polling, fix, commit or push. */
 export async function runReviewOnly(context: PipelineContext, workspaceDir: string, reporter: StepReporter, ghSpawn?: (args: string[]) => SpawnResult) {
-  const gh = ghSpawn ?? makeDefaultGhSpawn(workspaceDir);
+  // Bound memory explicitly; overflow is an incomplete review, never a partial diff review.
+  const gh = ghSpawn ?? makeDefaultGhSpawn(workspaceDir, 64 * 1024 * 1024);
   const prNumber = context.data.prNumber!;
   let findings: ReviewLedgerFinding[] = [];
   let feedback = "";
@@ -3073,10 +3100,16 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
     feedback = error instanceof Error ? error.message : String(error);
   }
   const verdict = failed ? "Review incomplete" : approved ? "Approved" : "Changes recommended";
-  const body = ["<!-- ai-implement rollup-review -->", `## Roll-up review: ${verdict}`, "Advisory only.", feedback,
-    ...findings.map(f => `- **${f.severity}** ${f.path ?? "(general)"}:${f.line ?? "?"} — ${f.body}`)].join("\n\n");
-  const posted = gh(["pr", "comment", prNumber, "--body", body]);
-  if (posted.exitCode !== 0) throw new Error(`Cannot post roll-up review: ${resultMessage(posted)}`);
+  const body = rollupReviewBody(verdict, feedback, findings);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rollup-review-"));
+  try {
+    const bodyFile = path.join(tempDir, "verdict.md");
+    fs.writeFileSync(bodyFile, body, { mode: 0o600 });
+    const posted = gh(["pr", "comment", prNumber, "--body-file", bodyFile]);
+    if (posted.exitCode !== 0) throw new Error(`Cannot post roll-up review: ${resultMessage(posted)}`);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
   return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
     passes: [], extraCostUsd: costUsd };
 }

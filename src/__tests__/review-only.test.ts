@@ -1,5 +1,5 @@
 import * as childProcess from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { testDir } from "./helpers/test-dir.js";
 import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
@@ -21,6 +21,53 @@ vi.mock("node:child_process", async (importOriginal) => {
 const diff = "diff --git a/earlier.ts b/earlier.ts\n+earlier commit\ndiff --git a/package-lock.json b/package-lock.json\n+lockfile change";
 
 describe("advisory roll-up review", () => {
+  it("publishes one bounded verdict for oversized reports from multiple reviewers", async () => {
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 1, terminalStatus: { subtype: "success", isError: false },
+      structuredOutput: { approved: false, summary: "Summary ".repeat(30_000), checks: [{ check: "Integration", result: "passed", evidence: "Reviewed diff" }],
+        findings: Array.from({ length: 75 }, (_, i) => ({ severity: "blocking", path: `file-${i}.ts`, line: 7,
+          body: `Finding ${i}: ` + "Detailed evidence 😀 ".repeat(2_000) })) } }));
+    let body = "";
+    const gh = vi.fn((args: string[]) => {
+      if (args[1] === "comment") {
+        expect(args[3]).toBe("--body-file");
+        body = readFileSync(args[4], "utf8");
+      }
+      return { stdout: args[1] === "diff" ? diff : "", exitCode: 0 };
+    });
+    const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [
+      { id: "integration-review", gates: true }, { id: "code-review", gates: true },
+    ] } }, { invoke });
+    await runReviewOnly(ctx, "/unused", new NoopStepReporter(), gh);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(gh.mock.calls.filter(([args]) => args[1] === "comment")).toHaveLength(1);
+    expect(body.length).toBeLessThanOrEqual(65_536);
+    expect(body).toContain("Roll-up review: Changes recommended");
+    expect(body).toContain("**blocking** file-0.ts:7 — Finding 0:");
+    expect(body).toContain("[truncated]");
+    expect(body).toContain("50 additional findings omitted");
+  });
+
+  it("reports diff buffer overflow without reviewing partial output", async () => {
+    const invoke = vi.fn();
+    let body = "";
+    const realSpawn = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawnSync;
+    const spawn = vi.mocked(childProcess.spawnSync).mockImplementation(((_command: string, args: string[]) => {
+      if (args[1] === "diff") return { status: null, stdout: Buffer.from("partial diff"),
+        stderr: Buffer.from(""), error: new Error("spawnSync gh ENOBUFS") };
+      body = readFileSync(args[4], "utf8");
+      return { status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    }) as typeof childProcess.spawnSync);
+    try {
+      const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [{ id: "code-review", gates: true }] } }, { invoke });
+      await runReviewOnly(ctx, "/unused", new NoopStepReporter());
+      expect(invoke).not.toHaveBeenCalled();
+      expect(body).toContain("Review incomplete");
+      expect(body).toContain("ENOBUFS");
+    } finally {
+      spawn.mockImplementation(realSpawn);
+    }
+  });
+
   it.each(["findings", "clean", "failure"])("runs reviewers once and posts one verdict: %s", async (kind) => {
     const invoke = vi.fn(async () => kind === "failure"
       ? { stdout: "", exitCode: 1, tokensUsed: 0, errorMessage: "reviewer unavailable" }
@@ -29,7 +76,11 @@ describe("advisory roll-up review", () => {
           { severity: "blocking", path: "earlier.ts", line: 7, body: "Missing shared contract" },
         ], summary: "Integration checked", checks: [{ check: "Shared contract", result: "passed", evidence: "earlier.ts" }],
       } });
-    const gh = vi.fn((args: string[]) => ({ stdout: args[1] === "diff" ? diff : "", exitCode: 0 }));
+    let body = "";
+    const gh = vi.fn((args: string[]) => {
+      if (args[1] === "comment") body = readFileSync(args[4], "utf8");
+      return { stdout: args[1] === "diff" ? diff : "", exitCode: 0 };
+    });
     const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [
       { id: "integration-review", gates: true }, { id: "code-review", gates: true },
     ] } }, { invoke });
@@ -41,7 +92,7 @@ describe("advisory roll-up review", () => {
       expect(params.builtinTools).toEqual(["Read", "Glob", "Grep"]);
     }
     expect(gh.mock.calls.map(([args]) => args.slice(0, 2))).toEqual([["pr", "diff"], ["pr", "comment"]]);
-    const body = gh.mock.calls[1][0][4];
+    expect(existsSync(gh.mock.calls[1][0][4])).toBe(false);
     expect(body).toContain("<!-- ai-implement rollup-review -->");
     expect(body).toContain(kind === "failure" ? "Review incomplete" : kind === "clean" ? "Approved" : "Changes recommended");
     if (kind === "findings") {
@@ -60,7 +111,7 @@ describe("review-only pipeline integration", () => {
     const workspaceDir = testDir("review-only-pr");
     const realSpawn = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawnSync;
     const git = (...args: string[]) => {
-      const result = realSpawn("git", args, { cwd: workspaceDir, encoding: "utf8" });
+      const result = realSpawn("git", args, { cwd: workspaceDir, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
       expect(result.status, result.stderr).toBe(0);
       return result.stdout;
     };
@@ -75,11 +126,12 @@ describe("review-only pipeline integration", () => {
     git("add", ".");
     git("commit", "-m", "first PR change");
     writeFileSync(join(workspaceDir, "later.ts"), "export const later = true;\n");
-    writeFileSync(join(workspaceDir, "package-lock.json"), "{}\n");
+    writeFileSync(join(workspaceDir, "package-lock.json"), "lockfile line\n".repeat(100_000));
     git("add", ".");
     git("commit", "-m", "second PR change");
     const head = git("rev-parse", "HEAD");
     const fullDiff = git("diff", `${base}...HEAD`);
+    expect(Buffer.byteLength(fullDiff)).toBeGreaterThan(1024 * 1024);
     expect(git("status", "--porcelain")).toBe("");
     expect(git("diff", "HEAD")).toBe("");
 
@@ -92,8 +144,8 @@ describe("review-only pipeline integration", () => {
           // Model GitHub's PR diff using the actual committed base and head.
           return realSpawn("git", ["diff", `${base}...HEAD`], options);
         }
-        if (args.slice(0, 4).join(" ") === "pr comment 42 --body") {
-          comments.push(args[4]);
+        if (args.slice(0, 4).join(" ") === "pr comment 42 --body-file") {
+          comments.push(readFileSync(args[4], "utf8"));
           return realSpawn("git", ["status", "--porcelain"], options);
         }
         throw new Error(`Unexpected GitHub call (polling/publication): ${args.join(" ")}`);
