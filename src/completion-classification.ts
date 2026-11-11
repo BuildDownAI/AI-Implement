@@ -340,6 +340,20 @@ export function classificationForFailure(
   lastSuccessfulStage?: string | null,
   isInitialRun?: boolean | null,
 ): Classification {
+  if (failure.code === "ACCOUNT_USAGE_LIMIT") {
+    const detailParts: string[] = [];
+    const statusLine = statusLineFor(failure, lastSuccessfulStage);
+    if (statusLine) detailParts.push(statusLine);
+    detailParts.push(prUrl ? `PR: ${prUrl}` : "No PR was opened.");
+    detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
+    return {
+      summary: `🟠 The model account reached its usage limit during ${failure.stage}.`,
+      detail: detailParts.join("\n\n"),
+      remediation: "The account reached its usage limit. Add a fallback account for this stage on Models & providers, or run it again after the limit resets.",
+      docsUrl: TROUBLESHOOTING_URL,
+      ...(runUrl ? { runUrl } : {}),
+    };
+  }
   if (failure.code === "PROVIDER_UNAVAILABLE") {
     return providerUnavailableClassification(failure, prUrl, runUrl, lastSuccessfulStage);
   }

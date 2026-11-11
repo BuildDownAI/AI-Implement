@@ -244,6 +244,7 @@ describe("snapshot immutability and idempotence", () => {
     const first = ready(await prep.prepareAgentRun(request(), deps));
     expect(JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string)).not.toHaveProperty("fallbackModels");
     expect(first.fallbackModels).toEqual({});
+    expect(first).not.toHaveProperty("accountFallbacks");
     expect(ready(await prep.prepareAgentRun(request(), deps)).fallbackModels).toEqual({});
   });
 
@@ -710,5 +711,186 @@ describe("auth mode state table", () => {
     expect(r.reservations.length).toBe(c.reserved ? 1 : 0);
     const b = r.takeBootstrap()!.bindings.find((x) => x.stage === "implementation")!;
     expect(b.ownerGeneration !== undefined).toBe(c.reserved);
+  });
+});
+
+describe("ordered account preparation", () => {
+  function configure() {
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.planning = stage("sub", "claude", "anthropic");
+    config.stages!.review = stage("sub", "claude", "anthropic");
+    config.stages!.implementation = { invocationTimeoutMs: 60_000, accounts: [{ accountProfileId: "brk", model: "m" }, { accountProfileId: "api", model: "m" }] };
+    store.setOrchestratorDefaults(config);
+  }
+  it.each([false, true])("fits frozen fallbacks into sixteen bindings (overflow=%s)", async overflow => {
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const accounts = ["api", ...Array.from({ length: 6 }, (_, i) => `fallback-${i}`)];
+    for (const profileId of accounts.slice(1)) {
+      store.saveAccountProfileRevision({
+        profileId, identity: profileId, revision: 1, agent: "claude", provider: "anthropic",
+        authMode: "anthropic-api-key", metadata: { credentialRef: `model-account:${profileId}` },
+      });
+    }
+    const config = store.getOrchestratorDefaults()!.config;
+    for (const stage of ["planning", "implementation", "review"] as const) {
+      config.stages![stage] = {
+        invocationTimeoutMs: 60_000,
+        accounts: (overflow ? accounts : accounts.slice(0, stage === "review" ? 6 : 5)).map(accountProfileId => ({ accountProfileId, model: "m" })),
+      };
+    }
+    store.setOrchestratorDefaults(config);
+    const first = ready(await prep.prepareAgentRun(request(), deps));
+    expect(first.grant.bindings).toHaveLength(16);
+    expect(first.takeBootstrap()!.bindings).toEqual(first.grant.bindings);
+    for (const stage of ["planning", "implementation", "review"] as const) {
+      expect(first.grant.bindings.filter(b => b.stage === stage).map(b => b.profileId)).toEqual(accounts.slice(0, stage === "review" ? 6 : 5));
+      expect(first.accountFallbacks?.[stage]?.map(b => b.accountProfileId)).toEqual(accounts.slice(1, stage === "review" ? 6 : 5));
+    }
+    const bindings = rows("model_credential_grant_profiles");
+    expect(bindings).toHaveLength(16);
+    expect(JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string).accountFallbacks).toEqual(first.accountFallbacks);
+    const drops = log.mock.calls.map(call => call[0] as string).filter(line => line.startsWith("Stage account fallback dropped "));
+    expect(drops).toEqual(overflow ? [
+      ["planning", "fallback-5"], ["implementation", "fallback-5"], ["review", "fallback-5"],
+      ["planning", "fallback-4"], ["implementation", "fallback-4"],
+    ].map(([stage, profileId]) => `Stage account fallback dropped ${JSON.stringify({ stage, profileId })}`) : []);
+    config.stages!.planning!.accounts = [{ accountProfileId: "api", model: "changed" }];
+    store.setOrchestratorDefaults(config);
+    store.retireAccountProfile("fallback-0");
+    const logCount = log.mock.calls.length;
+    const again = ready(await prep.prepareAgentRun(request(), deps));
+    expect(log).toHaveBeenCalledTimes(logCount);
+    expect(again.grant.bindings).toEqual(first.grant.bindings);
+    expect(again.accountFallbacks).toEqual(first.accountFallbacks);
+    expect(rows("model_credential_grant_profiles")).toEqual(bindings);
+    expect(bindings.map(b => `${b.stage}:${b.profile_id}`).sort()).toEqual(first.grant.bindings.map(b => `${b.stage}:${b.profileId}`).sort());
+    log.mockRestore();
+  });
+  it("grants every frozen fallback without proving its credentials and reuses the list", async () => {
+    configure();
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.implementation!.accounts = [
+      { accountProfileId: "api", model: "primary" },
+      { accountProfileId: "brk", model: "backup-b" },
+      { accountProfileId: "sub2", model: "backup-c" },
+    ];
+    store.setOrchestratorDefaults(config);
+    events.length = 0;
+    const first = ready(await prep.prepareAgentRun(request(), deps));
+    const expected = { implementation: [
+      { accountProfileId: "brk", profileRevision: 1, agent: "claude", provider: "bedrock", authMode: "bedrock", model: "backup-b" },
+      { accountProfileId: "sub2", profileRevision: 1, agent: "claude", provider: "anthropic", authMode: "claude-subscription", model: "backup-c" },
+    ] };
+    expect(first.accountFallbacks).toEqual(expected);
+    expect(events).not.toContain("proof:sub2");
+    expect(events).not.toContain("proof:brk");
+    expect(first.grant.bindings.filter(b => b.stage === "implementation").map(b => b.profileId)).toEqual(["api", "brk", "sub2"]);
+    const bindings = rows("model_credential_grant_profiles");
+    store.retireAccountProfile("sub2");
+    const again = ready(await prep.prepareAgentRun(request(), deps));
+    expect(again.accountFallbacks).toEqual(expected);
+    expect(again.grant.bindings).toEqual(first.grant.bindings);
+    expect(rows("model_credential_grant_profiles")).toEqual(bindings);
+    expect(JSON.stringify(expected)).not.toContain("credentialRef");
+  });
+  it.each(["fly-machines", "github-actions"] as const)("omits a model fallback made redundant by account selection on %s", async backend => {
+    configure();
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.implementation!.accounts = [{ accountProfileId: "brk", model: "primary" }, { accountProfileId: "api", model: "backup" }];
+    config.stages!.implementation!.fallbackModel = "backup";
+    store.setOrchestratorDefaults(config);
+    deps.checkRunnerCapability = async () => true;
+    const first = ready(await prep.prepareAgentRun(request({ backend }), deps));
+    expect(first.snapshot.stages.implementation.model).toBe(backend === "fly-machines" ? "backup" : "primary");
+    expect(first.fallbackModels).toEqual(backend === "fly-machines" ? {} : { implementation: "backup" });
+    const persisted = JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string);
+    expect(persisted.fallbackModels ?? {}).toEqual(first.fallbackModels);
+    expect(ready(await prep.prepareAgentRun(request({ backend }), deps)).fallbackModels).toEqual(first.fallbackModels);
+  });
+  it.each(["fly-machines", "github-actions"] as const)("freezes choices on %s and reuses them after retirement", async backend => {
+    configure();
+    deps.checkRunnerCapability = async () => true;
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const first = ready(await prep.prepareAgentRun(request({ backend }), deps));
+    expect(first.snapshot.stages.implementation.accountProfileId).toBe(backend === "fly-machines" ? "api" : "brk");
+    expect(first.selection.implementation).toEqual(backend === "fly-machines" ? { chosen: 1, skipped: [{ index: 0, accountProfileId: "brk", reason: "unsupported_combination" }] } : { chosen: 0, skipped: [] });
+    if (backend === "github-actions") expect(first.accountFallbacks?.implementation).toEqual([{ accountProfileId: "api", profileRevision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", model: "m" }]);
+    expect(log).toHaveBeenCalledTimes(backend === "fly-machines" ? 1 : 0);
+    if (backend === "fly-machines") {
+      const line = log.mock.calls[0][0] as string;
+      expect(line).toContain('"stage":"implementation"');
+      expect(line).toContain('"chosen":1');
+      expect(line).toContain('"accountProfileId":"api"');
+      expect(line).toContain('"index":0,"accountProfileId":"brk","reason":"unsupported_combination"');
+      expect(line).not.toContain("\n");
+      expect(line).not.toContain(API_SENTINEL);
+      expect(line).not.toContain(SESSION_SENTINEL);
+    }
+    store.retireAccountProfile(backend === "fly-machines" ? "brk" : "api");
+    const again = ready(await prep.prepareAgentRun(request({ backend }), deps));
+    expect(again.snapshot).toEqual(first.snapshot);
+    expect(again.selection).toEqual(first.selection);
+    expect(again.accountFallbacks).toEqual(first.accountFallbacks);
+    log.mockRestore();
+  });
+  it.each([true, false])("freezes fallback inheritance for account override=%s", async accountOverride => {
+    configure();
+    store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { implementation: accountOverride ? { accountProfileId: "brk" } : { model: "project-model" } } });
+    const result = ready(await prep.prepareAgentRun(request(), deps));
+    expect(result.accountFallbacks?.implementation?.map(entry => entry.accountProfileId) ?? []).toEqual(accountOverride ? [] : ["api"]);
+    expect(result.snapshot.stages.implementation.model).toBe(accountOverride ? "m" : "project-model");
+  });
+  it("returns the concurrent insert winner's metadata rather than its candidate", async () => {
+    configure();
+    const db = dedup.getDb();
+    const originalPrepare = db.prepare.bind(db);
+    const winnerSelection = { implementation: { chosen: 1, skipped: [{ index: 0, accountProfileId: "retired", reason: "resolution_failed" }] } };
+    const winnerFallbacks = { implementation: [{ accountProfileId: "sub2", profileRevision: 1, agent: "claude", provider: "anthropic", authMode: "claude-subscription", model: "winner-model" }] };
+    let inserted = false;
+    const spy = vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
+      const statement = originalPrepare(sql);
+      if (sql.includes("INSERT OR IGNORE INTO run_agent_config_snapshots")) {
+        const run = statement.run.bind(statement);
+        statement.run = ((...args: unknown[]) => {
+          if (!inserted) {
+            inserted = true;
+            const winner = [...args];
+            const payload = JSON.parse(winner[3] as string);
+            payload.selection = winnerSelection;
+            payload.accountFallbacks = winnerFallbacks;
+            winner[3] = JSON.stringify(payload);
+            run(...winner as never[]);
+          }
+          return run(...args as never[]);
+        }) as typeof statement.run;
+      }
+      return statement;
+    }) as typeof db.prepare);
+    try {
+      const result = ready(await prep.prepareAgentRun(request(), deps));
+      const stored = JSON.parse(rows("run_agent_config_snapshots")[0].resolved_config_json as string);
+      expect(stored.selection).toEqual(winnerSelection);
+      expect(stored.accountFallbacks).toEqual(winnerFallbacks);
+      expect(result.selection).toEqual(stored.selection);
+      expect(result.accountFallbacks).toEqual(stored.accountFallbacks);
+    } finally { spy.mockRestore(); }
+  });
+
+  it("does not skip a chosen account with an unreadable credential", async () => {
+    configure();
+    // The stored value cannot be decoded as a Bedrock credential.
+    secrets.set("model-account:brk", "unreadable-bedrock-record");
+    expect(await prep.prepareAgentRun(request(), deps)).toMatchObject({ status: "authentication-required", profileId: "brk" });
+    expect(prep.loadStoredSnapshot("d1")!.stages.implementation.accountProfileId).toBe("brk");
+    expect(secretReads).toContain("model-account:brk");
+    expect(secretReads).not.toContain("model-account:api");
+    expect(events).not.toContain("proof:api");
+  });
+  it("does not skip a chosen account with a missing credential", async () => {
+    configure();
+    secrets.delete("model-account:brk");
+    expect(await prep.prepareAgentRun(request(), deps)).toMatchObject({ status: "authentication-required", profileId: "brk" });
+    expect(prep.loadStoredSnapshot("d1")!.stages.implementation.accountProfileId).toBe("brk");
+    expect(secretReads).not.toContain("model-account:api");
   });
 });

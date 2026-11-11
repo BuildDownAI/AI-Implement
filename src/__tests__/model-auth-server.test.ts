@@ -211,6 +211,16 @@ beforeEach(async () => {
 });
 
 describe("checkout", () => {
+  it("permits several profiles for the same stage while refusing an unbound profile", async () => {
+    bindings = [SUB, { ...KEYB, stage: "implementation" }];
+    handlers = build();
+    expect((await checkout("sub1")).body).toMatchObject({ ok: true });
+    const fallback = await checkout("key1");
+    expect(fallback.body).toMatchObject({ ok: true, profileId: "key1", secret: { kind: "api-key", apiKey: API_KEY } });
+    expect((await checkout("cdx1")).body).toMatchObject({ ok: false, category: "unauthorized" });
+    expectNoLeak(fallback, [API_KEY]);
+  });
+
   it("returns the selected API key with no-store", async () => {
     const res = await checkout("key1");
     expect(res.status).toBe(200);

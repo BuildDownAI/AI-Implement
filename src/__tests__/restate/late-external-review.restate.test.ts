@@ -21,7 +21,8 @@ const SHA = "a".repeat(40);
 const OTHER_SHA = "b".repeat(40);
 const INTERVAL_MS = 50;
 const DEADLINE_MS = 1_500;
-const HEAD_GRACE_MS = 400;
+// Allow journal/replay round trips on a busy CI worker before the second tick.
+const HEAD_GRACE_MS = 2_000;
 
 interface Scenario {
   /** One tick per read; the last one repeats. */
@@ -472,7 +473,7 @@ describe("LateExternalReview workflow", () => {
         });
 
         it("ends superseded with no mark when the pushed head first shows after the grace", async () => {
-          const stale = Array.from({ length: 12 }, () => onA);
+          const stale = Array.from({ length: Math.ceil(HEAD_GRACE_MS / INTERVAL_MS) + 4 }, () => onA);
           const { result, sc } = await gap({ ticks: [...stale, { ...onB, checks: "success" }] });
           expect(result).toEqual({ outcome: "superseded" });
           expect(sc.stamps).toEqual([]);

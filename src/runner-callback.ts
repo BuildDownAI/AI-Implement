@@ -366,7 +366,9 @@ export function formatFailureComment(
 ): string {
   const { prUrl, failure, runUrl, lastSuccessfulStage, isInitialRun } = options;
   let c: Classification;
-  if (failureCode === "SENSITIVE_FILES_BLOCKED") {
+  if (failure?.code === "ACCOUNT_USAGE_LIMIT") {
+    return renderFailureRecord(failure, prUrl, runUrl, lastSuccessfulStage, isInitialRun);
+  } else if (failureCode === "SENSITIVE_FILES_BLOCKED") {
     // Pushed through the same redact/cap `classifyCompletion` applies to a persisted
     // FailureRecord's `message` (BAC-27112 follow-up) — otherwise a raw, secret-bearing
     // `failureReason` would render differently here than the byte-identical guardrail

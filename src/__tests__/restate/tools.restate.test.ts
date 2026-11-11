@@ -1,4 +1,8 @@
 import { getReviewerScorecard } from "../../report-card.js";
+import { createModelProtectedSecrets } from "../../model-protected-secrets.js";
+import { getOrchestratorDefaults } from "../../agent-config-store.js";
+import { createSession } from "../../admin-session.js";
+import { handleAdminRequest } from "../../admin.js";
 import { initReconciliationTable } from "../../reconciliation.js";
 import { readFileSync } from "node:fs";
 import { createModelPrices, type ModelPrice } from "../../restate/model-prices.js";
@@ -25,7 +29,7 @@ import { initSettingsTable } from "../../runner-mode.js";
 import { setKgMemoryProvider, type KgToolResult, type MemoryProvider } from "../../kg-provider.js";
 import { createSetupChecks } from "../../restate/setup-checks.js";
 import type { SetupCheckRun } from "../../setup-checks/index.js";
-import { VARIANTS, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
+import { VARIANTS, journalEntries, journalText, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
 
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
@@ -960,6 +964,70 @@ describe("orchestratorTools (Restate)", () => {
     // had just written).
     expect(replayInsideCounter).toBe(1);
     expect(replayOutsideCounter).toBeGreaterThan(1);
+  });
+
+  it("imports an environment account through one secret-free journal step", async () => {
+    const env = environments.get("alwaysReplay")!;
+    const names = ["RUNNER_TOKEN_SECRET", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] as const;
+    const previous = names.map(name => process.env[name]);
+    const token = "SENTINEL-RESTATE-ENV-IMPORT";
+    const ref = "model-account:adopted-env-claude-subscription";
+    const defaults = getOrchestratorDefaults();
+    const mappings = getMappings();
+    const projects = dedup.getDb().prepare("SELECT * FROM stage_agent_config_revisions WHERE scope_kind = 'project'").all();
+    try {
+      process.env.RUNNER_TOKEN_SECRET = "test-environment-import-secret";
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = token;
+      delete process.env.ANTHROPIC_API_KEY;
+      const invoke = (caller = SYSTEM as Caller) => callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "import_environment_credential", { caller, args: {} });
+      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      expect(JSON.parse((await invoke()).content![0]!.text)).toEqual({ status: 404, body: { error: "no model credential in the environment" } });
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = token;
+      delete process.env.RUNNER_TOKEN_SECRET;
+      expect(JSON.parse((await invoke()).content![0]!.text)).toEqual({ status: 503, body: { error: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it" } });
+      process.env.RUNNER_TOKEN_SECRET = "test-environment-import-secret";
+      const first = await invoke();
+      expect(JSON.parse(first.content![0]!.text)).toMatchObject({ status: 201, body: { result: "created", profileId: "adopted-env-claude-subscription" } });
+      const store = createModelProtectedSecrets({ env: process.env });
+      expect(store.delete(ref).ok).toBe(true);
+      expect(store.open(ref).ok).toBe(false);
+      const repaired = await invoke();
+      expect(JSON.parse(repaired.content![0]!.text)).toMatchObject({ status: 201, body: { result: "created" } });
+      expect(store.resolve(ref)).toBe(token);
+      const second = await invoke();
+      expect(JSON.parse(second.content![0]!.text)).toMatchObject({ status: 200, body: { result: "already-imported" } });
+      expect((await invoke({ kind: "human", email: "user@example.com", role: "user", grants: [] })).isError).toBe(true);
+      expect(getOrchestratorDefaults()).toEqual(defaults);
+      expect(getMappings()).toEqual(mappings);
+      expect(dedup.getDb().prepare("SELECT * FROM stage_agent_config_revisions WHERE scope_kind = 'project'").all()).toEqual(projects);
+      let status = 0;
+      let body = "";
+      handleAdminRequest({ url: "/api/model-accounts", method: "GET", headers: { authorization: `Bearer ${createSession()}` } } as never,
+        { writeHead: (code: number) => { status = code; }, end: (data: string) => { body = data; } } as never,
+        { adminAccessCode: "test" } as never, {} as never);
+      expect(status).toBe(200);
+      expect(body).toContain('"credentialSet":true');
+      expect(body).toContain("adopted-env-claude-subscription");
+      const invocations = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'import_environment_credential'");
+      expect(invocations.length).toBeGreaterThanOrEqual(3);
+      const journals: string[] = [];
+      for (const invocation of invocations) {
+        const entries = await journalEntries(env.adminAPIBaseUrl(), String(invocation.id));
+        const text = journalText(entries);
+        journals.push(text);
+        expect(text).not.toContain(token);
+        expect(text).not.toContain(ref);
+      }
+      // Prove the absence checks searched the decoded import result, not an empty journal.
+      expect(journals.join("\n")).toContain("adopted-env-claude-subscription");
+      expect(journals.join("\n")).toContain("import-environment-credential");
+      expect(JSON.stringify([first, repaired, second, body])).not.toContain(token);
+      expect(JSON.stringify([first, repaired, second, body])).not.toContain(ref);
+      const metadata = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools/handlers/import_environment_credential`).then(r => r.json());
+      expect(metadata).toMatchObject({ retry_policy: { max_attempts: 1, on_max_attempts: "Kill" } });
+    } finally {
+      names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; });
+    }
   });
 
   it("pause_project: a second ingress call with the same idempotency key attaches to the first result instead of running pauseProjectAction again", async () => {

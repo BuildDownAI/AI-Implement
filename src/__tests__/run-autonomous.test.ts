@@ -1,3 +1,4 @@
+import { ModelAuthClientError } from "../model-auth-client.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
@@ -2620,6 +2621,65 @@ describe("runAutonomous", () => {
     expect(body.failure).toEqual(providerFailure);
   });
 
+  it.each(["review", "implement"])("publishes the draft and renders exhausted %s accounts as a usage limit", async stage => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const providerFailure = {
+      category: "auth" as const,
+      code: "ACCOUNT_USAGE_LIMIT",
+      stage,
+      attempt: 2,
+      retryable: false,
+      message: "Usage limit reached on every account: A, B",
+      evidence: { truncated: false },
+    };
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue(makeFeedbackLoopOutputs({
+            approved: false,
+            finalFeedback: providerFailure.message,
+            terminationReason: stage === "review" ? "review_error" : "provider_unavailable",
+            failure: providerFailure,
+          })),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue(openedPr(12, { draft: true })) }],
+      ["post-push-review", { run: postPushReviewRun }],
+    ]);
+    pipeline.steps[2].skip = () => true;
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(),
+      fetchImpl: fake.fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = resultBody(fake) as {
+      failureCode: string;
+      failureReason: string;
+      failure?: typeof providerFailure;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
+    expect(body.failureCode).toBe("ACCOUNT_USAGE_LIMIT");
+    expect(body.failureReason).not.toContain("did not approve");
+    // The stuck-job status cell and the give-up alert keep only the first line, so it names the usage limit.
+    expect(body.failureReason).toBe(providerFailure.message);
+    const { formatFailureComment } = await import("../runner-callback.js");
+    const comment = formatFailureComment(body.failureCode, body.failureReason, { failure: body.failure, prUrl: "https://github.com/o/r/pull/12" });
+    expect(comment).toMatch(/usage limit/i);
+    expect(comment).not.toContain("a review did not approve it");
+    expect(body.failure).toEqual(providerFailure);
+  });
+
   it("words the PROVIDER_UNAVAILABLE fallback reason as the AI service when the run has no feedback", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
@@ -4565,6 +4625,37 @@ describe("configured (opted-in) autonomous runs", () => {
     expect(client.checkout).toHaveBeenCalledTimes(1);
     expect(client.checkout).toHaveBeenCalledWith({ profileId: "p-rev", authMode: "anthropic-api-key" });
     expect(client.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])("checks out a fallback profile once and preserves checkout failures (refused=%s)", async refused => {
+    const client = fakeClient();
+    const injected = makeExecutor();
+    const checkoutFailure = { category: "auth" as const, code: "MODEL_AUTH_PROFILE_NOT_ALLOWED", stage: "review", attempt: 1, retryable: false, message: "model-auth client error: profile_not_allowed", evidence: { truncated: false } };
+    if (refused) vi.mocked(client.checkout).mockResolvedValueOnce(undefined).mockRejectedValueOnce(new ModelAuthClientError("profile_not_allowed"));
+    const entries = [{ accountProfileId: "fallback-review", profileRevision: 2, agent: "claude" as const, provider: "anthropic" as const, authMode: "anthropic-api-key" as const, model: "claude-next" }];
+    const failure = { category: "auth" as const, code: "ACCOUNT_USAGE_LIMIT", stage: "review", attempt: 1, retryable: false, message: "limit", evidence: { truncated: false } };
+    vi.mocked(injected.invoke).mockResolvedValueOnce({ stdout: "", exitCode: 1, tokensUsed: 0, failure });
+    const { pipeline, runner } = makeSingleStepPipeline("capture", {
+      run: vi.fn(async (ctx: PipelineContext) => {
+        const params = { prompt: "p", model: "ignored", agentStage: "review" as const };
+        await ctx.llmExecutor.invoke(params);
+        if (refused) {
+          await expect(ctx.llmExecutor.invoke(params)).rejects.toMatchObject({ failure: checkoutFailure });
+          await expect(ctx.llmExecutor.invoke(params)).rejects.toMatchObject({ failure: checkoutFailure });
+        } else {
+          await ctx.llmExecutor.invoke(params);
+          await ctx.llmExecutor.invoke(params);
+        }
+        return {};
+      }),
+    });
+    await runAutonomousLocally({
+      workspaceDir, issueIdentifier: "AII-1", issueTitle: "t", issueDescription: "d", pipeline, runner, llmExecutor: injected,
+      configured: { agentConfig: snap, modelAuthClient: client, localCredentialPort: { load: vi.fn() }, accountFallbacks: { review: entries } },
+    });
+    expect(client.checkout).toHaveBeenCalledTimes(2);
+    expect(client.checkout).toHaveBeenNthCalledWith(2, { profileId: "fallback-review", authMode: "anthropic-api-key" });
+    expect(client.invoke).toHaveBeenCalledTimes(refused ? 1 : 3);
   });
 
   it("finishes and disposes once on success and as failed on a thrown step", async () => {
