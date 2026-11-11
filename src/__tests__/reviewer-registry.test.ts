@@ -120,6 +120,14 @@ afterEach(() => {
 });
 
 describe("resolveReviewer", () => {
+  it("resolves integration-review through both real built-in resolvers", async () => {
+    const reviewer = await resolveReviewer("integration-review", { customRoot: "/workspace", existsSyncImpl: () => false });
+    expect(reviewer).toMatchObject({ id: "integration-review" });
+    await expect(resolveTrustedReviewer("integration-review", {
+      trustedRoot: "/trusted-package", existsSyncImpl: () => false,
+    })).resolves.toBe(reviewer);
+  });
+
   it("returns a registered built-in when no custom override exists", async () => {
     const builtin = makeReviewer("known-reviewer");
     const result = await resolveReviewer("known-reviewer", {
