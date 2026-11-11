@@ -573,7 +573,7 @@ describe("postPushReviewStep", () => {
               return {
                 stdout: "", exitCode, tokensUsed: 1,
                 terminalStatus: { subtype: "error_during_execution", isError: true },
-                telemetry: { ...NO_RESULT_TELEMETRY, costUsd: 1 },
+                telemetry: { ...NO_RESULT_TELEMETRY, costUsd: 1, ...(agentStage === "implementation" ? { outcome: "max_turns" as const } : {}) },
                 failure: {
                   category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: params.stage!, attempt: 1,
                   retryable: false, message: "All accounts exhausted", evidence: { llmErrorMessage: "exhausted profiles", truncated: false },
@@ -608,10 +608,15 @@ describe("postPushReviewStep", () => {
       });
     });
 
-    it.each([false, true])("commits and pushes a turn-capped fix and reviews again (configured stages: %s)", async (configured) => {
+    it.each([
+      { configured: false, exitCode: 0 },
+      { configured: false, exitCode: 1 },
+      { configured: true, exitCode: 0 },
+      { configured: true, exitCode: 1 },
+    ])("commits and pushes a turn-capped fix and reviews again (configured stages: $configured, exit: $exitCode)", async ({ configured, exitCode }) => {
       gitSpawn.mockClear();
       const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
-        ? { stdout: "partial fix", exitCode: 0, tokensUsed: 1,
+        ? { stdout: "partial fix", exitCode, tokensUsed: 1,
           terminalStatus: { subtype: "error_max_turns", isError: true },
           telemetry: { ...NO_RESULT_TELEMETRY, outcome: "max_turns" as const } }
         : structuredReviewResult(params.stage.endsWith("review-2") ? { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] } : notApproved));
@@ -646,16 +651,19 @@ describe("postPushReviewStep", () => {
     });
 
     it.each([
-      { exitCode: 1, outcome: "max_turns" as const },
+      { exitCode: 1, outcome: "error" as const },
+      { exitCode: 1, outcome: "success" as const },
+      { exitCode: 1, outcome: undefined },
     ])("rejects fix errors with exit $exitCode and outcome $outcome", async ({ exitCode, outcome }) => {
       gitSpawn.mockClear();
       const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
         ? { stdout: "", exitCode, tokensUsed: 0,
           terminalStatus: { subtype: "error_during_execution", isError: true },
-          telemetry: { ...NO_RESULT_TELEMETRY, outcome } }
+          telemetry: outcome === undefined ? undefined : { ...NO_RESULT_TELEMETRY, outcome } }
         : structuredReviewResult(notApproved));
       const out = await run(makeCtx(invoke), 2);
       expect(out.terminationReason).toBe("fix_failed");
+      expect(gitSpawn.mock.calls.some(([args]) => args[0] === "commit")).toBe(false);
       expect(gitSpawn.mock.calls.some(([args]) => args[0] === "push")).toBe(false);
     });
 
