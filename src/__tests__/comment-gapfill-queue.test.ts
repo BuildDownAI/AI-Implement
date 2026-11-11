@@ -363,3 +363,24 @@ describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
     });
   });
 });
+
+
+describe("roll-up reviews", () => {
+  it("deduplicates each head even after completion and isolates all key components", () => {
+    const input = { owner: "org", repo: "repo", prNumber: 42, headSha: "head-a" };
+    expect(queue.enqueueRollupReview(input)).toBe(true);
+    expect(queue.enqueueRollupReview(input)).toBe(false);
+    const [row] = queue.claimPendingCommentGapfills();
+    expect(row.commenter).toBe(queue.ROLLUP_REVIEW_COMMENTER);
+    expect(Number.isSafeInteger(row.commentId)).toBe(true);
+    expect(row.commentId).toBeLessThan(-2_000_000_000);
+    queue.markCommentGapfillProcessed(row.id, "completed");
+    expect(queue.enqueueRollupReview(input)).toBe(false);
+    for (const change of [{ owner: "other" }, { repo: "other" }, { prNumber: 43 }, { headSha: "head-b" }]) {
+      expect(queue.enqueueRollupReview({ ...input, ...change })).toBe(true);
+    }
+    const rows = dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all();
+    expect(rows).toHaveLength(5);
+    expect(queue.countConflictAttempts("org", "repo", 42)).toBe(0);
+  });
+});

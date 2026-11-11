@@ -15,6 +15,17 @@ vi.mock("../dedup.js", async () => {
   const db = new Database(":memory:");
   return { getDb: () => db };
 });
+const reviewHeads = vi.hoisted(() => new Set<string>());
+vi.mock("../comment-gapfill-queue.js", () => ({
+  enqueueRollupReview: vi.fn((input) => {
+    const key = JSON.stringify(input);
+    if (reviewHeads.has(key)) return false;
+    reviewHeads.add(key);
+    return true;
+  }),
+}));
+import { enqueueRollupReview } from "../comment-gapfill-queue.js";
+
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "tok"),
 }));
@@ -45,6 +56,7 @@ const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  reviewHeads.clear();
   resetRollUpHandledMarkers();
   resetClosedVetoLogGuard();
   vi.mocked(findOpenPullRequest).mockResolvedValue(null);
@@ -69,6 +81,7 @@ describe("runMergeUps", () => {
     // The roll-up commit message must NOT contain an issue identifier (Linear would link it).
     const commitMsg = vi.mocked(mergeBranch).mock.calls[0][5];
     expect(commitMsg).not.toMatch(/OOL-\d+/i);
+    expect(enqueueRollupReview).not.toHaveBeenCalled();
     // Internal roll-up never opens a PR and never calls top-of-tree helpers.
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(findPullRequestByBranches)).not.toHaveBeenCalled();
@@ -91,6 +104,7 @@ describe("runMergeUps", () => {
   it("opens a human PR (no direct merge) for the top-level feature→base roll-up", async () => {
     vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
     vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(getBranchSha).mockResolvedValue("new-head");
     await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping()));
 
     expect(vi.mocked(createPullRequest)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", expect.objectContaining({
@@ -98,9 +112,21 @@ describe("runMergeUps", () => {
       base: "testing",
     }));
     expect(vi.mocked(mergeBranch)).not.toHaveBeenCalled();
+    expect(enqueueRollupReview).toHaveBeenCalledExactlyOnceWith({ owner: "jodwyer", repo: "alpacaWheel", prNumber: 7, headSha: "new-head" });
     // PR title/body carry no issue identifier.
     const arg = vi.mocked(createPullRequest).mock.calls[0][3];
     expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
+  });
+
+  it("recovers a missing creation head on the next open poll", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(enqueueRollupReview).not.toHaveBeenCalled();
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 7, url: "https://gh/pr/7", state: "open", merged: false, headSha: "recovered",
+    });
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(enqueueRollupReview).toHaveBeenCalledTimes(1);
   });
 
   it("lists the grouped issues in the top-of-tree PR body", async () => {
@@ -158,6 +184,20 @@ describe("runMergeUps", () => {
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
     expect(finalizeMerged).not.toHaveBeenCalled();
+    expect(compareBranches).not.toHaveBeenCalled();
+    expect(mergeBranch).not.toHaveBeenCalled();
+    expect(getBranchSha).not.toHaveBeenCalled();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    onTestFinished(() => logSpy.mockRestore());
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(reviewHeads.size).toBe(1);
+    expect(logSpy).not.toHaveBeenCalled();
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 42, url: "https://gh/pr/42", state: "open", merged: false, headSha: "changed-head",
+    });
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(reviewHeads.size).toBe(2);
+    expect(logSpy).toHaveBeenCalledTimes(1);
   });
 
   it("detects a merged top-of-tree PR, deletes the branch, and finalizes the issue (tip == pr.head.sha)", async () => {
@@ -176,6 +216,7 @@ describe("runMergeUps", () => {
     expect(finalizeMerged).toHaveBeenCalledWith("uuid-parent", "OOL");
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(getBranchSha)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
+    expect(enqueueRollupReview).not.toHaveBeenCalled();
     // SHA equality alone is sufficient — no need to fall back to the ancestry check.
     expect(vi.mocked(compareBranches)).not.toHaveBeenCalled();
   });
@@ -206,6 +247,7 @@ describe("runMergeUps", () => {
       const arg = vi.mocked(createPullRequest).mock.calls[0][3];
       expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
 
+      expect(enqueueRollupReview).toHaveBeenCalledExactlyOnceWith({ owner: "jodwyer", repo: "alpacaWheel", prNumber: 7, headSha: "sha-late-commit" });
       const lines = logSpy.mock.calls.map((c) => String(c[0]));
       expect(lines.some((l) => l.includes("commits ahead of its merged roll-up"))).toBe(true);
       expect(isRollUpHandled("jodwyer", "alpacaWheel", "ai-implement/feature/ool-106")).toBe(false);
@@ -291,6 +333,7 @@ describe("runMergeUps", () => {
       }
       const vetoLines = logSpy.mock.calls.filter((c) => String(c[0]).includes("closed without merging"));
       expect(vetoLines).toHaveLength(1);
+      expect(enqueueRollupReview).not.toHaveBeenCalled();
       // the veto is still respected on every cycle — no PR ever re-opened
       expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     } finally {

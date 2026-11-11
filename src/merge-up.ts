@@ -1,5 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { FeatureNodeRollUp } from "./providers/types.js";
+import { enqueueRollupReview } from "./comment-gapfill-queue.js";
 import { getDb } from "./dedup.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
@@ -171,6 +172,7 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
     await deps.finalizeMerged(rollUp.issueId, rollUp.scopeKey);
     mergedRollUpNumber = pr.number;
   } else if (pr?.state === "open") {
+    requestRollupReview(owner, repo, pr.number, pr.headSha);
     return; // awaiting human merge
   } else if (pr && pr.state === "closed" && !pr.merged) {
     // A human may have closed the PR without merging (a deliberate veto). Respect that
@@ -202,10 +204,18 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
       "to merge into the base branch. Opened for human review." +
       grouped,
   });
+  const headSha = await getBranchSha(ghToken, owner, repo, branch);
+  if (headSha) requestRollupReview(owner, repo, newPr.number, headSha);
   if (mergedRollUpNumber !== null) {
     console.log(
       `[merge-up] ${branch} is ${ahead} commits ahead of its merged roll-up #${mergedRollUpNumber}; opened a new roll-up instead of deleting`,
     );
   }
   console.log(`[merge-up] Opened feature→base PR ${newPr.url} for ${rollUp.identifier} (awaiting human merge)`);
+}
+
+function requestRollupReview(owner: string, repo: string, prNumber: number, headSha: string): void {
+  if (headSha && enqueueRollupReview({ owner, repo, prNumber, headSha })) {
+    console.log(`[merge-up] Enqueued advisory roll-up review for ${owner}/${repo}#${prNumber} at ${headSha}`);
+  }
 }
