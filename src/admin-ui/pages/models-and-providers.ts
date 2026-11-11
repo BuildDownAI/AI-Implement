@@ -69,7 +69,9 @@ export const modelsAndProvidersHtml = `
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-provider">Provider</label><select class="input" id="mp-new-provider"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="bedrock">bedrock</option></select></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-authMode">Authentication</label><select class="input" id="mp-new-authMode"><option value="anthropic-api-key">anthropic-api-key</option><option value="openai-api-key">openai-api-key</option><option value="codex-subscription">codex-subscription</option><option value="claude-subscription">claude-subscription</option><option value="bedrock">bedrock</option></select></span>
             <button class="btn btn-primary btn-sm" onclick="mpAddAccount()">Add account profile</button>
+            <button class="btn btn-sm" id="mp-import-credential" onclick="mpImportCredential()">Import orchestrator credential</button>
           </div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:6px">Import copies the credential the orchestrator uses for legacy runs. Legacy projects keep reading the environment variable until they opt in.</div>
         </div>
         <div class="text-tertiary" style="font-size:11.5px;padding:12px">
           <div><strong>Provisioning.</strong> Add a profile above and set an API key or Claude subscription setup-token per profile; a key is encrypted on save and never shown again. Connect a ChatGPT plan from a laptop with a pairing code; Bedrock credentials are provisioned on the host.</div>
@@ -402,6 +404,34 @@ export const modelsAndProvidersScript = `(function () {
     await loadStageConfig(false);
   }
 
+  async function mpImportCredential() {
+    if (!mpCanEdit()) return;
+    mpAccountError('');
+    try {
+      const res = await window.api('/api/tools/import_environment_credential', {
+        method: 'POST', body: JSON.stringify({ args: {} }),
+      });
+      const body = await res.json().catch(function () { return {}; });
+      if (!res.ok) { mpAccountError(body.error || 'Import failed (HTTP ' + res.status + ')'); return; }
+      const text = body.content && body.content[0] ? body.content[0].text : 'Import failed';
+      let result = null;
+      try { result = JSON.parse(text); } catch (_) { /* plain-text role error */ }
+      if (!result || (result.status !== 201 && result.status !== 200)) {
+        mpAccountError(result && result.body ? result.body.error : text);
+        return;
+      }
+      const accRes = await window.api('/api/model-accounts');
+      if (!accRes.ok) { mpAccountError(await mpErrorText(accRes, 'Failed to load account profiles')); return; }
+      const data = await accRes.json();
+      mpAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+      mpRenderAccounts();
+      mpRerenderWithCompat();
+      mpAccountError(result.body.profileId + ': ' + (result.status === 201 ? 'created' : 'already imported'));
+    } catch (err) {
+      mpAccountError('Import failed: ' + String(err));
+    }
+  }
+
   async function mpAddAccount() {
     if (!mpCanEdit()) return;
     mpAccountError('');
@@ -598,6 +628,7 @@ export const modelsAndProvidersScript = `(function () {
   window.loadModelsAndProviders = loadModelsAndProviders;
   window.saveStageDefaults = saveStageDefaults;
   window.mpAddAccount = mpAddAccount;
+  window.mpImportCredential = mpImportCredential;
   window.resetStageDefaults = resetStageDefaults;
   window.registerPage('models', function () { mpWatchDirty(); mpWatchKeys(); loadModelsAndProviders(); setInterval(loadModelsAndProviders, 60000); });
 })();`;

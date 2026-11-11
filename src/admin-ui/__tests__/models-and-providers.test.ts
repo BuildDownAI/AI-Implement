@@ -175,3 +175,87 @@ describe("Claude subscription credentials", () => {
     }
   });
 });
+
+describe("Import orchestrator credential", () => {
+  const profileId = `environment"'<img src=x>&`;
+  const wrapped = (status: number, body: object) => ({ content: [{ type: "text", text: JSON.stringify({ status, body }) }] });
+
+  async function fixture(admin: boolean, reply: object, ok = true) {
+    const dom = new JSDOM(modelsAndProvidersHtml, { runScripts: "outside-only" });
+    const win = dom.window;
+    win.isAdmin = () => admin;
+    win.esc = win.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+    let activate = () => {};
+    win.registerPage = (_route: string, callback: () => void) => { activate = callback; };
+    win.setInterval = (() => 0) as typeof win.setInterval;
+    let imported = false;
+    const account = { profileId, identity: "Environment", agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", profileStatus: "active" };
+    const api = vi.fn(async (path: string, _options?: { method?: string; body?: string }) => {
+      if (path === "/api/tools/import_environment_credential") {
+        imported = true;
+        return { ok, status: ok ? 200 : 503, json: async () => reply };
+      }
+      return { ok: true, json: async () => path === "/api/model-accounts" ? { accounts: imported ? [account] : [] }
+        : path === "/api/agent-defaults" ? { mode: "legacy", stages: {} } : {} };
+    });
+    win.api = api;
+    win.eval(modelsAndProvidersScript);
+    activate();
+    await vi.waitFor(() => expect(win.document.querySelectorAll("#mp-stage-rows tr")).toHaveLength(3));
+    api.mockClear();
+    // outside-only scripts do not execute inline onclick attributes.
+    const invoke = () => win.eval("mpImportCredential()");
+    win.document.getElementById("mp-import-credential")!.addEventListener("click", invoke);
+    return { win, api, invoke };
+  }
+
+  it.each([true, false])("shows the action only to admins and guards invocation (admin=%s)", async admin => {
+    const { win, api, invoke } = await fixture(admin, wrapped(404, { error: "missing" }));
+    try {
+      const button = win.document.getElementById("mp-import-credential")!;
+      expect(button.textContent).toBe("Import orchestrator credential");
+      expect(button.closest("#mp-account-form")!.classList.contains("hidden")).toBe(!admin);
+      expect(button.previousElementSibling?.textContent).toBe("Add account profile");
+      expect(win.document.getElementById("mp-account-form")!.textContent).toContain("Legacy projects keep reading the environment variable until they opt in");
+      if (!admin) { await invoke(); expect(api).not.toHaveBeenCalled(); }
+    } finally { win.close(); }
+  });
+
+  it.each([201, 200])("refreshes accounts and preserves stage edits for inner status %s", async status => {
+    const { win, api } = await fixture(true, wrapped(status, { profileId }));
+    try {
+      const input = win.document.querySelector<HTMLInputElement>('[data-stage="planning"][data-field="model"]')!;
+      input.value = "unsaved-model";
+      input.dispatchEvent(new win.Event("input", { bubbles: true }));
+      win.document.getElementById("mp-import-credential")!.click();
+      await vi.waitFor(() => expect(win.document.getElementById("mp-account-error")!.textContent).toBe(`${profileId}: ${status === 201 ? "created" : "already imported"}`));
+      expect(api.mock.calls.filter(([path]) => path === "/api/tools/import_environment_credential")).toEqual([
+        ["/api/tools/import_environment_credential", { method: "POST", body: JSON.stringify({ args: {} }) }],
+      ]);
+      expect(api.mock.calls.filter(([path]) => path === "/api/model-accounts")).toHaveLength(1);
+      expect(win.document.querySelector("#mp-account-rows td")!.textContent).toBe(profileId);
+      expect(win.document.querySelector<HTMLInputElement>('[data-stage="planning"][data-field="model"]')!.value).toBe("unsaved-model");
+      expect(win.document.querySelector("img")).toBeNull();
+      expect(win.document.getElementById("mp-account-error")!.classList.contains("hidden")).toBe(false);
+    } finally { win.close(); }
+  });
+
+  it.each([
+    [wrapped(404, { error: "no model credential in the environment" }), true, "no model credential in the environment"],
+    [wrapped(409, { error: "conflict <img src=x>" }), true, "conflict <img src=x>"],
+    [wrapped(503, { error: "unavailable" }), true, "unavailable"],
+    [{ content: [{ type: "text", text: "forbidden: admin required" }] }, true, "forbidden: admin required"],
+    [{ error: "HTTP failure <img src=x>" }, false, "HTTP failure <img src=x>"],
+  ] as const)("shows failures without refreshing accounts (%j)", async (reply, ok, message) => {
+    const { win, api, invoke } = await fixture(true, reply, ok);
+    try {
+      const before = win.document.getElementById("mp-account-rows")!.innerHTML;
+      await invoke();
+      expect(win.document.getElementById("mp-account-error")!.textContent).toBe(message);
+      expect(win.document.getElementById("mp-account-error")!.classList.contains("hidden")).toBe(false);
+      expect(win.document.getElementById("mp-account-rows")!.innerHTML).toBe(before);
+      expect(api).toHaveBeenCalledTimes(1);
+      expect(win.document.querySelector("img")).toBeNull();
+    } finally { win.close(); }
+  });
+});
