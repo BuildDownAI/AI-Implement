@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as mappingConfig from "../../config.js";
-import { LinearProvider } from "../../providers/linear.js";
+import { LinearGraphQLError, LinearLabelWriteError, LinearProvider } from "../../providers/linear.js";
 import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import {
   clearLinearTokenCache,
@@ -67,6 +67,102 @@ describe("LinearProvider.postComment", () => {
 
     const p = new LinearProvider({});
     await expect(p.postComment("i", "b")).rejects.toThrow(/Permission denied/);
+  });
+});
+
+describe("Linear GraphQL failures", () => {
+  it.each([
+    [undefined, undefined],
+    [null, undefined],
+    [{}, undefined],
+    [[], undefined],
+    [42, undefined],
+    [false, undefined],
+    [{ type: null, code: 42 }, undefined],
+    [{ type: "unknown", code: "fallback" }, "unknown"],
+    [{ code: "unknown" }, "unknown"],
+    [{ type: 42, code: "fallback" }, "fallback"],
+    ["malformed", undefined],
+  ])("retains the first error and safely reads extensions %j", async (extensions, extensionsType) => {
+    linear({ json: { errors: [
+      { message: "not allowed to take action", extensions },
+      { message: "second error", extensions: { type: "other" } },
+    ] } });
+    const error = await new LinearProvider({}).postComment("i", "b").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(LinearGraphQLError);
+    expect(error).toMatchObject({
+      name: "LinearGraphQLError", operation: "commentCreate",
+      linearMessage: "not allowed to take action", extensionsType, permanent: false,
+      message: "Linear GraphQL error (commentCreate): not allowed to take action",
+    });
+  });
+
+  it("adds label and actual team context to a refused create", async () => {
+    linear(
+      data({ issue: { team: { key: "THR2" } } }),
+      data({ teams: { nodes: [{ id: "team-thr2" }] } }),
+      data({ issueLabels: { nodes: [] } }),
+      { json: { errors: [{ message: "not allowed to take action", extensions: { code: "unknown" } }] } },
+    );
+    const error = await new LinearProvider({}).markPlanningStarted("i", "AII").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(LinearLabelWriteError);
+    expect(error).toBeInstanceOf(LinearGraphQLError);
+    expect(error).toMatchObject({
+      name: "LinearLabelWriteError", operation: "issueLabelCreate", label: "AI-Planning",
+      teamKey: "THR2", action: "create", linearMessage: "not allowed to take action",
+      extensionsType: "unknown", permanent: false,
+      message: 'Linear refused to create label "AI-Planning" on team THR2: not allowed to take action',
+    });
+  });
+
+  it.each([
+    ["planning label", (p: LinearProvider) => p.markPlanningStarted("i", "ENG"), 1],
+    ["planning state", (p: LinearProvider) => p.markPlanningStarted("i", "ENG"), 2],
+    ["plan complete", (p: LinearProvider) => p.markPlanComplete("i", "ENG", { awaitApproval: false }), 1],
+    ["planning failed", (p: LinearProvider) => p.markPlanningFailed("i", "ENG", "reason"), 1],
+    ["implementing", (p: LinearProvider) => p.markImplementing("i", "ENG"), 1],
+    ["PR ready", (p: LinearProvider) => p.markPrReady("i", "ENG", "url"), 1],
+    ["merged", (p: LinearProvider) => p.markMerged("i", "ENG"), 1],
+    ["implementation failed", (p: LinearProvider) => p.markImplementationFailed("i", "ENG", "reason"), 1],
+    ["clear working", (p: LinearProvider) => p.clearWorkingState("i", "ENG", "planning"), 1],
+    ["park", (p: LinearProvider) => p.parkForHuman("i", "ENG", "planning"), 1],
+  ] as const)("names issueUpdate for %s failures", async (_name, run, failAt) => {
+    let mutations = 0;
+    fakeFetch({ "POST /graphql": ({ body }) => {
+      const { query } = JSON.parse(body) as { query: string };
+      if (query.includes("mutation")) {
+        mutations++;
+        return mutations === failAt
+          ? { json: { errors: [{ message: "write refused" }] } }
+          : { json: { data: { issueUpdate: { success: true } } } };
+      }
+      return { json: { data: {
+        issue: { team: { key: "ENG" }, state: { type: "unstarted" }, labels: { nodes: [
+          { id: "planning", name: "AI-Planning" }, { id: "working", name: "AI-Working" },
+        ] } },
+        teams: { nodes: [{ id: "team-eng" }] },
+        issueLabels: { nodes: [{ id: "reusable", team: null }] },
+        workflowStates: { nodes: [{ id: "state", name: "In Progress", type: "started" }] },
+      } } };
+    } }).install();
+    await expect(run(new LinearProvider({}))).rejects.toMatchObject({
+      operation: "issueUpdate", linearMessage: "write refused",
+      message: "Linear GraphQL error (issueUpdate): write refused",
+    });
+  });
+
+  it.each(["lookup", "http"])("does not wrap a label %s failure", async (kind) => {
+    const failure = kind === "http" ? { status: 403, text: "refused" }
+      : { json: { errors: [{ message: "lookup refused" }] } };
+    linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-eng" }] } }),
+      ...(kind === "http" ? [data({ issueLabels: { nodes: [] } })] : []),
+      failure,
+    );
+    const error = await new LinearProvider({}).markPlanningStarted("i", "ENG").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(kind === "http" ? LinearApiError : LinearGraphQLError);
+    expect(error).not.toBeInstanceOf(LinearLabelWriteError);
   });
 });
 
