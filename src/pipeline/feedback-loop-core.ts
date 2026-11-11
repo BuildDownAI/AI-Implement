@@ -167,7 +167,7 @@ function buildImplementPrompt(
   return prompt;
 }
 
-const IMPLEMENT_CONTINUATION_NOTE =
+export const IMPLEMENT_CONTINUATION_NOTE =
   "A previous attempt was interrupted by a provider error. The working tree contains its partial changes. Continue from the current state; do not revert it.";
 
 /** Structural view of `implementStep`'s outputs — only what the loop reads. */
@@ -242,6 +242,7 @@ export async function runFeedbackLoop(
   let reviewIssues: string[] = [];
   let terminationReason: TerminationReason = "iterations_exhausted";
   const passes: PassStat[] = [];
+  let implementationAccountSwitched = false;
   const fallbackOrigins: Partial<Record<"implementation" | "review", string>> = {};
   let postMortem: string | undefined;
   let failureForOutputs: FailureRecord | undefined;
@@ -355,6 +356,7 @@ export async function runFeedbackLoop(
         const fallback = implementFailure.modelFallback;
         const fallbackRetry = fallback?.stage === "implementation" && !fallbackOrigins.implementation;
         if (fallbackRetry) fallbackOrigins.implementation = fallback.from;
+        if (implementFailure.accountFallback?.stage === "implementation") implementationAccountSwitched = true;
         const willRetryImplement = implementFailure.accountFallback?.stage === "implementation" || fallbackRetry || (isTransient && implementStageAttempt <= params.retryPolicy.stageRetries);
         // A retried attempt's failure must not overwrite the canonical `implement.{iteration}`
         // row — that id is reserved for the final attempt (BAC-27134's "keep every attempt's
@@ -390,11 +392,11 @@ export async function runFeedbackLoop(
           continue;
         }
 
-        if (isTransient || implementFailure.code === "ACCOUNT_USAGE_LIMIT") {
+        if (isTransient || implementFailure.code === "ACCOUNT_USAGE_LIMIT" || (implementationAccountSwitched && implementFailure.code.startsWith("MODEL_AUTH_"))) {
           const providerUnavailableFailure: FailureRecord = {
             ...implementFailure,
             stage: "implement",
-            code: isTransient ? "PROVIDER_UNAVAILABLE" : "ACCOUNT_USAGE_LIMIT",
+            code: isTransient ? "PROVIDER_UNAVAILABLE" : implementFailure.code,
             // Exhausted the account list or stage-retry budget: this record is terminal, matching the
             // convention push.ts's GIT_PUSH_RETRIES_EXHAUSTED states — an orchestrator
             // rail keying off `retryable` must not start a run again that already spent

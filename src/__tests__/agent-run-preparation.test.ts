@@ -730,6 +730,7 @@ describe("ordered account preparation", () => {
         profileId, identity: profileId, revision: 1, agent: "claude", provider: "anthropic",
         authMode: "anthropic-api-key", metadata: { credentialRef: `model-account:${profileId}` },
       });
+      secrets.set(`model-account:${profileId}`, API_SENTINEL);
     }
     const config = store.getOrchestratorDefaults()!.config;
     for (const stage of ["planning", "implementation", "review"] as const) {
@@ -766,7 +767,29 @@ describe("ordered account preparation", () => {
     expect(bindings.map(b => `${b.stage}:${b.profile_id}`).sort()).toEqual(first.grant.bindings.map(b => `${b.stage}:${b.profileId}`).sort());
     log.mockRestore();
   });
-  it("grants every frozen fallback without proving its credentials and reuses the list", async () => {
+  it.each([false, true])("drops an API fallback with missing credentials (reference=%s)", async reference => {
+    store.saveAccountProfileRevision({ profileId: "missing", identity: "Missing", revision: 1,
+      agent: "codex", provider: "openai", authMode: "openai-api-key",
+      metadata: reference ? { credentialRef: "model-account:missing" } : {} });
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.implementation!.accounts = [
+      { accountProfileId: "api", model: "primary" },
+      { accountProfileId: "missing", model: "backup" },
+      { accountProfileId: "brk", model: "valid" },
+    ];
+    store.setOrchestratorDefaults(config);
+    const first = ready(await prep.prepareAgentRun(request(), deps));
+    expect(first.accountFallbacks?.implementation?.map(p => p.accountProfileId)).toEqual(["brk"]);
+    expect(first.grant.bindings.some(p => p.profileId === "missing")).toBe(false);
+    const persisted = JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string);
+    expect(persisted.droppedAccountFallbacks).toEqual([
+      { stage: "implementation", profileId: "missing", reason: expect.any(String) },
+    ]);
+    expect(JSON.stringify(persisted)).not.toContain("model-account:missing");
+    secrets.set("model-account:missing", API_SENTINEL);
+    expect(ready(await prep.prepareAgentRun(request(), deps)).grant.bindings).toEqual(first.grant.bindings);
+  });
+  it("checks unreserved fallback credentials and reuses the frozen list", async () => {
     configure();
     const config = store.getOrchestratorDefaults()!.config;
     config.stages!.implementation!.accounts = [
@@ -782,8 +805,8 @@ describe("ordered account preparation", () => {
       { accountProfileId: "sub2", profileRevision: 1, agent: "claude", provider: "anthropic", authMode: "claude-subscription", model: "backup-c" },
     ] };
     expect(first.accountFallbacks).toEqual(expected);
-    expect(events).not.toContain("proof:sub2");
-    expect(events).not.toContain("proof:brk");
+    expect(events).toContain("proof:sub2");
+    expect(events).toContain("proof:brk");
     expect(first.grant.bindings.filter(b => b.stage === "implementation").map(b => b.profileId)).toEqual(["api", "brk", "sub2"]);
     const bindings = rows("model_credential_grant_profiles");
     store.retireAccountProfile("sub2");
@@ -883,14 +906,14 @@ describe("ordered account preparation", () => {
     expect(await prep.prepareAgentRun(request(), deps)).toMatchObject({ status: "authentication-required", profileId: "brk" });
     expect(prep.loadStoredSnapshot("d1")!.stages.implementation.accountProfileId).toBe("brk");
     expect(secretReads).toContain("model-account:brk");
-    expect(secretReads).not.toContain("model-account:api");
-    expect(events).not.toContain("proof:api");
+    expect(secretReads).toContain("model-account:api");
+    expect(events).toContain("proof:api");
   });
   it("does not skip a chosen account with a missing credential", async () => {
     configure();
     secrets.delete("model-account:brk");
     expect(await prep.prepareAgentRun(request(), deps)).toMatchObject({ status: "authentication-required", profileId: "brk" });
     expect(prep.loadStoredSnapshot("d1")!.stages.implementation.accountProfileId).toBe("brk");
-    expect(secretReads).not.toContain("model-account:api");
+    expect(secretReads).toContain("model-account:api");
   });
 });
