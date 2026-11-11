@@ -100,7 +100,7 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.linear.credentials`](ticketing-providers.md#the-apps-credentials) | Linear refusing the app's credentials, with its HTTP status |
 | [`tracker.linear.team-access`](ticketing-providers.md#team-access) | A Linear project whose key names no team the app can see |
 | [`tracker.linear.pickup-label`](ticketing-providers.md#the-pickup-label) | No label with the pickup label's exact name at workspace level or in the team, or one only in a different case |
-| [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case |
+| [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case (`warn`), or a missing label whose creation permission cannot be checked read-only (`cannot-verify`); mixed cases warn and report both |
 | [`tracker.linear.workflow-states`](ticketing-providers.md#workflow-states) | A team with no `started`-type or no `completed`-type state |
 | [`tracker.jira.credentials`](ticketing-providers.md#credentials) | Jira refusing the credentials, with its HTTP status, or OAuth mode, whose access token is never refreshed |
 | [`tracker.jira.fields`](ticketing-providers.md#custom-fields) | A required field that matches no field or several by name, which stops every Jira project; a warning for an optional field named twice |

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
+import { LINEAR_LABELS } from "../../providers/linear.js";
 import { STATUS_VALUES } from "../../providers/jira-fields.js";
 import type { JiraProjectSetupFacts, JiraSetupFacts, LinearSetupFacts } from "../../providers/types.js";
 import type { SetupCheckContext, SetupCheckId, SetupCheckOutcome } from "../../setup-checks/index.js";
@@ -180,15 +181,46 @@ describe("tracker.linear.pickup-label", () => {
 });
 
 describe("tracker.linear.lifecycle-labels", () => {
-  it("passes when each lifecycle label is missing or has its exact name", async () => {
-    const facts = makeLinearSetupFacts({ found: [{ name: "AI-Working", teamKey: "ENG" }, { name: "Plan-Complete", teamKey: null }] });
+  const exactLabels = Object.values(LINEAR_LABELS).map(({ name }) => ({ name, teamKey: null }));
+  const missingDetail = (names: string) => `${names} do not exist. The orchestrator creates them at the team's first dispatch, which needs the app to be allowed to create team labels.`;
+  const missingFix = (names: string, team = "ENG") => `Create ${names} in team ${team}, or check that the app can create labels in the team.`;
+
+  it.each([["Plan-Complete"], ["AI-Planning", "Plan-Complete"]])("cannot verify missing labels %j", async (...missing) => {
+    const names = missing.join(", ");
+    const facts = makeLinearSetupFacts({ found: exactLabels.filter(({ name }) => !missing.includes(name)) });
     expect(await run("tracker.linear.lifecycle-labels", onLinear(facts))).toEqual([
-      { project: "ENG", state: "pass", detail: "Each lifecycle label has its exact name, or is created at first use" },
+      { project: "ENG", state: "cannot-verify", detail: missingDetail(names), fix: missingFix(names) },
+    ]);
+  });
+
+  it("combines missing labels with case warnings and both fixes", async () => {
+    const facts = makeLinearSetupFacts({ found: [...exactLabels.filter(({ name }) => name !== "Plan-Complete" && name !== "AI-Working"), { name: "ai-working", teamKey: "ENG" }] });
+    expect(await run("tracker.linear.lifecycle-labels", onLinear(facts))).toEqual([
+      {
+        project: "ENG", state: "warn",
+        detail: "ai-working is used for AI-Working. The orchestrator applies a label in a different case, but the poll and the label removal look for the exact name. " + missingDetail("Plan-Complete"),
+        fix: "Rename each label to the exact name shown. " + missingFix("Plan-Complete"),
+      },
+    ]);
+  });
+
+  it("reports a label belonging only to another team as missing, separately per team", async () => {
+    const facts = makeLinearSetupFacts({ teams: { ENG: [], OPS: [] }, found: [...exactLabels.filter(({ name }) => name !== "Plan-Complete"), { name: "Plan-Complete", teamKey: "OPS" }] });
+    expect(await run("tracker.linear.lifecycle-labels", onLinear(facts, "ENG", "OPS"))).toEqual([
+      { project: "ENG", state: "cannot-verify", detail: missingDetail("Plan-Complete"), fix: missingFix("Plan-Complete") },
+      { project: "OPS", state: "pass", detail: "Each lifecycle label exists" },
+    ]);
+  });
+
+  it("passes when each lifecycle label has its exact name", async () => {
+    const facts = makeLinearSetupFacts({ found: [...exactLabels, { name: "AI-Working", teamKey: "ENG" }, { name: "Plan-Complete", teamKey: null }] });
+    expect(await run("tracker.linear.lifecycle-labels", onLinear(facts))).toEqual([
+      { project: "ENG", state: "pass", detail: "Each lifecycle label exists" },
     ]);
   });
 
   it("warns about the label the orchestrator would reuse: the team's own, even beside an exact workspace label", async () => {
-    const facts = makeLinearSetupFacts({ found: [{ name: "ai-working", teamKey: "ENG" }, { name: "AI-Working", teamKey: null }, { name: "plan-complete", teamKey: null }] });
+    const facts = makeLinearSetupFacts({ found: [...exactLabels.filter(({ name }) => name !== "AI-Working" && name !== "Plan-Complete"), { name: "ai-working", teamKey: "ENG" }, { name: "AI-Working", teamKey: null }, { name: "plan-complete", teamKey: null }] });
     expect(await run("tracker.linear.lifecycle-labels", onLinear(facts))).toEqual([
       {
         project: "ENG",
@@ -200,13 +232,13 @@ describe("tracker.linear.lifecycle-labels", () => {
   });
 
   it("ignores a wrongly cased label in another team", async () => {
-    const facts = makeLinearSetupFacts({ teams: { ENG: ["started", "completed"], OPS: ["started", "completed"] }, found: [{ name: "ai-planning", teamKey: "OPS" }] });
+    const facts = makeLinearSetupFacts({ teams: { ENG: ["started", "completed"], OPS: ["started", "completed"] }, found: [...exactLabels, { name: "ai-planning", teamKey: "OPS" }] });
     const outcomes = await run("tracker.linear.lifecycle-labels", onLinear(facts, "ENG", "OPS"));
     expect(outcomes).toMatchObject([{ project: "ENG", state: "pass" }, { project: "OPS", state: "warn" }]);
   });
 
   it("judges Ready for Review as it judges the other lifecycle labels", async () => {
-    const facts = makeLinearSetupFacts({ found: [{ name: "Ready for review", teamKey: null }] });
+    const facts = makeLinearSetupFacts({ found: [...exactLabels.filter(({ name }) => name !== "Ready for Review"), { name: "Ready for review", teamKey: null }] });
     expect(await run("tracker.linear.lifecycle-labels", onLinear(facts))).toEqual([
       {
         project: "ENG",
