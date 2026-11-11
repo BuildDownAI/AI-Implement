@@ -244,7 +244,7 @@ separately because it is incomplete.
 | Claude completion comments (operator-supplied) | 181 | 3 m 44 s | 6 m 14 s | 7 m 25 s | 12 m 50 s | 47 | 2 |
 | Check jobs retrieved before GitHub's unauthenticated rate limit (incomplete sample) | 112 | — | 6 m 53 s | — | — | — | — |
 
-The chosen limit is **600 000 ms**, giving the completion-comment p90 a
+The chosen limit is **600,000 ms**, giving the completion-comment p90 a
 **3 m 46 s** margin (and the observed check-job p90 a 3 m 7 s margin).
 The incomplete check sample does not establish the full window's check p90.
 Compared with the previous five-minute limit, this adds **at most 5 more minutes

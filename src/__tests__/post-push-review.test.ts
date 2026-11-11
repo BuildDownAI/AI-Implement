@@ -4428,7 +4428,7 @@ describe("postPushReviewStep", () => {
     });
     const out = await runReview(
       makeCtx(vi.fn(async () => structuredReviewResult(f.reviewerOutput))),
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: f.ghSpawn,
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(f.ghSpawn),
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep },
       { report: vi.fn(async () => undefined) },
     );
