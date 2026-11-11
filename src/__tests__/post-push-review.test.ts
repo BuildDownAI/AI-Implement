@@ -875,6 +875,39 @@ describe("postPushReviewStep", () => {
     })]);
   });
 
+  it.each(["advisory-incomplete", "gating-incomplete", "repeated", "minor"] as const)("reports gating findings and closes them using gating completeness: %s", async (mode) => {
+    const finding = { severity: mode === "minor" ? "minor" as const : "blocking" as const, body: "Gating defect" };
+    const invoke = vi.fn(async (params) => {
+      if (params.stage.includes("fix-")) return structuredReviewResult({});
+      const second = params.stage.endsWith("review-2");
+      if (params.stage.includes("gap-analysis")) {
+        if (second && mode.endsWith("incomplete")) return turnCapResult(undefined, 1);
+        return structuredReviewResult({ approved: true, findings: [] });
+      }
+      return structuredReviewResult({ approved: true, findings: second && mode !== "repeated" ? [] : [finding] });
+    });
+    const out = await runReview(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
+      prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [],
+      reviewers: [{ id: "code-review", gates: true }, { id: "gap-analysis", gates: mode === "gating-incomplete" }],
+      trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review"), selectedReviewerDefinition("gap-analysis")]),
+      ghSpawn: vi.fn((args: string[]) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 })),
+      gitSpawn: vi.fn((args: string[]) => ({
+        stdout: args[0] === "status" ? "M file.ts\n"
+          : args[0] === "rev-parse" ? "ai-implement/aii-200-x\n"
+          : args[0] === "ls-remote" ? "beadfeed\trefs/heads/ai-implement/aii-200-x\n" : "", exitCode: 0,
+      })),
+    }, { report: vi.fn(async () => undefined) });
+    expect(out.internalFindings).toEqual([expect.objectContaining(finding)]);
+    if (mode === "advisory-incomplete") {
+      expect(out.approved).toBe(true);
+      expect(out.findingDispositions).toContainEqual(expect.objectContaining({
+        findingKey: stableReviewFindingKey({ source: "ai-implement-internal", ...finding }), disposition: "fixed",
+      }));
+    } else {
+      expect(out.findingDispositions.filter(d => d.disposition === "fixed")).toEqual([]);
+    }
+  });
+
   it("runs a fix pass when reviewer approves but reports actionable issues", async () => {
     const approvedWithIssues = { approved: true, findings: [{ severity: "blocking", body: "Escape quoted user input" }], summary: "Minor issue worth addressing.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const gitSpawn = vi.fn((args: string[]) => {
@@ -1180,6 +1213,7 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(true);
+    expect(out.internalFindings).toEqual([]);
     expect(invoke).toHaveBeenCalledTimes(1);
     const approvalComment = ghComments.find((comment) => comment.includes("Ready to merge"));
     expect(approvalComment).toContain("Advisory custom concern");
@@ -1212,7 +1246,7 @@ describe("postPushReviewStep", () => {
     expect(invokePrompt(invoke, 2)).toContain("Same defect");
   });
 
-  it("retains advisory internal findings when a matching gating GitHub finding wins prompt deduplication", async () => {
+  it("excludes advisory internal findings when a matching gating GitHub finding wins prompt deduplication", async () => {
     const body = "Use the shared validator for path params.";
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -1240,9 +1274,7 @@ describe("postPushReviewStep", () => {
     expect(invoke).toHaveBeenCalledTimes(2);
     expect(invokePrompt(invoke, 1)).toContain("github-review-thread blocking src/routes.ts:88");
     expect(invokePrompt(invoke, 1)).not.toContain("ai-implement-internal");
-    expect(out.internalFindings).toEqual([expect.objectContaining({
-      source: "ai-implement-internal", reviewerId: "custom-review", severity: "blocking", body,
-    })]);
+    expect(out.internalFindings).toEqual([]);
   });
 
   it("reports a selected reviewer's own maxTurns when that reviewer exhausts", async () => {
@@ -1573,6 +1605,7 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(true);
+    expect(out.internalFindings).toEqual([]);
     expect(out.terminationReason).toBe("approved");
     expect(invoke.mock.calls.map((call) => call[0].stage)).not.toContain("post-push-review/fix-1");
     const approvalComment = ghComments.find((comment) => comment.includes("Ready to merge"));
