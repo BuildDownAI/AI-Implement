@@ -1,3 +1,4 @@
+import { IMPLEMENT_CONTINUATION_NOTE } from "../feedback-loop-core.js";
 import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../review-publication-limits.js";
 import { buildInlineReviewComments, inlineCommentBody } from "../review-inline-comments.js";
 import { removeScratchFromIndex } from "../scratch-exclude.js";
@@ -10,7 +11,7 @@ import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter
 import { formatGitNameStatusSummary, formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
 import type { ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
-import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
+import { classifyLlmResult, isLlmResultFailure, type FailureRecord } from "../failure-classification.js";
 import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
 import { summaryLine } from "../claude-stream.js";
 import { assertRunnerPublicationAuthority, refreshRunnerGithubCredentials } from "../../runner-token.js";
@@ -1786,16 +1787,19 @@ async function runSelectedInternalReviewers(params: {
     }
     let reviewEndedAt = new Date().toISOString();
     let reviewStageAttempt = 1;
+    let transientRetries = 0;
     let reviewStageClassified: FailureRecord | undefined;
     let invocationThrew = false;
     while (reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
-      reviewStageClassified = classifyLlmResult(reviewResult, {
+      reviewStageClassified = reviewResult.failure ?? classifyLlmResult(reviewResult, {
         stage,
         attempt: reviewResult.attempts ?? 1,
         expectsStructuredOutput: true,
         elapsedMs: reviewResult.telemetry?.durationMs ?? undefined,
       });
-      if (reviewStageClassified.category !== "transient" || reviewStageAttempt > params.retryPolicy.stageRetries) break;
+      const accountSwitched = reviewStageClassified.code === "ACCOUNT_USAGE_LIMIT"
+        && reviewStageClassified.accountFallback?.stage === "review";
+      if (!accountSwitched && (reviewStageClassified.category !== "transient" || transientRetries >= params.retryPolicy.stageRetries)) break;
       await params.reporter.report({
         id: `${reportId}.retry${reviewStageAttempt}`,
         type: "custom",
@@ -1808,7 +1812,10 @@ async function runSelectedInternalReviewers(params: {
         logs_url: null,
       });
       costUsd = addExtraCost(costUsd, reviewResult.telemetry?.costUsd);
-      await params.sleep(computeBackoffMs(reviewStageAttempt, params.retryPolicy));
+      if (!accountSwitched) {
+        transientRetries++;
+        await params.sleep(computeBackoffMs(transientRetries, params.retryPolicy));
+      }
       reviewStageAttempt++;
       reviewStartedAt = new Date().toISOString();
       try {
@@ -1866,7 +1873,7 @@ async function runSelectedInternalReviewers(params: {
 
     const reviewFailure = reviewFailureMessage(reviewResult);
     if (reviewFailure) {
-      const failure = classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
+      const failure = reviewResult.failure ?? classifyLlmResult(reviewResult, { stage, attempt: reviewResult.attempts ?? 1, expectsStructuredOutput: true, elapsedMs: reviewResult.telemetry?.durationMs ?? undefined });
       const telemetryPart = reviewResult.telemetry ? summaryLine(reviewResult.telemetry) : "no telemetry reported";
       const timedOut = isTimeBudget && reviewResult.failure?.code === "INVOCATION_TIMEOUT";
       const feedback = compactErrorMessage(timedOut
@@ -2735,16 +2742,39 @@ ${externalFindingsFixBlock}
       // commit the fix pass started from, reported as the cycle summary's `inputCommit`.
       const inputHead = leaseSha ? null : gitSpawn(["rev-parse", "HEAD"]);
       const fixCycleInputCommit = leaseSha ?? (inputHead?.exitCode === 0 && inputHead.stdout.trim() ? inputHead.stdout.trim() : null);
-      const fixResult = await context.llmExecutor.invoke({
-        prompt: fixPrompt,
+      const invokeFix = (continuation = false) => context.llmExecutor.invoke({
+        prompt: continuation ? `${fixPrompt}\n\n${IMPLEMENT_CONTINUATION_NOTE}` : fixPrompt,
         model,
         maxTurns: FIX_MAX_TURNS,
         stage: `post-push-review/fix-${iteration}`,
         agentStage: "implementation",
         expectsStructuredOutput: false,
       });
+      let fixResult = await invokeFix();
+      let fixAttempt = 1;
+      while (isLlmResultFailure(fixResult, false) && fixResult.failure?.code === "ACCOUNT_USAGE_LIMIT"
+        && fixResult.failure.accountFallback?.stage === "implementation") {
+        await reporter.report({
+          id: `post-push-review.fix-${iteration}.retry${fixAttempt++}`,
+          type: "custom",
+          status: "failed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: { failure: fixResult.failure, telemetry: fixResult.telemetry },
+          logs_url: null,
+        });
+        costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
+        fixResult = await invokeFix(true);
+      }
       costUsd = addExtraCost(costUsd, fixResult.telemetry?.costUsd);
-      if (fixResult.exitCode !== 0) {
+      const fixFailure = fixResult.failure ?? (isLlmResultFailure(fixResult, false) ? classifyLlmResult(fixResult, {
+        stage: `post-push-review/fix-${iteration}`, attempt: fixResult.attempts ?? 1, expectsStructuredOutput: false,
+      }) : null);
+      // Preserve partial work from exit-0 errors, except when usage-limit retries are exhausted.
+      if (fixResult.exitCode !== 0 || fixFailure?.code === "ACCOUNT_USAGE_LIMIT") {
+        if (fixFailure?.code === "ACCOUNT_USAGE_LIMIT") reviewerFailure = fixFailure;
         priorLlmFailure = true;
         terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
@@ -2771,7 +2801,7 @@ ${externalFindingsFixBlock}
           ended_at: new Date().toISOString(),
           parent_step_id: "post-push-review",
           inputs: { iteration, prNumber },
-          outputs: { error: failure, telemetry: fixResult.telemetry },
+          outputs: { error: failure, failure: fixFailure, telemetry: fixResult.telemetry },
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} fix-failed -->`;
