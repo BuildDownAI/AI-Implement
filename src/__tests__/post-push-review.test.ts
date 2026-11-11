@@ -7841,8 +7841,8 @@ describe("Claude GHA comment incident replays", () => {
 });
 
 describe("completed check comment finality", () => {
-  it.each(["approve", "late-created", "incomplete", "malformed", "incomplete-timeout", "malformed-timeout", "blocking", "pending", "unreadable", "stale"] as const)("waits for %s comment evidence", async (mode) => {
-    const approves = ["approve", "late-created", "incomplete", "malformed"].includes(mode);
+  it.each(["approve", "throw-recover", "throw-timeout", "late-created", "incomplete", "malformed", "incomplete-timeout", "malformed-timeout", "blocking", "pending", "unreadable", "stale"] as const)("waits for %s comment evidence", async (mode) => {
+    const approves = ["approve", "throw-recover", "late-created", "incomplete", "malformed"].includes(mode);
     const settles = approves || mode === "blocking";
     let reads = 0;
     let probing = false;
@@ -7855,6 +7855,11 @@ describe("completed check comment finality", () => {
         reads++;
         // A later status-comment lookup must not replace the final probe snapshot.
         if (reads > 2 && settles) return { stdout: "[]", exitCode: 0 };
+        if ((mode === "throw-timeout" && reads <= 4) || (mode === "throw-recover" && reads === 1)) {
+          // The 3-second budget permits four probes; later status lookups succeed.
+          probing = false;
+          throw new Error("comment read failed");
+        }
         if (mode === "unreadable") return { stdout: "unavailable", exitCode: 1 };
         const final = reads > 1 && !["pending", "incomplete-timeout", "malformed-timeout"].includes(mode);
         const intermediate = mode.startsWith("incomplete")
@@ -7875,7 +7880,10 @@ describe("completed check comment finality", () => {
     expect(out.approved).toBe(approves);
     expect(sleep).toHaveBeenCalled();
     if (settles) expect(reads).toBe(3);
-    else expect(out.terminationReason).toBe("external_review_pending");
+    else {
+      expect(reads).toBeGreaterThan(1);
+      expect(out.terminationReason).toBe("external_review_pending");
+    }
     if (mode === "blocking") expect(posted.join("\n")).toContain("Fix the regression");
   });
 });

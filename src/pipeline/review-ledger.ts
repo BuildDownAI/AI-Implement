@@ -769,7 +769,10 @@ function collectClaudeIssueComments(
       && isVerdictEligibleAuthor(comment, options)
       && !isAiImplementComment(comment.body)
       && /\*\*Claude is working[.…]/i.test(comment.body)
-      && (classified === null || classified.findingsUnavailable);
+      // Final review structure takes precedence over quoted tracker text,
+      // including when the final output is malformed or unrecognized.
+      && !hasClaudeReviewHeading(comment.body)
+      && classified === null;
     if (classified === null && !pending) continue;
     if (options.requireCurrentReview) {
       const created = Date.parse(typeof comment.created_at === "string" ? comment.created_at : "");
