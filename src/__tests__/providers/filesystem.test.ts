@@ -648,6 +648,26 @@ for (const planningEnabled of [true, false]) {
   });
 }
 
+it("discovers marked filesystem children across active and terminal states within their scope", async () => {
+  const directory = testDir("fs-review-discovery");
+  await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+  const mappings = { TEAM: mapping({ directory }), OTHER: mapping({ directory: testDir("fs-other") }) };
+  const p = provider(mappings);
+  const child = await p.createChildIssue("filesystem:TEAM:TEST-1", "TEAM", {
+    title: "[roll-up-review] acme/repo#1 " + "a".repeat(40) + " Fix blockers", body: "Blocking body",
+  });
+  await p.postComment(child.id, "Review handoff");
+  for (const terminal of [false, true]) {
+    if (terminal) await p.markMerged(child.id, "TEAM");
+    const page = await provider(mappings).listIssuesPage({ ...mappings.TEAM, teamKey: "TEAM" }, null, { titlePrefix: "[roll-up-review]" });
+    expect(page.pageInfo.hasNextPage).toBe(false);
+    expect(page.issues).toHaveLength(1);
+    expect(page.issues[0]).toMatchObject({ id: child.id, parent: { identifier: "TEST-1" },
+      description: "Blocking body", comments: { nodes: [expect.objectContaining({ body: "Review handoff" })] } });
+  }
+  expect((await p.listIssuesPage({ ...mappings.OTHER, teamKey: "OTHER" }, null)).issues).toEqual([]);
+});
+
 it("creates concurrent filesystem children without overwriting tasks", async () => {
   const directory = testDir("fs-child-concurrent");
   await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");

@@ -435,7 +435,7 @@ export class JiraProvider implements TicketingProvider {
 
     const fieldIds = await this.fields(scopeKey);
     const res = await this.client.searchJqlPage(
-      `(${cfg.jql})${filter ? ' AND summary ~ ' + JSON.stringify('"' + filter.titlePrefix.replace(/[\[\]]/g, "") + '"') : ""}`,
+      `(${cfg.jql})${filter ? ' AND summary ~ ' + JSON.stringify(filter.titlePrefix.replace(/[\[\]]/g, "")) : ""}`,
       [
         "summary", "description", "status", "labels", "project", "parent", "issuelinks", "comment",
         fieldIds.repoFieldId,

@@ -8,6 +8,10 @@ import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
 import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
+import { FilesystemProvider } from "../providers/filesystem.js";
+import { testDir } from "./helpers/test-dir.js";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { testDb } from "./helpers/test-db.js";
 
 // Mocked only for the "pre-launch failure releases the reservation" describe block below —
@@ -1615,11 +1619,13 @@ describe("poll implementation submission — ImplementationRun for every project
     const github = await import("../github.js");
     const mapping = jiraMapping("AII", { planningEnabled: true });
     store.upsertMapping("AII", mapping);
+    store.upsertMapping("OTHER", jiraMapping("OTHER"));
+    const unrelated = makeIssue({ id: "other-id", identifier: "OTHER-1", scopeKey: "OTHER" });
     const child = makeIssue({ ...issue, title: `[roll-up-review] ${mapping.owner}/${mapping.repo}#7 ${"a".repeat(40)} Fix blockers` });
     const provider = jiraProvider();
     let parked = false;
-    Object.assign(provider, { listIssuesPage: vi.fn(async () => ({
-      issues: [{ id: child.id, identifier: child.identifier, title: child.title,
+    Object.assign(provider, { listIssuesPage: vi.fn(async (mapping: RepoMapping) => ({
+      issues: mapping.teamKey === "OTHER" ? [] : [{ id: child.id, identifier: child.identifier, title: child.title,
         description: "body", parent: { identifier: "AII-1500" },
         state: { name: "Ready", type: "unstarted" }, labels: { nodes: [] },
         project: null, comments: { nodes: [] }, relations: { nodes: [] } }],
@@ -1633,7 +1639,7 @@ describe("poll implementation submission — ImplementationRun for every project
     });
     vi.mocked(provider.fetchAIImplementSnapshot).mockImplementation(async () => ({
       needsPlanning: !parked && kind === "planning" ? [child] : [],
-      readyForImplementation: !parked && kind === "implementation" ? [child] : [],
+      readyForImplementation: [...(!parked && kind === "implementation" ? [child] : []), unrelated],
       inProgressCountsByScope: {}, parentsToFinalize: [],
     }));
     vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
@@ -1650,10 +1656,35 @@ describe("poll implementation submission — ImplementationRun for every project
       expect(provider.parkForHuman).toHaveBeenCalledWith(child.id, "AII", "implementation");
       expect(provider.postComment).toHaveBeenCalledWith(child.id, expect.stringContaining("re-file this fix against the base branch"));
     } else {
-      expect(provider.fetchAIImplementSnapshot).not.toHaveBeenCalled();
+      expect(provider.fetchAIImplementSnapshot).toHaveBeenCalledTimes(1);
     }
     expect(planningIngress.submit).not.toHaveBeenCalled();
-    expect(implementationIngress.submit).not.toHaveBeenCalled();
+    expect(implementationIngress.submit).toHaveBeenCalledTimes(1);
+    expect(implementationIngress.submit.mock.calls[0][1].issueIdentifier).toBe("OTHER-1");
+  });
+
+  it.each([false, true, "reconciliation-failure"])("dispatches filesystem work with mixed providers=%s", async (mixed) => {
+    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    const directory = testDir("poll-filesystem");
+    await writeFile(join(directory, "LOCAL-1.md"), "---\ntitle: Local work\n---\nImplement local work");
+    store.upsertMapping("LOCAL", makeMapping({ ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory }, planningEnabled: false }));
+    const filesystem = new FilesystemProvider(store.getMappings);
+    const jira = jiraProvider();
+    if (mixed) {
+      store.upsertMapping("AII", jiraMapping("AII"));
+      vi.mocked(jira.fetchAIImplementSnapshot).mockResolvedValue({ needsPlanning: [],
+        readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [] });
+    }
+    if (mixed === "reconciliation-failure") {
+      vi.mocked(jira.listIssuesPage!).mockRejectedValue(new Error("Jira unavailable"));
+    }
+    await indexModule.poll(config, makeRegistry({ providers: { filesystem, jira }, mappings: store.getMappings() }));
+    expect(implementationIngress.submit.mock.calls.map(([, input]) => input.issueIdentifier).sort())
+      .toEqual(mixed === true ? ["AII-1555", "LOCAL-1"] : ["LOCAL-1"]);
   });
 
   it("skips unavailable Restate without admission or dedup", async () => {

@@ -25,6 +25,7 @@ import type {
   IssueLifecycleState,
   TicketIssue,
   TicketingProvider,
+  TrackerIssuePage,
 } from "./types.js";
 
 export type FilesystemStatus =
@@ -135,6 +136,22 @@ export class FilesystemProvider implements TicketingProvider {
     }
 
     return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize: [] };
+  }
+
+  async listIssuesPage(mapping: RepoMapping, _cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
+    const tasks = [...(await this.scanTasks()).values()].filter(task =>
+      task.issue.scopeKey === mapping.teamKey && (!filter || task.issue.title.startsWith(filter.titlePrefix)));
+    return {
+      issues: tasks.map(({ issue, state }) => ({
+        id: issue.id, identifier: issue.identifier, title: issue.title,
+        description: issue.description ?? null,
+        parent: state?.parentRef ?? null,
+        state: { name: issue.nativeStatus ?? "ready", type: state && TERMINAL.has(state.status) ? "completed" : "unstarted" },
+        labels: { nodes: [] }, project: null, relations: { nodes: [] },
+        comments: { nodes: (state?.comments ?? []).map(comment => ({ ...comment, user: null })) },
+      })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    };
   }
 
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {

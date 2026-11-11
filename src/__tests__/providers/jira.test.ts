@@ -1701,7 +1701,7 @@ describe("JiraProvider.listIssuesPage", () => {
     const fake = jira([page([])]);
     await provider("lip-filter").listIssuesPage(mapping(), null, { titlePrefix: "[roll-up-review]" });
     const search = fake.calls.find(call => call.url.pathname.includes("search/jql"));
-    expect(JSON.parse(search!.body).jql).toContain("AND summary ~ " + JSON.stringify('"roll-up-review"'));
+    expect(JSON.parse(search!.body).jql).toContain('AND summary ~ "roll-up-review"');
   });
 
   const full = {

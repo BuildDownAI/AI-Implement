@@ -292,7 +292,7 @@ a comment explaining that the tree merged first or closed and the fix should be
 re-filed against the base branch. The sweep runs before fetching planning and
 implementation pickup snapshots, so a child parked in this poll cannot be dispatched
 from a stale snapshot. Closure is also checked immediately after creation.
-Roll-up child reconciliation filters tracker queries by the review-child title marker. If a child’s lifecycle or roll-up PR state cannot be verified, or required parking fails, the poll skips pickup until reconciliation succeeds.
+Roll-up child reconciliation filters tracker queries by the review-child title marker. If a child’s lifecycle or roll-up PR state cannot be verified, or required parking fails, the poll skips planning and implementation pickup for that mapping until reconciliation succeeds; other mappings continue. Filesystem mappings discover marked children in active and archived tasks, retaining terminal children for the filing cap.
 The verdict remains advisory to merge gates: review-only results never write
 `review_findings`, dispositions, approval marks, or `LateExternalReview` submissions.
 Filing and parking emit `[roll-up-review]` log lines.
