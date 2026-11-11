@@ -138,6 +138,18 @@ describe("handleReferenceTokenRequest", () => {
     expect(repos).toContain("helper");
   });
 
+  it("asks GitHub for a repository saved with a .git suffix by its bare name, the only name a mint accepts", async () => {
+    const token = mintProgressToken();
+    mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_acme", expiresAt: "2030-01-01T00:00:00Z" });
+
+    await callHandler({
+      authorization: `Bearer ${token}`,
+      resolveMapping: () => mapping({ referenceRepos: [{ repo: "https://github.com/acme/docs.git", path: "refs/docs" }] }),
+    });
+
+    expect((mockGetScopedToken.mock.calls[0][3] as { repositories: string[] }).repositories).toEqual(["docs"]);
+  });
+
   it("returns authMode: public when app is not installed on an owner (404)", async () => {
     const { GitHubApiError } = await import("../github-errors.js");
     const token = mintProgressToken();
