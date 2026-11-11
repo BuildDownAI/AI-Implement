@@ -21,6 +21,37 @@ import { makeJob } from "./helpers/builders.js";
 
 const PR = "https://github.com/org/repo/pull/1";
 
+describe("classificationForFailure — code-specific next steps", () => {
+  const failure: FailureRecord = {
+    category: "config",
+    code: "PLAN_STATUS_WRITE_FAILED",
+    stage: "planning",
+    attempt: 1,
+    retryable: false,
+    message: "The tracker refused the Plan-Complete write. Grant the tracker permission to update issue status.",
+    evidence: { truncated: false },
+  };
+  const nextStep = "The tracker refused a write the plan needs. Fix the tracker setup that the message above names, then use Unpark at /admin#runners.";
+
+  it("gives plan status write failures tracker remediation", () => {
+    const classification = classificationForFailure(failure);
+    expect(classification.remediation).toBe(nextStep);
+    expect(classification.remediation).not.toMatch(/model id|env|config\.yml/i);
+  });
+
+  it("keeps the category remediation for other config failures", () => {
+    expect(classificationForFailure({ ...failure, code: "PROVIDER_CONFIG" }).remediation).toBe(
+      "The run configuration is invalid (model id, env). Fix the mapping or config.yml, then run it again.",
+    );
+  });
+
+  it("renders the tracker message and the code-specific next step", () => {
+    const rendered = renderFailureRecord(failure);
+    expect(rendered).toContain("```\n" + failure.message + "\n```");
+    expect(rendered).toContain(`**Next step:** ${nextStep}`);
+  });
+});
+
 // classifyCompletion only reads status/phase/conclusion/prUrl/failure, so those are the arguments.
 function jobOf(
   status: JobStatus,

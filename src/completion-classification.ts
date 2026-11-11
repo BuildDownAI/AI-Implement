@@ -27,6 +27,10 @@ const CATEGORY_NEXT_STEPS: Record<FailureCategory, string> = {
   unknown: "The failure could not be classified. Check the run logs.",
 };
 
+const CODE_NEXT_STEPS: Partial<Record<string, string>> = {
+  PLAN_STATUS_WRITE_FAILED: "The tracker refused a write the plan needs. Fix the tracker setup that the message above names, then use Unpark at /admin#runners.",
+};
+
 /** The ticket comment shows a short excerpt, never the whole (up to 8 KiB) tail — the drawer has the rest. */
 const EVIDENCE_MAX_LINES = 12;
 
@@ -382,7 +386,7 @@ export function classificationForFailure(
   return {
     summary: `❌ Failed at stage \`${failure.stage}\` — ${failure.category}/${failure.code}${attemptSuffix}`,
     detail: detailParts.join("\n\n"),
-    remediation: CATEGORY_NEXT_STEPS[failure.category],
+    remediation: CODE_NEXT_STEPS[failure.code] ?? CATEGORY_NEXT_STEPS[failure.category],
     docsUrl: TROUBLESHOOTING_URL,
     ...(runUrl ? { runUrl } : {}),
   };
