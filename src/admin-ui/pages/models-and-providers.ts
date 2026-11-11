@@ -109,8 +109,6 @@ export const modelsAndProvidersHtml = `
 
 export const modelsAndProvidersScript = `(function () {
   const MP_STAGES = ['planning', 'implementation', 'review'];
-  const MP_AGENTS = ['claude', 'codex'];
-  const MP_PROVIDERS = ['anthropic', 'bedrock', 'openai'];
   let mpDefaults = { mode: 'legacy', stages: {} };
   let mpAccounts = [];
   const mpAccountEdits = new Map();
@@ -164,15 +162,6 @@ export const modelsAndProvidersScript = `(function () {
     el.classList.toggle('hidden', !msg);
   }
 
-  function mpOptions(values, current, labelOf) {
-    let html = '<option value="">(inherit)</option>';
-    const all = values.slice();
-    if (current && all.indexOf(current) === -1) all.push(current);
-    for (const v of all) {
-      html += '<option value="' + window.escAttr(v) + '"' + (v === current ? ' selected' : '') + '>' + window.esc(labelOf ? labelOf(v) : v) + '</option>';
-    }
-    return html;
-  }
 
   function mpProfileSelect(stage, current) {
     const list = mpAccounts.filter(function (a) { return a.profileStatus === 'active'; });
@@ -212,16 +201,10 @@ export const modelsAndProvidersScript = `(function () {
     const list = document.querySelector('[data-account-list="' + stage + '"]');
     const profileId = list.querySelector('[data-field="accountProfileId"]').value;
     const profile = mpAccounts.find(function (a) { return a.profileId === profileId; });
+    const saved = (mpDefaults.stages || {})[stage] || {};
     for (const field of ['agent', 'provider']) {
-      const control = document.querySelector('#mp-stage-rows [data-stage="' + stage + '"][data-field="' + field + '"]');
-      if (profile) {
-        if (!control.hasAttribute('data-inherited-value')) control.setAttribute('data-inherited-value', control.value);
-        control.innerHTML = mpOptions(field === 'agent' ? MP_AGENTS : MP_PROVIDERS, profile[field]);
-      } else if (control.hasAttribute('data-inherited-value')) {
-        control.innerHTML = mpOptions(field === 'agent' ? MP_AGENTS : MP_PROVIDERS, control.getAttribute('data-inherited-value'));
-        control.removeAttribute('data-inherited-value');
-      }
-      control.disabled = !mpCanEdit() || !!profile;
+      const display = document.querySelector('#mp-stage-rows [data-stage="' + stage + '"][data-profile-field="' + field + '"]');
+      display.textContent = (profile ? profile[field] : saved[field]) || 'inherit';
     }
   }
 
@@ -229,7 +212,13 @@ export const modelsAndProvidersScript = `(function () {
     const stages = {};
     for (const stage of MP_STAGES) {
       mpSyncStageProfile(stage);
-      const patch = {};
+      const saved = (mpDefaults.stages || {})[stage] || {};
+      const firstProfileId = document.querySelector('[data-account-list="' + stage + '"] [data-field="accountProfileId"]').value;
+      const firstProfile = mpAccounts.find(function (a) { return a.profileId === firstProfileId; });
+      const patch = {
+        agent: (firstProfile ? firstProfile.agent : saved.agent) || null,
+        provider: (firstProfile ? firstProfile.provider : saved.provider) || null
+      };
       for (const el of document.querySelectorAll('#mp-stage-rows [data-stage="' + stage + '"][data-field]')) {
         if (el.closest('[data-account-row]')) continue;
         const field = el.getAttribute('data-field');
@@ -271,8 +260,8 @@ export const modelsAndProvidersScript = `(function () {
       const attr = 'data-stage="' + window.escAttr(stage) + '"';
       html += '<tr>' +
         '<td><span class="mono">' + window.esc(stage) + '</span></td>' +
-        '<td><select class="input" ' + attr + ' data-field="agent"' + dis + '>' + mpOptions(MP_AGENTS, sel.agent || '') + '</select></td>' +
-        '<td><select class="input" ' + attr + ' data-field="provider"' + dis + '>' + mpOptions(MP_PROVIDERS, sel.provider || '') + '</select></td>' +
+        '<td><span ' + attr + ' data-profile-field="agent"></span></td>' +
+        '<td><span ' + attr + ' data-profile-field="provider"></span></td>' +
         '<td><input class="input" ' + attr + ' data-field="fallbackModel" aria-label="Fallback model for ' + window.escAttr(stage) + '" value="' + window.escAttr(sel.fallbackModel || '') + '" placeholder="none"' + dis + '><div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div></td>' +
         '<td><div data-account-list="' + window.escAttr(stage) + '"></div><button class="btn btn-sm" data-account-action="add" data-stage="' + window.escAttr(stage) + '"' + dis + '>Add account</button></td>' +
         '<td><input class="input" type="number" min="1" step="1" ' + attr + ' data-field="invocationTimeoutMs" value="' + window.escAttr(limit) + '" placeholder="inherit"' + dis + '></td>' +
