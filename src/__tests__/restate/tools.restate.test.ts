@@ -1,3 +1,4 @@
+import { createModelProtectedSecrets } from "../../model-protected-secrets.js";
 import { getOrchestratorDefaults } from "../../agent-config-store.js";
 import { createSession } from "../../admin-session.js";
 import { handleAdminRequest } from "../../admin.js";
@@ -973,6 +974,12 @@ describe("orchestratorTools (Restate)", () => {
       process.env.RUNNER_TOKEN_SECRET = "test-environment-import-secret";
       const first = await invoke();
       expect(JSON.parse(first.content![0]!.text)).toMatchObject({ status: 201, body: { result: "created", profileId: "adopted-env-claude-subscription" } });
+      const store = createModelProtectedSecrets({ env: process.env });
+      expect(store.delete(ref).ok).toBe(true);
+      expect(store.open(ref).ok).toBe(false);
+      const repaired = await invoke();
+      expect(JSON.parse(repaired.content![0]!.text)).toMatchObject({ status: 201, body: { result: "created" } });
+      expect(store.resolve(ref)).toBe(token);
       const second = await invoke();
       expect(JSON.parse(second.content![0]!.text)).toMatchObject({ status: 200, body: { result: "already-imported" } });
       expect((await invoke({ kind: "human", email: "user@example.com", role: "user", grants: [] })).isError).toBe(true);
@@ -1000,8 +1007,8 @@ describe("orchestratorTools (Restate)", () => {
       // Prove the absence checks searched the decoded import result, not an empty journal.
       expect(journals.join("\n")).toContain("adopted-env-claude-subscription");
       expect(journals.join("\n")).toContain("import-environment-credential");
-      expect(JSON.stringify([first, second, body])).not.toContain(token);
-      expect(JSON.stringify([first, second, body])).not.toContain(ref);
+      expect(JSON.stringify([first, repaired, second, body])).not.toContain(token);
+      expect(JSON.stringify([first, repaired, second, body])).not.toContain(ref);
       const metadata = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools/handlers/import_environment_credential`).then(r => r.json());
       expect(metadata).toMatchObject({ retry_policy: { max_attempts: 1, on_max_attempts: "Kill" } });
     } finally {
