@@ -205,9 +205,27 @@ export const modelsAndProvidersScript = `(function () {
     });
   }
 
+  function mpSyncStageProfile(stage) {
+    const list = document.querySelector('[data-account-list="' + stage + '"]');
+    const profileId = list.querySelector('[data-field="accountProfileId"]').value;
+    const profile = mpAccounts.find(function (a) { return a.profileId === profileId; });
+    for (const field of ['agent', 'provider']) {
+      const control = document.querySelector('#mp-stage-rows [data-stage="' + stage + '"][data-field="' + field + '"]');
+      if (profile) {
+        if (!control.hasAttribute('data-inherited-value')) control.setAttribute('data-inherited-value', control.value);
+        control.innerHTML = mpOptions(field === 'agent' ? MP_AGENTS : MP_PROVIDERS, profile[field]);
+      } else if (control.hasAttribute('data-inherited-value')) {
+        control.innerHTML = mpOptions(field === 'agent' ? MP_AGENTS : MP_PROVIDERS, control.getAttribute('data-inherited-value'));
+        control.removeAttribute('data-inherited-value');
+      }
+      control.disabled = !mpCanEdit() || !!profile;
+    }
+  }
+
   function mpReadForm() {
     const stages = {};
     for (const stage of MP_STAGES) {
+      mpSyncStageProfile(stage);
       const patch = {};
       for (const el of document.querySelectorAll('#mp-stage-rows [data-stage="' + stage + '"][data-field]')) {
         if (el.closest('[data-account-row]')) continue;
@@ -264,6 +282,7 @@ export const modelsAndProvidersScript = `(function () {
       const accounts = sel.accounts && sel.accounts.length ? sel.accounts : [{ accountProfileId: sel.accountProfileId, model: sel.model }];
       accounts.forEach(function (entry) { list.appendChild(mpAccountRow(stage, entry)); });
       mpUpdateAccountButtons(list);
+      mpSyncStageProfile(stage);
     }
     document.getElementById('mp-stage-hints').textContent = hints.join(' ');
     document.getElementById('mp-stage-actions').classList.toggle('hidden', !edit);
@@ -273,9 +292,27 @@ export const modelsAndProvidersScript = `(function () {
       : 'Defaults are saved but off (legacy). Turn them on in Settings.';
   }
 
+  // Refresh profile choices in place so credential imports and polling preserve unsaved account order and models.
+  function mpRerenderWithCompat() {
+    for (const stage of MP_STAGES) {
+      const list = document.querySelector('[data-account-list="' + stage + '"]');
+      if (!list) continue;
+      for (const select of list.querySelectorAll('[data-field="accountProfileId"]')) {
+        const holder = document.createElement('div');
+        holder.innerHTML = mpProfileSelect(stage, select.value);
+        select.innerHTML = holder.firstElementChild.innerHTML;
+      }
+      mpSyncStageProfile(stage);
+    }
+  }
+
   function mpWatchDirty() {
     const rowsEl = document.getElementById('mp-stage-rows');
-    rowsEl.oninput = rowsEl.onchange = function () { mpDirty = true; };
+    rowsEl.oninput = rowsEl.onchange = function (event) {
+      const stage = event.target.getAttribute('data-stage');
+      if (stage) mpSyncStageProfile(stage);
+      mpDirty = true;
+    };
     rowsEl.onclick = function (event) {
       const button = event.target.closest('[data-account-action]');
       if (!button || button.disabled || !mpCanEdit()) return;
@@ -287,6 +324,7 @@ export const modelsAndProvidersScript = `(function () {
       if (action === 'up' && row.previousElementSibling) list.insertBefore(row, row.previousElementSibling);
       if (action === 'down' && row.nextElementSibling) list.insertBefore(row.nextElementSibling, row);
       mpUpdateAccountButtons(list);
+      mpSyncStageProfile(list.getAttribute('data-account-list'));
       mpDirty = true;
     };
   }
@@ -537,7 +575,7 @@ export const modelsAndProvidersScript = `(function () {
         accountErr.classList.remove('hidden');
       }
       mpRenderAccounts();
-      if (mpDirty && !force) return;
+      if (mpDirty && !force) { mpRerenderWithCompat(); return; }
       const defRes = await window.api('/api/agent-defaults');
       if (defRes.ok) {
         if (mpDirty && !force) return;
