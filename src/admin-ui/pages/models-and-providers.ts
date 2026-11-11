@@ -52,7 +52,7 @@ export const modelsAndProvidersHtml = `
         <div style="overflow-x:auto">
         <table class="tbl">
           <thead>
-            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Profile</th><th>Readiness</th><th>API key</th></tr>
+            <tr><th>Name</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Status</th><th>Readiness</th><th>API key</th></tr>
           </thead>
           <tbody id="mp-account-rows"></tbody>
         </table>
@@ -63,8 +63,7 @@ export const modelsAndProvidersHtml = `
         <div id="mp-account-form" class="hidden" style="padding:12px">
           <h3 style="font-size:13px;margin:0 0 6px">Add account profile</h3>
           <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-profileId">Profile ID</label><input class="input" id="mp-new-profileId" placeholder="profileId"></span>
-            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-identity">Identity</label><input class="input" id="mp-new-identity" placeholder="identity"></span>
+            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-name">Name</label><input class="input" id="mp-new-name" placeholder="Name"></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-agent">Agent</label><select class="input" id="mp-new-agent"><option value="claude">claude</option><option value="codex">codex</option></select></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-provider">Provider</label><select class="input" id="mp-new-provider"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="bedrock">bedrock</option></select></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-authMode">Authentication</label><select class="input" id="mp-new-authMode"><option value="anthropic-api-key">anthropic-api-key</option><option value="openai-api-key">openai-api-key</option><option value="codex-subscription">codex-subscription</option><option value="claude-subscription">claude-subscription</option><option value="bedrock">bedrock</option></select></span>
@@ -109,6 +108,19 @@ export const modelsAndProvidersScript = `(function () {
   const MP_PROVIDERS = ['anthropic', 'bedrock', 'openai'];
   let mpDefaults = { mode: 'legacy', stages: {} };
   let mpAccounts = [];
+  const mpAccountEdits = new Map();
+
+  function mpProfileIdFromName(name, existingIds) {
+    const base = String(name).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'account';
+    let id = base;
+    let n = 2;
+    while (existingIds.indexOf(id) !== -1) {
+      const suffix = '-' + n++;
+      id = base.slice(0, 64 - suffix.length) + suffix;
+    }
+    return id;
+  }
+
   // The pairing code lives only here: it is never written to storage and loadStageConfig does not re-render it.
   let mpPairing = null;
   let mpDirty = false;
@@ -297,13 +309,24 @@ export const modelsAndProvidersScript = `(function () {
       if (a.authMode === 'codex-subscription' && a.profileStatus === 'active' && mpCanEdit()) {
         keyCell = '<button class="btn btn-sm" data-act="pair" data-profile="' + window.escAttr(a.profileId) + '">Connect ChatGPT plan</button>';
       }
+      const draft = mpCanEdit() && mpAccountEdits.get(a.profileId);
+      const pid = window.escAttr(a.profileId);
+      const action = function (act, text) { return '<button class="btn btn-sm" data-act="' + window.escAttr(act) + '" data-profile="' + pid + '">' + window.esc(text) + '</button>'; };
+      const nameCell = draft
+        ? '<input class="input" aria-label="Name" data-edit-name="' + pid + '" value="' + window.escAttr(draft.identity) + '">'
+        : window.esc(a.identity);
+      const statusCell = draft
+        ? '<select class="input" aria-label="Status" data-edit-status="' + pid + '">' + ['active', 'disabled', 'archived'].map(function (status) {
+            return '<option value="' + window.escAttr(status) + '"' + (status === draft.status ? ' selected' : '') + '>' + window.esc(status) + '</option>';
+          }).join('') + '</select>'
+        : '<span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span>';
       html += '<tr>' +
-        '<td><span class="mono">' + window.esc(a.profileId) + '</span></td>' +
-        '<td>' + window.esc(a.identity) + '</td>' +
+        '<td>' + nameCell + '<div class="mono text-tertiary" style="font-size:11px">' + window.esc(a.profileId) + '</div>' +
+          (mpCanEdit() ? '<div>' + (draft ? action('save-profile', 'Save') + action('cancel-profile', 'Cancel') : action('edit-profile', 'Edit')) + '</div>' : '') + '</td>' +
         '<td>' + window.esc(a.agent) + '</td>' +
         '<td>' + window.esc(a.provider) + '</td>' +
         '<td>' + window.esc(mpAuthLabel(a.authMode)) + '</td>' +
-        '<td><span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span></td>' +
+        '<td>' + statusCell + '</td>' +
         '<td>' + readyCell + '</td>' +
         '<td>' + keyCell + '</td>' +
         '</tr>';
@@ -406,7 +429,8 @@ export const modelsAndProvidersScript = `(function () {
     if (!mpCanEdit()) return;
     mpAccountError('');
     const val = function (id) { return String(document.getElementById('mp-new-' + id).value || '').trim(); };
-    const body = { profileId: val('profileId'), identity: val('identity'), agent: val('agent'), provider: val('provider'), authMode: val('authMode') };
+    const name = val('name');
+    const body = { profileId: mpProfileIdFromName(name, mpAccounts.map(function (a) { return a.profileId; })), identity: name, agent: val('agent'), provider: val('provider'), authMode: val('authMode') };
     try {
       const res = await window.api('/api/model-accounts', { method: 'POST', body: JSON.stringify(body) });
       if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to add account profile')); return; }
@@ -414,12 +438,38 @@ export const modelsAndProvidersScript = `(function () {
       mpAccountError('Failed to add account profile');
       return;
     }
-    document.getElementById('mp-new-profileId').value = '';
-    document.getElementById('mp-new-identity').value = '';
+    document.getElementById('mp-new-name').value = '';
+    await loadStageConfig(false);
+  }
+
+  async function mpSaveProfile(profileId) {
+    const draft = mpAccountEdits.get(profileId);
+    if (!draft || draft.saving) return;
+    const body = {};
+    if (draft.identity !== draft.originalIdentity) body.identity = draft.identity;
+    if (draft.status !== draft.originalStatus) body.status = draft.status;
+    mpAccountError('');
+    if (Object.keys(body).length) {
+      draft.saving = true;
+      try {
+        const res = await window.api('/api/model-accounts/' + encodeURIComponent(profileId), { method: 'PATCH', body: JSON.stringify(body) });
+        if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to update account profile')); return; }
+      } catch (_) { mpAccountError('Failed to update account profile'); return; }
+      finally { draft.saving = false; }
+    }
+    mpAccountEdits.delete(profileId);
     await loadStageConfig(false);
   }
 
   function mpWatchKeys() {
+    const updateDraft = function (e) {
+      const nameId = e.target.getAttribute('data-edit-name');
+      const statusId = e.target.getAttribute('data-edit-status');
+      const draft = mpAccountEdits.get(nameId || statusId);
+      if (draft && !draft.saving) draft[nameId !== null ? 'identity' : 'status'] = e.target.value;
+    };
+    document.getElementById('mp-account-rows').oninput = updateDraft;
+    document.getElementById('mp-account-rows').onchange = updateDraft;
     document.getElementById('mp-pairing').onclick = function (e) {
       const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
       if (!btn) return;
@@ -429,11 +479,21 @@ export const modelsAndProvidersScript = `(function () {
     };
     document.getElementById('mp-account-rows').onclick = async function (e) {
       const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
-      if (!btn) return;
+      if (!btn || !mpCanEdit()) return;
       const profileId = btn.getAttribute('data-profile');
       const act = btn.getAttribute('data-act');
+      if (act === 'edit-profile') {
+        const a = mpAccounts.find(function (a) { return a.profileId === profileId; });
+        if (!a) return;
+        mpAccountEdits.set(profileId, { identity: a.identity, status: a.profileStatus, originalIdentity: a.identity, originalStatus: a.profileStatus });
+        mpRenderAccounts();
+        return;
+      }
+      if (act === 'cancel-profile') { mpAccountEdits.delete(profileId); mpAccountError(''); mpRenderAccounts(); return; }
+      if (act === 'save-profile') { await mpSaveProfile(profileId); return; }
       if (act === 'pair') { await mpPairingMint(profileId); return; }
       if (act === 'remove-key') { await mpCredentialCall(profileId, 'DELETE'); return; }
+      if (act !== 'set-key') return;
       const inputs = document.querySelectorAll('#mp-account-rows input[data-key-for]');
       let input = null;
       for (const el of inputs) { if (el.getAttribute('data-key-for') === profileId) input = el; }
@@ -445,7 +505,6 @@ export const modelsAndProvidersScript = `(function () {
   }
 
   async function loadStageConfig(force) {
-    if (mpDirty && !force) return;
     const accountErr = document.getElementById('mp-account-error');
     accountErr.classList.add('hidden');
     try {
@@ -457,6 +516,8 @@ export const modelsAndProvidersScript = `(function () {
         accountErr.textContent = await mpErrorText(accRes, 'Failed to load account profiles');
         accountErr.classList.remove('hidden');
       }
+      mpRenderAccounts();
+      if (mpDirty && !force) return;
       const defRes = await window.api('/api/agent-defaults');
       if (defRes.ok) {
         if (mpDirty && !force) return;
@@ -509,7 +570,7 @@ export const modelsAndProvidersScript = `(function () {
     const subtitleEl = document.getElementById('mp-subtitle');
 
     errorEl.hidden = true;
-    loadStageConfig(false);
+    await loadStageConfig(false);
 
     const res = await window.api('/api/mappings');
     if (!res.ok) {
@@ -598,6 +659,7 @@ export const modelsAndProvidersScript = `(function () {
   window.loadModelsAndProviders = loadModelsAndProviders;
   window.saveStageDefaults = saveStageDefaults;
   window.mpAddAccount = mpAddAccount;
+  window.mpProfileIdFromName = mpProfileIdFromName;
   window.resetStageDefaults = resetStageDefaults;
   window.registerPage('models', function () { mpWatchDirty(); mpWatchKeys(); loadModelsAndProviders(); setInterval(loadModelsAndProviders, 60000); });
 })();`;

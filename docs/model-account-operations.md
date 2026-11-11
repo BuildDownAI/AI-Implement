@@ -7,15 +7,24 @@ machine as `node dist/model-account-cli.js <command> --profile <id>`.
 
 ## Add an account profile
 
-On Models & providers an admin adds a profile with the form (`POST /api/model-accounts`). Add the profile first, then set its key or connect its plan account ([API credentials](#api-credentials), [ChatGPT plan accounts](#chatgpt-plan-accounts)). The form has six fields:
+On Models & providers an admin adds a profile with the form (`POST /api/model-accounts`). Add the profile first, then set its key or connect its plan account ([API credentials](#api-credentials), [ChatGPT plan accounts](#chatgpt-plan-accounts)). The form asks for:
 
 | Field | Meaning |
 |---|---|
-| Profile ID | The profile's name. Use lowercase letters, digits, `.`, `_` or `-`. The create route also accepts uppercase, but the fallback API-key reference `model-account:<profileId>` is lowercase-only (`MODEL_ACCOUNT_REF_PATTERN`, `src/model-credentials.ts`), so a mixed-case id cannot take a key unless the profile has its own `credentialRef` |
-| Identity | A label for the account behind the profile |
+| Name | A label for the account behind the profile, stored as `identity`. Nothing at run time depends on it, and it can be changed later |
 | Agent | `claude` or `codex` |
 | Provider | `anthropic`, `openai` or `bedrock` |
 | Authentication | `anthropic-api-key`, `openai-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
+
+The page makes the profile ID from the Name: lowercase, each run outside `[a-z0-9._-]` replaced by `-`, leading and trailing hyphens removed, then leading punctuation removed so the ID starts with a letter or digit. It cuts the result to 64 characters and uses `account` when nothing is left. When an ID is loaded already, it adds `-2`, `-3`, …, shortening the base so the entire ID stays within 64 characters. If another admin creates the same ID before submission, the form shows the route's error message.
+
+The ID is the profile's key and never changes. A caller of the route itself sends its own `profileId`; use lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit, because the fallback reference `model-account:<profileId>` is lowercase-only (`MODEL_ACCOUNT_REF_PATTERN`, `src/model-credentials.ts`).
+
+## Edit an account profile
+
+The table reads Name, Agent, Provider, Authentication, Status, Readiness and API key, with the immutable profile ID below the Name. For an admin, **Edit** changes the Name and status (`active`, `disabled` or `archived`); **Save** sends only changed `identity` and `status` fields to `PATCH /api/model-accounts/:id`, and **Cancel** discards the edit. Non-admins have no Edit action or add form. Stage edits and unsubmitted keys survive account refreshes.
+
+The admin-only route may accept `identity`, `agent`, `provider`, `authMode`, `credentialRef` and `status`; any other key is a 400. It copies the current head, applies the body, and saves a new revision (`handlePatchModelAccount`, `src/admin.ts`). The credential reference is kept unless the body sets `credentialRef` to `null`. The profile ID is the path and cannot change: stage defaults, credential references and run attribution store it. The same validation as create applies (`validateProfileInput`, `src/agent-config-store.ts`).
 
 - **Readiness.** Credential readiness comes from the profile's own credential status (`accountStatus`, `src/admin.ts`), whether or not any project uses it. Every active profile is usable by every project; disable or archive a profile to stop its use.
 - **Every stage needs a profile.** A project that opts into configured runs needs a usable profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown, disabled or archived profile, or one whose agent or provider does not match the stage, throws. A project that wants Codex only for review must still give planning and implementation a profile.
