@@ -166,7 +166,11 @@ The admin tool `import_environment_credential` (no arguments, through MCP or
 `POST /api/tools/import_environment_credential` with `{ "args": {} }`) imports the
 credential as an ordinary account profile named `Adopted environment credential`.
 It does not change stage defaults, project grants, or project opt-ins. Repeating
-the import returns `already-imported` without writing.
+the import returns `already-imported` (200) without writing when the stored
+credential opens. If the stored credential is missing or unreadable, the tool
+reseals the value from the current orchestrator environment and returns `created`
+(201), as it does for a new import. Responses contain neither the credential
+value nor its stored reference.
 
 To also configure stage defaults, run `node dist/model-account-cli.js adopt-env`
 on the orchestrator with no arguments.
@@ -194,10 +198,13 @@ is `configured`, and all three stages name the adopted profile. Projects still
 need their own explicit opt-in. To roll back, revert the defaults and delete the
 profile on Models & providers; remove its encrypted credential with `secret-delete`
 if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
-with `secret-import` or the profile's credential editor. The one-time
-`import_environment_credential` tool does not repair existing credentials.
-When replacing legacy defaults, `adopt-env` repairs a missing or unreadable
-credential from the environment before configuring the stages.
+with `secret-import`, the profile's credential editor, or
+`import_environment_credential` when the credential is still available in the
+orchestrator environment. The tool and `adopt-env` share the same import and
+repair logic. When replacing legacy defaults, `adopt-env` repairs a missing or
+unreadable credential from the environment before configuring the stages;
+already configured defaults remain a no-op, so use the tool to repair their
+credential.
 
 ## Adopting existing projects
 

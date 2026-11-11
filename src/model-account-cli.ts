@@ -235,11 +235,12 @@ export function importEnvironmentCredential(env: NodeJS.ProcessEnv, secrets: Mod
         profileId, identity: "Adopted environment credential", revision: 1,
         agent: "claude", provider: "anthropic", authMode, metadata: { credentialRef: ref },
       });
-      if (!profile) {
+      const needsWrite = !profile || !secrets.open(ref).ok;
+      if (needsWrite) {
         const result = secrets.write(ref, value);
         if (!result.ok) throw new EnvironmentCredentialError(result.code === "key_unavailable" ? 503 : 500, SECRET_FAILURES[result.code]);
       }
-      return { profileId, authMode, result: profile ? "already-imported" as const : "created" as const, keyIgnored: Boolean(token && key) };
+      return { profileId, authMode, result: needsWrite ? "created" as const : "already-imported" as const, keyIgnored: Boolean(token && key) };
     }).immediate();
   } catch (error) {
     if (error instanceof EnvironmentCredentialError) throw error;
@@ -261,14 +262,7 @@ function adoptEnv(deps: CliDeps): void {
       return existing.config;
     }
     const secrets = deps.secrets();
-    const { profileId, keyIgnored, result } = importEnvironmentCredential(deps.env, secrets);
-    // The one-time tool import never rewrites an existing credential. The CLI
-    // also repairs unreadable credentials before switching legacy defaults.
-    const ref = `model-account:${profileId}`;
-    if (result === "already-imported" && !secrets.open(ref).ok) {
-      const written = secrets.write(ref, (deps.env.CLAUDE_CODE_OAUTH_TOKEN || deps.env.ANTHROPIC_API_KEY)!);
-      if (!written.ok) throw new CliError(SECRET_FAILURES[written.code]);
-    }
+    const { profileId, keyIgnored } = importEnvironmentCredential(deps.env, secrets);
     const stage = { agent: "claude" as const, provider: "anthropic" as const, model: DEFAULT_MODEL,
       accountProfileId: profileId, invocationTimeoutMs: 90 * 60 * 1000 };
     const defaults: StageAgentConfigurationV1 = { version: 1, mode: "configured",

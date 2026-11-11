@@ -410,16 +410,19 @@ describe("importEnvironmentCredential", () => {
     if (status !== 201) { expect(snapshot()).toEqual(before); expect(write).not.toHaveBeenCalled(); }
     expect(accounts.getOrchestratorDefaults()).toBeNull();
   });
-  it.each(["missing", "undecryptable"])("does not rewrite a previously imported %s secret", failure => {
+  it.each(["missing", "undecryptable"])("repairs a previously imported %s secret", failure => {
     cli.importEnvironmentCredential(base, protectedSecrets.createModelProtectedSecrets({ env: base }));
     const env = failure === "undecryptable" ? { ...base, RUNNER_TOKEN_SECRET: "rotated-secret" } : base;
     const store = protectedSecrets.createModelProtectedSecrets({ env });
     const ref = "model-account:adopted-env-claude-subscription";
     if (failure === "missing") store.delete(ref);
-    const write = vi.spyOn(store, "write");
-    expect(cli.importEnvironmentCredential(env, store).result).toBe("already-imported");
-    expect(write).not.toHaveBeenCalled();
     expect(store.open(ref).ok).toBe(false);
+    const revisions = dedup.getDb().prepare("SELECT * FROM model_account_profile_revisions").all();
+    const write = vi.spyOn(store, "write");
+    expect(cli.importEnvironmentCredential(env, store).result).toBe("created");
+    expect(write).toHaveBeenCalledExactlyOnceWith(ref, token);
+    expect(store.resolve(ref)).toBe(token);
+    expect(dedup.getDb().prepare("SELECT * FROM model_account_profile_revisions").all()).toEqual(revisions);
   });
 
   it("sanitizes secret-bearing storage exceptions and rolls back the profile", () => {
