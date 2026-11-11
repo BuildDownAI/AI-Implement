@@ -6,6 +6,7 @@ import {
   deriveLastSuccessfulStage,
   monitorFailureCommentPrefix,
   renderClassification,
+  renderFailureRecord,
   sensitiveFilesGuardrailClassification,
   shouldPostMonitorClassificationComment,
   TROUBLESHOOTING_URL,
@@ -780,5 +781,23 @@ describe("classificationForFailure — terminal error evidence", () => {
     const baseline = classificationForFailure({ ...failure, evidence: { ...evidence, llmErrorMessage: "" } }).detail;
     expect(detail).toBe(baseline);
     expect(detail).toContain("```\n" + expected + "\n```");
+  });
+});
+
+
+describe("ACCOUNT_USAGE_LIMIT notice", () => {
+  it.each(["implement", "feedback-loop/review-2", "planning"])("renders usage-limit advice for %s", (stage) => {
+    const failure: FailureRecord = {
+      category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage, attempt: 1, retryable: false,
+      message: "usage limit reached",
+      evidence: { truncated: false, llmErrorMessage: "hit your usage limit", stderrTail: "unrelated warning" },
+    };
+    const rendered = renderFailureRecord(failure);
+    expect(rendered).toContain(`🟠 The model account reached its usage limit during ${stage}.`);
+    expect(rendered).toContain("The account reached its usage limit. Add a fallback account for this stage on Models & providers, or run it again after the limit resets.");
+    expect(rendered).toContain("```\nhit your usage limit\n```");
+    expect(rendered).not.toContain("unrelated warning");
+    expect(rendered).not.toContain("A credential expired or was rejected");
+    expect(rendered).not.toContain("Check the GitHub App and provider keys");
   });
 });

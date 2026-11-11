@@ -100,6 +100,12 @@ function matchSignature(table: SignatureRow[], text: string): { category: Failur
  * the classify* functions directly rather than as rows here.
  */
 export const PROVIDER_SIGNATURES: SignatureRow[] = [
+  // Account exhaustion must win over accompanying rate-limit statuses (e.g. 429).
+  {
+    category: "auth",
+    code: "ACCOUNT_USAGE_LIMIT",
+    test: /usage limit reached|reached your weekly usage limit|hit your usage limit|usage_limit_reached|workspace_member_usage_limit_reached|reached their Subscription Sharing usage limit/i,
+  },
   {
     category: "transient",
     code: "PROVIDER_OVERLOADED",
