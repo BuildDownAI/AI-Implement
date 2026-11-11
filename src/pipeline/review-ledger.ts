@@ -59,7 +59,7 @@ export interface ReviewLedgerOptions {
   extraAuthors: readonly string[];
   /** When set, a review thread whose latest comment was written on another commit is not a finding. */
   headSha?: string;
-  /** Require top-level comments created during the single review check on the resolved head. */
+  /** Require top-level comments created since the single review check on the resolved head started. */
   requireCurrentReview?: boolean;
   reviewWindow?: { startedAt: string; completedAt: string };
   /** A successful `issues/{pr}/comments` read the caller already made; when set, the readers reuse it instead of fetching again. */
@@ -757,8 +757,9 @@ function collectClaudeIssueComments(
     return;
   }
   // Top-level Claude review comments are revision verdicts, not an append-only ledger.
-  // A check window binds newly created comments to this head; updated_at only orders
-  // revisions inside that window, never promotes an older head's edited approval.
+  // The current head's check start binds newly created comments to this head.
+  // Publication and tracker edits may follow check completion; updated_at only
+  // orders revisions and never promotes an older head's edited approval.
   // Formal CHANGES_REQUESTED reviews and unresolved threads remain independently collected.
   for (const comment of comments) {
     if (!isRecord(comment)) continue;
@@ -773,9 +774,7 @@ function collectClaudeIssueComments(
     if (options.requireCurrentReview) {
       const created = Date.parse(typeof comment.created_at === "string" ? comment.created_at : "");
       if (!Number.isFinite(created)) { out.findingsUnavailable = true; return; }
-      if (created < start || created > end) continue;
-      // An edit after this check finished cannot be attributed to that review.
-      if (reviewCommentTimestamp(comment) > end) { out.findingsUnavailable = true; return; }
+      if (created < start) continue;
     }
 
     if (pending) {

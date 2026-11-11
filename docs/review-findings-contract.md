@@ -254,7 +254,10 @@ finish sooner return as soon as a poll sees completion.
 For `ai-implement`, a completed check also probes the trusted current-review
 comment. A standalone “Claude is working…” tracker keeps the wait pending; a
 combined tracker and readable final review counts as final. Missing comments
-and failed comment reads retry within the same budget. A newer trusted tracker
+and failed comment reads, incomplete verdicts, and temporarily unparseable reviews
+retry within the same budget. Comments must be created since the current head’s
+check started; final publication or tracker edits may follow check completion.
+Editing a comment created before that check cannot make it current. A newer trusted tracker
 supersedes an older verdict; foreign authors cannot supply either state.
 
 The wait preserves these outcomes:

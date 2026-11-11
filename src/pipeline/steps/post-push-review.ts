@@ -820,7 +820,8 @@ function probeExternalReviewCheck(
     const comment = collectClaudeReviewCommentFromGh(ghSpawn, prNumber, {
       process, extraAuthors: opts.extraAuthors, requireCurrentReview: true, reviewWindow, issueComments,
     });
-    return { state: comment.reviewPending ? "running" : "completed", reviewWindow, issueComments };
+    const pending = comment.reviewPending || comment.findingsUnavailable || comment.verdict === "incomplete";
+    return { state: pending ? "running" : "completed", reviewWindow, issueComments };
   }
   // Every matching run is completed but none produced a real verdict. Return "no-real-verdict" so
   // the caller can fail closed immediately rather than approving as if no check existed.
