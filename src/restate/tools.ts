@@ -72,7 +72,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
-  grants: z.array(z.literal("deploy")).readonly().default([]),
+  grants: z.array(z.enum(["deploy", "projects"])).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -93,7 +93,7 @@ interface ToolOptions<I extends z.ZodType> {
   input: I;
   role: AccessRole;
   /** Alternate authority, accepted only by tools that explicitly request it. */
-  grant?: "deploy";
+  grant?: "deploy" | "projects";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -1532,6 +1532,7 @@ export const setProjectAgentModeTool = tool(
   {
     description: "Change a project's agent mode to configured or legacy without readiness inspection. Refusals: mapping-not-found, resolution-failed.",
     input: SetProjectAgentModeArgsSchema,
+    grant: "projects",
     role: "admin",
     operation: "write",
     retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },

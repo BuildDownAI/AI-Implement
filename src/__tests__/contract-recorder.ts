@@ -121,7 +121,7 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
     callTool: async (name, args, caller) => {
       expect(caller).toEqual({
         kind: "service", email: null, role: "user",
-        grants: (opts?.scope ?? "orchestrator:read").split(" ").includes("orchestrator:deploy") ? ["deploy"] : [],
+        grants: ["deploy", "projects"].filter((grant) => (opts?.scope ?? "orchestrator:read").split(" ").includes(`orchestrator:${grant}`)),
       });
       return callTool(name, args, caller, {
         restateReady: () => true,
