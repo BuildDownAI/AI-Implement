@@ -712,3 +712,15 @@ describe("ImplementationRun gap-fill ingress", () => {
     expect(queue.getCommentGapfillItem(id)?.status).toBe("pending");
   });
 });
+
+it("selects integration-review plus deduplicated effective gating reviewers only for the synthetic commenter", () => {
+  expect(drain.rollupReviewMode("sam", makeMapping())).toBeUndefined();
+  const mode = drain.rollupReviewMode(queue.ROLLUP_REVIEW_COMMENTER, makeMapping());
+  expect(mode?.reviewers).toContainEqual({ id: "integration-review", gates: true });
+  expect(mode?.reviewers.length).toBeGreaterThan(1);
+  expect(drain.rollupReviewMode(queue.ROLLUP_REVIEW_COMMENTER, makeMapping({ reviewers: [] }))?.reviewers)
+    .toEqual([{ id: "integration-review", gates: true }]);
+  expect(drain.rollupReviewMode(queue.ROLLUP_REVIEW_COMMENTER, makeMapping({ reviewers: [
+    { id: "integration-review", gates: true }, { id: "code-review", gates: true }, { id: "optional", gates: false },
+  ] }))?.reviewers).toEqual([{ id: "integration-review", gates: true }, { id: "code-review", gates: true }]);
+});

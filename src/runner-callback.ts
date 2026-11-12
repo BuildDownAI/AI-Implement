@@ -1,3 +1,4 @@
+import { listRollupReviewChildren, reconcileRollupReviewChildren, ROLLUP_REVIEW_CHILD_PREFIX } from "./merge-up.js";
 import { getDb } from "./dedup.js";
 import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
 import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
@@ -48,7 +49,7 @@ import {
   type StoredReviewFinding,
 } from "./review-ledger-store.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { getCommitAuthorType, getPullRequestState, postOrUpdateStickyComment } from "./github.js";
+import { getCommitAuthorType, getPullRequestState, listPrComments, updatePrComment, postOrUpdateStickyComment } from "./github.js";
 import {
   renderClassification,
   renderFailureRecord,
@@ -180,6 +181,8 @@ export interface RunnerResultBody {
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
   /** Internal findings collected across review iterations, validated before storage. */
+  reviewOnly?: boolean;
+  rollupReview?: { headSha: string; verdictUrl: string };
   internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
@@ -812,6 +815,7 @@ async function handleRunnerResultInternal(
   // otherwise burn a one-time-use token and lose any chance of retry from
   // the runner.
   const body = input.body as unknown as {
+    reviewOnly?: unknown;
     phase?: unknown;
     outcome?: unknown;
     comments?: unknown;
@@ -999,7 +1003,8 @@ async function handleRunnerResultInternal(
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
   const owned = readAdmission(preflight.claims.dispatchId)?.lifecycleOwner.kind === "restate";
-  const verified = owned ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
+  // Review-only delivery must retain its credential until pre-write failures can be retried.
+  const verified = owned || body.reviewOnly === true ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     console.warn(
       `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
@@ -1125,6 +1130,21 @@ async function handleRunnerResultInternal(
       warn("checkImplementationAdmissionTermination", err);
     }
   };
+
+  if (body.reviewOnly === true) {
+    const job = getJobByDispatchId(claims.dispatchId);
+    let trackerWriteReserved = false;
+    try {
+      await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId, () => { trackerWriteReserved = true; });
+    } catch (err) {
+      warn("roll-up-review", err);
+      if (!trackerWriteReserved) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
+    }
+    if (!owned) verifyAndConsumeRunToken(bearerToken, input.secret);
+    if (job) updateJobStatus(job.id, body.outcome === "success" ? "completed" : "failed", "rollup_review", undefined, { skipAdmissionRelease: true });
+    await sendImplementationReport();
+    return { status: 200, body: { acknowledged: true, warnings } };
+  }
 
   for (const c of input.body.comments) {
     try {
@@ -2026,4 +2046,80 @@ export async function resubmitPendingGapFillReviews(opts: {
     }
   }
   return submitted;
+}
+
+/** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
+async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
+  scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
+  // Partial findings remain advisory evidence; only a complete review can request a fix.
+  if (input.body.outcome !== "success") return;
+  const review = input.body.rollupReview;
+  if (!review || typeof review.headSha !== "string" || !/^[a-f0-9]{40,64}$/.test(review.headSha) ||
+      typeof review.verdictUrl !== "string" || !job?.prUrl || !input.watchdogConfig) return;
+  const target = parsePrUrlTarget(job.prUrl);
+  if (!target || job.repo !== `${target.owner}/${target.repo}`) return;
+  const { owner, repo, prNumber } = target;
+  if (!provider.listIssuesPage) {
+    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up`);
+    return;
+  }
+  const reservationKey = `roll-up-review:children:${owner}/${repo}#${prNumber}`;
+  const reserved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
+  if (reserved && (JSON.parse(reserved.value) as string[]).includes(review.headSha)) onTrackerWriteReserved();
+  const configuredMapping = getMappings()[scopeKey];
+  const mapping = configuredMapping ? { ...configuredMapping, teamKey: scopeKey } : null;
+  if (!mapping || mapping.owner !== owner || mapping.repo !== repo) return;
+  const verdictMatch = review.verdictUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)#issuecomment-(\d+)$/);
+  if (!verdictMatch || verdictMatch[1] !== owner || verdictMatch[2] !== repo || Number(verdictMatch[3]) !== prNumber) return;
+  const token = await getInstallationToken(input.watchdogConfig.githubAppId, input.watchdogConfig.githubAppPrivateKey, owner);
+  const pr = await getPullRequestState(token, owner, repo, prNumber);
+  if (!pr) throw new Error("Cannot read roll-up PR state");
+  const branch = pr.headRef?.match(/^ai-implement\/(?:feature|multi-issue)\/(.+)$/);
+  if (!branch || branch[1].toLowerCase() !== job.issueIdentifier?.toLowerCase()) return;
+  const parent = await provider.findByKey(job.issueIdentifier!, scopeKey);
+  if (!parent || parent.id !== parentId) return;
+  if (pr.merged || pr.state === "closed") {
+    await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
+    return;
+  }
+  const blockers = (input.body.internalFindings ?? []).filter(f => f && f.severity === "blocking" &&
+    typeof f.body === "string" && f.body.trim() && (f.path === undefined || typeof f.path === "string") &&
+    (f.line === undefined || (Number.isInteger(f.line) && f.line > 0)));
+  if (!blockers.length) return;
+  const children = (await listRollupReviewChildren(provider, mapping)).filter(c =>
+    c.parent?.identifier === parent.identifier && c.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} `));
+  const existingHeads = children.map(c => c.title.split(" ")[2]);
+  if (existingHeads.includes(review.headSha)) onTrackerWriteReserved();
+  // Reserve synchronously before awaiting a write. Never release on an ambiguous tracker failure:
+  // the server may have created the child even when its response was lost.
+  const reservation = getDb().transaction(() => {
+    const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
+    const heads = new Set<string>([...existingHeads, ...(row ? JSON.parse(row.value) as string[] : [])]);
+    if (heads.has(review.headSha)) return { create: false, count: heads.size };
+    if (heads.size >= 2) return { create: false, count: heads.size };
+    heads.add(review.headSha);
+    getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(reservationKey, JSON.stringify([...heads]));
+    return { create: true, count: heads.size };
+  })();
+  let childIdentifier = children.find(c => c.title.split(" ")[2] === review.headSha)?.identifier;
+  if (reservation.create) {
+    onTrackerWriteReserved();
+    const summary = blockers[0].body.replace(/\s+/g, " ").trim().slice(0, 70);
+    const title = `${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} ${review.headSha} ${summary}`.slice(0, 250);
+    const body = `## Problem\n\nBlocking roll-up review findings at head \`${review.headSha}\`.\n\nPR: ${job.prUrl}\nVerdict: ${review.verdictUrl}\n\n## Task\n\nFix every blocking finding below in a PR targeting the parent's feature branch.\n\n` +
+      blockers.map((f, i) => `### Finding ${i + 1}: ${f.path ?? "(general)"}:${f.line ?? "?"}\n\nScenario and finding:\n${f.body}`).join("\n\n") +
+      `\n\n## Files\n\n${[...new Set(blockers.map(f => f.path ?? "(general)"))].map(p => `- ${p}`).join("\n")}\n\n## Acceptance Criteria\n\n- [ ] Address each blocking scenario above and verify the fix with regression coverage.\n- [ ] Merge the fix into the parent's feature branch so the roll-up is reviewed again.\n`;
+    const child = await provider.createChildIssue(parentId, scopeKey, { title, body });
+    childIdentifier = child.identifier;
+    console.log(`[roll-up-review] Filed ${child.identifier} for ${owner}/${repo}#${prNumber} at ${review.headSha}`);
+    // Closure can race the tracker write; the independent poll sweep also retries this cleanup.
+    await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
+  }
+  const comments = await listPrComments(token, owner, repo, prNumber, { strict: true });
+  const verdict = comments.find(c => c.id === Number(verdictMatch[4]));
+  if (!verdict) throw new Error("Cannot find roll-up verdict comment");
+  const marker = "<!-- roll-up-review follow-up -->";
+  const notice = `${marker}\n\n${childIdentifier ? `Blocking findings filed as ${childIdentifier}.` : "No additional child filed."}` +
+    (reservation.count >= 2 ? " The automatic follow-up limit (two children per roll-up PR) is reached; a person decides any further fixes." : "");
+  await updatePrComment(token, owner, repo, verdict.id, verdict.body.split(marker)[0].trimEnd() + "\n\n" + notice);
 }

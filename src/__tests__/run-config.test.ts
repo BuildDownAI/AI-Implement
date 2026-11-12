@@ -1111,3 +1111,17 @@ describe("accountFallbacks", () => {
     }
   });
 });
+
+describe("review-only envelope", () => {
+  it("round trips the explicit selection through the builder and codec", () => {
+    const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+    const config = buildRunConfig({ runnerPhase: "gap-analysis", mapping: makeMapping(), issue: full.issue, prNumber: "42", reviewOnly, retryPolicy: null });
+    expect(decodeRunConfig(encodeRunConfig(config)).reviewOnly).toEqual(reviewOnly);
+    expect(decodeRunConfig(encodeRunConfig(full)).reviewOnly).toBeUndefined();
+  });
+  it("rejects malformed mode rather than silently implementing", () => {
+    for (const reviewOnly of [true, {}, { reviewers: "integration-review" }]) {
+      expect(() => decodeRunConfig(Buffer.from(JSON.stringify({ ...full, reviewOnly })).toString("base64"))).toThrow(/reviewOnly/);
+    }
+  });
+});

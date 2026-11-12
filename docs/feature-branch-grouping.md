@@ -267,7 +267,37 @@ The step is **idempotent** and **fails soft** per roll-up — one failure never 
 
 Idempotency is handled differently per path:
 - **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or `null` (branch missing) causes an early return.
-- **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker, but **only when nothing on the branch is missing from the base**: it fetches the branch's current tip (`getBranchSha`) and deletes when that tip equals the merged PR's recorded head SHA, or — as a secondary fallback, for a real merge-commit strategy or a branch already gone — when `compareBranches` confirms 0 commits ahead. SHA equality is checked first because it is strategy-agnostic (unlike ancestry, it doesn't get confused by a squash/rebase merge); the ahead-count fallback exists for a fully-absorbed merge-commit branch or a since-deleted one, not as the primary defense against a squash/rebase false-ahead reading. A merged PR does not by itself mean the branch is safe to delete: a long-lived feature node's roll-up can merge early (an interim roll-up), after which more children merge into the same branch by hand or via the cascade — the branch's tip then moves past the PR's recorded head and it also shows genuinely ahead of the base. In that case the branch is kept, the already-merged roll-up is still finalized, and a further roll-up PR is opened for the new commits instead of deleting the branch ([AII-642](https://linear.app/eudoxus/issue/AII-642)). If the PR is still open, the step returns and awaits the human. Only when no PR exists (or the last one merged but the branch has since moved on) is a new one opened (guarded by the same ahead-check so a missing branch exits early). The ahead-count fallback is a narrower version of the old git-ancestry-only heuristic that once gated the top-of-tree path, which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)) — the SHA check now covers that case directly instead of relying on ancestry alone.
+- **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker, but **only when nothing on the branch is missing from the base**: it fetches the branch's current tip (`getBranchSha`) and deletes when that tip equals the merged PR's recorded head SHA, or — as a secondary fallback, for a real merge-commit strategy or a branch already gone — when `compareBranches` confirms 0 commits ahead. SHA equality is checked first because it is strategy-agnostic (unlike ancestry, it doesn't get confused by a squash/rebase merge); the ahead-count fallback exists for a fully-absorbed merge-commit branch or a since-deleted one, not as the primary defense against a squash/rebase false-ahead reading. A merged PR does not by itself mean the branch is safe to delete: a long-lived feature node's roll-up can merge early (an interim roll-up), after which more children merge into the same branch by hand or via the cascade — the branch's tip then moves past the PR's recorded head and it also shows genuinely ahead of the base. In that case the branch is kept, the already-merged roll-up is still finalized, and a further roll-up PR is opened for the new commits instead of deleting the branch ([AII-642](https://linear.app/eudoxus/issue/AII-642)). If the PR is still open, the step requests a review for its current head and returns to await the human. Only when no PR exists (or the last one merged but the branch has since moved on) is a new one opened (guarded by the same ahead-check so a missing branch exits early). The ahead-count fallback is a narrower version of the old git-ancestry-only heuristic that once gated the top-of-tree path, which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)) — the SHA check now covers that case directly instead of relying on ancestry alone.
+
+An automatic review-only run is queued when the top-of-tree roll-up PR opens and
+whenever polling observes a new head SHA on that open PR. Each head is queued only
+once, even after its review finishes. The review is advisory: it does not merge or
+modify the branch. Its verdict appears as a comment in the roll-up PR conversation.
+
+Blocking findings from a complete review on an open roll-up also produce
+**one pickup-ready child** under that tree's parent, containing all blockers and
+the reviewed head, PR, and verdict
+links in the Problem / Task / Files / Acceptance Criteria template. Minor findings
+stay in the verdict comment. Incomplete reviews retain any partial findings in the
+verdict but create no child and consume none of the two-child budget. Titles start
+with `[roll-up-review]` and identify the repository, PR, and head. Each head gets at most one child; each PR gets at most
+two, including completed or cancelled children. The second child's verdict notice
+announces the limit and leaves further fixes to a person. Existing settings rows
+reserve creation attempts atomically, including ambiguous tracker failures (which
+require a person to check the tracker); no new table is used. Tracker enumeration
+must finish successfully before filing, so an unreadable page cannot reset the cap.
+
+A separate poll sweep finds marked children even when an active child excludes its
+parent from roll-up discovery, or the tree already has a handled marker. If its
+roll-up has merged or closed, a nonterminal child is parked for a person and gets
+a comment explaining that the tree merged first or closed and the fix should be
+re-filed against the base branch. The sweep runs before fetching planning and
+implementation pickup snapshots, so a child parked in this poll cannot be dispatched
+from a stale snapshot. Closure is also checked immediately after creation.
+Roll-up child reconciliation filters tracker queries by the review-child title marker. If a child’s lifecycle or roll-up PR state cannot be verified, or required parking fails, the poll skips planning and implementation pickup for that mapping until reconciliation succeeds; other mappings continue. Filesystem mappings discover marked children in active and archived tasks, retaining terminal children for the filing cap.
+The verdict remains advisory to merge gates: review-only results never write
+`review_findings`, dispositions, approval marks, or `LateExternalReview` submissions.
+Filing and parking emit `[roll-up-review]` log lines.
 
 **`/ai-implement` on the roll-up PR.** Merge-up opens the top-of-tree PR directly, never
 through a dispatch, so it has no `dispatch_log` row of its own and the comment-gapfill drain's

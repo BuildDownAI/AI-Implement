@@ -13,6 +13,7 @@ import { buildProtectedFlyBootstrap } from "./fly-protection-key.js";
 export interface DispatchFlyGapfillInput {
   runName?: string;
   dispatchId?: string;
+  reviewOnly?: RunConfigV1["reviewOnly"];
   reviewFix?: RunConfigV1["reviewFix"];
   mapping: RepoMapping;
   issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null };
@@ -100,6 +101,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
       prNumber: String(input.prNumber),
       commentInstruction,
       retryPolicy: getRetryPolicy(),
+      reviewOnly: input.reviewOnly,
       reviewFix: input.reviewFix,
     }),
     ...managedRunConfigFields(protectedLaunch),
@@ -185,6 +187,7 @@ export interface GhaGapfillDependencies {
 export interface PrepareGhaGapfillLaunchArgs extends Omit<GhaGapfillDependencies, "dispatch"> {
   mapping: RepoMapping;
   issue: { issueId: string; issueIdentifier?: string | null; issueTitle?: string | null };
+  reviewOnly?: RunConfigV1["reviewOnly"];
   item: { owner: string; repo: string; prNumber: number };
   ghToken: string;
   decision: Extract<ManagedDispatchDecision, { kind: "legacy" | "launch" }>;
@@ -227,6 +230,7 @@ export async function prepareGhaGapfillLaunch(args: PrepareGhaGapfillLaunchArgs)
     ref: mapping.defaultBranch,
   }));
   const contract = capabilities.contract;
+  if (args.reviewOnly && contract !== "envelope") throw new Error("review-only requires an envelope workflow");
   const suppliedCredentials = args.getTrustedCredentials?.({ owner: item.owner, repo: item.repo, prNumber: item.prNumber });
   const managedCredentials = ghaManagedCredentials(ghaDecision, args.runnerCallbackBaseUrl, { extraEnv: mapping.extraEnv });
   const trustedCredentials = managedCredentials ? { ...suppliedCredentials, ...managedCredentials } : suppliedCredentials;
@@ -246,6 +250,7 @@ export async function prepareGhaGapfillLaunch(args: PrepareGhaGapfillLaunchArgs)
   const inputs = (contract === "envelope"
     ? buildEnvelopeDispatchInputs(mapping, gapFillIssue, {
         runnerPhase: "gap-analysis",
+        reviewOnly: args.reviewOnly,
         prNumber: String(item.prNumber),
         commentInstruction,
         runnerCallbackUrl: runnerCallbackUrl || undefined,

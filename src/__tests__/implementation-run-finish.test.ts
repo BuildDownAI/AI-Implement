@@ -59,6 +59,20 @@ describe("finishImplementationJob", () => {
     expect(deps.finalize).not.toHaveBeenCalled();
   });
 
+  describe.each(["completed", "failed"] as const)("review-only callback (%s)", status => {
+    it.each(["run_ended", "deadline", "cancelled"] as const)("preserves the advisory outcome after %s", async kind => {
+      const job = makeJob({ status, conclusion: "rollup_review", approved: false, prUrl: PR });
+      const deps = setup(job, true);
+      expect(await finishImplementationJob(deps, "d", { kind })).toEqual({});
+      expect(deps.closeRow).not.toHaveBeenCalled();
+      expect(deps.finalize).not.toHaveBeenCalled();
+      expect(deps.remediateStuck).not.toHaveBeenCalled();
+      expect(deps.isPrMerged).not.toHaveBeenCalled();
+      expect(deps.clearWorkingState).not.toHaveBeenCalled();
+      expect(job).toMatchObject({ status, conclusion: "rollup_review", approved: false });
+    });
+  });
+
   it("backend ended with no callback writes failed/ended_without_callback, then the fix-up", async () => {
     const deps = setup(makeJob({ status: "running" }));
     await finishImplementationJob(deps, "d", { kind: "run_ended" });

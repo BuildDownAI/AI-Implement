@@ -102,7 +102,7 @@ export interface RepoMapping {
 
 /** Which reviewers run on this project's PRs, and which of them may hold a merge. */
 export interface ReviewerSelection {
-  /** Reviewer id. Built-ins are "gap-analysis" and "code-review". */
+  /** Reviewer id. Built-ins are "gap-analysis", "code-review", and "integration-review". */
   id: string;
   /** false runs the reviewer and shows its findings without ever blocking a merge. */
   gates: boolean;

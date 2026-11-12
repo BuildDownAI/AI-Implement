@@ -5,6 +5,7 @@ import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
@@ -209,13 +210,13 @@ interface FixSummary {
   notes: string;
 }
 
-function makeDefaultGhSpawn(cwd: string) {
+function makeDefaultGhSpawn(cwd: string, maxBuffer?: number) {
   return (args: string[]) => {
-    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"], ...(maxBuffer === undefined ? {} : { maxBuffer }) });
     return {
       stdout: r.stdout?.toString() ?? "",
-      stderr: r.stderr?.toString() ?? "",
-      exitCode: r.status ?? 1,
+      stderr: r.error ? `${r.error.message}\n${r.stderr?.toString() ?? ""}` : r.stderr?.toString() ?? "",
+      exitCode: r.error ? 1 : r.status ?? 1,
     };
   };
 }
@@ -1735,7 +1736,7 @@ async function runSelectedInternalReviewers(params: {
         status: "failed",
         started_at: startedAt,
         ended_at: endedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { approved: false, complete: false, feedback, issues: [], blockingIssues: [], maxTurns, ...extraOutputs, ...(telemetry ? { telemetry } : {}) },
         logs_url: null,
@@ -1790,7 +1791,7 @@ async function runSelectedInternalReviewers(params: {
     let transientRetries = 0;
     let reviewStageClassified: FailureRecord | undefined;
     let invocationThrew = false;
-    while (reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
+    while (!params.context.data.reviewOnly && reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
       reviewStageClassified = reviewResult.failure ?? classifyLlmResult(reviewResult, {
         stage,
         attempt: reviewResult.attempts ?? 1,
@@ -1806,7 +1807,7 @@ async function runSelectedInternalReviewers(params: {
         status: "failed",
         started_at: reviewStartedAt,
         ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { failure: reviewStageClassified, maxTurns, telemetry: reviewResult.telemetry },
         logs_url: null,
@@ -1924,7 +1925,7 @@ async function runSelectedInternalReviewers(params: {
       status: "passed",
       started_at: reviewStartedAt,
       ended_at: reviewEndedAt,
-      parent_step_id: "post-push-review",
+      parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
       inputs: reportInputs,
       outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
       logs_url: null,
@@ -3037,3 +3038,87 @@ ${externalFindingsFixBlock}
 };
 
 export default postPushReviewStep;
+
+// Keep one comment below GitHub's 65,536-character limit. Allocate finding
+// space before summaries, and make any omitted detail explicit.
+function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLedgerFinding[]): string {
+  const limit = 65_000;
+  const clip = (value: string, size: number) => {
+    if (value.length <= size) return value;
+    let end = Math.max(0, size - 15);
+    // Avoid cutting a Unicode surrogate pair when shortening reviewer text.
+    if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
+    return `${value.slice(0, end)}… [truncated]`;
+  };
+  const header = `<!-- ai-implement rollup-review -->\n\n## Roll-up review: ${verdict}\n\nAdvisory only.`;
+  const shown = findings.slice(0, 100);
+  const findingBudget = 50_000;
+  const perFinding = Math.floor(findingBudget / Math.max(1, shown.length));
+  const details = shown.map(f => {
+    const location = `${clip(f.path ?? "(general)", Math.floor(perFinding / 3))}:${f.line ?? "?"}`;
+    const prefix = `- **${f.severity}** ${location} — `;
+    return prefix + clip(f.body, Math.max(30, perFinding - prefix.length - 2));
+  }).join("\n\n");
+  const omitted = findings.length > shown.length ? `\n\n${findings.length - shown.length} additional findings omitted from this comment.` : "";
+  const body = [header, details + omitted].filter(Boolean).join("\n\n");
+  return `${body}\n\n${clip(feedback, limit - body.length - 2)}`;
+}
+
+/** Single advisory pass. No native review, external polling, fix, commit or push. */
+export async function runReviewOnly(context: PipelineContext, workspaceDir: string, reporter: StepReporter, ghSpawn?: (args: string[]) => SpawnResult) {
+  // Bound memory explicitly; overflow is an incomplete review, never a partial diff review.
+  const gh = ghSpawn ?? makeDefaultGhSpawn(workspaceDir, 64 * 1024 * 1024);
+  const prNumber = context.data.prNumber!;
+  let reviewedHead = "";
+  let findings: ReviewLedgerFinding[] = [];
+  let feedback = "";
+  let failed = false;
+  let approved = false;
+  let costUsd: number | null = null;
+  try {
+    const headArgs = ["pr", "view", prNumber, "--json", "headRefOid", "--jq", ".headRefOid"];
+    const head = gh(headArgs);
+    if (head.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("Cannot read reviewed roll-up head");
+    reviewedHead = head.stdout.trim();
+    // gh returns the entire base-to-head PR diff, including earlier commits and lockfiles.
+    const diff = gh(["pr", "diff", prNumber]);
+    if (diff.exitCode !== 0) throw new Error(`Cannot read PR diff: ${resultMessage(diff)}`);
+    const afterDiff = gh(headArgs);
+    if (afterDiff.exitCode !== 0 || afterDiff.stdout.trim() !== reviewedHead) throw new Error("Roll-up head changed while reading the diff; review incomplete");
+    const { fetchTrustedConfigReviewers } = await import("./install.js");
+    const trustedConfig = await fetchTrustedConfigReviewers({
+      owner: context.data.githubOwner, repo: context.data.githubRepo, token: context.data.githubToken,
+      reviewers: context.data.reviewOnly!.reviewers, trustedReviewerDefinitions: context.data.trustedReviewerDefinitions,
+    });
+    const definitions = await resolveConfigReviewerDefinitions([], context.data.trustedReviewerDefinitions, trustedConfig);
+    const resolved = await resolveSelectedInternalReviewers(context.data.reviewOnly!.reviewers, context.data.trustedReviewerDefinitions,
+      definitions.trustedDefinitions, definitions.branchDefinitions);
+    if (resolved.unresolvedIds.length) throw new Error(selectionFailureMessage("unresolved", resolved.unresolvedIds));
+    const result = await runSelectedInternalReviewers({ context, reporter, reviewers: resolved.reviewers,
+      retryPolicy: normalizeRetryPolicy(context.data.retryPolicy), prNumber, iteration: 1, diff: diff.stdout,
+      previousFindings: "", model: context.data.model ?? DEFAULT_MODEL, sleep: async () => {} });
+    findings = result.findings;
+    feedback = result.feedback;
+    failed = result.incompleteReviews.length > 0;
+    approved = result.approved;
+    costUsd = result.costUsd;
+  } catch (error) {
+    failed = true;
+    feedback = error instanceof Error ? error.message : String(error);
+  }
+  const verdict = failed ? "Review incomplete" : approved ? "Approved" : "Changes recommended";
+  const body = rollupReviewBody(verdict, feedback, findings);
+  let verdictUrl = "";
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rollup-review-"));
+  try {
+    const bodyFile = path.join(tempDir, "verdict.md");
+    fs.writeFileSync(bodyFile, body, { mode: 0o600 });
+    const posted = gh(["pr", "comment", prNumber, "--body-file", bodyFile]);
+    if (posted.exitCode !== 0) throw new Error(`Cannot post roll-up review: ${resultMessage(posted)}`);
+    verdictUrl = posted.stdout.trim();
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
+    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl } };
+}

@@ -209,6 +209,29 @@ describe("runAutonomous", () => {
     vi.unstubAllEnvs();
   });
 
+  it.each([false, true])("reports review-only completion without dispositions or teardown (failed: %s)", async (failed) => {
+    const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig({ v: 1,
+      issue: { id: "i", identifier: "ENG-1", title: "review", description: "review" },
+      runnerPhase: "gap-analysis", prNumber: "42", reviewOnly, runnerCallbackUrl: "https://orch.test",
+    }));
+    vi.stubEnv("RUN_TOKEN", "test-run-token");
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nReview\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), "touch teardown-ran");
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const gh = vi.fn<GhSpawn>(() => ({ stdout: "", exitCode: 0 }));
+    const { pipeline, runner } = makeSingleStepPipeline("feedback-loop", { run: async ctx => {
+      expect(ctx.data.reviewOnly).toEqual(reviewOnly);
+      return { terminationReason: failed ? "review_error" : "approved", approved: !failed };
+    } });
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(), ghSpawn: gh, fetchImpl: fake.fetch });
+    expect(resultBody(fake)).toMatchObject({ reviewOnly: true, phase: "gap-analysis", outcome: failed ? "failure" : "success" });
+    expect(resultBody(fake)).not.toHaveProperty("findingDispositions");
+    expect(existsSync(join(workspaceDir, "teardown-ran"))).toBe(false);
+    expect(gh).not.toHaveBeenCalled();
+  });
+
   it("removes the publication bearer before any pipeline step runs", async () => {
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
     const mod: StepModule = {
