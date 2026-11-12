@@ -23,6 +23,7 @@ import { mintLaunchTokens, implementationTtlSeconds } from "../runner-tokens.js"
 import { dispatchLocalGapfill } from "../local-gapfill.js";
 import { findLocalContainerIdByName } from "../local-docker.js";
 import { listMachines } from "../fly-machines.js";
+import { resolveSessionImage } from "../repo-image.js";
 import { getRetryPolicy } from "../orchestrator-settings.js";
 
 // Kept private, as in implementation-launch: child credentials must be repository scoped.
@@ -206,6 +207,17 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         mapping = target.mapping;
         const { item } = target;
         reviewOnly = rollupReviewMode(item.commenter, mapping);
+        // Only the image paired with this orchestrator is known to honor reviewOnly.
+        // Local Docker builds its runner alongside the orchestrator.
+        if (reviewOnly && run.backend !== "local-docker") {
+          const image = await resolveSessionImage({ owner: mapping.owner, repo: mapping.repo,
+            token: await getTargetRepoToken(config, mapping.owner, mapping.repo), defaultImage: config.sessionImage });
+          if (image.source !== "default") {
+            console.log(`[comment-gapfill] Roll-up review for ${gap.repository} PR #${gap.prNumber} skipped: runner image is not paired with the orchestrator`);
+            markCommentGapfillProcessed(item.id, "skipped");
+            return { outcome: "rejected" };
+          }
+        }
         if (run.backend !== "github-actions") {
           const backendLabel = run.backend === "fly-machines" ? "Fly Machines" : "local Docker";
           const reason = run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)

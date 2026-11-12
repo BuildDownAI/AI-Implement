@@ -5,6 +5,8 @@ import type { ImplementationRunProductionInput } from "../restate/implementation
 vi.mock("../agent-run-preparation.js", async original => ({ ...await original<object>(), persistedPreparationState: vi.fn(() => "absent"), loadStoredSnapshot: vi.fn(() => null) }));
 vi.mock("../backend-run.js", () => ({ classifyFlyMachine: vi.fn(async () => "started"), stopBackendRun: vi.fn(async () => true), destroyMachineRecorded: vi.fn(async () => {}) }));
 import { classifyFlyMachine, stopBackendRun, destroyMachineRecorded } from "../backend-run.js";
+vi.mock("../repo-image.js", () => ({ resolveSessionImage: vi.fn() }));
+import { resolveSessionImage } from "../repo-image.js";
 const intents = vi.hoisted(() => new Map<string, unknown>());
 // The ordinary launch path now persists its own recovery intent (AII-1555).
 const ordinaryIntents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: boolean }>());
@@ -78,6 +80,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(listMachines).mockReset().mockResolvedValue([]);
   vi.mocked(findLocalContainerIdByName).mockReset().mockResolvedValue(null);
+  vi.mocked(resolveSessionImage).mockReset().mockResolvedValue({ image: "paired-image", source: "default" });
   intents.clear();
   ordinaryIntents.clear();
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [] }) })));
@@ -439,6 +442,42 @@ function configureContainer() {
     return { containerId: "machine", containerName: args.runName!, runConfig: { bootstrap: "BOOTSTRAP-SENTINEL" } as never };
   });
 }
+
+it.each(["github-actions", "fly-machines"] as const)("quietly skips roll-up review on an override image: %s", async backend => {
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: "ai-implement-rollup-review" });
+  vi.mocked(resolveSessionImage).mockResolvedValue({ image: "custom-image", source: "override" });
+  expect(await d.launch({ ...run, backend })).toEqual({ outcome: "rejected" });
+  expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "skipped");
+  expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+  expect(dispatchFlyGapfill).not.toHaveBeenCalled();
+  expect(dispatchLocalGapfill).not.toHaveBeenCalled();
+  expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
+  expect(resolveManagedDecision).not.toHaveBeenCalled();
+  expect(mintLaunchTokens).not.toHaveBeenCalled();
+  expect(surfaceDispatchFailure).not.toHaveBeenCalled();
+  expect(postBranchComment).not.toHaveBeenCalled();
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+  expect(intents.size).toBe(0);
+});
+
+it.each(["github-actions", "fly-machines", "local-docker"] as const)("launches paired roll-up review on %s", async backend => {
+  configureContainer();
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: "ai-implement-rollup-review" });
+  expect(await d.launch({ ...run, backend })).toEqual({ outcome: "accepted", jobId: backend === "github-actions" ? "88" : "machine" });
+  const helper = backend === "github-actions" ? prepareGhaGapfillLaunch : backend === "fly-machines" ? dispatchFlyGapfill : dispatchLocalGapfill;
+  expect(helper).toHaveBeenCalledWith(expect.objectContaining({ reviewOnly: { reviewers: expect.arrayContaining([{ id: "integration-review", gates: true }]) } }));
+  expect(resolveSessionImage).toHaveBeenCalledTimes(backend === "local-docker" ? 0 : 1);
+});
+
+it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend => (["default", "override"] as const).map(source => ({ backend, source }))))("ordinary gap-fill bypasses review capability: $backend / $source", async ({ backend, source }) => {
+  configureContainer();
+  vi.mocked(resolveSessionImage).mockResolvedValue({ image: "image", source });
+  expect(await d.launch({ ...run, backend })).toEqual({ outcome: "accepted", jobId: backend === "github-actions" ? "88" : "machine" });
+  expect(resolveSessionImage).not.toHaveBeenCalled();
+});
+
 it.each(containerBackends)("%s accepted launch records compute privately and returns only id", async backend => {
   configureContainer();
   const result = await d.launch({ ...run, backend });
