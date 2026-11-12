@@ -325,7 +325,7 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
   if (input.projectConfig.mode === "legacy") return { mode: "legacy" };
   validateConfigShape(input.orchestratorDefaults, "orchestratorDefaults");
   if (input.orchestratorDefaults.mode !== "configured") {
-    throw new Error("project opted into stage configuration but orchestrator defaults are not configured");
+    throw new Error("project is configured for stage agents but the orchestrator stage defaults are off");
   }
 
   const profileById = new Map<string, AccountProfile>();
