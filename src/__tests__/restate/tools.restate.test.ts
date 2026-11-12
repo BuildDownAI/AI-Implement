@@ -131,6 +131,7 @@ const authorizationTools = restate.service({
   handlers: {
     read: tool({ description: "test read", input: z.object({}), role: "user" }, authorizationHandler),
     admin: tool({ description: "test admin", input: z.object({}), role: "admin" }, authorizationHandler),
+    projects: tool({ description: "test projects", input: z.object({}), role: "admin", grant: "projects" }, authorizationHandler),
     deploy: tool({ description: "test deploy", input: z.object({}), role: "admin", grant: "deploy" }, authorizationHandler),
   },
 });
@@ -242,15 +243,17 @@ describe("orchestratorTools (Restate)", () => {
   it.each(VARIANTS.map(([label]) => label))("enforces every authorization state-table cell (%s)", async (label) => {
     const env = environments.get(label)!;
     const rows: Array<[string, Caller, boolean[]]> = [
-      ["read token", serviceCaller(), [true, false, false]],
-      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true]],
-      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true]],
-      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false]],
-      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true]],
-      ["system", systemCaller(), [true, true, true]],
+      ["projects token", serviceCaller({ grants: ["projects"] }), [true, false, false, true]],
+      ["projects + deploy token", serviceCaller({ grants: ["deploy", "projects"] }), [true, false, true, true]],
+      ["read token", serviceCaller(), [true, false, false, false]],
+      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
+      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
+      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false, false]],
+      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true, true]],
+      ["system", systemCaller(), [true, true, true, true]],
     ];
     for (const [row, caller, allowed] of rows) {
-      for (const [index, name] of ["read", "admin", "deploy"].entries()) {
+      for (const [index, name] of ["read", "admin", "deploy", "projects"].entries()) {
         const before = authorizationExecutions;
         const result = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", name, { caller, args: {} });
         if (allowed[index]) {
@@ -400,7 +403,7 @@ describe("orchestratorTools (Restate)", () => {
 
   it.each(VARIANTS.map(([label]) => label))("changes project agent modes through ingress (%s)", async (label) => {
     const env = environments.get(label)!;
-    const change = (mode: string, caller = SYSTEM) => callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", { caller, args: { teamKey: "BDS", mode } });
+    const change = (mode: string, caller: Caller = systemCaller()) => callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", { caller, args: { teamKey: "BDS", mode } });
     try {
       setProjectConfigured("BDS", false);
       if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
@@ -408,7 +411,7 @@ describe("orchestratorTools (Restate)", () => {
       }
       setOrchestratorDefaults(makeStageAgentDefaults());
       for (const mode of ["configured", "legacy"]) {
-        const result = await change(mode);
+        const result = await change(mode, serviceCaller({ grants: ["projects"] }));
         expect(result.isError).toBeFalsy();
         expect(JSON.parse(result.content[0].text)).toEqual({ teamKey: "BDS", agentMode: mode });
         const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });

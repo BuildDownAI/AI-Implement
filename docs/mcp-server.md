@@ -67,7 +67,7 @@ Three ways to reach a tool's result, all going through the same handler and the 
 | Entry point | Credential | Notes |
 | -- | -- | -- |
 | `/mcp` | OAuth bearer token | `tools/call`, described above. |
-| `POST /api/tools/<name>` | Admin session (the same session every other `/api/` route requires), **or** a BuildDown control-plane token as `Authorization: Bearer` (`src/control-plane-token.ts`) | For a caller with no MCP client, such as CI. Maps the session to `Caller { kind: "human", email, role, grants: [] }` using the session's own resolved role — never defaulted to `admin`. `<name>` must match `^[a-z][a-z0-9_]{0,63}$`; anything else answers `404 { error: "unknown tool" }` before the ingress is reached. A control-plane token is a JWT from `BUILDDOWN_OIDC_ISSUER` (https; keys from the discovery `jwks_uri`, which must be https on the issuer's host) whose `aud` contains this orchestrator's `OAUTH_REDIRECT_BASE_URL` (exact string match, no trailing-slash normalisation), whose `scope` includes `orchestrator:read`, `orchestrator:deploy`, or both, and whose `exp` is in the future (60 s leeway). It maps to `Caller { kind: "service", role: "user", grants }`: deploy scope adds `["deploy"]`; otherwise grants are `[]`. Every admin tool without a matching grant is refused by the wrapper. It is accepted on this route only; every other `/api/` route answers 401 to it. Inactive when either env var is unset. A refused token records one `401` auth event (`expired` or `invalid`, no token text). A run capability ([AII-688](https://linear.app/eudoxus/issue/AII-688/run-identity-on-restate-for-kg-refresh-capabilities-mcp-reads-and-the)) is a later, separate entry point. |
+| `POST /api/tools/<name>` | Admin session (the same session every other `/api/` route requires), **or** a BuildDown control-plane token as `Authorization: Bearer` (`src/control-plane-token.ts`) | For a caller with no MCP client, such as CI. Maps the session to `Caller { kind: "human", email, role, grants: [] }` using the session's own resolved role — never defaulted to `admin`. `<name>` must match `^[a-z][a-z0-9_]{0,63}$`; anything else answers `404 { error: "unknown tool" }` before the ingress is reached. A control-plane token is a JWT from `BUILDDOWN_OIDC_ISSUER` (https; keys from the discovery `jwks_uri`, which must be https on the issuer's host) whose `aud` contains this orchestrator's `OAUTH_REDIRECT_BASE_URL` (exact string match, no trailing-slash normalisation), whose `scope` includes at least one of `orchestrator:read`, `orchestrator:deploy`, or `orchestrator:projects`, and whose `exp` is in the future (60 s leeway). It maps to `Caller { kind: "service", role: "user", grants }`: deploy scope adds `deploy`, projects scope adds `projects`, independently; read scope adds no grant. Every admin tool without a matching grant is refused by the wrapper. It is accepted on this route only; every other `/api/` route answers 401 to it. Inactive when either env var is unset. A refused token records one `401` auth event (`expired` or `invalid`, no token text). A run capability ([AII-688](https://linear.app/eudoxus/issue/AII-688/run-identity-on-restate-for-kg-refresh-capabilities-mcp-reads-and-the)) is a later, separate entry point. |
 | In-process | None | `callToolAsSystem` (`src/restate/tools-client.ts`) calls the handler directly with `systemCaller()` — for orchestrator code that wants a tool result without an HTTP hop. |
 
 ## Tools
@@ -129,6 +129,32 @@ A tool that the BuildDown control plane calls with its `service` token (for exam
 * **The semantics:** write down every rule a consumer depends on: how paging ends (for example a `null` cursor on a page that is not full), what `null` means, units, ordering, and what can change after a read.
 * **Recorded exchanges:** a test calls the real handler through the real route for each scenario and writes the request and response bodies to `docs/contracts/<tool>/<scenario>.json`. It fails when the output differs, and rewrites only with an explicit environment variable. The control plane copies these files and its fake answers only from them.
 * **Changes:** a change to the request, the response or a rule regenerates the files, and the PR names the Control-Plane issue that takes the new files. Ship this repo first, then the control plane.
+
+### Project agent mode
+
+The control plane uses `set_project_agent_mode` for [CON-137](https://linear.app/eudoxus/issue/CON-137/see-and-change-each-orchestrators-project-agent-modes-on-the-control).
+A token with `orchestrator:projects` receives the `projects` grant and keeps the
+`service` identity's `user` role. This grant authorizes only this tool; it cannot
+start a deploy. A deploy-only or read-only token cannot change project modes.
+All three recognized scopes allow read tools; a token with none is refused (401).
+
+Request: `POST /api/tools/set_project_agent_mode` with
+`{ "args": { "teamKey": "BDS", "mode": "configured" } }`.
+`mode` is `configured` or `legacy`; the strict schema accepts no other keys.
+Arguments must be inside `args`.
+Success is HTTP 200 with MCP text containing JSON:
+`{ "content": [{ "type": "text", "text": "{\"teamKey\":\"BDS\",\"agentMode\":\"configured\"}" }] }`.
+Moving to legacy returns the same shape with `agentMode: "legacy"`.
+
+A refusal is an HTTP 200 MCP envelope with `isError: true` and one text item.
+The entire text is the bare code `mapping-not-found` (unknown project) or
+`resolution-failed` (configured agents cannot be resolved). A caller without
+admin role or projects grant receives
+`forbidden: set_project_agent_mode requires the admin role`.
+Recorded schema and exchanges (`set-configured`, `resolution-failed`,
+`read-scope-refused`) live in [contracts/set_project_agent_mode/](contracts/set_project_agent_mode/).
+`src/__tests__/set-project-agent-mode-contract.test.ts` checks them; regenerate
+with `UPDATE_CONTRACT_FIXTURES=1`. CON-137 takes these files after this repo ships.
 
 ### Monitor tools: health and fleet
 
