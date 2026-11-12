@@ -46,7 +46,7 @@ import {
   type StageAgentConfigurationV1,
   type StageName,
 } from "./agent-config.js";
-import { getProjectOptIn, resolveCandidateProjectStageConfig, resolveProjectStageConfig } from "./agent-config-store.js";
+import { isProjectConfigured, resolveCandidateProjectStageConfig, resolveProjectStageConfig } from "./agent-config-store.js";
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import {
   MODEL_AUTH_AUDIENCE,
@@ -315,7 +315,7 @@ function resolveForRequest(request: AgentRunRequest): Resolved {
     const snapshot = snapshotFromRow(row);
     return snapshot ? { kind: "snapshot", snapshot, stored: true, fallbackModels: fallbackModelsFromRow(row), metadata: metadataFromRow(row) } : { kind: "error", code: "snapshot_invalid" };
   }
-  if (!getProjectOptIn(request.projectKey)) return { kind: "legacy" };
+  if (!isProjectConfigured(request.projectKey)) return { kind: "legacy" };
   return resolveCurrent(request);
 }
 

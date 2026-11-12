@@ -144,7 +144,7 @@ beforeEach(async () => {
     authMode: "claude-subscription", metadata: { credentialRef: "model-account:sub" },
   });
   useCodex();
-  store.setProjectOptIn("AII", true);
+  store.setProjectConfigured("AII", true);
 });
 
 afterEach(async () => {
@@ -155,7 +155,7 @@ afterEach(async () => {
 
 describe("prepareManagedDispatch", () => {
   it("returns legacy for an opted-out project without touching any runtime dependency", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     const spy = vi.spyOn(runtime, "preparationDeps");
     const d = await adapter.prepareManagedDispatch(req(), runtime);
     expect(d).toEqual({ kind: "legacy" });
@@ -195,7 +195,7 @@ describe("prepareManagedDispatch", () => {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run("s1", "d1", "AII", JSON.stringify({ stages: resolved.resolution.stages, profiles: resolved.resolution.profiles }),
       JSON.stringify(resolved.resolution.sources), JSON.stringify({ orchestratorDefault: refs.orchestratorDefault, project: refs.project }), Date.now());
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     expect(adapter.isManagedProject("AII", "d1")).toBe(true);
     const d = await adapter.prepareManagedDispatch(req(), runtime);
     expectSubscriptionLaunch(d);
@@ -298,7 +298,7 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
   };
 
   it("opted out: legacy, no workflow read", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     const spies = gha({});
     expect(await adapter.prepareManagedDispatch(ghaReq(), runtime)).toEqual({ kind: "legacy" });
     expect(spies.reads).toBe(0);
@@ -389,7 +389,7 @@ describe("prepareManagedDispatch on github-actions (AII-1420)", () => {
   it("keeps the snapshot across a config change and mints no second bootstrap", async () => {
     gha({ [WORKFLOW]: CAPABLE, ...ABSENT_RETIRED });
     const first = launchOf(await adapter.prepareManagedDispatch(ghaReq(), runtime));
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     const second = await adapter.prepareManagedDispatch(ghaReq(), runtime);
     expect(second).toEqual({ kind: "hold", code: "bootstrap_consumed" });
     expect(count("model_credential_grants")).toBe(1);

@@ -72,7 +72,7 @@ function seed(): void {
 describe("stage inputs fingerprint", () => {
   it("changes with a profile revision, a retired profile and the project head", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const base = store.readStageInputsFingerprint("AII");
     expect(store.readStageInputsFingerprint("AII")).toBe(base);
 
@@ -165,24 +165,24 @@ describe("profiles", () => {
 
 describe("stage configuration", () => {
   it("defaults to not opted in and legacy", () => {
-    expect(store.getProjectOptIn("AII")).toBe(false);
+    expect(store.isProjectConfigured("AII")).toBe(false);
     expect(store.resolveProjectStageConfig("AII").resolution).toEqual({ mode: "legacy" });
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     expect(store.getProjectStageConfig("AII")).toBeNull();
   });
 
   it("cannot opt in without valid defaults", () => {
     const before = dump();
-    expect(() => store.setProjectOptIn("AII", true)).toThrow();
+    expect(() => store.setProjectConfigured("AII", true)).toThrow();
     expect(dump()).toBe(before);
-    expect(store.getProjectOptIn("AII")).toBe(false);
+    expect(store.isProjectConfigured("AII")).toBe(false);
   });
 
   it("opts in, inherits defaults, and clearing an override restores inheritance", () => {
     seed();
     store.saveAccountProfileRevision(codexProfile({ profileId: "codex-alt" }));
-    store.setProjectOptIn("AII", true);
-    expect(store.getProjectOptIn("AII")).toBe(true);
+    store.setProjectConfigured("AII", true);
+    expect(store.isProjectConfigured("AII")).toBe(true);
     store.setProjectStageConfig("AII", {
       version: 1,
       mode: "configured",
@@ -203,13 +203,13 @@ describe("stage configuration", () => {
     expect(r.resolution.stages.implementation.accountProfileId).toBe("codex-main");
     expect(r.resolution.sources.implementation.accountProfileId).toBe("orchestrator-default");
 
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     expect(store.resolveProjectStageConfig("AII").resolution).toEqual({ mode: "legacy" });
   });
 
   it("rejects invalid writes atomically", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const before = dump();
     const bad: StageAgentConfigurationV1[] = [
       { version: 1, mode: "configured", stages: { bogus: {} } as never },
@@ -226,7 +226,7 @@ describe("stage configuration", () => {
 
   it("disabled or archived profiles fail new resolution while retire still works", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     store.retireAccountProfile("codex-main");
     expect(() => store.resolveProjectStageConfig("AII")).toThrow(/disabled/);
     expect(store.getAccountProfileRevision("codex-main", 1)?.status).toBe("disabled");
@@ -239,7 +239,7 @@ describe("stage configuration", () => {
 
   it("reads reproduce writes across restart", async () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     store.saveAccountProfileRevision(claudeProfile({ revision: 2 }));
     const profiles = store.listAccountProfiles();
     const defaultsRow = store.getOrchestratorDefaults();
@@ -249,14 +249,14 @@ describe("stage configuration", () => {
     expect(store.listAccountProfiles()).toEqual(profiles);
     expect(store.getOrchestratorDefaults()).toEqual(defaultsRow);
     expect(store.getProjectStageConfig("AII")).toEqual(projectRow);
-    expect(store.getProjectOptIn("AII")).toBe(true);
+    expect(store.isProjectConfigured("AII")).toBe(true);
     expect(store.resolveProjectStageConfig("AII")).toEqual(resolved);
     expect(store.getAccountProfileRevision("claude-main", 1)?.revision).toBe(1);
   });
 
   it("snapshots of resolved profiles carry no credential references", () => {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const json = JSON.stringify(store.resolveProjectStageConfig("AII"));
     expect(json).not.toContain("vault/claude-main");
     expect(json).not.toContain("metadata");
@@ -271,7 +271,7 @@ describe("config references and frozen snapshots", () => {
 
   function optIn(): void {
     seed();
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
   }
 
   it("legacy resolution has no references or ids", () => {
@@ -338,7 +338,7 @@ describe("stored fallback models", () => {
     const config = defaults();
     config.stages!.review!.fallbackModel = "backup";
     store.setOrchestratorDefaults(config);
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     const before = dump();
 
     expect(() => store.setProjectStageConfig("AII", {

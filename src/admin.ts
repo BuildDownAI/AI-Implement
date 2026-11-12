@@ -4294,13 +4294,13 @@ function backendsFor(mapping: { executionMode: "github-actions" | "fly-machines"
 const WORKFLOW_SYNC_ACTION =
   "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows.";
 
-interface OptInRefusal {
+interface ReadinessRefusal {
   status: number;
   body: Record<string, unknown>;
 }
 
 /** Read-only readiness of an uncommitted candidate for the backend(s) dispatch would use. Nothing is stored to inspect it. */
-async function optInRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<OptInRefusal | null> {
+async function readinessRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<ReadinessRefusal | null> {
   const mapping = getMappings()[projectKey]!;
   try {
     resolveCandidateProjectStageConfig(projectKey, candidate);
@@ -4414,7 +4414,7 @@ async function putProjectAgentConfigLocked(
       json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
       return;
     }
-    const refusal = await optInRefusal(projectKey, candidate, deps);
+    const refusal = await readinessRefusal(projectKey, candidate, deps);
     if (refusal) {
       json(res, refusal.status, refusal.body);
       return;

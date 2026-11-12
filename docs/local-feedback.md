@@ -279,7 +279,7 @@ acceptable for local development. Opted-out projects keep today's arguments and 
 
 1. Opt the project in with direct store writes: save the account profile revision and the orchestrator
    defaults with `src/agent-config-store.ts` (`saveAccountProfileRevision`, `setOrchestratorDefaults`), then
-   call `setProjectOptIn("<TEAM>", true)`.
+   call `setProjectConfigured("<TEAM>", true)`.
 2. Import a plan record for the profile with `src/model-account-cli.ts` (see the earlier sections).
 3. Run `npm run dev:local`. The container reaches the model-auth routes at
    `config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? http://host.docker.internal:<healthPort>`.
