@@ -271,15 +271,13 @@ reuse). Only then remove that one `.ai-lock` file by hand. The harness never doe
 
 ## Hosted Codex job in local Docker
 
-`npm run dev:local` can launch an implementation run of an opted-in project in local Docker with a
+`npm run dev:local` can launch an implementation run of a configured project in local Docker with a
 `codex-subscription` profile. The run config and every model-auth value (the plain `local` grant bearer,
 `AI_IMPLEMENT_MODEL_AUTH_*`) travel only in the 0600 env file passed with `--env-file`, never in `docker run`
 arguments; the file is deleted after the launch attempt. `docker inspect` still shows the values, which is
-acceptable for local development. Opted-out projects keep today's arguments and need an Anthropic credential.
+acceptable for local development. Projects on the legacy path keep the legacy arguments and need an Anthropic credential.
 
-1. Opt the project in with direct store writes: save the account profile revision and the orchestrator
-   defaults with `src/agent-config-store.ts` (`saveAccountProfileRevision`, `setOrchestratorDefaults`), then
-   call `setProjectConfigured("<TEAM>", true)`.
+1. Configure the project as described in [Stage agent configuration](stage-agent-configuration.md).
 2. Import a plan record for the profile with `src/model-account-cli.ts` (see the earlier sections).
 3. Run `npm run dev:local`. The container reaches the model-auth routes at
    `config.localRunnerOrchestratorUrl ?? config.runnerCallbackBaseUrl ?? http://host.docker.internal:<healthPort>`.
