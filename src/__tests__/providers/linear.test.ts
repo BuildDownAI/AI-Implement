@@ -1392,7 +1392,17 @@ describe("LinearProvider.listIssuesPage", () => {
     await new LinearProvider({}).listIssuesPage(mapping, null, { titlePrefix: "[roll-up-review]" });
     const body = JSON.parse(fake.calls[0].body);
     expect(body.query).toContain("title: { startsWith: $title }");
-    expect(body.variables.title).toBe("[roll-up-review]");
+    expect(body.query).toContain("$title: String");
+    expect(body.variables).toEqual({ teamKey: "ENG", first: 50, after: null, title: "[roll-up-review]" });
+  });
+
+  it("retains the title filter for an explicitly supplied empty prefix", async () => {
+    const fake = linear(data(page));
+    await new LinearProvider({}).listIssuesPage(mapping, "cur", { titlePrefix: "" });
+    const body = JSON.parse(fake.calls[0].body);
+    expect(body.query).toContain("$title: String");
+    expect(body.query).toContain("title: { startsWith: $title }");
+    expect(body.variables).toEqual({ teamKey: "ENG", first: 50, after: "cur", title: "" });
   });
 
   it("does not stamp sourceSystem or team on the records", async () => {
@@ -1407,9 +1417,16 @@ describe("LinearProvider.listIssuesPage", () => {
     const p = new LinearProvider({});
     await p.listIssuesPage(mapping, null);
     await p.listIssuesPage(mapping, "cur");
+    for (const call of fake.calls) {
+      const { query } = JSON.parse(call.body);
+      expect(query).toContain("issues(filter: { team: { key: { eq: $teamKey } } },");
+      expect(query).not.toContain("$title");
+      expect(query).not.toContain("title:");
+      expect(query).not.toContain("startsWith");
+    }
     expect([variables(fake, 0), variables(fake, 1)]).toEqual([
-      { teamKey: "ENG", first: 50, after: null, title: "" },
-      { teamKey: "ENG", first: 50, after: "cur", title: "" },
+      { teamKey: "ENG", first: 50, after: null },
+      { teamKey: "ENG", first: 50, after: "cur" },
     ]);
   });
 
