@@ -280,6 +280,7 @@ const STRIPPED_PREFIXES: readonly string[] = [
  * pattern wildcards, so an unlisted name (LC_SECRET, COMPOSER_AUTH, ...) never inherits.
  */
 const SAFE_CONTEXT_KEYS: ReadonlySet<string> = new Set([
+  "CI", "GITHUB_ACTIONS",
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "TZ",
   "LANG", "LANGUAGE",
   "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
