@@ -30,3 +30,17 @@ The primary credential is checked after the choice. A missing or unreadable prim
 ## Where to see it
 
 `GET /api/mappings/:key/agent-config/resolved` shows each stage's entries in order, whether each passes the configuration checks now, and the reason when it does not. It also shows whether a project account override drops the default fallbacks. These diagnostics check profile compatibility and support on the project's current dispatch backend(s). Preparation checks the backend of its actual request. If a stage cannot form a complete selection, its entries are empty and the route preserves the structured resolution error. The Reports page shows the profile each invocation used.
+
+## Configured agent environment
+
+`SAFE_CONTEXT_KEYS` in `src/model-auth-client.ts` is the source for the exact environment names a configured agent inherits:
+
+- Runner context: `CI`, `GITHUB_ACTIONS`.
+- Process context: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `TMPDIR`, `TMP`, `TEMP`, `TZ`.
+- Locale: `LANG`, `LANGUAGE`, `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, `LC_TELEPHONE`.
+- Certificate locations: `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`.
+- Proxies: `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`, `no_proxy`, `all_proxy`.
+
+Values are copied unchanged only when supplied by the runner, including empty strings. Missing or undefined values remain absent; no default `CI` or `GITHUB_ACTIONS` value is set. Other `GITHUB_*` and `ACTIONS_*` names are dropped, including `GITHUB_REPOSITORY`, `GITHUB_ENV` and `ACTIONS_RUNTIME_TOKEN`.
+
+Protected names, forwarded secrets and the credential/routing strip lists take precedence over this allowlist. A forwarded secret named `CI` is therefore removed, as are inherited credentials such as `GITHUB_TOKEN`. After filtering, the selected account's authentication values are supplied separately for its auth mode.

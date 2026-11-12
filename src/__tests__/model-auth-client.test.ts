@@ -240,13 +240,47 @@ describe("buildModelInvocationEnv", () => {
     for (const [k, v] of Object.entries(SAFE)) expect(out.env[k]).toBe(v);
   });
 
+  describe.each(["CI", "GITHUB_ACTIONS"])("runner context %s", (key) => {
+    it.each(["true", "false", "custom-value", ""])("preserves the supplied value %j", (value) => {
+      const { env } = buildModelInvocationEnv({
+        authMode: "anthropic-api-key",
+        secret: { kind: "api-key", apiKey: S_API },
+        inheritedEnv: { [key]: value },
+      });
+      expect(env).toHaveProperty(key, value);
+    });
+
+    it.each([{}, { [key]: undefined }])("does not invent a value for %j", (inheritedEnv) => {
+      const { env } = buildModelInvocationEnv({
+        authMode: "anthropic-api-key",
+        secret: { kind: "api-key", apiKey: S_API },
+        inheritedEnv,
+      });
+      expect(env).not.toHaveProperty(key);
+    });
+  });
+
+  it.each(["GITHUB_REPOSITORY", "GITHUB_ENV", "GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN"])(
+    "drops platform name %s",
+    (key) => {
+      const { env, strippedKeys } = buildModelInvocationEnv({
+        authMode: "anthropic-api-key",
+        secret: { kind: "api-key", apiKey: S_API },
+        inheritedEnv: { CI: "true", GITHUB_ACTIONS: "true", [key]: S_INHERITED },
+      });
+      expect(env).not.toHaveProperty(key);
+      expect(strippedKeys).toContain(key);
+    },
+  );
+
   it("protected and forwarded names override safe-context names", () => {
     const out = buildModelInvocationEnv({
       authMode: "anthropic-api-key",
       secret: { kind: "api-key", apiKey: S_API },
-      inheritedEnv: { ...SAFE, AI_IMPLEMENT_FORWARDED_SECRETS: "HOME, LANG" },
+      inheritedEnv: { ...SAFE, CI: S_INHERITED, AI_IMPLEMENT_FORWARDED_SECRETS: "HOME, LANG, CI" },
       protectedKeys: ["HTTPS_PROXY"],
     });
+    expect(out.env).not.toHaveProperty("CI");
     expect(out.env).not.toHaveProperty("HOME");
     expect(out.env).not.toHaveProperty("LANG");
     expect(out.env).not.toHaveProperty("HTTPS_PROXY");
