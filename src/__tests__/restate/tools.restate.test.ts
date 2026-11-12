@@ -992,6 +992,23 @@ describe("orchestratorTools (Restate)", () => {
     },
   );
 
+  it.each(VARIANTS.map(([label]) => label))("add_project starts configured with defaults on (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const teamKey = `CONFIGURED-${label}`;
+    try {
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) saveAccountProfileRevision(makeStageAgentProfile());
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "add_project", {
+        caller: SYSTEM, args: { teamKey, owner: "BuildDownAI", repo: "configured-fixture", defaultBranch: "main" },
+      });
+      expect(JSON.parse(result.content![0].text).status).toBe(202);
+      const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });
+      expect(JSON.parse(health.content[0].text).stageAgents.projects).toContainEqual({ teamKey, agentMode: "configured" });
+    } finally {
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
+
   it.each(VARIANTS.map(([label]) => label))(
     "a user caller is refused a write tool over the real ingress and never runs the action (%s)",
     async (label) => {

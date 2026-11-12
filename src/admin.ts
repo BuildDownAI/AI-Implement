@@ -2099,7 +2099,7 @@ async function handleAuth(
 export function setProjectAgentModeAction(
   projectKey: string,
   mode: "configured" | "legacy",
-  actor: string,
+  actor: string | null,
 ): { ok: true; teamKey: string; agentMode: "configured" | "legacy" } | { ok: false; code: "mapping-not-found" | "resolution-failed" } {
   if (!Object.hasOwn(getMappings(), projectKey)) {
     return { ok: false, code: "mapping-not-found" };
@@ -3657,6 +3657,10 @@ export async function upsertMappingAction(
   }
 
   upsertMapping(body.teamKey, mapping);
+  if (!existingMapping && !getProjectStageConfig(body.teamKey) && getOrchestratorDefaults()?.config.mode === "configured") {
+    const result = setProjectAgentModeAction(body.teamKey, "configured", null);
+    if (!result.ok) warnings.push(`Project saved in legacy mode: ${result.code}`);
+  }
   registry.invalidate();
 
   // Kick the workflow sync off in the background and return immediately
@@ -4393,16 +4397,12 @@ async function putProjectAgentConfigLocked(
     json(res, 404, { error: "mapping not found" });
     return;
   }
-  const extra = unsupportedKeys(body, ["enabled", "stages"]);
+  const extra = unsupportedKeys(body, ["stages"]);
   if (extra.length > 0) {
     json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}` });
     return;
   }
   const previous = getProjectStageConfig(projectKey);
-  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
-    json(res, 400, { error: "enabled must be a boolean" });
-    return;
-  }
   if (body.stages !== undefined) {
     const bad = validateStagesBody(body.stages);
     if (bad) {
@@ -4410,7 +4410,7 @@ async function putProjectAgentConfigLocked(
       return;
     }
   }
-  const enabled = body.enabled ?? previous?.config.mode === "configured";
+  const enabled = previous?.config.mode === "configured";
   if (enabled && !deps.agentConfig) {
     json(res, 501, { error: "agent configuration readiness inspection is not configured", code: "readiness_unavailable" });
     return;
