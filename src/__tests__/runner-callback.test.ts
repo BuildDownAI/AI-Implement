@@ -6586,14 +6586,14 @@ describe("roll-up review follow-up children", () => {
       { source: "ai-implement-internal", severity: "blocking", path: "two.ts", line: 9, body: "When retried, work is duplicated." },
       { source: "ai-implement-internal", severity: "minor", body: "minor nit" },
     ];
-    async function prepare(head: string, internalFindings = findings) {
+    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success") {
       const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
       const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
       const deliver = () => runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
         resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
-        body: { phase: "gap-analysis", outcome: "success", reviewOnly: true, comments: [], internalFindings,
+        body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
           rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99" } } });
       return { deliver, dispatchId };
     }
@@ -6621,6 +6621,18 @@ describe("roll-up review follow-up children", () => {
     expect(content.title).toMatch(/^\[roll-up-review\] org\/repo#12 /);
     expect(content.body).not.toContain("minor nit");
     expect(update.mock.calls[0][4]).toContain("minor nit");
+  });
+
+  it("does not file partial blockers from an incomplete review or consume the child budget", async () => {
+    const { prepare, create, update, run, findings } = await setup();
+    const { deliver, dispatchId } = await prepare("a", findings, "failure");
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", approved: false, conclusion: "rollup_review" });
+    expect(create).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    await run("a");
+    await run("b");
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   it("ignores minor-only results", async () => {

@@ -2051,6 +2051,8 @@ export async function resubmitPendingGapFillReviews(opts: {
 /** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
 async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
   scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
+  // Partial findings remain advisory evidence; only a complete review can request a fix.
+  if (input.body.outcome !== "success") return;
   const review = input.body.rollupReview;
   if (!review || typeof review.headSha !== "string" || !/^[a-f0-9]{40,64}$/.test(review.headSha) ||
       typeof review.verdictUrl !== "string" || !job?.prUrl || !input.watchdogConfig) return;

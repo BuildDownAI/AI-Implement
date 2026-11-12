@@ -274,11 +274,13 @@ whenever polling observes a new head SHA on that open PR. Each head is queued on
 once, even after its review finishes. The review is advisory: it does not merge or
 modify the branch. Its verdict appears as a comment in the roll-up PR conversation.
 
-Blocking findings on an open roll-up also produce **one pickup-ready child** under
-that tree's parent, containing all blockers and the reviewed head, PR, and verdict
+Blocking findings from a complete review on an open roll-up also produce
+**one pickup-ready child** under that tree's parent, containing all blockers and
+the reviewed head, PR, and verdict
 links in the Problem / Task / Files / Acceptance Criteria template. Minor findings
-stay in the verdict comment. Titles start with `[roll-up-review]` and identify the
-repository, PR, and head. Each head gets at most one child; each PR gets at most
+stay in the verdict comment. Incomplete reviews retain any partial findings in the
+verdict but create no child and consume none of the two-child budget. Titles start
+with `[roll-up-review]` and identify the repository, PR, and head. Each head gets at most one child; each PR gets at most
 two, including completed or cancelled children. The second child's verdict notice
 announces the limit and leaves further fixes to a person. Existing settings rows
 reserve creation attempts atomically, including ambiguous tracker failures (which
