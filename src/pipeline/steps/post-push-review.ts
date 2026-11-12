@@ -3069,15 +3069,22 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
   // Bound memory explicitly; overflow is an incomplete review, never a partial diff review.
   const gh = ghSpawn ?? makeDefaultGhSpawn(workspaceDir, 64 * 1024 * 1024);
   const prNumber = context.data.prNumber!;
+  let reviewedHead = "";
   let findings: ReviewLedgerFinding[] = [];
   let feedback = "";
   let failed = false;
   let approved = false;
   let costUsd: number | null = null;
   try {
+    const headArgs = ["pr", "view", prNumber, "--json", "headRefOid", "--jq", ".headRefOid"];
+    const head = gh(headArgs);
+    if (head.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("Cannot read reviewed roll-up head");
+    reviewedHead = head.stdout.trim();
     // gh returns the entire base-to-head PR diff, including earlier commits and lockfiles.
     const diff = gh(["pr", "diff", prNumber]);
     if (diff.exitCode !== 0) throw new Error(`Cannot read PR diff: ${resultMessage(diff)}`);
+    const afterDiff = gh(headArgs);
+    if (afterDiff.exitCode !== 0 || afterDiff.stdout.trim() !== reviewedHead) throw new Error("Roll-up head changed while reading the diff; review incomplete");
     const { fetchTrustedConfigReviewers } = await import("./install.js");
     const trustedConfig = await fetchTrustedConfigReviewers({
       owner: context.data.githubOwner, repo: context.data.githubRepo, token: context.data.githubToken,
@@ -3101,15 +3108,17 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
   }
   const verdict = failed ? "Review incomplete" : approved ? "Approved" : "Changes recommended";
   const body = rollupReviewBody(verdict, feedback, findings);
+  let verdictUrl = "";
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rollup-review-"));
   try {
     const bodyFile = path.join(tempDir, "verdict.md");
     fs.writeFileSync(bodyFile, body, { mode: 0o600 });
     const posted = gh(["pr", "comment", prNumber, "--body-file", bodyFile]);
     if (posted.exitCode !== 0) throw new Error(`Cannot post roll-up review: ${resultMessage(posted)}`);
+    verdictUrl = posted.stdout.trim();
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
   return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
-    passes: [], extraCostUsd: costUsd };
+    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl } };
 }

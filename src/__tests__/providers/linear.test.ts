@@ -1387,6 +1387,14 @@ describe("LinearProvider.listIssuesPage", () => {
     },
   };
 
+  it("filters review-child enumeration on the server", async () => {
+    const fake = linear(data({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } }));
+    await new LinearProvider({}).listIssuesPage(mapping, null, { titlePrefix: "[roll-up-review]" });
+    const body = JSON.parse(fake.calls[0].body);
+    expect(body.query).toContain("title: { startsWith: $title }");
+    expect(body.variables.title).toBe("[roll-up-review]");
+  });
+
   it("does not stamp sourceSystem or team on the records", async () => {
     linear(data(page));
     const result = await new LinearProvider({}).listIssuesPage(mapping, null);
@@ -1400,8 +1408,8 @@ describe("LinearProvider.listIssuesPage", () => {
     await p.listIssuesPage(mapping, null);
     await p.listIssuesPage(mapping, "cur");
     expect([variables(fake, 0), variables(fake, 1)]).toEqual([
-      { teamKey: "ENG", first: 50, after: null },
-      { teamKey: "ENG", first: 50, after: "cur" },
+      { teamKey: "ENG", first: 50, after: null, title: "" },
+      { teamKey: "ENG", first: 50, after: "cur", title: "" },
     ]);
   });
 

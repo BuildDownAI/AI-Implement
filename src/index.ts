@@ -131,7 +131,7 @@ import { pickPrForRun } from "./monitor-status.js";
 import { type RunCredentialsV1 } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
-import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
+import { runMergeUps, reconcileRollupReviewChildren, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
@@ -570,6 +570,20 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
   }
 
   try {
+    // Parking changes pickup eligibility. Reconcile before taking either planning or
+    // implementation snapshots so this poll cannot dispatch a child just handed to a person.
+    const reconciliationFailedScopes = new Set<string>();
+    for (const provider of providers) {
+      for (const [scopeKey, mapping] of Object.entries(getMappings())) {
+        if (mapping.ticketingProvider !== provider.id) continue;
+        try {
+          await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config);
+        } catch (err) {
+          reconciliationFailedScopes.add(scopeKey);
+          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle:`, err);
+        }
+      }
+    }
     const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
     for (const { providerId, error } of failed) {
       console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);
@@ -579,6 +593,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     // existing roll-up path opens the top-of-tree PR without dispatching a junk implement pass.
     for (const { provider, snapshot } of entries) {
       for (const entry of snapshot.parentsToFinalize) {
+        if (reconciliationFailedScopes.has(entry.scopeKey)) continue;
         // An entry whose key belongs to another tracker's mapping must not touch that repo.
         if (getMappings()[entry.scopeKey] && !mappingForProvider(provider.id, entry.scopeKey, getMappings())) continue;
         console.log(`[${provider.id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
@@ -611,6 +626,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     const allMappingsForDispatch = getMappings();
     const teamRepoMap: Record<string, RepoMapping> = {};
     for (const [k, m] of Object.entries(allMappingsForDispatch)) {
+      if (reconciliationFailedScopes.has(k)) continue;
       if (m.paused) {
         console.log(`[poll] Skipping paused project ${k} (${m.owner}/${m.repo})`);
         continue;
