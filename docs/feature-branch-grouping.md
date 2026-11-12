@@ -309,6 +309,7 @@ identity. The gap-fill then runs against the roll-up branch with `prNumber` = th
 and reports against the parent issue. The fallback is best-effort — a failed PR lookup or a
 parent with no dispatch in the log degrades to the existing refusal — and hand-created PRs
 are still refused, since nothing on them names a tracker issue to report against.
+For an automated roll-up review (commenter `ai-implement-rollup-review`, `ROLLUP_REVIEW_COMMENTER`), a parent with no dispatch in the log is instead skipped quietly: the drain logs one line, marks the queue item `skipped`, posts nothing on the PR, and does not retry it (`src/comment-gapfill-drain.ts`, the branch after `resolveInFlightDispatch`).
 
 > ⚠️ **Auto-roll-up needs the runner callback.** A feature node only completes when its
 > closing-work PR merges and Linear marks it Done; the roll-up keys off that completed
