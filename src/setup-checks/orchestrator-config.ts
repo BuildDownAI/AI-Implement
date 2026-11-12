@@ -287,7 +287,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     run: async ({ env, runnerMode, orchestratorHealthAt, orchestratorInstanceId }) => {
       const { url } = resolveRunnerCallbackBaseUrl(env);
-      if (!url) return [{ state: "cannot-verify", detail: "No callback address is set, so there is none to reach", fix: "Clear callback.config first." }];
+      if (!url) return [{ state: "cannot-verify", detail: "No callback address is set, so there is none to reach", fix: "More information is needed. Address the callback.config check first." }];
       // A local runner reaches the orchestrator through host.docker.internal, which resolves inside its container only.
       if (runnerMode().mode === "local") return [{ state: "not-applicable", detail: "The runner mode is local, so runs reach the orchestrator from containers on this host" }];
       if (hostnameOf(url) === "host.docker.internal") return [{ state: "not-applicable", detail: `${url} resolves only inside a local runner's container` }];

@@ -24,17 +24,20 @@ function projectsOn(ctx: SetupCheckContext, providerId: string): string[] {
   return Object.entries(ctx.mappings()).filter(([, mapping]) => mapping.ticketingProvider === providerId).map(([key]) => key);
 }
 
-/** Judges Linear's facts once its token is minted, or says why they cannot be read. */
+/**
+ * Judges Linear's facts once its token is minted, or says why they cannot be read.
+ * With no Linear project it answers nothing, since tracker.linear.credentials already says so.
+ */
 async function judgeLinear(
   ctx: SetupCheckContext,
   judge: (facts: MintedLinearFacts, projects: string[]) => SetupCheckOutcome[],
 ): Promise<SetupCheckOutcome[]> {
   const projects = projectsOn(ctx, "linear");
-  if (projects.length === 0) return NO_LINEAR_PROJECT;
+  if (projects.length === 0) return [];
   const facts = await ctx.trackerSetupFacts("linear");
   if (facts === null || facts.kind !== "linear") return [{ state: "cannot-verify", detail: "The Linear provider reads no setup facts", fix: "Check the team's labels and states by hand." }];
   if (facts.token === "refused") {
-    return [{ state: "cannot-verify", detail: "Linear gave the app no token, so this cannot be read", fix: "Clear tracker.linear.credentials first." }];
+    return [{ state: "cannot-verify", detail: "Linear gave the app no token, so this cannot be read", fix: "More information is needed. Address the tracker.linear.credentials check first." }];
   }
   return judge(facts, projects);
 }
@@ -44,7 +47,7 @@ function perVisibleTeam(facts: MintedLinearFacts, projects: string[], judge: (te
   return projects.map((team): SetupCheckOutcome => ({
     ...(team in facts.teams
       ? judge(team)
-      : { state: "cannot-verify", detail: `The app cannot see team ${team}, so this cannot be read`, fix: "Clear tracker.linear.team-access first." }),
+      : { state: "cannot-verify", detail: `The app cannot see team ${team}, so this cannot be read`, fix: "More information is needed. Address the tracker.linear.team-access check first." }),
     project: team,
   }));
 }
@@ -54,17 +57,20 @@ function labelsInScope(facts: MintedLinearFacts, name: string, team: string) {
   return facts.labels[name].filter((label) => label.teamKey === null || label.teamKey === team);
 }
 
-/** Judges Jira's facts once Jira accepts the credentials, or says why they cannot be read. */
+/**
+ * Judges Jira's facts once Jira accepts the credentials, or says why they cannot be read.
+ * With no Jira project it answers nothing, since tracker.jira.credentials already says so.
+ */
 async function judgeJira(
   ctx: SetupCheckContext,
   judge: (facts: AcceptedJiraFacts, projects: string[]) => SetupCheckOutcome[],
 ): Promise<SetupCheckOutcome[]> {
   const projects = projectsOn(ctx, "jira");
-  if (projects.length === 0) return NO_JIRA_PROJECT;
+  if (projects.length === 0) return [];
   const facts = await ctx.trackerSetupFacts("jira");
   if (facts === null || facts.kind !== "jira") return [{ state: "cannot-verify", detail: "The Jira provider reads no setup facts", fix: "Check the projects' fields and JQL by hand." }];
   if (facts.credentials === "refused") {
-    return [{ state: "cannot-verify", detail: "Jira did not accept the credentials, so this cannot be read", fix: "Clear tracker.jira.credentials first." }];
+    return [{ state: "cannot-verify", detail: "Jira did not accept the credentials, so this cannot be read", fix: "More information is needed. Address the tracker.jira.credentials check first." }];
   }
   return judge(facts, projects);
 }
@@ -80,7 +86,7 @@ function perResolvedProject(
     return {
       ...(project?.fields === "resolved"
         ? judge(project, key)
-        : { state: "cannot-verify", detail: "This project's Jira fields cannot be found, so this cannot be read", fix: "Clear tracker.jira.fields first." }),
+        : { state: "cannot-verify", detail: "This project's Jira fields cannot be found, so this cannot be read", fix: "More information is needed. Address the tracker.jira.fields check first." }),
       project: key,
     };
   });
@@ -129,7 +135,7 @@ function unreadOptions(options: Extract<JiraFieldOptions, { read: "failed" }>, f
 export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
   {
     id: "tracker.provider",
-    title: "Tracker providers",
+    title: "Ticketing system providers",
     group: "tracker",
     tier: "core",
     onAdminPath: false,
@@ -146,8 +152,8 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
           if (provider.fetchSetupFacts) return { state: "pass", detail: `The ${id} provider is ready for ${names}` };
           return {
             state: "cannot-verify",
-            detail: `The ${id} provider has no setup checks, so the tracker setup of ${names} is not checked`,
-            fix: "Check the tracker's credentials, labels and states by hand.",
+            detail: `The ${id} provider has no setup checks, so the ticketing system setup of ${names} is not checked`,
+            fix: "Check the ticketing system's credentials, labels and states by hand.",
           };
         } catch (err) {
           return {

@@ -3,7 +3,7 @@ export const auditHtml = `
   <header class="page-header">
     <div class="page-header-left">
       <h1 class="page-title">Audit log</h1>
-      <div class="page-subtitle">Dispatch dedup ledger (last 24h). Full audit-log enrichment is on the roadmap.</div>
+      <div class="page-subtitle">The dispatch dedup ledger: every issue dispatched and not yet cleared, newest first. Full audit-log enrichment is on the roadmap.</div>
     </div>
     <div class="page-header-actions">
       <button class="btn btn-sm" onclick="loadDedup()">&#8635; Refresh</button>

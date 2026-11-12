@@ -158,6 +158,7 @@ export const componentsCss = `
 
 .page-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   padding: 20px 32px 18px;
@@ -165,7 +166,8 @@ export const componentsCss = `
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-app);
 }
-.page-header-left { min-width: 0; }
+/* The title side keeps a readable width; below it the actions wrap underneath instead of squeezing the subtitle. */
+.page-header-left { min-width: 0; flex: 1 1 320px; }
 .page-title {
   font-size: 17px;
   font-weight: 600;
@@ -438,10 +440,9 @@ export const componentsCss = `
   font-variant-numeric: tabular-nums;
 }
 .tbl tbody tr:last-child td { border-bottom: none; }
-.tbl tbody tr {
-  cursor: pointer;
-  transition: background 80ms ease;
-}
+.tbl tbody tr { transition: background 80ms ease; }
+/* Only a row that opens something shows the pointer; today that is a job row, which opens the drawer. */
+.tbl tbody tr[data-job-id] { cursor: pointer; }
 .tbl tbody tr:hover { background: var(--bg-hover); }
 .tbl tbody tr.active { background: var(--bg-active); }
 .tbl tbody tr.failed-row td { background: rgba(220, 38, 38, 0.025); }

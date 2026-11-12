@@ -50,8 +50,6 @@ export function ownerRepositoryRequests(mappings: Record<string, RepoMapping>, o
   return [...requests].map(([repo, { expressions, heads }]) => ({ repo, expressions: [...expressions], openPullRequestHeads: [...heads] }));
 }
 
-const NO_PROJECT: SetupCheckOutcome[] = [{ state: "not-applicable", detail: "No project is configured" }];
-
 const unreachable = (err: unknown): SetupCheckOutcome => ({
   state: "cannot-verify",
   detail: `The orchestrator could not reach GitHub: ${err instanceof Error ? err.message : String(err)}`,
@@ -61,7 +59,7 @@ const unreachable = (err: unknown): SetupCheckOutcome => ({
 /** Why GitHub cannot be asked as the App, in env.github-app's own words, or null when it can. */
 function credentialsGate(ctx: SetupCheckContext): SetupCheckOutcome | null {
   const problem = appCredentialsProblem(ctx.env);
-  return problem ? { state: "cannot-verify", detail: `${problem}, so GitHub cannot be asked as the App`, fix: "Clear env.github-app first." } : null;
+  return problem ? { state: "cannot-verify", detail: `${problem}, so GitHub cannot be asked as the App`, fix: "More information is needed. Address the env.github-app check first." } : null;
 }
 
 /** GitHub's answer to the App's credentials, or the outcome that says why it could not be asked. */
@@ -96,6 +94,7 @@ type AcceptedApp = AppIdentityRead & { slug: string };
 /**
  * Judges every project once GitHub accepts the App's credentials, or says in one row why it cannot.
  * `subject` names what the check reads, for that row.
+ * With no project it answers nothing, since tracker.provider already says no project is configured.
  */
 async function judgeProjects(
   ctx: SetupCheckContext,
@@ -103,13 +102,13 @@ async function judgeProjects(
   judge: (app: AcceptedApp, mapping: RepoMapping, key: string) => Promise<SetupCheckOutcome>,
 ): Promise<SetupCheckOutcome[]> {
   const projects = Object.entries(ctx.mappings());
-  if (projects.length === 0) return NO_PROJECT;
+  if (projects.length === 0) return [];
   const read = await readApp(ctx);
   if ("outcome" in read) return [read.outcome];
   const { app } = read;
   if (app.slug === null) {
     if (!appCredentialsRefused(app)) return [{ state: "cannot-verify", detail: `${unjudged(app)}, so ${subject} cannot be read`, fix: RETRY_FIX }];
-    return [{ state: "cannot-verify", detail: `GitHub refused the App's credentials, so ${subject} cannot be read`, fix: "Clear github.app-identity first." }];
+    return [{ state: "cannot-verify", detail: `GitHub refused the App's credentials, so ${subject} cannot be read`, fix: "More information is needed. Address the github.app-identity check first." }];
   }
   const accepted = { ...app, slug: app.slug };
   return Promise.all(projects.map(async ([key, mapping]): Promise<SetupCheckOutcome> => ({
@@ -131,16 +130,16 @@ function notOnGitHubActions(ctx: SetupCheckContext, { owner, repo, executionMode
 async function projectRepository(ctx: SetupCheckContext, { owner, repo }: RepoMapping): Promise<{ facts: RepositoryFacts } | { outcome: SetupCheckOutcome }> {
   const github = ctx.githubSetupFacts();
   if (!(await github.installation(owner))) {
-    return { outcome: { state: "cannot-verify", detail: `The App is not installed on ${owner}, so ${owner}/${repo} cannot be read`, fix: "Clear github.installation first." } };
+    return { outcome: { state: "cannot-verify", detail: `The App is not installed on ${owner}, so ${owner}/${repo} cannot be read`, fix: "More information is needed. Address the github.installation check first." } };
   }
   let facts;
   try {
     facts = (await github.repositories(owner)).get(repo.toLowerCase());
   } catch (err) {
-    if (err instanceof GitHubApiError) return { outcome: { state: "cannot-verify", detail: `GitHub refused to read ${owner}'s repositories for the App (HTTP ${err.status})`, fix: "Clear github.permissions first." } };
+    if (err instanceof GitHubApiError) return { outcome: { state: "cannot-verify", detail: `GitHub refused to read ${owner}'s repositories for the App (HTTP ${err.status})`, fix: "More information is needed. Address the github.permissions check first." } };
     throw err;
   }
-  if (!facts?.visible) return { outcome: { state: "cannot-verify", detail: `The App's installation on ${owner} cannot see ${repo}`, fix: "Clear github.installation first." } };
+  if (!facts?.visible) return { outcome: { state: "cannot-verify", detail: `The App's installation on ${owner} cannot see ${repo}`, fix: "More information is needed. Address the github.installation check first." } };
   return { facts };
 }
 
@@ -257,14 +256,13 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     // No fixUrl: GitHub documents the App's permissions page only as navigation, and only an owner or App manager can open it.
     run: (ctx) => judgeProjects(ctx, "the App's permissions", async (_app, { owner }) => {
       const installation = await ctx.githubSetupFacts().installation(owner);
-      if (!installation) return { state: "cannot-verify", detail: `The App is not installed on ${owner}, so its permissions there cannot be read`, fix: "Clear github.installation first." };
+      if (!installation) return { state: "cannot-verify", detail: `The App is not installed on ${owner}, so its permissions there cannot be read`, fix: "More information is needed. Address the github.installation check first." };
       const gaps = GITHUB_APP_PERMISSIONS.filter((p) => !permissionLevelCovers(installation.permissions[p.name], p.level));
-      const required = gaps.filter((p) => p.required);
-      const shown = required.length > 0 ? required : gaps;
-      if (shown.length === 0) return { state: "pass", detail: `The App's installation on ${owner} has every permission the orchestrator uses` };
+      if (gaps.length === 0) return { state: "pass", detail: `The App's installation on ${owner} has every permission the orchestrator uses` };
+      // Every gap at once, so one round of grants and one approval on the installation covers them all.
       return {
-        state: required.length > 0 ? "fail" : "warn",
-        detail: `The App's installation on ${owner} lacks ${shown.map((p) => `${p.title} (${levelLabel(p.level)})`).join(", ")}. ${shown.map((p) => p.whenMissing).join(" ")}`,
+        state: gaps.some((p) => p.required) ? "fail" : "warn",
+        detail: `The App's installation on ${owner} lacks ${gaps.map((p) => `${p.title} (${levelLabel(p.level)})`).join(", ")}. ${gaps.map((p) => p.whenMissing).join(" ")}`,
         fix: `An organization owner or a GitHub App manager grants these in the settings of the account that owns the App: Developer settings -> GitHub Apps -> Edit -> Permissions & events. Then an owner of ${owner} approves the new permissions on its installation.`,
       };
     }),
@@ -276,9 +274,8 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     tier: "mode",
     onAdminPath: false,
     run: (ctx) => {
-      const projects = Object.entries(ctx.mappings());
-      if (projects.length === 0) return NO_PROJECT;
-      return projects.map(([key, mapping]): SetupCheckOutcome => {
+      // With no project there is nothing to answer, as in judgeProjects.
+      return Object.entries(ctx.mappings()).map(([key, mapping]): SetupCheckOutcome => {
         const { owner, repo } = mapping;
         const off = notOnGitHubActions(ctx, mapping, "App secrets");
         if (off) return { ...off, project: key };
@@ -306,7 +303,7 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
         listed = await ctx.githubSetupFacts().deliveries();
       } catch (err) {
         if (err instanceof GitHubApiError) {
-          return [{ state: "cannot-verify", detail: `GitHub refused to list the App's webhook deliveries (HTTP ${err.status}), so their signatures cannot be read`, fix: "Clear github.app-identity first." }];
+          return [{ state: "cannot-verify", detail: `GitHub refused to list the App's webhook deliveries (HTTP ${err.status}), so their signatures cannot be read`, fix: "More information is needed. Address the github.app-identity check first." }];
         }
         return [unreachable(err)];
       }

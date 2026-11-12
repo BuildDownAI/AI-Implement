@@ -13,7 +13,7 @@ import { readOrchestratorHealth } from "./health-body.js";
 import { parseHealthPort } from "./http-server.js";
 import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { refreshRunnerBackendCache } from "./orchestrator-settings.js";
-import { countFailingCore, createSetupCheckContext, runSetupChecks, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus, type SetupCheckResult, type SetupCheckRun } from "./setup-checks/index.js";
+import { countFailingCore, createSetupCheckContext, runSetupChecks, SETUP_CHECK_GROUP_LABELS, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus, type SetupCheckResult, type SetupCheckRun } from "./setup-checks/index.js";
 
 export interface CheckSetupDependencies {
   checks: readonly SetupCheck[];
@@ -81,7 +81,7 @@ export function formatCheckRow(r: Pick<SetupCheckResult, "state" | "id" | "proje
 function formatRun(run: SetupCheckRun, failingCore: number): string {
   const lines: string[] = [];
   for (const group of new Set(run.results.map((r) => r.group))) {
-    lines.push(group);
+    lines.push(SETUP_CHECK_GROUP_LABELS[group]);
     for (const r of run.results.filter((result) => result.group === group)) lines.push(...formatCheckRow(r));
     lines.push("");
   }

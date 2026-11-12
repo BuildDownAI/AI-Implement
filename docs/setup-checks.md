@@ -11,7 +11,7 @@ The command runs the checks with no HTTP server, no Restate and no sign-in, so i
 | Locally | `npm run check-setup`, which loads `.env` the way `npm run dev` does |
 | On Fly | `fly ssh console -a <app> -C "node /app/dist/check-setup.js"`, inside the running machine, with the app's secrets in its environment |
 
-`--json` prints the run instead of the table: a `SetupCheckRun`, holding `checkedAt` and one result per check, or per project for a per-project check, with its `id`, `title`, `group`, `tier`, `onAdminPath`, `state`, `detail` and `fix`, plus `project` on a per-project row and `fixUrl` where a page applies the fix. `--help` prints the usage.
+`--json` prints the run instead of the table: a `SetupCheckRun`, holding `startedAt` and `checkedAt` (when the run began and when its last check finished) and its results, one per check, or per project for a per-project check, with its `id`, `title`, `group`, `tier`, `onAdminPath`, `state`, `detail` and `fix`, plus `project` on a per-project row and `fixUrl` where a page applies the fix. A check whose prerequisite does not apply returns no result (below). `--help` prints the usage.
 
 The authority is shell access on the host, as for [access recovery](access-model.md#recovery-from-lockout). Shell access already implies reading every secret, so the command prints each check's detail and fix. No check prints a secret's value; a check names the variable instead.
 
@@ -29,7 +29,7 @@ The authority is shell access on the host, as for [access recovery](access-model
 For example, a raw copy of `.env.example` with no orchestrator running prints, among its other rows:
 
 ```
-orchestrator
+Orchestrator
   FAIL           env.github-app: GitHub App credentials
                  GITHUB_APP_PRIVATE_KEY does not parse as a private key
                  Fix: Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY. The private key is the PEM file from the GitHub App's settings page.
@@ -40,7 +40,9 @@ orchestrator
 3 core checks fail.
 ```
 
-Results print grouped by check group, one row per check, or per project for a per-project check: its state, id and title, then what it read, then its fix when it has one. The states are `PASS`, `WARN`, `FAIL`, `CANNOT VERIFY` (the fact could not be read, with the reason in the detail) and `N/A` (the check does not apply to this setup).
+Results print grouped by check group, under the group's display name (the `tracker` group prints as "Ticketing system"), one row per check, or per project for a per-project check: its state, id and title, then what it read, then its fix when it has one. The states are `PASS`, `WARN`, `FAIL`, `CANNOT VERIFY` (the fact could not be read, with the reason in the detail) and `N/A` (the check does not apply to this setup).
+
+A check whose prerequisite does not apply prints no row, so the one check that gates it speaks for the rest. With no project on Linear, only `tracker.linear.credentials` reports it, and likewise `tracker.jira.credentials` for Jira; with no project at all, only `tracker.provider` reports it, for the GitHub checks that run once per project as well. A check that cannot read what another check reports still prints its row, *cannot verify*, with a fix that names that check: "More information is needed. Address the tracker.jira.credentials check first."
 
 Each check has a tier: `core` applies to every deployment, `mode` to one execution mode, and `feature` to an optional feature. The last line counts the failing core checks.
 
@@ -54,15 +56,17 @@ A warning, a check that cannot verify, and a failing `mode` or `feature` check a
 
 ## In a running orchestrator
 
-Inside the server, the checks run in the `SetupChecks` Restate object (`src/restate/setup-checks.ts`), which keeps the last run. Nothing starts a run on its own yet: an admin starts one, and each surface below shows the stored run, or nothing before the first.
+Inside the server, the checks run in the `SetupChecks` Restate object (`src/restate/setup-checks.ts`), which keeps the last run. Nothing starts a run on its own yet: an admin starts one from the Setup page, and each surface below shows the stored run, or nothing before the first.
 
 | Where | Who | Shows |
 |---|---|---|
-| `POST /api/setup-checks/run` | admins | starts a run, waits up to 60 seconds for it, and answers it with every field |
-| `GET /api/setup-checks` | admins, and a user granted a page that lists the route (none does yet) | the stored run with every field, or `null` before the first run |
+| The admin **Setup** page (`/admin#setup`) | admins, and users granted the page | the stored run with every row's detail and fix, a card per group and one per project; while a run goes, its progress. Only an admin can start a run |
+| Overview | admins | a line naming the groups that have failing checks, linking to the Setup page |
+| `POST /api/setup-checks/run` | admins | starts a run and answers 202 with its invocation id at once, without waiting for it; 409 `run-in-progress`, with the running run's `startedAt`, while one is going |
+| `GET /api/setup-checks` | admins, and users granted the Setup page | `run`, the stored run with every field (`null` before the first); `progress`, the run in progress (`null` when none), with its `startedAt`, the `total` number of checks, the `finished` rows and the checks still `running` by `id`, `title` and `group`; and `groups`, each group's display name |
 | `get_tenant_health`, field `setupChecks` | every allowlisted identity | each row's `id`, `title`, `state` and `project`, the count of failing core rows (`failingCore`) and `checkedAt`; `null` before the first run |
 
-Why each audience sees what it sees is [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md)'s second decision. Both routes answer 503 `restate-unavailable` while Restate cannot take the call (the sidecar not ready, or the endpoint not registered) or does not answer. For the same reason a stored run's `restate` row always passes: a run reaches the object only while Restate can serve. A Restate fault shows on `GET /` and in the setup command instead. `failingCore` counts rows, as the command's last line does, so a check that fails for two projects counts twice. A run's detail and fix are kept in the object's state and journal, which only admins can read, through the Restate UI. Neither carries a secret's value.
+Why each audience sees what it sees is [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md)'s second decision. Starting a run is admin-only even for a user granted the page, since a grant reaches only a page's `GET` routes. Both routes answer 503 `restate-unavailable` while Restate cannot take the call (the sidecar not ready, or the endpoint not registered) or does not answer; the `GET`'s 503 also carries `setupCommand`, the setup command as an operator runs it against this orchestrator (`setupCommandFor`: the `fly ssh` form for the app when `FLY_APP_NAME` is set, otherwise `npm run check-setup`), which the Setup page shows, since that command runs without Restate. A run's progress is kept in the orchestrator's memory while the run goes, not in Restate: each check adds its rows as it finishes, and the record clears once the finished run is stored, so a restart mid-run loses it, and Restate retrying the run starts a fresh record. For the same reason a stored run's `restate` row always passes: a run reaches the object only while Restate can serve. A Restate fault shows on `GET /` and in the setup command instead. `failingCore` counts rows, as the command's last line does, so a check that fails for two projects counts twice. A run's detail and fix are kept in the object's state and journal, which only admins can read, through the Restate UI. Neither carries a secret's value.
 
 ## The checks, by group
 

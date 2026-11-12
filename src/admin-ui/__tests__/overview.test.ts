@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { overviewHtml, overviewScript } from "../pages/overview.js";
 import { blockersHtml, blockersScript } from "../pages/blockers.js";
 import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
+import { SETUP_CHECK_GROUP_LABELS } from "../../setup-checks/index.js";
 
 type CapacityByMapping = Record<string, { used: number; cap: number; source: "reservations" }>;
 
@@ -11,13 +12,16 @@ function mountOverview(fixtures: {
   capacityOk?: boolean;
   capacityReject?: boolean;
   capacityByMapping?: CapacityByMapping | null;
+  setupChecks?: { status: number; body?: unknown };
 }) {
   const { log = [], mappings = {}, capacityOk = true, capacityReject = false, capacityByMapping = {} } = fixtures;
+  const { setupChecks = { status: 200, body: { run: null, progress: null, groups: SETUP_CHECK_GROUP_LABELS } } } = fixtures;
   return mountAdminPage({
     html: overviewHtml,
     script: overviewScript,
     route: "overview",
     api: async (url) => {
+      if (url === "/api/setup-checks") return { ok: setupChecks.status === 200, status: setupChecks.status, json: async () => setupChecks.body };
       if (url === "/api/log") return { ok: true, status: 200, json: async () => log };
       if (url === "/api/mappings") return { ok: true, status: 200, json: async () => mappings };
       if (url === "/api/reaper/summary") return { ok: true, status: 200, json: async () => ({ lastSweepAt: null }) };
@@ -118,7 +122,7 @@ describe("overview page", () => {
     expect(overviewScript.split(needle).length - 1).toBe(2);
   });
 
-  it("includes timed_out in statusBadge map for display consistency", () => {
+  it("includes timed_out in jobStatusBadge map for display consistency", () => {
     expect(overviewScript).toContain("timed_out: 'warn'");
   });
 
@@ -130,6 +134,41 @@ describe("overview page", () => {
 
   it("no longer renders the removed gap-fill trigger row", () => {
     expect(overviewScript).not.toContain("Gap-fill trigger");
+  });
+});
+
+describe("overview page setup-check line (AII-1541)", () => {
+  const row = (group: string, state: string) => ({ id: "restate", title: "Restate engine", group, tier: "core", onAdminPath: false, state });
+  const line = async (setupChecks: { status: number; body?: unknown }) => {
+    const { win, doc } = mountOverview({ setupChecks });
+    await win.loadOverview();
+    await vi.waitFor(() => expect(doc.getElementById("overview-setup-status")?.textContent).not.toMatch(/^\s*$/));
+    return doc.getElementById("overview-setup-status")!;
+  };
+
+  it("names each group with a failing row once, in the route's group order, and links to the Setup page", async () => {
+    const run = { checkedAt: 1, results: [row("github", "fail"), row("tracker", "fail"), row("tracker", "fail"), row("model", "warn"), row("orchestrator", "pass")] };
+    const el = await line({ status: 200, body: { run, progress: null, groups: SETUP_CHECK_GROUP_LABELS } });
+    const text = el.textContent!;
+    const labels = SETUP_CHECK_GROUP_LABELS;
+    const times = (label: string) => text.split(label).length - 1;
+    expect([labels.orchestrator, labels.tracker, labels.github, labels.model].map(times)).toEqual([0, 1, 1, 0]);
+    expect(text.indexOf(labels.tracker)).toBeLessThan(text.indexOf(labels.github));
+    expect(el.querySelector("a")?.getAttribute("href")).toBe("#setup");
+  });
+
+  it.each([
+    ["no failing row", { status: 200, body: { run: { checkedAt: 1, results: [row("orchestrator", "warn")] }, progress: null, groups: SETUP_CHECK_GROUP_LABELS } }, /no setup check fails/i],
+    ["no run yet", { status: 200, body: { run: null, progress: null, groups: SETUP_CHECK_GROUP_LABELS } }, /not run/],
+    ["a run in progress", { status: 200, body: { run: null, progress: { startedAt: 1, total: 2, finished: [], running: [{ id: "restate", title: "Restate engine", group: "orchestrator" }] }, groups: SETUP_CHECK_GROUP_LABELS } }, /running/],
+    ["an unreadable stored run", { status: 503, body: { error: "restate-unavailable" } }, /cannot be read/],
+  ])("says so for %s", async (_case, setupChecks, fact) => {
+    expect((await line(setupChecks)).textContent).toMatch(fact);
+  });
+
+  it("no longer reads the environment status or shows its pills", () => {
+    expect(overviewScript).not.toContain("/api/admin/config-status");
+    expect(overviewHtml).not.toContain("overview-env-status");
   });
 });
 

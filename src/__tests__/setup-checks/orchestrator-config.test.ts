@@ -361,7 +361,7 @@ describe("callback.reachable", () => {
     const orchestratorHealthAt = answering(ITSELF);
 
     expect(await run("callback.reachable", { env: {}, orchestratorHealthAt })).toEqual([
-      { state: "cannot-verify", detail: "No callback address is set, so there is none to reach", fix: "Clear callback.config first." },
+      { state: "cannot-verify", detail: "No callback address is set, so there is none to reach", fix: "More information is needed. Address the callback.config check first." },
     ]);
     expect(orchestratorHealthAt).not.toHaveBeenCalled();
   });

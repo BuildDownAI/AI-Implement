@@ -47,11 +47,11 @@ export const blockersHtml = `
 export const blockersScript = `
 (function () {
   function reasonBadge(reason) {
-    if (reason === 'no-mapping') return '<span class="badge fail"><span class="dot"></span>No mapping</span>';
-    if (reason === 'dedup') return '<span class="badge info"><span class="dot"></span>Dedup</span>';
-    if (reason === 'concurrency') return '<span class="badge warn"><span class="dot"></span>Concurrency cap</span>';
-    if (reason === 'parked') return '<span class="badge fail"><span class="dot"></span>Parked</span>';
-    return '<span class="badge neutral"><span class="dot"></span>' + window.esc(reason) + '</span>';
+    if (reason === 'no-mapping') return window.statusBadge('fail', 'No mapping');
+    if (reason === 'dedup') return window.statusBadge('info', 'Dedup');
+    if (reason === 'concurrency') return window.statusBadge('warn', 'Concurrency cap');
+    if (reason === 'parked') return window.statusBadge('fail', 'Parked');
+    return window.statusBadge('neutral', reason);
   }
 
   function renderRows(blockers) {
@@ -109,7 +109,7 @@ export const blockersScript = `
     const el = document.getElementById('blockers-partial');
     if (!failedTrackers || failedTrackers.length === 0) { el.hidden = true; return; }
     const named = failedTrackers.map(function (t) { return window.esc(t.provider) + ': ' + window.esc(t.error); }).join('; ');
-    el.innerHTML = '<div style="flex:1"><div class="alert-title">Some trackers did not answer</div><div class="alert-desc">' + named + '. Their issues are missing below until they answer.</div></div>';
+    el.innerHTML = '<div style="flex:1"><div class="alert-title">Some ticketing systems did not answer</div><div class="alert-desc">' + named + '. Their issues are missing below until they answer.</div></div>';
     el.hidden = false;
   }
 

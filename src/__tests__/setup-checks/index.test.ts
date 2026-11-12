@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { FilesystemSetupFacts, JiraSetupFacts } from "../../providers/types.js";
@@ -200,15 +201,27 @@ describe("SETUP_CHECKS", () => {
 
   it("never shows a secret's value in any field", async () => {
     const results = await resultsFor(makeSentinelSetupCheckContext());
-    expect(results.length).toBe(checks.SETUP_CHECKS.length);
+    // Every check answers but the Jira checks that depend on a Jira project, which the context's one Linear project leaves out.
+    const answering = checks.SETUP_CHECK_IDS.filter((id) => !id.startsWith("tracker.jira.") || id === "tracker.jira.credentials");
+    expect(new Set(results.map((r) => r.id))).toEqual(new Set(answering));
     expect(JSON.stringify(results)).not.toContain("sentinel-");
+  });
+
+  it("points a fix at another check only by an id that exists", () => {
+    const sources = ["orchestrator-config", "tracker-config", "github-config"]
+      .map((file) => readFileSync(new URL(`../../setup-checks/${file}.ts`, import.meta.url), "utf8")).join("\n");
+    const pointers = [...sources.matchAll(/Address the(.*?) check first\./g)].map((match) => match[1]);
+    expect(pointers.length).toBeGreaterThan(0);
+    for (const pointer of pointers) expect(checks.SETUP_CHECK_IDS.map((id) => ` ${id}`), pointer).toContain(pointer);
   });
 });
 
 describe("runSetupChecks", () => {
-  it("adds each check's identity to its outcomes and stamps the run with the clock", async () => {
+  it("adds each check's identity to its outcomes and stamps the run with when it began and finished", async () => {
+    const ticks = [1000, 1234];
     const check = fakeCheck({ id: "admin.path", title: "Admin sign-in", tier: "mode", onAdminPath: true, run: () => [{ state: "warn", detail: "d", fix: "f" }] });
-    expect(await checks.runSetupChecks(makeSetupCheckContext(), [check], () => 1234)).toEqual({
+    expect(await checks.runSetupChecks(makeSetupCheckContext(), [check], () => ticks.shift()!)).toEqual({
+      startedAt: 1000,
       checkedAt: 1234,
       results: [{ id: "admin.path", title: "Admin sign-in", group: "orchestrator", tier: "mode", onAdminPath: true, state: "warn", detail: "d", fix: "f" }],
     });
@@ -239,8 +252,101 @@ describe("runSetupChecks", () => {
   });
 
   it("runs the registered list by default", async () => {
-    const { results } = await checks.runSetupChecks(makeSetupCheckContext());
-    expect(new Set(results.map((r) => r.id))).toEqual(new Set(checks.SETUP_CHECK_IDS));
+    // Settled checks, not rows: with no project configured, the checks that depend on one answer nothing.
+    const settled: string[] = [];
+    await checks.runSetupChecks(makeSetupCheckContext(), undefined, Date.now, (id) => settled.push(id));
+    expect(new Set(settled)).toEqual(new Set(checks.SETUP_CHECK_IDS));
+  });
+
+  it("tells onSettled each check's rows the moment that check finishes, while the run still answers in list order", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const slow = fakeCheck({ id: "env.github-app", run: async () => { await held; return [{ state: "pass" }]; } });
+    const fast = fakeCheck({ id: "restate", run: () => [{ state: "warn" }] });
+    const throws = fakeCheck({ id: "admin.path", run: () => { throw new Error("reader broke"); } });
+    const heard: Array<[string, string[]]> = [];
+    const run = checks.runSetupChecks(makeSetupCheckContext(), [slow, fast, throws], Date.now, (id, rows) => heard.push([id, rows.map((row) => row.state)]));
+
+    await vi.waitFor(() => expect(heard).toHaveLength(2));
+    // The two quick checks settle in either order; the held one cannot have been heard yet.
+    expect(heard).toEqual(expect.arrayContaining([["restate", ["warn"]], ["admin.path", ["cannot-verify"]]]));
+    release();
+    const { results } = await run;
+    expect(heard[2]).toEqual(["env.github-app", ["pass"]]);
+    expect(results.map((row) => row.id)).toEqual(["env.github-app", "restate", "admin.path"]);
+  });
+});
+
+describe("the run in progress", () => {
+  // callback.reachable reads the callback address's health, so holding that read holds exactly one check.
+  function heldContext() {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const ctx = makeSetupCheckContext({
+      env: { RUNNER_CALLBACK_BASE_URL: "https://o.example.com" },
+      orchestratorHealthAt: async () => { await held; return { outcome: "no-response", timedOut: true, error: "timeout" }; },
+    });
+    return { ctx, release };
+  }
+
+  it("is null before any run", () => {
+    expect(checks.getSetupCheckProgress()).toBeNull();
+  });
+
+  const runningIds = () => checks.getSetupCheckProgress()?.running.map((check) => check.id);
+
+  it("records every check as running, then each finished check's rows, until the run is ended", async () => {
+    const { ctx, release } = heldContext();
+    const run = checks.runSetupChecksWithProgress(ctx, () => 50);
+
+    await vi.waitFor(() => expect(runningIds()).toEqual(["callback.reachable"]));
+    const during = checks.getSetupCheckProgress()!;
+    // Named as the Setup page shows it, since a page module cannot import the check list.
+    const reachable = checks.SETUP_CHECKS.find((check) => check.id === "callback.reachable")!;
+    expect(during.running).toEqual([{ id: reachable.id, title: reachable.title, group: reachable.group }]);
+    expect(during.startedAt).toBe(50);
+    expect(during.total).toBe(checks.SETUP_CHECKS.length);
+    expect(during.finished.map((row) => row.id)).not.toContain("callback.reachable");
+    release();
+    const finished = await run;
+
+    // The record stays until the caller has stored the run, so a reader always sees one or the other.
+    expect(checks.getSetupCheckProgress()).toEqual({ startedAt: 50, total: checks.SETUP_CHECKS.length, finished: expect.any(Array), running: [] });
+    expect(new Set(checks.getSetupCheckProgress()!.finished)).toEqual(new Set(finished.results));
+    checks.endSetupCheckProgress();
+    expect(checks.getSetupCheckProgress()).toBeNull();
+  });
+
+  it("answers a copy, so a reader cannot change the record", async () => {
+    const { ctx, release } = heldContext();
+    const run = checks.runSetupChecksWithProgress(ctx);
+    await vi.waitFor(() => expect(runningIds()).toEqual(["callback.reachable"]));
+    checks.getSetupCheckProgress()!.running.length = 0;
+    expect(runningIds()).toEqual(["callback.reachable"]);
+    release();
+    await run;
+  });
+
+  it("never lets a superseded run's late checks write into a newer run's record", async () => {
+    const first = heldContext();
+    const firstRun = checks.runSetupChecksWithProgress(first.ctx, () => 1);
+    await vi.waitFor(() => expect(runningIds()).toEqual(["callback.reachable"]));
+    const second = heldContext();
+    const secondRun = checks.runSetupChecksWithProgress(second.ctx, () => 2);
+    await vi.waitFor(() => expect(runningIds()).toEqual(["callback.reachable"]));
+
+    first.release();
+    await firstRun;
+    expect(checks.getSetupCheckProgress()).toMatchObject({ startedAt: 2, running: [{ id: "callback.reachable" }] });
+    second.release();
+    await secondRun;
+  });
+});
+
+describe("setupCommandFor", () => {
+  it("names the SSH command for the app on Fly, and the npm script off it", () => {
+    expect(checks.setupCommandFor({ FLY_APP_NAME: "acme-orchestrator" })).toBe('fly ssh console -a acme-orchestrator -C "node /app/dist/check-setup.js"');
+    expect(checks.setupCommandFor({})).toBe("npm run check-setup");
   });
 });
 
@@ -338,7 +444,7 @@ describe("createSetupCheckContext", () => {
     const mappings = () => ({ ENG: makeMapping() });
 
     const unconfigured = checks.createSetupCheckContext({ restateStatus, mappings });
-    await expect(unconfigured.trackerProvider("jira")).rejects.toThrow("No project uses the jira tracker");
+    await expect(unconfigured.trackerProvider("jira")).rejects.toThrow("No project uses the jira ticketing system");
     await expect(unconfigured.trackerProvider("linear")).rejects.toThrow(/linearClientId/);
 
     linearAuth.configureLinearAuth("client-id", "client-secret");
@@ -438,6 +544,40 @@ describe("createSetupCheckContext", () => {
       queue.enqueueWorkflowSync("ENG");
       expect(facts.workflowSync("ENG")).toMatchObject({ teamKey: "ENG", status: "pending" });
       expect(api.calls).toHaveLength(0);
+    });
+
+    it("only reads from GitHub across a whole run: a GET, a token mint, or the GraphQL read query", async () => {
+      const api = fakeFetch({
+        "GET /app": { json: { slug: "app" } },
+        "GET /orgs/o/installation": installed(1),
+        "GET /orgs/other/installation": githubError(404, "Not Found"),
+        "GET /users/other/installation": githubError(404, "Not Found"),
+        "POST /app/installations/1/access_tokens": { status: 201, json: { token: "ghs_read", expires_at: new Date(Date.now() + 3600_000).toISOString() } },
+        "POST /graphql": { json: { data: { r0: { defaultBranchRef: { name: "main" }, isPrivate: false, e0: null, e1: null, e2: null, p0: { nodes: [] } } } } },
+        "GET /app/hook/deliveries": { json: [] },
+        "GET /repos/other/docs": { json: { private: false } },
+        "GET /repos/other/skills": { json: { private: false } },
+      }).install();
+      const ctx = checks.createSetupCheckContext({
+        env: { ...env, GITHUB_WEBHOOK_SECRET: "s" },
+        restateStatus,
+        mappings: () => ({
+          ENG: makeMapping({ owner: "o", repo: "app", referenceRepos: [{ repo: "https://github.com/other/docs", path: "docs" }], skillsRepo: "https://github.com/other/skills" }),
+        }),
+        // The ticketing system's reads are its own checks' subject, not GitHub's.
+        trackerProvider: async () => makeProvider(),
+        trackerSetupFacts: async () => null,
+      });
+
+      await checks.runSetupChecks(ctx);
+
+      const kinds = api.calls.map((call) => {
+        if (call.method === "GET") return "get";
+        if (call.method === "POST" && /^\/app\/installations\/\d+\/access_tokens$/.test(call.path)) return "mint";
+        if (call.method === "POST" && call.path === "/graphql" && /^\s*query\b/.test(JSON.parse(call.body).query)) return "query";
+        return `${call.method} ${call.path}`;
+      });
+      expect(new Set(kinds)).toEqual(new Set(["get", "mint", "query"]));
     });
   });
 

@@ -83,12 +83,7 @@ export const kgPipelinesHtml = `
 
 export const kgPipelinesScript = `
 (function () {
-  // Local copies of the Deployments page helpers; the message box here is #kg-pipelines-error.
-  function setBadge(el, kind, label) {
-    el.className = 'badge ' + kind;
-    el.innerHTML = '<span class="dot"></span>' + window.esc(label);
-  }
-
+  // A local copy of the Deployments page's showMessage; the message box here is #kg-pipelines-error.
   function showMessage(kind, text) {
     const el = document.getElementById('kg-pipelines-error');
     el.className = kind;
@@ -121,30 +116,30 @@ export const kgPipelinesScript = `
       // older orchestrator responses that lack it.
       const stage = data.stage || (data.running ? 'checking' : 'idle');
       if (stage === 'checking') {
-        setBadge(badge, 'running', 'checking');
+        window.setStatusBadge(badge, 'running', 'checking');
       } else if (stage === 'ingest-running') {
-        setBadge(badge, 'running', 'running');
+        window.setStatusBadge(badge, 'running', 'running');
       } else if (stage === 'snapshot-landed') {
-        setBadge(badge, 'running', 'landing');
+        window.setStatusBadge(badge, 'running', 'landing');
       } else if (stage === 'staging') {
-        setBadge(badge, 'running', 'staging');
+        window.setStatusBadge(badge, 'running', 'staging');
       } else if (stage === 'awaiting-decision') {
-        setBadge(badge, 'warn', 'awaiting decision');
+        window.setStatusBadge(badge, 'warn', 'awaiting decision');
       } else if (stage === 'serving') {
-        setBadge(badge, 'ok', 'serving');
+        window.setStatusBadge(badge, 'success', 'serving');
       } else if (stage === 'reverted') {
-        setBadge(badge, 'warn', 'reverted');
+        window.setStatusBadge(badge, 'warn', 'reverted');
       } else if (stage === 'failed') {
         const concl = data.lastRefresh && data.lastRefresh.conclusion;
-        if (concl === 'operator_cancelled') setBadge(badge, 'neutral', 'cancelled');
-        else if (concl === 'decision_timeout') setBadge(badge, 'warn', 'timed out');
-        else setBadge(badge, 'fail', 'failed');
+        if (concl === 'operator_cancelled') window.setStatusBadge(badge, 'neutral', 'cancelled');
+        else if (concl === 'decision_timeout') window.setStatusBadge(badge, 'warn', 'timed out');
+        else window.setStatusBadge(badge, 'fail', 'failed');
       } else if (data.kgDegraded) {
-        setBadge(badge, 'warn', 'degraded');
+        window.setStatusBadge(badge, 'warn', 'degraded');
       } else if (data.lastRefresh?.gate === 'ingest-needed') {
-        setBadge(badge, 'neutral', 'stale');
+        window.setStatusBadge(badge, 'neutral', 'stale');
       } else {
-        setBadge(badge, 'ok', 'serving');
+        window.setStatusBadge(badge, 'success', 'serving');
       }
       document.getElementById('kg-refresh-stamp').textContent =
         'Served graph stamp: ' + (data.servedStamp || 'baked image graph');

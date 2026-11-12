@@ -1,7 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
 import { buildHealthBody } from "./health-body.js";
-import { createSetupCheckContext, getLastSetupCheckRun, setupChecksHealthField } from "./setup-checks/index.js";
+import { createSetupCheckContext, getLastSetupCheckRun, getSetupCheckProgress, setupChecksHealthField } from "./setup-checks/index.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
@@ -61,7 +61,7 @@ import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
-import { createSetupChecksHydration, readSetupChecksViaObject, runSetupChecksViaObject } from "./restate/setup-checks.js";
+import { createSetupChecksHydration, readSetupChecksViaObject, startSetupChecksViaObject } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -4840,7 +4840,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, startSetupChecks: startSetupChecksViaObject, setupCheckProgress: getSetupCheckProgress,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,

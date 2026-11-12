@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { parseEnv } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import { runCheckSetup, type CheckSetupDependencies } from "../check-setup.js";
-import { SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus } from "../setup-checks/index.js";
+import { SETUP_CHECK_GROUP_LABELS, SETUP_CHECKS, type SetupCheck, type SetupCheckContext, type SetupCheckRestateStatus } from "../setup-checks/index.js";
 import { makeMapping } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 import { makeSetupCheckContext } from "./helpers/fixtures/setup-checks.js";
@@ -212,21 +212,22 @@ describe("output", () => {
     check({ id: "env.admin-access-code", title: "Third", group: "tracker", run: () => [{ state: "fail", fix: "Do it." }] }),
   ];
 
-  it("prints a table grouped by check group, with each state, detail and fix, and a summary", async () => {
+  it("prints a table grouped by check group under each group's operator label, with each state, detail and fix, and a summary", async () => {
     const d = deps({ checks: CHECKS });
 
     await runCheckSetup([], d.deps);
 
+    // The labels are read from the map, so rewording one never breaks this test, while printing a raw key does.
     expect(d.stdout()).toBe(
       [
-        "orchestrator",
+        SETUP_CHECK_GROUP_LABELS.orchestrator,
         "  PASS           env.github-app: First",
         "                 Read the key",
         "  WARN           runner.fly-sessions (ENG): Second",
         "                 A detail",
         "                 Fix: A fix.",
         "",
-        "tracker",
+        SETUP_CHECK_GROUP_LABELS.tracker,
         "  FAIL           env.admin-access-code: Third",
         "                 Fix: Do it.",
         "",
@@ -253,6 +254,7 @@ describe("output", () => {
 
     expect(await runCheckSetup(["--json"], d.deps)).toBe(1);
     expect(JSON.parse(d.stdout())).toEqual({
+      startedAt: expect.any(Number),
       checkedAt: expect.any(Number),
       results: [
         { id: "env.github-app", title: "First", group: "orchestrator", tier: "core", onAdminPath: false, state: "pass", detail: "Read the key" },
