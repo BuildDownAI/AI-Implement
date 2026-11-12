@@ -65,6 +65,7 @@ import {
   saveAccountProfileRevision,
   setOrchestratorDefaults,
   setProjectStageConfig,
+  setProjectConfigured,
   StaleStageInputsError,
   type AccountProfileProjection,
 } from "./agent-config-store.js";
@@ -2092,6 +2093,22 @@ async function handleAuth(
     }
   } catch {
     json(res, 400, { error: "Invalid request body" });
+  }
+}
+
+export function setProjectAgentModeAction(
+  projectKey: string,
+  mode: "configured" | "legacy",
+  actor: string,
+): { ok: true; teamKey: string; agentMode: "configured" | "legacy" } | { ok: false; code: "mapping-not-found" | "resolution-failed" } {
+  if (!getMappings()[projectKey]) {
+    return { ok: false, code: "mapping-not-found" };
+  }
+  try {
+    setProjectConfigured(projectKey, mode === "configured", actor);
+    return { ok: true, teamKey: projectKey, agentMode: mode };
+  } catch {
+    return { ok: false, code: "resolution-failed" };
   }
 }
 

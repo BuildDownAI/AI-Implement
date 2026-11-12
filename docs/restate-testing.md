@@ -117,7 +117,7 @@ The unit tier for the same modules, `src/__tests__/tools.test.ts` and `src/__tes
 | Fake | What it replaces | How |
 |---|---|---|
 | `fakeContext(handlerName)` | `restate.Context` | An object with only `request()` returning `{ target: { handler } }`, because that is the one context call the `tool()` wrapper makes. `restate.handlers.handler` returns a plain callable, so the test calls `myTool(fakeContext("my_tool"), { caller, args })` directly |
-| `vi.mock("../admin.js")` | The five admin action functions the write tools call | Mocked wholesale so a write scenario asserts the action was called with the right arguments and the handler mapped its return to the right result text |
+| `vi.mock("../admin.js")` | The six admin action functions the write tools call | Mocked wholesale so a write scenario asserts the action was called with the right arguments and the handler mapped its return to the right result text |
 | `vi.mock("../report-card.js")`, `vi.mock("../config.js")` (partial) | Report and mapping reads | Return values set per test |
 | A faked `fetch` passed through `deps` | The Restate admin API and ingress | `discoverTools()` and `callTool()` take `fetchImpl` in their deps, so the test hands them canned responses: a metadata body, a 4xx, a 5xx, an empty body, a connection error |
 | `UNROUTABLE_INGRESS` (`http://127.0.0.1:59999`) | A down sidecar | Nothing listens there, so `RestateRefreshAuthority` gets a fast `ECONNREFUSED` and the test asserts the `unavailable` mapping |
