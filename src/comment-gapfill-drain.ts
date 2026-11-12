@@ -337,6 +337,11 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         // The PR's own run still in flight: canDispatch's in_flight refusal below leaves
         // the item pending, and a later drain retries it once the run sets pr_url.
         if (!prLog) prLog = resolveInFlightDispatch(item.owner, item.repo, headRef);
+        if (!prLog && item.commenter === ROLLUP_REVIEW_COMMENTER) {
+          console.log(`[comment-gapfill] Roll-up review for ${fullRepo} PR #${item.prNumber} skipped: no parent dispatch log`);
+          markCommentGapfillProcessed(item.id, "skipped");
+          continue;
+        }
         if (!prLog) {
           console.warn(`[comment-gapfill] No dispatch log for ${fullRepo} PR #${item.prNumber}`);
           await opts.postComment(

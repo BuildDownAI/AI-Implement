@@ -72,7 +72,8 @@ When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left 
 | Condition | Reply | Item |
 |---|---|---|
 | PR cannot be read (null or throw) | "could not read this PR from GitHub just now … repost" | `failed` |
-| No dispatch row, no roll-up parent, no in-flight match | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
+| No dispatch row, no roll-up parent, no in-flight match; comment from a person | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
+| Same, but the commenter is `ROLLUP_REVIEW_COMMENTER` | no reply (one log line) | `skipped` |
 | PR dispatch budget reached | budget park message (once per park, also when the dispatch breaker parked the PR first) | `pending` |
 
 ### Roll-up review-only runs
@@ -80,7 +81,13 @@ When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left 
 A programmatic queue row whose commenter is `ROLLUP_REVIEW_COMMENTER`
 (`ai-implement-rollup-review`) requests an advisory review of the existing PR.
 The drain uses the usual PR identity resolution, including recovery from a roll-up
-parent. Restate launch preparation sets the envelope's `reviewOnly` payload to
+parent. When the drain finds no parent dispatch for a roll-up review row, it skips
+the row quietly (one log line, item `skipped`, nothing posted, no retry).
+When the runner image is not the paired image (`resolveSessionImage` source is not
+`default`; local Docker is exempt), Restate launch preparation skips the review
+the same way and launches no run; see the [paired-image rule](workflow-envelope.md#advisory-review-only-gap-fills).
+
+Restate launch preparation sets the envelope's `reviewOnly` payload to
 `integration-review` plus the project's effective gating reviewers, deduplicated by
 id. An unset project selection uses the normal defaults; an empty selection still
 runs `integration-review`. Open ledger findings are not appended as fix instructions.

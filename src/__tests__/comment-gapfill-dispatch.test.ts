@@ -613,6 +613,18 @@ describe("ImplementationRun gap-fill ingress", () => {
     await checkNoSubmit(opts, seedItem(), "failed");
     expect(opts.postComment).toHaveBeenCalledWith("gh-token", "acme", "billing", 42, expect.stringContaining("no record"));
   });
+  it("quietly skips a roll-up review without a parent run and does not retry", async () => {
+    prLookup(42, openPrWithHead("ai-implement/feature/aii-1"));
+    const id = seedItem({ commenter: queue.ROLLUP_REVIEW_COMMENTER });
+    const opts = optsFor();
+    await checkNoSubmit(opts, id, "skipped");
+    expect(opts.postComment).not.toHaveBeenCalled();
+    vi.mocked(opts.getInstallationToken).mockClear();
+    await drain.drainCommentGapfillQueue(opts);
+    expect(opts.getInstallationToken).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(opts.postComment).not.toHaveBeenCalled();
+  });
   it("paused mapping skips", async () => {
     seedOrigin();
     await checkNoSubmit(optsFor(makeMapping({ owner: "acme", repo: "billing", paused: true })), seedItem(), "skipped");

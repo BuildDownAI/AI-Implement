@@ -481,7 +481,12 @@ nonempty. Absent mode preserves the normal implement/fix gap-fill flow. Malforme
 mode fails decoding; it cannot be combined with `reviewFix`.
 
 GHA envelope dispatch, Fly and local Docker retain this payload. Legacy per-input
-GHA workflows reject the mode before launch. Use a runner image that supports it.
+GHA workflows reject the mode before launch. Roll-up reviews on GHA and Fly launch
+only on the runner image paired with the orchestrator deployment
+(`resolveSessionImage(...).source === "default"`). A repository image override
+causes a quiet skip: no run launches and no PR comment is posted. Local Docker is
+always capable because its runner is built alongside the orchestrator. Ordinary
+gap-fills are unaffected by this restriction.
 The runner reads the PR's full base-to-head diff and invokes the selected internal
 reviewers once with read-only tools. It skips installs, repository hooks,
 implementation, fixes, preflight, commit/push, and external-review polling.
