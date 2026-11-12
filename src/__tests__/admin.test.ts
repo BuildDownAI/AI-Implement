@@ -6440,7 +6440,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "m" }, { accountProfileId: "other", model: "claude" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
     // Simulate an existing project override; the save route correctly refuses this configuration.
-    modules.agentConfigStore.setProjectOptIn("APP", true);
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     dedup.getDb().prepare("INSERT INTO stage_agent_config_revisions (config_revision_id, scope_kind, scope_key, revision, version, config_json, created_at) VALUES ('override-test', 'project', 'APP', 2, 1, ?, ?)").run(
       JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
     const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
@@ -6728,7 +6728,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
         return { status: "not-ready", code: "runner_incompatible" };
       });
       await inside;
-      expect(store.getProjectOptIn("APP")).toBe(false);
+      expect(store.isProjectConfigured("APP")).toBe(false);
       expect(store.getProjectStageConfig("APP")).toBeNull();
       expect(count("stage_agent_config_revisions")).toBe(revs);
       release();
@@ -6754,7 +6754,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
         });
         expect(r.status).toBe(409);
         expect(r.json.code).toBe("stale_inputs");
-        expect(store.getProjectOptIn("APP")).toBe(false);
+        expect(store.isProjectConfigured("APP")).toBe(false);
         // Only the concurrent writer's own revision (project move) may exist; the stale candidate never lands.
         expect(store.getProjectStageConfig("APP")?.revision ?? 0).toBeLessThanOrEqual(before + 1);
       }
@@ -6775,7 +6775,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
         throw new Error("boom");
       });
       expect(backendFail.status).toBe(503);
-      expect(store.getProjectOptIn("APP")).toBe(false);
+      expect(store.isProjectConfigured("APP")).toBe(false);
     });
 
     it("refuses unreadable GitHub Actions workflows with the sync action and stores nothing", async () => {
@@ -6785,7 +6785,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(r.status).toBe(409);
       expect(r.json).toMatchObject({ code: "delivery_unreadable", backend: "github-actions",
         action: "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows." });
-      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(false);
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(false);
       expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
       expect(count("stage_agent_config_revisions")).toBe(revs);
     });
@@ -6795,7 +6795,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
       expect((await optIn(t, inspect)).status).toBe(200);
       expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions", projectKey: "APP" }), expect.objectContaining({ mode: "configured" }));
-      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(true);
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(true);
       expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
     });
 
@@ -6837,7 +6837,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ projectKey: "APP" }),
         expect.objectContaining({ stages: expect.objectContaining({ review: expect.objectContaining({ accountProfileId: "cl-sub" }) }) }));
       expect(r.status).toBe(ready ? 200 : 409);
-      expect(store.getProjectOptIn("APP")).toBe(ready);
+      expect(store.isProjectConfigured("APP")).toBe(ready);
       if (ready) {
         expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
         const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, readyDeps());
@@ -6858,7 +6858,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     const body = { enabled: true, agentConfig: { mode: "configured" } };
     await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
     await request("/api/mappings/APP", "PATCH", "secret", body, t);
-    expect(store.getProjectOptIn("APP")).toBe(false);
+    expect(store.isProjectConfigured("APP")).toBe(false);
     expect(store.getProjectStageConfig("APP")).toBeNull();
   });
 

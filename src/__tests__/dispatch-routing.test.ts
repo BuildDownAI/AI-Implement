@@ -1746,7 +1746,7 @@ describe("poll implementation submission — ImplementationRun for every project
     });
     const stage = { agent: "codex" as const, provider: "openai" as const, model: "m", accountProfileId: "managed", invocationTimeoutMs: 60_000 };
     store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
     await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), {
       ...ctx, runnerMode: "shadow", baseBranch: "release", baseBranchFieldValue: "release",
     });

@@ -157,7 +157,7 @@ describe("workflow preparation", () => {
         );
 
       beforeEach(() => {
-        store.setProjectOptIn("AII", true);
+        store.setProjectConfigured("AII", true);
         byRef = {};
         const answer = (path: string) => (call: { url: URL }) => byRef[call.url.searchParams.get("ref") ?? ""]?.[path] ?? NOT_FOUND;
         contents = fakeFetch({
@@ -270,7 +270,7 @@ describe("prepareAgentRun with the runtime deps", () => {
       version: 1, mode: "configured",
       stages: { planning: stage(profile, agent, provider), implementation: stage(profile, agent, provider), review: stage(profile, agent, provider) },
     });
-    store.setProjectOptIn("AII", true);
+    store.setProjectConfigured("AII", true);
   }
 
   function claudeProfile() {

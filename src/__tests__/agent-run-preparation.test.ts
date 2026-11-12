@@ -95,7 +95,7 @@ function useStages(planning: [string, "claude" | "codex", "anthropic" | "openai"
 }
 
 function optIn() {
-  store.setProjectOptIn("AII", true);
+  store.setProjectConfigured("AII", true);
 }
 
 /** Leaves a session state another (released) dispatch imported, as the operator CLI would. */
@@ -181,7 +181,7 @@ beforeEach(async () => {
 
 describe("legacy", () => {
   it("returns legacy without writing anything when the project is not opted in", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     const before = counts();
     expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "legacy" });
     expect(counts()).toEqual(before);
@@ -339,7 +339,7 @@ describe("snapshot immutability and idempotence", () => {
 
   it("reuses a stored snapshot even after the project is opted out", async () => {
     const first = ready(await prep.prepareAgentRun(request(), deps));
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     expect(ready(await prep.prepareAgentRun(request(), deps)).snapshot.snapshotId).toBe(first.snapshot.snapshotId);
   });
 
