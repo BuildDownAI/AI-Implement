@@ -50,3 +50,18 @@ are omitted. The tool reads these modes from SQLite and exposes no runner enviro
 Values are copied unchanged only when supplied by the runner, including empty strings. Missing or undefined values remain absent; no default `CI` or `GITHUB_ACTIONS` value is set. Other `GITHUB_*` and `ACTIONS_*` names are dropped, including `GITHUB_REPOSITORY`, `GITHUB_ENV` and `ACTIONS_RUNTIME_TOKEN`.
 
 Protected names, forwarded secrets and the credential/routing strip lists take precedence over this allowlist. A forwarded secret named `CI` is therefore removed, as are inherited credentials such as `GITHUB_TOKEN`. After filtering, the selected account's authentication values are supplied separately for its auth mode.
+
+
+The admin tool `set_project_agent_mode` changes a project's mode to `configured` or
+`legacy`. It inspects nothing: no workflow readiness, account check or GitHub read.
+It validates configuration resolution when moving to configured and keeps stored stages.
+A repeated request for the current mode adds no row. In-flight runs keep their stored
+snapshot; the new mode applies to the next dispatch. A project with a stored row is
+moved by this tool, not by `adopt-projects`.
+
+Dispatch gates configured runs. When a configured project is not ready, dispatch starts
+no run. The ticket gets "Managed dispatch refused (configuration-error): <code>. No run
+was started." with the prefix "Planning failed:" or "Implementation failed:".
+Repeated refusals count as dispatch failures and park the issue at the limit.
+Recover by setting the project to legacy, or by merging the workflow sync pull request
+and removing the park.

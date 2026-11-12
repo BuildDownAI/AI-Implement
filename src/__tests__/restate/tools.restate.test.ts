@@ -368,7 +368,7 @@ describe("orchestratorTools (Restate)", () => {
     // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
     for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["deploy"] }), args,
+        caller: serviceCaller({ grants: ["deploy"] }), args: name === "set_project_agent_mode" ? { teamKey: "BDS", mode: "legacy" } : args,
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -397,6 +397,34 @@ describe("orchestratorTools (Restate)", () => {
       expect(health).toHaveProperty("kgRefreshPreflight");
     },
   );
+
+  it.each(VARIANTS.map(([label]) => label))("changes project agent modes through ingress (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const change = (mode: string, caller = SYSTEM) => callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", { caller, args: { teamKey: "BDS", mode } });
+    try {
+      setProjectConfigured("BDS", false);
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
+        saveAccountProfileRevision(makeStageAgentProfile());
+      }
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      for (const mode of ["configured", "legacy"]) {
+        const result = await change(mode);
+        expect(result.isError).toBeFalsy();
+        expect(JSON.parse(result.content[0].text)).toEqual({ teamKey: "BDS", agentMode: mode });
+        const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });
+        expect(JSON.parse(health.content[0].text).stageAgents.projects).toContainEqual({ teamKey: "BDS", agentMode: mode });
+      }
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+      expect(await change("configured")).toEqual({ isError: true, content: [{ type: "text", text: "resolution-failed" }] });
+      const refused = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", {
+        caller: { kind: "human", email: "user@example.com", role: "user" }, args: { teamKey: "BDS", mode: "legacy" },
+      });
+      expect(refused).toEqual({ isError: true, content: [{ type: "text", text: "forbidden: set_project_agent_mode requires the admin role" }] });
+    } finally {
+      setProjectConfigured("BDS", false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
 
   it.each(VARIANTS.map(([label]) => label))("reports configured and legacy stage agents through ingress (%s)", async (label) => {
     const env = environments.get(label)!;

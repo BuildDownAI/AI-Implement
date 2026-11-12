@@ -56,6 +56,7 @@ import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../rep
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
+  setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -1522,6 +1523,29 @@ export const addProjectArgsSchema = z.object({
   ),
 });
 
+export const SetProjectAgentModeArgsSchema = z.object({
+  teamKey: z.string(),
+  mode: z.enum(["configured", "legacy"]),
+}).strict();
+
+export const setProjectAgentModeTool = tool(
+  {
+    description: "Change a project's agent mode to configured or legacy without readiness inspection. Refusals: mapping-not-found, resolution-failed.",
+    input: SetProjectAgentModeArgsSchema,
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `teamKey=${input.args.teamKey} mode=${input.args.mode}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("set-project-agent-mode", () =>
+      setProjectAgentModeAction(input.args.teamKey, input.args.mode, auditActor(input.caller, "system")),
+    { maxRetryAttempts: 1 });
+    if (!result.ok) return toolError(result.code);
+    return { content: [{ type: "text", text: JSON.stringify({ teamKey: result.teamKey, agentMode: result.agentMode }) }] };
+  },
+);
+
 export const addProjectTool = tool(
   {
     description: ADD_PROJECT_DESCRIPTION,
@@ -1684,6 +1708,7 @@ export const orchestratorTools = restate.service({
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,
     add_project: addProjectTool,
+    set_project_agent_mode: setProjectAgentModeTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
     list_dispatch_reservations: listDispatchReservationsTool,

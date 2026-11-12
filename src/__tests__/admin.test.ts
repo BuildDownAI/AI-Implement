@@ -6343,6 +6343,53 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 
+  it("refuses mode changes for a missing mapping before writing", () => {
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction("MISSING", mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+    }
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("refuses inherited mapping name %s in both modes without writing", async (projectKey) => {
+    await seed();
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction(projectKey, mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
+  it("keeps absent-row legacy unchanged and refuses unresolved configuration without writing", async () => {
+    await seed();
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it("changes both modes preserving stages and actor, and unchanged modes append nothing even with invalid defaults", async () => {
+    const t = await seed();
+    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false, stages: { planning: { model: "project-model" } } });
+    const stages = modules.agentConfigStore.getProjectStageConfig("APP")!.config.stages;
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "configured" });
+    expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "operator", config: { mode: "configured", stages } });
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const unchanged = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged);
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "other", config: { mode: "legacy", stages } });
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+  });
+
   it("preserves resolution failure diagnostics when defaults become legacy", async () => {
     const t = await seed();
     expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
