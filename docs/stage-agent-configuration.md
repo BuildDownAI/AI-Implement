@@ -1,6 +1,6 @@
 # Stage agent configuration
 
-Stage agent configuration decides, for each stage of a run, which agent runs, through which provider, on which model, with which account's credential. A project uses it once it is opted in; a project that is not opted in runs on the legacy path, which reads the model credential from the target repository's secrets or the orchestrator's environment.
+Stage agent configuration decides, for each stage of a run, which agent runs, through which provider, on which model, with which account's credential. A configured project uses it; a legacy project runs on the legacy path, which reads the model credential from the target repository's secrets or the orchestrator's environment.
 
 ## Stages and selections
 
@@ -22,6 +22,8 @@ On Models & providers, the Orchestrator stage defaults card edits this list with
 - `invocationTimeoutMs` and `fallbackModel` are stage fields, merged field by field.
 
 Saving refuses an entry that does not resolve, a profile listed twice, an entry of another agent with a blank model, and an API-key or Bedrock entry after a subscription entry: a run never moves from subscription use to paid API use by itself. Errors name the stage and account index (starting at zero). The local harness uses these same rules for `stages`; its project-like `selections` block refuses lists.
+
+The Projects Agents tab has no mode control. It shows the project mode and names the admin tool `set_project_agent_mode` for changing it. Stage overrides and their save button remain available for both modes; saves send only `stages`. Legacy runs ignore stored overrides until the project becomes configured. Unsaved projects show “Save the mapping first”.
 
 ## Run preparation and the snapshot
 

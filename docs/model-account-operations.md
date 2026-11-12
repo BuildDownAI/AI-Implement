@@ -27,7 +27,7 @@ The table reads Name, Agent, Provider, Authentication, Status, Readiness and API
 The admin-only route may accept `identity`, `agent`, `provider`, `authMode`, `credentialRef` and `status`; any other key is a 400. It copies the current head, applies the body, and saves a new revision (`handlePatchModelAccount`, `src/admin.ts`). The credential reference is kept unless the body sets `credentialRef` to `null`. The profile ID is the path and cannot change: stage defaults, credential references and run attribution store it. The same validation as create applies (`validateProfileInput`, `src/agent-config-store.ts`).
 
 - **Readiness.** Credential readiness comes from the profile's own credential status (`accountStatus`, `src/admin.ts`), whether or not any project uses it. Every active profile is usable by every project; disable or archive a profile to stop its use.
-- **Every stage needs a profile.** A project that opts into configured runs needs a usable profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown, disabled or archived profile, or one whose agent or provider does not match the stage, throws. A project that wants Codex only for review must still give planning and implementation a profile.
+- **Every stage needs a profile.** A configured project needs a usable profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown, disabled or archived profile, or one whose agent or provider does not match the stage, throws. A project that wants Codex only for review must still give planning and implementation a profile.
 
 ## ChatGPT plan accounts
 
@@ -165,7 +165,7 @@ The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token
 The admin tool `import_environment_credential` (no arguments, through MCP or
 `POST /api/tools/import_environment_credential` with `{ "args": {} }`) imports the
 credential as an ordinary account profile named `Adopted environment credential`.
-It does not change stage defaults, project grants, or project opt-ins. Repeating
+It does not change stage defaults, project grants, or project modes. Repeating
 the import returns `already-imported` (200) without writing when the stored
 credential opens. If the stored credential is missing or unreadable, the tool
 reseals the value from the current orchestrator environment and returns `created`
@@ -183,7 +183,7 @@ The command creates `adopted-env-claude-subscription` or
 `model-account:<profile-id>` reference, and configures planning, implementation
 and review with that profile, agent `claude`, provider `anthropic` and the built-in
 `DEFAULT_MODEL`. Each stage uses 90 minutes because configured stages require a
-timeout. It creates no project grants and opts no project into configured runs.
+timeout. It creates no project grants and changes no existing project mode.
 
 Output lists each stage and profile id, never the credential. Existing configured
 defaults are a no-op, including when the environment no longer has the credential;
@@ -194,8 +194,7 @@ when existing defaults reference it. Identifier or reference collisions fail wit
 changes. Adoption writes are atomic.
 
 Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode`
-is `configured`, and all three stages name the adopted profile. Projects still
-need their own explicit opt-in. To roll back, revert the defaults and delete the
+is `configured`, and all three stages name the adopted profile. New projects start configured when defaults are on; existing projects keep their mode. To roll back, revert the defaults and delete the
 profile on Models & providers; remove its encrypted credential with `secret-delete`
 if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
 with `secret-import`, the profile's credential editor, or
@@ -208,7 +207,7 @@ credential.
 
 ## Adopting existing projects
 
-Existing projects remain legacy until an operator runs `adopt-projects`:
+Existing projects keep their mode. To configure projects without a stored row, an operator can run `adopt-projects`; for a stored legacy row, use `set_project_agent_mode`:
 
 ```bash
 npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --dry-run
@@ -217,11 +216,11 @@ npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --proj
 
 Run `adopt-env` first to establish configured defaults. Each project line reports the outcome and each stage's model and source. Adoption reads `.ai-implement/config.yml`, `WORKFLOW.md` and `PLANNING.md` at one commit resolved from the configured dispatch branch (`mapping.defaultBranch`). Implementation and review prefer `models.implement` / `models.review`, then observable `mapping.extraEnv.CLAUDE_MODEL` on Fly/local, then WORKFLOW front matter. Planning prefers that mapping model on Fly/local, then PLANNING front matter. Legacy GitHub Actions does not receive mapping Extra Env, so adoption ignores it on that backend. Shadow implementation/review must resolve the same model on both backends; a difference reports `model_conflict` with the stage, backend values and sources, and skips the project without writes. Shadow planning uses GitHub Actions only. Stages without a repository model retain the legacy `DEFAULT_MODEL` fallback (shown as `DEFAULT_MODEL` in the report). Each effective legacy model becomes a stage override when it differs from configured defaults; matching models need no override. If repository reads fail, the report says “model not carried” and all stages inherit defaults.
 
-Runner-only environment settings (for example, Fly secrets, image environment, or GitHub Actions variables/secrets) are not observable through these readers. Adoption cannot preserve those unknown model overrides; inspect the preview against your runner configuration before opting in. The command does not read credentials or guess their values.
+Runner-only environment settings (for example, Fly secrets, image environment, or GitHub Actions variables/secrets) are not observable through these readers. Adoption cannot preserve those unknown model overrides; inspect the preview against your runner configuration before adopting projects. The command does not read credentials or guess their values.
 
-Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and explicit legacy opt-outs are skipped. After readiness, adoption rechecks that branch head before synchronously revalidating local inputs and writing. An observed push or disappeared branch reports `inputs_changed`; retry to inspect the new snapshot. A failed final revision check reports `repository_unavailable` without writing or replacing the checked candidate. Dry-run uses the same guard. This last GitHub observation does not lock remote pushes: a push after it is a later repository change. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
+Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and projects with stored legacy rows are skipped. After readiness, adoption rechecks that branch head before synchronously revalidating local inputs and writing. An observed push or disappeared branch reports `inputs_changed`; retry to inspect the new snapshot. A failed final revision check reports `repository_unavailable` without writing or replacing the checked candidate. Dry-run uses the same guard. This last GitHub observation does not lock remote pushes: a push after it is a later repository change. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
 
-After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, write an explicit legacy row on the project's **Agents** tab; future adoption runs preserve that opt-out.
+After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, use the admin tool `set_project_agent_mode` with mode `legacy`; future adoption runs preserve that mode.
 
 
 ### Stage fallback accounts
