@@ -1003,7 +1003,8 @@ async function handleRunnerResultInternal(
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
   const owned = readAdmission(preflight.claims.dispatchId)?.lifecycleOwner.kind === "restate";
-  const verified = owned ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
+  // Review-only delivery must retain its credential until pre-write failures can be retried.
+  const verified = owned || body.reviewOnly === true ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     console.warn(
       `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
@@ -1132,9 +1133,14 @@ async function handleRunnerResultInternal(
 
   if (body.reviewOnly === true) {
     const job = getJobByDispatchId(claims.dispatchId);
+    let trackerWriteReserved = false;
     try {
-      await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId);
-    } catch (err) { warn("roll-up-review", err); }
+      await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId, () => { trackerWriteReserved = true; });
+    } catch (err) {
+      warn("roll-up-review", err);
+      if (!trackerWriteReserved) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
+    }
+    if (!owned) verifyAndConsumeRunToken(bearerToken, input.secret);
     if (job) updateJobStatus(job.id, body.outcome === "success" ? "completed" : "failed", "rollup_review", undefined, { skipAdmissionRelease: true });
     await sendImplementationReport();
     return { status: 200, body: { acknowledged: true, warnings } };
@@ -2044,13 +2050,20 @@ export async function resubmitPendingGapFillReviews(opts: {
 
 /** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
 async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
-  scopeKey: string, parentId: string): Promise<void> {
+  scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
   const review = input.body.rollupReview;
   if (!review || typeof review.headSha !== "string" || !/^[a-f0-9]{40,64}$/.test(review.headSha) ||
       typeof review.verdictUrl !== "string" || !job?.prUrl || !input.watchdogConfig) return;
   const target = parsePrUrlTarget(job.prUrl);
   if (!target || job.repo !== `${target.owner}/${target.repo}`) return;
   const { owner, repo, prNumber } = target;
+  if (!provider.listIssuesPage) {
+    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up`);
+    return;
+  }
+  const reservationKey = `roll-up-review:children:${owner}/${repo}#${prNumber}`;
+  const reserved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
+  if (reserved && (JSON.parse(reserved.value) as string[]).includes(review.headSha)) onTrackerWriteReserved();
   const configuredMapping = getMappings()[scopeKey];
   const mapping = configuredMapping ? { ...configuredMapping, teamKey: scopeKey } : null;
   if (!mapping || mapping.owner !== owner || mapping.repo !== repo) return;
@@ -2074,7 +2087,7 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   const children = (await listRollupReviewChildren(provider, mapping)).filter(c =>
     c.parent?.identifier === parent.identifier && c.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} `));
   const existingHeads = children.map(c => c.title.split(" ")[2]);
-  const reservationKey = `roll-up-review:children:${owner}/${repo}#${prNumber}`;
+  if (existingHeads.includes(review.headSha)) onTrackerWriteReserved();
   // Reserve synchronously before awaiting a write. Never release on an ambiguous tracker failure:
   // the server may have created the child even when its response was lost.
   const reservation = getDb().transaction(() => {
@@ -2088,6 +2101,7 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   })();
   let childIdentifier = children.find(c => c.title.split(" ")[2] === review.headSha)?.identifier;
   if (reservation.create) {
+    onTrackerWriteReserved();
     const summary = blockers[0].body.replace(/\s+/g, " ").trim().slice(0, 70);
     const title = `${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} ${review.headSha} ${summary}`.slice(0, 250);
     const body = `## Problem\n\nBlocking roll-up review findings at head \`${review.headSha}\`.\n\nPR: ${job.prUrl}\nVerdict: ${review.verdictUrl}\n\n## Task\n\nFix every blocking finding below in a PR targeting the parent's feature branch.\n\n` +

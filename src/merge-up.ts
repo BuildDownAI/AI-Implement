@@ -223,8 +223,16 @@ function requestRollupReview(owner: string, repo: string, prNumber: number, head
 /** Stable title identity: parent + repository/PR + reviewed head, including terminal children. */
 export const ROLLUP_REVIEW_CHILD_PREFIX = "[roll-up-review]";
 
+const providersWithoutRollupListing = new WeakSet<TicketingProvider>();
+
 export async function listRollupReviewChildren(provider: TicketingProvider, mapping: RepoMapping): Promise<TrackerIssueRecord[]> {
-  if (!provider.listIssuesPage) throw new Error("Provider cannot enumerate roll-up review children");
+  if (!provider.listIssuesPage) {
+    if (!providersWithoutRollupListing.has(provider)) {
+      providersWithoutRollupListing.add(provider);
+      console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; skipping reconciliation`);
+    }
+    return [];
+  }
   const children: TrackerIssueRecord[] = [];
   let cursor: string | null = null;
   const seen = new Set<string>();

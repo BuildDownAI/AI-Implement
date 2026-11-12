@@ -6586,22 +6586,27 @@ describe("roll-up review follow-up children", () => {
       { source: "ai-implement-internal", severity: "blocking", path: "two.ts", line: 9, body: "When retried, work is duplicated." },
       { source: "ai-implement-internal", severity: "minor", body: "minor nit" },
     ];
-    async function run(head: string, internalFindings = findings) {
+    async function prepare(head: string, internalFindings = findings) {
       const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
       const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
-      const result = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
+      const deliver = () => runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
         resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
         body: { phase: "gap-analysis", outcome: "success", reviewOnly: true, comments: [], internalFindings,
           rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99" } } });
+      return { deliver, dispatchId };
+    }
+    async function run(head: string, internalFindings = findings) {
+      const { deliver, dispatchId } = await prepare(head, internalFindings);
+      const result = await deliver();
       expect(result.status).toBe(200);
       expect(log.getJobByDispatchId(dispatchId)?.approved).toBe(false);
       expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
       expect(submit).not.toHaveBeenCalled();
       return result;
     }
-    return { provider, children, listing, create, update, run, findings };
+    return { provider, children, listing, create, update, run, prepare, findings };
   }
 
   it("files both blockers in one templated child and keeps minors in the verdict", async () => {
@@ -6641,13 +6646,29 @@ describe("roll-up review follow-up children", () => {
   });
 
   it("fails closed on tracker reads and ambiguous creates", async () => {
-    const { run, listing, create } = await setup();
+    const { run, listing, create, prepare } = await setup();
     listing.mockRejectedValueOnce(new Error("tracker read unavailable"));
-    await run("a");
+    const { deliver, dispatchId } = await prepare("a");
+    expect((await deliver()).status).toBe(503);
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
     expect(create).not.toHaveBeenCalled();
+    expect((await deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledOnce();
     create.mockRejectedValueOnce(new Error("response lost"));
-    await run("a");
-    await run("a");
+    await run("b");
+    await run("b");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("acknowledges failures after creation and unsupported child discovery", async () => {
+    const { prepare, create, update, provider } = await setup();
+    update.mockRejectedValueOnce(new Error("comment unavailable"));
+    const { deliver } = await prepare("a");
+    expect((await deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledOnce();
+    Object.assign(provider, { listIssuesPage: undefined });
+    const next = await prepare("b");
+    expect((await next.deliver()).status).toBe(200);
     expect(create).toHaveBeenCalledOnce();
   });
 

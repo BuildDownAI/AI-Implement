@@ -1610,6 +1610,24 @@ describe("poll implementation submission — ImplementationRun for every project
     });
   });
 
+  it("dispatches on every poll when the provider cannot enumerate roll-up children", async () => {
+    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    store.upsertMapping("AII", jiraMapping("AII"));
+    const provider = jiraProvider();
+    Object.assign(provider, { listIssuesPage: undefined });
+    vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+      needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+    });
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    const registry = makeRegistry({ provider, mappings: store.getMappings() });
+    await indexModule.poll(config, registry);
+    expect(implementationIngress.submit).toHaveBeenCalledTimes(1);
+    await indexModule.poll(config, registry);
+    expect(implementationIngress.submit).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["planning", "implementation"].flatMap(kind =>
     ["success", "lookup-null", "lookup-error", "park-rejected", "park-error"].map(outcome => ({ kind, outcome }))))(
     "blocks $kind pickup when roll-up reconciliation outcome is $outcome", async ({ kind, outcome }) => {
