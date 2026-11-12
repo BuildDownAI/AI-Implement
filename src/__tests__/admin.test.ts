@@ -6973,10 +6973,10 @@ describe("model accounts and stage configuration (AII-962)", () => {
     else expect(body.warnings).toBeUndefined();
   });
 
-  it.each(["legacy", "configured"] as const)("mapping updates preserve %s with defaults on for every body", async (mode) => {
+  it.each(["absent", "legacy", "configured"] as const)("mapping updates preserve %s with defaults on for every body", async (mode) => {
     const t = await seed();
     const store = modules.agentConfigStore;
-    store.setProjectStageConfig("APP", { version: 1, mode });
+    if (mode !== "absent") store.setProjectStageConfig("APP", { version: 1, mode });
     const before = count("stage_agent_config_revisions");
     const row = store.getProjectStageConfig("APP");
     for (const body of [{}, { enabled: true }, { enabled: false }, { agentConfig: { mode: "configured" } }]) {

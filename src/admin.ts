@@ -3658,8 +3658,11 @@ export async function upsertMappingAction(
 
   upsertMapping(body.teamKey, mapping);
   if (!existingMapping && !getProjectStageConfig(body.teamKey) && getOrchestratorDefaults()?.config.mode === "configured") {
-    const result = setProjectAgentModeAction(body.teamKey, "configured", null);
-    if (!result.ok) warnings.push(`Project saved in legacy mode: ${result.code}`);
+    try {
+      setProjectConfigured(body.teamKey, true);
+    } catch {
+      warnings.push("Project saved in legacy mode: resolution-failed");
+    }
   }
   registry.invalidate();
 

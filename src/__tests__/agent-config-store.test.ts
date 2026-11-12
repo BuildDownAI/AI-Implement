@@ -178,6 +178,25 @@ describe("stage configuration", () => {
     expect(store.isProjectConfigured("AII")).toBe(false);
   });
 
+  it("preserves stages across mode changes and appends nothing for unchanged modes", () => {
+    seed();
+    const stages = { review: { model: "project-review" } };
+    store.setProjectStageConfig("AII", { version: 1, mode: "legacy", stages });
+    for (const configured of [true, false]) {
+      store.setProjectConfigured("AII", configured);
+      expect(store.getProjectStageConfig("AII")?.config).toEqual({
+        version: 1, mode: configured ? "configured" : "legacy", stages,
+      });
+      const before = dump();
+      store.setProjectConfigured("AII", configured);
+      expect(dump()).toBe(before);
+    }
+    store.saveAccountProfileRevision(claudeProfile({ revision: 2, status: "disabled" }));
+    const before = dump();
+    expect(() => store.setProjectConfigured("AII", true)).toThrow();
+    expect(dump()).toBe(before);
+  });
+
   it("opts in, inherits defaults, and clearing an override restores inheritance", () => {
     seed();
     store.saveAccountProfileRevision(codexProfile({ profileId: "codex-alt" }));
