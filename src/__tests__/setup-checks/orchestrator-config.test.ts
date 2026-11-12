@@ -545,6 +545,8 @@ describe("model.credentials-adopted", () => {
     const projectStageConfig = vi.fn((key: string) => key === "ENG" ? null : stored(key === "READY" ? "configured" : "legacy"));
     const result = await run("model.credentials-adopted", { env, mappings, orchestratorDefaults: () => stored("configured"), projectStageConfig });
     expect(result).toMatchObject([{ state: "warn", detail: "Projects without configured model access: ENG, OPS", fix: expect.stringContaining("adopt-projects") }]);
+    expect(result[0].fix).toContain("stored legacy row");
+    expect(result[0].fix).toContain("set_project_agent_mode");
     expect(projectStageConfig.mock.calls.map(([key]) => key)).toEqual(["ENG", "OPS", "READY"]);
     expect(JSON.stringify(result)).not.toContain("secret-sentinel");
   });

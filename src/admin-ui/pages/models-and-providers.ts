@@ -15,7 +15,7 @@ export const modelsAndProvidersHtml = `
     <div class="alert info">
       <div style="flex:1">
         <div class="alert-title">How models are configured</div>
-        <div class="alert-desc">Orchestrator defaults below choose the agent, provider, model, account profile and limit for planning, implementation and review, without a repository change. Projects opt in separately; a legacy project keeps its current behavior, including the model in its <span class="mono">WORKFLOW.md</span> front matter. Saved changes apply to the next run, not to a run already in flight.</div>
+        <div class="alert-desc">Orchestrator defaults below choose the agent, provider, model, account profile and limit for planning, implementation and review, without a repository change. New projects start configured when defaults are on; existing projects keep their mode. A legacy project keeps its current behavior, including the model in its <span class="mono">WORKFLOW.md</span> front matter. Saved changes apply to the next run, not to a run already in flight.</div>
       </div>
     </div>
 
@@ -73,7 +73,7 @@ export const modelsAndProvidersHtml = `
             <button class="btn btn-primary btn-sm" onclick="mpAddAccount()">Add account profile</button>
             <button class="btn btn-sm" id="mp-import-credential" onclick="mpImportCredential()">Import orchestrator credential</button>
           </div>
-          <div class="text-tertiary" style="font-size:11px;margin-top:6px">Import copies the credential the orchestrator uses for legacy runs. Legacy projects keep reading the environment variable until they opt in.</div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:6px">Import copies the credential the orchestrator uses for legacy runs. Legacy projects keep reading the environment variable until an admin changes their mode with set_project_agent_mode.</div>
         </div>
         <div class="text-tertiary" style="font-size:11.5px;padding:12px">
           <div><strong>Provisioning.</strong> Add a profile above and set an API key or Claude subscription setup-token per profile; a key is encrypted on save and never shown again. Connect a ChatGPT plan from a laptop with a pairing code; Bedrock credentials are provisioned on the host.</div>
@@ -280,7 +280,7 @@ export const modelsAndProvidersScript = `(function () {
     document.getElementById('mp-stage-actions').classList.toggle('hidden', !edit);
     const modeEl = document.getElementById('mp-stage-mode');
     modeEl.textContent = mpDefaults.mode === 'configured'
-      ? 'Defaults are active for projects that opt in'
+      ? 'Defaults are active for configured projects and for new projects'
       : 'Defaults are saved but off (legacy). Turn them on in Settings.';
   }
 

@@ -137,7 +137,12 @@ describe("orchestrator agent defaults card", () => {
   it("is declared with its own error element and no raw credential field", () => {
     expect(settingsHtml).toContain('id="settings-agent-defaults-mode"');
     expect(settingsHtml).toContain('id="settings-agent-defaults-error" class="error hidden"');
-    expect(settingsHtml).toContain("each project opts in separately");
+    expect(settingsHtml).toContain("When defaults are on, a new project starts configured. An existing project keeps its mode.");
+    expect(settingsHtml).toContain("new projects start configured, existing projects keep their mode");
+    expect(settingsHtml).toContain('onclick="saveAgentDefaultsMode()"');
+    const dom = document.createElement("div");
+    dom.innerHTML = settingsHtml;
+    expect(dom.textContent).not.toMatch(/opt in|opt-in|opts in|opted-in/i);
     expect(settingsHtml).toContain("Changes apply to the next run");
   });
 });

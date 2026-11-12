@@ -18,10 +18,10 @@ describe("models-and-providers page", () => {
     expect(modelsAndProvidersScript).toContain("/api/agent-defaults");
     expect(modelsAndProvidersScript).toContain("/api/model-accounts");
   });
-  it("drops the blanket repo-front-matter claim and explains opt-in", () => {
+  it("drops the blanket repo-front-matter claim and explains project modes", () => {
     expect(modelsAndProvidersHtml).not.toContain("Edit the model itself in the target repo");
     expect(modelsAndProvidersHtml).not.toContain("not in the orchestrator");
-    expect(modelsAndProvidersHtml).toContain("Projects opt in separately");
+    expect(modelsAndProvidersHtml).toContain("New projects start configured when defaults are on; existing projects keep their mode");
     expect(modelsAndProvidersHtml).toContain("next run");
   });
   it("offers write-only key entry and an add-profile form, without the old read-only subtitle", () => {
@@ -368,7 +368,7 @@ describe("Import orchestrator credential", () => {
   const profileId = `environment"'<img src=x>&`;
   const wrapped = (status: number, body: object) => ({ content: [{ type: "text", text: JSON.stringify({ status, body }) }] });
 
-  async function fixture(admin: boolean, reply: object, ok = true) {
+  async function fixture(admin: boolean, reply: object, ok = true, mode = "legacy") {
     const dom = new JSDOM(modelsAndProvidersHtml, { runScripts: "outside-only" });
     const win = dom.window;
     win.isAdmin = () => admin;
@@ -384,7 +384,7 @@ describe("Import orchestrator credential", () => {
         return { ok, status: ok ? 200 : 503, json: async () => reply };
       }
       return { ok: true, json: async () => path === "/api/model-accounts" ? { accounts: imported ? [account] : [] }
-        : path === "/api/agent-defaults" ? { mode: "legacy", stages: {} } : {} };
+        : path === "/api/agent-defaults" ? { mode, stages: {} } : {} };
     });
     win.api = api;
     win.eval(modelsAndProvidersScript);
@@ -397,6 +397,14 @@ describe("Import orchestrator credential", () => {
     return { win, api, invoke };
   }
 
+  it("renders defaults active for configured and new projects without opt-in copy", async () => {
+    const { win } = await fixture(true, {}, true, "configured");
+    try {
+      expect(win.document.body.textContent).toContain("Defaults are active for configured projects and for new projects");
+      expect(win.document.body.textContent).not.toMatch(/opt in|opt-in|opts in|opted-in/i);
+    } finally { win.close(); }
+  });
+
   it.each([true, false])("shows the action only to admins and guards invocation (admin=%s)", async admin => {
     const { win, api, invoke } = await fixture(admin, wrapped(404, { error: "missing" }));
     try {
@@ -404,7 +412,7 @@ describe("Import orchestrator credential", () => {
       expect(button.textContent).toBe("Import orchestrator credential");
       expect(button.closest("#mp-account-form")!.classList.contains("hidden")).toBe(!admin);
       expect(button.previousElementSibling?.textContent).toBe("Add account profile");
-      expect(win.document.getElementById("mp-account-form")!.textContent).toContain("Legacy projects keep reading the environment variable until they opt in");
+      expect(win.document.getElementById("mp-account-form")!.textContent).toContain("Legacy projects keep reading the environment variable until an admin changes their mode with set_project_agent_mode");
       if (!admin) { await invoke(); expect(api).not.toHaveBeenCalled(); }
     } finally { win.close(); }
   });
