@@ -61,6 +61,11 @@ import {
 // The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
 // wholesale, same as tools.test.ts, since src/restate/tools.ts only imports these five names
 // from admin.ts.
+vi.mock("../agent-config-store.js", () => ({
+  getOrchestratorDefaults: vi.fn(() => null),
+  isProjectConfigured: vi.fn(() => false),
+}));
+
 vi.mock("../admin.js", () => ({
   setRunnerModeAction: vi.fn(),
   pauseProjectAction: vi.fn(),

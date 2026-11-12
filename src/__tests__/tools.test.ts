@@ -63,7 +63,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as InFlightModule from "../in-flight-work.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
-import { makeAppendLogEntry, makeMapping, makeRegistry } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeMapping, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -1058,6 +1058,48 @@ describe("migrated read handlers (AII-711)", () => {
         ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastRefresh", "materialize", "restate", "runProfile", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
+  });
+});
+
+describe("get_tenant_health stageAgents", () => {
+  let tools: typeof ToolsModule;
+  let store: typeof import("../agent-config-store.js");
+
+  beforeEach(async () => {
+    ({ tools, store } = (await testDb({ modules: {
+      tools: () => import("../restate/tools.js"),
+      store: () => import("../agent-config-store.js"),
+    } })).modules);
+    vi.mocked(getMappings).mockReturnValue({});
+  });
+
+  const health = async () => JSON.parse((await tools.getTenantHealth(fakeContext("get_tenant_health"), { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
+
+  it("defaults to legacy without a defaults row and returns no projects without mappings", async () => {
+    expect((await health()).stageAgents).toEqual({ defaultsMode: "legacy", projects: [] });
+  });
+
+  it("reports mapped keys only, sorted, with missing project rows treated as legacy", async () => {
+    store.saveAccountProfileRevision(makeStageAgentProfile());
+    store.setOrchestratorDefaults(makeStageAgentDefaults());
+    store.setProjectConfigured("UNMAPPED", true);
+    store.setProjectConfigured("AII", true);
+    store.setProjectConfigured("EXPLICIT", true);
+    store.setProjectConfigured("EXPLICIT", false);
+    vi.mocked(getMappings).mockReturnValue({
+      EXPLICIT: makeMapping(), BDS: makeMapping(),
+      AII: makeMapping({ extraEnv: { SECRET: "must-not-leak" } }),
+    });
+    expect((await health()).stageAgents).toEqual({
+      defaultsMode: "configured",
+      projects: [
+        { teamKey: "AII", agentMode: "configured" },
+        { teamKey: "BDS", agentMode: "legacy" },
+        { teamKey: "EXPLICIT", agentMode: "legacy" },
+      ],
+    });
+    store.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    expect((await health()).stageAgents.defaultsMode).toBe("legacy");
   });
 });
 

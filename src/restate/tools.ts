@@ -28,6 +28,7 @@ import {
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { getOrchestratorDefaults, isProjectConfigured } from "../agent-config-store.js";
 import { summarizeSetupChecks } from "../setup-checks/index.js";
 import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
@@ -201,7 +202,7 @@ export function tool<I extends z.ZodType>(
 }
 
 export const GET_TENANT_HEALTH_DESCRIPTION =
-  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
+  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, stage agent modes (`stageAgents`: defaultsMode and projects with teamKey and agentMode only, sorted by teamKey; missing defaults or project rows mean legacy; only mapped projects appear), and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
 
 export const GetTenantHealthArgsSchema = z.object({});
 
@@ -221,7 +222,16 @@ export const getTenantHealth = tool(
     const { n: awaitingDecisionCount } = db
       .prepare("SELECT COUNT(*) as n FROM dispatch_log WHERE phase = 'kg-refresh' AND status = 'completed' AND conclusion = 'awaiting_decision'")
       .get() as { n: number };
-    const projectCount = Object.keys(getMappings()).length;
+    const projectKeys = Object.keys(getMappings()).sort();
+    const projectCount = projectKeys.length;
+    // Explicit projection: mapping values can contain runner environment secrets.
+    const stageAgents = {
+      defaultsMode: getOrchestratorDefaults()?.config.mode ?? "legacy",
+      projects: projectKeys.map(teamKey => ({
+        teamKey,
+        agentMode: isProjectConfigured(teamKey) ? "configured" : "legacy",
+      })),
+    };
     const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
     const kgRefreshPreflight = kgSourceRepo
       ? await runKgRefreshPreflight({
@@ -238,6 +248,7 @@ export const getTenantHealth = tool(
       awaitingDecisionCount,
       pendingGapfillCount,
       projectCount,
+      stageAgents,
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
       restate: getRestateStatus(),

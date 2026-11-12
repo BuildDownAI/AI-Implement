@@ -145,9 +145,16 @@ probe; `lastError` is `null` without a probe error. `restateRetentionDays` and
 `volumeSnapshotRetentionDays` are days. `kgRefreshPreflight` is `null` without a
 configured KG source repo; `setupChecks` is `null` before the first setup-check
 run, otherwise the summary described in [setup-checks.md](setup-checks.md).
+`stageAgents` contains `defaultsMode` (`configured` or `legacy`) and `projects`,
+an array of `{ teamKey, agentMode }` with modes from the latest stored project rows.
+Missing defaults or project rows mean `legacy`. Only mapped projects appear,
+in ascending `teamKey` order; no mappings means `[]`, and unmapped project rows
+are omitted. These additional reads use SQLite only and expose no mapping values
+or runner environment values. This reports stored modes without changing any run.
 See the [argument schema](contracts/get_tenant_health/args.schema.json) and
 recorded [healthy](contracts/get_tenant_health/healthy.json) and
-[KG degraded](contracts/get_tenant_health/degraded.json) exchanges.
+[KG degraded](contracts/get_tenant_health/degraded.json), and
+[stage agents](contracts/get_tenant_health/stage-agents.json) exchanges.
 
 `get_fleet_report` takes `{ "args": {} }` for the default 30-day look-back, or
 `{ "args": { "days": 7 } }` for seven days. `days` is an optional number;

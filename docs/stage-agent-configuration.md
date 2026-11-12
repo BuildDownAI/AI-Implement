@@ -29,6 +29,12 @@ The primary credential is checked after the choice. A missing or unreadable prim
 
 ## Where to see it
 
+`get_tenant_health` reports `stageAgents`: the orchestrator's stored `defaultsMode`
+and each mapped project's `teamKey` and `agentMode` (`configured` or `legacy`).
+Projects are sorted by ascending team key. Missing defaults or project rows mean
+`legacy`; no mappings produces an empty project array, and unmapped project rows
+are omitted. The tool reads these modes from SQLite and exposes no runner environment values.
+
 `GET /api/mappings/:key/agent-config/resolved` shows each stage's entries in order, whether each passes the configuration checks now, and the reason when it does not. It also shows whether a project account override drops the default fallbacks. These diagnostics check profile compatibility and support on the project's current dispatch backend(s). Preparation checks the backend of its actual request. If a stage cannot form a complete selection, its entries are empty and the route preserves the structured resolution error. The Reports page shows the profile each invocation used.
 
 ## Configured agent environment
