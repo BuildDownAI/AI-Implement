@@ -6351,6 +6351,16 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(count("stage_agent_config_revisions")).toBe(before);
   });
 
+  it.each(["constructor", "toString", "__proto__"])("refuses inherited mapping name %s in both modes without writing", async (projectKey) => {
+    await seed();
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction(projectKey, mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
   it("keeps absent-row legacy unchanged and refuses unresolved configuration without writing", async () => {
     await seed();
     modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });

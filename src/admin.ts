@@ -2101,7 +2101,7 @@ export function setProjectAgentModeAction(
   mode: "configured" | "legacy",
   actor: string,
 ): { ok: true; teamKey: string; agentMode: "configured" | "legacy" } | { ok: false; code: "mapping-not-found" | "resolution-failed" } {
-  if (!getMappings()[projectKey]) {
+  if (!Object.hasOwn(getMappings(), projectKey)) {
     return { ok: false, code: "mapping-not-found" };
   }
   try {
