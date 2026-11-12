@@ -1,6 +1,7 @@
 import { getReviewerScorecard } from "../../report-card.js";
 import { createModelProtectedSecrets } from "../../model-protected-secrets.js";
-import { getOrchestratorDefaults } from "../../agent-config-store.js";
+import { makeStageAgentDefaults, makeStageAgentProfile } from "../helpers/builders.js";
+import { getOrchestratorDefaults, saveAccountProfileRevision, setOrchestratorDefaults, setProjectConfigured } from "../../agent-config-store.js";
 import { createSession } from "../../admin-session.js";
 import { handleAdminRequest } from "../../admin.js";
 import { initReconciliationTable } from "../../reconciliation.js";
@@ -396,6 +397,32 @@ describe("orchestratorTools (Restate)", () => {
       expect(health).toHaveProperty("kgRefreshPreflight");
     },
   );
+
+  it.each(VARIANTS.map(([label]) => label))("reports configured and legacy stage agents through ingress (%s)", async (label) => {
+    const env = environments.get(label)!;
+    try {
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
+        saveAccountProfileRevision(makeStageAgentProfile());
+      }
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      dedup.getDb().prepare("INSERT OR IGNORE INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES ('AII', 'acme', 'widgets', 'claude.yml', 'main')").run();
+      setProjectConfigured("AII", true);
+      setProjectConfigured("BDS", false);
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
+        caller: { kind: "human", email: "user@example.com", role: "user", grants: [] }, args: {},
+      });
+      expect(result.isError).toBeFalsy();
+      expect(JSON.parse(result.content[0].text).stageAgents).toEqual({
+        defaultsMode: "configured",
+        projects: [{ teamKey: "AII", agentMode: "configured" }, { teamKey: "BDS", agentMode: "legacy" }],
+      });
+    } finally {
+      setProjectConfigured("AII", false);
+      setProjectConfigured("BDS", false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+      dedup.getDb().prepare("DELETE FROM mappings WHERE team_key = 'AII'").run();
+    }
+  });
 
   it.each(VARIANTS.map(([label]) => label))(
     "get_tenant_health reads the stored setup-check run from the SetupChecks object, without its detail or fix (%s)",

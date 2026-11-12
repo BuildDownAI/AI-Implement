@@ -1,0 +1,14 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"runnerMode\": {\n    \"mode\": \"default\",\n    \"source\": \"env\"\n  },\n  \"inFlightJobCount\": 0,\n  \"awaitingDecisionCount\": 0,\n  \"pendingGapfillCount\": 0,\n  \"projectCount\": 2,\n  \"stageAgents\": {\n    \"defaultsMode\": \"configured\",\n    \"projects\": [\n      {\n        \"teamKey\": \"AII\",\n        \"agentMode\": \"configured\"\n      },\n      {\n        \"teamKey\": \"BDS\",\n        \"agentMode\": \"legacy\"\n      }\n    ]\n  },\n  \"kgDegraded\": false,\n  \"kgUnavailable\": false,\n  \"sidecar\": {\n    \"reachable\": true,\n    \"toolsListed\": true,\n    \"lastError\": null,\n    \"checkedAt\": 1700000000000\n  },\n  \"restate\": {\n    \"sidecar\": {\n      \"state\": \"ready\"\n    },\n    \"registration\": {\n      \"state\": \"registered\"\n    }\n  },\n  \"restateRetentionDays\": 14,\n  \"volumeSnapshotRetentionDays\": 14,\n  \"kgRefreshPreflight\": null,\n  \"setupChecks\": null\n}"
+      }
+    ]
+  }
+}
