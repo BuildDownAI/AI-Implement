@@ -161,40 +161,10 @@ export const deploymentsHtml = `
 
 export const deploymentsScript = `
 (function () {
-  function fmtAgo(ms) {
-    const s = Math.floor((Date.now() - ms) / 1000);
-    if (s < 60) return s + 's ago';
-    const m = Math.floor(s / 60);
-    if (m < 60) return m + 'm ago';
-    const h = Math.floor(m / 60);
-    if (h < 24) return h + 'h ago';
-    // The last deploy of a quiet orchestrator is weeks old, and "504h ago" is unreadable.
-    const d = Math.floor(h / 24);
-    return d + 'd ago';
-  }
-
-  // Duration since a start, not distance from now — deliberately not fmtAgo, whose
-  // "Xm ago" wording reads wrong for something still running.
-  function fmtElapsed(startedAt) {
-    const s = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-    if (s < 60) return s + 's';
-    const m = Math.floor(s / 60);
-    return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
-  }
-
   function short(sha) { return sha ? sha.slice(0, 7) : ''; }
 
   function plural(count, noun) {
     return count + '\\u00a0' + noun + (count === 1 ? '' : 's');
-  }
-
-  // Every badge in the app carries a .dot child: .badge .dot sizes it, .badge.<kind> .dot
-  // colours it, and .badge.running .dot is where the pulse animation lives. The class
-  // alone renders a dotless pill, so the span is opt-in markup that is easy to drop.
-  // Routing every badge through here is what stops that recurring on this page.
-  function setBadge(el, kind, label) {
-    el.className = 'badge ' + kind;
-    el.innerHTML = '<span class="dot"></span>' + window.esc(label);
   }
 
   // a static https:// prefix with escAttr on the path segments
@@ -278,14 +248,14 @@ export const deploymentsScript = `
     lastCard.hidden = !isResult;
     document.getElementById('deployments-deploy-btn').disabled = deployActive;
     if (deployActive) {
-      setBadge(document.getElementById('deployments-active-badge'), phase === 'draining' ? 'warn' : 'running', phase);
+      window.setStatusBadge(document.getElementById('deployments-active-badge'), phase === 'draining' ? 'warn' : 'running', phase);
       const parts = deployDetails(deploy);
       if (deploy.requestedBy) parts.push('started by ' + deploy.requestedBy);
       if (deploy.startedAt) parts.push('started ' + new Date(deploy.startedAt).toLocaleString());
       document.getElementById('deployments-active-details').textContent = parts.join(' · ');
     }
     if (isResult) {
-      setBadge(document.getElementById('deployments-last-result-badge'), phase === 'succeeded' ? 'success' : phase === 'failed' ? 'fail' : 'neutral', phase);
+      window.setStatusBadge(document.getElementById('deployments-last-result-badge'), phase === 'succeeded' ? 'success' : phase === 'failed' ? 'fail' : 'neutral', phase);
       const parts = deployDetails(deploy);
       if (deploy.reason) parts.push('reason ' + deploy.reason);
       if (deploy.finishedAt) parts.push('finished ' + new Date(deploy.finishedAt).toLocaleString());
@@ -400,7 +370,7 @@ export const deploymentsScript = `
         return;
       }
       const rows = (await res.json()).reservations || [];
-      setBadge(badgeEl, rows.length ? 'warn' : 'success', String(rows.length));
+      window.setStatusBadge(badgeEl, rows.length ? 'warn' : 'success', String(rows.length));
       if (!rows.length) {
         listEl.innerHTML = '<div class="kpi-trend text-secondary">No held reservations.</div>';
         return;
@@ -417,10 +387,14 @@ export const deploymentsScript = `
           + '<td style="font-family: var(--font-mono)">' + window.esc(r.lifecycleOwner) + '</td>'
           + '<td>' + window.esc(reservationAge(r.ageMs)) + '</td>'
           + '<td>' + window.esc(job) + '</td>'
-          + '<td><button class="btn btn-sm" data-dispatch-id="' + window.escAttr(r.dispatchId) + '" onclick="window.releaseReservation(this.dataset.dispatchId)">Release</button></td>'
+          + '<td><button class="btn btn-sm reservation-release">Release</button></td>'
           + '</tr>';
       }
       listEl.innerHTML = html + '</tbody></table>';
+      // Each button releases its own row's reservation, captured here rather than read back from the markup (ADR 002).
+      listEl.querySelectorAll('.reservation-release').forEach(function (button, i) {
+        button.addEventListener('click', function () { releaseReservation(rows[i].dispatchId); });
+      });
     } catch (err) {
       setReservationMessage('Could not read reservations — ' + String(err), true);
     }
@@ -588,16 +562,16 @@ export const deploymentsScript = `
     const dispatchEl = document.getElementById('kpi-deploy-dispatch');
     statusKpi.hidden = !held;
     if (held) {
-      const elapsed = data.deployStartedAt ? fmtElapsed(data.deployStartedAt) + ' elapsed' : '';
+      const elapsed = data.deployStartedAt ? window.fmtDuration(Date.now() - data.deployStartedAt) + ' elapsed' : '';
       if (inFlight.length > 0) {
-        setBadge(statusBadge, 'warn', 'Draining');
+        window.setStatusBadge(statusBadge, 'warn', 'Draining');
         statusEl.textContent = inFlight.map(function (w) {
           if (w.kind === 'kg-refresh') return plural(w.count, 'KG ingest run');
           return plural(w.count, w.kind);
         }).join(', ');
         statusUnit.textContent = elapsed || 'waiting for in-flight work to finish';
       } else {
-        setBadge(statusBadge, 'running', 'Building');
+        window.setStatusBadge(statusBadge, 'running', 'Building');
         statusEl.textContent = 'Building and releasing the new image';
         // Blank without a clock, unlike Draining above: the value here is a whole sentence,
         // so filler beside it would add nothing. Only a pre-clock hold reaches that.
@@ -617,7 +591,7 @@ export const deploymentsScript = `
     const outcomeWhen = document.getElementById('kpi-deploy-outcome-when');
     const outcomeMeta = document.getElementById('kpi-deploy-outcome-meta');
     if (!outcome) {
-      setBadge(outcomeBadge, 'neutral', 'None yet');
+      window.setStatusBadge(outcomeBadge, 'neutral', 'None yet');
       outcomeCommit.textContent = '\\u2014';
       outcomeWhen.textContent = '';
       outcomeMeta.textContent = 'No self-deploy has completed on this orchestrator.';
@@ -627,20 +601,20 @@ export const deploymentsScript = `
       // review_failed gets. A release whose sidecar is missing serves every route but
       // /mcp, so it is degraded rather than failed.
       if (outcome.kind === 'deployed-ok') {
-        setBadge(outcomeBadge, 'success', 'Completed');
+        window.setStatusBadge(outcomeBadge, 'success', 'Completed');
       } else if (outcome.kind === 'deployed-not-serving') {
-        setBadge(outcomeBadge, 'warn', 'Degraded');
+        window.setStatusBadge(outcomeBadge, 'warn', 'Degraded');
       } else if (outcome.kind === 'deploy-cancelled') {
         // Deliberate, so neither the red failure treatment nor a success.
-        setBadge(outcomeBadge, 'neutral', 'Cancelled');
+        window.setStatusBadge(outcomeBadge, 'neutral', 'Cancelled');
       } else {
-        setBadge(outcomeBadge, 'fail', 'Failed');
+        window.setStatusBadge(outcomeBadge, 'fail', 'Failed');
       }
       // A build failure names the commit it tried, not the one running, so this can
       // legitimately differ from the tile beside it. Only that case says so — for the
       // other two the commit here and the running one are the same value.
       outcomeCommit.innerHTML = commitLink(data.repo, outcome.commit) || '\\u2014';
-      outcomeWhen.textContent = outcome.timestamp ? fmtAgo(outcome.timestamp) : '';
+      outcomeWhen.textContent = outcome.timestamp ? window.fmtAgo(outcome.timestamp) : '';
       outcomeMeta.textContent = outcome.kind === 'build-failed' ? 'attempted — never released' : '';
     }
 
@@ -681,11 +655,11 @@ export const deploymentsScript = `
     // a tag. The commits it was derived from are the value.
     const badgeEl = document.getElementById('kpi-deploy-badge');
     if (available === true) {
-      setBadge(badgeEl, 'warn', 'Available');
+      window.setStatusBadge(badgeEl, 'warn', 'Available');
     } else if (available === false) {
-      setBadge(badgeEl, 'success', 'Up to date');
+      window.setStatusBadge(badgeEl, 'success', 'Up to date');
     } else {
-      setBadge(badgeEl, 'neutral', 'Unknown');
+      window.setStatusBadge(badgeEl, 'neutral', 'Unknown');
     }
 
     // Built from whichever commits resolved rather than branching on the verdict:
@@ -698,7 +672,7 @@ export const deploymentsScript = `
     }
     document.getElementById('kpi-deploy-commit').innerHTML = links.length ? links.join(' → ') : '—';
     document.getElementById('kpi-deploy-checked').textContent =
-      data.checkedAt ? 'checked ' + fmtAgo(data.checkedAt) : 'not yet checked';
+      data.checkedAt ? 'checked ' + window.fmtAgo(data.checkedAt) : 'not yet checked';
 
     const source = [];
     if (data.repo) source.push(data.repo);
@@ -823,7 +797,7 @@ export const deploymentsScript = `
     const last = data.volume.lastApplied;
     let text = 'Volume retention: not applied since boot';
     if (last) {
-      text = 'Volume retention last applied ' + fmtAgo(last.at) + ': ' + last.applied.length + ' volume(s) changed'
+      text = 'Volume retention last applied ' + window.fmtAgo(last.at) + ': ' + last.applied.length + ' volume(s) changed'
         + (last.skipped ? ', not applied — ' + last.skipped : '');
     }
     document.getElementById('deployments-retention-applied').textContent = text;
@@ -882,7 +856,6 @@ export const deploymentsScript = `
   }
 
   window.loadDeployments = loadDeployments;
-  window.releaseReservation = releaseReservation;
   window.triggerDeploy = triggerDeploy;
   window.cancelDeploy = cancelDeploy;
   window.saveDeployPolicy = saveDeployPolicy;

@@ -91,13 +91,27 @@ export interface SetupCheckResult {
   onAdminPath: boolean;    // named on GET / while no admin path is configured
   project?: string;        // the mapping key, for a per-project check; absent for orchestrator-wide checks
   state: SetupCheckState;
-  detail?: string;         // what was read; shown to admins only
-  fix?: string;            // set when state is warn, fail or cannot-verify
-  fixUrl?: string;         // a page that applies the fix; admin-only, like fix
+  detail?: string;         // what was read; only on the Setup page and its route, never in a summary (ADR 047)
+  fix?: string;            // set when state is warn, fail or cannot-verify; shown where detail is
+  fixUrl?: string;         // a page that applies the fix; shown where detail is
+}
+
+/** How each group is named to an operator. The keys stay as they are, since stored runs and their readers use them. */
+export const SETUP_CHECK_GROUP_LABELS: Record<SetupCheckResult["group"], string> = {
+  orchestrator: "Orchestrator",
+  tracker: "Ticketing system",
+  github: "GitHub",
+  model: "Models",
+};
+
+/** The setup command as an operator runs it against this orchestrator: over SSH on Fly, which sets FLY_APP_NAME, else from the checkout. */
+export function setupCommandFor(env: NodeJS.ProcessEnv): string {
+  return env.FLY_APP_NAME ? `fly ssh console -a ${env.FLY_APP_NAME} -C "node /app/dist/check-setup.js"` : "npm run check-setup";
 }
 
 export interface SetupCheckRun {
-  checkedAt: number;
+  startedAt?: number;      // when the run began; absent on a run an older orchestrator stored
+  checkedAt: number;       // when its last check finished
   results: SetupCheckResult[];
 }
 
@@ -255,7 +269,7 @@ export function createSetupCheckContext(
     onSeparateFilesystem: (dir) => statSync(dir).dev !== statSync("/").dev,
     trackerProvider: async (providerId) => {
       const mapping = Object.values(ctx.mappings()).find((m) => m.ticketingProvider === providerId);
-      if (!mapping) throw new Error(`No project uses the ${providerId} tracker`);
+      if (!mapping) throw new Error(`No project uses the ${providerId} ticketing system`);
       return registry.forMapping(mapping);
     },
     // Every check that judges one provider's facts shares a single read per run.
@@ -294,26 +308,78 @@ export interface SetupCheck {
 
 export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS, ...TRACKER_CONFIG_CHECKS, ...GITHUB_CONFIG_CHECKS];
 
-/** Runs every check. A check that throws reports `cannot-verify` with its error, and the others still run. */
+/**
+ * Runs every check at once and answers them in list order. A check that throws reports `cannot-verify` with its error,
+ * and the others still run. `onSettled` hears each check's rows the moment that check finishes.
+ */
 export async function runSetupChecks(
   ctx: SetupCheckContext,
   checks: readonly SetupCheck[] = SETUP_CHECKS,
   now: () => number = Date.now,
+  onSettled: (id: SetupCheckId, rows: SetupCheckResult[]) => void = () => {},
 ): Promise<SetupCheckRun> {
-  // The async wrapper turns a check's synchronous throw into a rejection that allSettled records.
-  const settled = await Promise.allSettled(checks.map(async (check) => check.run(ctx)));
-  const results = settled.flatMap((result, i) => {
-    const check = checks[i];
+  const startedAt = now();
+  const rows = await Promise.all(checks.map(async (check) => {
     const identity = { id: check.id, title: check.title, group: check.group, tier: check.tier, onAdminPath: check.onAdminPath };
-    if (result.status === "fulfilled") return result.value.map((outcome) => ({ ...identity, ...outcome }));
-    return [{
-      ...identity,
-      state: "cannot-verify" as const,
-      detail: result.reason instanceof Error ? result.reason.message : String(result.reason),
-      fix: "The check itself could not run, its detail names the error.",
-    }];
+    let settled: SetupCheckResult[];
+    try {
+      settled = (await check.run(ctx)).map((outcome) => ({ ...identity, ...outcome }));
+    } catch (error) {
+      settled = [{
+        ...identity,
+        state: "cannot-verify",
+        detail: error instanceof Error ? error.message : String(error),
+        fix: "The check itself could not run, its detail names the error.",
+      }];
+    }
+    onSettled(check.id, settled);
+    return settled;
+  }));
+  return { startedAt, checkedAt: now(), results: rows.flat() };
+}
+
+/** The run in progress in this process, as the admin Setup page shows it while it runs. */
+export interface SetupCheckProgress {
+  startedAt: number;
+  total: number;                // checks in the run
+  finished: SetupCheckResult[]; // the rows of every check that has finished
+  running: Array<Pick<SetupCheckResult, "id" | "title" | "group">>; // the checks still running, named as the page names them
+}
+
+let progress: SetupCheckProgress | null = null;
+
+function newProgress(now: () => number): SetupCheckProgress {
+  return { startedAt: now(), total: SETUP_CHECKS.length, finished: [], running: SETUP_CHECKS.map(({ id, title, group }) => ({ id, title, group })) };
+}
+
+/**
+ * Claims the next run for a caller about to start one, by showing it as started before it is sent.
+ * Answers the run already going, or null when the claim is the caller's. Two starts cannot both find no run going.
+ */
+export function claimSetupCheckRun(now: () => number = Date.now): SetupCheckProgress | null {
+  if (progress !== null) return structuredClone(progress);
+  progress = newProgress(now);
+  return null;
+}
+
+/** Runs every check, recording each check's rows in this process as it finishes, until `endSetupCheckProgress`. */
+export function runSetupChecksWithProgress(ctx: SetupCheckContext, now: () => number = Date.now): Promise<SetupCheckRun> {
+  // A retried run starts its own record, so a superseded run's late checks never write into it.
+  const current = newProgress(now);
+  progress = current;
+  return runSetupChecks(ctx, SETUP_CHECKS, now, (id, rows) => {
+    current.finished.push(...rows);
+    current.running = current.running.filter((running) => running.id !== id);
   });
-  return { checkedAt: now(), results };
+}
+
+export function getSetupCheckProgress(): SetupCheckProgress | null {
+  return progress === null ? null : structuredClone(progress);
+}
+
+/** Called once the finished run is recorded, so a reader always sees the run or its progress, or when a claimed run was never sent. */
+export function endSetupCheckProgress(): void {
+  progress = null;
 }
 
 /** The core rows in state `fail`: what the setup command's exit code, its last line and every summary count. */

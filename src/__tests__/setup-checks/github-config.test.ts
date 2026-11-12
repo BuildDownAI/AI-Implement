@@ -115,7 +115,7 @@ describe("the App's credentials, before any GitHub read", () => {
     const env = { GITHUB_WEBHOOK_SECRET: "s", KG_SOURCE_REPO: "acme/kg" };
     for (const appEnv of [{ GITHUB_APP_ID: "123456" }, { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: "not a key" }]) {
       const rows = await run(id, context({}, { env: { ...env, ...appEnv } }));
-      expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "Clear env.github-app first." })]);
+      expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the env.github-app check first." })]);
     }
   });
 });
@@ -180,13 +180,14 @@ describe("github.clock", () => {
 });
 
 describe("github.installation", () => {
-  it("is not applicable with no project", async () => {
-    expect(await run("github.installation", context({}, { mappings: () => ({}) }))).toEqual([{ state: "not-applicable", detail: "No project is configured" }]);
+  it("answers nothing with no project, which tracker.provider reports", async () => {
+    expect(await run("github.installation", context({}, { mappings: () => ({}) }))).toEqual([]);
+    expect(await run("github.target-secrets", context({}, { mappings: () => ({}) }))).toEqual([]);
   });
 
   it("waits on github.app-identity when GitHub refuses the credentials", async () => {
     const rows = await run("github.installation", context({ app: async () => appRead({ slug: null }) }));
-    expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "Clear github.app-identity first." })]);
+    expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the github.app-identity check first." })]);
   });
 
   it("cannot verify, without blaming the credentials, when GitHub answers HTTP 503", async () => {
@@ -248,6 +249,15 @@ describe("github.permissions", () => {
     expect(row).not.toHaveProperty("fixUrl");
   });
 
+  it("names every missing permission at once, optional ones beside required ones, so one approval covers them all", async () => {
+    const permissions = { ...installation().permissions } as Record<string, string>;
+    delete permissions.checks;
+    delete permissions.workflows;
+    const [row] = await run("github.permissions", context({ installation: async () => installation({ permissions }) }));
+    expect(row.state).toBe("fail");
+    expect(row.detail).toMatch(/^The App's installation on acme lacks Workflows \(read and write\), Checks \(read-only\)\. /);
+  });
+
   it("warns when only an optional permission is missing", async () => {
     const permissions = { ...installation().permissions } as Record<string, string>;
     delete permissions.checks;
@@ -257,7 +267,7 @@ describe("github.permissions", () => {
 
   it("waits on github.installation for an owner without the App", async () => {
     const [row] = await run("github.permissions", context({ installation: async () => null }));
-    expect(row).toMatchObject({ state: "cannot-verify", fix: "Clear github.installation first." });
+    expect(row).toMatchObject({ state: "cannot-verify", fix: "More information is needed. Address the github.installation check first." });
   });
 });
 
@@ -304,7 +314,7 @@ describe("github.webhook-signature", () => {
 
   it("waits on github.app-identity when GitHub refuses to list deliveries", async () => {
     const rows = await run("github.webhook-signature", withSecret({ deliveries: async () => { throw new GitHubApiError({ status: 401 }); } }));
-    expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "Clear github.app-identity first." })]);
+    expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the github.app-identity check first." })]);
   });
 });
 
@@ -400,9 +410,9 @@ describe("github.workflow-default-branch", () => {
 
   it("waits on github.installation and github.permissions when the repository cannot be read", async () => {
     const hidden = await run("github.workflow-default-branch", gha(repoFacts({ visible: false })));
-    expect(hidden).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "Clear github.installation first." })]);
+    expect(hidden).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the github.installation check first." })]);
     const refused = await run("github.workflow-default-branch", gha(repoFacts(), { repositories: async () => { throw new GitHubApiError({ status: 422 }); } }));
-    expect(refused).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "Clear github.permissions first." })]);
+    expect(refused).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the github.permissions check first." })]);
   });
 });
 

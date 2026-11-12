@@ -8,7 +8,7 @@ import { createModelSessionKeyProvider } from "../model-session-keys.js";
 import { createModelSessionStore } from "../model-session-store.js";
 import type * as AdminModule from "../admin.js";
 import type { SelfDeployClient } from "../restate/self-deploy.js";
-import type { SetupCheckRun } from "../setup-checks/index.js";
+import { SETUP_CHECK_GROUP_LABELS, setupCommandFor, type SetupCheckProgress, type SetupCheckRun } from "../setup-checks/index.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { AIImplementSnapshot } from "../providers/types.js";
@@ -5739,54 +5739,86 @@ describe("per-page grants", () => {
     });
   });
 
-  describe("the setup-check routes (AII-1538)", () => {
+  describe("the setup-check routes (AII-1538, AII-1541)", () => {
     const RUN: SetupCheckRun = {
       checkedAt: 7,
       results: [{ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" }],
     };
+    const PROGRESS: SetupCheckProgress = { startedAt: 5, total: 2, finished: RUN.results, running: [{ id: "admin.path", title: "Admin path", group: "orchestrator" }] };
     const ok = <T>(value: T) => vi.fn(async () => ({ status: "ok" as const, value }));
+    const started = () => ok({ invocationId: "inv_1" });
 
-    it("answers an admin the stored run with every field, and null before the first run", async () => {
-      expect(JSON.parse((await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(RUN) })).body)).toEqual(RUN);
+    it("answers an admin the stored run with every field and no run in progress, and a null run before the first", async () => {
+      expect(JSON.parse((await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(RUN) })).body)).toEqual({ run: RUN, progress: null, groups: SETUP_CHECK_GROUP_LABELS });
       const before = await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(null) });
       expect(before.statusCode).toBe(200);
-      expect(JSON.parse(before.body)).toBeNull();
+      expect(JSON.parse(before.body)).toEqual({ run: null, progress: null, groups: SETUP_CHECK_GROUP_LABELS });
     });
 
-    it("starts one run for an admin and answers it", async () => {
-      const run = ok(RUN);
-      const res = await requestWithDeps("/api/setup-checks/run", "POST", adminSsoSession(), { runSetupChecks: run });
-      expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body)).toEqual(RUN);
-      expect(run).toHaveBeenCalledTimes(1);
+    it("answers the run in progress beside the last finished run", async () => {
+      const res = await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(RUN), setupCheckProgress: () => PROGRESS });
+      expect(JSON.parse(res.body)).toEqual({ run: RUN, progress: PROGRESS, groups: SETUP_CHECK_GROUP_LABELS });
+    });
+
+    it("starts one run for an admin and answers 202 without waiting for it", async () => {
+      const start = started();
+      const res = await requestWithDeps("/api/setup-checks/run", "POST", adminSsoSession(), { startSetupChecks: start });
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body)).toEqual({ invocationId: "inv_1" });
+      expect(start).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a second run while one is in progress, naming when it started", async () => {
+      const busy = vi.fn(async () => ({ status: "busy" as const, startedAt: 5 }));
+      const res = await requestWithDeps("/api/setup-checks/run", "POST", adminSsoSession(), { startSetupChecks: busy });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "run-in-progress", startedAt: 5 });
     });
 
     it("refuses both routes to a user with no grant, and never calls the object", async () => {
       const read = ok(RUN);
-      const run = ok(RUN);
+      const start = started();
       expect((await requestWithDeps("/api/setup-checks", "GET", userSession(), { readSetupChecks: read })).statusCode).toBe(403);
-      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { runSetupChecks: run })).statusCode).toBe(403);
+      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { startSetupChecks: start })).statusCode).toBe(403);
       expect(read).not.toHaveBeenCalled();
-      expect(run).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    });
+
+    it("answers a user granted the Setup page the stored run, detail and fix included (ADR 047)", async () => {
+      accessGrants.savePageGrants(["setup"], "ada@eudoxus.ai");
+      const res = await requestWithDeps("/api/setup-checks", "GET", userSession(), { readSetupChecks: ok(RUN) });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).run).toEqual(RUN);
     });
 
     it("refuses a run to a user granted every page, since a grant reaches only a page's GET routes", async () => {
       accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
-      const run = ok(RUN);
-      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { runSetupChecks: run })).statusCode).toBe(403);
-      expect(run).not.toHaveBeenCalled();
+      const start = started();
+      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { startSetupChecks: start })).statusCode).toBe(403);
+      expect(start).not.toHaveBeenCalled();
     });
 
     it.each([
       ["GET", "/api/setup-checks", "readSetupChecks"],
-      ["POST", "/api/setup-checks/run", "runSetupChecks"],
+      ["POST", "/api/setup-checks/run", "startSetupChecks"],
     ] as const)("%s %s answers 503 restate-unavailable when Restate could not take the call, or nothing is wired", async (method, url, dep) => {
       const refused = vi.fn(async () => ({ status: "unavailable" as const }));
       const res = await requestWithDeps(url, method, adminSsoSession(), { [dep]: refused });
       expect(res.statusCode).toBe(503);
-      expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+      expect(JSON.parse(res.body)).toMatchObject({ error: "restate-unavailable" });
       const unwired = await requestWithDeps(url, method, adminSsoSession(), {});
       expect(unwired.statusCode).toBe(503);
+    });
+
+    it("names the setup command when the stored run cannot be read, since that command runs every check without Restate", async () => {
+      const refused = vi.fn(async () => ({ status: "unavailable" as const }));
+      vi.stubEnv("FLY_APP_NAME", "acme-orchestrator");
+      try {
+        const res = await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: refused });
+        expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable", setupCommand: setupCommandFor({ FLY_APP_NAME: "acme-orchestrator" }) });
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
   });
 

@@ -33,6 +33,7 @@ export const PAGE_ROUTES: Record<string, readonly string[]> = {
   reaper: ["/api/reaper/recent", "/api/reaper/summary"],
   audit: ["/api/dedup"],
   customizations: ["/api/customizations"],
+  setup: ["/api/setup-checks"],           // its run route is a POST, so a grant shows results but never starts a run
 };
 
 export function initAccessPageGrantsTable(): void {

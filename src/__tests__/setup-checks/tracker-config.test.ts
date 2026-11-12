@@ -34,16 +34,16 @@ const LINEAR_IDS: SetupCheckId[] = [
 ];
 
 describe("every Linear check", () => {
-  it.each(LINEAR_IDS)("does not apply when no project uses Linear (%s)", async (id) => {
+  it.each(LINEAR_IDS)("leaves it to the credentials check to say no project uses Linear (%s)", async (id) => {
     const outcomes = await run(id, { mappings: () => ({ OPS: makeMapping({ ticketingProvider: "jira" }) }) });
-    expect(outcomes).toEqual([{ state: "not-applicable", detail: "No project uses Linear" }]);
+    expect(outcomes).toEqual(id === "tracker.linear.credentials" ? [{ state: "not-applicable", detail: "No project uses Linear" }] : []);
   });
 
   it.each(LINEAR_IDS.filter((id) => id !== "tracker.linear.credentials"))(
     "cannot verify, and points at the credentials check, when Linear gives the app no token (%s)",
     async (id) => {
       expect(await run(id, onLinear(REFUSED))).toEqual([
-        { state: "cannot-verify", detail: "Linear gave the app no token, so this cannot be read", fix: "Clear tracker.linear.credentials first." },
+        { state: "cannot-verify", detail: "Linear gave the app no token, so this cannot be read", fix: "More information is needed. Address the tracker.linear.credentials check first." },
       ]);
     },
   );
@@ -76,8 +76,8 @@ describe("tracker.provider", () => {
       { state: "pass", detail: "The linear provider is ready for ENG, WEB" },
       {
         state: "cannot-verify",
-        detail: "The jira provider has no setup checks, so the tracker setup of OPS is not checked",
-        fix: "Check the tracker's credentials, labels and states by hand.",
+        detail: "The jira provider has no setup checks, so the ticketing system setup of OPS is not checked",
+        fix: "Check the ticketing system's credentials, labels and states by hand.",
       },
       {
         state: "fail",
@@ -131,7 +131,7 @@ describe("the per-team Linear checks", () => {
     "cannot verify a project whose team the app cannot see (%s)",
     async (id) => {
       expect(await run(id, onLinear(makeLinearSetupFacts(), "ENGG"))).toEqual([
-        { project: "ENGG", state: "cannot-verify", detail: "The app cannot see team ENGG, so this cannot be read", fix: "Clear tracker.linear.team-access first." },
+        { project: "ENGG", state: "cannot-verify", detail: "The app cannot see team ENGG, so this cannot be read", fix: "More information is needed. Address the tracker.linear.team-access check first." },
       ]);
     },
   );
@@ -290,9 +290,10 @@ const JIRA_IDS: SetupCheckId[] = [
 const PER_RESOLVED_PROJECT_IDS = JIRA_IDS.filter((id) => id !== "tracker.jira.credentials" && id !== "tracker.jira.fields");
 
 describe("every Jira check", () => {
-  it.each(JIRA_IDS)("does not apply, and reads nothing, when no project uses Jira (%s)", async (id) => {
+  it.each(JIRA_IDS)("reads nothing, and leaves it to the credentials check to say, when no project uses Jira (%s)", async (id) => {
     const trackerSetupFacts = vi.fn(async () => null);
-    expect(await run(id, { mappings: () => ({ ENG: makeMapping() }), trackerSetupFacts })).toEqual([{ state: "not-applicable", detail: "No project uses Jira" }]);
+    expect(await run(id, { mappings: () => ({ ENG: makeMapping() }), trackerSetupFacts }))
+      .toEqual(id === "tracker.jira.credentials" ? [{ state: "not-applicable", detail: "No project uses Jira" }] : []);
     expect(trackerSetupFacts).not.toHaveBeenCalled();
   });
 
@@ -300,7 +301,7 @@ describe("every Jira check", () => {
     "cannot verify, and points at the credentials check, when Jira does not accept the credentials (%s)",
     async (id) => {
       expect(await run(id, onJira(REFUSED_JIRA))).toEqual([
-        { state: "cannot-verify", detail: "Jira did not accept the credentials, so this cannot be read", fix: "Clear tracker.jira.credentials first." },
+        { state: "cannot-verify", detail: "Jira did not accept the credentials, so this cannot be read", fix: "More information is needed. Address the tracker.jira.credentials check first." },
       ]);
     },
   );
@@ -320,7 +321,7 @@ describe("every Jira check", () => {
       const facts = acceptedJira({ OPS: { fields: "unresolved", field: "AI-Implement Status", fault: "missing" }, WEB: resolvedProject() });
       const outcomes = await run(id, onJira(facts, { OPS: jiraProject(), WEB: jiraProject() }));
       expect(outcomes).toEqual([
-        { project: "OPS", state: "cannot-verify", detail: "This project's Jira fields cannot be found, so this cannot be read", fix: "Clear tracker.jira.fields first." },
+        { project: "OPS", state: "cannot-verify", detail: "This project's Jira fields cannot be found, so this cannot be read", fix: "More information is needed. Address the tracker.jira.fields check first." },
         expect.objectContaining({ project: "WEB", state: "pass" }),
       ]);
     },

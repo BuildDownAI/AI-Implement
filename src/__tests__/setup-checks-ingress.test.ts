@@ -1,10 +1,9 @@
-// The admin routes' two ingress functions for the SetupChecks object (AII-1538): when they call, what they call, and how a
-// refusal, an error or a hung ingress comes back.
+// The admin routes' two ingress functions for the SetupChecks object (AII-1538, AII-1541): when they call, what they call,
+// and how a refusal, an error or a hung ingress comes back.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createSetupChecksHydration, readSetupChecksViaObject, runSetupChecksViaObject } from "../restate/setup-checks.js";
+import { createSetupChecksHydration, readSetupChecksViaObject, startSetupChecksViaObject } from "../restate/setup-checks.js";
 import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
-import { CALL_TOOL_TIMEOUT_MS } from "../restate/tools-client.js";
-import { getLastSetupCheckRun, recordSetupCheckRun, type SetupCheckRun } from "../setup-checks/index.js";
+import { endSetupCheckProgress, getLastSetupCheckRun, getSetupCheckProgress, recordSetupCheckRun, type SetupCheckRun } from "../setup-checks/index.js";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 
 const BASE_URL = "http://ingress.test";
@@ -16,6 +15,8 @@ const RUN: SetupCheckRun = {
 afterEach(() => {
   vi.restoreAllMocks();
   resetRestateStatus();
+  // A sent run's claim lasts until its handler ends it, and no handler runs here.
+  endSetupCheckProgress();
 });
 
 describe("readSetupChecksViaObject", () => {
@@ -60,24 +61,43 @@ describe("readSetupChecksViaObject", () => {
   });
 });
 
-describe("runSetupChecksViaObject", () => {
+describe("startSetupChecksViaObject", () => {
   it("answers unavailable without contacting the ingress while Restate cannot serve", async () => {
     const fake = fakeFetch({});
-    expect(await runSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => false })).toEqual({ status: "unavailable" });
+    expect(await startSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => false })).toEqual({ status: "unavailable" });
     expect(fake.calls).toHaveLength(0);
   });
 
-  it("starts a run through SetupChecks/orchestrator/run and answers it", async () => {
-    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/run": { json: RUN } });
-    expect(await runSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "ok", value: RUN });
-    expect(fake.calls.map((call) => call.path)).toEqual(["/SetupChecks/orchestrator/run"]);
+  it("sends a run through SetupChecks/orchestrator/run/send and answers its invocation id, never the run", async () => {
+    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/run/send": { json: { invocationId: "inv_1", status: "Accepted" } } });
+    expect(await startSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "ok", value: { invocationId: "inv_1" } });
+    expect(fake.calls.map((call) => call.path)).toEqual(["/SetupChecks/orchestrator/run/send"]);
   });
 
-  it("bounds a run at the tool ingress's bound", async () => {
+  it("bounds the send at 10 seconds, so a hung ingress answers unavailable", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
-    stubAbortTimeout(CALL_TOOL_TIMEOUT_MS);
-    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/run": hangUntilAborted });
-    expect(await runSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "unavailable" });
+    stubAbortTimeout(10_000);
+    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/run/send": hangUntilAborted });
+    expect(await startSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "unavailable" });
+  });
+
+  it("sends one run for two starts that overlap, answering the second busy with the first's start", async () => {
+    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/run/send": { json: { invocationId: "inv_1", status: "Accepted" } } });
+    const deps = { baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true };
+    const [first, second] = await Promise.all([startSetupChecksViaObject(deps), startSetupChecksViaObject(deps)]);
+    expect(fake.calls).toHaveLength(1);
+    expect(first).toEqual({ status: "ok", value: { invocationId: "inv_1" } });
+    expect(second).toEqual({ status: "busy", startedAt: getSetupCheckProgress()!.startedAt });
+  });
+
+  it.each([
+    ["Restate cannot serve", false, {}],
+    ["the ingress refuses the send", true, { "POST /SetupChecks/orchestrator/run/send": { status: 500, text: "boom" } }],
+  ] as const)("frees the next start when %s, since no run will end its claim", async (_case, canServe, routes) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = fakeFetch(routes);
+    expect(await startSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => canServe })).toEqual({ status: "unavailable" });
+    expect(getSetupCheckProgress()).toBeNull();
   });
 });
 

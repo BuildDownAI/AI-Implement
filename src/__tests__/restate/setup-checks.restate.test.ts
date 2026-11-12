@@ -1,10 +1,11 @@
 // Real Restate coverage for the SetupChecks object (AII-1538), on both variants.
 //
 // Run with `npm run test:restate`; excluded from `npm test`.
+import * as restate from "@restatedev/restate-sdk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createSetupChecks } from "../../restate/setup-checks.js";
-import { getLastSetupCheckRun, runSetupChecks, SETUP_CHECKS, type SetupCheckRun } from "../../setup-checks/index.js";
-import { makeSentinelSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
+import { getLastSetupCheckRun, getSetupCheckProgress, runSetupChecks, runSetupChecksWithProgress, SETUP_CHECKS, type SetupCheckRun } from "../../setup-checks/index.js";
+import { makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import type { RestateEnvironment } from "./harness.js";
 import { VARIANTS, callObject, eventually, gate, journalEntries, journalText, journaledRunResult, queryInvocations, settle, startVariants, stopAll } from "./harness.js";
 
@@ -78,12 +79,34 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     expect(await eventually(() => call<SetupCheckRun | null>("queued", "get"), (stored) => stored?.checkedAt === 2002, { label: "the later run stored" })).toEqual(runAt(2002));
   });
 
+  it("clears the run's progress only once the run is stored, and when the run fails", async () => {
+    let progressWhileStoring: unknown = "unread";
+    nextRun = async () => {
+      const run = await runSetupChecksWithProgress(makeSetupCheckContext(), () => 3000);
+      progressWhileStoring = getSetupCheckProgress()?.startedAt;
+      return run;
+    };
+    const run = await call<SetupCheckRun>("progress", "run");
+    expect(progressWhileStoring).toBe(3000);
+    expect(getLastSetupCheckRun()).toEqual(run);
+    expect(getSetupCheckProgress()).toBeNull();
+
+    nextRun = async () => {
+      await runSetupChecksWithProgress(makeSetupCheckContext());
+      throw new restate.TerminalError("the run broke");
+    };
+    await expect(call<SetupCheckRun>("progress-failed", "run")).rejects.toThrow();
+    expect(getSetupCheckProgress()).toBeNull();
+  });
+
   it("keeps no secret's value in its state or its journal", async () => {
     nextRun = () => runSetupChecks(makeSentinelSetupCheckContext());
     const run = await call<SetupCheckRun>("sentinel", "run");
     const stored = await call<SetupCheckRun>("sentinel", "get");
 
-    expect(new Set(run.results.map((result) => result.id)).size).toBe(SETUP_CHECKS.length);
+    // Every check answers but the Jira checks that depend on a Jira project, which the context's one Linear project leaves out.
+    const answering = SETUP_CHECKS.filter((check) => !check.id.startsWith("tracker.jira.") || check.id === "tracker.jira.credentials");
+    expect(new Set(run.results.map((result) => result.id)).size).toBe(answering.length);
     expect(JSON.stringify(stored)).not.toContain("sentinel-");
     for (const handler of ["run", "get"] as const) {
       const rows = await invocations("sentinel", handler);

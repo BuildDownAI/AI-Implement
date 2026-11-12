@@ -12,9 +12,9 @@ export const overviewHtml = `
   </header>
   <div class="page-body">
 
-    <!-- Environment status pills -->
-    <div id="overview-env-status" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
-      <!-- populated by loadEnvStatus() -->
+    <!-- The last setup-check run in one line, linking to the Setup page -->
+    <div id="overview-setup-status" class="text-secondary" style="margin-bottom:16px;font-size:0.9em">
+      <!-- populated by loadSetupStatus() -->
     </div>
 
     <!-- Stale-template alert (hidden when everything is current) -->
@@ -137,24 +137,6 @@ export const overviewHtml = `
 
 export const overviewScript = `
 (function () {
-  function fmtAgo(ts) {
-    const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
-    if (s < 60) return s + 's ago';
-    const m = Math.floor(s / 60);
-    if (m < 60) return m + 'm ago';
-    const h = Math.floor(m / 60);
-    return h + 'h ago';
-  }
-
-  function fmtDuration(ms) {
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return s + 's';
-    const m = Math.floor(s / 60);
-    if (m < 60) return m + 'm ' + (s % 60) + 's';
-    const h = Math.floor(m / 60);
-    return h + 'h ' + (m % 60) + 'm';
-  }
-
   function sparkline(values) {
     if (!values || values.length === 0) {
       return '<div class="text-tertiary" style="font-size:11px">no data</div>';
@@ -208,7 +190,7 @@ export const overviewScript = `
       || (code === 'PROVIDER_UNAVAILABLE' && (!stage || stage.includes('review')));
   }
 
-  function statusBadge(status, entry) {
+  function jobStatusBadge(status, entry) {
     const map = { running: 'running', review_failed: 'warn', timed_out: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
     const label = isReviewIncomplete(entry)
@@ -218,7 +200,7 @@ export const overviewScript = `
         : status === 'dispatch-failed'
           ? 'dispatch failed'
           : status;
-    return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
+    return window.statusBadge(kind, label);
   }
 
   function dispatch24hBuckets(log) {
@@ -238,7 +220,7 @@ export const overviewScript = `
   function renderHeaderSubtitle(reaper) {
     const el = document.getElementById('overview-subtitle');
     if (!el) return;
-    el.textContent = 'last sweep ' + (reaper.lastSweepAt ? fmtAgo(reaper.lastSweepAt) : 'never');
+    el.textContent = 'last sweep ' + (reaper.lastSweepAt ? window.fmtAgo(reaper.lastSweepAt) : 'never');
   }
 
   function renderKpis(log, running, capacityByMapping) {
@@ -307,14 +289,14 @@ export const overviewScript = `
       tr.style.cursor = 'pointer';
       const issueLabel = e.issueIdentifier || e.issueId || '—';
       const title = e.issueTitle ? window.esc(e.issueTitle) : '';
-      const duration = e.dispatchedAt ? fmtDuration(now - new Date(e.dispatchedAt).getTime()) : '—';
+      const duration = e.dispatchedAt ? window.fmtDuration(now - new Date(e.dispatchedAt).getTime()) : '—';
       tr.innerHTML = '<td class="col-grow">'
         + '<div><span class="mono" style="color:var(--fg-tertiary);margin-right:8px">' + window.esc(issueLabel) + '</span>'
         + (title ? '<span>' + title + '</span>' : '') + '</div>'
         + '<div style="font-size:11px;color:var(--fg-tertiary);margin-top:2px">'
         + window.esc(e.teamKey || '—') + ' &middot; ' + window.esc(e.repo || '—')
         + '</div></td>'
-        + '<td>' + statusBadge(e.status, e) + '</td>'
+        + '<td>' + jobStatusBadge(e.status, e) + '</td>'
         + '<td style="text-align:right" class="mono text-secondary">' + duration + '</td>';
       tbody.appendChild(tr);
     });
@@ -375,10 +357,10 @@ export const overviewScript = `
       tr.style.cursor = 'pointer';
       const issueLabel = e.issueIdentifier || e.issueId || '—';
       const failedAt = e.dispatchedAt ? new Date(e.dispatchedAt).toLocaleString() : '—';
-      const when = e.dispatchedAt ? fmtAgo(e.dispatchedAt) : '—';
+      const when = e.dispatchedAt ? window.fmtAgo(e.dispatchedAt) : '—';
       tr.innerHTML = '<td class="col-grow"><span class="mono text-secondary">' + window.esc(issueLabel) + '</span>'
         + (e.issueTitle ? ' <span>' + window.esc(e.issueTitle) + '</span>' : '')
-        + ' <span style="margin-left:6px">' + statusBadge(e.status, e) + '</span></td>'
+        + ' <span style="margin-left:6px">' + jobStatusBadge(e.status, e) + '</span></td>'
         + '<td class="mono text-tertiary" style="white-space:nowrap">' + failedAt + '</td>'
         + '<td style="text-align:right" class="mono text-tertiary">' + when + '</td>';
       tbody.appendChild(tr);
@@ -421,7 +403,7 @@ export const overviewScript = `
       const tr = document.createElement('tr');
       tr.innerHTML = '<td><span class="mono" style="font-weight:600">' + window.esc(key) + '</span></td>'
         + '<td class="mono text-secondary">' + window.esc((m.owner || '?') + '/' + (m.repo || '?')) + '</td>'
-        + '<td><span class="badge ' + runnerKind + '">' + runnerLabel + '</span></td>'
+        + '<td>' + window.labelBadge(runnerKind, runnerLabel) + '</td>'
         + '<td class="text-secondary">' + window.esc(m.provider || 'anthropic') + '</td>'
         + '<td>' + (c ? capacityMeter(c.used, c.cap) : capacityMeterUnavailable()) + '</td>'
         + '<td style="text-align:right" class="mono text-secondary">&mdash;</td>';
@@ -429,31 +411,30 @@ export const overviewScript = `
     });
   }
 
-  function renderEnvStatus(status) {
-    const container = document.getElementById('overview-env-status');
-    if (!container) return;
-    const pills = [
-      { label: 'Linear', on: !!status.linear, hint: 'LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET' },
-      { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_SITE_URL + (JIRA_EMAIL or JIRA_CLOUD_ID)' },
-      { label: 'Runner callback', on: !!status.runnerCallback, hint: 'RUNNER_CALLBACK_BASE_URL + RUNNER_TOKEN_SECRET' },
-    ];
-    container.innerHTML = pills.map(function (p) {
-      const tint = p.on ? 'var(--st-ok-fg, #2a8)' : 'var(--text-tertiary, #888)';
-      const dot = p.on ? '●' : '○';
-      const text = p.label + ' ' + (p.on ? 'ON' : 'off');
-      return '<span title="' + window.escAttr(p.hint) + '" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border, #2a2a2a);border-radius:999px;font-size:0.85em;color:' + tint + '"><span style="font-size:0.7em">' + dot + '</span>' + window.esc(text) + '</span>';
-    }).join('');
+  // One line from GET /api/setup-checks: which groups the last run found failing, in the route's group order,
+  // or why there is nothing to show.
+  function setupStatusText(data) {
+    if (!data) return 'Setup checks cannot be read right now.';
+    if (data.progress) return 'Setup checks are running.';
+    if (!data.run) return 'Setup checks have not run yet.';
+    const failing = Object.keys(data.groups).filter(function (group) {
+      return data.run.results.some(function (row) { return row.group === group && row.state === 'fail'; });
+    });
+    if (failing.length === 0) return 'No setup check fails.';
+    return 'Failing setup checks: ' + failing.map(function (group) { return data.groups[group]; }).join(', ') + '.';
   }
 
-  async function loadEnvStatus() {
+  async function loadSetupStatus() {
+    const el = document.getElementById('overview-setup-status');
+    if (!el) return;
+    let data = null;
     try {
-      const res = await window.api('/api/admin/config-status');
-      if (!res.ok) return;
-      const status = await res.json();
-      renderEnvStatus(status);
+      const res = await window.api('/api/setup-checks');
+      if (res.ok) data = await res.json();
     } catch (err) {
-      console.error('loadEnvStatus failed:', err);
+      console.error('loadSetupStatus failed:', err);
     }
+    el.innerHTML = window.esc(setupStatusText(data)) + ' <a href="#setup">Open Setup</a>';
   }
 
   function renderTemplateStatus(entries) {
@@ -520,7 +501,7 @@ export const overviewScript = `
       renderAtCapacity(capacityByMapping);
       renderRecentFailures(safeLog);
       renderProjectGrid(safeMappings, capacityByMapping);
-      loadEnvStatus();
+      loadSetupStatus();
       loadTemplateStatus();
     } catch (err) {
       console.error('loadOverview failed:', err);

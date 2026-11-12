@@ -39,9 +39,9 @@ export function makeSetupCheckContext(overrides: Partial<SetupCheckContext> = {}
     restateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
     databasePath: () => ({ path: "/data/dedup.sqlite", configured: "/data/dedup.sqlite", fellBack: false }),
     onSeparateFilesystem: () => true,
-    trackerProvider: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
+    trackerProvider: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} ticketing system`)),
     // A provider that cannot be built has no facts to read either, as in createSetupCheckContext.
-    trackerSetupFacts: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} tracker`)),
+    trackerSetupFacts: (providerId) => Promise.reject(new Error(`No project uses the ${providerId} ticketing system`)),
     githubSetupFacts: () => makeGitHubSetupFacts(),
     // Nothing answers at any address, as on a refused connection.
     orchestratorHealthAt: () => Promise.resolve({ outcome: "no-response", timedOut: false, error: "fetch failed: connect ECONNREFUSED" }),
