@@ -182,7 +182,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
       sessionData: JSON.stringify(makeChatGptPlanRecord({ accessToken: ACCESS })) }).ok).toBe(true);
     const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", accountProfileId: "cdx", invocationTimeoutMs: 60_000 };
     profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-    profiles.setProjectOptIn("AII", true);
+    profiles.setProjectConfigured("AII", true);
     upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", reviewFixLifecycle: "restate" }));
     expect(getMappings().AII?.reviewFixLifecycle).toBe("restate");
     store = new SqliteReviewFixAttemptStore();
@@ -583,7 +583,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
         profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: {
           planning: stage(mode === "api" ? "api" : "cdx"), implementation: stage(mode === "plan" ? "cdx" : "api"), review: mode === "mixed" ? { ...stage("claude"), agent: "claude", provider: "anthropic" } : stage(mode === "api" ? "api" : "cdx"),
         } });
-        profiles.setProjectOptIn("AII", true);
+        profiles.setProjectConfigured("AII", true);
         const before = state.containers.length;
         const { attemptId } = await admit(pr);
         await eventually(() => state.containers.length, n => n === before + 1, { timeoutMs: 20_000, label: "managed container launch" });
@@ -592,7 +592,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
         const frozen = loadStoredSnapshot(attemptId);
         expect(frozen).toEqual(launch.snapshot);
         expect(launch.backend).toBe(backend);
-        profiles.setProjectOptIn("AII", false);
+        profiles.setProjectConfigured("AII", false);
         profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage("cdx"), implementation: stage("cdx"), review: stage("cdx") } });
         await env.startedRestateServer.restart();
         expect(loadStoredSnapshot(attemptId)).toEqual(frozen);
@@ -625,7 +625,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
           upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", executionMode: "fly-machines", reviewFixLifecycle: "restate" }));
           const stage = { agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", accountProfileId: "cdx", invocationTimeoutMs: 60_000 };
           profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: { ...stage, accountProfileId: "api" }, review: stage } });
-          profiles.setProjectOptIn("AII", true);
+          profiles.setProjectConfigured("AII", true);
           const before = state.containers.length;
           const { attemptId } = await admit(pr);
           await eventually(() => state.containers.length, n => n === before + 1, { timeoutMs: 20_000 });

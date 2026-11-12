@@ -149,7 +149,7 @@ beforeEach(async () => {
   });
   const stage = { agent: "codex", provider: "openai", model: "m", accountProfileId: "cdx", invocationTimeoutMs: 60_000 } as const;
   store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  store.setProjectOptIn("AII", true);
+  store.setProjectConfigured("AII", true);
 
   const credentials = { sessionStore: sessions, resolveProtectedSecret: () => null };
   holder.runtime = {
@@ -223,7 +223,7 @@ describe("opted-in Fly implementation", () => {
     expect(fly.createMachine).toHaveBeenCalledOnce();
 
     vi.mocked(fly.createMachine).mockClear();
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     await index.dispatchFlyMachine(noKey, provider, { ...issue, id: "issue-other" } as TicketIssue, mapping, prior, "default", "main", null);
     expect(fly.createMachine).not.toHaveBeenCalled();
   });
@@ -308,7 +308,7 @@ describe("dispatchSession managed guards", () => {
   });
 
   it("an opted-out project without managedAuth keeps today's path", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     const backend = vi.fn().mockRejectedValue(new Error("stop"));
     await expect(session({ backend })).rejects.toThrow("stop");
     expect(backend).toHaveBeenCalledOnce();
@@ -441,7 +441,7 @@ describe("opted-in GitHub Actions implementation (AII-1420)", () => {
   });
 
   it("an opted-out project keeps today's inputs: no agentConfig, no credentials", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     workflows = {};
     vi.mocked(probe.resolveWorkflowCapabilities).mockResolvedValue({ ...capabilities, supportsPrivateRunConfig: false } as never);
     await dispatchGha();
@@ -454,7 +454,7 @@ describe("opted-in GitHub Actions implementation (AII-1420)", () => {
 
 describe("opted-out Fly implementation", () => {
   it("keeps the legacy machine body: raw credential, plain run config, no protected markers", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     await dispatchFly();
     const body = machineBody();
     const env = body.config.env;
@@ -545,7 +545,7 @@ function normalize(v: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe("opted-out dispatch is unchanged", () => {
-  beforeEach(() => store.setProjectOptIn("AII", false));
+  beforeEach(() => store.setProjectConfigured("AII", false));
 
   it("Fly createMachine body deep-equals the pre-change fixture", async () => {
     await dispatchFly({ ...mapping, extraEnv: { FOO: "bar" } } as RepoMapping);
@@ -574,7 +574,7 @@ describe("dispatchBothMode", () => {
   });
 
   it("still shadows an opted-out project on Fly", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     vi.mocked(probe.resolveWorkflowCapabilities).mockResolvedValue({ contract: "legacy", supportsRunPublicationToken: false, supportsAttemptCorrelation: false } as never);
     vi.mocked(repoImage.resolveRunnerImageForDispatch).mockResolvedValue(undefined as never);
     vi.mocked(github.postWorkflowDispatch).mockResolvedValue({ success: true, outcome: "accepted" } as never);

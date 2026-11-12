@@ -462,7 +462,7 @@ async function managedSetup(backend: typeof backends[number], mode: "api" | "pla
   expect(runtime.sessionStore.writePlanRecord({ profileId: "plan", expectedSequence: null, sessionData: JSON.stringify(makeChatGptPlanRecord({ accessToken: "sentinel-access" })) }).ok).toBe(true);
   const stage = (id: string) => ({ agent: "codex" as const, provider: "openai" as const, model: "gpt-6-luna", fallbackModel: "gpt-5.4", accountProfileId: id, invocationTimeoutMs: 60000 });
   profiles.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage(mode === "api" ? "api" : "plan"), implementation: stage(mode === "plan" ? "plan" : "api"), review: mode === "mixed" ? { ...stage("claude"), agent: "claude", provider: "anthropic" } : stage(mode === "api" ? "api" : "plan") } });
-  profiles.setProjectOptIn("AII", true);
+  profiles.setProjectConfigured("AII", true);
   s.deps.modelAuthRuntime = runtime;
   return { ...s, runtime, profiles };
 }
@@ -475,7 +475,7 @@ for (const backend of backends) describe(`managed ${backend}`, () => {
     const { loadStoredSnapshot } = await import("../agent-run-preparation.js");
     const frozen = loadStoredSnapshot(s.plan.attemptId);
     expect(frozen?.stages.implementation.accountProfileId).toBe(mode === "plan" ? "plan" : "api");
-    s.profiles.setProjectOptIn("AII", false);
+    s.profiles.setProjectConfigured("AII", false);
     expect(await new s.worker.ContainerReviewFixWorker(s.deps).launch(prepared)).toEqual({ status: "unknown" });
     expect(loadStoredSnapshot(s.plan.attemptId)).toEqual(frozen);
     expect(s.runtime.preparationDeps).toHaveBeenCalledTimes(1);
