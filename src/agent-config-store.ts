@@ -578,15 +578,6 @@ export function setProjectConfigured(projectKey: string, configured: boolean, cr
     .immediate();
 }
 
-// Compatibility exports; part 2 deletes these wrappers.
-export function getProjectOptIn(projectKey: string): boolean {
-  return isProjectConfigured(projectKey);
-}
-
-export function setProjectOptIn(projectKey: string, configured: boolean, createdBy: string | null = null): boolean {
-  return setProjectConfigured(projectKey, configured, createdBy);
-}
-
 /**
  * Resolves a project's stage configuration from current heads. Legacy (no row or mode=legacy) resolves as such;
  * a disabled, archived, or unknown profile throws.

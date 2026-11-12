@@ -803,7 +803,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
   m.config.saveAccountProfileRevision({ profileId: "api", identity: "API", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
   const stage = { agent: "claude" as const, provider: "anthropic" as const, model: "m", accountProfileId: "api", invocationTimeoutMs: 60000 };
   m.config.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  m.config.setProjectOptIn("ENG", true);
+  m.config.setProjectConfigured("ENG", true);
   const actual = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
   const req = { dispatchId: "before-intent", projectKey: "ENG", backend: "github-actions" as const, owner: "Org", repo: "repo", workflowFile: "claude-implement.yml" };
   const initialRuntime = makeRuntime(m);
@@ -814,7 +814,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
     const frozen = m.prep.loadStoredSnapshot(req.dispatchId);
     expect(frozen).not.toBeNull();
     expect(m.dedup.getDb().prepare("SELECT * FROM model_credential_grants").all()).toEqual([]);
-    m.config.setProjectOptIn("ENG", false);
+    m.config.setProjectConfigured("ENG", false);
     const reopened = await database.reopen();
     const managed = await import("../managed-dispatch-auth.js");
     const replay = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
@@ -860,7 +860,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
   // Prove the actual retry returns no credential and cannot create another grant.
   expect(await replay.prepareManagedDispatch(req, runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
   if (configuration === "missing") input.getMapping = () => undefined;
-  if (configuration === "opted-out") reopened.config.setProjectOptIn("ENG", false);
+  if (configuration === "opted-out") reopened.config.setProjectConfigured("ENG", false);
   reopened.production.createProductionImplementationRunServices(input);
   const deps = captured.deps as ImplementationRunDependencies;
   const db = reopened.dedup.getDb();
