@@ -35,7 +35,7 @@ export const modelsAndProvidersHtml = `
         </div>
         <div class="text-tertiary" style="font-size:11px;margin-top:6px">Blank fields inherit. The limit is an elapsed time in milliseconds for either agent. Claude turn caps are separate: Max Turns per project, and Review Max Turns under Retry Policy on the Settings page.</div>
         <div class="field-hint">The first account is the stage account; later accounts are fallbacks. A fallback model may be blank only when its profile uses the same agent as the first account.</div>
-        <div class="field-hint">A project that overrides the account profile on its Agents tab runs without these fallbacks.</div>
+        <div class="field-hint">A project that overrides the account profile on its Agents tab uses these defaults as fallbacks after its project account, subject to subscription ordering.</div>
         <div id="mp-stage-hints" class="text-tertiary" style="font-size:11px;margin-top:6px"></div>
         <div id="mp-stage-actions" style="display:flex;gap:6px;margin-top:8px">
           <button class="btn btn-primary btn-sm" onclick="saveStageDefaults()">Save</button>
