@@ -39,6 +39,23 @@ Every step is idempotent, so a second boot changes nothing:
 - One trigger is the exception. `trg_dispatch_log_changed_at` is dropped and created at every
   boot, so an older form of it is replaced by the current form.
 
+### OpenRouter CHECK constraint rebuilds (AII-1883)
+
+`getDb()` creates `model_account_profile_revisions` and `model_invocation_attribution`
+with `openrouter` in their provider CHECK lists; profile revisions also accept
+`openrouter-api-key` in their auth mode CHECK. Types and application validators are unchanged.
+For each existing table independently, it reads `sqlite_master.sql`: if the stored SQL
+contains `openrouter`, no rebuild runs. Otherwise it creates a replacement table, copies
+all named columns, drops the old table and renames the replacement, in one transaction.
+A second boot skips both rebuilds, including after only one table was upgraded.
+
+The same transaction restores the profile revision immutable UPDATE trigger or the
+attribution `(dispatch_id, stage)` index. It also temporarily drops and restores the
+stored `trg_dispatch_log_pruned` definition, since its reference to attribution would
+prevent the rename while that table is absent. `initLogTable()` calls `getDb()` before
+`ensureAccountingTriggers()`, which recreates `trg_invocation_attribution_changed_at`
+after the rebuild. Historical copied rows therefore do not advance job timestamps.
+
 ## 2. The accounting parts (AII-1561)
 
 **Tables** (created in `getDb()`):
@@ -94,6 +111,8 @@ Nothing undoes a schema change. If you deploy older code over a newer database:
 - Old code ignores the new tables and columns. Its inserts name their columns, and the new
   columns are nullable.
 - The triggers stay in the database and keep working under old code.
+- The OpenRouter rebuilds keep their wider provider and auth mode CHECK lists. Reverting
+  the code does not narrow them; an older orchestrator runs correctly with these lists.
 - The prune trigger's deletes (section 4) stay active.
 
 ## 4. The one irreversible change
