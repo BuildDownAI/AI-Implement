@@ -8,7 +8,7 @@ There are three stages: `planning`, `implementation` and `review` (`STAGE_NAMES`
 
 ## Account profiles
 
-An account profile is a named account an operator creates on Models & providers. Its revisions are immutable (`model_account_profile_revisions`): each change saves a new revision. A profile has an agent, a provider, an auth mode (`anthropic-api-key`, `openai-api-key`, `openrouter-api-key`, `bedrock`, `codex-subscription`, `claude-subscription`) and a status (`active`, `disabled`, `archived`). Every active profile is usable by every project. Its credential lives encrypted on the orchestrator; a profile names it by `credentialRef`, and no read returns it. See [model-account-operations.md](model-account-operations.md).
+An account profile is a named account an operator creates on Models & providers, or through the admin API for OpenRouter. Its revisions are immutable (`model_account_profile_revisions`): each change saves a new revision. A profile has an agent, a provider, an auth mode (`anthropic-api-key`, `openai-api-key`, `openrouter-api-key`, `bedrock`, `codex-subscription`, `claude-subscription`) and a status (`active`, `disabled`, `archived`). Every active profile is usable by every project. Its credential lives encrypted on the orchestrator; a profile names it by `credentialRef`, and no read returns it. See [model-account-operations.md](model-account-operations.md).
 
 ## Defaults, overrides and the account list
 
