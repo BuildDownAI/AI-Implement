@@ -349,7 +349,7 @@ Every fake that a workflow test adds for a projection (`recordDispatchRow`, `rec
 
 Four flakes cost gap-fill rounds (a base URL captured before a restart, a scenario that outran a shortened
 wall-clock window, a `sys_invocation` read before a scheduled send was visible, a scenario that raced a deadline it
-did not test). Scenarios follow four rules, and
+did not test). Scenarios follow five rules, and
 `src/__tests__/restate-test-hygiene.test.ts` (default suite) fails on the patterns that break them in every
 `*.restate.test.ts` file.
 
@@ -396,6 +396,13 @@ did not test). Scenarios follow four rules, and
    bootstrap deadline with a 30 s total, for a scenario that must act after the bootstrap deadline and has no upper bound to beat). The short deadlines are a 1 s bootstrap and a 1.8 s total, with a 100 ms watch tick. The
    bootstrap deadline is the one that cannot shrink: AII-1125's started read must arrive inside it, AII-1111 raised a 400 ms
    bootstrap to avoid that race, and AII-1028 measured invocation start delays up to 1.08 s on a loaded runner.
+
+5. **A wall-clock limit is never the proof.** `timeoutMs` on `eventually` is a liveness limit: the scenario must give
+   the same verdict with a limit that is ten times longer. To prove that an event came before a timer, compare times
+   that the engine or the code under test recorded (a journal `wake_up_time`, a stored outcome time), or hold the
+   workflow at a gate (§ [Driving the race](#driving-the-race)). For example, "$event ends an unknown launch during
+   its backed-off wait ($label)" in `review-fix-pilot.restate.test.ts` compares the durable `completed_at` with the
+   last sleep's `wake_up_time` in that attempt's journal. A longer limit is not a fix for a test that fails on a busy worker.
 
 `settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
 `setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a
