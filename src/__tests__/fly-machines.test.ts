@@ -23,6 +23,7 @@ import {
   fetchMachineLogs,
   updateMachineMetadata,
   readMachineExit,
+  machineNeverStarted,
   ProtectedBootstrapError,
 } from "../fly-machines.js";
 import type { Machine, MachineEvent, SessionMachineInput, SettleOptions, CreateMachineOpts, ProtectedBootstrapSecretMetadata } from "../fly-machines.js";
@@ -1502,5 +1503,16 @@ describe("putAppSecretsVersioned", () => {
     const err = await putAppSecretsVersioned("tok", "app", { A: "SECRETVALUE" }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).not.toContain("SECRETVALUE");
+  });
+});
+
+describe("machineNeverStarted", () => {
+  it.each([
+    [["launch", "promote", "launch", "destroy"], true],
+    [["launch", "start", "destroy"], false],
+    [[], false],
+    [undefined, false],
+  ] as const)("reads start evidence from %j", (types, expected) => {
+    expect(machineNeverStarted({ ...mockMachine, events: types?.map(type => ({ type })) })).toBe(expected);
   });
 });

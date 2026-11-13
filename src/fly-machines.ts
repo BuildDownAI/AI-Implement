@@ -365,6 +365,12 @@ export interface MachineExit {
   timestamp: number | null;
 }
 
+/** True only when recorded events contain no evidence that the machine started. */
+export function machineNeverStarted(machine: Machine): boolean {
+  const events = machine.events;
+  return !!events?.length && !events.some(event => event.type === "start");
+}
+
 /**
  * Terminal exit details from the newest event carrying an exit_event (all null when none exists).
  * Raw: Fly omits exit_code for a clean exit 0, so `exitCode: null` with an event present is a

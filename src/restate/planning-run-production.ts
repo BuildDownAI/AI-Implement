@@ -15,7 +15,7 @@ import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../
 import { getInstallationToken } from "../github-app-auth.js";
 import { findLogIdByDispatchId, getJobByDispatchId, markJobFailureCommented, recordGhaRunCompleted, updateJobRunId, updateJobStatus, type Job } from "../log.js";
 import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
-import { listMachines } from "../fly-machines.js";
+import { listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { parkIssue } from "../dispatch-breaker.js";
 import { buildRunUrl } from "../completion-classification.js";
@@ -246,7 +246,17 @@ export function createProductionPlanningRunServices(input: PlanningRunProduction
     if (job.failureCommentedAt) return;
     const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;
     if (!mapping || !job.issueId) return;
-    const cause = outcome.kind === "deadline" ? "the run deadline passed before a planning result arrived" : "the run ended with no planning result";
+    let cause = outcome.kind === "deadline" ? "the run deadline passed before a planning result arrived" : "the run ended with no planning result";
+    if (outcome.kind === "run_ended" && job.executionMode === "fly-machines" && job.machineId) {
+      try {
+        if (config.flySessionsToken && config.flySessionsApp &&
+            machineNeverStarted(await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId))) {
+          cause = "Fly removed the machine before it started";
+        }
+      } catch {
+        // Diagnostic only: a failed read must never delay admission release.
+      }
+    }
     const runUrl = buildRunUrl(job);
     const reason =
       `${cause}${runUrl ? ` (run: ${runUrl})` : ""}. The issue is parked and will not be retried by itself. ` +

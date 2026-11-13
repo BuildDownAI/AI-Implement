@@ -26,7 +26,7 @@ vi.mock("../log.js", () => ({
   recordGhaRunCompleted: vi.fn(),
 }));
 vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
-vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
+vi.mock("../fly-machines.js", () => ({ machineNeverStarted: vi.fn().mockReturnValue(false), getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
 vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn(), removeLocalContainer: vi.fn() }));
 vi.mock("../stuck-watchdog.js", () => ({ remediateFailedJob: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../dispatch-admission.js", () => ({
