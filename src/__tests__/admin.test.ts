@@ -3226,13 +3226,30 @@ describe("admin filesystem issue detail endpoint", () => {
 
   it.each(["constructor", "toString", "__proto__"])("keeps filesystem routes at 404 for inherited name %s", async (scopeKey) => {
     await withFilesystemProject(async ({ registry, token }) => {
-      const issueId = `filesystem:${scopeKey}:SAN2-001`;
-      const detail = await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry);
-      expect(detail.statusCode).toBe(404);
-      expect(JSON.parse(detail.body)).toEqual({ error: "filesystem issue not found" });
-      const retry = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
-      expect(retry.statusCode).toBe(404);
-      expect(JSON.parse(retry.body)).toEqual({ error: "Filesystem ticket not found" });
+      // The old provider guard also returned 404 for Object.prototype values.
+      // Observe property access to prove inherited values are rejected before
+      // either route inspects them, rather than relying on that second guard.
+      const inspectInheritedMapping = vi.fn(() => undefined);
+      const inheritedMapping = Object.defineProperty({}, "ticketingProvider", {
+        get: inspectInheritedMapping,
+      });
+      const mappings = Object.assign(
+        Object.create({ [scopeKey]: inheritedMapping }),
+        config.getMappings(),
+      );
+      const getMappings = vi.spyOn(config, "getMappings").mockReturnValue(mappings);
+      try {
+        const issueId = `filesystem:${scopeKey}:SAN2-001`;
+        const detail = await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry);
+        expect(detail.statusCode).toBe(404);
+        expect(JSON.parse(detail.body)).toEqual({ error: "filesystem issue not found" });
+        const retry = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+        expect(retry.statusCode).toBe(404);
+        expect(JSON.parse(retry.body)).toEqual({ error: "Filesystem ticket not found" });
+        expect(inspectInheritedMapping).not.toHaveBeenCalled();
+      } finally {
+        getMappings.mockRestore();
+      }
     });
   });
 
