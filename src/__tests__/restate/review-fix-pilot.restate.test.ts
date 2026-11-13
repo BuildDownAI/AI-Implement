@@ -1124,7 +1124,9 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
         createReviewFixIngressClient(env.baseUrl()))).toBe(true);
     }
     await eventually(async () => (await sqliteStore.getRecordedOutcome(attemptId))?.terminal.status,
-      (status) => status === "launch_unresolved", { timeoutMs: 1_500, label: "cancel interrupts backoff" });
+      // Allow the cancellation and outcome steps to replay on a busy CI worker.
+      // Keep this below the backoff so waiting for the timer still fails the test.
+      (status) => status === "launch_unresolved", { timeoutMs: SHORT_POST_DEADLINE_RECONCILE_MS - 1_000, label: "cancel interrupts backoff" });
     expect(fixture.dispatchCalls).toBe(1);
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
   }, 15_000);
