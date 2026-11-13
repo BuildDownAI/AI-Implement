@@ -185,6 +185,8 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 
 ## Running tests
 
+Follow the [Rules for a reliable test](docs/unit-tests.md#rules-for-a-reliable-test) when writing or repairing tests.
+
 A test never proves a result with a wall-clock limit or a fixed sleep; see [Timing rules](docs/restate-testing.md#timing-rules).
 
 ```bash
