@@ -68,8 +68,16 @@ describe("account usage-limit provider signatures", () => {
     { errorMessage: "You've hit your usage limit.", category: "auth", code: "ACCOUNT_USAGE_LIMIT" },
     { stdout: "You've hit your usage limit.", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
     { stderr: "You've hit your usage limit.", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+    { errorMessage: "401 authentication_error", category: "auth", code: "PROVIDER_AUTH" },
+    { errorMessage: "invalid_request_error: unknown model", category: "config", code: "PROVIDER_CONFIG" },
+    { stdout: "401 authentication_error", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+    { stderr: "401 authentication_error", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+    { stdout: "invalid_request_error: unknown model", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+    { stderr: "invalid_request_error: unknown model", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
+    { errorMessage: "You've hit your usage limit. 401 authentication_error", category: "auth", code: "ACCOUNT_USAGE_LIMIT" },
+    { errorMessage: "You've hit your usage limit. 403 Forbidden", category: "auth", code: "ACCOUNT_USAGE_LIMIT" },
     { errorMessage: "API Error: 429 overloaded_error", category: "invalid_output", code: "LLM_TERMINAL_ERROR" },
-  ])("classifies exit-zero terminal errors using only provider usage-limit errors: %j", ({ category, code, ...text }) => {
+  ])("classifies exit-zero terminal errors using only permitted provider terminal errors: %j", ({ category, code, ...text }) => {
     const record = classifyLlmResult(llmResult({
       exitCode: 0,
       terminalStatus: { isError: true, subtype: "turn.failed" },
@@ -77,6 +85,17 @@ describe("account usage-limit provider signatures", () => {
     }), CTX);
     expect(record).toMatchObject({ category, code, retryable: false });
   });
+
+  it.each(["401 authentication_error", "invalid_request_error: unknown model"])(
+    "does not match provider text without an error terminal status: %s",
+    (errorMessage) => {
+      const record = classifyLlmResult(llmResult({
+        errorMessage,
+        terminalStatus: { isError: false, subtype: "turn.failed" },
+      }), { ...CTX, expectsStructuredOutput: true });
+      expect(record).toMatchObject({ category: "invalid_output", code: "LLM_TERMINAL_ERROR", retryable: false });
+    },
+  );
 
   it("does not classify bare limit text as an account usage limit", () => {
     expect(classifyThrown(new Error("limit"), CTX)).toMatchObject({ category: "unknown", code: "UNKNOWN" });
