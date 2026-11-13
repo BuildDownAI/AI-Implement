@@ -4458,6 +4458,11 @@ async function putProjectAgentConfigLocked(
   json(res, 200, { projectKey, ...storedConfigView(stored) });
 }
 
+/**
+ * The response's fallbacksDropped field is true only when a project account
+ * override has no following diagnostic entry; an override alone does not imply
+ * that its default fallbacks were dropped. This applies to both response paths.
+ */
 function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: string, deps: AdminDeps): void {
   const mapping = getOwnMapping(projectKey);
   if (!mapping) {

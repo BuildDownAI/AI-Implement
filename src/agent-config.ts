@@ -307,7 +307,7 @@ function stageAccountCandidates(input: ResolveStageAgentConfigInput, stage: Stag
   const projectAccount = override?.accountProfileId != null;
   const raw = defaults?.accounts && !projectAccount ? defaults.accounts : [{ accountProfileId: resolved.selection.accountProfileId, model: resolved.selection.model }];
   if (projectAccount) {
-    // Normalize defaults before prepending: blank models belong to the defaults,
+    // Normalize defaults before appending: blank models belong to the defaults,
     // even when their first entry is deduplicated against the project account.
     const defaultEntries = defaults?.accounts ?? (defaults?.accountProfileId && defaults.model
       ? [{ accountProfileId: defaults.accountProfileId, model: defaults.model }] : []);
