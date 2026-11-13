@@ -4458,6 +4458,11 @@ async function putProjectAgentConfigLocked(
   json(res, 200, { projectKey, ...storedConfigView(stored) });
 }
 
+/**
+ * The response's fallbacksDropped field is true only when a project account
+ * override has no following diagnostic entry; an override alone does not imply
+ * that its default fallbacks were dropped. This applies to both response paths.
+ */
 function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: string, deps: AdminDeps): void {
   const mapping = getOwnMapping(projectKey);
   if (!mapping) {
@@ -4479,7 +4484,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
       ...base,
       mode: "configured",
       resolved: false,
-      stages: Object.fromEntries(STAGE_NAMES.map(stage => [stage, { entries: accountEntries[stage], fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null }])),
+      stages: Object.fromEntries(STAGE_NAMES.map(stage => [stage, { entries: accountEntries[stage], fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null && (accountEntries[stage]?.length ?? 0) <= 1 }])),
       error: { code: "resolution_failed", message: err instanceof Error ? err.message : "stage configuration does not resolve" },
     });
     return;
@@ -4495,7 +4500,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
     const projectionProfile = getAccountProfile(profile.id);
     stages[stage] = {
       entries: resolution.accountEntries?.[stage],
-      fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null,
+      fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null && (resolution.accountEntries?.[stage]?.length ?? 0) <= 1,
       values: { ...resolution.stages[stage], fallbackModel: resolution.fallbackModels[stage] ?? null },
       sources: { ...resolution.sources[stage], fallbackModel: resolution.fallbackModelSources[stage] ?? null },
       profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },

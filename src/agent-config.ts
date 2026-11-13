@@ -304,7 +304,24 @@ function stageAccountCandidates(input: ResolveStageAgentConfigInput, stage: Stag
   const firstProfile = first && profileById.get(first.accountProfileId);
   const base = first ? { ...defaults, ...first, agent: firstProfile?.agent ?? defaults?.agent ?? "claude", provider: firstProfile?.provider ?? defaults?.provider ?? "anthropic" } : defaults;
   const resolved = resolveStage(stage, base, override, input.remainingJobMs);
-  const raw = defaults?.accounts && override?.accountProfileId == null ? defaults.accounts : [{ accountProfileId: resolved.selection.accountProfileId, model: resolved.selection.model }];
+  const projectAccount = override?.accountProfileId != null;
+  const raw = defaults?.accounts && !projectAccount ? defaults.accounts : [{ accountProfileId: resolved.selection.accountProfileId, model: resolved.selection.model }];
+  if (projectAccount) {
+    // Normalize defaults before appending: blank models belong to the defaults,
+    // even when their first entry is deduplicated against the project account.
+    const defaultEntries = defaults?.accounts ?? (defaults?.accountProfileId && defaults.model
+      ? [{ accountProfileId: defaults.accountProfileId, model: defaults.model }] : []);
+    const seen = new Set([resolved.selection.accountProfileId]);
+    let subscription = profileById.get(resolved.selection.accountProfileId)?.authMode.endsWith("subscription") ?? false;
+    for (const entry of defaultEntries) {
+      if (seen.has(entry.accountProfileId)) continue;
+      const isSubscription = profileById.get(entry.accountProfileId)?.authMode.endsWith("subscription") ?? false;
+      if (subscription && !isSubscription) continue;
+      seen.add(entry.accountProfileId);
+      subscription ||= isSubscription;
+      raw.push({ ...entry, model: entry.model.trim() ? entry.model : defaultEntries[0].model });
+    }
+  }
   const entries = raw.map((entry, index) => {
     const p = profileById.get(entry.accountProfileId);
     return { ...entry, ...(index === 0 ? resolved.selection : {}), profileRevision: p?.revision ?? 0,
@@ -352,6 +369,11 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       fallbackModelSources[stage] = projectFallback != null ? "project" : "orchestrator-default";
     }
     const choice = chooseStageAccount(entries, check);
+    // A project account is mandatory; appended defaults are runtime fallbacks.
+    if (input.projectConfig.stages?.[stage]?.accountProfileId != null &&
+        (!choice.chosen || choice.chosen.index !== 0)) {
+      throw new StageAccountError(stage, choice.chosen ? choice.skipped[0].reason : choice.failure);
+    }
     if (!choice.chosen) {
       // Preserve the existing fixed resolver messages for flat configurations.
       if (!defaults?.accounts && choice.failure === "resolution_failed") {
@@ -361,13 +383,14 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       }
       throw new StageAccountError(stage, choice.failure);
     }
-    if (defaults?.accounts) {
+    if (defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null) {
       selection[stage] = { chosen: choice.chosen.index, skipped: choice.skipped };
       if (choice.fallbacks.length) accountFallbacks[stage] = choice.fallbacks;
     }
     if (choice.chosen.index > 0) {
       // Later entries supply their own profile fields; a blank model inherits
-      // the first candidate's effective model, including its project override.
+      // the first candidate's effective model for model-only overrides.
+      // Appended defaults have already had their blank models resolved.
       for (const field of ["accountProfileId", "agent", "provider"] as const) {
         resolved.sources[field] = "orchestrator-default";
       }
@@ -378,7 +401,7 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       delete fallbackModels[stage];
       delete fallbackModelSources[stage];
     } else if (fallback === resolved.selection.model) {
-      if (!defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null) {
+      if (choice.chosen.index === 0 && (!defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null)) {
         throw new Error(`${stage}.fallbackModel must differ from model`);
       }
       // Backend selection can make the stage fallback redundant for this run.
