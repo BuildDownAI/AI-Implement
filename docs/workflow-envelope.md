@@ -145,6 +145,7 @@ interface RunConfigV1 {
   };
   agentConfig?: ResolvedAgentSnapshotV1; // AII-944, see "Resolved agent snapshot"
   modelFallbacks?: Partial<Record<StageName, string>>; // Public per-stage fallback model ids
+  accountFallbacks?: Partial<Record<StageName, StageAccount[]>>; // Ordered frozen public account entries
   modelPrices?: RunModelPrices; // Public cached prices and fetchedAt (epoch milliseconds)
 }
 ```
@@ -169,6 +170,7 @@ Field notes:
 | `reviewProcess` | The project's review process (ADR 038), copied from the mapping when non-null. Absent means `ai-implement`. A value that is not a known process id is dropped during decode with one warning (`[run-config] Ignoring invalid reviewProcess field; using ai-implement`) rather than rejecting the envelope, so version skew between orchestrator and runner cannot fail a run. The autonomous run and `post-push-review` read it: under `claude-code-review` the gate accepts the process's check-run/app pairs and an empty internal reviewer selection is valid. |
 | `trustedReviewAuthors` | Extra GitHub logins trusted as review authors, copied from the mapping when non-null. Absent means the process's own authors. The list adds to those authors and never replaces them. Anything other than an array of non-empty strings is dropped during decode with one warning (`[run-config] Ignoring invalid trustedReviewAuthors field; using the process's own authors`). `post-push-review` reads it when matching review authors. |
 | `modelFallbacks` | Optional public map of `planning`, `implementation`, and `review` to fallback model ids, separate from the frozen snapshot. Empty maps are omitted. Unknown stages or values outside printable non-space ASCII (1–128 characters) discard the entire field without preventing the run. Contains no credentials. |
+| `accountFallbacks` | Optional ordered frozen account entries per stage; absent or empty means no fallback accounts. Strictly copied without credentials or credential references; see "Stored fallback models". |
 | `modelPrices` | Optional copy of `ModelPrices/builddown.current`: `prices` contains only model, version, effectiveFrom and the four per-token USD rates; `fetchedAt` is epoch milliseconds (nullable). Implementation dispatch reads the cache through Restate with a one-second request timeout and no retries; failed or empty reads omit the field. The run-stats comment estimates missing implement/review costs only when model and token telemetry permit it, adds an estimate provenance note, and preserves reported costs. Incomplete totals retain the reported-cost partial/unavailable labels. Estimates never enter accounting or callbacks. |
 | `retryPolicy` | Global retry/backoff policy and reviewer turn cap, edited on the admin Settings page and stored in the orchestrator's `settings` table (never an env var). Absent means the runner uses `DEFAULT_RETRY_POLICY` (`src/pipeline/retry-backoff.ts`). Populated by `getRetryPolicy()` on every implementation-phase and gap-analysis-phase dispatch across all three execution modes — the initial dispatch, the `/ai-implement` comment gap-fill drain, the PR-comment gap-fill trigger, and the review-fix re-dispatch — because `pushRetries` and `reviewMaxTurns` apply to those re-dispatches exactly as to initial runs. Never sent on planning or kg-refresh dispatches, which have no retry loop. On the GHA path, `buildEnvelopeDispatchInputs`'s `retryPolicy` option is required (nullable), not optional — a caller can no longer omit it silently, it must state intent: planning passes `null` explicitly, implementation/gap-analysis pass the real policy from `getRetryPolicy()`. The function itself only stamps the field into `run_config` when `runnerPhase` is neither `planning` nor `kg-refresh`, substituting `DEFAULT_RETRY_POLICY` only if the passed value is `null`, so all three backends agree that every implementation/gap-analysis dispatch carries this field. The runner runs the decoded value through `normalizeRetryPolicy` (an out-of-range or malformed field degrades to the default for that field alone; an unknown key is dropped). The `push` step consumes `pushRetries` and the backoff fields (see [pipeline-architecture.md](pipeline-architecture.md), "Push retry and remote reconciliation"); the remaining fields are stored and transported so the retry rails built on top of them read one source of truth. |
 | `reviewFix` | The Restate review-fix pilot's explicit attempt-identity marker (AII-776), shaped by the canonical AII-770 contract (`src/review-fix-contract.ts`'s `ReviewFixMetadataV1`): `attemptId` identifies one Restate attempt, `installationId`/`repository`/`prNumber` scope it to one PR under one GitHub App installation, and `deadlineAt` is an epoch-ms timestamp (not ISO) so it compares with plain `<`/`>`. Absent means Legacy (non-pilot) dispatch, the only path the legacy flat-env contract can produce — there is no environment-variable equivalent. Unlike every other optional field on this envelope, a **present but malformed or unsupported** `reviewFix` fails closed: `decodeRunConfig` throws rather than dropping the field and falling back to Legacy, because a bad pilot marker must never be silently treated as a non-pilot dispatch. Carries no credential or token — repository/PR/execution authority is verified downstream against stored state, never trusted from this field alone. This slice only carries the field through `RunConfigV1` and `ResolvedRunnerInputs`; no pipeline step reads it yet. |
@@ -430,3 +432,67 @@ snapshot selections and source maps are unchanged. The envelope delivers the val
 `run_config.modelFallbacks`, and the runner uses them as described in
 [Pipeline architecture](pipeline-architecture.md). Before reverting to code that predates this field,
 clear fallback models from every stored configuration.
+
+
+The optional `run_config.accountFallbacks` carries the ordered account fallback
+lists frozen in `resolved_config_json.accountFallbacks`. Each stage maps to an
+array of complete entries: `{accountProfileId, profileRevision, agent, provider,
+authMode, model}`. Preparation returns the stored list unchanged on reuse and
+`managedRunConfigFields` copies it into every managed launch envelope. Absent or
+empty lists mean no fallback accounts; the snapshot schema is unchanged. The
+strict copier rejects unknown stages, missing fields and extra keys with the fixed
+error `invalid run_config.accountFallbacks`, without echoing input values. Older
+runners ignore the new optional field.
+
+The same credential grant binds the chosen profile and every fallback profile for
+each stage, within the 16-binding cap. Preparation trims fallback tails across
+stages to fit the cap while preserving each chosen account and fallback prefix.
+Preparation checks credential readiness only for the chosen profile;
+fallback credentials are issued only on checkout. The model-auth server authorizes
+fallbacks from the frozen row's provider, revision and auth mode after checking the
+grant binding. No credential values or credential references enter this list.
+The runner forwards it to stage executor options. Implement and review switch to
+the next account when an account reaches its usage limit; exhausted accounts stop
+the stage, preserving partial work for a draft PR when available.
+
+
+### Review-fix machine result contract
+
+The optional review-fix marker field `executionBackend` accepts only
+`fly-machines` or `local-docker`; absence preserves the GitHub Actions wire
+shape. GitHub results require positive safe integer `githubRunId` and
+`githubRunAttempt`. Machine results carry the backend tag and `outputCommit`
+without either GitHub ID. Mixed shapes fail validation. Every result requires
+a full lowercase 40-character output commit SHA.
+
+`resultMatchesExecution` correlates GitHub IDs or matching machine backend tags.
+For machines, origin proof is the attempt-scoped result token plus launch-once,
+rather than a machine/container ID. This contract does not enable machine result
+production, intake admission, or publication. An old Fly/local runner drops the
+backend tag and, without GitHub IDs, reports no result; approval ends as
+`not_applicable` (fails closed). An old orchestrator with a newer runner retains
+the unchanged GitHub shape; machine launches remain a later slice.
+
+### Advisory review-only gap-fills
+
+`reviewOnly: { reviewers: ReviewerSelection[] }` selects a single internal review pass
+for an existing `prNumber` with `runnerPhase: "gap-analysis"`. The selection must be
+nonempty. Absent mode preserves the normal implement/fix gap-fill flow. Malformed
+mode fails decoding; it cannot be combined with `reviewFix`.
+
+GHA envelope dispatch, Fly and local Docker retain this payload. Legacy per-input
+GHA workflows reject the mode before launch. Roll-up reviews on GHA and Fly launch
+only on the runner image paired with the orchestrator deployment
+(`resolveSessionImage(...).source === "default"`). A repository image override
+causes a quiet skip: no run launches and no PR comment is posted. Local Docker is
+always capable because its runner is built alongside the orchestrator. Ordinary
+gap-fills are unaffected by this restriction.
+The runner reads the PR's full base-to-head diff and invokes the selected internal
+reviewers once with read-only tools. It skips installs, repository hooks,
+implementation, fixes, preflight, commit/push, and external-review polling.
+
+It posts one advisory PR verdict comment marked `<!-- ai-implement rollup-review -->`,
+including finding severity, file:line and body (or an incomplete-review verdict on
+reviewer failure). The result carries `reviewOnly: true`. Its callback records the
+terminal dispatch status but writes no findings, dispositions or approval mark and
+never submits `LateExternalReview`. The verdict is not a merge gate.

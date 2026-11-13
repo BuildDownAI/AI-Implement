@@ -22,7 +22,7 @@ describe("finishImplementationJob", () => {
   it("callback success with a PR: ready for review is not repeated when the callback made the transition", async () => {
     const deps = setup(makeJob({ status: "running", approved: true, conclusion: "runner_approved", prUrl: PR }));
     await finishImplementationJob(deps, "d", { kind: "run_ended" });
-    expect(deps.closeRow).toHaveBeenCalledWith(expect.anything(), "completed", "runner_approved", { backendTerminated: true });
+    expect(deps.closeRow).toHaveBeenCalledWith(expect.anything(), "completed", "runner_approved", { skipAdmissionRelease: true });
     expect(deps.finalize).not.toHaveBeenCalled();
   });
 
@@ -41,7 +41,7 @@ describe("finishImplementationJob", () => {
   it("callback failure with a draft PR closes the row and passes no outcome", async () => {
     const deps = setup(makeJob({ status: "running", failure: FAILURE, failureCommentedAt: 1, conclusion: "REVIEW_UNAPPROVED", prUrl: PR }));
     await finishImplementationJob(deps, "d", { kind: "run_ended" });
-    expect(deps.closeRow).toHaveBeenCalledWith(expect.anything(), "failed", "REVIEW_UNAPPROVED", { backendTerminated: true });
+    expect(deps.closeRow).toHaveBeenCalledWith(expect.anything(), "failed", "REVIEW_UNAPPROVED", { skipAdmissionRelease: true });
     expect(deps.finalize).not.toHaveBeenCalled();
   });
 
@@ -59,10 +59,24 @@ describe("finishImplementationJob", () => {
     expect(deps.finalize).not.toHaveBeenCalled();
   });
 
+  describe.each(["completed", "failed"] as const)("review-only callback (%s)", status => {
+    it.each(["run_ended", "deadline", "cancelled"] as const)("preserves the advisory outcome after %s", async kind => {
+      const job = makeJob({ status, conclusion: "rollup_review", approved: false, prUrl: PR });
+      const deps = setup(job, true);
+      expect(await finishImplementationJob(deps, "d", { kind })).toEqual({});
+      expect(deps.closeRow).not.toHaveBeenCalled();
+      expect(deps.finalize).not.toHaveBeenCalled();
+      expect(deps.remediateStuck).not.toHaveBeenCalled();
+      expect(deps.isPrMerged).not.toHaveBeenCalled();
+      expect(deps.clearWorkingState).not.toHaveBeenCalled();
+      expect(job).toMatchObject({ status, conclusion: "rollup_review", approved: false });
+    });
+  });
+
   it("backend ended with no callback writes failed/ended_without_callback, then the fix-up", async () => {
     const deps = setup(makeJob({ status: "running" }));
     await finishImplementationJob(deps, "d", { kind: "run_ended" });
-    expect(deps.closeRow).toHaveBeenCalledWith(expect.anything(), "failed", "ended_without_callback", { backendTerminated: true });
+    expect(deps.closeRow).toHaveBeenCalledWith(expect.anything(), "failed", "ended_without_callback", { skipAdmissionRelease: true });
     expect(deps.finalize).toHaveBeenCalledWith({ kind: "failed", conclusion: "ended_without_callback" }, expect.anything());
   });
 

@@ -9,7 +9,7 @@ export interface StoredReviewFinding extends ReviewLedgerFinding {
   repo: string;
   prNumber: number;
   findingKey: string;
-  status: "open" | "resolved" | "deferred";
+  status: "open" | "resolved" | "deferred" | "rejected";
   revision: number;
   firstSeenAt: number;
   lastSeenAt: number;
@@ -32,7 +32,7 @@ interface ReviewFindingRow {
   path: string | null;
   line: number | null;
   url: string | null;
-  status: "open" | "resolved" | "deferred";
+  status: "open" | "resolved" | "deferred" | "rejected";
   revision: number;
   first_seen_at: number;
   last_seen_at: number;
@@ -54,10 +54,11 @@ export function upsertReviewFinding(input: UpsertReviewFindingInput): number {
       path = excluded.path,
       line = excluded.line,
       url = excluded.url,
-      status = CASE WHEN review_findings.status = 'deferred' THEN 'deferred' ELSE 'open' END,
+      status = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.status ELSE 'open' END,
+      disposition = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.disposition ELSE NULL END,
       revision = review_findings.revision + 1,
       last_seen_at = excluded.last_seen_at,
-      resolved_at = CASE WHEN review_findings.status = 'deferred' THEN review_findings.resolved_at ELSE NULL END
+      resolved_at = CASE WHEN review_findings.status IN ('deferred', 'rejected') THEN review_findings.resolved_at ELSE NULL END
   `).run({
     repo: input.repo,
     prNumber: input.prNumber,
@@ -78,7 +79,7 @@ export function upsertReviewFinding(input: UpsertReviewFindingInput): number {
 }
 
 /**
- * Records a finding without starting a new version of one already open or deferred.
+ * Records a finding without starting a new version of one already open, deferred, or rejected.
  * Unlike `upsertReviewFinding`, a repeat of the same finding (a webhook redelivery,
  * or the same comment posted twice) leaves the row's revision untouched, so the
  * revision-keyed attempt and disposition checks still match it. A resolved finding
@@ -91,6 +92,25 @@ export function recordReviewFinding(input: UpsertReviewFindingInput): number {
     .get(input.repo, input.prNumber, findingKey) as { id: number; status: StoredReviewFinding["status"] } | undefined;
   if (existing && existing.status !== "resolved") return existing.id;
   return upsertReviewFinding(input);
+}
+
+/** Records a new dispatch report once, retaining its revision across callback retries. */
+export function recordInternalReviewFinding(input: UpsertReviewFindingInput, dispatchId: string): { id: number; revision: number } {
+  const db = getDb();
+  return db.transaction(() => {
+    const previous = db.prepare(`
+      SELECT r.finding_id AS id, r.revision
+      FROM internal_review_finding_reports r
+      JOIN review_findings f ON f.id = r.finding_id
+      WHERE r.dispatch_id = ? AND f.repo = ? AND f.pr_number = ? AND f.finding_key = ?
+    `).get(dispatchId, input.repo, input.prNumber, stableReviewFindingKey(input)) as { id: number; revision: number } | undefined;
+    if (previous) return previous;
+    const id = upsertReviewFinding(input);
+    const { revision } = db.prepare("SELECT revision FROM review_findings WHERE id = ?").get(id) as { revision: number };
+    db.prepare("INSERT INTO internal_review_finding_reports (dispatch_id, finding_id, revision) VALUES (?, ?, ?)")
+      .run(dispatchId, id, revision);
+    return { id, revision };
+  })();
 }
 
 export function upsertReviewFindings(repo: string, prNumber: number, findings: ReviewLedgerFinding[]): number[] {
@@ -121,8 +141,8 @@ export function markReviewFindingsResolvedForPr(repo: string, prNumber: number):
 
 /**
  * Resolves only open rows last seen at or before `seenBefore` whose
- * `finding_key` is in `keys` — the keys the agent disposed `fixed` or
- * `invalid`. An empty `keys` resolves nothing on purpose (fail closed): a
+ * `finding_key` is in `keys` — the keys the agent disposed `fixed`.
+ * An empty `keys` resolves nothing on purpose (fail closed): a
  * finding is never resolved without a recorded disposition.
  */
 export function markReviewFindingsResolvedForPrSeenBefore(
@@ -136,7 +156,7 @@ export function markReviewFindingsResolvedForPrSeenBefore(
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE repo = ? AND pr_number = ? AND status = 'open' AND last_seen_at <= ? AND finding_key IN (${placeholders})
     `)
     .run(Date.now(), Date.now(), repo, prNumber, seenBefore, ...keys);
@@ -145,8 +165,8 @@ export function markReviewFindingsResolvedForPrSeenBefore(
 
 /**
  * Resolves only open rows whose id is in `findingIds` (the dispatch snapshot)
- * and whose `finding_key` is in `keys` — the keys the agent disposed `fixed`
- * or `invalid`. An empty `keys` resolves nothing on purpose (fail closed): a
+ * and whose `finding_key` is in `keys` — the keys the agent disposed `fixed`.
+ * An empty `keys` resolves nothing on purpose (fail closed): a
  * finding is never resolved without a recorded disposition.
  */
 export function markReviewFindingsResolvedByIds(
@@ -161,7 +181,7 @@ export function markReviewFindingsResolvedByIds(
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE repo = ? AND pr_number = ? AND status = 'open' AND id IN (${placeholders}) AND finding_key IN (${keyPlaceholders})
     `)
     .run(Date.now(), Date.now(), repo, prNumber, ...findingIds, ...keys);
@@ -175,6 +195,19 @@ export function markReviewFindingsDeferredByKeys(repo: string, prNumber: number,
     .prepare(`
       UPDATE review_findings
       SET status = 'deferred'
+      WHERE repo = ? AND pr_number = ? AND status = 'open' AND finding_key IN (${placeholders})
+    `)
+    .run(repo, prNumber, ...keys);
+  return result.changes;
+}
+
+export function markReviewFindingsRejectedByKeys(repo: string, prNumber: number, keys: string[]): number {
+  if (keys.length === 0) return 0;
+  const placeholders = keys.map(() => "?").join(", ");
+  const result = getDb()
+    .prepare(`
+      UPDATE review_findings
+      SET status = 'rejected'
       WHERE repo = ? AND pr_number = ? AND status = 'open' AND finding_key IN (${placeholders})
     `)
     .run(repo, prNumber, ...keys);
@@ -198,7 +231,7 @@ export function markReviewFindingResolvedIfRevision(id: number, revision: number
   const result = getDb()
     .prepare(`
       UPDATE review_findings
-      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      SET status = 'resolved', disposition = 'fixed', resolved_at = ?, last_seen_at = ?
       WHERE id = ? AND revision = ? AND status = 'open'
     `)
     .run(Date.now(), Date.now(), id, revision);

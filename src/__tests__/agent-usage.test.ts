@@ -344,22 +344,48 @@ describe("recorded usage", () => {
   });
 
   it.each([
-    { managed: true, mismatch: null },
-    { managed: true, mismatch: "model" },
-    { managed: true, mismatch: "profileId" },
-    { managed: false, mismatch: "model" },
-    { managed: false, mismatch: "profileId" },
-  ] as const)("applies managed acceptance policy (managed=$managed, mismatch=$mismatch)", async ({ managed, mismatch }) => {
+    { managed: true, mismatch: null, fallback: true, modelFallback: true },
+    { managed: false, mismatch: null, fallback: true, modelFallback: true },
+    { managed: true, mismatch: null, fallback: true },
+    { managed: false, mismatch: null, fallback: true },
+    { managed: true, mismatch: "model", fallback: true },
+    { managed: true, mismatch: "profileId", fallback: true },
+    { managed: true, mismatch: null, fallback: false },
+    { managed: true, mismatch: "model", fallback: false },
+    { managed: true, mismatch: "profileId", fallback: false },
+    { managed: false, mismatch: "model", fallback: false },
+    { managed: false, mismatch: "profileId", fallback: false },
+  ] as const)("applies managed acceptance policy (managed=$managed, mismatch=$mismatch, fallback=$fallback)", async (testCase) => {
+    const { managed, mismatch, fallback } = testCase;
+    const modelFallback = "modelFallback" in testCase && testCase.modelFallback;
     const { testDb } = await import("./helpers/test-db.js");
     const { modules: { usage, dedup } } = await testDb({ modules: {
       usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
     } });
     const db = dedup.getDb();
     const dispatchId = "policy-dispatch";
+    const fallbackAccount = {
+      accountProfileId: "fallback-claude", profileRevision: 7,
+      agent: "claude", provider: "anthropic", authMode: "claude-subscription", model: "claude-sonnet-4-6",
+    };
+    const policySnapshot = structuredClone(snap);
+    if (modelFallback) {
+      policySnapshot.stages.implementation.agent = "claude";
+      policySnapshot.stages.implementation.provider = "anthropic";
+      policySnapshot.profiles.implementation.agent = "claude";
+      policySnapshot.profiles.implementation.provider = "anthropic";
+      policySnapshot.profiles.implementation.authMode = "claude-subscription";
+    }
+    const fallbackClaim = fallback ? {
+      profileId: fallbackAccount.accountProfileId, agent: fallbackAccount.agent as "claude",
+      provider: fallbackAccount.provider as "anthropic", authMode: fallbackAccount.authMode as "claude-subscription",
+      model: modelFallback ? "claude-authorized-fallback" : fallbackAccount.model,
+    } : {};
+
     db.prepare(`INSERT INTO run_agent_config_snapshots
       (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
       VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, dispatchId,
-      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+      JSON.stringify({ stages: policySnapshot.stages, profiles: policySnapshot.profiles, fallbackModels: { implementation: "claude-authorized-fallback" }, accountFallbacks: { implementation: [fallbackAccount] } }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
     if (managed) {
       // Durable attempt ownership must enforce the policy even without an active admission.
       db.prepare(`INSERT INTO review_fix_attempts
@@ -371,8 +397,8 @@ describe("recorded usage", () => {
     const overrides = mismatch ? { [mismatch]: "different-selection" } : {};
     // Distinct ids exercise both the invocation list and the legacy attribution path.
     const input = usage.toRecordedUsage({
-      invocations: [{ attribution: claim("implementation", { ...overrides, invocationId: "policy-list" }) }],
-      attribution: claim("implementation", { ...overrides, invocationId: "policy-legacy" }),
+      invocations: [{ attribution: claim("implementation", { ...fallbackClaim, ...overrides, invocationId: "policy-list" }) }],
+      attribution: claim("implementation", { ...fallbackClaim, ...overrides, invocationId: "policy-legacy" }),
       pushedCommits: [],
     });
     expect(input.listWhole).toBe(true);
@@ -386,7 +412,10 @@ describe("recorded usage", () => {
       const stored = rows();
       expect(stored.map((row) => row.invocation_id)).toEqual(rejected ? [] : ["policy-list", "policy-legacy"]);
       for (const row of stored) {
-        expect(row).toMatchObject({ model: snap.stages.implementation.model, profile_id: snap.profiles.implementation.id });
+        expect(row).toMatchObject(fallback && mismatch === null ? {
+          agent: "claude", provider: "anthropic", auth_mode: "claude-subscription",
+          model: modelFallback ? "claude-authorized-fallback" : fallbackAccount.model, profile_id: fallbackAccount.accountProfileId, profile_revision: 7,
+        } : { model: snap.stages.implementation.model, profile_id: snap.profiles.implementation.id });
         expect(JSON.parse(row.usage_json)).toMatchObject({
           attribution: mismatch ? "mismatch" : "verified",
           mismatches: mismatch ? [mismatch] : [],

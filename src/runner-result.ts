@@ -1,3 +1,4 @@
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import type { SourceResult } from "./kg-source-results.js";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -160,6 +161,9 @@ export async function postRunnerResult(params: {
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
+  reviewOnly?: boolean;
+  rollupReview?: { headSha: string; verdictUrl: string };
+  internalFindings?: ReviewLedgerFinding[];
   findingDispositions?: FindingDisposition[];
   /**
    * Per-cycle evidence records read back from this run's declared cycle-summary file (AII-801,
@@ -246,6 +250,9 @@ export async function postRunnerResult(params: {
   if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
     body.referenceRepoResults = params.referenceRepoResults;
   }
+  if (params.reviewOnly) body.reviewOnly = true;
+  if (params.rollupReview) body.rollupReview = params.rollupReview;
+  if (params.internalFindings) body.internalFindings = params.internalFindings;
   if (params.findingDispositions && params.findingDispositions.length > 0) {
     body.findingDispositions = params.findingDispositions;
   }

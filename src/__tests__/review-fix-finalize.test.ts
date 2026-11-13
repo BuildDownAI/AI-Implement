@@ -50,7 +50,7 @@ function admissionRequest(overrides: Partial<ReviewFixAdmissionRequest> = {}): R
   };
 }
 
-function resultFor(attemptId: string, deadlineAt: number, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+function resultFor(attemptId: string, deadlineAt: number, overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   return makeReviewFixResult({ attemptId, ...SCOPE, deadlineAt, outputCommit: OUTPUT_COMMIT, ...overrides });
 }
 

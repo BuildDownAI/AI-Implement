@@ -13,7 +13,6 @@ import {
   getMappings,
   initMappingsTable,
   resolvePrDispatchBudget,
-  resolveReviewFixLifecycle,
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { recordReaperAction, markDispatched, closeDb, getDb, getDispatchedRows, deleteDispatched } from "./dedup.js";
@@ -92,7 +91,7 @@ import { postStatusComment } from "./status-events.js";
 import { buildRunUrl, classifyCompletion, deriveLastSuccessfulStage, monitorFailureCommentPrefix, renderClassification, shouldPostMonitorClassificationComment } from "./completion-classification.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded } from "./backend-run.js";
 import { getMachine, listMachines, updateMachine, generateSessionToken, generateMachineNonce, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
-import { isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
+import { reconcileRestateMachine, reconcileRestateLocalContainers, isDurableRunnerMachine, safeDestroyMachine, sweepOrphanedMachines } from "./reaper.js";
 import type { ReaperHelpers } from "./reaper.js";
 import { getRunnerMode, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook, type KgPrCheckConfig } from "./webhook.js";
@@ -125,7 +124,6 @@ import {
   inspectLocalContainer,
   removeLocalContainer,
   startLocalRunnerContainer,
-  sweepExitedLocalContainers,
 } from "./local-docker.js";
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
@@ -133,7 +131,7 @@ import { pickPrForRun } from "./monitor-status.js";
 import { type RunCredentialsV1 } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
-import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
+import { runMergeUps, reconcileRollupReviewChildren, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
@@ -166,7 +164,7 @@ import { applyVolumeSnapshotRetention, applyVolumeSnapshotRetentionAtBoot } from
 import { createProductionReviewFixServices } from "./restate/review-fix-production.js";
 import { sweepOnRegistered } from "./webhook-redelivery.js";
 import { createKgFindRunByTitle, createProductionKgRefreshServices, bindKeptMachineFly } from "./restate/kg-refresh-production.js";
-import { createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
+import { IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY, IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY, IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY, IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY, createProductionImplementationRunServices } from "./restate/implementation-run-production.js";
 import { createImplementationAdmissionTerminationHook, createImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANNING_CONTEXT_FIELD_VALUE_KEY } from "./restate/planning-run-production.js";
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
@@ -461,7 +459,7 @@ async function reviewFixAccounting(
   return trackerAccounting(mapping, provider, { id: fix.issueId, identifier: fix.issueIdentifier });
 }
 
-async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+export async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const cycle = beginCycle();
   if (!cycle) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
@@ -572,6 +570,20 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   }
 
   try {
+    // Parking changes pickup eligibility. Reconcile before taking either planning or
+    // implementation snapshots so this poll cannot dispatch a child just handed to a person.
+    const reconciliationFailedScopes = new Set<string>();
+    for (const provider of providers) {
+      for (const [scopeKey, mapping] of Object.entries(getMappings())) {
+        if (mapping.ticketingProvider !== provider.id) continue;
+        try {
+          await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config);
+        } catch (err) {
+          reconciliationFailedScopes.add(scopeKey);
+          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle:`, err);
+        }
+      }
+    }
     const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
     for (const { providerId, error } of failed) {
       console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);
@@ -581,6 +593,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     // existing roll-up path opens the top-of-tree PR without dispatching a junk implement pass.
     for (const { provider, snapshot } of entries) {
       for (const entry of snapshot.parentsToFinalize) {
+        if (reconciliationFailedScopes.has(entry.scopeKey)) continue;
         // An entry whose key belongs to another tracker's mapping must not touch that repo.
         if (getMappings()[entry.scopeKey] && !mappingForProvider(provider.id, entry.scopeKey, getMappings())) continue;
         console.log(`[${provider.id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
@@ -613,6 +626,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const allMappingsForDispatch = getMappings();
     const teamRepoMap: Record<string, RepoMapping> = {};
     for (const [k, m] of Object.entries(allMappingsForDispatch)) {
+      if (reconciliationFailedScopes.has(k)) continue;
       if (m.paused) {
         console.log(`[poll] Skipping paused project ${k} (${m.owner}/${m.repo})`);
         continue;
@@ -858,16 +872,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           // feature-branch-grouping fallback and must not trigger a comment).
           const implFieldValue = implValidated.branch;
 
-          if (execPath === "both") {
-            // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchBothMode(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else if (execPath === "local-docker") {
-            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          } else {
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
-          }
+          await submitImplementationRun(config, issue, mapping, {
+            execPath, runnerMode, baseBranch, baseBranchFieldValue: implFieldValue,
+          });
         }
       } catch (err) {
         console.error(`[poll] Error processing ${issue.identifier}:`, err);
@@ -904,10 +911,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const inFlightMachineIds = getInFlightJobs()
       .map((j) => j.machineId)
       .filter((id): id is string => Boolean(id));
-    const swept = await sweepExitedLocalContainers(inFlightMachineIds);
-    for (const name of swept) {
-      console.log(`[monitor] Swept exited local container ${name}`);
-    }
+    await reconcileRestateLocalContainers(reaperConfig(config, registry), inFlightMachineIds);
   }
 
   // Sweep for orphaned/stale/aged-out Fly machines
@@ -1162,6 +1166,23 @@ async function firePrBudgetPark(
     // Retry next tick; the PR comment's marker keeps that retry from posting it twice.
     releasePrBudgetNotice(issueId, "gap-analysis");
   }
+}
+
+/** Preserve the proven park/notice mechanism for PRs with no tracker identity. */
+export async function parkRestatePrBudget(
+  config: AppConfig, registry: ProviderRegistry, mapping: RepoMapping,
+  trackerIssueId: string | null, repo: string, prNumber: number, budget: number,
+): Promise<void> {
+  // Only tracker delivery is suppressed. No provider needs to be configured for
+  // an issueless PR; the stable PR identity still owns its park and notice claim.
+  const noticeRegistry = trackerIssueId ? registry : new Proxy(registry, {
+    get(target, property, receiver) {
+      if (property === "forMapping") return async () => ({ postComment: async () => {} });
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  await firePrBudgetPark(config, noticeRegistry, mapping, trackerIssueId || `${repo}#${prNumber}`,
+    repo, prNumber, budget);
 }
 
 // ---------- Dispatch: GitHub Actions ----------
@@ -1454,64 +1475,101 @@ export async function preparePlanningDispatch(
   return { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue: planningValidated.branch };
 }
 
-// Exported for direct testing of the GHA result-based admission release/hold branch —
-// see "dispatchPlanning GHA path" in dispatch-routing.test.ts. Not part of the module's
-// public API otherwise; the only production call site is poll(), via
-// preparePlanningDispatch's resolved context.
+// Submit only safe launch context; credentials are resolved by the workflow at launch.
+export async function submitImplementationRun(
+  _config: AppConfig,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  ctx: {
+    execPath: ReturnType<typeof resolveExecutionPath>;
+    runnerMode: string;
+    baseBranch: string;
+    baseBranchFieldValue: string | null;
+  },
+): Promise<void> {
+  if (!restateCanServe()) {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: Restate unavailable`);
+    return;
+  }
+  const dispatchId = crypto.randomUUID();
+  const backend = ctx.execPath === "fly-machines" || ctx.execPath === "local-docker" ? ctx.execPath : "github-actions";
+  // Advisory only: the workflow's reserve step owns admission and deduplication.
+  const decision = canDispatch({
+    issueId: issue.id,
+    kind: "implementation",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+  });
+  if (!decision.ok) return;
+  const launchContext: Record<string, string> = {
+    [IMPLEMENTATION_CONTEXT_BASE_BRANCH_KEY]: ctx.baseBranch,
+    [IMPLEMENTATION_CONTEXT_RUNNER_MODE_KEY]: ctx.runnerMode,
+    [IMPLEMENTATION_CONTEXT_GROUPING_PARENT_KEY]: String(isGroupingParentDispatch(issue)),
+  };
+  if (ctx.baseBranchFieldValue) {
+    launchContext[IMPLEMENTATION_CONTEXT_BASE_BRANCH_FIELD_VALUE_KEY] = ctx.baseBranchFieldValue;
+  }
+  const submitted = await createImplementationRunIngressClient().submit(dispatchId, {
+    dispatchId, teamKey: issue.scopeKey, issueId: issue.id, issueIdentifier: issue.identifier,
+    launchContext, maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(mapping.maxJobMinutes), backend,
+  });
+  if (submitted.status === "unavailable") {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: Restate unavailable`);
+    return;
+  }
+  if (submitted.status === "not-found") {
+    console.log(`[poll] Implementation for ${issue.identifier} skipped: the ImplementationRun service is not registered`);
+    return;
+  }
+  console.log(`[poll] Submitted ImplementationRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+  if (submitted.status === "conflict") {
+    console.log(`[poll] Existing ImplementationRun owns dispatch=${dispatchId}`);
+  }
+}
+
+// The poll submits safe context; PlanningRun owns reservation and launch on every backend.
 export async function dispatchPlanning(
-  config: AppConfig,
-  provider: TicketingProvider,
+  _config: AppConfig,
+  _provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
   ctx: PlanningDispatchContext,
 ): Promise<void> {
-  const { execPath, runnerMode, resolvedPlanningBranch, planningFieldValue } = ctx;
+  const { execPath, resolvedPlanningBranch, planningFieldValue } = ctx;
 
-  // GitHub Actions always uses PlanningRun; container backends retain the lifecycle switch.
-  if (execPath === "github-actions" || resolveReviewFixLifecycle(mapping) === "restate") {
-    if (!restateCanServe()) {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
-      return;
-    }
-    const dispatchId = crypto.randomUUID();
-    const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
-    // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
-    const decision = canDispatch({
-      issueId: issue.id,
-      kind: "planning",
-      teamKey: issue.scopeKey,
-      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
-    });
-    if (!decision.ok) return;
-    const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
-    if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
-    const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
-      dispatchId,
-      teamKey: issue.scopeKey,
-      issueId: issue.id,
-      issueIdentifier: issue.identifier,
-      backend,
-      planningContext,
-    });
-    if (submitted.status === "unavailable") {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
-      return;
-    }
-    if (submitted.status === "not-found") {
-      console.log(`[poll] Planning for ${issue.identifier} skipped: the PlanningRun service is not registered`);
-      return;
-    }
-    console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
+  if (!restateCanServe()) {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
     return;
   }
-
-  if (execPath === "fly-machines" || execPath === "local-docker") {
-    await launchPlanningSession({
-      config, provider, issue, mapping, execPath, runnerMode, resolvedPlanningBranch, planningFieldValue,
-      deps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
-    });
+  const dispatchId = crypto.randomUUID();
+  const backend = execPath === "fly-machines" || execPath === "local-docker" ? execPath : "github-actions";
+  // Non-binding pre-check only: the workflow takes the reservation in its first step, so a crash here leaves no row.
+  const decision = canDispatch({
+    issueId: issue.id,
+    kind: "planning",
+    teamKey: issue.scopeKey,
+    maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+  });
+  if (!decision.ok) return;
+  const planningContext: Record<string, string> = { [PLANNING_CONTEXT_BRANCH_KEY]: resolvedPlanningBranch };
+  if (planningFieldValue) planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] = planningFieldValue;
+  const submitted = await createPlanningRunIngressClient().submit(dispatchId, {
+    dispatchId,
+    teamKey: issue.scopeKey,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    backend,
+    planningContext,
+  });
+  if (submitted.status === "unavailable") {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: Restate unavailable`);
     return;
   }
+  if (submitted.status === "not-found") {
+    console.log(`[poll] Planning for ${issue.identifier} skipped: the PlanningRun service is not registered`);
+    return;
+  }
+  console.log(`[poll] Submitted PlanningRun for ${issue.identifier} dispatch=${dispatchId} backend=${backend} (${submitted.status})`);
 }
 
 // ---------- Shared session-dispatch core ----------
@@ -2255,50 +2313,6 @@ export async function confirmAdmissionTerminated(
   }
 
   return false;
-}
-
-/**
- * Fast-path companion to `confirmAdmissionTerminated` for the planning callback
- * (AII-783 review, third round, on PR #681): the callback marks the job row
- * `completed` with `skipAdmissionRelease` because its own self-report is not proof the
- * backend has exited, but that write also drops the job out of `getInFlightJobs()`'s
- * `dispatched`/`running` set — the set every per-poll-cycle monitor (GHA run-status
- * poll, Fly/local monitor) reads from. Relying solely on `sweepStaleAdmissions`'s
- * 6-hour floor to eventually notice an already-finished backend would strand the common
- * case — a planning run that finishes in minutes — at full team capacity for hours,
- * reversing the very "accelerate the planning→implementation handoff" optimization the
- * callback exists for.
- *
- * This runs the same termination oracle once, immediately, right after the callback
- * records the job as completed. A backend already confirmed terminal releases the
- * reservation right away; a still-running or unconfirmable backend is a no-op here —
- * the reservation then stays held exactly as `skipAdmissionRelease` left it, for a
- * later monitor tick or the stale-admission sweep to resolve.
- */
-export async function tryFastReleasePlanningAdmission(config: AppConfig, dispatchId: string): Promise<void> {
-  const record = readAdmission(dispatchId);
-  if (!record || record.releasedAt !== null) return;
-
-  let confirmed: boolean;
-  try {
-    confirmed = await confirmAdmissionTerminated(config, {
-      dispatchId: record.dispatchId,
-      mappingKey: record.mappingKey,
-      backend: record.backend,
-      lifecycleOwner: record.lifecycleOwner,
-      generation: record.generation,
-      ageMs: Date.now() - record.createdAt,
-    });
-  } catch (err) {
-    console.error(`[admission] Fast-path confirmAdmissionTerminated threw for dispatch=${dispatchId}:`, err);
-    return;
-  }
-  if (!confirmed) return;
-
-  const outcome = releaseAdmission(record.dispatchId, record.lifecycleOwner, record.generation, "finalized");
-  if (outcome.status === "released") {
-    console.log(`[admission] Fast-released planning admission dispatch=${dispatchId} mapping=${record.mappingKey}`);
-  }
 }
 
 // stuck_review_fix: remediateStuckJob already closed out a review-fix run and alerted the human.
@@ -3207,6 +3221,9 @@ function reaperConfig(config: AppConfig, registry: ProviderRegistry) {
 }
 
 async function startupReconciliation(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+  if (getRunnerMode().mode === "local") {
+    await reconcileRestateLocalContainers(reaperConfig(config, registry));
+  }
   if (!config.flySessionsToken || !config.flySessionsApp) return;
 
   console.log("[startup] Running machine reconciliation...");
@@ -3270,7 +3287,8 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
     // AII-791: boot recovery never finalizes a Restate-owned attempt, even one that
     // looks orphaned or stale from this row's own status — Restate's own workflow
     // owns confirming its termination.
-    if (isRestateOwnedJob(job)) continue;
+    if (await reconcileRestateMachine(reaperConfig(config, registry), job, machine.id,
+      Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000), "startup-stale-terminal")) continue;
 
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";
@@ -3357,7 +3375,69 @@ function acquireGapfillAdmission(input: {
   });
 }
 
-export async function processReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
+export async function processReviewFixQueue(config: AppConfig, _registry: ProviderRegistry): Promise<void> {
+  const pending = getPendingReviewFixes();
+  if (pending.length === 0) return;
+
+  console.log(`[review-fix] Processing ${pending.length} pending review fix run(s)`);
+
+  const teamRepoMap = getMappings();
+
+  for (const fix of pending) {
+    try {
+      const [fixOwner, fixRepo] = fix.repo.split("/");
+      const previousDispatch = getLatestDispatchForPr(fixOwner, fixRepo, fix.prNumber);
+      const mappingEntry = Object.entries(teamRepoMap).find(
+        ([key, mapping]) => `${mapping.owner}/${mapping.repo}` === fix.repo &&
+          (!previousDispatch?.teamKey || key === previousDispatch.teamKey),
+      );
+
+      if (!mappingEntry) {
+        console.warn(`[review-fix] No mapping found for repo ${fix.repo}, skipping review fix #${fix.id}`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
+      const [, mapping] = mappingEntry;
+      {
+        if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
+        if (!restateCanServe()) continue;
+        try {
+          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
+          if (!prState) continue;
+          if (shouldSkipReviewFix(prState)) {
+            updateReviewFixStatus(fix.id, "skipped");
+            continue;
+          }
+          const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const lastEvent = listReviewFixEvents(fix.id).at(-1);
+          if (!lastEvent) continue;
+          // Periodic, identity-stable nudges repair a missed signal or a project
+          // unpaused while the same queue row waits.
+          // ReviewFixPR's existing wake never extends its first 5-second window.
+          const nudge = await reviewFixIngressClient.feedback(
+            { installationId, repository: fix.repo, prNumber: fix.prNumber },
+            undefined,
+            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
+          );
+          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
+        } catch (err) {
+          console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
+        }
+        continue;
+      }
+    } catch (err) {
+      console.warn(`[review-fix] Could not process feedback for #${fix.id}; keeping pending:`, err);
+    }
+  }
+}
+
+// C7a rollback boundary: retained without a caller until C7b removes the Legacy drain.
+// Referencing the function keeps noUnusedLocals enabled without invoking it.
+void processLegacyReviewFixQueue;
+
+async function processLegacyReviewFixQueue(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const pending = getPendingReviewFixes();
   if (pending.length === 0) return;
 
@@ -3382,39 +3462,6 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
 
       const [scopeKey, mapping] = mappingEntry;
       const runnerMode = getRunnerMode().mode;
-      const selectedExecutionPath = resolveExecutionPath(runnerMode, mapping.executionMode);
-      if (resolveReviewFixLifecycle(mapping) === "restate" && selectedExecutionPath !== "local-docker") {
-        if (selectedExecutionPath !== "github-actions") {
-          console.warn(`[review-fix] Restate pilot runner mode unavailable for ${fix.repo}; keeping #${fix.id} pending`);
-          continue;
-        }
-        if (mapping.paused || !config.runnerCallbackBaseUrl || !config.runnerTokenSecret) continue;
-        if (!restateCanServe()) continue;
-        try {
-          const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-          const prState = await getPullRequestState(token, mapping.owner, mapping.repo, fix.prNumber);
-          if (!prState) continue;
-          if (shouldSkipReviewFix(prState)) {
-            updateReviewFixStatus(fix.id, "skipped");
-            continue;
-          }
-          const installationId = await getInstallationId(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
-          const lastEvent = listReviewFixEvents(fix.id).at(-1);
-          if (!lastEvent) continue;
-          // Periodic, identity-stable nudges repair a missed signal or a project
-          // toggled away from and back to Restate while the same queue row waits.
-          // ReviewFixPR's existing wake never extends its first 5-second window.
-          const nudge = await reviewFixIngressClient.feedback(
-            { installationId, repository: fix.repo, prNumber: fix.prNumber },
-            undefined,
-            { idempotencyKey: `${fix.id}.${lastEvent.id}.${Math.floor(Date.now() / 30_000)}` },
-          );
-          if (nudge.status !== "accepted") console.error(`[review-fix] Could not queue Restate feedback for #${fix.id}: ${nudge.status}`);
-        } catch (err) {
-          console.warn(`[review-fix] Could not signal Restate feedback for #${fix.id}; keeping pending:`, err);
-        }
-        continue;
-      }
       // The repository's auto-fix owns the PR: the ledger findings stay for LateExternalReview, nothing dispatches.
       if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository") {
         updateReviewFixStatus(fix.id, "skipped");
@@ -3593,6 +3640,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           }
         }
         let launchStarted = false;
+        let localMachineNonce: string | undefined;
         let container: Awaited<ReturnType<typeof dispatchLocalGapfill>>;
         try {
           // The child boots repo-scoped; a mint failure aborts the launch (no broad fallback).
@@ -3616,7 +3664,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
             anthropicApiKey: reviewFixDecision.kind === "launch" ? undefined : config.anthropicApiKey,
             claudeOAuthToken: reviewFixDecision.kind === "launch" ? undefined : config.claudeOAuthToken,
             retryPolicy: getRetryPolicy(),
-            onBeforeLaunch: () => { launchStarted = true; },
+            onBeforeLaunch: (nonce) => { localMachineNonce = nonce; launchStarted = true; },
             ...(reviewFixDecision.kind === "launch"
               ? {
                   managed: {
@@ -3644,7 +3692,7 @@ export async function processReviewFixQueue(config: AppConfig, registry: Provide
           executionMode: "local-docker",
           runnerMode,
           sessionImage: config.localRunnerImage,
-          machineNonce: container.machineNonce,
+          machineNonce: localMachineNonce,
           machineId: container.containerId,
           computeStartedAt: Date.now(),
           phase: "gap-analysis",
@@ -4569,7 +4617,6 @@ function startServer(
           },
           checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({
             ingress: createPlanningRunIngressClient(),
-            legacy: (dispatchId) => tryFastReleasePlanningAdmission(config, dispatchId),
           }),
           checkImplementationAdmissionTermination: createImplementationAdmissionTerminationHook({
             ingress: createImplementationRunIngressClient(),
@@ -4840,7 +4887,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, getRestateStatus, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, startSetupChecks: startSetupChecksViaObject, setupCheckProgress: getSetupCheckProgress,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, startSetupChecks: startSetupChecksViaObject, setupCheckProgress: getSetupCheckProgress,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -5252,7 +5299,8 @@ async function main(): Promise<void> {
   console.log(`[restate] retention ${getRestateRetentionDays()} days`);
   // Fire-and-forget: the helper never throws, and boot must not wait on Fly.
   void applyVolumeSnapshotRetentionAtBoot(config.flyDeployToken, process.env.FLY_APP_NAME, getVolumeSnapshotRetentionDays);
-  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config));
+  const reviewFixServices = createProductionReviewFixServices(config, registry, reviewFixAttemptStore, submitLateExternalReview, getModelAuthRuntime(config),
+    (mapping, issueId, repo, prNumber, budget) => parkRestatePrBudget(config, registry, mapping, issueId, repo, prNumber, budget));
   // The KgRepo object and KgRefresh workflow (AII-683). Skipped without KG_SOURCE_REPO: the
   // tool handlers then answer 501 from their unset deps.
   const kgSourceRepo = config.kgSourceRepo;
@@ -5306,7 +5354,7 @@ async function main(): Promise<void> {
   setKgRefreshToolDeps(kgComposition?.toolDeps ?? null);
   kgScheduleBound = kgComposition !== null;
   const kgServices = kgComposition?.services ?? [];
-  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every GitHub Actions run and container projects on the Restate lifecycle.
+  // The PlanningRun workflow (AII-1020, AII-1054): registered; `dispatchPlanning` submits it for every project on every backend.
   const planningRunServices = createProductionPlanningRunServices({
     config,
     resolveProvider: (mapping) => registry.forMapping(mapping),
@@ -5318,10 +5366,10 @@ async function main(): Promise<void> {
     reportTerminalJob: (job) => reportTerminalJob(config, registry, job, { ownerCall: true }),
     sessionDeps: { dispatchSession, isDefinitiveFlyRejectionError, isDefinitiveLocalDockerLaunchFailure, shouldReleaseAdmissionOnDispatchError },
   }).services;
-  // The ImplementationRun workflow (AII-1557): registered, but no dispatch path submits it yet (AII-1555, AII-1554).
+  // The ImplementationRun workflow (AII-1557): registered; the poll submits first-time implementations for every project; comment gap-fill also submits this workflow.
   const implementationRunServices = createProductionImplementationRunServices({
     config,
-    resolveProvider: (mapping) => registry.forMapping(mapping),
+    resolveProvider: (mapping, recoveryScopeKey) => recoveryScopeKey ? registry.forRecovery(mapping, recoveryScopeKey) : registry.forMapping(mapping),
     resolveRunnerImage: resolveDispatchRunnerImage,
     isGroupingParentDispatch,
     fireBreakerTrip,

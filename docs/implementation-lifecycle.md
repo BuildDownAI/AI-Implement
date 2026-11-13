@@ -1,12 +1,16 @@
 # Implementation lifecycle
 
-How an implementation job runs today (Legacy), and the duty table that maps every Legacy function that finishes or fixes an implementation job to the step of the `ImplementationRun` workflow (`src/restate/implementation-run-workflow.ts`) that takes its work over. Step 2 of [AII-1550](https://linear.app/eudoxus/issue/AII-1550/run-implementation-jobs-as-a-restate-workflow).
+The retained Legacy implementation lifecycle, and the duty table that maps every Legacy function that finishes or fixes an implementation job to the step of the `ImplementationRun` workflow (`src/restate/implementation-run-workflow.ts`) that takes its work over. Step 2 of [AII-1550](https://linear.app/eudoxus/issue/AII-1550/run-implementation-jobs-as-a-restate-workflow).
 
-**Status.** `ImplementationRun` exists in the tree ([AII-1553](https://linear.app/eudoxus/issue/AII-1553)); no production path starts it yet ([AII-1557](https://linear.app/eudoxus/issue/AII-1557) wires it). The step names below are the real ones, the `PlanningRun` names (`src/restate/planning-run-workflow.ts`) plus nothing new: `reserve`, `dispatch`, `wait`, `stop`, `finish-job`, `cleanup`, `outcome`, `release`. Keep a step name stable: the Restate UI, the job drawer and the tests read it. Every function, file, and rule named here exists in the tree; line numbers are not cited because they drift.
+**Status.** The poll loop submits `ImplementationRun` for every project's first-time implementation on GitHub Actions, Fly Machines and local Docker, regardless of the stored review-fix lifecycle. Shadow mode submits GitHub Actions only, with no Fly mirror. Restate unavailability skips dispatch without reserving capacity or marking dedup. Managed preparation remains in the workflow's prepare step. There is no per-project switch or rollback setting; rollback is a deploy revert. The comment drain also submits every project’s gap-fill and feature-branch conflict re-queue to `ImplementationRun`, on all three backends, without reading the stored lifecycle. The Legacy lifecycle below remains for existing jobs until Stage 3 cleanup. The step names below are the real ones, the `PlanningRun` names (`src/restate/planning-run-workflow.ts`) for the main phases: `reserve`, `dispatch`, `wait`, `stop`, `finish-job`, `cleanup`, `outcome`, `release`. Keep a step name stable: the Restate UI, the job drawer and the tests read it. Every function, file, and rule named here exists in the tree; line numbers are not cited because they drift.
 
-**Why the table exists.** Planning missed two duties the first time (AII-1018): the reaper's machine cleanup, and the notice and breaker bookkeeping in `reportJobCompletion`. Each Legacy function below *skips* a Restate-owned job (`isRestateOwnedJob`), so a duty with no workflow step is silently dropped for an owned job. The table is the check that none is. Planning's version of this table is in [restate.md](restate.md) § "Legacy functions that fence on `isRestateOwnedJob`".
+For first-time container dispatches with neither an admission nor a recorded job, `reserve` checks eligibility before taking capacity or reading a backend: Bedrock is unsupported, Fly requires its sessions token and app, and unmanaged runs require API or OAuth credentials. Managed runs can prepare credentials without environment credentials. Ineligible issues remain queued with no job, dedup, or tracker transition. An existing admission or job bypasses this first-dispatch check: `dispatch` still reconciles before preparing any new launch, so later configuration changes cannot hide a recorded or possibly launched run. Missing Fly configuration and failed backend reads still throw during recovery; they never establish backend absence. Inputs and journal command names are unchanged.
 
-## How an implementation job runs today
+`ImplementationRun` accepts an optional strict `gapFill` input part with `queueItemId`, `repository` (`owner/repo`), `installationId`, `prNumber`, `prDispatchBudget`, and `humanRequested`. Its absence preserves first-time implementation inputs, including previously journaled values. Queue and PR IDs are positive integers; the budget is a nonnegative integer captured once at dispatch (ADR 045). The prepared gap-fill dependencies now serve the comment drain’s `ImplementationRun` submissions. The workflow reserves PR-scoped admission and reads comment text and open review findings from the queue and ledger at launch; dependency preparation alone did not switch the earlier Legacy caller. The part carries neither comment text nor a token.
+
+**Why the table exists.** Planning missed two duties the first time (AII-1018): the reaper's machine cleanup, and the notice and breaker bookkeeping in `reportJobCompletion`. Legacy lifecycle mutation below *skips* a Restate-owned job (`isRestateOwnedJob`), so a duty with no workflow step is silently dropped for an owned job. Guarded resource-only cleanup of finished, released Restate jobs is the reaper exception (D23a). The table is the check that none is. Planning's version of this table is in [restate.md](restate.md) § "Legacy functions that fence on `isRestateOwnedJob`".
+
+## Retained Legacy implementation lifecycle
 
 ```mermaid
 flowchart TD
@@ -42,7 +46,7 @@ flowchart TD
 | 6 | `src/index.ts` | `startupReconciliation` | skips the stale-terminal destroy | D24 |
 | 7 | `src/stuck-watchdog.ts` | `remediateStuckJob` | returns `false`, does nothing | D20 |
 | 8 | `src/stuck-watchdog.ts` | `remediateFailedJob` | returns, unless `opts.ownerCall` | D21 |
-| 9 | `src/reaper.ts` | `sweepOrphanedMachines` | skips the `stale-terminal-job`, `max-age-exceeded`, `issue-terminal` rules | D22, D23 |
+| 9 | `src/reaper.ts` | `sweepOrphanedMachines` | fences lifecycle mutation for Restate-owned jobs; permits resource-only cleanup for terminal jobs with a matching released admission, subject to orchestrator and `FlyMachineProfile` guards | D22, D23, D23a |
 
 `sweepStaleAdmissions` and `reconcileTerminalCallbackAdmissions` do not call it: they select `lifecycle_owner = 'legacy'` rows in SQL (the second also checks `candidate.lifecycleOwner.kind !== "legacy"`), so an owned reservation never reaches them (D25, D26).
 
@@ -54,8 +58,8 @@ flowchart TD
 | `dispatch` | `findExistingRun` first, then the launch on the selected backend (the launch move, AII-1550 step 1); returns ids only, never a token | `dispatch` |
 | `wait` | `awaitOwnedRun`: waits for the runner `report`, a run-ended status read, or a deadline; the bounded status read is the `readStatus` of the wait | `wait`, `confirm` |
 | `stop` | requests the backend stop and confirms termination | `stop` |
-| `finish-job` | reads the `dispatch_log` row, writes the terminal status the callback did not (`backendTerminated` only when confirmed), and makes the ticket move through `finalizeImplementation`. At the deadline it is `finish-job-deadline` (the bounded stuck cleanup, `remediateStuckJob` with `ownerCall`); on the escape path `finish-job-escape` | `finish-job` |
-| `cleanup` | best-effort backend cleanup: removes the attempt's Fly machine (`destroyMachineRecorded`) or local container, a 404 counts as done; GitHub Actions is a no-op. Session logs, status comments and nonce invalidation belong here too | `cleanup` |
+| `finish-job` | reads the `dispatch_log` row, writes the terminal status the callback did not (`skipAdmissionRelease` on every owned terminal write), and makes the ticket move through `finalizeImplementation`. At the deadline it is `finish-job-deadline` (the bounded stuck cleanup, `remediateStuckJob` with `ownerCall`); on the escape path `finish-job-escape` | `finish-job` |
+| `cleanup` | required backend cleanup: removes the attempt's Fly machine (`destroyMachineRecorded`) or local container, a 404 counts as done; GitHub Actions is a no-op. Session logs, status comments and nonce invalidation belong here too | `cleanup` |
 | `outcome` | `reportTerminalJob` with `ownerCall: true`: breaker count, failure comment, completion notice | `outcome` |
 | `release` | releases the admission after termination is confirmed | `release` |
 
@@ -97,7 +101,7 @@ There is no separate ticket step. The ticket transition is part of `finish-job`,
 | D21 | `remediateFailedJob` (`src/stuck-watchdog.ts`) | `boundedCleanup` for a failed run whose runner already stopped: attempts 1-3 clear the working state and dedup, later attempts alert and comment. Fenced for an owned job unless `ownerCall: true` | failed job without a draft PR (D8, D16, D19, and the callback, D36) | `finish-job` (the finalizer calls it with `ownerCall: true`) |
 | D22 | `sweepOrphanedMachines`: `stale-terminal-job` | Destroys the machine of a job whose row is already terminal | Fly machine tagged to this orchestrator, job row terminal | `cleanup` (planning's missed duty, AII-1018) |
 | D23 | `sweepOrphanedMachines`: `max-age-exceeded`, `issue-terminal` | Rule `max-age-exceeded` (`SWEEP_MACHINE_MAX_AGE_MS`, 4 h): dumps session logs if no PR, destroys, writes `timed_out` / `machine_max_age_sweep`, `invalidateNonce`, `resetTicket`. Rule `issue-terminal`: the ticket reached `completed` or `cancelled` (`fetchLifecycleStates`): destroys, writes `issue_completed_sweep`, `resetTicket`. Both use `skipAdmissionRelease` when the destroy is unconfirmed | in-flight job past 4 h, or ticket closed outside the flow | `max-age-exceeded`: `wait` (total deadline) then `stop`, `cleanup` (logs), `finish-job` (the bounded stuck cleanup resets the ticket). `issue-terminal`: **not read by the workflow** (settled in AII-1553): an owned run whose ticket closes runs to its `report`, its end, or its deadline, and the reaper's 4 h `max-age-exceeded` rule stays the backstop |
-| D23a | `sweepOrphanedMachines`: `orphan`, `durable-expired`, owner filter, burst alert | `orphan`: no job row, destroy. `durable-expired`: past `durable_until` on a `FlyMachineProfile` machine. Skips machines tagged to another orchestrator. Records `recordReaperAction`; alerts above `reaperAlertThreshold` (`notifyReaperBurst`) | every poll | **stays outside the workflow:** there is no job row (`orphan`) or no workflow (`durable-expired`) to own the machine, so this is the backstop that exists for a lost owner. The rules are not fenced by `isRestateOwnedJob` and need no change |
+| D23a | `sweepOrphanedMachines`: `orphan`, `durable-expired`, owner filter, terminal Restate resource cleanup, burst alert | `orphan`: no job row, destroy. `durable-expired`: past `durable_until` on a `FlyMachineProfile` machine. Skips machines tagged to another orchestrator and preserves `FlyMachineProfile` guards. A terminal Restate-owned job with a matching released admission permits resource-only cleanup (AII-1072). These attempts contribute to the existing periodic burst counter (AII-1794), preserving attempt-count, dry-run and `reaperAlertThreshold` / `notifyReaperBurst` semantics | every poll | **stays outside the workflow:** orphan/durable expiry and guarded resource-only cleanup are reaper duties. The workflow alone finalizes Restate jobs and releases their admissions; this cleanup performs neither duty |
 | D23b | `sweepExitedLocalContainers` (`src/local-docker.ts`, called from the poll loop) | Removes exited local containers that no in-flight job owns | `runnerMode` is `local` | **stays outside the workflow:** a backstop for a container `cleanup` missed; it keys on the in-flight machine ids and so needs no fence |
 | D24 | `startupReconciliation` (`src/index.ts`) | At boot, lists machines: `orphan` (no job row) destroyed; durable-runner machine kept; an owned job skipped; a terminal job's machine destroyed (`startup-stale-terminal`) with nonce invalidation; an in-flight job's machine logged as resumed | orchestrator start | Orphan and durable rows **stay outside the workflow** (no owner). Stale-terminal for an owned job: `cleanup`; Restate replays an unfinished workflow after a restart, so boot recovery is not needed for it. A workflow that never replays is left to D22 |
 | D25 | `sweepStaleAdmissions` (`src/dispatch-admission.ts`) | Releases a **legacy** reservation unreleased for `DEFAULT_ADMISSION_SWEEP_MAX_AGE_MS` (6 h) once `confirmAdmissionTerminated` proves the backend ended; reason `deadline_exceeded` | legacy reservation older than 6 h | `release` for an owned run (after `wait`'s confirmed-ended read). The sweep **stays outside the workflow** for legacy rows; its SQL excludes owned ones |
@@ -135,7 +139,7 @@ For an owned planning or implementation result, `callback_lifecycle_completed_at
 
 | ID | Legacy function | What it does | Trigger | Owner |
 |---|---|---|---|---|
-| D41 | `drainCommentGapfillQueue` (`src/comment-gapfill-drain.ts`) | Launches a gap-fill run for a `/ai-implement` PR comment. Own admission: `canDispatch` with `kind: "gap-fill"` and a **PR scope** (one run per PR, `prDispatchBudget`), then `acquireGapfillAdmission` with `lifecycleOwner: { kind: "legacy" }`; defers or parks (`firePrBudgetPark`) when refused | pending row in the comment gap-fill queue | **Stays outside the workflow, on the legacy path, until [AII-1554](https://linear.app/eudoxus/issue/AII-1554) sends gap-fill runs and the feature-branch re-queue through `ImplementationRun`.** Until then its terminal handling is the legacy monitors' (`updateJobStatus` also terminalizes the queue row, `markCommentGapfillRunTerminal`) |
+| D41 | `drainCommentGapfillQueue` (`src/comment-gapfill-drain.ts`) | Preserves queue, PR lookup, paused/filesystem checks, `canDispatch` preview, budget park notices and ephemeral full-access deferral, then submits a gap-fill run (including feature-branch conflict re-queues) to `ImplementationRun`. Restate unavailable or service not registered leaves the item pending; accepted/conflict marks it dispatched | pending row in the comment gap-fill queue | `ImplementationRun` owns a gap-fill run on all three backends for every project, regardless of stored lifecycle. Its `reserve` takes PR-scoped admission and restores pending on refusal; workflow launch dependencies mint credentials and launch. Workflow terminal handling finalizes the job and queue row and releases admission after verified backend termination |
 
 ## Decisions from AII-1553
 
@@ -153,3 +157,132 @@ Settled 2026-10-26; the table above already uses them.
 - `grep -n isRestateOwnedJob src/index.ts src/stuck-watchdog.ts src/reaper.ts` shows one definition and the call sites in the table above (six, two, one).
 - Every function named in a row exists in the file named in its heading; run `grep -rn "<name>" src` for each before changing a row.
 - No file under `src/` changes with this doc.
+
+### Recovery after backend acceptance
+
+ImplementationRun stores a private SQLite launch intent immediately before the backend call.
+It freezes the issue and effective limits, allowlisted repository/workflow and tracker identity,
+branch, admission generation, accounting,
+image/guest/compute metadata, and container callback nonce. Credentials and bootstrap tokens are
+excluded from the intent, including arbitrary mapping `extraEnv` values and App/registry credentials;
+neither the intent nor its nonce is returned to the Restate journal.
+Local containers use a name derived from the dispatch ID, independent of issue key and runner mode;
+Legacy callers retain their timestamp names. Docker name uniqueness also fences a late first create.
+An empty Docker inspect response is an error, not evidence of absence.
+
+Preparation identity is persisted before the first asynchronous preparation operation for managed
+and unmanaged projects alike. It freezes the exact admission generation, owner/backend, repository
+lookup and Fly app. A backend candidate without ordinary launch intent or an owned job is ambiguous:
+recovery cannot adopt it, invent callback authority, or launch a replacement.
+
+Tracker recovery uses the original allowlisted nonsecret project configuration (Jira field overrides
+and project selectors, or the filesystem directory). A scoped provider is reconstructed with current
+credentials and the usual provider identity and local runner-mode guards. Missing or edited current
+project mappings cannot redirect this bookkeeping. Failed tracker work remains incomplete and retries.
+
+Every production lookup repairs bookkeeping before returning an adopted execution to the workflow:
+the same idempotent dispatch row, execution reference, dedup mark and tracker transition are used.
+Completed bookkeeping is not repeated and terminal rows are preserved. An ambiguous intent prevents
+new preparation or another managed grant even if a later lookup sees nothing or eligibility changes;
+a reconstructed launch preserves the existing managed grant only when acceptance is confirmed.
+Unconfirmed staged recovery with no found execution revokes the old exact-dispatch grant and returns
+unknown while retaining admission and the original intent. Confirmed acceptance is persisted before
+bookkeeping, including when an exact execution is adopted; adoption never restores a revoked grant.
+Recovery never prepares again, releases admission on ambiguity, or establishes backend absence from
+a missing acceptance record. Credential revocation does not prove backend termination. The workflow retains ownership
+through reconciliation, including beyond its deadline when termination is unconfirmed. Definitive rejection
+removes the intent without creating a job or dedup mark. Backend read errors still propagate.
+
+`implementation-recovery.restate.test.ts` exercises lost acceptance before recording on all three
+backends against the pinned Restate binary, including the actual local finder and Docker launcher,
+repeat recovery, configuration changes, authenticated callbacks, shared finalization and release.
+Workflow input, existing journal command names and committed journal snapshots remain unchanged.
+
+### Retained occupancy and termination recovery (AII-1787)
+
+The operator's 2026-11-09 correction supersedes AII-1553's bounded unconditional
+release for ImplementationRun. The stop margin bounds the wait, not occupancy.
+A cancellation acknowledgement, callback, terminal job row, empty search, elapsed
+margin, or failed backend read cannot establish termination. These paths expose
+`termination_unconfirmed` and keep the issue/PR reservation and team capacity.
+They do not finalize/rearm an active runner or start a replacement. Definite
+non-launch releases safely; exact backend `ended` evidence permits finalization,
+cleanup, outcome reporting, then release of that generation. Cleanup failures
+swallowed by the existing bounded helper after verified termination remain best
+effort; interrupted finalization retains admission for recovery.
+
+Before the first asynchronous reserve hook, production writes an allowlisted
+`owner:<dispatchId>` JSON record in the existing private
+`implementation_launch_intent` storage. It contains dispatch/scope/backend,
+admission generation, frozen lookup configuration and eventual exact run ID;
+launchContext, credentials and bootstrap tokens are excluded. The record exists
+before launch and before any attempt to expose retention, so another cancellation
+cannot leave recovery dependent on an in-memory retained flag. Business job
+status and admission occupancy remain separate: held admissions continue blocking
+capacity and deployment drain even when a callback has terminalized the job.
+
+There is no promise of an automatic retry loop after the workflow stops.
+Invoke the authenticated Restate ingress handler
+`ImplementationRunRecovery/<dispatchId>/reconcile` with JSON `null` after the
+workflow exposes `termination_unconfirmed`. It serializes recovery requests,
+refuses to compete with a workflow still doing normal work, reads only the exact
+owner/backend, and retains on active/unknown/unreadable evidence. Confirmed end
+runs unfinished finalization, cleanup and outcome reporting before exact-generation
+release. Successful finalization and its result are persisted, so a later
+bookkeeping failure can retry without spending the stuck-attempt budget again.
+Deadline and failure remediation commit their retry charge and private owner receipt in one
+SQLite transaction before awaiting tracker bookkeeping. Recovery resumes that
+same charge, including the original give-up decision after parking resets the
+shared counter. A completed cleanup receipt also survives later owner updates;
+no schema change or new retry budget is introduced.
+Cancellation escape persists its original finish intent before any backend search
+or stop; a second cancellation during that work cannot turn later no-callback
+recovery into `ended_without_callback`. The first intent wins, preserving deadline
+semantics and already completed normal finalization. Cleanup and outcome entry
+are distinct from successful completion: cancellation or exhausted retries in
+either required effect retain occupancy. Recovery retries bookkeeping before release.
+Repeated recovery cannot release a replacement generation. The same authority
+covers optional gap-fill inputs without changing their callers or frozen targets.
+
+The private record outlives workflow/journal retention. After that retention
+expires, workflow status may be empty; recovery still uses the private owner and
+held admission. Keep both records until reconciliation; deleting a journal or
+terminal job does not authorize release. For a historical journaled reserve with
+no owner record, the recovery handler also accepts the original ImplementationRun
+input as its JSON body. Reconstruction requires the exact issue/PR/backend and
+the original admission generation (zero), or matching persisted launch/preparation
+generation evidence. It never adopts a replacement generation. Missing execution
+identity stays uncertain; search failure or absence of launch metadata is not a
+non-launch proof. Historical recovery never substitutes current repository/Fly
+settings for missing original target evidence: it needs frozen intent/preparation
+or an exact-generation job to confirm a GHA run. Without that evidence it retains
+occupancy, allowing later exact callback/bookkeeping evidence to resolve identity.
+This target requirement also applies to workflow reads, stop requests, lookup and
+cleanup, including historical recorded dispatch outcomes. A missing original Fly
+app fails closed before backend I/O; a 404 in the currently configured replacement
+app cannot prove the original machine absent. Deadline remediation uses the same
+owner-fenced stop adapter and frozen target, including after configuration changes.
+
+Input and existing effect result schemas, command names, wait/confirm guards and
+committed journal snapshots remain unchanged. New owner writes occur inside
+existing effects. A deadline with no execution ID adds `retain termination` to
+preserve its eventual retry-budget treatment; its owner already exists if another
+cancellation interrupts that write. `retain escape intent` is an additive first
+escape command, persisting cancellation semantics before cancellable backend work.
+Old invocations already in escape must drain on their original deployment before
+rebinding, including those with recorded cleanup/outcome errors that the old shared
+helpers swallowed. Existing successful cleanup/outcome effect names, void results
+and three-attempt limits are preserved; ImplementationRun now propagates failure
+instead of treating it as completion. `read-escape-terminal` is an additive command only on escape,
+where the old path lacked terminal evidence; the recovery object's commands have
+independent journals. Before rebinding old invocations already past a deadline
+margin or escape stop, confirm their backend termination and drain that old
+finalization boundary on its original deployment. Such histories may contain the
+old unconditional `finish-job-deadline`/`finish-job-escape` suffix and must not be
+replayed against the changed branch sequence. Normal wait/confirm replay remains
+covered without snapshot regeneration.
+
+PlanningRun's `deadlinePath` and unconditional escape `finally` release in
+`src/restate/planning-run-workflow.ts` remain the separate
+AII-1788 follow-up; this correction does not change that workflow or the shared
+owned-run lifecycle helpers.

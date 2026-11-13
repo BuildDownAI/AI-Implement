@@ -5,9 +5,13 @@ import type * as GateModule from "../dispatch-gate.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { RepoMapping } from "../config.js";
 import { shouldReleaseAdmissionOnDispatchError } from "../index.js";
-import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
+import { FilesystemProvider } from "../providers/filesystem.js";
+import { testDir } from "./helpers/test-dir.js";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { testDb } from "./helpers/test-db.js";
 
 // Mocked only for the "pre-launch failure releases the reservation" describe block below —
@@ -87,6 +91,12 @@ vi.mock("../restate/planning-run-client.js", async (importOriginal) => {
   return { ...actual, createPlanningRunIngressClient: () => planningIngress };
 });
 
+const implementationIngress = vi.hoisted(() => ({ submit: vi.fn(), report: vi.fn() }));
+vi.mock("../restate/implementation-run-client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../restate/implementation-run-client.js")>();
+  return { ...actual, createImplementationRunIngressClient: () => implementationIngress };
+});
+
 /** A Jira project's mapping, its tracker config as validation stores it, for the describes whose provider is Jira. */
 function jiraMapping(project: string, overrides: Partial<RepoMapping> = {}): RepoMapping {
   return makeMapping({
@@ -103,7 +113,9 @@ function jiraMapping(project: string, overrides: Partial<RepoMapping> = {}): Rep
 const CALLBACK_CONFIG = { runnerCallbackBaseUrl: "https://orchestrator.example", runnerTokenSecret: "secret" };
 
 function jiraProvider(): TicketingProvider {
-  return makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` });
+  return Object.assign(makeProvider({ id: "jira", issueUrl: (issue) => `https://example.atlassian.net/browse/${issue.identifier}` }), {
+    listIssuesPage: vi.fn(async () => ({ issues: [], pageInfo: { hasNextPage: false, endCursor: null } })),
+  });
 }
 
 // No request is expected unless a test routes it.
@@ -466,7 +478,10 @@ describe("dispatch entry points — pre-launch failure releases the reservation 
 
   it("dispatchLocalDocker: a throw after markLaunchAttempted (container launch failure) holds the reservation — docker's CLI response can be lost after the container was actually created (AII-783 review, second round, on PR #681)", async () => {
     vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue(makeScopedInstallationToken({ token: "gh-token" }));
-    vi.mocked(localDocker.startLocalRunnerContainer).mockRejectedValue(new Error("docker run failed"));
+    vi.mocked(localDocker.startLocalRunnerContainer).mockImplementation(async (input) => {
+      input.onBeforeLaunch?.();
+      throw new Error("docker run failed");
+    });
     const config = makeAppConfig({ anthropicApiKey: "sk-test" });
 
     await expect(
@@ -618,11 +633,6 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
   }
 
-  function expectPlanningBootTokenSplit() {
-    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
-  }
-
   function flyConfigJson(): string {
     expect(flyMachines.createMachine).toHaveBeenCalledOnce();
     return JSON.stringify(vi.mocked(flyMachines.createMachine).mock.calls[0]![2]);
@@ -660,34 +670,12 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expect(json).not.toContain("broad-token");
   });
 
-  it.each([null, "legacy"] as const)("Fly planning boots with the scoped token (lifecycle %s)", async (reviewFixLifecycle) => {
-    planningIngress.submit.mockClear();
-    await indexModule.dispatchPlanning(config, provider, issue, { ...mapping, reviewFixLifecycle }, planningCtx("fly-machines"));
-    expect(planningIngress.submit).not.toHaveBeenCalled();
-
-    expectPlanningBootTokenSplit();
-    const json = flyConfigJson();
-    expect(json).toContain("scoped-token");
-    expect(json).not.toContain("broad-token");
-  });
-
   it("local implementation boots with the scoped token", async () => {
     await indexModule.dispatchLocalDocker(config, provider, issue, mapping, prior, "default", mapping.defaultBranch, null);
 
     expectScopedOnly();
     expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
       expect.objectContaining({ githubToken: "scoped-token" }),
-    );
-  });
-
-  it.each([null, "legacy"] as const)("local planning boots with the scoped token (lifecycle %s)", async (reviewFixLifecycle) => {
-    planningIngress.submit.mockClear();
-    await indexModule.dispatchPlanning(config, provider, issue, { ...mapping, reviewFixLifecycle }, planningCtx("local-docker"));
-    expect(planningIngress.submit).not.toHaveBeenCalled();
-
-    expectPlanningBootTokenSplit();
-    expect(vi.mocked(localDocker.startLocalRunnerContainer).mock.calls[0]![0]).toEqual(
-      expect.objectContaining({ githubToken: "scoped-token", phase: "planning" }),
     );
   });
 
@@ -703,26 +691,19 @@ describe("Fly and local boot tokens are scoped to the target repository (AII-853
     expectFreeSlot("fly-machines", "implementation");
   });
 
-  it("Fly planning: a narrow-mint failure launches nothing and falls back to nothing", async () => {
+  it.each(["fly-machines", "local-docker"] as const)("%s planning defers credential minting to the workflow", async (backend) => {
+    const status = await import("../restate/status.js");
+    status.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    onTestFinished(() => status.resetRestateStatus());
+    planningIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
     vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
-
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("fly-machines")).catch(() => undefined);
-
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
+    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx(backend));
+    expect(planningIngress.submit).toHaveBeenCalledOnce();
+    expect(githubAppAuth.getScopedInstallationToken).not.toHaveBeenCalled();
+    expect(githubAppAuth.getInstallationToken).not.toHaveBeenCalled();
     expect(flyMachines.createMachine).not.toHaveBeenCalled();
-    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
-    expectFreeSlot("fly-machines", "planning");
-  });
-
-  it("local planning: a narrow-mint failure launches nothing and falls back to nothing", async () => {
-    vi.mocked(githubAppAuth.getScopedInstallationToken).mockRejectedValue(new Error("mint failed"));
-
-    await indexModule.dispatchPlanning(config, provider, issue, mapping, planningCtx("local-docker")).catch(() => undefined);
-
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus", SCOPED_REQUEST);
     expect(localDocker.startLocalRunnerContainer).not.toHaveBeenCalled();
-    expect(githubAppAuth.getInstallationToken).toHaveBeenCalledWith("id", "key", "eudoxus");
-    expectFreeSlot("local-docker", "planning");
+    expectFreeSlot(backend, "planning");
   });
 });
 
@@ -1169,131 +1150,7 @@ describe("preparePlanningDispatch — feature-branch chain resolution (AII-898)"
   });
 });
 
-// AII-783 review, third round, on PR #681: the planning callback marks its job row
-// "completed" with skipAdmissionRelease, which removes the job from getInFlightJobs()'s
-// dispatched/running set — so the normal per-poll GHA/Fly/local monitor never checks it
-// again. tryFastReleasePlanningAdmission is the fast path that takes the monitor's place:
-// one immediate confirmAdmissionTerminated check, right after the callback, instead of
-// stranding an already-finished planning run's capacity slot behind the 6-hour
-// stale-admission-sweep floor. Exercised here against the real dispatch_admissions table
-// with a mocked local-docker backend (no network calls needed to observe termination).
-describe("tryFastReleasePlanningAdmission — fast release path for the planning callback (AII-783 review, third round, on PR #681)", () => {
-  const loaders = {
-    dispatchAdmission: () => import("../dispatch-admission.js"),
-    log: () => import("../log.js"),
-    localDocker: () => import("../local-docker.js"),
-    indexModule: () => import("../index.js"),
-  };
-  let dispatchAdmission: typeof import("../dispatch-admission.js");
-  let log: typeof import("../log.js");
-  let indexModule: typeof import("../index.js");
-  let localDocker: typeof import("../local-docker.js");
-
-  const config = makeAppConfig();
-
-  beforeEach(async () => {
-    ({ dispatchAdmission, log, localDocker, indexModule } = (await testDb({ modules: loaders })).modules);
-    vi.mocked(localDocker.inspectLocalContainer).mockClear();
-  });
-
-  function acquireAndLog(dispatchId: string): void {
-    const admitted = dispatchAdmission.acquire({
-      dispatchId,
-      mappingKey: "AII",
-      scope: { kind: "issue", issueScope: "AII", issueId: "issue-1" },
-      kind: "planning",
-      backend: "local-docker",
-      lifecycleOwner: { kind: "legacy" },
-      cap: 1,
-    });
-    expect(admitted.ok).toBe(true);
-    if (!admitted.ok) throw new Error("test admission unexpectedly deferred");
-    log.appendLog(makeAppendLogEntry({
-      issueIdentifier: "AII-1",
-      teamKey: "AII",
-      repo: "o/r",
-      dispatchId,
-      admissionGeneration: admitted.record.generation,
-      executionMode: "local-docker",
-      contract: undefined,
-      phase: "planning",
-      machineNonce: "nonce-1",
-      machineId: "container-1",
-    }));
-  }
-
-  it("releases the reservation once the backend is confirmed stopped", async () => {
-    acquireAndLog("dispatch-fast-1");
-    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "exited", running: false, exitCode: 0 });
-
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-1");
-
-    const record = dispatchAdmission.read("dispatch-fast-1");
-    expect(record?.releasedAt).not.toBeNull();
-    expect(dispatchAdmission.count("AII")).toBe(0);
-  });
-
-  it("leaves the reservation held while the backend is still observed running", async () => {
-    acquireAndLog("dispatch-fast-2");
-    vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
-
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-2");
-
-    const record = dispatchAdmission.read("dispatch-fast-2");
-    expect(record?.releasedAt).toBeNull();
-    expect(dispatchAdmission.count("AII")).toBe(1);
-  });
-
-  it("is a no-op when no reservation exists for the dispatch id", async () => {
-    await expect(indexModule.tryFastReleasePlanningAdmission(config, "never-reserved")).resolves.toBeUndefined();
-    expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
-  });
-
-  it("is a no-op when the reservation was already released", async () => {
-    acquireAndLog("dispatch-fast-3");
-    dispatchAdmission.releaseByDispatchId("dispatch-fast-3", "finalized");
-
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-fast-3");
-
-    expect(localDocker.inspectLocalContainer).not.toHaveBeenCalled();
-  });
-
-  it("does not release a replacement generation after a slow terminal check", async () => {
-    const dispatchId = "dispatch-fast-race";
-    acquireAndLog(dispatchId);
-    const original = dispatchAdmission.read(dispatchId);
-    expect(original).not.toBeNull();
-    if (!original) throw new Error("test admission missing");
-    vi.mocked(localDocker.inspectLocalContainer).mockImplementation(async () => {
-      dispatchAdmission.release(dispatchId, original.lifecycleOwner, original.generation, "finalized");
-      const replacement = dispatchAdmission.acquire({
-        dispatchId,
-        mappingKey: "AII",
-        scope: { kind: "issue", issueScope: "AII", issueId: "issue-2" },
-        kind: "planning",
-        backend: "local-docker",
-        lifecycleOwner: { kind: "legacy" },
-        cap: 1,
-      });
-      expect(replacement.ok).toBe(true);
-      return { status: "exited", running: false, exitCode: 0 };
-    });
-
-    await indexModule.tryFastReleasePlanningAdmission(config, dispatchId);
-
-    expect(dispatchAdmission.read(dispatchId)).toMatchObject({ generation: original.generation + 1, releasedAt: null });
-    expect(dispatchAdmission.count("AII")).toBe(1);
-  });
-});
-
-// AII-783 gap-fill (third and final round, on PR #681): the planning_callback fast path
-// above usually catches a planning run's reservation before the poll loop's own
-// reconciliation gets a chance to — but operator_cancelled has no fast path at all, and a
-// planning_callback whose backend was still shutting down at fast-path time falls through
-// to here too. reconcileTerminalCallbackAdmissions is wired into the poll loop right next
-// to sweepStaleAdmissions (index.ts); this exercises it end-to-end through the real
-// confirmAdmissionTerminated oracle against the real dispatch_admissions/dispatch_log
-// tables, the same way the fast-path block above does.
+// Terminal callbacks retain reservations until backend reconciliation confirms termination.
 describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for terminal callback conclusions (AII-783 gap-fill, third round, on PR #681)", () => {
   const loaders = {
     dispatchAdmission: () => import("../dispatch-admission.js"),
@@ -1374,13 +1231,14 @@ describe("reconcileTerminalCallbackAdmissions — per-poll reconciliation for te
     expect(dispatchAdmission.count("AII")).toBe(1);
   });
 
-  it("catches a planning_callback reservation the inline fast path missed (backend still running at fast-path time, terminal by the next poll)", async () => {
+  it("reconciles a planning_callback reservation once the backend stops", async () => {
     acquireLogAndFinalize("dispatch-pc-1", "issue-1", "planning_callback");
     vi.mocked(localDocker.inspectLocalContainer).mockResolvedValue({ status: "running", running: true, exitCode: null });
 
-    // Simulates the inline fast path (tryFastReleasePlanningAdmission) observing the
-    // backend still running right after the callback — it must be a no-op, not a release.
-    await indexModule.tryFastReleasePlanningAdmission(config, "dispatch-pc-1");
+    const pending = await dispatchAdmission.reconcileTerminalCallbackAdmissions((candidate) =>
+      indexModule.confirmAdmissionTerminated(config, candidate),
+    );
+    expect(pending).toEqual([]);
     expect(dispatchAdmission.read("dispatch-pc-1")?.releasedAt).toBeNull();
 
     // By the next poll cycle, the backend has actually exited.
@@ -1525,8 +1383,8 @@ describe("dispatchGitHubActions — run lookup is keyed by issue identifier (AII
   });
 });
 
-// GitHub Actions always submits PlanningRun; container backends retain the lifecycle switch.
-describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
+// Every backend submits PlanningRun regardless of the stored lifecycle.
+describe("dispatchPlanning — PlanningRun for every project", () => {
   const loaders = {
     dedup: () => import("../dedup.js"),
     admission: () => import("../dispatch-admission.js"),
@@ -1549,6 +1407,8 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
   const ctxFor = (execPath: "github-actions" | "fly-machines" | "local-docker") => ({
     execPath, runnerMode: "default", resolvedPlanningBranch: "release/1.0", planningFieldValue: "release/1.0",
   });
+  const backends = ["github-actions", "fly-machines", "local-docker"] as const;
+  const cases = backends.flatMap((backend) => [null, "legacy", "restate"].map((reviewFixLifecycle) => ({ backend, reviewFixLifecycle: reviewFixLifecycle as RepoMapping["reviewFixLifecycle"] })));
   const activeRows = () =>
     (dedup.getDb().prepare("SELECT dispatch_id FROM dispatch_admissions WHERE released_at IS NULL").all() as { dispatch_id: string }[]);
 
@@ -1557,14 +1417,22 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     restateStatus.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
     planningIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
     vi.mocked(github.postWorkflowDispatch).mockReset();
+    const fly = await import("../fly-machines.js");
+    const local = await import("../local-docker.js");
+    vi.mocked(fly.createMachine).mockClear();
+    vi.mocked(local.startLocalRunnerContainer).mockClear();
+    onTestFinished(() => {
+      expect(fly.createMachine).not.toHaveBeenCalled();
+      expect(local.startLocalRunnerContainer).not.toHaveBeenCalled();
+    });
   });
 
   afterEach(() => {
     restateStatus.resetRestateStatus();
   });
 
-  it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits without taking a reservation, and without launching (%s)", async (backend) => {
-    await indexModule.dispatchPlanning(config, provider, issue, pilot, ctxFor(backend));
+  it.each(cases)("submits without reservation or launch ($backend, $reviewFixLifecycle)", async ({ backend, reviewFixLifecycle }) => {
+    await indexModule.dispatchPlanning(config, provider, issue, { ...pilot, reviewFixLifecycle }, ctxFor(backend));
 
     expect(planningIngress.submit).toHaveBeenCalledTimes(1);
     const [dispatchId, input] = planningIngress.submit.mock.calls[0];
@@ -1578,10 +1446,10 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
-  it.each([null, "legacy", "restate"] as const)("with Restate not ready, lifecycle %s makes no reservation, submit, or launch", async (reviewFixLifecycle) => {
+  it.each(cases)("with Restate not ready, no reservation, submit, or launch ($backend, $reviewFixLifecycle)", async ({ backend, reviewFixLifecycle }) => {
     restateStatus.setRestateStatus({ sidecar: { state: "starting" } });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await indexModule.dispatchPlanning(config, provider, issue, { ...legacyMapping, reviewFixLifecycle }, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, { ...legacyMapping, reviewFixLifecycle }, ctxFor(backend));
     expect(logSpy.mock.calls.map((c) => c.join(" "))).toContain("[poll] Planning for AII-1100 skipped: Restate unavailable");
     logSpy.mockRestore();
     expect(planningIngress.submit).not.toHaveBeenCalled();
@@ -1596,10 +1464,10 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(activeRows()).toEqual([]);
   });
 
-  it("submit unavailable leaves no dispatch_admissions row", async () => {
+  it.each(backends)("submit unavailable leaves no dispatch_admissions row (%s)", async (backend) => {
     planningIngress.submit.mockResolvedValue({ status: "unavailable" });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor(backend));
     const lines = logSpy.mock.calls.map((c) => c.join(" "));
     logSpy.mockRestore();
     expect(lines).toContain("[poll] Planning for AII-1100 skipped: Restate unavailable");
@@ -1607,10 +1475,10 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
-  it("submit not-found logs that the service is not registered, with no row", async () => {
+  it.each(backends)("submit not-found logs that the service is not registered, with no row (%s)", async (backend) => {
     planningIngress.submit.mockResolvedValue({ status: "not-found" });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor(backend));
     const lines = logSpy.mock.calls.map((c) => c.join(" "));
     logSpy.mockRestore();
     expect(lines).toContain("[poll] Planning for AII-1100 skipped: the PlanningRun service is not registered");
@@ -1618,9 +1486,9 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
   });
 
-  it("an issue the non-binding check refuses is not submitted", async () => {
+  it.each(backends)("an issue the non-binding check refuses is not submitted (%s)", async (backend) => {
     dedup.markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
-    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor("github-actions"));
+    await indexModule.dispatchPlanning(config, provider, issue, legacyMapping, ctxFor(backend));
     expect(planningIngress.submit).not.toHaveBeenCalled();
     expect(activeRows()).toEqual([]);
     expect(github.postWorkflowDispatch).not.toHaveBeenCalled();
@@ -1649,4 +1517,246 @@ describe("dispatchPlanning — Restate lifecycle switch (AII-1021)", () => {
     expect(activeRows()).toEqual([]);
   });
 
+});
+
+describe("poll implementation submission — ImplementationRun for every project", () => {
+  const issue = makeIssue({ identifier: "AII-1555", scopeKey: "AII" });
+  const config = makeAppConfig({ ...CALLBACK_CONFIG, runnerTokenSecret: "TOKEN_SENTINEL" });
+  const ctx = { execPath: "github-actions" as const, runnerMode: "default", baseBranch: "feature/group", baseBranchFieldValue: null as string | null };
+  let indexModule: typeof import("../index.js");
+  let dedup: typeof DedupModule;
+  let status: typeof import("../restate/status.js");
+  const rows = () => dedup.getDb().prepare("SELECT * FROM dispatch_admissions").all();
+
+  beforeEach(async () => {
+    const db = await testDb({ modules: {
+      indexModule: () => import("../index.js"), dedup: () => import("../dedup.js"),
+      status: () => import("../restate/status.js"),
+    } });
+    ({ indexModule, dedup, status } = db.modules);
+    status.setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    implementationIngress.submit.mockReset().mockResolvedValue({ status: "accepted" });
+  });
+  afterEach(() => status.resetRestateStatus());
+
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("freezes a grouping parent's classification for %s", async (execPath) => {
+    const parent = { ...issue, featureBranchChain: [{ identifier: issue.identifier, mode: "feature" as const }] };
+    await indexModule.submitImplementationRun(config, parent, jiraMapping("AII"), { ...ctx, execPath });
+    expect(implementationIngress.submit.mock.calls[0]![1].launchContext.groupingParent).toBe("true");
+  });
+
+  it.each(["github-actions", "fly-machines", "local-docker", "both"] as const)("submits %s with a schema-valid credential-free input", async (execPath) => {
+    const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
+    const { normalizeGithubActionsJobTimeoutMinutes } = await import("../github-actions-watchdog.js");
+    const mapping = jiraMapping("AII", { maxJobMinutes: 42 });
+    const log = vi.spyOn(console, "log");
+    await indexModule.submitImplementationRun(config, issue, mapping, { ...ctx, execPath });
+    const [key, input] = implementationIngress.submit.mock.calls[0];
+    expect(implementationRunInputSchema.parse(input)).toEqual(input);
+    expect(key).toMatch(/^[0-9a-f-]{36}$/);
+    const backend = execPath === "both" ? "github-actions" : execPath;
+    expect(input).toEqual({ dispatchId: key, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier,
+      backend, maxJobMinutes: normalizeGithubActionsJobTimeoutMinutes(42),
+      launchContext: { baseBranch: "feature/group", runnerMode: "default", groupingParent: "false" } });
+    expect(JSON.stringify(input)).not.toContain("TOKEN_SENTINEL");
+    expect(log).toHaveBeenCalledWith(`[poll] Submitted ImplementationRun for AII-1555 dispatch=${key} backend=${backend} (accepted)`);
+    expect(rows()).toEqual([]);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+  });
+
+  describe.each([null, "legacy", "restate"] as const)("poll with stored lifecycle %s", (reviewFixLifecycle) => {
+    it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits through ImplementationRun on %s", async (executionMode) => {
+      fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+      const store = await import("../config.js");
+      const auth = await import("../github-app-auth.js");
+      const github = await import("../github.js");
+      const fly = await import("../fly-machines.js");
+      const docker = await import("../local-docker.js");
+      const runnerMode = executionMode === "local-docker" ? "local" : "default";
+      const mode = await import("../runner-mode.js");
+      mode.setRunnerMode(runnerMode);
+      vi.mocked(docker.sweepExitedLocalContainers).mockResolvedValue([]);
+      const mapping = jiraMapping("AII", { reviewFixLifecycle, executionMode: executionMode === "local-docker" ? "github-actions" : executionMode, defaultBranch: "release/poll", maxJobMinutes: 42 });
+      store.upsertMapping("AII", mapping);
+      expect(dedup.getDb().prepare("SELECT review_fix_lifecycle FROM mappings WHERE team_key = ?").get("AII"))
+        .toEqual({ review_fix_lifecycle: reviewFixLifecycle });
+      const provider = jiraProvider();
+      vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+        needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+      });
+      vi.mocked(auth.getInstallationToken).mockResolvedValue("TOKEN_SENTINEL");
+      const legacyCalls = (["dispatchGitHubActions", "dispatchFlyMachine", "dispatchLocalDocker", "dispatchBothMode"] as const)
+        .map((name) => vi.spyOn(indexModule, name));
+      // Same-module calls can bypass export spies; the launch API spies also catch those calls.
+      const launchCalls = [github.postWorkflowDispatch, fly.createMachine, docker.startLocalRunnerContainer];
+      for (const call of launchCalls) vi.mocked(call).mockClear();
+
+      await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
+
+      expect(provider.fetchAIImplementSnapshot).toHaveBeenCalledTimes(1);
+      expect(implementationIngress.submit).toHaveBeenCalledTimes(1);
+      const [dispatchId, input] = implementationIngress.submit.mock.calls[0];
+      expect(input).toEqual({
+        dispatchId, teamKey: "AII", issueId: issue.id, issueIdentifier: issue.identifier,
+        backend: executionMode, maxJobMinutes: 42,
+        launchContext: { baseBranch: "release/poll", runnerMode, groupingParent: "false" },
+      });
+      const { implementationRunInputSchema } = await import("../restate/implementation-run-workflow.js");
+      expect(implementationRunInputSchema.parse(input)).toEqual(input);
+      expect(JSON.stringify(input)).not.toContain("TOKEN_SENTINEL");
+      for (const call of [...legacyCalls, ...launchCalls]) expect(call).not.toHaveBeenCalled();
+      expect(rows()).toEqual([]);
+      expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+    });
+  });
+
+  it("dispatches on every poll when the provider cannot enumerate roll-up children", async () => {
+    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    store.upsertMapping("AII", jiraMapping("AII"));
+    const provider = jiraProvider();
+    Object.assign(provider, { listIssuesPage: undefined });
+    vi.mocked(provider.fetchAIImplementSnapshot).mockResolvedValue({
+      needsPlanning: [], readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [],
+    });
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    const registry = makeRegistry({ provider, mappings: store.getMappings() });
+    await indexModule.poll(config, registry);
+    expect(implementationIngress.submit).toHaveBeenCalledTimes(1);
+    await indexModule.poll(config, registry);
+    expect(implementationIngress.submit).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["planning", "implementation"].flatMap(kind =>
+    ["success", "lookup-null", "lookup-error", "park-rejected", "park-error"].map(outcome => ({ kind, outcome }))))(
+    "blocks $kind pickup when roll-up reconciliation outcome is $outcome", async ({ kind, outcome }) => {
+    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    const github = await import("../github.js");
+    const mapping = jiraMapping("AII", { planningEnabled: true });
+    store.upsertMapping("AII", mapping);
+    store.upsertMapping("OTHER", jiraMapping("OTHER"));
+    const unrelated = makeIssue({ id: "other-id", identifier: "OTHER-1", scopeKey: "OTHER" });
+    const child = makeIssue({ ...issue, title: `[roll-up-review] ${mapping.owner}/${mapping.repo}#7 ${"a".repeat(40)} Fix blockers` });
+    const provider = jiraProvider();
+    let parked = false;
+    Object.assign(provider, { listIssuesPage: vi.fn(async (mapping: RepoMapping) => ({
+      issues: mapping.teamKey === "OTHER" ? [] : [{ id: child.id, identifier: child.identifier, title: child.title,
+        description: "body", parent: { identifier: "AII-1500" },
+        state: { name: "Ready", type: "unstarted" }, labels: { nodes: [] },
+        project: null, comments: { nodes: [] }, relations: { nodes: [] } }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    })) });
+    vi.mocked(provider.fetchLifecycleStates).mockResolvedValue(new Map([[child.id, "active"]]));
+    vi.mocked(provider.parkForHuman).mockImplementation(async () => {
+      if (outcome === "park-error") throw new Error("parking unavailable");
+      if (outcome === "park-rejected") return false;
+      parked = true; return true;
+    });
+    vi.mocked(provider.fetchAIImplementSnapshot).mockImplementation(async () => ({
+      needsPlanning: !parked && kind === "planning" ? [child] : [],
+      readyForImplementation: [...(!parked && kind === "implementation" ? [child] : []), unrelated],
+      inProgressCountsByScope: {}, parentsToFinalize: [],
+    }));
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    vi.spyOn(github, "getPullRequestState").mockImplementation(async () => {
+      if (outcome === "lookup-error") throw new Error("GitHub unavailable");
+      if (outcome === "lookup-null") return null;
+      return { merged: false, state: "closed", headRef: null, headSha: null };
+    });
+    planningIngress.submit.mockClear();
+
+    await indexModule.poll(config, makeRegistry({ provider, mappings: store.getMappings() }));
+
+    if (outcome === "success") {
+      expect(provider.parkForHuman).toHaveBeenCalledWith(child.id, "AII", "implementation");
+      expect(provider.postComment).toHaveBeenCalledWith(child.id, expect.stringContaining("re-file this fix against the base branch"));
+    } else {
+      expect(provider.fetchAIImplementSnapshot).toHaveBeenCalledTimes(1);
+    }
+    expect(planningIngress.submit).not.toHaveBeenCalled();
+    expect(implementationIngress.submit).toHaveBeenCalledTimes(1);
+    expect(implementationIngress.submit.mock.calls[0][1].issueIdentifier).toBe("OTHER-1");
+  });
+
+  it.each([false, true, "reconciliation-failure"])("dispatches filesystem work with mixed providers=%s", async (mixed) => {
+    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    const store = await import("../config.js");
+    const auth = await import("../github-app-auth.js");
+    vi.mocked(auth.getInstallationToken).mockResolvedValue("token");
+    const directory = testDir("poll-filesystem");
+    await writeFile(join(directory, "LOCAL-1.md"), "---\ntitle: Local work\n---\nImplement local work");
+    store.upsertMapping("LOCAL", makeMapping({ ticketingProvider: "filesystem",
+      ticketingConfig: { kind: "filesystem", directory }, planningEnabled: false }));
+    const filesystem = new FilesystemProvider(store.getMappings);
+    const jira = jiraProvider();
+    if (mixed) {
+      store.upsertMapping("AII", jiraMapping("AII"));
+      vi.mocked(jira.fetchAIImplementSnapshot).mockResolvedValue({ needsPlanning: [],
+        readyForImplementation: [issue], inProgressCountsByScope: {}, parentsToFinalize: [] });
+    }
+    if (mixed === "reconciliation-failure") {
+      vi.mocked(jira.listIssuesPage!).mockRejectedValue(new Error("Jira unavailable"));
+    }
+    await indexModule.poll(config, makeRegistry({ providers: { filesystem, jira }, mappings: store.getMappings() }));
+    expect(implementationIngress.submit.mock.calls.map(([, input]) => input.issueIdentifier).sort())
+      .toEqual(mixed === true ? ["AII-1555", "LOCAL-1"] : ["LOCAL-1"]);
+  });
+
+  it("skips unavailable Restate without admission or dedup", async () => {
+    status.setRestateStatus({ sidecar: { state: "starting" } });
+    const log = vi.spyOn(console, "log");
+    const mark = vi.spyOn(dedup, "markDispatched");
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), ctx);
+    expect(implementationIngress.submit).not.toHaveBeenCalled();
+    expect(rows()).toEqual([]);
+    expect(mark).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith("[poll] Implementation for AII-1555 skipped: Restate unavailable");
+  });
+
+  it("does not submit when admission refuses", async () => {
+    dedup.markDispatched(issue.id, issue.scopeKey, issue.identifier, issue.title);
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), ctx);
+    expect(implementationIngress.submit).not.toHaveBeenCalled();
+    expect(rows()).toEqual([]);
+  });
+
+  it.each(["unavailable", "not-found", "conflict"] as const)("handles submit status %s without reserving or marking dedup", async (submitStatus) => {
+    implementationIngress.submit.mockResolvedValue({ status: submitStatus });
+    const log = vi.spyOn(console, "log");
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), ctx);
+    const key = implementationIngress.submit.mock.calls[0][0];
+    const line = submitStatus === "unavailable" ? "Implementation for AII-1555 skipped: Restate unavailable"
+      : submitStatus === "not-found" ? "Implementation for AII-1555 skipped: the ImplementationRun service is not registered"
+      : `Existing ImplementationRun owns dispatch=${key}`;
+    expect(log).toHaveBeenCalledWith(`[poll] ${line}`);
+    expect(rows()).toEqual([]);
+    expect(dedup.isAlreadyDispatched(issue.id)).toBe(false);
+  });
+
+  it("passes explicit branch context and leaves managed preparation to the workflow", async () => {
+    const managed = await import("../managed-dispatch-auth.js");
+    const prepare = vi.spyOn(managed, "prepareManagedDispatch");
+    prepare.mockClear();
+    const store = await import("../agent-config-store.js");
+    store.saveAccountProfileRevision({
+      profileId: "managed", identity: "Managed", revision: 1, agent: "codex", provider: "openai", authMode: "codex-subscription",
+    });
+    const stage = { agent: "codex" as const, provider: "openai" as const, model: "m", accountProfileId: "managed", invocationTimeoutMs: 60_000 };
+    store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
+    store.setProjectOptIn("AII", true);
+    await indexModule.submitImplementationRun(config, issue, jiraMapping("AII"), {
+      ...ctx, runnerMode: "shadow", baseBranch: "release", baseBranchFieldValue: "release",
+    });
+    expect(implementationIngress.submit).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      launchContext: { baseBranch: "release", baseBranchFieldValue: "release", runnerMode: "shadow", groupingParent: "false" },
+    }));
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it("the submission helper does not resolve a lifecycle switch", () => {
+    expect(indexModule.submitImplementationRun.toString()).not.toContain("resolveReviewFixLifecycle");
+  });
 });

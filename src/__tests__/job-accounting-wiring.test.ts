@@ -111,6 +111,33 @@ describe("local Docker removal stamps the stop", () => {
     expect(row(id).compute_stopped_at).toBeGreaterThanOrEqual(1000);
   });
 
+  it("missing-container removal falls back to completed_at and preserves the first stop", async () => {
+    const id = log.appendLog({ issueId: "i", machineId: "gone" });
+    dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = 6000 WHERE id = ?").run(id);
+    dockerResult(new Error("Error: No such container: gone"));
+    await expect(docker.removeLocalContainer("gone")).rejects.toThrow("No such container");
+    expect(row(id).compute_stopped_at).toBe(6000);
+
+    dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = 9000 WHERE id = ?").run(id);
+    await expect(docker.removeLocalContainer("gone")).rejects.toThrow("No such container");
+    expect(row(id).compute_stopped_at).toBe(6000);
+    dockerResult(null);
+    await docker.removeLocalContainer("gone");
+    expect(row(id).compute_stopped_at).toBe(6000);
+  });
+
+  it("a lost removal acknowledgement is accounted for when retry finds the container gone", async () => {
+    const id = log.appendLog({ issueId: "i", machineId: "lost" });
+    dedup.getDb().prepare("UPDATE dispatch_log SET completed_at = 7000 WHERE id = ?").run(id);
+    dockerResult(new Error("Docker connection lost"));
+    await expect(docker.removeLocalContainer("lost")).rejects.toThrow("connection lost");
+    expect(row(id).compute_stopped_at).toBeNull();
+
+    dockerResult(new Error("Error: No such container: lost"));
+    await expect(docker.removeLocalContainer("lost")).rejects.toThrow("No such container");
+    expect(row(id).compute_stopped_at).toBe(7000);
+  });
+
   it("stopLocalContainer sets the stop; 'no such container' falls back to completed_at and never overwrites", async () => {
     const a = log.appendLog({ issueId: "i", machineId: "c2" });
     dockerResult(null);

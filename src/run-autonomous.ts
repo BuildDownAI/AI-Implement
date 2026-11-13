@@ -451,6 +451,7 @@ export interface ResolvedRunnerInputs {
   issueIdentifier: string;
   issueTitle: string;
   issueDescription: string;
+  reviewOnly?: import("./run-config.js").RunConfigV1["reviewOnly"];
   prNumber: string;
   commentInstruction: string | null;
   runnerPhase: "implementation" | "gap-analysis";
@@ -540,13 +541,13 @@ type ReviewFixResultResolution =
   | { readonly kind: "no-result"; readonly reason: string };
 
 /**
- * Folds the actual GitHub Actions execution identity and the real published output commit onto
+ * Folds the execution backend evidence and the real published output commit onto
  * a pilot attempt's resolved identity (run_config.reviewFix, AII-776) into the full result
  * marker the callback validates (ReviewFixResultMetadataV1, AII-794). Undefined `identity` means
- * a Legacy (non-pilot) dispatch — no marker is ever in play. `outputCommit` and
- * githubRunId/githubRunAttempt are all required by the wire contract (ReviewFixResultMetadataV1
- * has no optional-evidence variant), so when any of them can't be resolved (no push happened on
- * this path, or the process isn't actually running under GHA) this reports `no-result` rather
+ * a Legacy (non-pilot) dispatch — no marker is ever in play. Machine results use the envelope
+ * executionBackend without GitHub ids; GitHub results require githubRunId/githubRunAttempt.
+ * Both require `outputCommit`, so when the required evidence cannot be resolved (no push
+ * happened, or a GitHub dispatch lacks valid run ids) this reports `no-result` rather
  * than a fabricated or partial marker. The caller must not then send an unmarked Legacy POST for
  * this attempt: the server's `classifyLifecycleOwner` (review-fix-contract.ts) would read a
  * missing `reviewFix` field as "this was never a pilot attempt" and process it on the Legacy
@@ -559,6 +560,12 @@ function resolveReviewFixResult(
   env: NodeJS.ProcessEnv,
 ): ReviewFixResultResolution {
   if (!identity) return { kind: "legacy" };
+  if (identity.executionBackend !== undefined) {
+    if (!outputCommit) {
+      return { kind: "no-result", reason: `no published output commit for attempt ${identity.attemptId}` };
+    }
+    return { kind: "attached", reviewFix: { ...identity, executionBackend: identity.executionBackend, outputCommit } };
+  }
   const githubRunId = parsePositiveIntEnv(env.GITHUB_RUN_ID);
   const githubRunAttempt = parsePositiveIntEnv(env.GITHUB_RUN_ATTEMPT);
   if (githubRunId === null || githubRunAttempt === null) {
@@ -570,7 +577,8 @@ function resolveReviewFixResult(
   if (!outputCommit) {
     return { kind: "no-result", reason: `no published output commit for attempt ${identity.attemptId}` };
   }
-  return { kind: "attached", reviewFix: { ...identity, githubRunId, githubRunAttempt, outputCommit } };
+  const { executionBackend: _backend, ...githubIdentity } = identity;
+  return { kind: "attached", reviewFix: { ...githubIdentity, githubRunId, githubRunAttempt, outputCommit } };
 }
 
 /**
@@ -690,6 +698,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     sensitiveFiles: cfg.sensitiveFiles,
     dependencyTokenScope: cfg.dependencyTokenScope,
     referenceRepos: cfg.referenceRepos,
+    reviewOnly: cfg.reviewOnly,
     reviewers: validReviewerSelectionArray(cfg.reviewers) ? cfg.reviewers : DEFAULT_REVIEWER_SELECTION,
     reviewProcess: cfg.reviewProcess ?? "ai-implement",
     trustedReviewAuthors: cfg.trustedReviewAuthors ?? [],
@@ -825,6 +834,7 @@ export { MODEL_AUTH_ENV };
 
 export interface ConfiguredRunOptions {
   modelFallbacks?: StageExecutorOptions["fallbackModels"];
+  accountFallbacks?: StageExecutorOptions["accountFallbacks"];
   /** Local runs: the resolved snapshot. Managed runs read it from the envelope. */
   agentConfig?: ResolvedAgentSnapshotV1;
   /** Local runs: protected credential source. */
@@ -1094,7 +1104,9 @@ export async function prepareConfiguredRun(input: {
   const modelFallbacks = options.modelFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
     ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).modelFallbacks
     : undefined);
-  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks }, syntheticProvider, implementationFullAccess);
+  const accountFallbacks = options.accountFallbacks ?? (env.AI_IMPLEMENT_RUN_CONFIG
+    ? decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG).accountFallbacks : undefined);
+  return buildConfiguredRun(snapshot, client, { ...options, modelFallbacks, accountFallbacks }, syntheticProvider, implementationFullAccess);
 }
 
 function buildConfiguredRun(
@@ -1105,6 +1117,9 @@ function buildConfiguredRun(
   implementationFullAccess = false,
 ): ConfiguredRun {
   const modes = new Map(STAGE_NAMES.map((s) => [snapshot.profiles[s].id, snapshot.profiles[s].authMode] as const));
+  for (const entries of Object.values(options.accountFallbacks ?? {})) {
+    for (const entry of entries) modes.set(entry.accountProfileId, entry.authMode);
+  }
   const checkouts = new Map<string, Promise<void>>();
   const checkedOut = new Set<string>();
   let held = false;
@@ -1146,6 +1161,7 @@ function buildConfiguredRun(
         },
         snapshot,
         fallbackModels: options.modelFallbacks,
+        accountFallbacks: options.accountFallbacks,
         auth,
         logLevel: args.logLevel,
         activityReporting: args.activityReporting,
@@ -1246,6 +1262,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     claudeModel,
     groupingParent,
     retryPolicy,
+    reviewOnly,
     reviewFix,
     agentConfig,
     modelPrices,
@@ -1259,7 +1276,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     options: opts.configured,
   });
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
-  const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewers);
+  const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewOnly?.reviewers ?? reviewers);
 
   // Planning context is fetched from the orchestrator's provider-agnostic
   // endpoint using the reusable progress token — the runner never calls the
@@ -1362,6 +1379,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       sensitiveFiles,
       dependencyTokenScope,
       referenceRepos,
+      reviewOnly,
       reviewers,
       reviewProcess,
       trustedReviewAuthors,
@@ -1411,6 +1429,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 
     referenceRepoResults = readReferenceRepoResults();
 
+    if (reviewOnly) {
+      const review = context.getOutputs("feedback-loop");
+      await reportRunnerResult(undefined, null, process.env, {
+        workspaceDir, phase: runnerPhase, outcome: review.terminationReason === "review_error" ? "failure" : "success",
+        reviewOnly: true, internalFindings: review.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[],
+        rollupReview: review.rollupReview as { headSha: string; verdictUrl: string },
+        callbackUrl, retryPolicy, fetchImpl: opts.fetchImpl,
+      });
+      runCompleted = true;
+      return { exitCode: 0 };
+    }
     const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
     const postPushReviewOutputs = context.getOutputs("post-push-review");
@@ -1457,6 +1486,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         outcome: "success",
         noWork: true,
         referenceRepoResults,
+        internalFindings: postPushReviewOutputs.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[] | undefined,
         findingDispositions,
         callbackUrl,
         retryPolicy,
@@ -1507,6 +1537,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           failureReason,
           prUrl,
           referenceRepoResults,
+          internalFindings: postPushReviewOutputs.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[] | undefined,
           findingDispositions,
           callbackUrl,
           retryPolicy,
@@ -1558,6 +1589,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         outcome: "success",
         prUrl,
         referenceRepoResults,
+        internalFindings: postPushReviewOutputs.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[] | undefined,
         findingDispositions,
         ...(runnerPhase === "gap-analysis" && outputCommit ? { externalReviewPending: { headSha: outputCommit } } : {}),
         callbackUrl,
@@ -1616,7 +1648,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // The verify hook still failed after the last iteration. Never a review verdict, so it gets
     // its own failureCode/wording; the hook's output tail rides in finalFeedback.
     const verifyFailed = terminationReason === "verify_failed";
-    const failureCode = verifyFailed
+    const accountUsageLimit = reviewerFailure?.code === "ACCOUNT_USAGE_LIMIT";
+    const failureCode = accountUsageLimit
+      ? "ACCOUNT_USAGE_LIMIT"
+      : verifyFailed
       ? "VERIFY_FAILED"
       : reviewerTurnsExhausted
       ? "REVIEWER_TURNS_EXHAUSTED"
@@ -1650,7 +1685,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const sentences = [lead, terminationReasonSentence(terminationReason, iterations), draft, reasonCodeTag(terminationReason)];
       return sentences.filter(Boolean).join(" ") + notes;
     };
-    const failureReason = verifyFailed
+    const failureReason = accountUsageLimit
+      ? reviewerFailure.message
+      : verifyFailed
       ? `The repository's verify hook still failed after ${iterations} iteration(s), so the review did not examine the last pass.\n\n${finalFeedback}`
       : reviewerTurnsExhausted
       ? `🟠 ${SECOND_REVIEW} did not finish. A reviewer used all of its permitted steps (${reviewMaxTurns}), so the review is incomplete.\n\n${finalFeedback.slice(0, 500)}\n\nSee the PR for completed reviewer reports and remaining review work.`
@@ -1671,7 +1708,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
-    disposition = verifyFailed
+    disposition = accountUsageLimit
+      ? `${prDisposition} — accounts reached their usage limit`
+      : verifyFailed
       ? `${prDisposition} — verify hook failed after ${iterations} iteration(s) (${terminationReason})`
       : reviewerTurnsExhausted
       ? `${prDisposition} — a reviewer used all of its permitted steps after ${iterations} iteration(s) (${terminationReason})`
@@ -1720,6 +1759,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       failure: reviewerFailure,
       prUrl,
       referenceRepoResults,
+      internalFindings: postPushReviewOutputs.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[] | undefined,
       findingDispositions,
       ...(externalReviewPendingHeadSha ? { externalReviewPending: { headSha: externalReviewPendingHeadSha } } : {}),
       callbackUrl,
@@ -1739,7 +1779,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const { valid: findingDispositions } = readFindingDispositions(workspaceDir);
     const pushOutputsOnError = context.getOutputs("push");
     const pushFailed = Boolean(pushOutputsOnError.error);
-    if (prNumber && !pushFailed) {
+    if (prNumber && !pushFailed && !reviewOnly) {
       replyToDispositionThreads(ghSpawn, prNumber, findingDispositions);
     }
     // A step can throw after push already ran and published a commit (e.g. post-push-review
@@ -1751,6 +1791,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       phase: runnerPhase,
       ...attributionField(errorAttribution(err) ?? finalAttribution()),
       outcome: "failure",
+      ...(reviewOnly ? { reviewOnly: true } : {}),
       failureReason: err instanceof Error ? err.message : String(err),
       failureCode: err instanceof SensitiveFilesError ? err.code
         : err instanceof OperatorCancelledError ? err.code
@@ -1771,7 +1812,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     } catch (summaryErr) {
       console.error(`timing summary failed: ${summaryErr}`);
     }
-    if (teardownHook) {
+    if (teardownHook && !reviewOnly) {
       try {
         const result = await runHookScript("teardown", teardownHook, workspaceDir);
         if (result.exitCode !== 0) {

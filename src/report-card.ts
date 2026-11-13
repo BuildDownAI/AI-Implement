@@ -264,12 +264,17 @@ function isRestateOwned(dispatchId: string): boolean {
   }
 }
 
-function restateRefForRow(d: DispatchRow): RunEntry["restate"] {
-  if (!d.dispatch_id) return null;
-  if (d.phase === "kg-refresh") return { service: "KgRefresh", key: d.dispatch_id };
-  if (!isRestateOwned(d.dispatch_id)) return null;
-  if (d.phase === "implementation") return { service: "ImplementationRun", key: d.dispatch_id };
-  return { service: d.phase === "planning" ? "PlanningRun" : "ReviewFixAttempt", key: d.dispatch_id };
+/** Resolve the owning workflow using durable admission and review-fix attempt records. */
+export function restateRefForJob(dispatchId: string | null, phase: string): RunEntry["restate"] {
+  if (!dispatchId) return null;
+  if (phase === "kg-refresh") return { service: "KgRefresh", key: dispatchId };
+  if (!isRestateOwned(dispatchId)) return null;
+  if (phase === "implementation") return { service: "ImplementationRun", key: dispatchId };
+  if (phase === "gap-analysis") {
+    const attempt = getDb().prepare("SELECT 1 FROM review_fix_attempts WHERE dispatch_id = ?").get(dispatchId);
+    return { service: attempt ? "ReviewFixAttempt" : "ImplementationRun", key: dispatchId };
+  }
+  return { service: phase === "planning" ? "PlanningRun" : "ReviewFixAttempt", key: dispatchId };
 }
 
 // ---- getIssueReportCard ----
@@ -312,7 +317,7 @@ export function getIssueReportCard(identifier: string, prices: readonly ModelPri
     status: d.status,
     conclusion: d.conclusion,
     ...derivedStatsForJob(db, d.id),
-    restate: restateRefForRow(d),
+    restate: restateRefForJob(d.dispatch_id, d.phase),
   }));
 
   const implRuns = runs.filter((r) => r.phase !== "planning");
@@ -862,4 +867,38 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
     escapeRate,
     runaways,
   };
+}
+
+export interface ReviewerScore {
+  source: string;
+  total: number;
+  fixed: number;
+  rejected: number;
+  deferred: number;
+  ignored: number;
+  rejectedRate: number;
+}
+
+/** First-seen cohort; active open findings contribute to total but not ignored. */
+export function getReviewerScorecard(opts: { days?: number; repo?: string } = {}): ReviewerScore[] {
+  const now = Date.now();
+  const since = now - (opts.days ?? 30) * 86_400_000;
+  const db = getDb();
+  const hasMergeCapture = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pr_merge_capture'").get();
+  const merged = hasMergeCapture
+    ? "EXISTS (SELECT 1 FROM pr_merge_capture m WHERE m.repo = f.repo AND m.pr_number = f.pr_number AND m.merged_at IS NOT NULL AND m.merged_at <= @now)"
+    : "0";
+  const rows = db.prepare(`
+    SELECT source, COUNT(*) AS total,
+      SUM(status = 'resolved' AND COALESCE(disposition = 'fixed', 0)) AS fixed,
+      SUM(status = 'rejected') AS rejected,
+      SUM(status = 'deferred') AS deferred,
+      SUM((status = 'resolved' AND (disposition IS NULL OR disposition != 'fixed'))
+        OR (status = 'open' AND ${merged})) AS ignored
+    FROM review_findings f
+    WHERE first_seen_at >= @since AND first_seen_at <= @now
+      AND (@repo IS NULL OR repo = @repo)
+    GROUP BY source ORDER BY source
+  `).all({ since, now, repo: opts.repo ?? null }) as Omit<ReviewerScore, "rejectedRate">[];
+  return rows.map(row => ({ ...row, rejectedRate: row.rejected / row.total }));
 }

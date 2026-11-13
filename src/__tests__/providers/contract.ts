@@ -150,3 +150,26 @@ export function runProviderContract(label: string, factory: ContractProviderFact
     });
   });
 }
+
+/** Creation adapters inspect native parent/scope and pickup fields where lookup omits them. */
+export function runChildIssueContract(label: string, factory: () => Promise<{
+  provider: TicketingProvider;
+  parentId: string;
+  scopeKey: string;
+  inspect: (identity: { id: string; identifier: string }) => Promise<{
+    title: string; body: string; parentId: string; scopeKey: string; pickupReady: boolean;
+  }>;
+}>): void {
+  describe(`TicketingProvider child creation: ${label}`, () => {
+    it("creates a distinct child with the supplied content, parent, scope and pickup signal", async () => {
+      const { provider, parentId, scopeKey, inspect } = await factory();
+      const identity = await provider.createChildIssue(parentId, scopeKey, { title: "Blocking finding", body: "Fix the regression." });
+      expect(identity.id).toBeTruthy();
+      expect(identity.identifier).toBeTruthy();
+      expect(identity.id).not.toBe(parentId);
+      expect(await inspect(identity)).toEqual({
+        title: "Blocking finding", body: "Fix the regression.", parentId, scopeKey, pickupReady: true,
+      });
+    });
+  });
+}

@@ -1,9 +1,13 @@
+import pr1546 from "./fixtures/claude-review-pr-1546.json";
+import pr1541 from "./fixtures/claude-review-pr-1541.json";
 import { describe, expect, it, vi } from "vitest";
 import { resolveReviewProcess } from "../review-process.js";
 import {
+  isAiImplementComment,
   classifyReviewIssueComment,
   collectClosedReviewThreadCommentUrls,
   collectExternalReviewFindingsFromGh,
+  collectClaudeReviewCommentFromGh,
   extractClaudeSummaryFindings,
   extractGithubActionsClaudeReviewFindings,
   extractReviewFindingsBlock,
@@ -12,6 +16,24 @@ import {
   type ReviewLedgerFinding,
   reviewContractFindingGates,
 } from "../pipeline/review-ledger.js";
+
+import { inlineCommentBody } from "../pipeline/review-inline-comments.js";
+
+describe("isAiImplementComment", () => {
+  const body = inlineCommentBody({ severity: "medium", body: "Add a null check." });
+
+  it.each([body, `${body} \n\t`])("recognizes an inline finding with optional trailing whitespace: %s", (comment) => {
+    expect(isAiImplementComment(comment)).toBe(true);
+  });
+
+  it("reads a review quoting the inline trailer in the middle", () => {
+    expect(isAiImplementComment(`The pipeline posted:\n${body}\nBut this still needs a fix.`)).toBe(false);
+  });
+
+  it("keeps recognizing a leading pipeline marker", () => {
+    expect(isAiImplementComment(" \n<!-- ai-implement finding-disposition -->\nResolved.")).toBe(true);
+  });
+});
 
 describe("extractClaudeSummaryFindings", () => {
   it("extracts normalized bullets from a blocking section only", () => {
@@ -2265,5 +2287,176 @@ describe("reviewContractFindingGates", () => {
     ["medium", undefined, true],
   ] as const)("%s finding under verdict %s gates=%s", (severity, verdict, expected) => {
     expect(reviewContractFindingGates({ severity }, verdict)).toBe(expected);
+  });
+});
+
+// Actual REST issue comments fetched from GitHub on 2026-11-10, including edits.
+describe("Claude GHA incident replays", () => {
+  it("distinguishes #1546's progress tracker from its review quoting a pipeline marker", () => {
+    const tracker = pr1546.find(c => c.id === 6778672152)!;
+    const review = pr1546.find(c => c.id === 6778794145)!;
+    expect(classifyReviewIssueComment(tracker)).toBeNull();
+    expect(review.body).toContain("<!-- ai-implement closed-findings");
+    expect(classifyReviewIssueComment(review)).toMatchObject({ verdict: "changes_requested", findingsUnavailable: false });
+    // The former body.includes("<!-- ai-implement") exclusion discarded this entire review.
+    expect(review.body.includes("<!-- ai-implement")).toBe(true);
+    expect(pr1541.filter(c => c.user.login === "github-actions[bot]").every(c => !c.body.includes("<!-- ai-implement"))).toBe(true);
+  });
+
+  it.each([[1546, pr1546, "blocking"], [1541, pr1541, "minor"]] as const)(
+    "reads PR #%s's newest review despite quoted pipeline markers", (_pr, comments, severity) => {
+      const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+        process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+        reviewWindow: _pr === 1546
+          ? { startedAt: "2026-11-10T20:38:09Z", completedAt: "2026-11-10T20:44:14Z" }
+          : { startedAt: "2026-11-10T19:46:53Z", completedAt: "2026-11-10T19:52:23Z" },
+        issueComments: { exitCode: 0, stdout: JSON.stringify(comments) },
+      });
+      expect(result.findingsUnavailable).toBe(false);
+      expect(result.selectedComment).toEqual({ id: _pr === 1546 ? 6778794145 : 6777662566, kind: "review-contract" });
+      expect(result.findings.length).toBeGreaterThan(0);
+      expect(result.findings.every(f => f.severity === severity)).toBe(true);
+      expect(result.findings.some(f => reviewContractFindingGates(f, result.verdict))).toBe(severity === "blocking");
+      if (severity === "blocking") expect(result.findings[0]).toMatchObject({ path: "src/pipeline/steps/post-push-review.ts" });
+    },
+  );
+  it("fails closed on a separate unclassifiable Actions review", () => {
+    expect(classifyReviewIssueComment({ user: { login: "github-actions[bot]", type: "Bot" }, body: "## Claude review\nSomething unexpected happened." }))
+      .toMatchObject({ findingsUnavailable: true });
+  });
+});
+
+describe("trusted Claude review selection", () => {
+  const user = { login: "github-actions[bot]", type: "Bot" };
+  const clean = { id: 1, user, body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```', created_at: "2026-11-10T20:00:00Z" };
+  it("selects an edited unclassifiable review over an older approval and ignores later progress", () => {
+    const comments = [
+      clean,
+      { id: 2, user, body: "## Claude review\nUnexpected output", created_at: "2026-11-10T19:00:00Z", updated_at: "2026-11-10T21:00:00Z" },
+      { id: 3, user, body: "**Claude finished**\n### Review in progress\n- [ ] Post review", created_at: "2026-11-10T22:00:00Z" },
+    ];
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], issueComments: { exitCode: 0, stdout: JSON.stringify(comments) },
+    });
+    expect(result).toMatchObject({ findingsUnavailable: true, selectedComment: { id: 2, kind: "unavailable" } });
+    expect(result.verdict).toBeUndefined();
+  });
+  it.each([{ login: "random-user", type: "User" }, { login: "github-actions[bot]", type: "User" }])("ignores an untrusted review identity %j", user => {
+    expect(classifyReviewIssueComment({ user, body: "## Claude review\nUnexpected output" })).toBeNull();
+  });
+  it.each([
+    "## Claude review\n### Approved\nThe implementation satisfies the requirements and is ready to ship.",
+    "## Claude review\n### 🟣 Pre-existing\n- Legacy behavior outside this change.",
+    "## Claude review\n### Blocking\nNone.",
+  ])("accepts recognized clean trusted Claude App sections: %s", body => {
+    expect(classifyReviewIssueComment({ user: { login: "claude[bot]", type: "Bot" }, body }))
+      .toMatchObject({ findings: [], findingsUnavailable: false });
+  });
+  it("keeps a trusted Claude App blocking section blocking", () => {
+    const result = classifyReviewIssueComment({
+      user: { login: "claude[bot]", type: "Bot" },
+      body: "## Claude review\n### 🔴 Blocking\n- Fix the missing authorization check.",
+    });
+    expect(result).toMatchObject({ findingsUnavailable: false, findings: [{ severity: "blocking" }] });
+  });
+  it("fails closed for an unclassifiable trusted Claude App review", () => {
+    expect(classifyReviewIssueComment({ user: { login: "claude[bot]", type: "Bot" }, body: "## Claude review\nUnexpected output" })).toMatchObject({ findingsUnavailable: true });
+  });
+});
+
+
+describe("current review comment association", () => {
+  const blocker = pr1546.find(c => c.id === 6778794145)!;
+  const stale = { ...blocker, id: 123, created_at: "2026-11-10T19:00:00Z", updated_at: "2026-11-10T21:00:00Z", body: '## Claude review\n```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' };
+  it.each(["new comment", "edited tracker"])("accepts a final %s published after check completion", mode => {
+    const comment = {
+      ...blocker,
+      created_at: mode === "new comment" ? "2026-11-10T20:45:00Z" : "2026-11-10T20:39:00Z",
+      updated_at: "2026-11-10T20:46:00Z",
+    };
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:38:00Z", completedAt: "2026-11-10T20:44:14Z" },
+      issueComments: { exitCode: 0, stdout: JSON.stringify([comment, stale]) },
+    });
+    expect(result.findingsUnavailable).toBe(false);
+    expect(result.selectedComment?.id).toBe(blocker.id);
+    expect(result.findings[0].severity).toBe("blocking");
+  });
+  it.each([true, false])("keeps the current blocker with window evidence=%s", evidence => {
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      ...(evidence ? { reviewWindow: { startedAt: "2026-11-10T20:38:00Z", completedAt: "2026-11-10T20:44:14Z" } } : {}),
+      issueComments: { exitCode: 0, stdout: JSON.stringify([blocker, stale]) },
+    });
+    if (evidence) {
+      expect(result.selectedComment?.id).toBe(blocker.id);
+      expect(result.findings[0].severity).toBe("blocking");
+    } else {
+      expect(result.findingsUnavailable).toBe(true);
+      expect(result.verdict).toBeUndefined();
+    }
+  });
+});
+
+
+describe("unavailable current Claude review evidence", () => {
+  const review = pr1546.find(c => c.id === 6778794145)!;
+  it.each([
+    { label: "missing creation time", comment: { ...review, created_at: "" }, exitCode: 0 },
+    { label: "only stale review", comment: { ...review, created_at: "2026-11-10T19:00:00Z" }, exitCode: 0 },
+    { label: "unreadable comments", comment: review, exitCode: 1 },
+  ])("fails closed for $label", ({ comment, exitCode }) => {
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:38:00Z", completedAt: "2026-11-10T20:44:14Z" },
+      issueComments: { exitCode, stdout: JSON.stringify([comment]) },
+    });
+    expect(result.findingsUnavailable).toBe(true);
+    expect(result.verdict).toBeUndefined();
+  });
+});
+
+describe("Claude tracker structure", () => {
+  it.each([
+    { label: "heading findings", body: "## Claude review\n### Blocking issues\n- Fix regression", unavailable: false, pending: false },
+    { label: "contract findings", body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"changes_requested","findings":[{"severity":"blocking","body":"Fix regression"}]}\n```', unavailable: false, pending: false },
+    { label: "unrecognized heading review", body: "## Claude review\nUnexpected output", unavailable: true, pending: false },
+    { label: "malformed contract", body: "```json review-findings\n{\n```", unavailable: true, pending: false },
+    { label: "genuine tracker", body: "", unavailable: true, pending: true },
+  ])("recognizes $label quoting the working phrase", ({ body, unavailable, pending }) => {
+    const result = collectClaudeReviewCommentFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:00:00Z", completedAt: "2026-11-10T20:05:00Z" },
+      issueComments: { exitCode: 0, stdout: JSON.stringify([{
+        id: 100, user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: "2026-11-10T20:01:00Z", body: body + "\n\n**Claude is working…**",
+      }]) },
+    });
+    expect(result.findingsUnavailable).toBe(unavailable);
+    expect(Boolean(result.reviewPending)).toBe(pending);
+    if (!unavailable) {
+      if (body.includes("review-findings")) expect(result.verdict).toBe("changes_requested");
+      expect(result.findings[0].body).toContain("Fix regression");
+    }
+  });
+});
+
+describe("tracker author and head filtering", () => {
+  it.each(["untrusted", "older-head"])("ignores a newer %s tracker", mode => {
+    const result = collectClaudeReviewCommentFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:00:00Z", completedAt: "2026-11-10T20:05:00Z" },
+      issueComments: { exitCode: 0, stdout: JSON.stringify([
+        { id: 100, user: { login: "github-actions[bot]", type: "Bot" }, created_at: "2026-11-10T20:01:00Z",
+          body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' },
+        { id: 101, user: { login: mode === "untrusted" ? "random-user" : "github-actions[bot]", type: "Bot" },
+          created_at: mode === "older-head" ? "2026-11-09T20:01:00Z" : "2026-11-10T20:02:00Z",
+          updated_at: "2026-11-10T20:06:00Z", body: "**Claude is working…**" },
+      ]) },
+    });
+    expect(result.verdict).toBe("approve");
+    expect(result.findingsUnavailable).toBe(false);
+    expect(result.reviewPending).toBeFalsy();
   });
 });

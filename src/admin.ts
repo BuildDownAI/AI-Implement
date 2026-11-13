@@ -46,8 +46,11 @@ import {
   STAGE_AGENT_CONFIG_VERSION,
   STAGE_NAMES,
   STORED_STAGE_SELECTION_FIELDS,
+  validateAccounts,
   type StageAgentConfigurationV1,
   type StageName,
+  type StageAccount,
+  type AccountFailure,
 } from "./agent-config.js";
 import {
   getAccountProfile,
@@ -58,6 +61,7 @@ import {
   readStageInputsFingerprint,
   resolveCandidateProjectStageConfig,
   resolveProjectStageConfig,
+  inspectProjectStageAccounts,
   saveAccountProfileRevision,
   setOrchestratorDefaults,
   setProjectStageConfig,
@@ -93,7 +97,7 @@ import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, fetchProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { count as countReservedCapacity } from "./dispatch-admission.js";
-import { read as readDispatchAdmission, listHeldReservations } from "./dispatch-admission.js";
+import { listHeldReservations } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
@@ -116,7 +120,7 @@ import { GitHubApiError } from "./github-errors.js";
 import { listRepoBranchesAndTags, getRepoDefaultBranch, fetchRepoTarball } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
-import { getFleetReport } from "./report-card.js";
+import { getFleetReport, restateRefForJob } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { FilesystemProvider } from "./providers/filesystem.js";
@@ -127,10 +131,8 @@ import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./wor
 import { isBareWorkflowFileName, workflowFileNamesCollide } from "./workflow-sync.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
-import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 import type { callTool } from "./restate/tools-client.js";
 import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
-import type { RestateStatus } from "./restate/status.js";
 import type { SetupChecksIngressResult, SetupChecksStart } from "./restate/setup-checks.js";
 import { SETUP_CHECK_GROUP_LABELS, setupCommandFor, type SetupCheckProgress, type SetupCheckRun } from "./setup-checks/index.js";
 import type { Caller } from "./mcp-identity.js";
@@ -243,69 +245,6 @@ function normalizeTrustedReviewAuthors(raw: unknown): string[] | null {
     result.push(normalized);
   });
   return result.length > 0 ? result : null;
-}
-
-/**
- * Returns the reason enabling reviewFixLifecycle="restate" is refused, or null when it may
- * proceed. Only automatic GitHub Actions review-fix runs ever move to Restate — local
- * review-fix and human comment-triggered runs stay on Legacy admission regardless.
- *
- * Checks both real prerequisites and fails closed whenever either signal is unavailable or
- * ambiguous (AII-804) — this never guesses:
- *  - "registered, healthy Restate endpoint": `deps.getRestateStatus()` (src/restate/status.ts,
- *    injected — see AdminDeps.getRestateStatus for why this file can't import it directly)
- *    must report the sidecar ready and the endpoint registered. AII-773/AII-724/AII-807 own
- *    when that state actually becomes reachable in production; until then this reports the
- *    endpoint unavailable rather than accepting on a hardcoded assumption.
- *  - "installed template/runner capability on the dispatch ref": a live probe of the target
- *    workflow file at `ref` (src/workflow-probe.ts's resolveWorkflowCapabilities, the same
- *    call the review-fix dispatcher itself makes) must show it declares `run_attempt_token`
- *    (AII-778's attempt-correlation contract) — the capability the Restate pilot actually
- *    depends on to correlate a dispatch back to its attempt.
- */
-async function reviewFixLifecycleEnablementError(
-  params: { executionMode: ExecutionMode; owner: string; repo: string; workflowFile: string; ref: string },
-  config: AdminConfig,
-  deps: AdminDeps,
-): Promise<string | null> {
-  const { executionMode, owner, repo, workflowFile, ref } = params;
-  if (executionMode !== "github-actions") {
-    return `reviewFixLifecycle "restate" requires executionMode "github-actions". Set the mode to GitHub Actions, or leave the lifecycle on Legacy.`;
-  }
-
-  const restateStatus = deps.getRestateStatus?.();
-  if (!restateStatus || restateStatus.sidecar.state !== "ready" || restateStatus.registration.state !== "registered") {
-    return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available. Read the "restate" field of GET / or of the get_tenant_health tool (docs/restate.md, "Health surfaces"). Save again when the sidecar is "ready" and the endpoint is "registered".`;
-  }
-
-  // The reservation ledger was introduced after some Legacy jobs were launched.
-  // Those jobs do not occupy a ledger slot, so admitting Restate work while one
-  // remains active could exceed the shared cap or let both owners work on a PR.
-  // Initial activation is refused until those runs end. Every current dispatch takes a
-  // reservation, so this applies only after an upgrade from a version without the ledger.
-  const unreservedLegacyJobs = getInFlightJobs().filter((job) => {
-    if (job.phase === "kg-refresh") return false;
-    const admission = job.dispatchId ? readDispatchAdmission(job.dispatchId) : null;
-    return !admission || admission.releasedAt !== null;
-  });
-  if (unreservedLegacyJobs.length > 0) {
-    const count = unreservedLegacyJobs.length;
-    return `reviewFixLifecycle "restate" cannot be enabled while ${count} run${count === 1 ? "" : "s"} in flight ${count === 1 ? "has" : "have"} no dispatch reservation. An older version of the orchestrator started ${count === 1 ? "it" : "them"}. No action is necessary: ${count === 1 ? "this run must" : "these runs must"} end by ${count === 1 ? "itself" : "themselves"}. Save again later.`;
-  }
-
-  let capabilities: Awaited<ReturnType<typeof resolveWorkflowCapabilities>>;
-  try {
-    const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-    capabilities = await resolveWorkflowCapabilities({ owner, repo, workflowFile, token, ref });
-  } catch {
-    return `reviewFixLifecycle "restate" could not verify the dispatch-ref workflow's capability. The orchestrator could not read "${workflowFile}" on "${ref}". Check the GitHub App installation and the ref.`;
-  }
-
-  if (capabilities.contract !== "envelope" || !capabilities.supportsAttemptCorrelation || !capabilities.supportsRunPublicationToken) {
-    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token and run_publication_token (installed template/runner capability). Use Sync workflows on this project and merge the PR that it opens on "${ref}". Then save again.`;
-  }
-
-  return null;
 }
 
 let _adminJiraClient: JiraClient | null = null;
@@ -563,26 +502,18 @@ export interface AdminDeps {
   /** Re-reads `RunnerBackend/fly-machines` into the cache after a Settings write. Defaults to `refreshRunnerBackendCache`; a test seam. */
   refreshRunnerBackendCache?: () => Promise<void>;
   /**
-   * Reads the Restate sidecar/endpoint status (src/restate/status.ts's getRestateStatus,
-   * AII-773/AII-804). Injected rather than imported at runtime because this file may only
-   * import src/restate/* as types (src/__tests__/restate-boundary.test.ts) — the real
-   * function is bound in src/index.ts, which sits on that test's runtime-import allowlist.
-   * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
-   */
-  getRestateStatus?: () => RestateStatus;
-  /**
    * Clears an address's bindings through the `AccessBinding` object (src/restate/access-binding.ts), which is the only
-   * writer of bindings. Injected for the same reason as `getRestateStatus`; bound in src/index.ts. Absent in tests that
+   * writer of bindings. Injected to keep runtime Restate imports outside admin.ts; bound in src/index.ts. Absent in tests that
    * don't exercise the route, where it answers 503. There is no direct-delete fallback.
    */
   clearAccessBindings?: (address: string, actor: string | null) => Promise<number>;
-  /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected for the same reason as `getRestateStatus`; absent in tests, where the status reports `unknown`. */
+  /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected to keep runtime Restate imports outside admin.ts; absent in tests, where the status reports `unknown`. */
   readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
    * The review-fix attempt lifecycle facade (AII-806) — attempt detail/activity reads
    * and the reconcile/adopt/cancel recovery actions. A narrow injected interface
    * mirroring `deps.kgRefresh`: its concrete implementation composes the storage
-   * (AII-786), delivery (AII-802/803), and lifecycle-setting (AII-804) contract work,
+   * (AII-786) and delivery (AII-802/803) contracts,
    * plus a real call into the Restate `ReviewFixAttempt` workflow — this file cannot
    * make that last call itself, since it may only import `src/restate/*` as types
    * (src/__tests__/restate-boundary.test.ts). Absent only in tests/deployments that
@@ -590,13 +521,12 @@ export interface AdminDeps {
    */
   reviewFixAttempts?: ReviewFixAttemptsFacade;
   /**
-   * Model-account and stage-configuration seam (AII-962). Injected for the same reason as
-   * `getRestateStatus`: the concrete readiness inspection composes `model-auth-runtime`
+   * Model-account and stage-configuration seam (AII-962). Injected because admin.ts only imports Restate types: the concrete readiness inspection composes `model-auth-runtime`
    * (GitHub App tokens, session store), bound in src/index.ts. Absent means readiness is
    * unknown: profile statuses read `unknown` and opting a project in is refused with 501.
    */
   agentConfig?: AgentConfigAdminDeps;
-  /** Reads the stored setup-check run from the `SetupChecks` object (AII-1538). Injected for the same reason as `getRestateStatus`; absent in tests that don't exercise the route, where it answers 503. */
+  /** Reads the stored setup-check run from the `SetupChecks` object (AII-1538). Injected to keep runtime Restate imports outside admin.ts; absent in tests that don't exercise the route, where it answers 503. */
   readSetupChecks?: () => Promise<SetupChecksIngressResult<SetupCheckRun | null>>;
   /** Starts `SetupChecks.run` without waiting for it, or answers `busy` while a run is going (AII-1541). Same injection as `readSetupChecks`. */
   startSetupChecks?: () => Promise<SetupChecksStart>;
@@ -619,7 +549,12 @@ export interface ReviewFixAttemptCaller {
   email: string | null;
 }
 
-export interface ReviewFixAttemptExecutionRef {
+export type ReviewFixAttemptExecutionRef =
+  | ({ backend: "github-actions" } & ReviewFixAttemptAdoptInput)
+  | { backend: "fly-machines" | "local-docker"; runRef: string };
+
+/** GitHub-only operator adoption body; independent of the read projection. */
+export interface ReviewFixAttemptAdoptInput {
   githubRunId: string;
   githubRunAttempt: number;
 }
@@ -719,7 +654,7 @@ export interface ReviewFixAttemptsFacade {
   reconcile(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
   /** Succeeds only when `execution` verifies as a genuine match for this attempt — an
    *  unverified reference must never flip ownership. */
-  adopt(attemptId: string, execution: ReviewFixAttemptExecutionRef, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  adopt(attemptId: string, execution: ReviewFixAttemptAdoptInput, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
   /**
    * Cancel is two explicit steps, called by the route handler in this order and never
    * collapsed into one call: authority is revoked before termination is even requested,
@@ -1607,7 +1542,7 @@ async function handleGetJobSteps(
   const job = getJobById(jobId);
   if (!job) { json(res, 404, { error: "job not found" }); return; }
   const issueUrl = await resolveIssueUrl(registry, job.teamKey, job.issueId, job.issueIdentifier);
-  json(res, 200, { job: { ...job, issueUrl }, steps: getStepsByJobId(jobId) });
+  json(res, 200, { job: { ...job, issueUrl, restate: restateRefForJob(job.dispatchId, job.phase) }, steps: getStepsByJobId(jobId) });
 }
 
 async function handleGetLocalJobLogs(
@@ -2560,7 +2495,7 @@ async function handleReviewFixAdopt(
     json(res, 400, { error: "Could not read request body" });
     return;
   }
-  let execution: ReviewFixAttemptExecutionRef;
+  let execution: ReviewFixAttemptAdoptInput;
   try {
     const parsed = JSON.parse(raw) as { githubRunId?: unknown; githubRunAttempt?: unknown };
     if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number" || !Number.isSafeInteger(parsed.githubRunAttempt) || parsed.githubRunAttempt < 1) {
@@ -3414,6 +3349,7 @@ export interface UpsertMappingBody {
   dependencyTokenScope?: string | null;
   reviewers?: unknown;
   prDispatchBudget?: number | null;
+  /** @deprecated Ignored; the stored field is historical metadata, not a lifecycle choice. */
   reviewFixLifecycle?: string | null;
   trustedReviewAuthors?: unknown;
   reviewProcess?: unknown;
@@ -3423,7 +3359,7 @@ export async function upsertMappingAction(
   body: UpsertMappingBody,
   config: AdminConfig,
   registry: ProviderRegistry,
-  deps: AdminDeps = {},
+  _deps: AdminDeps = {},
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   if (!body.teamKey || !body.owner || !body.repo) {
     return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
@@ -3629,21 +3565,9 @@ export async function upsertMappingAction(
     return { status: 400, body: { error: `dependencyTokenScope invalid: must be null or "installation"` } };
   }
 
-  let reviewFixLifecycle: "legacy" | "restate" | null;
-  const rawLifecycle = body.reviewFixLifecycle;
-  if (rawLifecycle === undefined) {
-    // Preserve stored value on omit — an unrelated project edit must not silently move which
-    // lifecycle coordinates this project's automatic review-fix runs.
-    reviewFixLifecycle = existingMapping?.reviewFixLifecycle ?? null;
-  } else if (rawLifecycle === null || rawLifecycle === "") {
-    reviewFixLifecycle = null;
-  } else if (rawLifecycle === "legacy") {
-    reviewFixLifecycle = "legacy";
-  } else if (rawLifecycle === "restate") {
-    reviewFixLifecycle = "restate";
-  } else {
-    return { status: 400, body: { error: `reviewFixLifecycle invalid: must be null, "legacy", or "restate"` } };
-  }
+  // Retired API input is ignored. Preserve history for a reviewed deploy revert;
+  // Restate owns new dispatches regardless of the stored value.
+  const reviewFixLifecycle = existingMapping?.reviewFixLifecycle ?? null;
 
   let reviewers: ReviewerSelection[] | null;
   if (body.reviewers === undefined) {
@@ -3675,7 +3599,7 @@ export async function upsertMappingAction(
     }
   }
 
-  // Validate the effective saved pair, including updates that omit either field.
+  // Validate the selected review process independently of retired lifecycle metadata.
   let reviewProcess: ReviewProcessId | null;
   if (body.reviewProcess === undefined) {
     reviewProcess = existingMapping?.reviewProcess ?? null;
@@ -3686,10 +3610,6 @@ export async function upsertMappingAction(
   } else {
     return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"` } };
   }
-  if (reviewProcess === "codex-code-review" && reviewFixLifecycle !== "restate") {
-    return { status: 400, body: { error: 'reviewProcess "codex-code-review" requires reviewFixLifecycle "restate"' } };
-  }
-
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
@@ -3730,23 +3650,6 @@ export async function upsertMappingAction(
     trustedReviewAuthors,
     reviewProcess,
   };
-
-  // Existing attempts keep their stored owner. Revalidate only when a save first enables
-  // Restate or changes where future attempts dispatch; ordinary edits keep the selection
-  // even while the endpoint is temporarily unhealthy.
-  if (reviewFixLifecycle === "restate" && (
-    !existingMapping || existingMapping.reviewFixLifecycle !== "restate" ||
-    mapping.owner !== existingMapping.owner || mapping.repo !== existingMapping.repo ||
-    mapping.workflowFile !== existingMapping.workflowFile || mapping.defaultBranch !== existingMapping.defaultBranch ||
-    mapping.executionMode !== existingMapping.executionMode
-  )) {
-    const enablementError = await reviewFixLifecycleEnablementError(
-      { executionMode, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile, ref: mapping.defaultBranch },
-      config,
-      deps,
-    );
-    if (enablementError) return { status: 400, body: { error: enablementError } };
-  }
 
   // Advisory only: a Linear mapping already holding this key is the one signal we have that it
   // is a Linear team key (no provider method lists teams). Selection drops that team's issues
@@ -4334,13 +4237,18 @@ function storedConfigView(stored: { configRevisionId: string; revision: number; 
 }
 
 /** Validates the value types the store leaves to the resolver, so a legacy-mode write cannot park a malformed stage. */
-function validateStagesBody(stages: unknown): string | null {
+function validateStagesBody(stages: unknown, defaults = false): string | null {
   if (typeof stages !== "object" || stages === null || Array.isArray(stages)) return "stages must be an object";
   for (const [stage, patch] of Object.entries(stages)) {
     if (!(STAGE_NAMES as readonly string[]).includes(stage)) return "stages contains unknown key(s)";
     if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return `stages.${stage} must be an object`;
     for (const [field, value] of Object.entries(patch)) {
       if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) return `stages.${stage} contains unknown key(s)`;
+      if (field === "accounts") {
+        if (!defaults) return "accounts is only supported in orchestrator defaults";
+        try { validateAccounts(value, stage); } catch (err) { return (err as Error).message; }
+        continue;
+      }
       if (value === null) continue;
       if (field === "invocationTimeoutMs" ? !Number.isSafeInteger(value) || (value as number) <= 0 : typeof value !== "string" || value.trim() === "") {
         return `stages.${stage}.${field} is malformed`;
@@ -4363,7 +4271,7 @@ async function handlePutAgentDefaults(req: http.IncomingMessage, res: http.Serve
     return;
   }
   if (body.stages !== undefined) {
-    const bad = validateStagesBody(body.stages);
+    const bad = validateStagesBody(body.stages, true);
     if (bad) {
       json(res, 400, { error: bad });
       return;
@@ -4555,15 +4463,20 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
   }
   const stored = getProjectStageConfig(projectKey);
   const base = { projectKey, enabled: stored?.config.mode === "configured" };
+  const backends = backendsFor(getMappings()[projectKey]!);
+  const checkAccount = (entry: StageAccount): AccountFailure | null =>
+    entry.authMode === "bedrock" && backends.some(backend => backend !== "github-actions") ? "unsupported_combination" : null;
   let projection;
   try {
-    projection = resolveProjectStageConfig(projectKey);
+    projection = resolveProjectStageConfig(projectKey, undefined, checkAccount);
   } catch (err) {
     // Resolver messages are fixed text (disabled or incompatible profile); none carries a credential.
+    const accountEntries = inspectProjectStageAccounts(projectKey, checkAccount);
     json(res, 200, {
       ...base,
       mode: "configured",
       resolved: false,
+      stages: Object.fromEntries(STAGE_NAMES.map(stage => [stage, { entries: accountEntries[stage], fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null }])),
       error: { code: "resolution_failed", message: err instanceof Error ? err.message : "stage configuration does not resolve" },
     });
     return;
@@ -4578,6 +4491,8 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
     const profile = resolution.profiles[stage];
     const projectionProfile = getAccountProfile(profile.id);
     stages[stage] = {
+      entries: resolution.accountEntries?.[stage],
+      fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null,
       values: { ...resolution.stages[stage], fallbackModel: resolution.fallbackModels[stage] ?? null },
       sources: { ...resolution.sources[stage], fallbackModel: resolution.fallbackModelSources[stage] ?? null },
       profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },

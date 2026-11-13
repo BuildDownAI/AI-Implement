@@ -167,7 +167,7 @@ function buildImplementPrompt(
   return prompt;
 }
 
-const IMPLEMENT_CONTINUATION_NOTE =
+export const IMPLEMENT_CONTINUATION_NOTE =
   "A previous attempt was interrupted by a provider error. The working tree contains its partial changes. Continue from the current state; do not revert it.";
 
 /** Structural view of `implementStep`'s outputs — only what the loop reads. */
@@ -242,6 +242,7 @@ export async function runFeedbackLoop(
   let reviewIssues: string[] = [];
   let terminationReason: TerminationReason = "iterations_exhausted";
   const passes: PassStat[] = [];
+  let implementationAccountSwitched = false;
   const fallbackOrigins: Partial<Record<"implementation" | "review", string>> = {};
   let postMortem: string | undefined;
   let failureForOutputs: FailureRecord | undefined;
@@ -326,7 +327,7 @@ export async function runFeedbackLoop(
         const invocationFailure = outputs.invocationFailure as FailureRecord | undefined;
         // Exit-zero fatal results normally retain partial work for review. A capacity
         // switch must instead reach the same retry rail as a thrown invocation failure.
-        if (invocationFailure?.modelFallback || (invocationFailure?.code === "PROVIDER_OVERLOADED" && fallbackOrigins.implementation)) {
+        if (invocationFailure?.accountFallback || invocationFailure?.code === "ACCOUNT_USAGE_LIMIT" || invocationFailure?.modelFallback || (invocationFailure?.code === "PROVIDER_OVERLOADED" && fallbackOrigins.implementation)) {
           throw Object.assign(new Error(invocationFailure.message), { failure: invocationFailure, telemetry: outputs.telemetry });
         }
         implementSubStep.status = "passed";
@@ -355,7 +356,8 @@ export async function runFeedbackLoop(
         const fallback = implementFailure.modelFallback;
         const fallbackRetry = fallback?.stage === "implementation" && !fallbackOrigins.implementation;
         if (fallbackRetry) fallbackOrigins.implementation = fallback.from;
-        const willRetryImplement = fallbackRetry || (isTransient && implementStageAttempt <= params.retryPolicy.stageRetries);
+        if (implementFailure.accountFallback?.stage === "implementation") implementationAccountSwitched = true;
+        const willRetryImplement = implementFailure.accountFallback?.stage === "implementation" || fallbackRetry || (isTransient && implementStageAttempt <= params.retryPolicy.stageRetries);
         // A retried attempt's failure must not overwrite the canonical `implement.{iteration}`
         // row — that id is reserved for the final attempt (BAC-27134's "keep every attempt's
         // evidence"), so a retried attempt's failure record and telemetry are preserved under
@@ -390,15 +392,15 @@ export async function runFeedbackLoop(
           continue;
         }
 
-        if (isTransient) {
+        if (isTransient || implementFailure.code === "ACCOUNT_USAGE_LIMIT" || (implementationAccountSwitched && implementFailure.code.startsWith("MODEL_AUTH_"))) {
           const providerUnavailableFailure: FailureRecord = {
             ...implementFailure,
             stage: "implement",
-            code: "PROVIDER_UNAVAILABLE",
-            // Exhausted the stage-retry budget: this record is terminal, matching the
+            code: isTransient ? "PROVIDER_UNAVAILABLE" : implementFailure.code,
+            // Exhausted the account list or stage-retry budget: this record is terminal, matching the
             // convention push.ts's GIT_PUSH_RETRIES_EXHAUSTED states — an orchestrator
             // rail keying off `retryable` must not start a run again that already spent
-            // its whole stage-retry budget.
+            // its available accounts or whole stage-retry budget.
             retryable: false,
           };
           const dirtyFinal = effects.isRunDirty();
@@ -409,7 +411,7 @@ export async function runFeedbackLoop(
             implementProviderUnavailableTelemetry = implementErrTelemetry;
             break;
           }
-          // Clean tree: nothing to preserve — fail the run with PROVIDER_UNAVAILABLE.
+          // Clean tree: nothing to preserve — fail with the terminal failure code.
           if (typeof err === "object" && err !== null) {
             try {
               (err as Record<string, unknown>).failure = providerUnavailableFailure;
@@ -644,7 +646,7 @@ export async function runFeedbackLoop(
         const fallback = reviewFailure.modelFallback;
         const fallbackRetry = fallback?.stage === "review" && !fallbackOrigins.review;
         if (fallbackRetry) fallbackOrigins.review = fallback.from;
-        const willRetryReview = fallbackRetry || (isTransient && reviewStageAttempt <= params.retryPolicy.stageRetries);
+        const willRetryReview = reviewFailure.accountFallback?.stage === "review" || fallbackRetry || (isTransient && reviewStageAttempt <= params.retryPolicy.stageRetries);
         // A retried attempt's failure must not overwrite the canonical `review.{iteration}`
         // row — see the matching implement-stage comment above (BAC-27134).
         if (willRetryReview) {
@@ -685,6 +687,10 @@ export async function runFeedbackLoop(
           effects.warn(
             `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
           );
+          // Preserve terminal usage-limit and checkout failures for the run's notice.
+          if (reviewFailure.code === "ACCOUNT_USAGE_LIMIT" || reviewFailure.code.startsWith("MODEL_AUTH_")) {
+            failureForOutputs = reviewFailure;
+          }
           feedback = `Review step failed and was skipped: ${String(err)}`;
           terminationReason = "review_error";
         }

@@ -106,6 +106,14 @@ beforeEach(async () => {
 });
 
 describe("loadLocalAgentConfig", () => {
+  it("accepts default account lists and refuses project account lists", async () => {
+    const config = baseConfig();
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "api-a", model: "m-1" }, { accountProfileId: "api-b", model: "" }] });
+    const loaded = await loadLocalAgentConfig(opts(await writeConfig(config)));
+    expect(loaded.resolution.mode).toBe("configured");
+    if (loaded.resolution.mode === "configured") expect(loaded.resolution.accountFallbacks.planning?.[0].accountProfileId).toBe("api-b");
+    await expectCategory(loadLocalAgentConfig(opts(await writeConfig({ ...config, selections: { planning: { accounts: [] } } }))), "resolution_rejected");
+  });
   it("resolves all three stages without any control plane", async () => {
     const { resolution, references } = await loadLocalAgentConfig(opts(await writeConfig(baseConfig())));
     expect(resolution.mode).toBe("configured");

@@ -212,7 +212,7 @@ describe("production managed GHA review-fix launch", () => {
     });
     expect(response.status).toBe(200);
     expect(await response.text()).toContain(ACCESS);
-    expect(result).toEqual({ status: "accepted", execution: { githubRunId: 9100, githubRunAttempt: 1 } });
+    expect(result).toEqual({ status: "accepted", execution: { backend: "github-actions", githubRunId: 9100, githubRunAttempt: 1 } });
     expect(revoked()).toBeNull();
     expect(sent).toHaveLength(1);
     expect(count("run_agent_config_snapshots")).toBe(1);
@@ -492,7 +492,8 @@ describe("production managed GHA review-fix launch", () => {
     const sideEffects = () => ["run_agent_config_snapshots", "model_credential_grants"].map(count);
     const admit = (rt: ModelAuthRuntime | undefined = runtime) => production.canAdmit(SCOPE, CONFIG, rt);
 
-    it("admits a configured Codex selection read-only, then launches exactly once on the real worker", async () => {
+    it.each(["gha", "shadow"])("admits a configured Codex selection read-only in %s, then launches exactly once on the real worker", async (mode) => {
+      vi.stubEnv("RUNNER_MODE", mode);
       const before = sideEffects();
       expect(await admit()).toBe("admit");
       expect(sideEffects()).toEqual(before);
@@ -500,6 +501,8 @@ describe("production managed GHA review-fix launch", () => {
       expect((await worker.launch(plan)).status).toBe("accepted");
       expect(sent).toHaveLength(1);
       expect((await decode()).agentConfig?.stages.implementation.accountProfileId).toBe("cdx");
+      expect((await decode()).credentials?.modelAuthGrant).toBeDefined();
+      expect((await decode()).credentials?.executionPolicy).toMatchObject({ backend: "gha", dispatchId: prepared.attemptId });
     });
 
     async function writeKey(profileId: string, agent: "claude" | "codex", provider: "anthropic" | "openai", authMode: string) {

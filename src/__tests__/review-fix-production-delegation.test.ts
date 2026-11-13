@@ -6,7 +6,6 @@ const updateReviewFixStatus = vi.fn();
 
 vi.mock("../config.js", () => ({
   getMappings: () => getMappings(),
-  resolveReviewFixLifecycle: () => "restate",
 }));
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),

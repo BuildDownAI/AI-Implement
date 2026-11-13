@@ -51,6 +51,8 @@ async function bootModels(admin = true, defaults?: any, accounts?: any[], stub: 
   return stub;
 }
 
+const display = (stage: string, f: string) => document.querySelector(`#mp-stage-rows [data-stage="${stage}"][data-profile-field="${f}"]`)!;
+
 const field = (stage: string, f: string) => document.querySelector(`#mp-stage-rows [data-stage="${stage}"][data-field="${f}"]`) as HTMLInputElement;
 
 describe("models page stage defaults", () => {
@@ -90,11 +92,219 @@ describe("models page stage defaults", () => {
     expect(document.getElementById("mp-stage-rows")!.textContent!.toLowerCase()).not.toContain("turns");
   });
 
-  it("filters profiles by agent/provider and explains an empty list", async () => {
+  it("offers every active profile by Name and ID and explains fallback rules", async () => {
     await bootModels(true, { configured: true, mode: "configured", stages: { review: { agent: "codex", provider: "openai" }, planning: { agent: "claude", provider: "bedrock" } } });
     const opts = Array.from((field("review", "accountProfileId") as unknown as HTMLSelectElement).options).map((o) => o.value);
-    expect(opts).toEqual(["", "p-gpt", "p-gpt2", "p-gpt3"]);
-    expect(document.getElementById("mp-stage-hints")!.textContent).toContain("planning: no compatible active account profile");
+    expect(opts).toEqual(["", "p-claude", "p-gpt", "p-gpt2", "p-gpt3"]);
+    const select = field("review", "accountProfileId") as unknown as HTMLSelectElement;
+    expect(select.options[2].textContent).toBe("gpt (p-gpt)");
+    expect(document.getElementById("mp-stage-card")!.textContent).toContain("same agent as the first account");
+    expect(document.getElementById("mp-stage-card")!.textContent).toContain("Agents tab runs without these fallbacks");
+  });
+
+  for (const multiple of [false, true]) {
+    it(`safely round-trips a hostile profile ID in ${multiple ? "list" : "flat"} defaults`, async () => {
+      const profileId = `hostile\"'><img src=x onerror="window.__pwn=1"><svg onload='window.__pwn=1'>`;
+      const identity = "Hostile profile " + SENT;
+      const accounts = [...ACCOUNTS, { ...ACCOUNTS[0], profileId, identity }];
+      const stub = await bootModels(true, undefined, accounts);
+      const assertSafe = () => {
+        const select = field("review", "accountProfileId") as unknown as HTMLSelectElement;
+        const option = Array.from(select.options).find(o => o.value === profileId)!;
+        expect(option).toBeDefined();
+        expect(option.getAttribute("value")).toBe(profileId);
+        expect(option.textContent).toBe(`${identity} (${profileId})`);
+        expect(document.querySelector("img, svg, [onerror], [onload]")).toBeNull();
+        expect(w.__pwn).toBeUndefined();
+        for (const secret of ["SECRET-REF", "SECRET-TOKEN", "SECRET-STATE"]) expect(document.body.innerHTML).not.toContain(secret);
+        return select;
+      };
+      const select = assertSafe();
+      select.value = profileId;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      field("review", "model").value = "primary";
+      if (multiple) {
+        (document.querySelector('[data-account-action="add"][data-stage="review"]') as HTMLButtonElement).click();
+        const fallback = document.querySelector('[data-account-list="review"]')!.lastElementChild!;
+        (fallback.querySelector('[data-field="accountProfileId"]') as HTMLSelectElement).value = "p-claude";
+      }
+      await w.saveStageDefaults();
+      const saved = stub.calls.find(c => c.method === "PUT")!.body;
+      if (multiple) expect(saved.stages.review.accounts[0]).toEqual({ accountProfileId: profileId, model: "primary" });
+      else {
+        expect(saved.stages.review.accountProfileId).toBe(profileId);
+        expect(saved.stages.review).not.toHaveProperty("accounts");
+      }
+      expect(assertSafe().value).toBe(profileId);
+      await bootModels(true, saved, accounts);
+      expect(assertSafe().value).toBe(profileId);
+    });
+  }
+
+  it("adds, reorders, reloads and removes account/model pairs without losing other edits", async () => {
+    const stub = await bootModels(true, { mode: "configured", stages: { review: { agent: "codex", provider: "openai", accountProfileId: "p-gpt", model: "first", fallbackModel: "capacity" } } });
+    const list = () => document.querySelector('[data-account-list="review"]')!;
+    const rows = () => Array.from(list().children);
+    const action = (index: number, act: string) => (rows()[index].querySelector(`[data-account-action="${act}"]`) as HTMLButtonElement).click();
+    const add = () => (document.querySelector('[data-account-action="add"][data-stage="review"]') as HTMLButtonElement).click();
+    field("review", "invocationTimeoutMs").value = "-1";
+    for (const [id, model] of [["p-gpt2", ""], ["p-gpt3", SENT]]) {
+      add();
+      const row = rows().at(-1)!;
+      (row.querySelector('[data-field="accountProfileId"]') as HTMLSelectElement).value = id;
+      (row.querySelector('[data-field="model"]') as HTMLInputElement).value = model;
+    }
+    action(2, "up");
+    action(1, "up");
+    action(1, "down");
+    expect(field("review", "invocationTimeoutMs").value).toBe("-1");
+    expect((rows()[0].querySelector('[data-account-action="up"]') as HTMLButtonElement).disabled).toBe(true);
+    expect((rows()[2].querySelector('[data-account-action="down"]') as HTMLButtonElement).disabled).toBe(true);
+    field("review", "invocationTimeoutMs").value = "60000";
+    await w.saveStageDefaults();
+    const saved = stub.calls.find(c => c.method === "PUT")!.body;
+    expect(saved.mode).toBe("configured");
+    expect(saved.stages.review).toMatchObject({ fallbackModel: "capacity", invocationTimeoutMs: 60000, accounts: [
+      { accountProfileId: "p-gpt3", model: SENT }, { accountProfileId: "p-gpt2", model: "" }, { accountProfileId: "p-gpt", model: "first" },
+    ] });
+    expect(saved.stages.planning).not.toHaveProperty("accounts");
+    await bootModels(true, saved);
+    expect(rows().map(row => (row.querySelector('[data-field="accountProfileId"]') as HTMLSelectElement).value)).toEqual(["p-gpt3", "p-gpt2", "p-gpt"]);
+    expect(field("review", "model").value).toBe(SENT);
+    expect(document.querySelector("img")).toBeNull();
+    action(2, "remove"); action(1, "remove"); action(0, "remove");
+    expect(rows()).toHaveLength(1);
+    await w.saveStageDefaults();
+    const flatStub: Stub = { calls: [] };
+    stubFetch(flatStub);
+    await w.saveStageDefaults();
+    expect(flatStub.calls[0].body.stages.review).toEqual({ agent: "codex", provider: "openai", model: SENT, accountProfileId: "p-gpt3", fallbackModel: "capacity", invocationTimeoutMs: 60000 });
+  });
+
+  for (const admin of [true, false]) {
+    it(`shows profile-derived text for all stages for ${admin ? "admins" : "non-admins"}`, async () => {
+      await bootModels(admin, { mode: "configured", stages: {
+        planning: { agent: "codex", provider: "openai", accountProfileId: "p-claude" },
+        implementation: { agent: "claude", provider: "bedrock", accounts: [{ accountProfileId: "p-gpt", model: "gpt" }] },
+      } });
+      expect(display("planning", "agent").textContent).toBe("claude");
+      expect(display("planning", "provider").textContent).toBe("anthropic");
+      expect(display("implementation", "agent").textContent).toBe("codex");
+      expect(display("implementation", "provider").textContent).toBe("openai");
+      expect(display("review", "agent").textContent).toBe("inherit");
+      expect(display("review", "provider").textContent).toBe("inherit");
+      expect(document.querySelector('#mp-stage-rows [data-field="agent"], #mp-stage-rows [data-field="provider"]')).toBeNull();
+      expect(document.querySelectorAll('#mp-stage-rows [data-profile-field]')).toHaveLength(6);
+      expect(document.querySelector('#mp-stage-rows [data-profile-field] input, #mp-stage-rows [data-profile-field] select')).toBeNull();
+    });
+  }
+
+  it("updates read-only values on profile changes and restores saved values when cleared", async () => {
+    const stub = await bootModels(true, { mode: "configured", stages: { review: { agent: "claude", provider: "bedrock" } } });
+    const change = (value: string) => {
+      field("review", "accountProfileId").value = value;
+      field("review", "accountProfileId").dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    expect(display("review", "provider").textContent).toBe("bedrock");
+    change("p-gpt");
+    expect(display("review", "agent").textContent).toBe("codex");
+    expect(display("review", "provider").textContent).toBe("openai");
+    change("p-claude");
+    expect(display("review", "agent").textContent).toBe("claude");
+    expect(display("review", "provider").textContent).toBe("anthropic");
+    change("");
+    expect(display("review", "provider").textContent).toBe("bedrock");
+    await w.saveStageDefaults();
+    expect(stub.calls.find(c => c.method === "PUT")!.body.stages.review).toEqual({
+      agent: "claude", provider: "bedrock", accountProfileId: null, model: null, fallbackModel: null, invocationTimeoutMs: null,
+    });
+  });
+
+  it("synchronizes the first account on render, reorder and removal and saves those values", async () => {
+    const stub = await bootModels(true, { mode: "configured", stages: { review: { agent: "claude", provider: "bedrock", accounts: [
+      { accountProfileId: "p-gpt", model: "gpt" }, { accountProfileId: "p-claude", model: "claude" },
+    ] } } });
+    const rows = () => Array.from(document.querySelector('[data-account-list="review"]')!.children);
+    expect(display("review", "agent").textContent).toBe("codex");
+    expect(display("review", "provider").textContent).toBe("openai");
+    (rows()[1].querySelector('[data-account-action="up"]') as HTMLButtonElement).click();
+    expect(display("review", "agent").textContent).toBe("claude");
+    expect(display("review", "provider").textContent).toBe("anthropic");
+    (rows()[1].querySelector('[data-account-action="up"]') as HTMLButtonElement).click();
+    expect(display("review", "agent").textContent).toBe("codex");
+    expect(display("review", "provider").textContent).toBe("openai");
+    (rows()[1].querySelector('[data-account-action="up"]') as HTMLButtonElement).click();
+    await w.saveStageDefaults();
+    expect(stub.calls.find(c => c.method === "PUT")!.body.stages.review).toMatchObject({ agent: "claude", provider: "anthropic", accounts: [
+      { accountProfileId: "p-claude", model: "claude" }, { accountProfileId: "p-gpt", model: "gpt" },
+    ] });
+    (rows()[0].querySelector('[data-account-action="remove"]') as HTMLButtonElement).click();
+    expect(display("review", "agent").textContent).toBe("codex");
+    expect(display("review", "provider").textContent).toBe("openai");
+  });
+
+  for (const multiple of [false, true]) {
+    for (const profileId of ["p-gpt", "", "unavailable"]) {
+      it(`preserves the complete ${multiple ? "list" : "flat"} save body for profile "${profileId}"`, async () => {
+        const entries = [{ accountProfileId: profileId, model: "  primary  " }, { accountProfileId: "p-claude", model: "  fallback  " }];
+        const stub = await bootModels(true, { mode: "configured", stages: {
+          planning: { agent: "claude", provider: "bedrock", accountProfileId: "unavailable" },
+          review: { agent: "claude", provider: "bedrock", fallbackModel: "  capacity  ", invocationTimeoutMs: 60000,
+            ...(multiple ? { accounts: entries } : entries[0]) },
+        } });
+        expect(display("review", "agent").textContent).toBe(profileId === "p-gpt" ? "codex" : "claude");
+        expect(display("review", "provider").textContent).toBe(profileId === "p-gpt" ? "openai" : "bedrock");
+        await w.saveStageDefaults();
+        const empty = { agent: null, provider: null, model: null, fallbackModel: null, accountProfileId: null, invocationTimeoutMs: null };
+        expect(stub.calls.find(c => c.method === "PUT")).toEqual({
+          url: "/api/agent-defaults", method: "PUT", body: {
+            mode: "configured", stages: {
+              planning: { ...empty, agent: "claude", provider: "bedrock", accountProfileId: "unavailable" },
+              implementation: empty,
+              review: {
+                agent: profileId === "p-gpt" ? "codex" : "claude",
+                provider: profileId === "p-gpt" ? "openai" : "bedrock",
+                fallbackModel: "capacity", invocationTimeoutMs: 60000,
+                ...(multiple ? { accounts: [{ accountProfileId: profileId, model: "primary" }, { accountProfileId: "p-claude", model: "fallback" }] }
+                  : { accountProfileId: profileId || null, model: "primary" }),
+              },
+            },
+          },
+        });
+      });
+    }
+  }
+
+  it("refreshes profile choices during polling without losing unsaved account order or models", async () => {
+    const stub = await bootModels(true);
+    field("review", "accountProfileId").value = "p-gpt";
+    field("review", "accountProfileId").dispatchEvent(new Event("change", { bubbles: true }));
+    field("review", "model").value = "unsaved";
+    (document.querySelector('[data-account-action="add"][data-stage="review"]') as HTMLButtonElement).click();
+    const list = document.querySelector('[data-account-list="review"]')!;
+    const fallback = list.lastElementChild!;
+    (fallback.querySelector('[data-field="accountProfileId"]') as HTMLSelectElement).value = "p-claude";
+    const refreshed = [...ACCOUNTS, { ...ACCOUNTS[0], profileId: "imported", identity: "Imported " + SENT }];
+    stubFetch(stub, undefined, refreshed);
+    await w.loadModelsAndProviders();
+    expect(list.children).toHaveLength(2);
+    expect(field("review", "accountProfileId").value).toBe("p-gpt");
+    expect(field("review", "model").value).toBe("unsaved");
+    expect((fallback.querySelector('[data-field="accountProfileId"]') as HTMLSelectElement).value).toBe("p-claude");
+    expect(Array.from((field("review", "accountProfileId") as unknown as HTMLSelectElement).options).map(o => o.value)).toContain("imported");
+    expect(display("review", "agent").textContent).toBe("codex");
+    expect(document.querySelector("img")).toBeNull();
+  });
+
+  it("sends cross-agent blank models to the server and retains its refusal through polling", async () => {
+    const error = "review.accounts[1] requires a model " + SENT;
+    const stub = await bootModels(true, { mode: "configured", stages: { review: { accounts: [{ accountProfileId: "p-gpt", model: "first" }, { accountProfileId: "p-claude", model: "" }] } } }, undefined, { calls: [], put: { status: 400, body: { error } } });
+    await w.saveStageDefaults();
+    expect(stub.calls.find(c => c.method === "PUT")!.body.stages.review.accounts[1].model).toBe("");
+    await w.loadModelsAndProviders();
+    expect(document.getElementById("mp-stage-error")!.textContent).toContain(error);
+    expect(document.querySelectorAll('[data-account-list="review"] [data-account-row]')).toHaveLength(2);
+    expect(document.querySelector("img")).toBeNull();
   });
 
   it("shows guidance when there are no accounts", async () => {
@@ -104,8 +314,6 @@ describe("models page stage defaults", () => {
 
   it("saves the full stages object with null for cleared fields", async () => {
     const stub = await bootModels(true, { configured: true, mode: "configured", stages: { planning: { agent: "claude" } } });
-    field("review", "agent").value = "codex";
-    field("review", "agent").dispatchEvent(new Event("change", { bubbles: true }));
     field("review", "model").value = "m1";
     field("review", "invocationTimeoutMs").value = "60000";
     w.saveStageDefaults();
@@ -114,7 +322,7 @@ describe("models page stage defaults", () => {
     expect(put.url).toBe("/api/agent-defaults");
     expect(put.body.mode).toBe("configured");
     expect(put.body.stages.planning).toEqual({ agent: "claude", provider: null, model: null, fallbackModel: null, accountProfileId: null, invocationTimeoutMs: null });
-    expect(put.body.stages.review).toMatchObject({ agent: "codex", model: "m1", invocationTimeoutMs: 60000, provider: null });
+    expect(put.body.stages.review).toMatchObject({ agent: null, model: "m1", invocationTimeoutMs: 60000, provider: null });
     expect(put.body.stages.implementation.agent).toBeNull();
   });
 
@@ -180,6 +388,7 @@ describe("models page stage defaults", () => {
     const stub = await bootModels(false);
     expect(document.getElementById("mp-stage-actions")!.classList.contains("hidden")).toBe(true);
     expect(field("review", "model").disabled).toBe(true);
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('[data-account-action]')).every(button => button.disabled)).toBe(true);
     w.saveStageDefaults();
     await tick();
     expect(stub.calls.some((c) => c.method !== "GET")).toBe(false);

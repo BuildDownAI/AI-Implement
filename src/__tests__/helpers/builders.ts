@@ -151,7 +151,9 @@ export function makeScopedInstallationToken(overrides: Partial<ScopedInstallatio
 }
 
 // The deadline is an hour ahead of when the result is built, so a default attempt has not expired.
-export function makeReviewFixResult(overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+export function makeReviewFixResult(
+  overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {},
+): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   return {
     version: 1,
     attemptId: "attempt-1",
@@ -294,6 +296,7 @@ export function makeProvider(overrides: Partial<TicketingProvider> = {}): Ticket
     clearWorkingState: vi.fn<TicketingProvider["clearWorkingState"]>(async () => true),
     parkForHuman: vi.fn<TicketingProvider["parkForHuman"]>(async () => true),
     markMerged: vi.fn<TicketingProvider["markMerged"]>(async () => {}),
+    createChildIssue: vi.fn<TicketingProvider["createChildIssue"]>(async () => ({ id: "child-id", identifier: "TEST-2" })),
     postComment: vi.fn<TicketingProvider["postComment"]>(async () => {}),
     fetchPlanningContext: vi.fn<TicketingProvider["fetchPlanningContext"]>(async () => ""),
     issueUrl: vi.fn<TicketingProvider["issueUrl"]>((issue) => `https://linear.app/issue/${issue.identifier}`),

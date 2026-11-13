@@ -71,6 +71,16 @@ describe("grant bootstrap", () => {
     if (r.ok) expect(r.value.bindings).toHaveLength(2);
   });
 
+  it("accepts sixteen bindings and rejects empty or oversized grants", () => {
+    const bindings = Array.from({ length: 16 }, (_, i) => ({ ...apiBinding, profileId: `profile-${i}` }));
+    const result = parseModelAuthGrantBootstrap(grant({ bindings }));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.bindings).toEqual(bindings);
+    for (const invalid of [[], [...bindings, { ...apiBinding, profileId: "extra" }]]) {
+      expect(errorOf(parseModelAuthGrantBootstrap(grant({ bindings: invalid })))).toContain("1-16 entries");
+    }
+  });
+
   it("allows one profile on several stages with identical pinning", () => {
     const r = parseModelAuthGrantBootstrap(
       grant({ bindings: [apiBinding, { ...apiBinding, stage: "review" }] }),

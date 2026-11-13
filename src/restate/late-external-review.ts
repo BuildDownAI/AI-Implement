@@ -326,11 +326,11 @@ async function newestReviewRejectsHead(token: string, input: { owner: string; re
     if (classified.verdict === "changes_requested") {
       if (classified.findings.length === 0) return "changes_requested-empty";
       // ADR 028: a finding the fix pass deferred does not gate the merge. Fail closed: every listed finding
-      // needs a ledger row and every row must be `deferred`; a missing row means the deferral was never recorded.
+      // needs a ledger row and every row must be `deferred` or `rejected`; a missing row means closure was never recorded.
       const keys = [...new Set(classified.findings.map((f) => stableReviewFindingKey(f)))];
       const rows = getReviewFindingsByKeys(`${input.owner}/${input.repo}`, input.prNumber, keys);
       const byKey = new Map(rows.map((r) => [r.findingKey, r.status]));
-      return keys.every((k) => byKey.get(k) === "deferred") ? undefined : "changes_requested";
+      return keys.every((k) => byKey.get(k) === "deferred" || byKey.get(k) === "rejected") ? undefined : "changes_requested";
     }
     return undefined;
   }

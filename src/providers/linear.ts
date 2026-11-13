@@ -141,6 +141,25 @@ export class LinearProvider implements TicketingProvider {
     return `${this.workspaceUrl}/issue/${issue.identifier}`;
   }
 
+  async createChildIssue(parentId: string, _scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    const { issue: parent } = await this.linearMutation<{ issue: { id: string; team: { id: string } } | null }>(
+      `query($parentId: String!) { issue(id: $parentId) { id team { id } } }`, { parentId },
+    );
+    if (!parent) throw new Error("Linear parent issue not found");
+    const name = getLinearPickupLabel();
+    const labels = await this.linearMutation<{ issueLabels: { nodes: Array<{ id: string; name: string; team: { id: string } | null }> } }>(
+      `query($name: String!) { issueLabels(filter: { name: { eq: $name } }) { nodes { id name team { id } } } }`, { name },
+    );
+    const label = reusableLabel(labels.issueLabels.nodes.filter((l) => l.name === name), (l) => l.team?.id ?? null, parent.team.id);
+    if (!label) throw new Error(`Linear pickup label "${name}" is unavailable for the parent's team`);
+    const result = await this.linearMutation<{ issueCreate: { success: boolean; issue: { id: string; identifier: string } | null } }>(
+      `mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier } } }`,
+      { input: { parentId: parent.id, teamId: parent.team.id, title: content.title, description: content.body, labelIds: [label.id] } },
+    );
+    if (!result.issueCreate.success || !result.issueCreate.issue) throw new Error("Linear child issue creation failed");
+    return result.issueCreate.issue;
+  }
+
   async findByKey(key: string): Promise<TicketIssue | null> {
     const match = /^([A-Z][A-Z0-9_]*)-(\d+)$/.exec(key);
     if (!match) return null;
@@ -174,12 +193,13 @@ export class LinearProvider implements TicketingProvider {
     return fetchLinearPlanningContext({ issueId });
   }
 
-  async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
     if (!isLinearAuthConfigured()) throw new TrackerUnavailableError("Linear credential not configured");
     if (!mapping.teamKey) throw new TrackerUnavailableError("mapping carries no team key");
+    const hasTitlePrefix = filter?.titlePrefix !== undefined;
     const data = await this.linearMutation<{ issues?: { nodes: TrackerIssuePage["issues"]; pageInfo: TrackerIssuePage["pageInfo"] } }>(
-      `query($teamKey: String!, $first: Int!, $after: String) {
-        issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
+      `query($teamKey: String!, $first: Int!, $after: String${hasTitlePrefix ? ", $title: String" : ""}) {
+        issues(filter: { team: { key: { eq: $teamKey } }${hasTitlePrefix ? ", title: { startsWith: $title }" : ""} }, first: $first, after: $after, orderBy: updatedAt) {
           nodes {
             id identifier title description branchName
             state { name type }
@@ -192,7 +212,7 @@ export class LinearProvider implements TicketingProvider {
           pageInfo { hasNextPage endCursor }
         }
       }`,
-      { teamKey: mapping.teamKey, first: 50, after: cursor },
+      { teamKey: mapping.teamKey, first: 50, after: cursor, ...(hasTitlePrefix ? { title: filter.titlePrefix } : {}) },
     );
     return {
       issues: data.issues?.nodes ?? [],

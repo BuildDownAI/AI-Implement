@@ -10,6 +10,7 @@ import {
   type AccountAuthMode,
   type ConfiguredStageResolution,
   type FieldSource,
+  type StageAccount,
   type StageName,
   type StageSelection,
   type StageSelectionField,
@@ -92,6 +93,33 @@ export function copyModelFallbacks(value: unknown): Partial<Record<StageName, st
   return out;
 }
 
+/** Frozen public account metadata only. Invalid input never echoes supplied values. */
+export type AccountFallbacks = Partial<Record<StageName, StageAccount[]>>;
+export function copyAccountFallbacks(value: unknown): AccountFallbacks | undefined {
+  if (value === undefined) return undefined;
+  const fail = (): never => { throw new Error("invalid run_config.accountFallbacks"); };
+  if (!isRec(value)) return fail();
+  const out: AccountFallbacks = {};
+  const keys = ["accountProfileId", "profileRevision", "agent", "provider", "authMode", "model"];
+  for (const [stage, entries] of Object.entries(value)) {
+    if (!(STAGE_NAMES as readonly string[]).includes(stage) || !Array.isArray(entries)) return fail();
+    const copied: StageAccount[] = [];
+    for (const entry of entries) {
+      if (!isRec(entry) || Object.keys(entry).length !== keys.length || Object.keys(entry).some(k => !keys.includes(k))
+        || typeof entry.accountProfileId !== "string" || !entry.accountProfileId.trim()
+        || !Number.isSafeInteger(entry.profileRevision) || (entry.profileRevision as number) < 1
+        || !["claude", "codex"].includes(entry.agent as string)
+        || !["anthropic", "bedrock", "openai"].includes(entry.provider as string)
+        || !["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"].includes(entry.authMode as string)
+        || typeof entry.model !== "string" || !entry.model.trim()) return fail();
+      copied.push({ accountProfileId: entry.accountProfileId, profileRevision: entry.profileRevision,
+        agent: entry.agent, provider: entry.provider, authMode: entry.authMode, model: entry.model } as StageAccount);
+    }
+    if (copied.length) out[stage as StageName] = copied;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
  * workflow_dispatch input (`run_config`) on GHA and as the
@@ -105,8 +133,10 @@ export function copyModelFallbacks(value: unknown): Partial<Record<StageName, st
 export interface RunConfigV1 {
   modelPrices?: RunModelPrices;
   modelFallbacks?: Partial<Record<StageName, string>>;
+  accountFallbacks?: AccountFallbacks;
   v: 1;
   issue: { id: string; identifier: string; title: string; description: string };
+  reviewOnly?: { reviewers: ReviewerSelection[] };
   prNumber?: string;
   baseBranch?: string;
   runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
@@ -491,6 +521,7 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 export interface ImplRunConfigInput {
   modelPrices?: RunModelPrices;
   modelFallbacks?: Partial<Record<StageName, string>>;
+  accountFallbacks?: AccountFallbacks;
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
   baseBranch: string;
@@ -513,6 +544,7 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
   return buildRunConfig({
     modelPrices: input.modelPrices,
     modelFallbacks: input.modelFallbacks,
+    accountFallbacks: input.accountFallbacks,
     runnerPhase: "implementation",
     issue,
     mapping,
@@ -527,11 +559,13 @@ export function buildImplRunConfig(input: ImplRunConfigInput): RunConfigV1 {
 export interface RunConfigBuildInput {
   modelPrices?: RunModelPrices;
   modelFallbacks?: Partial<Record<StageName, string>>;
+  accountFallbacks?: AccountFallbacks;
   runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string };
   mapping: RepoMapping;
   baseBranch?: string;
   runnerCallbackUrl?: string;
+  reviewOnly?: { reviewers: ReviewerSelection[] };
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. */
   commentInstruction?: string;
@@ -557,9 +591,11 @@ export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
   const { issue, mapping } = input;
   const modelPrices = copyModelPrices(input.modelPrices);
   const modelFallbacks = copyModelFallbacks(input.modelFallbacks);
+  const accountFallbacks = copyAccountFallbacks(input.accountFallbacks);
   return {
     ...(modelPrices ? { modelPrices } : {}),
     ...(modelFallbacks ? { modelFallbacks } : {}),
+    ...(accountFallbacks ? { accountFallbacks } : {}),
     v: 1,
     issue: {
       id: issue.id,
@@ -574,6 +610,7 @@ export function buildRunConfig(input: RunConfigBuildInput): RunConfigV1 {
     ...(input.runnerCallbackUrl ? { runnerCallbackUrl: input.runnerCallbackUrl } : {}),
     ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
     ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+    ...(input.reviewOnly ? { reviewOnly: input.reviewOnly } : {}),
     ...(input.prNumber ? { prNumber: input.prNumber } : {}),
     ...(input.commentInstruction ? { commentInstruction: input.commentInstruction } : {}),
     ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
@@ -662,7 +699,16 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (prices) out.modelPrices = prices;
   const fallbacks = copyModelFallbacks(cfg.modelFallbacks);
   if (fallbacks) out.modelFallbacks = fallbacks;
+  const accounts = copyAccountFallbacks(cfg.accountFallbacks);
+  if (accounts) out.accountFallbacks = accounts;
   if (prNumber !== undefined) out.prNumber = prNumber;
+  if (cfg.reviewOnly !== undefined) {
+    if (!isRec(cfg.reviewOnly) || !isReviewerSelectionArray(cfg.reviewOnly.reviewers) || cfg.reviewOnly.reviewers.length === 0
+      || !prNumber || runnerPhase !== "gap-analysis" || reviewFix !== undefined) {
+      throw new Error("invalid run_config.reviewOnly");
+    }
+    out.reviewOnly = { reviewers: cfg.reviewOnly.reviewers };
+  }
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
   if (runnerPhase !== undefined) out.runnerPhase = runnerPhase;
   if (branchPrefix !== undefined) out.branchPrefix = branchPrefix;

@@ -26,7 +26,7 @@ export interface TicketIssue {
   nativeStatus: string;
   /**
    * Immediate parent identifier, when this issue has a parent. Logging/informational only.
-   * Populated by the Linear and Jira providers; undefined for others.
+   * Populated when the provider knows the parent association.
    */
   parentRef?: { identifier: string };
   /**
@@ -250,6 +250,9 @@ export interface TicketingProvider {
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;
 
+  /** Create a native child in the parent's team/project, ready for pickup. */
+  createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }>;
+
   // Communication
   postComment(issueId: string, body: string): Promise<void>;
 
@@ -267,8 +270,8 @@ export interface TicketingProvider {
    *  provider that cannot infer the mapping from the key (Jira) answers `scopeKey: ""`. */
   findByKey(key: string, scopeKey?: string): Promise<TicketIssue | null>;
 
-  /** One page of the mapping's issues for the knowledge-graph export. Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
-  listIssuesPage?(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage>;
+  /** One page of the mapping's issues for export or review-child discovery. When supplied, filter must narrow results server-side (a title-prefix superset is allowed). Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
+  listIssuesPage?(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage>;
   /** The facts the setup checks judge for these projects, read without any write. A Linear project's key is its team's key. Optional so a fork's custom provider still compiles. */
   fetchSetupFacts?(projectKeys: string[]): Promise<TrackerSetupFacts>;
 }

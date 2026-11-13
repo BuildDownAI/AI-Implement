@@ -41,7 +41,9 @@
  * It does not perform the network calls or authority/policy checks a full
  * `ReviewFixFinalizerPort.applyApproval` needs — those remain out of scope here.
  */
+import { normalizeExecutionIdentity } from "./review-fix-contract.js";
 import { createHash } from "node:crypto";
+import { getRunnerMode, resolvePlanningExecutionPath } from "./runner-mode.js";
 import { getDb } from "./dedup.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { isParked } from "./dispatch-breaker.js";
@@ -89,7 +91,9 @@ interface AttemptRow {
   state: string;
   created_at: number;
   deadline_at: number;
+  execution_backend: PreparedReviewFixAttempt["executionBackend"];
   authority_revoked_at: number | null;
+  execution_ref: string | null;
   github_run_id: number | null;
   github_run_attempt: number | null;
   task_snapshot_json: string;
@@ -162,6 +166,7 @@ function toPrepared(row: AttemptRow): PreparedReviewFixAttempt {
     findings: JSON.parse(row.finding_versions_json),
     owner: row.owner,
     deadlineAt: row.deadline_at,
+    executionBackend: row.execution_backend ?? "github-actions",
   };
 }
 
@@ -230,6 +235,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         return { status: "deferred", reason: "paused" };
       }
       const { teamKey, mapping } = mappingEntry;
+      const executionBackend = resolvePlanningExecutionPath(getRunnerMode().mode, mapping.executionMode);
 
       const now = Date.now();
       const issueId = `${request.scope.repository}#${request.scope.prNumber}`;
@@ -249,22 +255,22 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
             prNumber: request.scope.prNumber,
           },
           kind: "gap-fill",
-          backend: "github-actions",
+          backend: executionBackend,
           lifecycleOwner: { kind: "restate", attemptId: dispatchId },
           cap: mapping.maxInProgressAiIssues,
           prDispatchBudget: resolvePrDispatchBudget(mapping),
-          parked: queueIssueId !== null && isParked(queueIssueId, "gap-analysis"),
+          parked: isParked(queueIssueId || issueId, "gap-analysis"),
         },
         () => {
           db.prepare(`
             INSERT INTO review_fix_attempts
               (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
                issue_scope, issue_id, owner, state, created_at, deadline_at,
-               task_snapshot_json, finding_versions_json)
+               task_snapshot_json, finding_versions_json, execution_backend)
             VALUES
               (@attemptId, @dispatchId, @mappingKey, @installationId, @repository, @prNumber,
                'pr', @issueId, @owner, 'prepared', @createdAt, @deadlineAt,
-               @taskSnapshotJson, @findingVersionsJson)
+               @taskSnapshotJson, @findingVersionsJson, @executionBackend)
           `).run({
             attemptId: dispatchId,
             dispatchId,
@@ -278,6 +284,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
             deadlineAt,
             taskSnapshotJson,
             findingVersionsJson,
+            executionBackend,
           });
           return undefined;
         },
@@ -322,9 +329,12 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
    * `getPreparedAttempt` does for `attemptId`, with no in-memory state of its own.
    */
   async findPreparedAttemptByExecution(execution: WorkerExecutionIdentity): Promise<PreparedReviewFixAttempt | null> {
-    const row = getDb()
-      .prepare("SELECT * FROM review_fix_attempts WHERE github_run_id = ? AND github_run_attempt = ?")
-      .get(execution.githubRunId, execution.githubRunAttempt) as AttemptRow | undefined;
+    const identity = normalizeExecutionIdentity(execution);
+    const row = (identity.backend === "github-actions"
+      ? getDb().prepare("SELECT * FROM review_fix_attempts WHERE execution_backend = ? AND github_run_id = ? AND github_run_attempt = ?")
+        .get(identity.backend, identity.githubRunId, identity.githubRunAttempt)
+      : getDb().prepare("SELECT * FROM review_fix_attempts WHERE execution_backend = ? AND execution_ref = ?")
+        .get(identity.backend, identity.runRef)) as AttemptRow | undefined;
     return row ? toPrepared(row) : null;
   }
 
@@ -341,13 +351,25 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
   }
 
   async bindExecution(attemptId: AttemptId, execution: WorkerExecutionIdentity, now: number): Promise<ReviewFixExecutionBindOutcome> {
+    const identity = normalizeExecutionIdentity(execution);
     const db = getDb();
     return db.transaction((): ReviewFixExecutionBindOutcome => {
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as AttemptRow | undefined;
       if (!row || !isDispatchActive(db, row.dispatch_id)) return { status: "not_owner" };
 
+      if ((row.execution_backend ?? "github-actions") !== identity.backend) return { status: "not_owner" };
+      if (identity.backend !== "github-actions") {
+        if (row.execution_ref !== null) {
+          return { status: "already_bound", execution: { backend: identity.backend, runRef: row.execution_ref } };
+        }
+        db.prepare(`UPDATE review_fix_attempts SET execution_ref = ?,
+          state = CASE WHEN state = 'prepared' THEN 'launch_intent' ELSE state END
+          WHERE attempt_id = ? AND execution_ref IS NULL`).run(identity.runRef, attemptId);
+        return { status: "bound" };
+      }
+
       if (row.github_run_id !== null && row.github_run_attempt !== null) {
-        return { status: "already_bound", execution: { githubRunId: row.github_run_id, githubRunAttempt: row.github_run_attempt } };
+        return { status: "already_bound", execution: { backend: "github-actions", githubRunId: row.github_run_id, githubRunAttempt: row.github_run_attempt } };
       }
 
       // A result can be accepted before binding (recordResult never writes
@@ -358,11 +380,11 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       // post-bind mismatch is surfaced (already_bound with the original
       // identity), and persist the conflict marker.
       if (row.accepted_result_json !== null) {
-        const accepted = JSON.parse(row.accepted_result_json) as ReviewFixResultMetadataV1;
-        if (accepted.githubRunId !== execution.githubRunId || accepted.githubRunAttempt !== execution.githubRunAttempt) {
+        const accepted = JSON.parse(row.accepted_result_json) as Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>;
+        if (accepted.githubRunId !== identity.githubRunId || accepted.githubRunAttempt !== identity.githubRunAttempt) {
           db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
             .run(now, attemptId);
-          return { status: "already_bound", execution: { githubRunId: accepted.githubRunId, githubRunAttempt: accepted.githubRunAttempt } };
+          return { status: "already_bound", execution: { backend: "github-actions", githubRunId: accepted.githubRunId, githubRunAttempt: accepted.githubRunAttempt } };
         }
       }
 
@@ -371,7 +393,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
         SET github_run_id = ?, github_run_attempt = ?,
             state = CASE WHEN state = 'prepared' THEN 'launch_intent' ELSE state END
         WHERE attempt_id = ? AND github_run_id IS NULL
-      `).run(execution.githubRunId, execution.githubRunAttempt, attemptId);
+      `).run(identity.githubRunId, identity.githubRunAttempt, attemptId);
       return { status: "bound" };
     })();
   }
@@ -411,6 +433,12 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
     return db.transaction((): ResultIntakeOutcome => {
       const row = db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as AttemptRow | undefined;
       if (!row) return { status: "stale", attemptId, reason: "unknown attempt" };
+      if ((row.execution_backend ?? "github-actions") !== (result.executionBackend ?? "github-actions")) {
+        return { status: "stale", attemptId, reason: "result does not match the attempt backend" };
+      }
+      if (result.executionBackend !== undefined && row.execution_ref === null) {
+        return { status: "stale", attemptId, reason: "container execution is not bound" };
+      }
       if (result.attemptId !== attemptId) {
         return { status: "stale", attemptId, reason: "result attemptId does not match the target attempt" };
       }
@@ -425,7 +453,7 @@ export class SqliteReviewFixAttemptStore implements ReviewFixAttemptStorePort {
       if (!isDispatchActive(db, row.dispatch_id)) {
         return { status: "stale", attemptId, reason: "attempt has been released or superseded" };
       }
-      if (row.github_run_id !== null
+      if (result.executionBackend === undefined && row.github_run_id !== null
         && (row.github_run_id !== result.githubRunId || row.github_run_attempt !== result.githubRunAttempt)) {
         db.prepare("UPDATE review_fix_attempts SET result_conflict_at = COALESCE(result_conflict_at, ?) WHERE attempt_id = ?")
           .run(now, attemptId);

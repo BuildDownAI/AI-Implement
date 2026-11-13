@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   copyModelPrices,
+  copyAccountFallbacks,
   encodeRunConfig,
   decodeRunConfig,
   decodeTrustedRunConfig,
@@ -1076,6 +1077,51 @@ describe("modelFallbacks", () => {
         },
       });
       expect(encodeTrustedRunConfig(config)).toBe(Buffer.from(expected, "utf8").toString("base64"));
+    }
+  });
+});
+
+
+describe("accountFallbacks", () => {
+  const entry = { accountProfileId: "B", profileRevision: 2, agent: "codex" as const, provider: "openai" as const, authMode: "openai-api-key" as const, model: "model-b" };
+  const accountFallbacks = { implementation: [entry, { ...entry, accountProfileId: "C", profileRevision: 3, model: "model-c" }] };
+  it.each([
+    ["valid", accountFallbacks, accountFallbacks],
+    ["absent", undefined, undefined],
+    ["empty", { implementation: [] }, undefined],
+  ])("copies %s", (_name, input, expected) => {
+    expect(copyAccountFallbacks(input)).toEqual(expected);
+  });
+  it.each([
+    ["wrong type", []], ["unknown stage", { unknown: [entry] }],
+    ["missing field", { implementation: [{ ...entry, model: undefined }] }],
+    ["extra key", { implementation: [{ ...entry, credentialRef: "secret" }] }],
+  ])("rejects %s with a fixed error", (_name, input) => {
+    expect(() => copyAccountFallbacks(input)).toThrowError(/^invalid run_config.accountFallbacks$/);
+  });
+  it("forwards ordered public entries through managed builders and both transports", () => {
+    const fields = managedRunConfigFields({ kind: "launch", snapshot: makeSnapshot(), accountFallbacks });
+    const input = { issue: full.issue, mapping: makeMapping(), baseBranch: "testing", retryPolicy: DEFAULT_RETRY_POLICY, ...fields };
+    for (const built of [buildRunConfig({ ...input, runnerPhase: "implementation" }), buildImplRunConfig(input)]) {
+      expect(built.accountFallbacks).toEqual(accountFallbacks);
+      expect(decodeRunConfig(encodeRunConfig(built)).accountFallbacks).toEqual(accountFallbacks);
+      expect(decodeTrustedRunConfig(encodeTrustedRunConfig(built)).accountFallbacks).toEqual(accountFallbacks);
+      expect(diagnosticProjection(built).accountFallbacks).toEqual(accountFallbacks);
+      expect(JSON.stringify(built)).not.toContain("credentialRef");
+    }
+  });
+});
+
+describe("review-only envelope", () => {
+  it("round trips the explicit selection through the builder and codec", () => {
+    const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+    const config = buildRunConfig({ runnerPhase: "gap-analysis", mapping: makeMapping(), issue: full.issue, prNumber: "42", reviewOnly, retryPolicy: null });
+    expect(decodeRunConfig(encodeRunConfig(config)).reviewOnly).toEqual(reviewOnly);
+    expect(decodeRunConfig(encodeRunConfig(full)).reviewOnly).toBeUndefined();
+  });
+  it("rejects malformed mode rather than silently implementing", () => {
+    for (const reviewOnly of [true, {}, { reviewers: "integration-review" }]) {
+      expect(() => decodeRunConfig(Buffer.from(JSON.stringify({ ...full, reviewOnly })).toString("base64"))).toThrow(/reviewOnly/);
     }
   });
 });

@@ -47,7 +47,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SOURCE_BRANCH: ${{ inputs.branch || github.ref_name }}
-      CONTROL_PLANE_OPS_TOKEN: ${{ secrets.CONTROL_PLANE_OPS_TOKEN }}
     steps:
       - name: Require Fly image push token
         env:
@@ -109,33 +108,3 @@ jobs:
             -f context=orchestrator-image/published \
             -f "description=$IMAGE" \
             -f "target_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-
-      - name: Notify control plane
-        if: ${{ always() && steps.published.outcome == 'success' && env.CONTROL_PLANE_OPS_TOKEN != '' }}
-        env:
-          SOURCE_COMMIT: ${{ steps.meta.outputs.commit }}
-          IMAGE: ${{ steps.meta.outputs.image }}
-        run: |
-          body=$(jq -n --arg branch "$SOURCE_BRANCH" --arg commit "$SOURCE_COMMIT" \
-            --arg image "$IMAGE" '{branch: $branch, commit: $commit, image: $image}')
-          response_file=$(mktemp)
-          trap 'rm -f "$response_file"' EXIT
-          if ! status=$(curl --silent --show-error --connect-timeout 15 --max-time 120 \
-            --output "$response_file" --write-out '%{http_code}' \
-            --request POST https://auth.builddown.ai/api/ops/auto-update \
-            --header "Authorization: Bearer $CONTROL_PLANE_OPS_TOKEN" \
-            --header 'Content-Type: application/json' --data "$body"); then
-            echo "Control plane HTTP status: ${status:-000}"
-            cat "$response_file"
-            echo '::error::Control plane notification transport failed; the image remains published.'
-            exit 1
-          fi
-          echo "Control plane HTTP status: $status"
-          cat "$response_file"
-          echo
-          echo "Control plane auto-update: HTTP $status" >> "$GITHUB_STEP_SUMMARY"
-          case "$status" in
-            2??) ;;
-            404) echo '::warning::Control plane auto-update route is not deployed yet; the image remains published.' ;;
-            *) echo "::error::Control plane auto-update failed with HTTP $status; the image remains published."; exit 1 ;;
-          esac

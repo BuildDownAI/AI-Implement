@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { getDb } from "./dedup.js";
 
 export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed" | "completed";
@@ -37,10 +38,10 @@ interface CommentGapfillQueueRow {
   processed_at: number | null;
 }
 
-export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number {
+function insertCommentGapfill(input: EnqueueCommentGapfillInput): boolean {
   const now = Date.now();
   const db = getDb();
-  db.prepare(`
+  const result = db.prepare(`
     INSERT OR IGNORE INTO comment_gapfill_queue
       (owner, repo, pr_number, comment_id, commenter, instruction, status, created_at, processed_at)
     VALUES
@@ -55,10 +56,20 @@ export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number
     now,
   });
 
-  const row = db
+  return result.changes > 0;
+}
+
+export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number {
+  insertCommentGapfill(input);
+  const row = getDb()
     .prepare("SELECT id FROM comment_gapfill_queue WHERE comment_id = ?")
     .get(input.commentId) as { id: number };
   return row.id;
+}
+
+export function getCommentGapfillItem(id: number): CommentGapfillQueueItem | null {
+  const row = getDb().prepare("SELECT * FROM comment_gapfill_queue WHERE id = ?").get(id) as CommentGapfillQueueRow | undefined;
+  return row ? mapRow(row) : null;
 }
 
 export function claimPendingCommentGapfills(limit = 20): CommentGapfillQueueItem[] {
@@ -70,8 +81,19 @@ export function claimPendingCommentGapfills(limit = 20): CommentGapfillQueueItem
 
 export function markCommentGapfillProcessed(id: number, status: CommentGapfillStatus): void {
   getDb()
-    .prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = ? WHERE id = ?")
+    .prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = MAX(?, COALESCE(processed_at + 1, 0)) WHERE id = ?")
     .run(status, Date.now(), id);
+}
+
+/** Complete the ingress handoff only if the workflow has not touched this row.
+ * processed_at advances on every transition, including pending -> pending refusals.
+ */
+export function markCommentGapfillSubmitted(item: CommentGapfillQueueItem): void {
+  getDb().prepare(`
+    UPDATE comment_gapfill_queue
+    SET status = 'dispatched', processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+    WHERE id = ? AND status = 'pending' AND processed_at IS ?
+  `).run(Date.now(), item.id, item.processedAt);
 }
 
 function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
@@ -88,6 +110,24 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
     processedAt: row.processed_at,
   };
 }
+
+export const ROLLUP_REVIEW_COMMENTER = "ai-implement-rollup-review";
+
+/** Returns true only for a newly inserted head, including across terminal states. */
+export function enqueueRollupReview(input: { owner: string; repo: string; prNumber: number; headSha: string }): boolean {
+  // 48 hash bits fit exactly in a JS number; reserve IDs below the existing
+  // synthetic helpers' -2 billion range and keep real webhook IDs positive.
+  const digest = createHash("sha256")
+    .update(JSON.stringify(["rollup-review", input.owner, input.repo, input.prNumber, input.headSha]))
+    .digest();
+  const commentId = -(digest.readUIntBE(0, 6) + 2_000_000_001);
+  return insertCommentGapfill({
+    owner: input.owner, repo: input.repo, prNumber: input.prNumber,
+    commentId, commenter: ROLLUP_REVIEW_COMMENTER,
+    instruction: `Review the feature-branch roll-up at head ${input.headSha}. Post an advisory verdict in the PR conversation.`,
+  });
+}
+
 
 export const CONFLICT_COMMENTER = "ai-implement-orchestrator";
 
@@ -216,4 +256,36 @@ export function requeueGapfillAfterPushFailure(repoFull: string, prNumber: numbe
   });
   const after = db.prepare("SELECT COUNT(*) AS n FROM comment_gapfill_queue").get() as { n: number };
   return after.n > before.n;
+}
+
+/** Non-secret write-ahead intent. Absence from a backend listing never clears it. */
+export interface CommentGapfillLaunch {
+  record: Parameters<typeof import("./log.js").appendLogIfAbsent>[0];
+  target: { owner: string; repo: string; workflowFile: string };
+  /** Frozen Fly identity; optional for GHA, Docker and older intents. */
+  flyApp?: string;
+  accepted: boolean;
+  rejected?: { status: number };
+}
+function launchStore() {
+  const db = getDb();
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_gapfill_launch (
+    dispatch_id TEXT PRIMARY KEY, recovery_json TEXT NOT NULL
+  )`);
+  return db;
+}
+export function stageCommentGapfillLaunch(dispatchId: string, launch: CommentGapfillLaunch): void {
+  launchStore().prepare("INSERT OR IGNORE INTO comment_gapfill_launch VALUES (?, ?)").run(dispatchId, JSON.stringify(launch));
+}
+export function getCommentGapfillLaunch(dispatchId: string): CommentGapfillLaunch | null {
+  const row = launchStore().prepare("SELECT recovery_json FROM comment_gapfill_launch WHERE dispatch_id = ?").get(dispatchId) as { recovery_json: string } | undefined;
+  return row ? JSON.parse(row.recovery_json) as CommentGapfillLaunch : null;
+}
+export function confirmCommentGapfillLaunch(dispatchId: string): void {
+  const launch = getCommentGapfillLaunch(dispatchId);
+  if (launch && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, accepted: true }), dispatchId);
+}
+export function rejectCommentGapfillLaunch(dispatchId: string, status: number): void {
+  const launch = getCommentGapfillLaunch(dispatchId);
+  if (launch && !launch.accepted && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, rejected: { status } }), dispatchId);
 }

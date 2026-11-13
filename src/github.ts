@@ -1,4 +1,4 @@
-import type { RepoMapping } from "./config.js";
+import type { ReviewerSelection, RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
 import { type ResolvedAgentSnapshotV1, type RunConfigV1, type RunCredentialsV1, buildRunConfig, encodeRunConfig, encodeTrustedRunConfig } from "./run-config.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
@@ -418,6 +418,7 @@ export interface EnvelopeDispatchOpts {
   /** Frozen stage snapshot from a managed `launch` decision; rides in `run_config.agentConfig`. */
   agentConfig?: ResolvedAgentSnapshotV1;
   runnerImage?: string | null;
+  reviewOnly?: { reviewers: ReviewerSelection[] };
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
   commentInstruction?: string;

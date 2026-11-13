@@ -1,3 +1,4 @@
+import { inlineCommentBody } from "../pipeline/review-inline-comments.js";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import type { ReviewFixFeedbackEvent } from "../restate/review-fix-pr.js";
 import type { RepoMapping } from "../config.js";
 import type { KgPrCheckConfig } from "../webhook.js";
 import { makeAppendLogEntry, makeMapping } from "./helpers/builders.js";
@@ -25,7 +27,6 @@ const hoisted = vi.hoisted(() => ({
 
 vi.mock("../config.js", () => ({
   getMappings: hoisted.getMappings,
-  resolveReviewFixLifecycle: (m: { reviewFixLifecycle?: string | null }) => (m.reviewFixLifecycle ?? "legacy"),
 }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: hoisted.getInstallationToken }));
 vi.mock("../workflow-probe.js", () => ({
@@ -34,6 +35,15 @@ vi.mock("../workflow-probe.js", () => ({
 }));
 
 // ---------- Test infrastructure ----------
+
+function recordingReviewIngress() {
+  const events: ReviewFixFeedbackEvent[] = [];
+  const feedback = vi.fn(async (_scope: unknown, event: ReviewFixFeedbackEvent) => {
+    events.push(event);
+    return { status: "accepted" as const };
+  });
+  return { events, feedback };
+}
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -2040,6 +2050,19 @@ describe("shouldEnqueueReviewEvent", () => {
     ).toEqual({ enqueue: false, reason: "self" });
   });
 
+  it("enqueues a current-head Bot review quoting the self marker mid-body", () => {
+    expect(webhook.shouldEnqueueReviewEvent({
+      ...BASE,
+      body: "## Claude review\nThe guard skips comments quoting `<!-- ai-implement`.",
+    })).toEqual({ enqueue: true });
+  });
+
+  it.each(["", " \n\t"])("drops a leading self marker after whitespace %j", whitespace => {
+    expect(webhook.shouldEnqueueReviewEvent({
+      ...BASE, body: `${whitespace}<!-- ai-implement status -->\nDone.`,
+    })).toEqual({ enqueue: false, reason: "self" });
+  });
+
   it("enqueues a human author unconditionally (today's behavior)", () => {
     expect(webhook.shouldEnqueueReviewEvent({ ...BASE, authorType: "User" })).toEqual({ enqueue: true });
   });
@@ -2388,6 +2411,38 @@ describe("bot review gate integration (AII-745)", () => {
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
     }
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores its inline finding trailer from a trusted Bot on the current head after dispatch", async () => {
+    const jobId = appendDispatch({ issueId: "issue-56", issueIdentifier: "AII-56", repo: "org/repo" });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/56");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: inlineCommentBody({ severity: "medium", body: "Add a null check.", path: "src/x.ts", line: 5 }),
+        html_url: "https://github.com/org/repo/pull/56#discussion_r103",
+        path: "src/x.ts",
+        line: 5,
+        user: { login: "ai-implement[bot]", type: "Bot" },
+        commit_id: "sha-current",
+        created_at: new Date(Date.now() + 1_000).toISOString(),
+      },
+      pull_request: {
+        number: 56,
+        html_url: "https://github.com/org/repo/pull/56",
+        head: { ref: "ai-implement/aii-56-fix", sha: "sha-current" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "self" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 56)).toEqual([]);
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
@@ -2757,6 +2812,7 @@ describe("/ai-implement comment trigger", () => {
 
     const { req, res } = makeRequest(SECRET, "issue_comment", {
       action: "created",
+      installation: { id: 7 },
       comment: {
         id: 7001,
         body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
@@ -2772,13 +2828,15 @@ describe("/ai-implement comment trigger", () => {
       repository: { full_name: "org/repo" },
     });
 
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key");
+    const ingress = recordingReviewIngress();
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, "app-id", "private-key", undefined, undefined, undefined, ingress as never);
     await res.done;
 
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
-    expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toHaveLength(1);
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toEqual({ forwarded: true });
+    expect(ingress.events[0]?.findings).toHaveLength(1);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toHaveLength(0);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
   });
 });
@@ -2795,6 +2853,7 @@ describe("review process on inline review comments (AII-1181)", () => {
     hoisted.getMappings.mockReturnValue(mapping ? orgRepoMapping(mapping) : {});
     const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
       action: "created",
+      installation: { id: 7 },
       comment: {
         id: pr * 10,
         body,
@@ -2812,9 +2871,10 @@ describe("review process on inline review comments (AII-1181)", () => {
       },
       repository: { full_name: "org/repo" },
     });
-    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    const ingress = recordingReviewIngress();
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
     await res.done;
-    return { body: JSON.parse(res.body), severities: reviewStore.listOpenReviewFindings("org/repo", pr).map((f) => f.severity) };
+    return { body: JSON.parse(res.body), severities: [...reviewStore.listOpenReviewFindings("org/repo", pr), ...ingress.events.flatMap((e) => e.findings ?? [])].map((f) => f.severity) };
   }
 
   const CLAUDE = { login: "claude[bot]", type: "Bot" };
@@ -2825,7 +2885,7 @@ describe("review process on inline review comments (AII-1181)", () => {
     let pr = 700;
     for (const [text, severity] of cases) {
       const out = await postInline(pr, CLAUDE, text, { reviewProcess: "claude-code-review" });
-      expect(out.body).toMatchObject({ queued: true });
+      expect(out.body).toMatchObject({ forwarded: true });
       expect(out.severities).toEqual([severity]);
       pr++;
     }
@@ -2881,18 +2941,20 @@ describe("review process on inline review comments (AII-1181)", () => {
       hoisted.getMappings.mockReturnValue(orgRepoMapping(mapping));
       const { req, res } = makeRequest(SECRET, "pull_request_review", {
         action: "submitted",
+        installation: { id: 7 },
         review: { id: pr, state: "changes_requested", body: "Fix this.", user, commit_id: "sha-current", submitted_at: new Date().toISOString() },
         pull_request: { number: pr, html_url: `https://github.com/org/repo/pull/${pr}`, head: { ref: `ai-implement/aii-${pr}-fix`, sha: "sha-current" } },
         repository: { full_name: "org/repo" },
       });
-      webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+      const ingress = recordingReviewIngress();
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, undefined, undefined, ingress as never);
       await res.done;
       pr++;
       return JSON.parse(res.body);
     };
     for (const reviewProcess of [null, "claude-code-review"] as const) {
       expect(await postReview(TOPIA, { reviewProcess, trustedReviewAuthors: [] })).toEqual({ ignored: true, reason: "untrusted_author" });
-      expect(await postReview(TOPIA, { reviewProcess, trustedReviewAuthors: ["topia-ai-implement-bot[bot]"] })).toMatchObject({ queued: true });
+      expect(await postReview(TOPIA, { reviewProcess, trustedReviewAuthors: ["topia-ai-implement-bot[bot]"] })).toMatchObject({ forwarded: true });
     }
   });
 
@@ -3146,14 +3208,23 @@ describe("Restate review-fix lifecycle forwards instead of writing (AII-1184)", 
     expect(ingress.feedback).not.toHaveBeenCalled();
   });
 
-  it.each([["legacy"], [null]] as const)("lifecycle %s keeps the SQLite path and never forwards", async (lifecycle) => {
-    mapRepo(lifecycle);
-    seedDispatch(19);
-    const ingress = fakeIngress();
-    const out = await post("reviewComment", 19, { ingress });
-    expect(out.status).toBe(200);
-    expect(out.body).toMatchObject({ queued: true, duplicate: false });
-    expect(ingress.feedback).not.toHaveBeenCalled();
-    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  describe.each(["legacy", null] as const)("stored lifecycle %s", (lifecycle) => {
+    it.each(["review", "reviewComment", "issueComment"])("%s forwards through Restate without writing the legacy queue", async (kind) => {
+      mapRepo(lifecycle);
+      seedDispatch(19);
+      const ingress = fakeIngress();
+      const out = await post(kind, 19, { ingress });
+      expect(out.status).toBe(202);
+      expect(ingress.feedback).toHaveBeenCalledTimes(1);
+      expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    });
+
+    it.each(["review", "reviewComment", "issueComment"])("%s stays unavailable without falling back to SQLite", async (kind) => {
+      mapRepo(lifecycle);
+      seedDispatch(19);
+      const out = await post(kind, 19);
+      expect(out).toEqual({ status: 503, body: { error: "restate_unavailable" } });
+      expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(0);
+    });
   });
 });
