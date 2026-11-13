@@ -417,64 +417,21 @@ export async function waitForMachine(
   }
 }
 
-// ── App Secrets CRUD (Fly GraphQL API) ───────────────────────────────────────
-//
-// Listing and admin writes use the GraphQL API. The REST secrets endpoint
-// (`POST /v1/apps/{app}/secrets`) also writes classic app secrets and, unlike
-// GraphQL here, returns the secrets `version`; `putAppSecretsVersioned` uses it.
-// KMS named-secrets keys are the separate `/secretkeys` endpoints.
-
-const FLY_GRAPHQL_URL = "https://api.fly.io/graphql";
-
 export interface FlySecret {
   name: string;
   digest: string;
   created_at: string;
 }
 
-async function flyGraphQL<T>(
-  token: string,
-  query: string,
-  variables: Record<string, unknown>,
-): Promise<T> {
-  const res = await fetch(FLY_GRAPHQL_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Fly API request failed (${res.status}): ${text}`);
-  }
-
-  const json = await res.json() as { data?: T; errors?: Array<{ message: string }> };
-  if (json.errors?.length) {
-    throw new Error(json.errors.map((e) => e.message).join("; "));
-  }
-
-  return json.data as T;
-}
-
 export async function listAppSecrets(
   token: string,
   appName: string,
 ): Promise<FlySecret[]> {
-  const data = await flyGraphQL<{
-    app: { secrets: Array<{ name: string; digest: string; createdAt: string }> } | null;
-  }>(token, `
-    query ListSecrets($appName: String!) {
-      app(name: $appName) {
-        secrets { name digest createdAt }
-      }
-    }
-  `, { appName });
-
-  return (data.app?.secrets ?? []).map((s) => ({
-    name: s.name,
-    digest: s.digest,
-    created_at: s.createdAt,
-  }));
+  const res = await fetch(`${FLY_API_BASE}/apps/${appName}/secrets`, {
+    headers: flyHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Fly app secrets list failed (${res.status})`);
+  return await res.json() as FlySecret[];
 }
 
 export async function setAppSecrets(
@@ -482,18 +439,8 @@ export async function setAppSecrets(
   appName: string,
   secrets: Record<string, string>,
 ): Promise<number | null> {
-  const secretInputs = Object.entries(secrets).map(([key, value]) => ({ key, value }));
-
-  // Always returns null: the GraphQL response is discarded (typed as unknown) so
-  // release.version — which would populate min_secrets_version — is never read.
-  // setFlySecretsMinVersion would store that version; getFlySecretsMinVersion would
-  // return it — but neither is called here, so callers always receive undefined.
-  await flyGraphQL<unknown>(token, `
-    mutation SetSecrets($input: SetSecretsInput!) {
-      setSecrets(input: $input) { release { version } }
-    }
-  `, { input: { appId: appName, secrets: secretInputs } });
-
+  // Ignore the version on purpose: admin writes must not enable secrets version pinning.
+  await putAppSecretsVersioned(token, appName, secrets);
   return null;
 }
 
@@ -531,11 +478,12 @@ export async function unsetAppSecret(
   appName: string,
   secretName: string,
 ): Promise<number | null> {
-  await flyGraphQL<unknown>(token, `
-    mutation UnsetSecrets($input: UnsetSecretsInput!) {
-      unsetSecrets(input: $input) { release { version } }
-    }
-  `, { input: { appId: appName, keys: [secretName] } });
+  const res = await fetch(`${FLY_API_BASE}/apps/${appName}/secrets/${encodeURIComponent(secretName)}`, {
+    method: "DELETE",
+    headers: flyHeaders(token),
+  });
+  if (!res.ok) throw new Error(`Fly app secrets delete failed (${res.status})`);
+  // Ignore the version deliberately, as for admin sets.
 
   return null;
 }
