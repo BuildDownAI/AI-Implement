@@ -3224,32 +3224,35 @@ describe("admin filesystem issue detail endpoint", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it.each(["constructor", "toString", "__proto__"])("keeps filesystem routes at 404 for inherited name %s", async (scopeKey) => {
-    await withFilesystemProject(async ({ registry, token }) => {
-      // The old provider guard also returned 404 for Object.prototype values.
-      // Observe property access to prove inherited values are rejected before
-      // either route inspects them, rather than relying on that second guard.
-      const inspectInheritedMapping = vi.fn(() => undefined);
-      const inheritedMapping = Object.defineProperty({}, "ticketingProvider", {
-        get: inspectInheritedMapping,
+  describe.each(["constructor", "toString", "__proto__"])("filesystem routes with inherited name %s", (scopeKey) => {
+    it.each(["details", "retry"])("keeps %s at 404 without inspecting the inherited mapping", async (route) => {
+      await withFilesystemProject(async ({ registry, token }) => {
+        // The old provider guard also returned 404 for Object.prototype values.
+        // Observe property access to prove inherited values are rejected before
+        // either route inspects them, rather than relying on that second guard.
+        const inspectInheritedMapping = vi.fn(() => undefined);
+        const inheritedMapping = Object.defineProperty({}, "ticketingProvider", {
+          get: inspectInheritedMapping,
+        });
+        const mappings = Object.assign(
+          Object.create({ [scopeKey]: inheritedMapping }),
+          config.getMappings(),
+        );
+        const getMappings = vi.spyOn(config, "getMappings").mockReturnValue(mappings);
+        try {
+          const issueId = `filesystem:${scopeKey}:SAN2-001`;
+          const result = route === "details"
+            ? await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry)
+            : await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+          expect(result.statusCode).toBe(404);
+          expect(JSON.parse(result.body)).toEqual({
+            error: route === "details" ? "filesystem issue not found" : "Filesystem ticket not found",
+          });
+          expect(inspectInheritedMapping).not.toHaveBeenCalled();
+        } finally {
+          getMappings.mockRestore();
+        }
       });
-      const mappings = Object.assign(
-        Object.create({ [scopeKey]: inheritedMapping }),
-        config.getMappings(),
-      );
-      const getMappings = vi.spyOn(config, "getMappings").mockReturnValue(mappings);
-      try {
-        const issueId = `filesystem:${scopeKey}:SAN2-001`;
-        const detail = await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry);
-        expect(detail.statusCode).toBe(404);
-        expect(JSON.parse(detail.body)).toEqual({ error: "filesystem issue not found" });
-        const retry = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
-        expect(retry.statusCode).toBe(404);
-        expect(JSON.parse(retry.body)).toEqual({ error: "Filesystem ticket not found" });
-        expect(inspectInheritedMapping).not.toHaveBeenCalled();
-      } finally {
-        getMappings.mockRestore();
-      }
     });
   });
 
