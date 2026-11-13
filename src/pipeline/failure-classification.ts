@@ -138,6 +138,13 @@ export const PROVIDER_SIGNATURES: SignatureRow[] = [
   },
 ];
 
+/** Provider codes permitted for exit-zero terminal error matching. */
+export const EXIT_ZERO_TERMINAL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ACCOUNT_USAGE_LIMIT",
+  "PROVIDER_AUTH",
+  "PROVIDER_CONFIG",
+]);
+
 /**
  * Lines carrying a transport-level marker, checked when falling back to
  * `stdout` for signature matching (see `signatureMatchText`) — `stdout` is
@@ -510,8 +517,9 @@ export function classifyLlmResult(
       // text is part of PROVIDER_SIGNATURES' match input (see signatureMatchText), so
       // a reviewer note like "treat API Error 503 as transient" appearing in a dropped
       // verdict's stdout must not turn a structural failure into a retryable transport
-      // one. Only a provider terminal error can identify account exhaustion here;
-      // no stdout/stderr text or other provider signature can override these checks.
+      // one. Only a provider terminal error can identify account exhaustion, refused
+      // credentials, or provider configuration errors here; no stdout/stderr text
+      // or transient provider signature can override these checks.
       // Ordered so a genuinely absent result event (terminalStatus == null, which
       // also always means structuredOutput === undefined — both derive from the
       // same event) is never shadowed by the missing-structured-output check below:
@@ -528,11 +536,11 @@ export function classifyLlmResult(
         result.terminalStatus?.isError === true ||
         (ctx.expectsStructuredOutput && result.terminalStatus != null && result.terminalStatus.subtype !== "success")
       ) {
-        const usageLimit = result.terminalStatus?.isError === true
-          ? matchSignature(PROVIDER_SIGNATURES.filter(row => row.code === "ACCOUNT_USAGE_LIMIT"), errorMessage)
+        const providerError = result.terminalStatus?.isError === true
+          ? matchSignature(PROVIDER_SIGNATURES.filter(row => EXIT_ZERO_TERMINAL_ERROR_CODES.has(row.code)), errorMessage)
           : null;
-        category = usageLimit?.category ?? "invalid_output";
-        code = usageLimit?.code ?? "LLM_TERMINAL_ERROR";
+        category = providerError?.category ?? "invalid_output";
+        code = providerError?.code ?? "LLM_TERMINAL_ERROR";
       } else if (
         ctx.expectsStructuredOutput &&
         result.telemetry?.outcome != null &&
