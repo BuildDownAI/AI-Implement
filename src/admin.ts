@@ -2107,7 +2107,8 @@ export function setProjectAgentModeAction(
   try {
     setProjectConfigured(projectKey, mode === "configured", actor);
     return { ok: true, teamKey: projectKey, agentMode: mode };
-  } catch {
+  } catch (err) {
+    console.error("[admin] set project agent mode failed:", err);
     return { ok: false, code: "resolution-failed" };
   }
 }
@@ -3657,12 +3658,13 @@ export async function upsertMappingAction(
   }
 
   upsertMapping(body.teamKey, mapping);
-  if (!existingMapping && !getProjectStageConfig(body.teamKey) && getOrchestratorDefaults()?.config.mode === "configured") {
-    try {
+  try {
+    if (!existingMapping && !getProjectStageConfig(body.teamKey) && getOrchestratorDefaults()?.config.mode === "configured") {
       setProjectConfigured(body.teamKey, true);
-    } catch {
-      warnings.push("Project saved in legacy mode: resolution-failed");
     }
+  } catch (err) {
+    console.error("[admin] configure new project failed:", err);
+    warnings.push("Project saved in legacy mode: resolution-failed");
   }
   registry.invalidate();
 

@@ -378,6 +378,30 @@ describe("orchestratorTools (Restate)", () => {
     }
   });
 
+  it.each(VARIANTS.map(([label]) => label))("projects grants cannot reach any other registered admin tool (%s)", async (label) => {
+    const env = environments.get(label)!;
+    // Bootstrap discovery with a harmless read, then select from the actual registry.
+    await callService(env.baseUrl(), "orchestratorTools", "get_runner_mode", { caller: SYSTEM, args: {} });
+    const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+    expect(response.ok).toBe(true);
+    const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
+    const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
+    expect(admins.length).toBeGreaterThan(0);
+    // A superset of schema-valid fields covers every current admin handler. Unknown
+    // fields are stripped by its schema; missing/new required fields fail ingress.
+    const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
+      backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
+      paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
+    // Only the project mode tool is reachable with the projects grant.
+    for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
+        caller: serviceCaller({ grants: ["projects"] }), args: name === "start_deploy" ? { branch: "testing", requestedBy: "test" } : args,
+      });
+      expect(result.isError, name).toBe(true);
+      expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+    }
+  });
+
   it.each(VARIANTS.map(([label]) => label))(
     "a direct ingress call with an admin caller returns the health payload (%s)",
     async (label) => {
@@ -429,31 +453,6 @@ describe("orchestratorTools (Restate)", () => {
     }
   });
 
-  it.each(VARIANTS.map(([label]) => label))("reports configured and legacy stage agents through ingress (%s)", async (label) => {
-    const env = environments.get(label)!;
-    try {
-      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
-        saveAccountProfileRevision(makeStageAgentProfile());
-      }
-      setOrchestratorDefaults(makeStageAgentDefaults());
-      dedup.getDb().prepare("INSERT OR IGNORE INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES ('AII', 'acme', 'widgets', 'claude.yml', 'main')").run();
-      setProjectConfigured("AII", true);
-      setProjectConfigured("BDS", false);
-      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
-        caller: { kind: "human", email: "user@example.com", role: "user", grants: [] }, args: {},
-      });
-      expect(result.isError).toBeFalsy();
-      expect(JSON.parse(result.content[0].text).stageAgents).toEqual({
-        defaultsMode: "configured",
-        projects: [{ teamKey: "AII", agentMode: "configured" }, { teamKey: "BDS", agentMode: "legacy" }],
-      });
-    } finally {
-      setProjectConfigured("AII", false);
-      setProjectConfigured("BDS", false);
-      setOrchestratorDefaults({ version: 1, mode: "legacy" });
-      dedup.getDb().prepare("DELETE FROM mappings WHERE team_key = 'AII'").run();
-    }
-  });
 
   it.each(VARIANTS.map(([label]) => label))(
     "get_tenant_health reads the stored setup-check run from the SetupChecks object, without its detail or fix (%s)",
@@ -1005,7 +1004,33 @@ describe("orchestratorTools (Restate)", () => {
       const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });
       expect(JSON.parse(health.content[0].text).stageAgents.projects).toContainEqual({ teamKey, agentMode: "configured" });
     } finally {
+      setProjectConfigured(teamKey, false);
       setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("reports configured and legacy stage agents through ingress (%s)", async (label) => {
+    const env = environments.get(label)!;
+    try {
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
+        saveAccountProfileRevision(makeStageAgentProfile());
+      }
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      dedup.getDb().prepare("INSERT OR IGNORE INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES ('AII', 'acme', 'widgets', 'claude.yml', 'main')").run();
+      setProjectConfigured("AII", true);
+      setProjectConfigured("BDS", false);
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
+        caller: { kind: "human", email: "user@example.com", role: "user", grants: [] }, args: {},
+      });
+      expect(result.isError).toBeFalsy();
+      const stageAgents = JSON.parse(result.content[0].text).stageAgents;
+      expect(stageAgents.defaultsMode).toBe("configured");
+      expect(stageAgents.projects.filter((project: { teamKey: string }) => ["AII", "BDS"].includes(project.teamKey))).toEqual([{ teamKey: "AII", agentMode: "configured" }, { teamKey: "BDS", agentMode: "legacy" }]);
+    } finally {
+      setProjectConfigured("AII", false);
+      setProjectConfigured("BDS", false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+      dedup.getDb().prepare("DELETE FROM mappings WHERE team_key = 'AII'").run();
     }
   });
 

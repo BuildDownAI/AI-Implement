@@ -25,6 +25,8 @@ Saving refuses an entry that does not resolve, a profile listed twice, an entry 
 
 The Projects Agents tab has no mode control. It shows the project mode and names the admin tool `set_project_agent_mode` for changing it. Stage overrides and their save button remain available for both modes; saves send only `stages`. Legacy runs ignore stored overrides until the project becomes configured. Unsaved projects show “Save the mapping first”.
 
+`PUT /api/mappings/:key/agent-config` inspects readiness for a configured project, so a new configured project receives `409` when saving stage overrides until its workflow sync pull request merges.
+
 ## Run preparation and the snapshot
 
 When a run is prepared (`prepareAgentRun`, `src/agent-run-preparation.ts`, called inside the ImplementationRun prelaunch), `chooseStageAccount` takes each stage's first entry that passes the configuration checks (its profile resolves, and its backend is supported) and lists the later passing entries as fallbacks. Bedrock is supported only on GitHub Actions. The chosen entries become the run's snapshot, stored once per dispatch in `run_agent_config_snapshots` and never updated; a retried preparation reuses it. Beside it, `resolved_config_json` records per stage the chosen index, each entry passed over with its reason, and the fallback list, including profile revision and auth mode. Before freezing a new dispatch, preparation checks fallback credentials using each entry's own provider, profile revision and auth mode. Unready fallbacks are dropped without refusing the run; `droppedAccountFallbacks` records profile ids and safe reason codes in `resolved_config_json`, and grants include only retained entries. Reserved subscription sessions are verified at checkout under their owner generation. The binding budget may also trim the fallback list. Repeated preparation reuses the frozen list and grant. Primary credential failures still stop preparation. When no entry passes, the run fails with the first entry's failure.
@@ -59,6 +61,7 @@ Protected names, forwarded secrets and the credential/routing strip lists take p
 The admin tool `set_project_agent_mode` changes a project's mode to `configured` or
 `legacy`. It inspects nothing: no workflow readiness, account check or GitHub read.
 It validates configuration resolution when moving to configured and keeps stored stages.
+The orchestrator log records the cause of a `resolution-failed` answer.
 A repeated request for the current mode adds no row. In-flight runs keep their stored
 snapshot; the new mode applies to the next dispatch. A project with a stored row is
 moved by this tool, not by `adopt-projects`.
