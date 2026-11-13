@@ -1115,6 +1115,17 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const attemptId = fixture.attemptId!;
     await eventually(() => sqliteStore.hasCurrentAuthority(attemptId), (authority) => !authority,
       { timeoutMs: 6_000, label: "deadline revokes unknown launch" });
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const runRows = await eventually(() => queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`),
+      (found) => found.length === 1, { label: "unknown launch run invocation" });
+    // Authority can expire before the workflow starts its backed-off sleep.
+    // Wait for that durable command so cancellation exercises the intended wait.
+    await eventually(() => journalEntries(env.adminAPIBaseUrl(), runRows[0].id as string),
+      (entries) => entries.some((entry) => entry.entry_type === "Command: Sleep"
+        && (JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } })
+          .Command.Sleep.wake_up_time > prepared.deadlineAt),
+      { label: "unknown launch backed-off sleep" });
     if (event === "cancel") {
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
     } else {
@@ -1124,9 +1135,24 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
         createReviewFixIngressClient(env.baseUrl()))).toBe(true);
     }
     await eventually(async () => (await sqliteStore.getRecordedOutcome(attemptId))?.terminal.status,
-      // Allow the cancellation and outcome steps to replay on a busy CI worker.
-      // Keep this below the backoff so waiting for the timer still fails the test.
-      (status) => status === "launch_unresolved", { timeoutMs: SHORT_POST_DEADLINE_RECONCILE_MS - 1_000, label: "cancel interrupts backoff" });
+      (status) => status === "launch_unresolved", { label: "cancel interrupts backoff" });
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    expect(rows).toHaveLength(1);
+    const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+    const sleeps = entries.filter((entry) => entry.entry_type === "Command: Sleep")
+      .sort((a, b) => Number(a.index) - Number(b.index));
+    expect(sleeps.length).toBeGreaterThan(0);
+    for (const sleep of sleeps) expect(Number.isFinite(Number(sleep.index))).toBe(true);
+    const command = JSON.parse(String(sleeps.at(-1)!.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+    const completedAt = (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(attemptId) as { completed_at: number | null }).completed_at;
+    expect(typeof completedAt).toBe("number");
+    expect(Number.isFinite(command.Command.Sleep.wake_up_time)).toBe(true);
+    // Timer completion would put checkedAt at or after wake_up_time. The durable
+    // outcome preceding it proves cancellation interrupted this attempt's wait,
+    // regardless of when polling observes the outcome.
+    expect(completedAt).toBeLessThan(command.Command.Sleep.wake_up_time);
     expect(fixture.dispatchCalls).toBe(1);
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
   }, 15_000);

@@ -185,6 +185,8 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 
 ## Running tests
 
+A test never proves a result with a wall-clock limit or a fixed sleep; see [Timing rules](docs/restate-testing.md#timing-rules).
+
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit, then tsc --noEmit -p tsconfig.tests.json (test files included)
