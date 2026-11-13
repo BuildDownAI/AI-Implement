@@ -41,8 +41,8 @@ const AUTH_MODES: readonly AccountAuthMode[] = [
   "openrouter-api-key",
 ];
 const AUTH_COMBINATIONS: Record<StageAgent, Partial<Record<ModelProvider, readonly AccountAuthMode[]>>> = {
-  claude: { anthropic: ["anthropic-api-key", "claude-subscription"], bedrock: ["bedrock"] },
-  codex: { openai: ["openai-api-key", "codex-subscription"] },
+  claude: { anthropic: ["anthropic-api-key", "claude-subscription"], bedrock: ["bedrock"], openrouter: ["openrouter-api-key"] },
+  codex: { openai: ["openai-api-key", "codex-subscription"], openrouter: ["openrouter-api-key"] },
 };
 
 /** Public projection. Never carries metadata, credential references, keys or session state. */

@@ -1,3 +1,4 @@
+import { accountCombinations } from "./helpers/account-combinations.js";
 import { describe, expect, it } from "vitest";
 import {
   describeInvocationLimit,
@@ -97,15 +98,13 @@ function captureError(fn: () => unknown): Error {
 }
 
 describe("resolveStageAgentConfig", () => {
-  it.each(["claude", "codex"] as const)("recognizes OpenRouter but refuses the %s combination", agent => {
+  it.each(accountCombinations)("resolve combination $agent/$provider/$authMode: $permitted", ({ permitted, ...combo }) => {
     const defaults = structuredClone(orchestratorDefaults);
-    defaults.stages!.planning = { ...defaults.stages!.planning!, agent, provider: "openrouter" };
-    const profiles = accountProfiles.map(profile => profile.id === "claude-api"
-      ? { ...profile, agent, provider: "openrouter" as const, authMode: "openrouter-api-key" as const }
-      : profile);
-    expect(() => resolveStageAgentConfig({
-      orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles: profiles,
-    })).toThrow(new RegExp("unsupported " + (agent === "claude" ? "Claude" : "Codex") + " provider/authentication combination"));
+    defaults.stages!.planning = { ...defaults.stages!.planning!, agent: combo.agent, provider: combo.provider };
+    const profiles = accountProfiles.map(profile => profile.id === "claude-api" ? { ...profile, ...combo } : profile);
+    const resolve = () => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles: profiles });
+    if (permitted) expect(resolve().mode).toBe("configured");
+    else expect(resolve).toThrow(/unsupported .* provider\/authentication combination/);
   });
 
   it("returns explicit legacy mode when project configuration is absent or legacy", () => {

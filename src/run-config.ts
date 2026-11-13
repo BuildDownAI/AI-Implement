@@ -262,6 +262,7 @@ function snapshotEnum<T extends string>(v: unknown, allowed: readonly T[], path:
 }
 
 function supportedCombination(agent: string, provider: string, authMode: string): boolean {
+  if (provider === "openrouter" && authMode === "openrouter-api-key") return true;
   if (agent === "claude") {
     return (provider === "anthropic" && (authMode === "anthropic-api-key" || authMode === "claude-subscription"))
       || (provider === "bedrock" && authMode === "bedrock");

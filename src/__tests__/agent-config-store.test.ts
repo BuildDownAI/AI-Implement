@@ -1,3 +1,4 @@
+import { accountCombinations } from "./helpers/account-combinations.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import type * as StoreModule from "../agent-config-store.js";
 import type * as DedupModule from "../dedup.js";
@@ -90,6 +91,13 @@ describe("stage inputs fingerprint", () => {
 });
 
 describe("profiles", () => {
+  it.each(accountCombinations)("save combination $agent/$provider/$authMode: $permitted", ({ permitted, ...combo }) => {
+    const before = dump();
+    const save = () => store.saveAccountProfileRevision(claudeProfile(combo));
+    if (permitted) expect(save().authMode).toBe(combo.authMode);
+    else { expect(save).toThrow("combination is unsupported"); expect(dump()).toBe(before); }
+  });
+
   it.each([
     ["claude", "anthropic", "anthropic-api-key"],
     ["claude", "anthropic", "claude-subscription"],
@@ -108,8 +116,6 @@ describe("profiles", () => {
     ["codex", "anthropic", "anthropic-api-key"],
     ["codex", "openai", "claude-subscription"],
     ["codex", "openai", "bedrock"],
-    ["claude", "openrouter", "openrouter-api-key"],
-    ["codex", "openrouter", "openrouter-api-key"],
   ] as const)("rejects mismatch %s/%s/%s without changes", (agent, provider, authMode) => {
     const before = dump();
     expect(() => store.saveAccountProfileRevision(claudeProfile({ agent, provider, authMode }))).toThrow("profile agent/provider/authentication combination is unsupported");
@@ -427,6 +433,16 @@ describe("default account list writes", () => {
     expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error(message));
     expect(dump()).toBe(before);
   });
+  it("refuses OpenRouter after a subscription without saving a revision", () => {
+    store.saveAccountProfileRevision(claudeProfile({ profileId: "plan", authMode: "claude-subscription" }));
+    store.saveAccountProfileRevision(claudeProfile({ profileId: "router", provider: "openrouter", authMode: "openrouter-api-key" }));
+    const config = defaults();
+    config.stages!.planning!.accounts = [{ accountProfileId: "plan", model: "m" }, { accountProfileId: "router", model: "m" }];
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults(config)).toThrow("cannot use paid API after subscription");
+    expect(dump()).toBe(before);
+  });
+
   it("accepts Claude subscriptions and refuses paid entries after them", () => {
     store.saveAccountProfileRevision(claudeProfile({ profileId: "plan", authMode: "claude-subscription" }));
     const config = defaults();

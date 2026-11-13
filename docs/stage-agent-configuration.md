@@ -4,11 +4,11 @@ Stage agent configuration decides, for each stage of a run, which agent runs, th
 
 ## Stages and selections
 
-There are three stages: `planning`, `implementation` and `review` (`STAGE_NAMES`, `src/agent-config.ts`). Each stage resolves to one selection: `agent` (`claude` or `codex`), `provider` (`anthropic`, `bedrock` or `openai`), `model`, `accountProfileId` and `invocationTimeoutMs`.
+There are three stages: `planning`, `implementation` and `review` (`STAGE_NAMES`, `src/agent-config.ts`). Each stage resolves to one selection: `agent` (`claude` or `codex`), `provider` (`anthropic`, `bedrock`, `openrouter` or `openai`), `model`, `accountProfileId` and `invocationTimeoutMs`.
 
 ## Account profiles
 
-An account profile is a named account an operator creates on Models & providers. Its revisions are immutable (`model_account_profile_revisions`): each change saves a new revision. A profile has an agent, a provider, an auth mode (`anthropic-api-key`, `openai-api-key`, `bedrock`, `codex-subscription`, `claude-subscription`) and a status (`active`, `disabled`, `archived`). Every active profile is usable by every project. Its credential lives encrypted on the orchestrator; a profile names it by `credentialRef`, and no read returns it. See [model-account-operations.md](model-account-operations.md).
+An account profile is a named account an operator creates on Models & providers. Its revisions are immutable (`model_account_profile_revisions`): each change saves a new revision. A profile has an agent, a provider, an auth mode (`anthropic-api-key`, `openai-api-key`, `openrouter-api-key`, `bedrock`, `codex-subscription`, `claude-subscription`) and a status (`active`, `disabled`, `archived`). Every active profile is usable by every project. Its credential lives encrypted on the orchestrator; a profile names it by `credentialRef`, and no read returns it. See [model-account-operations.md](model-account-operations.md).
 
 ## Defaults, overrides and the account list
 
@@ -74,3 +74,5 @@ was started." with the prefix "Planning failed:" or "Implementation failed:".
 Repeated refusals count as dispatch failures and park the issue at the limit.
 Recover by setting the project to legacy, or by merging the workflow sync pull request
 and removing the park.
+
+OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key` with either `claude` or `codex`, on every backend. Create the profile through `POST /api/model-accounts` and store its write-only key through `PUT /api/model-accounts/:id/credential`. OpenRouter is a paid API mode, so it cannot follow a subscription in an account list. Runner support is delivered separately; until then, runs fail closed with `unsupported_auth_mode`.

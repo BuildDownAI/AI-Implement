@@ -1,3 +1,4 @@
+import { accountCombinations } from "./helpers/account-combinations.js";
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -765,16 +766,22 @@ describe("agentConfig resolved snapshot", () => {
     expect(decodeRunConfig(encodeRunConfig(cfg)).agentConfig).toEqual(build());
   });
 
-  it.each(["stage", "profile", "both"])("recognizes OpenRouter in %s but refuses execution", site => {
+  it.each(["stage", "profile"])("refuses an OpenRouter provider mismatch in %s", site => {
     const s = build();
     if (site !== "profile") s.stages.review.provider = "openrouter";
     if (site !== "stage") {
       s.profiles.review.provider = "openrouter";
       s.profiles.review.authMode = "openrouter-api-key";
     }
-    expect(() => decodeWith(s)).toThrow(site === "both"
-      ? "has an unsupported agent/provider/authMode combination"
-      : "provider does not match the stage provider");
+    expect(() => decodeWith(s)).toThrow("provider does not match the stage provider");
+  });
+
+  it.each(accountCombinations)("snapshot combination $agent/$provider/$authMode: $permitted", ({ permitted, agent, provider, authMode }) => {
+    const s = build();
+    Object.assign(s.stages.review, { agent, provider });
+    Object.assign(s.profiles.review, { agent, provider, authMode });
+    if (permitted) expect(decodeWith(s).agentConfig?.profiles.review.authMode).toBe(authMode);
+    else expect(() => decodeWith(s)).toThrow("unsupported agent/provider/authMode combination");
   });
 
   it("accepts every auth mode", () => {
