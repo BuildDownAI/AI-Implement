@@ -6696,6 +6696,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("reports dropped fallbacks only when an override has no following default entry", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
       stages: { implementation: { accountProfileId: "oai-1" } },
     }, readyDeps())).status).toBe(200);
@@ -6703,7 +6704,13 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(resolved.json.resolved).toBe(true);
     expect(resolved.json.stages.implementation.fallbacksDropped).toBe(true);
     expect(resolved.json.stages.implementation.entries).toHaveLength(1);
+    expect(resolved.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
     expect(resolved.json.stages.planning.fallbacksDropped).toBe(false);
+    for (const stage of ["planning", "review"]) {
+      expect(resolved.json.stages[stage].fallbacksDropped).toBe(false);
+      expect(resolved.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
+      expect(resolved.json.stages[stage].entries).toHaveLength(1);
+    }
     expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
     const failed = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(failed.json.resolved).toBe(false);
@@ -6711,6 +6718,11 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(failed.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
     expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
     expect(failed.json.stages.planning.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(failed.json.stages[stage].entries).toHaveLength(1);
+      expect(failed.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: false }]);
+    }
+    expect(failed.json.stages.review.fallbacksDropped).toBe(false);
   });
 
   it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
