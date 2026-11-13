@@ -799,7 +799,10 @@ describe("published value limits are enforced where the record is served (AII-15
 
   it("matches every dispatch id generator, within the 200-character cap", () => {
     const legacy = log.appendLog({ issueId: "legacy", executionMode: "fly-machines" });
-    dedup.getDb().prepare("UPDATE dispatch_log SET dispatch_id = NULL, status = 'completed', completed_at = ?, changed_at = ? WHERE id = ?").run(OLD, OLD, legacy);
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatch_id = NULL, status = 'completed', completed_at = ? WHERE id = ?").run(OLD, legacy);
+    // The trigger stamps the wall clock; pin changed_at to the completion time like a job that never changed again.
+    dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(OLD, legacy);
+    expect(dedup.getDb().prepare("SELECT changed_at FROM dispatch_log WHERE id = ?").get(legacy)).toEqual({ changed_at: OLD });
     const synthetic = acc.listJobAccounting({ now: NOW }).records.map((r) => r.dispatchId);
     expect(synthetic).toEqual([`log-${legacy}`]);
 
