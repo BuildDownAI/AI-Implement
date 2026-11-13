@@ -8,13 +8,14 @@ export type StoredStageSelectionField = (typeof STORED_STAGE_SELECTION_FIELDS)[n
 export type StageName = (typeof STAGE_NAMES)[number];
 export type StageSelectionField = (typeof STAGE_SELECTION_FIELDS)[number];
 export type StageAgent = "claude" | "codex";
-export type ModelProvider = "anthropic" | "bedrock" | "openai";
+export type ModelProvider = "anthropic" | "bedrock" | "openai" | "openrouter";
 export type AccountAuthMode =
   | "anthropic-api-key"
   | "bedrock"
   | "claude-subscription"
   | "openai-api-key"
-  | "codex-subscription";
+  | "codex-subscription"
+  | "openrouter-api-key";
 export type StageConfigMode = "legacy" | "configured";
 export type FieldSource = "orchestrator-default" | "project" | "job-deadline";
 
@@ -190,7 +191,7 @@ function asStageSelection(value: Partial<Record<StageSelectionField, unknown>>, 
   if (selection.agent !== "claude" && selection.agent !== "codex") {
     throw new Error(`${stage}.agent is unsupported`);
   }
-  if (selection.provider !== "anthropic" && selection.provider !== "bedrock" && selection.provider !== "openai") {
+  if (selection.provider !== "anthropic" && selection.provider !== "bedrock" && selection.provider !== "openai" && selection.provider !== "openrouter") {
     throw new Error(`${stage}.provider is unsupported`);
   }
   if (typeof selection.model !== "string" || selection.model.trim() === "") {
@@ -250,7 +251,7 @@ function validateAccountProfile(profile: AccountProfile): void {
   if (profile.agent !== "claude" && profile.agent !== "codex") {
     throw new Error("account profile agent is unsupported");
   }
-  if (profile.provider !== "anthropic" && profile.provider !== "bedrock" && profile.provider !== "openai") {
+  if (profile.provider !== "anthropic" && profile.provider !== "bedrock" && profile.provider !== "openai" && profile.provider !== "openrouter") {
     throw new Error("account profile provider is unsupported");
   }
   if (
@@ -258,7 +259,8 @@ function validateAccountProfile(profile: AccountProfile): void {
     profile.authMode !== "bedrock" &&
     profile.authMode !== "claude-subscription" &&
     profile.authMode !== "openai-api-key" &&
-    profile.authMode !== "codex-subscription"
+    profile.authMode !== "codex-subscription" &&
+    profile.authMode !== "openrouter-api-key"
   ) {
     throw new Error("account profile authentication mode is unsupported");
   }

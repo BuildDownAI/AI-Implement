@@ -108,9 +108,11 @@ describe("profiles", () => {
     ["codex", "anthropic", "anthropic-api-key"],
     ["codex", "openai", "claude-subscription"],
     ["codex", "openai", "bedrock"],
+    ["claude", "openrouter", "openrouter-api-key"],
+    ["codex", "openrouter", "openrouter-api-key"],
   ] as const)("rejects mismatch %s/%s/%s without changes", (agent, provider, authMode) => {
     const before = dump();
-    expect(() => store.saveAccountProfileRevision(claudeProfile({ agent, provider, authMode }))).toThrow();
+    expect(() => store.saveAccountProfileRevision(claudeProfile({ agent, provider, authMode }))).toThrow("profile agent/provider/authentication combination is unsupported");
     expect(dump()).toBe(before);
   });
 

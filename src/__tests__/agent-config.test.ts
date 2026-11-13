@@ -97,6 +97,17 @@ function captureError(fn: () => unknown): Error {
 }
 
 describe("resolveStageAgentConfig", () => {
+  it.each(["claude", "codex"] as const)("recognizes OpenRouter but refuses the %s combination", agent => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning = { ...defaults.stages!.planning!, agent, provider: "openrouter" };
+    const profiles = accountProfiles.map(profile => profile.id === "claude-api"
+      ? { ...profile, agent, provider: "openrouter" as const, authMode: "openrouter-api-key" as const }
+      : profile);
+    expect(() => resolveStageAgentConfig({
+      orchestratorDefaults: defaults, projectConfig: configuredProject(), accountProfiles: profiles,
+    })).toThrow(new RegExp("unsupported " + (agent === "claude" ? "Claude" : "Codex") + " provider/authentication combination"));
+  });
+
   it("returns explicit legacy mode when project configuration is absent or legacy", () => {
     expect(
       resolveStageAgentConfig({
