@@ -49,9 +49,17 @@ For each claimed item the drain resolves the PR's dispatch row, in this order:
    2. In-flight run: the newest `dispatched`/`running` row in the same repo whose issue identifier matches the head branch (`branchMatchesIssueIdentifier`). The PR's own run has the branch identifier but no `pr_url` until it completes. Ended runs already have `pr_url` and are not matched.
 3. No match: "no record" reply.
 
+## ImplementationRun ownership
+
+After the existing mapping, paused/filesystem, `canDispatch`, budget-notice and ephemeral full-access checks, the drain submits `ImplementationRun` with the queue item ID and PR-scoped gap-fill input. This applies to every project on GitHub Actions, Fly Machines and local Docker, including `CONFLICT_COMMENTER` feature-branch re-queues. Stored review-fix lifecycle is not read; shadow mode selects GitHub Actions only. There is no Legacy fallback.
+
+Restate unavailability or an unavailable submission leaves the item pending and logs `skipped: Restate unavailable`. An unregistered service also leaves it pending. Accepted and conflict submissions mark it dispatched; the workflow reserves capacity and PR occupancy, restoring pending if reservation is refused. Token minting, managed preparation and backend launch happen inside the workflow.
+
+GitHub Actions gap-fill recovery uses the persisted `comment_gapfill_launch` intent’s frozen owner/repo and workflow target. `readStatus` and `stop` also use that original owner/repo even when the current mapping disappears or points to a different repository. Monitoring and crash recovery therefore keep authority over the original launch.
+
 ## Open review findings
 
-The run's instruction is the comment's text followed by the PR's open review findings (`buildCommentGapfillInstruction`, `src/comment-gapfill-drain.ts`, reading `listOpenReviewFindings`). A human's inline review comment is recorded in the ledger and starts no run on its own ([review-fix-rail.md](review-fix-rail.md#a-human-inline-comment-is-recorded-not-enqueued)), and the agent cannot read the PR, so this block is how `/ai-implement` addresses those comments. A bare `/ai-implement` gets the block alone; with no open findings the instruction is the comment text unchanged.
+At workflow launch, the run's instruction is the comment's text followed by the PR's open review findings (`buildCommentGapfillInstruction`, `src/comment-gapfill-drain.ts`, reading `listOpenReviewFindings`). A human's inline review comment is recorded in the ledger and starts no run on its own ([review-fix-rail.md](review-fix-rail.md#a-human-inline-comment-is-recorded-not-enqueued)), and the agent cannot read the PR, so this block is how `/ai-implement` addresses those comments. A bare `/ai-implement` gets the block alone; with no open findings the instruction is the comment text unchanged.
 
 Each finding is rendered whole under its `finding_key`, the same shape a review-fix task uses, so the agent's `fixed` / `invalid` disposition resolves it when the run succeeds and anything undisposed stays open (review-fix-rail.md § "Resolution"). The block holds at most 30 findings and 12,000 characters (`MAX_COMMENT_FINDINGS_BLOCK_CHARS`), because `commentInstruction` has no cap of its own; a finding that does not fit is left out whole, never clipped, and the block says how many were left out. A conflict-resolution row (`CONFLICT_COMMENTER`) gets no block, since review work could fail its review and lose the merge commit; a push-retry row replays a human comment and keeps it.
 
@@ -64,5 +72,33 @@ When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left 
 | Condition | Reply | Item |
 |---|---|---|
 | PR cannot be read (null or throw) | "could not read this PR from GitHub just now … repost" | `failed` |
-| No dispatch row, no roll-up parent, no in-flight match | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
+| No dispatch row, no roll-up parent, no in-flight match; comment from a person | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
+| Same, but the commenter is `ROLLUP_REVIEW_COMMENTER` | no reply (one log line) | `skipped` |
 | PR dispatch budget reached | budget park message (once per park, also when the dispatch breaker parked the PR first) | `pending` |
+
+### Roll-up review-only runs
+
+A programmatic queue row whose commenter is `ROLLUP_REVIEW_COMMENTER`
+(`ai-implement-rollup-review`) requests an advisory review of the existing PR.
+The drain uses the usual PR identity resolution, including recovery from a roll-up
+parent. When the drain finds no parent dispatch for a roll-up review row, it skips
+the row quietly (one log line, item `skipped`, nothing posted, no retry).
+When the runner image is not the paired image (`resolveSessionImage` source is not
+`default`; local Docker is exempt), Restate launch preparation skips the review
+the same way and launches no run; see the [paired-image rule](workflow-envelope.md#advisory-review-only-gap-fills).
+
+Restate launch preparation sets the envelope's `reviewOnly` payload to
+`integration-review` plus the project's effective gating reviewers, deduplicated by
+id. An unset project selection uses the normal defaults; an empty selection still
+runs `integration-review`. Open ledger findings are not appended as fix instructions.
+
+The runner reviews the full PR diff once and posts one verdict comment marked
+`<!-- ai-implement rollup-review -->`, containing severity, file:line and body for
+each finding. Reviewer failure produces an incomplete verdict. No implement or fix
+pass, repository hook, commit, push, or external-review polling runs. The callback
+finishes the dispatch row with `rollup_review` and preserves the findings ledger,
+dispositions and approval marks; it does not submit `LateExternalReview`. Findings
+are advisory and cannot authorize merging. The owning workflow preserves successful
+and failed `rollup_review` results, including when a deadline follows the callback,
+and releases the reservation without implementation tracker transitions or stuck
+remediation. Ordinary comment gap-fills are unchanged.

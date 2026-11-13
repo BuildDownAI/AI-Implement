@@ -360,6 +360,111 @@ describe("retired model account permissions table", () => {
   });
 });
 
+describe("review-fix execution backend schema", () => {
+  const expectedColumns = [
+    { name: "execution_backend", type: "TEXT", nn: 1, defaultValue: "'github-actions'" },
+    { name: "execution_ref", type: "TEXT", nn: 0, defaultValue: null },
+  ];
+  const executionColumns = (db: Database.Database) => db.prepare(`
+    SELECT name, type, "notnull" AS nn, dflt_value AS defaultValue
+    FROM pragma_table_info('review_fix_attempts')
+    WHERE name IN ('execution_backend', 'execution_ref') ORDER BY name
+  `).all();
+
+  function oldAttempts(): Database.Database {
+    const old = new Database(dbPath);
+    old.exec(`CREATE TABLE review_fix_attempts (
+      attempt_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL UNIQUE,
+      mapping_key TEXT NOT NULL,
+      installation_id TEXT NOT NULL,
+      repository TEXT NOT NULL,
+      pr_number INTEGER NOT NULL,
+      issue_scope TEXT NOT NULL,
+      issue_id TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      state TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      deadline_at INTEGER NOT NULL,
+      authority_revoked_at INTEGER,
+      github_run_id INTEGER,
+      github_run_attempt INTEGER,
+      task_snapshot_json TEXT NOT NULL,
+      finding_versions_json TEXT NOT NULL,
+      accepted_result_json TEXT,
+      accepted_result_hash TEXT,
+      result_conflict_at INTEGER,
+      terminal_outcome_json TEXT,
+      completed_at INTEGER,
+      changed_at INTEGER,
+      CHECK ((github_run_id IS NULL) = (github_run_attempt IS NULL)),
+      CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
+    )`);
+    old.exec(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       github_run_id, github_run_attempt, task_snapshot_json, finding_versions_json,
+       accepted_result_json, accepted_result_hash)
+      VALUES ('attempt-old', 'dispatch-old', 'APP', '7', 'acme/app', 42,
+              'team', 'issue-old', 'attempt-old', 'running', 10, 1000,
+              111, 2, '{}', '[]', '{}', 'hash-old')`);
+    return old;
+  }
+
+  it("creates the execution columns with GitHub defaults on a new database", () => {
+    expect(executionColumns(dedup.getDb())).toEqual(expectedColumns);
+  });
+
+  it("upgrades old attempts twice without changing rows, existing columns or checks", () => {
+    const old = oldAttempts();
+    const original = old.prepare<[], Record<string, unknown>>("SELECT * FROM review_fix_attempts").get();
+    const originalColumns = old.prepare("PRAGMA table_info(review_fix_attempts)").all();
+    old.close();
+    if (!original) throw new Error("legacy attempt fixture is missing");
+
+    const db = dedup.getDb();
+    expect(executionColumns(db)).toEqual(expectedColumns);
+    expect(db.prepare(`SELECT * FROM pragma_table_info('review_fix_attempts')
+      WHERE name NOT IN ('execution_backend', 'execution_ref') ORDER BY cid`).all())
+      .toEqual(originalColumns);
+    expect(db.prepare("SELECT * FROM review_fix_attempts").get()).toEqual({
+      ...original,
+      execution_backend: "github-actions",
+      execution_ref: null,
+    });
+    expect(() => db.prepare("UPDATE review_fix_attempts SET github_run_attempt = NULL").run())
+      .toThrow(/CHECK/);
+    expect(() => db.prepare("UPDATE review_fix_attempts SET accepted_result_hash = NULL").run())
+      .toThrow(/CHECK/);
+    expect(() => db.prepare("UPDATE review_fix_attempts SET owner = 'other'").run())
+      .toThrow(/immutable/);
+
+    db.prepare("UPDATE review_fix_attempts SET execution_backend = 'fly-machines', execution_ref = 'machine-1'").run();
+    const migrated = db.prepare("SELECT * FROM review_fix_attempts").get();
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'review_fix_attempts'").get();
+    dedup.closeDb();
+    const reopened = dedup.getDb();
+    expect(executionColumns(reopened)).toEqual(expectedColumns);
+    expect(reopened.prepare("SELECT * FROM review_fix_attempts").get()).toEqual(migrated);
+    expect(reopened.prepare("SELECT sql FROM sqlite_master WHERE name = 'review_fix_attempts'").get()).toEqual(schema);
+  });
+
+  it.each([
+    { column: "execution_backend", sql: "ALTER TABLE review_fix_attempts ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'github-actions'" },
+    { column: "execution_ref", sql: "ALTER TABLE review_fix_attempts ADD COLUMN execution_ref TEXT" },
+  ])("completes an interrupted upgrade with only $column present", ({ sql }) => {
+    const old = oldAttempts();
+    old.exec(sql);
+    old.close();
+
+    expect(executionColumns(dedup.getDb())).toEqual(expectedColumns);
+    expect(dedup.getDb().prepare(`SELECT execution_backend, execution_ref, github_run_id, github_run_attempt
+      FROM review_fix_attempts WHERE attempt_id = 'attempt-old'`).get()).toEqual({
+      execution_backend: "github-actions", execution_ref: null, github_run_id: 111, github_run_attempt: 2,
+    });
+  });
+});
+
 describe("review-fix attempt schema", () => {
   it("creates model_protected_secrets with ciphertext-only columns and keeps rows across startups", () => {
     const db = dedup.getDb();

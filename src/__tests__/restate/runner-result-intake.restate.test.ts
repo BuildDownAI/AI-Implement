@@ -175,7 +175,7 @@ describe("runner result to workflow accounting", () => {
           authorization: `Bearer ${token}`, secret: SECRET,
           body: { phase, outcome: kind === "implementation-failure" ? "failure" : "success", noWork: kind === "implementation", comments: [], prUrl: "https://github.com/o/r/pull/42", reviewFix, invocations: calls as never },
           resolveProvider: async () => provider,
-          checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({ ingress: planning, legacy: async () => {}, readAdmission: read }),
+          checkPlanningAdmissionTermination: createPlanningAdmissionTerminationHook({ ingress: planning, readAdmission: read }),
           checkImplementationAdmissionTermination: createImplementationAdmissionTerminationHook({ ingress: implementation, legacy: async () => {}, readAdmission: read }),
           kgRefreshClient: kg,
           onReviewFixResult: async (result, opts) => {

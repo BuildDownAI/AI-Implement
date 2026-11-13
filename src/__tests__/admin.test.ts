@@ -1648,226 +1648,44 @@ describe("admin mappings", () => {
     }
   });
 
-  it("treats absent reviewFixLifecycle as null on a new mapping", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL1", owner: "org", repo: "app",
-    }, token);
-    expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFL1.reviewFixLifecycle).toBeNull();
-  });
-
-  it("treats null and empty-string reviewFixLifecycle as null", async () => {
-    const token = await login("secret");
-    for (const [teamKey, value] of [["RFL2", null], ["RFL3", ""]] as const) {
-      const res = await request("/api/mappings", "POST", "secret", {
-        teamKey, owner: "org", repo: "app",
-        reviewFixLifecycle: value,
-      }, token);
-      expect(res.statusCode).toBe(202);
-      expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
-    }
-  });
-
-  it("accepts an explicit reviewFixLifecycle='legacy'", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL4", owner: "org", repo: "app",
-      reviewFixLifecycle: "legacy",
-    }, token);
-    expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("legacy");
-  });
-
-  it("preserves existing reviewFixLifecycle when omitted from an unrelated update", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL5", owner: "org", repo: "app",
-      reviewFixLifecycle: "legacy",
-    }, token);
-
-    const update = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL5", owner: "org", repo: "app-updated",
-    }, token);
-    expect(update.statusCode).toBe(202);
-    expect(JSON.parse(update.body).reviewFixLifecycle).toBe("legacy");
-  });
-
-  it("rejects invalid reviewFixLifecycle values with 400", async () => {
-    const token = await login("secret");
-    for (const invalid of ["bogus", "RESTATE", "true"]) {
-      const res = await request("/api/mappings", "POST", "secret", {
-        teamKey: "RFLBAD", owner: "org", repo: "app",
-        reviewFixLifecycle: invalid,
-      }, token);
-      expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).error).toContain("reviewFixLifecycle");
-    }
-  });
-
-  it("rejects reviewFixLifecycle='restate' with an actionable, fail-closed 400 naming the missing execution-mode prerequisite", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLFLY", owner: "org", repo: "app",
-      executionMode: "fly-machines",
-      reviewFixLifecycle: "restate",
-    }, token);
-    expect(res.statusCode).toBe(400);
-    const error = JSON.parse(res.body).error;
-    expect(error).toContain("github-actions");
-    expect(error).toContain("leave the lifecycle on Legacy");
-  });
-
-  it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 when no Restate endpoint status is available (fail closed, deps.getRestateStatus unset)", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLGHA", owner: "org", repo: "app",
-      executionMode: "github-actions",
-      reviewFixLifecycle: "restate",
-    }, token);
-    expect(res.statusCode).toBe(400);
-    const error = JSON.parse(res.body).error;
-    expect(error).toContain("Restate endpoint");
-    expect(error).toContain("get_tenant_health");
-    expect(error).toContain('"registered"');
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLGHA).toBeUndefined();
-  });
-
-  it("rejects reviewFixLifecycle='restate' with a registered, healthy Restate endpoint but a dispatch-ref workflow lacking the attempt-correlation capability", async () => {
-    const token = await login("secret");
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false,
-    });
-    const res = await requestWithDeps("/api/mappings", "POST", token, {
-      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
-    }, {
-      teamKey: "RFLCAP", owner: "org", repo: "app", defaultBranch: "main",
-      executionMode: "github-actions",
-      reviewFixLifecycle: "restate",
-    });
-    expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("run_attempt_token");
-    expect(JSON.parse(res.body).error).toContain("Sync workflows");
-    expect(resolveWorkflowCapabilitiesMock).toHaveBeenCalledWith(expect.objectContaining({
-      owner: "org", repo: "app", workflowFile: "claude-implement.yml", ref: "main", token: "gh-token-mock",
-    }));
-  });
-
-  it("accepts reviewFixLifecycle='restate' when github-actions, the Restate endpoint is registered and healthy, and the dispatch-ref workflow supports attempt correlation", async () => {
-    const token = await login("secret");
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
-    });
-    const res = await requestWithDeps("/api/mappings", "POST", token, {
-      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
-    }, {
-      teamKey: "RFLOK", owner: "org", repo: "app", defaultBranch: "main",
-      executionMode: "github-actions",
-      reviewFixLifecycle: "restate",
-    });
-    expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("restate");
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLOK.reviewFixLifecycle).toBe("restate");
-  });
-
-  it("rejects initial Restate activation while an unreserved Legacy runner is active", async () => {
+  it.each([undefined, null, "", "legacy", "restate", "bogus"])("ignores retired lifecycle input %s on a new mapping without probing readiness", async (reviewFixLifecycle) => {
     const token = await login("secret");
     resolveWorkflowCapabilitiesMock.mockClear();
-    dedup.getDb().prepare(`
-      INSERT INTO dispatch_log (issue_id, repo, dispatched_at, status, phase)
-      VALUES ('legacy-issue', 'org/app', ?, 'running', 'gap-analysis')
-    `).run(Date.now());
-    const res = await requestWithDeps("/api/mappings", "POST", token, {
-      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
-    }, {
-      teamKey: "RFLDRAIN", owner: "org", repo: "app", defaultBranch: "main",
-      executionMode: "github-actions", reviewFixLifecycle: "restate",
-    });
-    expect(res.statusCode).toBe(400);
-    const error = JSON.parse(res.body).error;
-    expect(error).toContain("1 run in flight has no dispatch reservation");
-    expect(error).toContain("No action is necessary");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RETIRED", owner: "org", repo: "app", reviewFixLifecycle,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toMatchObject({ reviewFixLifecycle: null });
+    expect(JSON.parse(res.body).syncJobId).toBeDefined();
+    expect(config.getMappings().RETIRED.reviewFixLifecycle).toBeNull();
     expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
   });
 
-  it("preserves a selected Restate lifecycle during an unrelated edit and rejects an unsupported dispatch change", async () => {
+  it.each([null, "legacy", "restate"] as const)("preserves historical lifecycle %s and protected settings when an old client sends another value", async (stored) => {
+    config.upsertMapping("HIST", makeMapping({
+      owner: "org", repo: "app", reviewFixLifecycle: stored, paused: true,
+      dependencyTokenScope: "installation", sensitiveAddPatterns: ["secrets/**"],
+    }));
     const token = await login("secret");
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "HIST", owner: "org", repo: "app", reviewFixLifecycle: "legacy",
+      sensitiveAddPatterns: ["secrets/**"],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().HIST).toMatchObject({
+      reviewFixLifecycle: stored, paused: true, dependencyTokenScope: "installation",
+      sensitiveAddPatterns: ["secrets/**"],
     });
-    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
-    const original = await requestWithDeps("/api/mappings", "POST", token, healthy, {
-      teamKey: "RFLPRESERVE", owner: "org", repo: "app", defaultBranch: "pilot-ref",
-      workflowFile: "pilot.yml", executionMode: "github-actions", reviewFixLifecycle: "restate",
-    });
-    expect(original.statusCode).toBe(202);
-
-    const unrelated = await requestWithDeps("/api/mappings", "POST", token, {}, {
-      teamKey: "RFLPRESERVE", owner: "org", repo: "app", paused: true,
-      reviewFixLifecycle: "restate",
-    });
-    expect(unrelated.statusCode).toBe(202);
-    expect(JSON.parse(unrelated.body)).toMatchObject({
-      reviewFixLifecycle: "restate", workflowFile: "pilot.yml", executionMode: "github-actions", paused: true,
-    });
-
-    const changed = await requestWithDeps("/api/mappings", "POST", token, {}, {
-      teamKey: "RFLPRESERVE", owner: "org", repo: "app", executionMode: "fly-machines",
-    });
-    expect(changed.statusCode).toBe(400);
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLPRESERVE.executionMode).toBe("github-actions");
   });
 
-  it("rejects a workflow without publication support and does not expose probe errors", async () => {
+  it("still rejects an unsupported Bedrock/Fly backend pair", async () => {
     const token = await login("secret");
-    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: true,
-    });
-    const unsupported = await requestWithDeps("/api/mappings", "POST", token, healthy, {
-      teamKey: "RFLNO-PUB", owner: "org", repo: "app", defaultBranch: "main",
-      reviewFixLifecycle: "restate",
-    });
-    expect(unsupported.statusCode).toBe(400);
-    expect(JSON.parse(unsupported.body).error).toContain("run_publication_token");
-    expect(JSON.parse(unsupported.body).error).toContain("Sync workflows");
-
-    resolveWorkflowCapabilitiesMock.mockRejectedValueOnce(new Error("secret probe detail"));
-    const failed = await requestWithDeps("/api/mappings", "POST", token, healthy, {
-      teamKey: "RFLPROBE", owner: "org", repo: "app", defaultBranch: "main",
-      reviewFixLifecycle: "restate",
-    });
-    expect(failed.statusCode).toBe(400);
-    expect(failed.body).not.toContain("secret probe detail");
-    expect(JSON.parse(failed.body).error).toContain("could not read");
-    expect(JSON.parse(failed.body).error).toContain("GitHub App installation");
-  });
-
-  it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLKEEP", owner: "org", repo: "app",
-      reviewFixLifecycle: "legacy",
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BADBACKEND", owner: "org", repo: "app", executionMode: "fly-machines",
+      provider: "bedrock", awsRegion: "us-east-1",
     }, token);
-
-    const rejected = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLKEEP", owner: "org", repo: "app",
-      executionMode: "fly-machines",
-      reviewFixLifecycle: "restate",
-    }, token);
-    expect(rejected.statusCode).toBe(400);
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLKEEP.reviewFixLifecycle).toBe("legacy");
-    expect(JSON.parse(list.body).RFLKEEP.executionMode).toBe("github-actions");
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("bedrock");
   });
 
   it("round-trips a reviewers array, including an empty one", async () => {
@@ -2068,21 +1886,24 @@ describe("admin mappings", () => {
     expect(JSON.parse(reset.body).reviewProcess).toBeNull();
   });
 
-  it("requires Restate for Codex, including lifecycle-only saves", async () => {
-    const token = await login("secret");
-    for (const reviewFixLifecycle of [undefined, null, "legacy"]) {
-      const res = await request("/api/mappings", "POST", "secret", {
-        teamKey: "CODEX", owner: "org", repo: "app", reviewProcess: "codex-code-review", reviewFixLifecycle,
-      }, token);
-      expect(res.statusCode).toBe(400);
-    }
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({ contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true });
-    const saved = await requestWithDeps("/api/mappings", "POST", token, {
-      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
-    }, { teamKey: "CODEX", owner: "org", repo: "app", defaultBranch: "main", executionMode: "github-actions", reviewProcess: "codex-code-review", reviewFixLifecycle: "restate" });
-    expect(saved.statusCode).toBe(202);
-    const moved = await request("/api/mappings", "POST", "secret", { teamKey: "CODEX", owner: "org", repo: "app", reviewFixLifecycle: "legacy" }, token);
-    expect(moved.statusCode).toBe(400);
+  it.each([null, "legacy", "restate"] as const)("allows Codex review with historical lifecycle %s without changing it", async (reviewFixLifecycle) => {
+    config.upsertMapping("CODEX", makeMapping({ owner: "org", repo: "app", reviewFixLifecycle }));
+    const result = await admin.upsertMappingAction({
+      teamKey: "CODEX", owner: "org", repo: "app", defaultBranch: "main",
+      reviewProcess: "codex-code-review",
+    }, adminConfig("secret"), makeFakeRegistry(provider));
+    expect(result.status).toBe(202);
+    expect(config.getMappings().CODEX).toMatchObject({ reviewProcess: "codex-code-review", reviewFixLifecycle });
+  });
+
+  it("creates a Codex mapping without an enablement dependency", async () => {
+    const result = await admin.upsertMappingAction({
+      teamKey: "NEWCODEX", owner: "org", repo: "app", defaultBranch: "main",
+      reviewProcess: "codex-code-review",
+    }, adminConfig("secret"), makeFakeRegistry(provider));
+    expect(result.status).toBe(202);
+    expect(result.body).toMatchObject({ reviewProcess: "codex-code-review", reviewFixLifecycle: null });
+    expect(result.body.syncJobId).toBeDefined();
   });
 
   it("stores reviewProcess claude-code-review-repository-fix", async () => {
@@ -3323,6 +3144,31 @@ describe("admin job-detail endpoint", () => {
     const body = JSON.parse(res.body);
     expect(body.job.id).toBe(id);
     expect(Array.isArray(body.steps)).toBe(true);
+  });
+
+  it.each(["restate", "legacy"] as const)("reports workflow ownership for a %s job", async (owner) => {
+    const token = await login("secret");
+    const dispatchId = `detail-${owner}`;
+    const admission = await import("../dispatch-admission.js");
+    expect(admission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "s", issueId: dispatchId },
+      kind: "implementation",
+      backend: "fly-machines",
+      lifecycleOwner: owner === "restate" ? { kind: owner, attemptId: "att-detail" } : { kind: owner },
+      cap: 5,
+    }).ok).toBe(true);
+    const id = log.appendLog({
+      issueId: dispatchId, issueIdentifier: "ENG-99", issueTitle: "Workflow",
+      teamKey: "ENG", repo: "org/repo", dispatchId, phase: "implementation",
+    });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.job.restate).toEqual(owner === "restate" ? { service: "ImplementationRun", key: dispatchId } : null);
+    expect(body.job.issueUrl).toBeNull();
+    expect(body.steps).toEqual([]);
   });
 
   it("resolves the job's issueUrl through the mapping's ticketing provider", async () => {
@@ -4762,7 +4608,7 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
   const ATTEMPT_DETAIL: AdminModule.ReviewFixAttemptDetail = {
     attemptId: "attempt-1",
     owner: { kind: "restate", attemptId: "attempt-1" },
-    execution: { githubRunId: "123", githubRunAttempt: 1 },
+    execution: { backend: "github-actions", githubRunId: "123", githubRunAttempt: 1 },
     deadlineAt: 1_700_000_000_000,
     pendingFeedback: false,
     snapshot: { taskText: "fix the thing", findings: [{ findingKey: "f1", version: 2 }] },
@@ -4853,19 +4699,25 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
       expect(res.statusCode).toBe(404);
     });
 
-    it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
+    it.each<AdminModule.ReviewFixAttemptExecutionRef | null>([
+      { backend: "github-actions", githubRunId: "9001", githubRunAttempt: 2 },
+      { backend: "fly-machines", runRef: "machine-123" },
+      { backend: "local-docker", runRef: "container-123" },
+      null,
+    ])("returns execution %j with explicit evidence fields", async (execution) => {
+      const detail = { ...ATTEMPT_DETAIL, execution };
       const token = await login("secret");
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1",
         "GET",
         token,
-        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: detail }) }) },
       );
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body).toHaveProperty("evidenceComplete", false);
       expect(body).toHaveProperty("terminationConfirmed", false);
-      expect(body).toEqual(ATTEMPT_DETAIL);
+      expect(body).toEqual(detail);
     });
 
     it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
@@ -5075,7 +4927,7 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
 
     it("passes the caller-supplied execution reference to the facade and answers 202 on a verified match", async () => {
       const token = await login("secret");
-      let capturedExecution: AdminModule.ReviewFixAttemptExecutionRef | undefined;
+      let capturedExecution: AdminModule.ReviewFixAttemptAdoptInput | undefined;
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1/adopt",
         "POST",
@@ -6522,6 +6374,162 @@ describe("model accounts and stage configuration (AII-962)", () => {
   }
 
   const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+
+  it("preserves resolution failure diagnostics when defaults become legacy", async () => {
+    const t = await seed();
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+      enabled: true, stages: { planning: { model: "project-model" } },
+    }, readyDeps())).status).toBe(200);
+    expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy" })).status).toBe(200);
+
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json).toMatchObject({
+      enabled: true, mode: "configured", resolved: false,
+      error: {
+        code: "resolution_failed",
+        message: "project opted into stage configuration but orchestrator defaults are not configured",
+      },
+    });
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(resolved.json.stages[stage]).toEqual({ entries: [], fallbacksDropped: false });
+    }
+  });
+
+  it("names the stage when every default account is later disabled", async () => {
+    const t = await seed();
+    for (const profileId of ["review-1", "review-2"]) {
+      expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId }))).status).toBe(201);
+    }
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.review, { accounts: [{ accountProfileId: "review-1", model: "gpt-review" }, { accountProfileId: "review-2", model: "" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    for (const profileId of ["review-1", "review-2"]) {
+      expect((await call(`/api/model-accounts/${profileId}`, "PATCH", t, { status: "disabled" })).status).toBe(200);
+    }
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    expect(result.status).toBe(400);
+    expect(result.json.error).toBe("review.accounts: no entry resolves (resolution_failed)");
+  });
+
+  it("stores singleton accounts flat, refuses project lists, and exposes failed entries", async () => {
+    const t = await seed();
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }] });
+    const singleton = await call("/api/agent-defaults", "PUT", t, config);
+    expect(singleton.status).toBe(200);
+    expect(singleton.json.stages.planning).not.toHaveProperty("accounts");
+    const refused = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { planning: { accounts: [] } } });
+    expect(refused.status).toBe(400);
+    expect(refused.json.error).toBe("accounts is only supported in orchestrator defaults");
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "oai-2" }));
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }, { accountProfileId: "oai-2", model: "" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.json.stages.planning.entries).toMatchObject([
+      { index: 0, accountProfileId: "oai-1", passes: false, reason: "resolution_failed" },
+      { index: 1, accountProfileId: "oai-2", passes: true, reason: null },
+    ]);
+  });
+
+  it.each([
+    { accounts: {}, message: "planning.accounts[0] must be a non-empty account list" },
+    { accounts: [], message: "planning.accounts[0] must be a non-empty account list" },
+    { accounts: [null], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "oai-1" }], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "oai-1", model: "m", extra: true }], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "disabled", model: "m" }], message: "planning.accounts[0] does not resolve" },
+    { accounts: [{ accountProfileId: "invalid", model: "m" }], message: "planning.accounts[0] does not resolve" },
+    { accounts: [{ accountProfileId: "plan", model: "m" }, { accountProfileId: "oai-1", model: "m" }], message: "planning.accounts[1] cannot use paid API after subscription" },
+  ])("rejects invalid defaults without appending a revision: $message", async ({ accounts, message }) => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "disabled" }));
+    await call("/api/model-accounts/disabled", "PATCH", t, { status: "disabled" });
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan", authMode: "codex-subscription" }));
+    // A historical incompatible profile must also be refused at the configuration boundary.
+    // Keep the valid paid profile separate from the incompatible one.
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "invalid" }));
+    dedup.getDb().exec("DROP TRIGGER trg_model_account_profile_revisions_immutable");
+    dedup.getDb().prepare("UPDATE model_account_profile_revisions SET agent = 'claude' WHERE profile_id = 'invalid'").run();
+    const before = count("stage_agent_config_revisions");
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts });
+    const result = await call("/api/agent-defaults", "PUT", t, config);
+    expect(result.status).toBe(400);
+    expect(result.json.error).toBe(message);
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it.each([
+    { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+    { agent: "claude", provider: "bedrock", authMode: "bedrock" },
+  ])("reports an incompatible account-only override ($provider)", async profile => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "other", ...profile }));
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "m" }, { accountProfileId: "other", model: "claude" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    // Simulate an existing project override; the save route correctly refuses this configuration.
+    modules.agentConfigStore.setProjectOptIn("APP", true);
+    dedup.getDb().prepare("INSERT INTO stage_agent_config_revisions (config_revision_id, scope_kind, scope_key, revision, version, config_json, created_at) VALUES ('override-test', 'project', 'APP', 2, 1, ?, ?)").run(
+      JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json.stages.planning.entries).toMatchObject([{ accountProfileId: "other", passes: false, reason: "resolution_failed" }]);
+  });
+
+  it.each([
+    { model: "api-model", chosenModel: "api-model", source: "orchestrator-default" },
+    { model: "", chosenModel: "project-model", source: "project" },
+  ])("reports selected account provenance or refuses cross-provider model inheritance ($source)", async ({ model, chosenModel, source }) => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+    for (const profile of [
+      { profileId: "brk", provider: "bedrock", authMode: "bedrock" },
+      { profileId: "cl-api", provider: "anthropic", authMode: "anthropic-api-key" },
+    ]) {
+      expect((await call("/api/model-accounts", "POST", t, profileBody({ ...profile, agent: "claude" }))).status).toBe(201);
+    }
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "primary" }, { accountProfileId: "cl-api", model }] });
+    const saved = await call("/api/agent-defaults", "PUT", t, config);
+    if (!model) {
+      expect(saved.status).toBe(400);
+      expect(saved.json.error).toContain("requires a model for another provider");
+      return;
+    }
+    expect(saved.status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, {
+      enabled: true, stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
+    }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json.stages.planning).toMatchObject({
+      values: { accountProfileId: "cl-api", agent: "claude", provider: "anthropic", model: chosenModel, invocationTimeoutMs: 700000 },
+      sources: { accountProfileId: "orchestrator-default", agent: "orchestrator-default", provider: "orchestrator-default", model: source, invocationTimeoutMs: "project" },
+      entries: [{ index: 0, passes: false, reason: "unsupported_combination" }, { index: 1, passes: true }],
+    });
+  });
+
+  it("shows unsupported backend entries and project fallback suppression", async () => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "brk", agent: "claude", provider: "bedrock", authMode: "bedrock" }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-api", agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" }));
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "claude" }, { accountProfileId: "cl-api", model: "claude-api-model" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(resolved.json.stages.planning.entries).toMatchObject([{ passes: false, reason: "unsupported_combination" }, { passes: true }]);
+    expect(resolved.json.stages.planning.values.accountProfileId).toBe("cl-api");
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: { planning: { accountProfileId: "cl-api", provider: "anthropic" } } }, readyDeps())).status).toBe(200);
+    const overridden = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(overridden.json.stages.planning.fallbacksDropped).toBe(true);
+    expect(overridden.json.stages.planning.entries).toHaveLength(1);
+  });
 
   it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
     await seed();

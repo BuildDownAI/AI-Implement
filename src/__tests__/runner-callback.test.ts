@@ -28,6 +28,11 @@ import type {
 } from "../review-fix-contract.js";
 import { makeAppendLogEntry, makeIssue, makeMapping, makeReviewFixResult } from "./helpers/builders.js";
 import { activityAccepted, cycleSummaryRecorded, noPlanningContext, progressAccepted, resultAccepted, reviewFixResultStored } from "./helpers/replies/orchestrator.js";
+import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
+import { testDir } from "./helpers/test-dir.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { makeContext } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 // ---------- Hoisted mocks for AII-749 lease-rejected handling ----------
@@ -493,80 +498,7 @@ describe("handleRunnerResult — planning", () => {
     expect(dispatchAdmission.count("ENG")).toBe(0);
   });
 
-  // AII-783 review, third round, on PR #681: updateJobStatus's "completed" write above
-  // drops the job out of getInFlightJobs()'s dispatched/running set, so the normal
-  // per-poll monitor never looks at it again — relying solely on sweepStaleAdmissions's
-  // 6-hour floor would strand every ordinary, already-finished planning run at full team
-  // capacity for hours. checkPlanningAdmissionTermination is the fast path that takes the
-  // monitor's place: this asserts the callback actually invokes it (with the right
-  // dispatchId) and that a backend the check confirms terminal is released well under the
-  // 6-hour sweep floor, not just eventually.
-  it("releases the admission reservation promptly via checkPlanningAdmissionTermination when the backend is already confirmed terminal", async () => {
-    const { token, dispatchId } = runnerTokens.mintRunToken({
-      issueId: "i",
-      mappingTeamKey: "ENG",
-      phase: "planning",
-      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
-      secret: SECRET,
-    });
-    const admitted = dispatchAdmission.acquire({
-      dispatchId,
-      mappingKey: "ENG",
-      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
-      kind: "planning",
-      backend: "github-actions",
-      lifecycleOwner: { kind: "legacy" },
-      cap: 1,
-    });
-    expect(admitted.ok).toBe(true);
-    log.appendLog({
-      issueId: "i",
-      issueIdentifier: "ENG-1",
-      issueTitle: "Plan it",
-      teamKey: "ENG",
-      repo: "o/r",
-      dispatchId,
-      executionMode: "github-actions",
-      phase: "planning",
-    });
-
-    const checkPlanningAdmissionTermination = vi.fn(async (id: string) => {
-      // Simulates index.ts's tryFastReleasePlanningAdmission having independently
-      // confirmed the backend terminal and released the reservation.
-      dispatchAdmission.releaseByDispatchId(id, "finalized");
-    });
-
-    const res = await runnerCallback.handleRunnerResult({
-      authorization: `Bearer ${token}`,
-      body: { phase: "planning", outcome: "success", comments: [] },
-      secret: SECRET,
-      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
-      checkPlanningAdmissionTermination,
-    });
-    expect(res.status).toBe(200);
-    expect(checkPlanningAdmissionTermination).toHaveBeenCalledWith(dispatchId);
-
-    const released = dispatchAdmission.read(dispatchId);
-    expect(released?.releasedAt).not.toBeNull();
-    expect(dispatchAdmission.count("ENG")).toBe(0);
-
-    // Capacity is free again immediately — not gated behind the 6-hour sweep floor.
-    const competing = dispatchAdmission.acquire({
-      dispatchId: "competing-dispatch-2",
-      mappingKey: "ENG",
-      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
-      kind: "planning",
-      backend: "github-actions",
-      lifecycleOwner: { kind: "legacy" },
-      cap: 1,
-    });
-    expect(competing.ok).toBe(true);
-  });
-
-  // A still-uncertain backend must leave the reservation held even when the fast-path
-  // seam is present — checkPlanningAdmissionTermination is a no-op call for the caller,
-  // not an automatic release.
-  it("leaves the admission reservation held when checkPlanningAdmissionTermination cannot confirm termination", async () => {
+  it("leaves the admission reservation held when the planning hook has no Restate owner", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
@@ -594,10 +526,7 @@ describe("handleRunnerResult — planning", () => {
       phase: "planning",
     });
 
-    const checkPlanningAdmissionTermination = vi.fn(async () => {
-      // Backend still running / unconfirmable: a real no-op, mirroring
-      // tryFastReleasePlanningAdmission when confirmAdmissionTerminated resolves false.
-    });
+    const checkPlanningAdmissionTermination = vi.fn(async () => {});
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
@@ -2571,7 +2500,7 @@ describe("handleRunnerResult — gap-analysis disposition-gated resolution", () 
   const countLines = (spy: { mock: { calls: unknown[][] } }) =>
     spy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("[runner-callback] gap-analysis findings"));
 
-  it("snapshot path: resolves fixed/invalid, leaves the undisposed finding open, defers follow-up", async () => {
+  it("snapshot path: resolves fixed, rejects invalid, leaves the undisposed finding open, defers follow-up", async () => {
     const a = seed("a");
     const b = seed("b");
     const c = seed("c");
@@ -2596,9 +2525,9 @@ describe("handleRunnerResult — gap-analysis disposition-gated resolution", () 
     }
     expect(res.status).toBe(200);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("resolved=2 deferred_on_pr=1 left_open=1");
+    expect(lines[0]).toContain("resolved=1 deferred_on_pr=1 rejected=1 left_open=1");
     expect(status(a.id)).toBe("resolved");
-    expect(status(b.id)).toBe("resolved");
+    expect(status(b.id)).toBe("rejected");
     expect(status(c.id)).toBe("open");
     expect(status(d.id)).toBe("deferred");
     expect(status(outside.id)).toBe("open");
@@ -2626,9 +2555,9 @@ describe("handleRunnerResult — gap-analysis disposition-gated resolution", () 
     }
     expect(res.status).toBe(200);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("resolved=2 deferred_on_pr=0 left_open=1");
+    expect(lines[0]).toContain("resolved=1 deferred_on_pr=0 rejected=1 left_open=1");
     expect(status(a.id)).toBe("resolved");
-    expect(status(b.id)).toBe("resolved");
+    expect(status(b.id)).toBe("rejected");
     expect(status(c.id)).toBe("open");
     expect(status(late.id)).toBe("open");
   });
@@ -4707,6 +4636,204 @@ describe("handleRunnerResult — deferred findings (AII-756)", () => {
     expect(fake.recordedCalls().filter((c) => c.method === "postComment" && (c.args[1] as string).includes("deferred"))).toHaveLength(1);
   });
 
+  it.each([
+    ["invalid", "rejected"],
+    ["follow-up", "deferred"],
+  ] as const)("applies %s to internal findings on an initial run using the callback PR", async (disposition, status) => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Handle missing input." };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "another finding remains", prUrl: "https://github.com/org/repo/pull/11",
+        comments: [], internalFindings: [finding],
+        findingDispositions: [{ findingKey: key, disposition, reason: "Outside this issue." }],
+      },
+      secret: SECRET, resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status }]);
+    expect(fake.recordedCalls().filter(c => c.method === "postComment" && (c.args[1] as string).includes("deferred")))
+      .toHaveLength(disposition === "follow-up" ? 1 : 0);
+  });
+
+  it.each([false, true])("closes an internal finding omitted by the final review and preserves closure on callback retry (historical report: %s)", async (historicalReport) => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Early internal defect" };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    fakeFetch({ "POST /runner/review-publication": { json: { status: "posted", reviewUrl: "https://github.com/org/repo/pull/11#pullrequestreview-80" } } }).install();
+    const output = await postPushReviewStep.run(
+      makeContext({ githubOwner: "org", githubRepo: "repo", githubToken: "token", nonce: "", orchestratorUrl: "", callbackUrl: "https://orchestrator.test/", progressToken: "progress" }, {
+        invoke: async ({ stage }) => ({
+          stdout: "", exitCode: 0, tokensUsed: 1,
+          structuredOutput: {
+            approved: /review-2$/.test(stage ?? ""),
+            findings: /review-2$/.test(stage ?? "") ? [] : [{ severity: finding.severity, body: finding.body }],
+            summary: "Review result",
+            checks: [{ check: "Diff review", result: "passed", evidence: "Inspected diff." }],
+          },
+          terminalStatus: { subtype: "success", isError: false },
+        }),
+      }),
+      {
+        prNumber: "11", workspaceDir: testDir("callback-final-review"), reviewers: DEFAULT_REVIEWER_SELECTION,
+        pushedSha: "head", reviewProviders: [], sleep: async () => undefined,
+        ghSpawn: (args) => ({ exitCode: 0, stdout: args.some(a => /^repos\/:owner\/:repo\/pulls\/11$/.test(a))
+          ? JSON.stringify({ state: "open", head: { sha: "head", ref: "branch" } })
+          : args.some(a => a.includes("/check-runs")) ? JSON.stringify([{ total_count: 0, check_runs: [] }])
+          : args[0] === "pr" && args[1] === "diff" ? "diff" : "" }),
+        gitSpawn: (args) => ({ exitCode: 0, stdout: args[0] === "status" ? "M file.ts\n" : args[0] === "show" ? "M\tfile.ts\n" : "head" }),
+      },
+      { report: async () => undefined },
+    );
+    expect(output.iterations).toBe(2);
+    expect(output.approved).toBe(true);
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    if (historicalReport) {
+      const historicalTime = Date.now() - 2000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(historicalTime);
+      reviewStore.recordInternalReviewFinding({ ...finding, repo: "org/repo", prNumber: 11 }, "older-dispatch");
+      clock.mockRestore();
+    }
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, dispatchedAt: Date.now() - 1000 });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+    // A report already recorded by this dispatch must still be eligible for closure.
+    reviewStore.recordInternalReviewFinding({ ...finding, repo: "org/repo", prNumber: 11 }, dispatchId);
+    for (let retry = 0; retry < 2; retry++) {
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+          failureReason: "another gate remains", prUrl: "https://github.com/org/repo/pull/11",
+          comments: [], internalFindings: output.internalFindings,
+          findingDispositions: output.findingDispositions,
+        },
+        secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      });
+      expect(res).toMatchObject({ status: retry === 0 ? 200 : 409 });
+      expect(reviewStore.listOpenReviewFindings("org/repo", 11)).toEqual([]);
+      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status: "resolved", revision: historicalReport ? 2 : 1 }]);
+      const { getReviewerScorecard } = await import("../report-card.js");
+      expect(getReviewerScorecard({ repo: "org/repo" })).toEqual([
+        expect.objectContaining({ source: "ai-implement-internal", total: 1, fixed: 1, ignored: 0 }),
+      ]);
+      const github = await import("../github.js");
+      vi.spyOn(github, "getCommitTime").mockResolvedValue(Date.now() - 1000);
+      const { headHasBlockingFinding } = await import("../review-head-clean.js");
+      expect(await headHasBlockingFinding("token", "org", "repo", 11, "head")).toBe(false);
+    }
+  });
+
+  it("keeps an internal finding open when another dispatch reports it after this dispatch started", async () => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Concurrent internal defect" };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    const dispatches = [0, 1].map(() => runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    }));
+    for (const { dispatchId } of dispatches) {
+      const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, dispatchedAt: Date.now() - 1000 });
+      log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+    }
+    // B reports first; A subsequently claims that its final review fixed the finding.
+    for (const index of [1, 0]) {
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${dispatches[index].token}`,
+        body: {
+          phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+          failureReason: "another gate remains", prUrl: "https://github.com/org/repo/pull/11",
+          comments: [], internalFindings: [finding],
+          findingDispositions: index === 0 ? [{ findingKey: key, disposition: "fixed", reason: "Absent from final review." }] : [],
+        },
+        secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      });
+      expect(res.status).toBe(200);
+    }
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{ status: "open" }]);
+  });
+
+  it.each([undefined, "invalid", "follow-up", "fixed"] as const)("reopens internal findings reported by a later dispatch with disposition %s", async (disposition) => {
+    const finding = { source: "ai-implement-internal" as const, severity: "blocking" as const, body: "Handle missing input.", path: "src/example.ts", line: 4 };
+    const key = reviewStore.stableReviewFindingKey(finding);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: "i", mappingTeamKey: "ENG", phase: "implementation",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+      });
+      const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+      log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase: "implementation", outcome: "failure", failureCode: "REVIEW_UNAPPROVED",
+          failureReason: "another finding remains", prUrl: "https://github.com/org/repo/pull/11",
+          comments: [], internalFindings: [finding],
+          findingDispositions: attempt === 0 || disposition ? [{ findingKey: key, disposition: attempt === 0 ? "fixed" : disposition!, reason: "addressed" }] : [],
+        },
+        secret: SECRET, resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+      });
+      expect(res.status).toBe(200);
+      expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [key])).toMatchObject([{
+        status: attempt === 0 || disposition === "fixed" ? "resolved" : disposition === "invalid" ? "rejected" : disposition === "follow-up" ? "deferred" : "open",
+        revision: attempt + 1,
+      }]);
+      const row = dedup.getDb().prepare("SELECT disposition FROM review_findings WHERE finding_key = ?").get(key);
+      expect(row).toEqual({ disposition: attempt === 0 || disposition === "fixed" ? "fixed" : null });
+    }
+  });
+
+  it("rejects on a non-gap-analysis failure outcome too, as long as the job already has a PR", async () => {
+    const deferredId = reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 11,
+      source: "github-review",
+      severity: "blocking",
+      body: "Add a config flag for this.",
+    });
+    const deferredKey = reviewStore.listOpenReviewFindings("org/repo", 11).find((f) => f.id === deferredId)!.findingKey;
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/11");
+
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "still has findings",
+        prUrl: "https://github.com/org/repo/pull/11",
+        comments: [],
+        findingDispositions: [
+          { findingKey: deferredKey, disposition: "invalid", reason: "Not required by this issue." },
+        ],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.getReviewFindingsByKeys("org/repo", 11, [deferredKey])[0]?.status).toBe("rejected");
+    expect(fake.recordedCalls().filter((c) => c.method === "postComment" && (c.args[1] as string).includes("deferred"))).toHaveLength(0);
+  });
+
   it("logs and swallows a postComment failure for the deferred-findings comment without changing the callback response", async () => {
     const deferredId = reviewStore.upsertReviewFinding({
       repo: "org/repo",
@@ -6404,5 +6531,165 @@ describe("owned result accounting boundary", () => {
     expect(consume).toHaveBeenCalledOnce();
     expect(record).toHaveBeenCalledWith(dispatchId, expect.objectContaining({ listWhole: true }));
     expect(runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false }).ok).toBe(false);
+  });
+});
+
+it.each(["success", "failure"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
+  const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
+    ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET });
+  const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
+  log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
+  const findings = ["fixed", "invalid", "follow-up"].map(disposition => ({ source: "ai-implement-internal" as const,
+    severity: "blocking" as const, body: disposition }));
+  for (const finding of findings) reviewStore.recordInternalReviewFinding({ ...finding, repo: "org/repo", prNumber: 12 }, "prior");
+  const before = reviewStore.listOpenReviewFindings("org/repo", 12);
+  const submit = vi.fn();
+  const provider = new FakeProvider({ recordCalls: true });
+  const res = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
+    resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
+    body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [],
+      internalFindings: [...findings, { source: "ai-implement-internal", severity: "blocking", body: "new" }],
+      findingDispositions: findings.map((f, i) => ({ findingKey: reviewStore.stableReviewFindingKey(f),
+        disposition: (["fixed", "invalid", "follow-up"] as const)[i], reason: "test" })),
+      externalReviewPending: { headSha: "a".repeat(40) } },
+  });
+  expect(res.status).toBe(200);
+  expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual(before);
+  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome === "success" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
+  expect(submit).not.toHaveBeenCalled();
+  expect(provider.recordedCalls()).toHaveLength(0);
+});
+
+describe("roll-up review follow-up children", () => {
+  async function setup() {
+    const config = await import("../config.js");
+    config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo" }));
+    const provider = new FakeProvider({ initialIssues: [makeIssue({ id: "i", identifier: "ENG-7", scopeKey: "ENG" })], recordCalls: true });
+    const children: import("../providers/types.js").TrackerIssueRecord[] = [];
+    const listing = vi.fn(async () => ({ issues: children, pageInfo: { hasNextPage: false, endCursor: null } }));
+    Object.assign(provider, { listIssuesPage: listing });
+    const actual = provider.createChildIssue.bind(provider);
+    const create = vi.spyOn(provider, "createChildIssue").mockImplementation(async (parent, scope, content) => {
+      const child = await actual(parent, scope, content);
+      children.push({ ...child, title: content.title, description: content.body, parent: { identifier: "ENG-7" },
+        state: { name: "Ready", type: "unstarted" }, labels: { nodes: [] }, project: null,
+        comments: { nodes: [] }, relations: { nodes: [] } });
+      return child;
+    });
+    hoisted.getPullRequestState.mockResolvedValue({ merged: false, state: "open", headRef: "ai-implement/feature/eng-7" });
+    const gh = await import("../github.js");
+    vi.spyOn(gh, "listPrComments").mockResolvedValue([{ id: 99, body: "<!-- ai-implement rollup-review -->\nVerdict with minor nit" }]);
+    const update = vi.spyOn(gh, "updatePrComment").mockResolvedValue();
+    const submit = vi.fn();
+    const findings: import("../pipeline/review-ledger.js").ReviewLedgerFinding[] = [
+      { source: "ai-implement-internal", severity: "blocking", path: "one.ts", line: 7, body: "When the request times out, work is lost." },
+      { source: "ai-implement-internal", severity: "blocking", path: "two.ts", line: 9, body: "When retried, work is duplicated." },
+      { source: "ai-implement-internal", severity: "minor", body: "minor nit" },
+    ];
+    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success") {
+      const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
+      const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
+      log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
+      const deliver = () => runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
+        resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
+        watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
+        body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
+          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99" } } });
+      return { deliver, dispatchId };
+    }
+    async function run(head: string, internalFindings = findings) {
+      const { deliver, dispatchId } = await prepare(head, internalFindings);
+      const result = await deliver();
+      expect(result.status).toBe(200);
+      expect(log.getJobByDispatchId(dispatchId)?.approved).toBe(false);
+      expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+      expect(submit).not.toHaveBeenCalled();
+      return result;
+    }
+    return { provider, children, listing, create, update, run, prepare, findings };
+  }
+
+  it("files both blockers in one templated child and keeps minors in the verdict", async () => {
+    const { create, run, update } = await setup();
+    await run("a");
+    expect(create).toHaveBeenCalledOnce();
+    const [parent, scope, content] = create.mock.calls[0];
+    expect([parent, scope]).toEqual(["i", "ENG"]);
+    for (const text of ["## Problem", "## Task", "## Files", "## Acceptance Criteria", "a".repeat(40),
+      "https://github.com/org/repo/pull/12", "#issuecomment-99", "one.ts:7", "two.ts:9", "work is lost", "work is duplicated"])
+      expect(content.body).toContain(text);
+    expect(content.title).toMatch(/^\[roll-up-review\] org\/repo#12 /);
+    expect(content.body).not.toContain("minor nit");
+    expect(update.mock.calls[0][4]).toContain("minor nit");
+  });
+
+  it("does not file partial blockers from an incomplete review or consume the child budget", async () => {
+    const { prepare, create, update, run, findings } = await setup();
+    const { deliver, dispatchId } = await prepare("a", findings, "failure");
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", approved: false, conclusion: "rollup_review" });
+    expect(create).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    await run("a");
+    await run("b");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores minor-only results", async () => {
+    const { run, create, findings } = await setup();
+    await run("a", [findings[2]]);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("serializes concurrent same-head creates and caps at two including terminal children", async () => {
+    const { run, create, update, children, provider } = await setup();
+    await Promise.all([run("a"), run("a")]);
+    expect(create).toHaveBeenCalledOnce();
+    provider.setLifecycle(children[0].id, "completed");
+    dedup.getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:children:%");
+    await run("a");
+    expect(create).toHaveBeenCalledOnce();
+    await run("b");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("a person decides");
+    dedup.getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:children:%");
+    await run("c");
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("limit");
+  });
+
+  it("fails closed on tracker reads and ambiguous creates", async () => {
+    const { run, listing, create, prepare } = await setup();
+    listing.mockRejectedValueOnce(new Error("tracker read unavailable"));
+    const { deliver, dispatchId } = await prepare("a");
+    expect((await deliver()).status).toBe(503);
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
+    expect(create).not.toHaveBeenCalled();
+    expect((await deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledOnce();
+    create.mockRejectedValueOnce(new Error("response lost"));
+    await run("b");
+    await run("b");
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("acknowledges failures after creation and unsupported child discovery", async () => {
+    const { prepare, create, update, provider } = await setup();
+    update.mockRejectedValueOnce(new Error("comment unavailable"));
+    const { deliver } = await prepare("a");
+    expect((await deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledOnce();
+    Object.assign(provider, { listIssuesPage: undefined });
+    const next = await prepare("b");
+    expect((await next.deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("parks a child if the PR closes during creation", async () => {
+    const { run, provider } = await setup();
+    hoisted.getPullRequestState.mockResolvedValueOnce({ merged: false, state: "open", headRef: "ai-implement/feature/eng-7" })
+      .mockResolvedValue({ merged: true, state: "closed", headRef: "ai-implement/feature/eng-7" });
+    await run("a");
+    expect(provider.recordedCalls().some(c => c.method === "parkForHuman")).toBe(true);
+    expect(provider.recordedCalls().filter(c => c.method === "postComment")[0].args[1]).toContain("re-file");
   });
 });

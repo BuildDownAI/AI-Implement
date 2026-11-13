@@ -419,7 +419,6 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
     await eventually(() => read(), (st) => st.step !== null && st.step !== "reserve", { label: `${dispatchId} past reserve` });
     const hook = createPlanningAdmissionTerminationHook({
       ingress: client,
-      legacy: async () => { throw new Error("the Legacy fast release must not run for a Restate-owned reservation"); },
     });
     return { dispatchId, issue, read, hook };
   }
@@ -884,7 +883,6 @@ describe("Restate PlanningRun pilot: production-composition proof", () => {
       const read = (id: string) => callWorkflow<PlanningRunStatusResult>(url, "PlanningRun", id, "status");
       const hook = createPlanningAdmissionTerminationHook({
         ingress: createPlanningRunIngressClient(url),
-        legacy: async () => { throw new Error("the Legacy fast release must not run for a Restate-owned reservation"); },
       });
       const runA = await eventually(() => read(resA.dispatchId), (s) => s.jobId !== null, { label: "first bound" });
       const runB = await eventually(() => read(resB.dispatchId), (s) => s.jobId !== null, { label: "second bound" });

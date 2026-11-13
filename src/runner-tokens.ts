@@ -219,6 +219,8 @@ interface PreparedAttemptTokenRow {
   deadline_at: number;
   authority_revoked_at: number | null;
   state: string;
+  execution_backend: string;
+  execution_ref: string | null;
   github_run_id: number | null;
   github_run_attempt: number | null;
   terminal_outcome_json: string | null;
@@ -240,7 +242,8 @@ function preparedAttempt(attemptId: string): PreparedAttemptTokenRow | undefined
   return getDb().prepare(`
     SELECT a.attempt_id, a.dispatch_id, a.issue_scope, a.issue_id, a.mapping_key,
            a.installation_id, a.repository, a.pr_number, a.deadline_at,
-           a.authority_revoked_at, a.state, a.github_run_id, a.github_run_attempt,
+           a.authority_revoked_at, a.state, a.execution_backend, a.execution_ref,
+           a.github_run_id, a.github_run_attempt,
            a.terminal_outcome_json, a.completed_at, a.owner, d.lifecycle_owner,
            d.mapping_key AS admission_mapping_key, d.issue_scope AS admission_issue_scope,
            d.issue_id AS admission_issue_id, d.installation_id AS admission_installation_id,
@@ -337,7 +340,7 @@ export function verifyPreparedReviewFixToken(
   expectedAudience: RunTokenAudience,
   options: {
     consumePublication?: boolean;
-    publicationExecution?: { repository: string; githubRunId: number; githubRunAttempt: number };
+    publicationExecution?: { repository: string; githubRunId?: number; githubRunAttempt?: number };
   } = {},
 ): VerifyResult {
   const db = getDb();
@@ -356,18 +359,26 @@ export function verifyPreparedReviewFixToken(
       SELECT expires_at FROM runner_tokens WHERE dispatch_id = ? AND audience = ?
     `).get(claims.dispatchId, claims.audience) as { expires_at: number } | undefined;
     if (!row || claims.exp !== row.expires_at) return { ok: false, reason: "wrong_scope", claims };
-    // Result delivery can retry after the workflow releases its admission.
+    // Ordinary result delivery can retry after the workflow releases its admission.
     // Keep every scope and explicit revocation check; release alone ends
-    // publication/progress authority, not an unexpired result credential.
-    const authority = expectedAudience === "result" ? { ...attempt, released_at: null } : attempt;
+    // publication/progress authority, including result-bearer pre-write checks.
+    const authority = expectedAudience === "result" && !options.publicationExecution
+      ? { ...attempt, released_at: null } : attempt;
     if (!hasPreparedAdmissionAuthority(authority)) {
       return { ok: false, reason: "revoked", claims };
     }
     if (options.publicationExecution) {
       const execution = options.publicationExecution;
-      if (attempt.repository !== execution.repository
-        || attempt.github_run_id !== execution.githubRunId
-        || attempt.github_run_attempt !== execution.githubRunAttempt) {
+      // Machine scope comes only from the orchestrator's binding; request run
+      // IDs carry authority only for GitHub Actions attempts.
+      const executionMatches = attempt.execution_backend === "github-actions"
+        ? Number.isSafeInteger(execution.githubRunId) && (execution.githubRunId ?? 0) > 0
+          && Number.isSafeInteger(execution.githubRunAttempt) && (execution.githubRunAttempt ?? 0) > 0
+          && attempt.github_run_id === execution.githubRunId
+          && attempt.github_run_attempt === execution.githubRunAttempt
+        : (attempt.execution_backend === "fly-machines" || attempt.execution_backend === "local-docker")
+          && attempt.execution_ref !== null;
+      if (attempt.repository !== execution.repository || !executionMatches) {
         return { ok: false, reason: "wrong_scope", claims };
       }
       if (Date.now() >= attempt.deadline_at || attempt.terminal_outcome_json !== null

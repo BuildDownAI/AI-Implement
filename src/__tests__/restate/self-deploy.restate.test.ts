@@ -306,10 +306,12 @@ describe("SelfDeploy durable phase machine", () => {
         .mockRejectedValueOnce(Object.assign(new Error("lease busy"), { status }))
         .mockRejectedValueOnce(Object.assign(new Error("lease busy"), { status }))
         .mockImplementationOnce(update);
-      await start(env); await phase(env, "verifying");
+      await start(env);
+      // Verification can finish between status polls. The terminal outcome also
+      // proves apply completed, without requiring observation of a transient phase.
+      await terminal(env, f, "succeeded");
       expect(f.deps.fly.updateMachine).toHaveBeenCalledTimes(3);
       expect(f.deps.flyctl).not.toHaveBeenCalled();
-      await terminal(env, f, "succeeded");
     }
   });
   it.each(VARIANTS)("logs sanitized fixed failures and passes durable notice detail (%s)", async label => {

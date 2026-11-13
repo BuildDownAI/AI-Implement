@@ -20,7 +20,7 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import { recordUsage, type RecordedUsage } from "../agent-usage.js";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
-import { acceptOwnedRunReport, type OwnedRunReportResult, cleanupOwnedRun, readBoundedOwnedRun, readOwnedRunStatus, reportOwnedRunOutcome, reserveOwnedRun } from "./owned-run-lifecycle.js";
+import { acceptOwnedRunReport, type OwnedRunReportResult, readBoundedOwnedRun, readOwnedRunStatus, reserveOwnedRun } from "./owned-run-lifecycle.js";
 import { awaitOwnedRun, type OwnedRunStatus } from "./owned-run-wait.js";
 import { restateRetentionMs } from "./retention.js";
 
@@ -54,6 +54,14 @@ export const implementationRunInputSchema = z.object({
    *  and read once at dispatch. The workflow never reads the setting: replay must see one value (ADR 045). */
   maxJobMinutes: z.number().int().positive(),
   backend: z.enum(["github-actions", "fly-machines", "local-docker"]),
+  gapFill: z.object({
+    queueItemId: z.number().int().positive(),
+    repository: z.string().regex(/^[^/]+\/[^/]+$/),
+    installationId: z.string().min(1),
+    prNumber: z.number().int().positive(),
+    prDispatchBudget: z.number().int().nonnegative(),
+    humanRequested: z.boolean(),
+  }).strict().optional(),
 }).strict();
 
 export type ImplementationRunInput = z.infer<typeof implementationRunInputSchema>;
@@ -78,7 +86,7 @@ export interface ImplementationRunStatusResult {
 
 export interface ImplementationRunResult {
   /** `refused`: the reservation was refused, so nothing launched and nothing was released. */
-  reason: DispatchAdmissionReleaseReason | "refused";
+  reason: DispatchAdmissionReleaseReason | "refused" | "termination_unconfirmed";
 }
 
 /** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
@@ -105,6 +113,10 @@ export interface ImplementationRunDependencies {
   /** `reportTerminalJob` with `ownerCall`: completion notice, failure comment, and breaker count. Once-only per dispatch. */
   onOutcome(dispatchId: string): void | Promise<void>;
   release(dispatchId: string, reason: DispatchAdmissionReleaseReason): void | Promise<void>;
+  /** Durable, exact-owner recovery; independent of the run invocation and its journal. */
+  ensureOwner?(input: ImplementationRunInput): void;
+  recordTerminationIntent?(input: ImplementationRunInput, outcome: ImplementationFinishOutcome): void;
+  reconcile?(dispatchId: string): Promise<ImplementationRunResult>;
   /** Test seams: production leaves every one of these unset. */
   tickMs?: number;
   confirmTickMs?: number;
@@ -141,11 +153,25 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     ctx.set("step", "reserve");
 
     let releaseStarted = false;
+    let retained = false;
+    function retain(): ImplementationRunResult {
+      retained = true;
+      ctx.set("step", "termination_unconfirmed");
+      return { reason: "termination_unconfirmed" };
+    }
 
     async function release(reason: DispatchAdmissionReleaseReason): Promise<ImplementationRunResult> {
       releaseStarted = true;
       ctx.set("step", "release");
-      await ctx.run("release", () => deps.release(dispatchId, reason), { maxRetryAttempts: 5 });
+      try {
+        await ctx.run("release", () => {
+          deps.ensureOwner?.(input);
+          return deps.release(dispatchId, reason);
+        }, { maxRetryAttempts: 5 });
+      } catch (err) {
+        if (!restate.internal.isSuspendedError(err)) retain();
+        throw err;
+      }
       ctx.set("step", "released");
       return { reason };
     }
@@ -173,35 +199,50 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     let currentJobId: string | null = null;
     let stopTried = false;
     let rowCloseTried = false;
+    let rowFinalized = false;
     let cleanupStarted = false;
+    let cleanupCompleted = false;
     let outcomeStarted = false;
+    let outcomeCompleted = false;
     // Set when the run is known to have ended (`endedPath`, `deadlinePath`): an escape then does not stop it.
     let runEnded = false;
     let dispatchedAtForEscape = 0;
     let pendingReason: DispatchAdmissionReleaseReason | null = null;
 
     /** Cleanup, then the outcome one time, for a run that was launched; each step name is journaled once. */
-    async function wrapUp(): Promise<void> {
+    async function wrapUp(): Promise<boolean> {
       const id = currentJobId;
       if (id !== null && !cleanupStarted) {
         cleanupStarted = true;
         ctx.set("step", "cleanup");
-        await cleanupOwnedRun(ctx, () => deps.cleanup(input, id));
+        await ctx.run("cleanup", async () => {
+          deps.ensureOwner?.(input);
+          await deps.cleanup(input, id);
+        }, { maxRetryAttempts: 3 });
+        cleanupCompleted = true;
       }
+      if (id !== null && !cleanupCompleted) return false;
       if (!outcomeStarted) {
         outcomeStarted = true;
         ctx.set("step", "outcome");
-        await reportOwnedRunOutcome(ctx, () => deps.onOutcome(dispatchId));
+        await ctx.run("outcome", async () => { await deps.onOutcome(dispatchId); }, { maxRetryAttempts: 3 });
+        outcomeCompleted = true;
       }
+      return outcomeCompleted;
     }
 
     async function wrapUpAndRelease(reason: DispatchAdmissionReleaseReason): Promise<ImplementationRunResult> {
-      await wrapUp();
+      if (!await wrapUp()) return retain();
       return release(reason);
     }
 
-    /** An escape after a launch: stop the run when its id is known, close the row, wrap up. Best effort throughout. */
+    /** An escape after a launch: persist intent, confirm termination, then finish required bookkeeping. */
     async function escape(): Promise<void> {
+      // Persist before any cancellable backend work. First intent wins, so a deadline
+      // or completed normal finalization cannot be rewritten by a later cancellation.
+      if (deps.recordTerminationIntent) {
+        await ctx.run("retain escape intent", () => deps.recordTerminationIntent!(input, { kind: "cancelled" }));
+      }
       if (currentJobId === null) {
         // A `dispatch` step that did not return may have launched, and its function can still complete after a
         // cancel: look for the run, then sleep and look again for a fixed time.
@@ -234,16 +275,20 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
           ctx.console.error(`[implementation-run] stop after escape failed dispatch=${dispatchId}`);
         }
       }
+      if (id !== null && !runEnded) {
+        const status = await readOwnedRunStatus(ctx, "read-escape-terminal", () => deps.readStatus(input, id));
+        runEnded = status === "ended";
+      }
+      if (!runEnded) return;
       if (!rowCloseTried) {
         rowCloseTried = true;
-        try {
-          await ctx.run("finish-job-escape", async () => (await deps.finishJob(dispatchId, { kind: "cancelled" })) ?? {}, { maxRetryAttempts: 3 });
-        } catch (err) {
-          if (restate.internal.isSuspendedError(err)) throw err;
-          ctx.console.error(`[implementation-run] closing the job row after escape failed dispatch=${dispatchId}`);
-        }
+        await ctx.run("finish-job-escape", async () => {
+          deps.ensureOwner?.(input);
+          return (await deps.finishJob(dispatchId, { kind: "cancelled" })) ?? {};
+        }, { maxRetryAttempts: 3 });
+        rowFinalized = true;
       }
-      await wrapUp();
+      if (rowFinalized) await wrapUp();
     }
 
     try {
@@ -258,6 +303,7 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
       const launched = await ctx.run(
         "dispatch",
         async (): Promise<ImplementationLaunchResult> => {
+          deps.ensureOwner?.(input);
           // Reconcile first: a retry after a committed-but-unacknowledged launch must adopt that run.
           const existing = await deps.findExistingRun(input, dispatchedAt);
           if (existing !== null) return { outcome: "accepted", jobId: existing };
@@ -312,7 +358,11 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         runEnded = true;
         pendingReason = "finalized";
         rowCloseTried = true;
-        const finished = await ctx.run("finish-job", async () => (await deps.finishJob(dispatchId, { kind: "run_ended" })) ?? {}, { maxRetryAttempts: 3 });
+        const finished = await ctx.run("finish-job", async () => {
+          deps.ensureOwner?.(input);
+          return (await deps.finishJob(dispatchId, { kind: "run_ended" })) ?? {};
+        }, { maxRetryAttempts: 3 });
+        rowFinalized = true;
         const reason = finished.release ?? "finalized";
         pendingReason = reason;
         return wrapUpAndRelease(reason);
@@ -324,7 +374,10 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
         if (jobId !== null) {
           const id = jobId;
           try {
-            const stopped = await ctx.run("stop", () => deps.stop(input, id), { maxRetryAttempts: 3 });
+            const stopped = await ctx.run("stop", () => {
+              deps.recordTerminationIntent?.(input, { kind: "deadline" });
+              return deps.stop(input, id);
+            }, { maxRetryAttempts: 3 });
             stopTried = true;
             ctx.console.log(`[implementation-run] stop after deadline dispatch=${dispatchId} stopped=${stopped}`);
           } catch (err) {
@@ -333,10 +386,10 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
             stopTried = true;
             ctx.console.error(`[implementation-run] stop failed dispatch=${dispatchId}: ${err.message}`);
           }
-          // The helper returns at `ended` or at the margin; either way the deadline outcome stands.
+          // The margin bounds waiting, not ownership. Only an ended result permits finalization.
           skipNextRead = false;
           const marginEnd = (await ctx.date.now()) + stopMarginMs;
-          await awaitOwnedRun(ctx, {
+          const stoppedRun = await awaitOwnedRun(ctx, {
             signals: [],
             resultSignal: "report",
             totalDeadlineAt: marginEnd,
@@ -344,10 +397,20 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
             startedSeen: true,
             readStatus,
           });
+          runEnded = stoppedRun.kind === "status" && stoppedRun.status === "ended";
+        }
+        if (!runEnded) {
+          if (jobId === null && deps.recordTerminationIntent) {
+            await ctx.run("retain termination", () => deps.recordTerminationIntent!(input, { kind: "deadline" }));
+          }
+          return retain();
         }
         rowCloseTried = true;
-        runEnded = true;
-        await ctx.run("finish-job-deadline", async () => (await deps.finishJob(dispatchId, { kind: "deadline" })) ?? {}, { maxRetryAttempts: 3 });
+        await ctx.run("finish-job-deadline", async () => {
+          deps.ensureOwner?.(input);
+          return (await deps.finishJob(dispatchId, { kind: "deadline" })) ?? {};
+        }, { maxRetryAttempts: 3 });
+        rowFinalized = true;
         return wrapUpAndRelease("deadline_exceeded");
       }
 
@@ -402,10 +465,9 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
       if (restate.internal.isSuspendedError(err)) suspended = true;
       throw err;
     } finally {
-      // Every escape owes the reservation a release; a suspension is not an escape, and a release
-      // step that already ran (and failed) is not journaled a second time. An error from the escape
-      // (a second cancel) does not skip the release; it is re-thrown after it.
-      if (!suspended && !releaseStarted) {
+      // Suspension is replay, not escape. Release requires confirmed end and successful
+      // finalization; interrupted cleanup or finalization retains recovery authority.
+      if (!suspended && !releaseStarted && !retained) {
         let escapeFailed = false;
         let escapeError: unknown;
         if (mayHaveLaunched) {
@@ -417,7 +479,8 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
             escapeError = err;
           }
         }
-        await release(pendingReason ?? "cancelled");
+        if (!mayHaveLaunched || (runEnded && rowFinalized && (currentJobId === null || cleanupCompleted) && outcomeCompleted && !escapeFailed)) await release(pendingReason ?? "cancelled");
+        else retain();
         if (escapeFailed) throw escapeError;
       }
     }

@@ -93,6 +93,7 @@ Reads, orchestrator-native:
 | `get_issue_dispatch_status` | user | In-flight and dedup state plus recent dispatches for one issue |
 | `get_issue_report_card` | user | Per-pass telemetry, totals, approval and merge state for one issue. `totals.costUsd` is reported cost only; `totals.estimatedCostUsd` is the separate estimated cost summed over calls with unavailable reported cost (null when none can be estimated). Estimates use current ModelPrices base rates and token/cache counts. `totals.unpricedCalls` counts unavailable-cost calls that cannot be estimated (missing model price or input/output tokens). Missing legacy invocation rows cannot be counted. Each run carries `restate: { service, key } | null` (`KgRefresh` for a kg-refresh row, `PlanningRun` for planning, `ReviewFixAttempt` for a Restate-owned review-fix row; `null` otherwise or without a dispatch id) — it is the key of the Restate UI link `/ui/workflows/<service>/<key>`. |
 | `get_fleet_report` | user | Per-repo outcomes over a look-back window |
+| `get_reviewer_scorecard` | user | Per-source finding counts: total, fixed (resolved with explicit fixed disposition), rejected, deferred, ignored (resolved without fixed evidence, or open on a PR confirmed merged by merge capture), rejectedRate (rejected / total). Optional `args.days` (non-negative, default 30) and `args.repo` (exact match); inclusive first-seen window through now. Active open findings count only in total. No paging; one JSON text block containing an array, empty when no findings match. Sources are channels, so GitHub thread findings do not distinguish Codex from people. |
 | `get_deploy_posture` | user | Autodeploy, deploy hold, running-vs-head commit, runner-channel state, and `selfDeploy`: the `SelfDeploy.status()` record (`deployId`, `phase` `draining`/`applying`/`verifying`/`succeeded`/`failed`/`cancelled`, `target`, `requestedBy`, `startedAt`, `finishedAt`, `reason` `drain-timeout`/`apply-failed`/`verify-timeout`/null), or `null` when no deploy was recorded or the object could not be read. Every other field, including `deploy.held` and `deploy.lastOutcome`, is unchanged. Recorded exchanges: [contracts/get_deploy_posture/](contracts/get_deploy_posture/) (`draining`, `succeeded`, `failed`). |
 | `get_review_fix_attempt` | admin | Status envelope for one Restate review-fix attempt: `{ status: "ok", attempt }`, `{ status: "not_found" }`, or `{ status: "unavailable" }`. The `attempt` preserves `evidenceComplete`, `terminationConfirmed`, cycle summaries, owner, execution, deadline, pending-feedback, snapshot, and state from the injected review-fix facade. |
 | `get_review_fix_activity` | admin | Status envelope for one page of Restate review-fix activity: `{ status: "ok", page }`, `{ status: "not_found" }`, or `{ status: "unavailable" }`. Arguments are `attemptId` (1..128 chars, `^[A-Za-z0-9][A-Za-z0-9._-]*$`), optional `pageSize` 1..500 (default 100), and optional `cursor: { producerId, sequence }` with the same ID shape for `producerId` and a non-negative safe-integer `sequence`. The page preserves events, `nextCursor`, and `truncated`. |
@@ -112,6 +113,7 @@ Writes, declared:
 | `set_runner_backend` | admin | Sets a backend's deployment-wide settings on the `RunnerBackend` Restate object: `backend` (`fly-machines`, `github-actions`) and `patch` (`app`, `region` for `fly-machines`; no fields for `github-actions`). Given fields merge into the stored state; an unknown backend or field answers 400. No secret is accepted. The Settings page writes through this tool. |
 | `set_pipeline_schedule` | admin | Sets a pipeline's daily schedule on the `PipelineSchedule` Restate object: `pipeline` and `patch` (`enabled`, `time` as `HH:MM`, `zone` as an IANA name). Given fields merge into the stored schedule; a bad time or zone, an unknown pipeline, or an unknown field answers 400 naming the field, and nothing is stored. The Knowledge Graph Pipelines page writes through this tool. |
 | `start_deploy` | admin | Starts a self-deploy of this orchestrator through `SelfDeploy.start`; also reachable with the control plane's `orchestrator:deploy` token ([AII-1612](https://linear.app/eudoxus/issue/AII-1612)). Request: `POST /api/tools/start_deploy` with body `{ "args": { "branch": "testing" \| "main", "requestedBy": string (1..200 characters) } }`; no other argument is accepted (an unknown key or another `branch` is the route's 400 `isError`). Success: `{ deployId, commit, image, alreadyActive }`. **Reads shared `SelfDeploy.status` first: during `draining`, `applying` or `verifying`, returns the active deploy immediately with `alreadyActive: true`, without calling or queueing `SelfDeploy.start`.** When no deploy is active, calls `SelfDeploy.start`, which retains its own `alreadyActive` check for concurrent callers that pass the status pre-check together. `SelfDeploy.start` sets the self-deploy hold, so `start_deploy` is one of the tools the hold lets through: a retry during a drain reads shared status and answers `alreadyActive: true` with the same `deployId`. A refusal is one fixed code as the error text (`isError: true`, not JSON): `image-not-published`, `head-unknown` or `not-configured`; a caller without the admin role or the deploy grant gets `forbidden: start_deploy requires the admin role`. A human `user` and a token with only `orchestrator:read` are refused. It is a write: it carries an idempotency key, so two calls with one key and no active deploy run `SelfDeploy.start` once. Progress is `get_deploy_posture`'s `selfDeploy`, which also answers during a hold (`selfDeploy.phase` is `draining` while the deploy drains). Recorded exchanges (`started`, `already-active`, `image-not-published`, `read-scope-refused`, `invalid-args`) are in [contracts/start_deploy/](contracts/start_deploy/), the request rules in [contracts/start_deploy/args.schema.json](contracts/start_deploy/args.schema.json); `src/__tests__/deploy-tools-contract.test.ts` fails when a response differs and `UPDATE_CONTRACT_FIXTURES=1` rewrites them. |
+| `import_environment_credential` | admin | Import the orchestrator environment credential as an account profile; leaves stage defaults unchanged. |
 | `pause_project` | admin | Same as the `paused` update of `PATCH /api/mappings/<teamKey>`. |
 | `add_project` | admin | Same as `POST /api/mappings`: create or update a project mapping, the upsert behind the admin UI's New project stepper. |
 | `trigger_workflow_sync` | admin | Same as `POST /api/mappings/<teamKey>/sync-workflows`: re-sync the workflow templates for one project. |
@@ -126,6 +128,53 @@ A tool that the BuildDown control plane calls with its `service` token (for exam
 * **The semantics:** write down every rule a consumer depends on: how paging ends (for example a `null` cursor on a page that is not full), what `null` means, units, ordering, and what can change after a read.
 * **Recorded exchanges:** a test calls the real handler through the real route for each scenario and writes the request and response bodies to `docs/contracts/<tool>/<scenario>.json`. It fails when the output differs, and rewrites only with an explicit environment variable. The control plane copies these files and its fake answers only from them.
 * **Changes:** a change to the request, the response or a rule regenerates the files, and the PR names the Control-Plane issue that takes the new files. Ship this repo first, then the control plane.
+
+### Monitor tools: health and fleet
+
+Both tools accept `POST /api/tools/<name>` with a read-scoped service token and
+return HTTP 200 with an MCP envelope: `{ "content": [{ "type": "text", "text":
+"<JSON report>" }] }`. Parse `content[0].text` as JSON. Neither report is paginated.
+
+`get_tenant_health` takes `{ "args": {} }` (no arguments). Its report contains
+`runnerMode: { mode, source }`, the counts `inFlightJobCount`,
+`awaitingDecisionCount`, `pendingGapfillCount`, and `projectCount`, `kgDegraded`
+(embeddings degraded), `kgUnavailable` (last sidecar probe failed), `sidecar`
+(`reachable`, `toolsListed`, `lastError`, `checkedAt`), and `restate` (`sidecar`
+and `registration` status). `checkedAt` is epoch milliseconds or `null` before a
+probe; `lastError` is `null` without a probe error. `restateRetentionDays` and
+`volumeSnapshotRetentionDays` are days. `kgRefreshPreflight` is `null` without a
+configured KG source repo; `setupChecks` is `null` before the first setup-check
+run, otherwise the summary described in [setup-checks.md](setup-checks.md).
+See the [argument schema](contracts/get_tenant_health/args.schema.json) and
+recorded [healthy](contracts/get_tenant_health/healthy.json) and
+[KG degraded](contracts/get_tenant_health/degraded.json) exchanges.
+
+`get_fleet_report` takes `{ "args": {} }` for the default 30-day look-back, or
+`{ "args": { "days": 7 } }` for seven days. `days` is an optional number;
+there are currently no integer or positive bounds. Unknown argument keys are
+stripped by both tools' inputs. The published schemas describe their parsed
+arguments. The fleet window includes dispatches at or after the cutoff and
+excludes `test-org/%` repos. The response has:
+
+* `byRepo`: per-repo `repo`, `jobs`, `issues`, `completed`, `failed`, `merged`,
+  `avgPasses`, and `costUsd` (USD).
+* `oneShotPct` and `eventualPct`: first-pass approval per eligible implementation
+  dispatch and eventual approval per distinct implementation issue.
+* `planning`: `planned` and `unplanned` cohorts, each with `jobs`, `oneShotPct`,
+  `avgPasses`, `avgCostUsd`, and `mergedPct`.
+* `escapeRate`: review escapes among captured merges; `runaways`: ranked entries
+  with `issueIdentifier`, `repo`, `dispatches`, and `consecutiveFailures`.
+
+Despite the `Pct` suffix, rates are fractions from 0 to 1. Rates with no eligible
+denominator and missing pass/cost measurements are `null`, not zero; empty
+collections are `[]`. Counts and a measured zero rate can be zero.
+See the [argument schema](contracts/get_fleet_report/args.schema.json),
+[default window](contracts/get_fleet_report/default-days.json),
+[seven-day window](contracts/get_fleet_report/seven-days.json), and
+[invalid arguments](contracts/get_fleet_report/invalid-args.json) recordings.
+A string `days` fails ingress deserialization: the route preserves its actual
+HTTP status in the recording and returns MCP `isError: true` with the ingress
+400 error in the text.
 
 ### Recording a tool contract
 

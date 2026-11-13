@@ -2,7 +2,8 @@
 // outside the SDK endpoint, as the later SQLite adapters will be in production.
 import { createHash, randomUUID } from "node:crypto";
 import type { RestateEnvironment } from "./harness.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import * as contract from "../../review-fix-contract.js";
 import type { ReviewFixResultMetadataV1, WorkerTerminalOutcome } from "../../review-fix-contract.js";
 import type { PreparedReviewFixAttempt } from "../../review-fix-ports.js";
 import { createReviewFixAttempt, type ReviewFixAttemptCompletion } from "../../restate/review-fix-attempt.js";
@@ -13,7 +14,7 @@ import { registerOwnedRunContract, type OwnedRunAdapter } from "./owned-run-cont
 import { makeReviewFixResult } from "../helpers/builders.js";
 
 const SHA = "a".repeat(40);
-const EXECUTION = { githubRunId: 782, githubRunAttempt: 1 };
+const EXECUTION = { backend: "github-actions" as const, githubRunId: 782, githubRunAttempt: 1 };
 
 type LaunchMode = "accepted" | "response_lost" | "rejected" | "unresolved";
 interface FakeAttempt {
@@ -28,12 +29,16 @@ interface FakeAttempt {
   terminal: WorkerTerminalOutcome | null;
   outcome: WorkerTerminalOutcome | null;
   approvalEffects: number;
+  approvalCalls: number;
+  evidenceCalls: number;
+  outcomeCalls: number;
   releaseEffects: number;
   cancelCalls: number;
   holdBinding: Gate | null;
   loadFailures: number;
   loadCalls: number;
   usageDispatchId?: string;
+  legacyLaunch?: boolean;
 }
 
 function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
@@ -49,15 +54,16 @@ function newFake(mode: LaunchMode, deadlineMs = 4_000): FakeAttempt {
     },
     mode, authority: true, occupied: true, intent: false, bound: false,
     launchEffects: 0, result: null, terminal: null, outcome: null,
-    approvalEffects: 0, releaseEffects: 0, cancelCalls: 0,
+    approvalEffects: 0, approvalCalls: 0, evidenceCalls: 0, outcomeCalls: 0, releaseEffects: 0, cancelCalls: 0,
     holdBinding: null, loadFailures: 0, loadCalls: 0,
   };
 }
 
-function resultOf(fake: FakeAttempt, overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
+function resultOf(fake: FakeAttempt, overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
   return makeReviewFixResult({
     attemptId: fake.prepared.attemptId, ...fake.prepared.scope, deadlineAt: fake.prepared.deadlineAt,
-    ...EXECUTION, outputCommit: SHA, ...overrides,
+    githubRunId: EXECUTION.githubRunId, githubRunAttempt: EXECUTION.githubRunAttempt,
+    outputCommit: SHA, ...overrides,
   });
 }
 
@@ -149,7 +155,8 @@ describe("ReviewFixAttempt durable workflow", () => {
         fake.launchEffects++;
         if (fake.mode === "response_lost") throw new Error("response lost after backend accepted");
         if (fake.mode === "unresolved") return { status: "unknown" } as const;
-        return { status: "accepted", execution: EXECUTION } as const;
+        return { status: "accepted", execution: fake.legacyLaunch
+          ? { githubRunId: EXECUTION.githubRunId, githubRunAttempt: EXECUTION.githubRunAttempt } : EXECUTION } as const;
       },
       reconcile: async (id) => get(id).mode === "unresolved"
         ? { status: "unknown" } as const : { status: "found", execution: EXECUTION } as const,
@@ -166,6 +173,7 @@ describe("ReviewFixAttempt durable workflow", () => {
     finalizer: {
       recordOutcome: async (outcome, now) => {
         const fake = get(outcome.attemptId);
+        fake.outcomeCalls++;
         if (fake.outcome) return { status: "already_recorded", outcome: {
           attemptId: outcome.attemptId, scope: outcome.scope, terminal: fake.outcome,
         } } as const;
@@ -174,6 +182,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       },
       applyApproval: async (input) => {
         const fake = get(input.attemptId);
+        fake.approvalCalls++;
         if (!input.currentAuthority || !fake.authority || !input.policyAllows
           || input.currentPrHeadSha !== input.result.outputCommit
           || input.findingDispositions.length !== fake.prepared.findings.length) {
@@ -184,9 +193,12 @@ describe("ReviewFixAttempt durable workflow", () => {
         return { status: "applied", effectId: input.attemptId } as const;
       },
     },
-    loadApprovalEvidence: async (attempt) => ({ currentPrHeadSha: SHA,
+    loadApprovalEvidence: async (attempt) => {
+      get(attempt.attemptId).evidenceCalls++;
+      return { currentPrHeadSha: SHA,
       findingDispositions: attempt.findings.map((finding) => ({ findingKey: finding.findingKey,
-        disposition: "addressed" as const })), policyAllows: true, dispositionsComplete: true }),
+        disposition: "addressed" as const })), policyAllows: true, dispositionsComplete: true };
+    },
   });
 
   let environments: Map<string, RestateEnvironment>;
@@ -329,6 +341,26 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect([fake.launchEffects, fake.approvalEffects, fake.releaseEffects, fake.occupied]).toEqual([1, 1, 1, false]);
   }, 20_000);
 
+  it.each(VARIANTS.map(([label]) => label))("withholds approval when confirmed terminal and accepted result heads differ (%s)", async (label) => {
+    const fake = newFake("accepted", 60_000);
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = envFor(label);
+    const done = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId });
+    await eventually(() => fake.bound, Boolean, { label: "fake.bound" });
+    const accepted = resultOf(fake, { outputCommit: "b".repeat(40) });
+    expect(await callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId, "result", accepted))
+      .toMatchObject({ status: "stored", result: accepted });
+    expect([fake.occupied, fake.releaseEffects, fake.outcome]).toEqual([true, 0, null]);
+    fake.terminal = { status: "succeeded", outputCommit: SHA };
+    expect(await done).toEqual({ status: "finalized", terminal: fake.terminal, approval: "withheld",
+      approvalReason: "terminal_result_head_mismatch" });
+    expect(fake.result).toEqual(accepted);
+    expect(fake.outcome).toEqual(fake.terminal);
+    expect([fake.outcomeCalls, fake.releaseEffects, fake.occupied]).toEqual([1, 1, false]);
+    expect([fake.evidenceCalls, fake.approvalCalls, fake.approvalEffects]).toEqual([0, 0, 0]);
+  }, 20_000);
+
   it.each(VARIANTS.map(([label]) => label))("success without a valid result never approves (%s)", async (label) => {
     const fake = newFake("accepted", 2_500);
     fake.terminal = { status: "succeeded", outputCommit: SHA };
@@ -459,6 +491,16 @@ describe("ReviewFixAttempt durable workflow", () => {
     expect(metadata).toContain("idempotency_retention");
   }, 20_000);
 
+  it("rejects a launch plan that changes the frozen backend", async () => {
+    const fake = newFake("accepted");
+    fake.prepared = { ...fake.prepared, executionBackend: "fly-machines" };
+    attempts.set(fake.prepared.attemptId, fake);
+    const env = environments.values().next().value!;
+    await expect(callWorkflow(env.baseUrl(), "ReviewFixAttempt", fake.prepared.attemptId,
+      "run", { attemptId: fake.prepared.attemptId })).rejects.toThrow();
+    expect(fake.launchEffects).toBe(0);
+  });
+
   it("engine retries a transient store read, then an endpoint and retained sidecar restart resume the same attempt", async () => {
     // This is intentionally outside the disableRetries variant: the failed
     // ctx.run must be retried by the engine before the attempt can launch.
@@ -477,11 +519,26 @@ describe("ReviewFixAttempt durable workflow", () => {
       expect([retry.loadCalls, retry.launchEffects, retry.approvalEffects]).toEqual([2, 1, 1]);
 
       const recovering = newFake("accepted", 60_000);
+      recovering.legacyLaunch = true;
+      // Simulate the old validator while writing launch-once, then restore the
+      // deployed validator before replay. The persisted outcome has no backend.
+      const validateLaunch = contract.validateWorkerLaunchOutcome;
+      const legacyValidator = vi.spyOn(contract, "validateWorkerLaunchOutcome").mockImplementationOnce((raw) => {
+        const checked = validateLaunch(raw);
+        if (checked.ok && checked.value.status === "accepted") {
+          const identity = contract.normalizeExecutionIdentity(checked.value.execution);
+          if (identity.backend === "github-actions") return { ok: true, value: {
+            status: "accepted", execution: { githubRunId: identity.githubRunId, githubRunAttempt: identity.githubRunAttempt },
+          } };
+        }
+        return checked;
+      });
       attempts.set(recovering.prepared.attemptId, recovering);
       const originalCall = callWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt",
         recovering.prepared.attemptId, "run", { attemptId: recovering.prepared.attemptId });
       void originalCall.catch(() => undefined); // ingress may disconnect during restart
       await eventually(() => recovering.bound, Boolean, { timeoutMs: 10_000, label: "recovering.bound" });
+      legacyValidator.mockRestore();
       replacement = await replaceEndpoint(env, [workflow]);
       await env.startedRestateServer.restart(); // same disk-backed server/journal
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", recovering.prepared.attemptId,
@@ -493,6 +550,7 @@ describe("ReviewFixAttempt durable workflow", () => {
       expect([recovering.launchEffects, recovering.approvalEffects, recovering.releaseEffects])
         .toEqual([1, 1, 1]);
     } finally {
+      vi.restoreAllMocks();
       replacement?.close();
       await env.stop();
     }

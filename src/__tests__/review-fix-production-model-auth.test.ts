@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mapping = { owner: "acme", repo: "app", paused: false, workflowFile: "claude-implement.yml", defaultBranch: "main" };
 const getMappings = vi.fn();
+let backend = "github-actions";
 const updateReviewFixStatus = vi.fn();
 const isManagedProject = vi.fn();
 const getInstallationToken = vi.fn(async () => "tok");
@@ -14,11 +15,10 @@ const getPullRequestState = vi.fn(async () => ({ state: "open", merged: false })
 
 vi.mock("../config.js", () => ({
   getMappings: () => getMappings(),
-  resolveReviewFixLifecycle: () => "restate",
 }));
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: () => ({ mode: "default" }),
-  resolveExecutionPath: () => "github-actions",
+  resolvePlanningExecutionPath: () => backend,
 }));
 vi.mock("../review-fix-queue.js", () => ({
   acceptReviewFixWebhookEvent: vi.fn(),
@@ -42,7 +42,7 @@ const runtime = { preparationDeps: vi.fn(() => ({})) } as never;
 const request = { scope, feedback: { taskText: "t", findings: [], queueCursor: { queueId: 42, eventId: 1 } },
   jobTimeoutMinutes: 30 } as never;
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => { vi.clearAllMocks(); backend = "github-actions"; });
 
 describe("review-fix admission and model authentication", () => {
   it("defers a managed project when no model-auth runtime is supplied, touching nothing", async () => {
@@ -156,4 +156,34 @@ describe("review-fix admission and model authentication", () => {
     isManagedProject.mockReturnValue(true);
     expect(await canAdmit(scope, config)).toBe("defer");
   });
+});
+
+it.each(["fly-machines", "local-docker"])("checks managed readiness on %s without GHA probes", async (path) => {
+  backend = path;
+  getMappings.mockReturnValue({ k: mapping });
+  isManagedProject.mockReturnValue(true);
+  const containerConfig = { ...config, flySessionsToken: "fly", flySessionsApp: "sessions", localRunnerImage: "runner" };
+  for (const [readiness, verdict] of [
+    [{ status: "ready" }, "admit"],
+    [{ status: "not-ready", code: "resolution_failed" }, "configuration_error"],
+    [{ status: "not-ready", code: "resolution_unavailable" }, "defer"],
+  ] as const) {
+    inspectAgentReadiness.mockResolvedValue(readiness);
+    expect(await canAdmit(scope, containerConfig, runtime)).toBe(verdict);
+    expect(inspectAgentReadiness).toHaveBeenLastCalledWith(expect.objectContaining({ backend: path }), expect.anything());
+  }
+  expect(resolveWorkflowCapabilities).not.toHaveBeenCalled();
+});
+
+it.each([null, "legacy", "restate"])("admits lifecycle %s, defers while paused, then admits after unpause", async (reviewFixLifecycle) => {
+  const active = { ...mapping, reviewFixLifecycle };
+  getMappings.mockReturnValue({ k: { ...active, paused: true } });
+  const store = { admit: vi.fn(() => ({ status: "prepared" })) };
+  expect(await admitReviewFix(request, config, store as never)).toEqual({ status: "deferred", reason: "paused" });
+  expect(store.admit).not.toHaveBeenCalled();
+  expect(getInstallationToken).not.toHaveBeenCalled();
+  getMappings.mockReturnValue({ k: active });
+  isManagedProject.mockReturnValue(false);
+  expect(await admitReviewFix(request, config, store as never)).toEqual({ status: "prepared" });
+  expect(store.admit).toHaveBeenCalledTimes(1);
 });

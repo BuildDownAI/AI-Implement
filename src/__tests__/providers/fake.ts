@@ -155,6 +155,21 @@ export class FakeProvider implements TicketingProvider {
     return `https://fake/issue/${issue.identifier}`;
   }
 
+  async createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    await this.tick("createChildIssue", [parentId, scopeKey, content]);
+    const parent = this.issues.get(parentId)?.issue;
+    if (!parent || parent.scopeKey !== scopeKey) throw new Error("Parent not found in scope");
+    let n = this.issues.size + 1;
+    while (this.issues.has(`fake-child-${n}`)) n++;
+    const id = `fake-child-${n}`;
+    const identifier = `CHILD-${n}`;
+    this.issues.set(id, { issue: { id, identifier, title: content.title, description: content.body,
+      scopeKey, nativeStatus: "Ready", parentRef: { identifier: parent.identifier } },
+      phase: "needs_planning", lifecycle: "active" });
+    this.comments.set(id, []);
+    return { id, identifier };
+  }
+
   async findByKey(key: string): Promise<TicketIssue | null> {
     await this.tick("findByKey", [key]);
     for (const { issue } of this.issues.values()) {

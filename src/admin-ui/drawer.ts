@@ -674,6 +674,23 @@ export const drawerScript = `
       el.innerHTML = '<div class="field"><div class="field-label">Execution</div><div style="font-size:12.5px" class="text-tertiary">launch state unknown — no execution recorded yet</div></div>';
       return;
     }
+    const backend = attempt.execution.backend;
+    switch (backend) {
+      case undefined: // Older orchestrators return the GitHub shape without a backend.
+      case 'github-actions':
+        break;
+      case 'fly-machines':
+      case 'local-docker': {
+        const label = backend === 'fly-machines' ? 'Fly machine' : 'Container';
+        el.innerHTML = '<div class="field"><div class="field-label">' + label + '</div><div style="font-size:12.5px"><span class="mono">'
+          + window.esc(attempt.execution.runRef) + '</span></div></div>';
+        return;
+      }
+      default:
+        el.innerHTML = '<div class="field"><div class="field-label">Execution</div><div style="font-size:12.5px"><span class="mono">'
+          + window.esc(backend) + ' ' + window.esc(attempt.execution.runRef) + '</span></div></div>';
+        return;
+    }
     const repoParts = repoPartsForJob(job, null);
     let html = '<div class="field"><div class="field-label">Workflow run</div><div style="font-size:12.5px">';
     if (repoParts) {
@@ -1014,8 +1031,9 @@ export const drawerScript = `
 
   // ---- Open in Restate UI link (AII-1262) ----
   //
-  // The orchestrator serves the Restate UI at /ui/, admin only. The service mirrors
-  // restateRefForRow in report-card.ts; a review-fix job counts only when the attempt
+  // The orchestrator serves the Restate UI at /ui/, admin only. Prefer the API
+  // reference from restateRefForJob in report-card.ts. For older orchestrators,
+  // the legacy service fallback counts a review-fix job only when the attempt
   // section just confirmed a Restate attempt for this dispatch id (pilotOwnedDispatchId),
   // so a legacy job shows no link.
 
@@ -1036,14 +1054,17 @@ export const drawerScript = `
   }
 
   function renderRestateLink(job) {
-    const service = window.isAdmin() ? journalServiceForJob(job) : null;
-    if (!service) {
+    const legacyService = job.restate === undefined ? journalServiceForJob(job) : null;
+    const ref = window.isAdmin()
+      ? (job.restate === undefined ? (legacyService ? { service: legacyService, key: job.dispatchId } : null) : job.restate)
+      : null;
+    if (!ref) {
       hideRestateLink();
       return;
     }
     const box = document.getElementById('drawer-restate-link');
-    box.innerHTML = '<a href="/ui/workflows/' + window.escAttr(encodeURIComponent(service)) + '/'
-      + window.escAttr(encodeURIComponent(job.dispatchId)) + '" target="_blank" rel="noopener noreferrer">Open in Restate UI</a>';
+    box.innerHTML = '<a href="/ui/workflows/' + window.escAttr(encodeURIComponent(ref.service)) + '/'
+      + window.escAttr(encodeURIComponent(ref.key)) + '" target="_blank" rel="noopener noreferrer">Open in Restate UI</a>';
     box.hidden = false;
   }
 

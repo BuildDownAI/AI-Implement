@@ -1,0 +1,17 @@
+{
+  "request": {
+    "args": {
+      "days": "7"
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "400 {\"code\":400,\"message\":\"Failed to deserialize input: [\\n  {\\n    \\\"expected\\\": \\\"number\\\",\\n    \\\"code\\\": \\\"invalid_type\\\",\\n    \\\"path\\\": [\\n      \\\"args\\\",\\n      \\\"days\\\"\\n    ],\\n    \\\"message\\\": \\\"Invalid input: expected number, received string\\\"\\n  }\\n]\",\"source\":\"invocation\"}"
+      }
+    ],
+    "isError": true
+  }
+}

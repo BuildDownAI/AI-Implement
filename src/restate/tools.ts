@@ -1,3 +1,5 @@
+import { importEnvironmentCredential } from "../model-account-cli.js";
+import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { modelPrices } from "./model-prices.js";
 // The tools service skeleton (AII-710): a tool() wrapper that attaches a zod input
 // schema, the fixed ToolResponse output shape, and the "mcp.type"/"mcp.role" metadata
@@ -49,7 +51,7 @@ import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
 import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
-import { getIssueReportCard, getFleetReport } from "../report-card.js";
+import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
@@ -201,10 +203,12 @@ export function tool<I extends z.ZodType>(
 export const GET_TENANT_HEALTH_DESCRIPTION =
   "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
 
+export const GetTenantHealthArgsSchema = z.object({});
+
 export const getTenantHealth = tool(
   {
     description: GET_TENANT_HEALTH_DESCRIPTION,
-    input: z.object({}),
+    input: GetTenantHealthArgsSchema,
     role: "user",
   },
   async (ctx): Promise<ToolResponse> => {
@@ -619,10 +623,12 @@ export const getIssueReportCardTool = tool(
 export const GET_FLEET_REPORT_DESCRIPTION =
   "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.";
 
+export const GetFleetReportArgsSchema = z.object({ days: z.number().optional() });
+
 export const getFleetReportTool = tool(
   {
     description: GET_FLEET_REPORT_DESCRIPTION,
-    input: z.object({ days: z.number().optional() }),
+    input: GetFleetReportArgsSchema,
     role: "user",
   },
   async (_ctx, input): Promise<ToolResponse> => {
@@ -630,6 +636,17 @@ export const getFleetReportTool = tool(
     const result = getFleetReport({ days });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
+);
+
+export const getReviewerScorecardTool = tool(
+  {
+    description: "Counts findings per source over a first-seen look-back window (days default 30), optionally filtered by repo. Returns total, fixed (explicit disposition), rejected, deferred, ignored (open on a merged PR or resolved without fixed evidence), and rejectedRate (rejected / total). Active open findings count only in total. No paging.",
+    input: z.object({ days: z.number().finite().nonnegative().optional(), repo: z.string().optional() }),
+    role: "user",
+  },
+  async (_ctx, input): Promise<ToolResponse> => ({
+    content: [{ type: "text", text: JSON.stringify(getReviewerScorecard(input.args), null, 2) }],
+  }),
 );
 
 /** What `get_deploy_posture` serves: the posture plus the SelfDeploy record (null when none or unreadable). */
@@ -1388,6 +1405,27 @@ export const getPipelineScheduleTool = tool(
   },
 );
 
+export const importEnvironmentCredentialTool = tool(
+  {
+    description: "Import the orchestrator environment credential into an account profile without changing stage defaults (admin role).",
+    input: z.object({}),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx): Promise<ToolResponse> => {
+    let reply;
+    try {
+      const body = await ctx.run("import-environment-credential", () => importEnvironmentCredential(process.env, createModelProtectedSecrets({ env: process.env })), { maxRetryAttempts: 1 });
+      reply = { status: body.result === "created" ? 201 : 200, body };
+    } catch (error) {
+      if (restate.internal.isSuspendedError(error)) throw error;
+      reply = { status: error instanceof restate.TerminalError ? error.code : 500,
+        body: { error: error instanceof restate.TerminalError ? error.message : "could not import the environment credential" } };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(reply, null, 2) }] };
+  },
+);
+
 export const PAUSE_PROJECT_DESCRIPTION =
   "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.";
 
@@ -1469,7 +1507,7 @@ export const addProjectArgsSchema = z.object({
     "Extra GitHub logins trusted as review authors for this project, additive to the built-in trusted authors (ai-implement, ai-implement[bot], and the Claude logins — github-actions[bot] is trusted separately). Omit to keep the stored value; pass null to reset to built-ins only.",
   ),
   reviewProcess: z.enum(["ai-implement", "claude-code-review", "claude-code-review-repository-fix", "codex-code-review"]).nullable().optional().describe(
-    "The project's review process. codex-code-review requires the Restate lifecycle. Omit to keep the stored value; pass null or \"ai-implement\" for the default. Claude and AI-Implement apply to every project; Codex Code Review is Restate-only.",
+    "The project's review process. Restate coordinates AI-Implement fixes for every project. Omit to keep the stored value; pass null or \"ai-implement\" for the default. All review processes apply to every project.",
   ),
 });
 
@@ -1609,6 +1647,7 @@ export const orchestratorTools = restate.service({
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,
+    get_reviewer_scorecard: getReviewerScorecardTool,
     get_deploy_posture: getDeployPostureTool,
     get_kg_status: getKgStatusTool,
     get_review_fix_attempt: getReviewFixAttemptTool,
@@ -1630,6 +1669,7 @@ export const orchestratorTools = restate.service({
     get_runner_backend: getRunnerBackendTool,
     set_pipeline_schedule: setPipelineScheduleTool,
     get_pipeline_schedule: getPipelineScheduleTool,
+    import_environment_credential: importEnvironmentCredentialTool,
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,
     add_project: addProjectTool,

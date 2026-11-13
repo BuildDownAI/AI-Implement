@@ -1,3 +1,6 @@
+import { IMPLEMENT_CONTINUATION_NOTE } from "../pipeline/feedback-loop-core.js";
+import pr1546 from "./fixtures/claude-review-pr-1546.json";
+import pr1541 from "./fixtures/claude-review-pr-1541.json";
 import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import { REVIEW_PROCESSES } from "../review-process.js";
 import { MAX_PUBLICATION_BYTES, MAX_PUBLICATION_COMMENTS } from "../pipeline/review-publication-limits.js";
@@ -7,7 +10,7 @@ import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
 import { prepareScratchExclusion } from "../pipeline/scratch-exclude.js";
-import { EXTERNAL_REVIEW_PENDING_NEXT_STEP, isReviewLedgerFindingGating, postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { EXTERNAL_REVIEW_PENDING_NEXT_STEP, isReviewLedgerFindingGating, postPushReviewStep, reportReviewerSelectionFailure } from "../pipeline/steps/post-push-review.js";
 import type { LLMExecutor, PipelineContextData } from "../pipeline/types.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -40,6 +43,28 @@ beforeEach(() => {
   workspaceDir = testDir("post-push-review");
   publicationFetch = fakeFetch({ "POST /runner/review-publication": { json: { status: "posted", reviewUrl: "https://github.com/acme/app/pull/42#pullrequestreview-80" } } }).install();
 });
+
+
+/** Add the current review's API timing evidence to legacy check-behavior fixtures. */
+function withCurrentReview(spawn: (args: string[]) => { stdout: string; exitCode: number; stderr?: string }) {
+  return (args: string[]) => {
+    const result = spawn(args);
+    if (result.exitCode !== 0) return result;
+    if (args.some(a => a.includes("/check-runs"))) {
+      const payload = JSON.parse(result.stdout);
+      for (const page of Array.isArray(payload) ? payload : [payload]) {
+        for (const run of page.check_runs ?? []) Object.assign(run, { started_at: run.started_at ?? "2026-11-10T20:00:00Z", completed_at: run.completed_at ?? "2026-11-10T20:45:00Z" });
+      }
+      return { ...result, stdout: JSON.stringify(payload) };
+    }
+    if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+      const comments = result.stdout ? JSON.parse(result.stdout).flat() : [];
+      if (!comments.length) comments.push({ user: { login: "github-actions[bot]", type: "Bot" }, body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' });
+      return { ...result, stdout: JSON.stringify(comments.map((c: object) => ({ created_at: "2026-11-10T20:44:00Z", ...c }))) };
+    }
+    return result;
+  };
+}
 
 function structuredReviewResult(structuredOutput: unknown, stdout = "ignored final text") {
   return {
@@ -527,6 +552,121 @@ describe("postPushReviewStep", () => {
     const run = (ctx: any, maxIterations: number) =>
       runReview(ctx, { prNumber: "42", workspaceDir, maxIterations, ghSpawn, gitSpawn }, { report: vi.fn(async () => undefined) });
 
+    describe("usage-limit account rotation", () => {
+      const approvedVerdict = { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
+
+      it.each([
+        { agentStage: "review", exitCode: 1 },
+        { agentStage: "review", exitCode: 0 },
+        { agentStage: "implementation", exitCode: 1 },
+        { agentStage: "implementation", exitCode: 0 },
+      ] as const)("retries $agentStage with exitCode=$exitCode only for actual switches and preserves exhaustion", async ({ agentStage, exitCode }) => {
+        for (const switches of [0, 2]) {
+          for (const recovers of [false, true]) {
+            gitSpawn.mockClear();
+            const report = vi.fn(async (_report: unknown) => undefined);
+            let attempts = 0;
+            const invoke = vi.fn<LLMExecutor["invoke"]>(async (params) => {
+              if (params.agentStage !== agentStage) return structuredReviewResult(notApproved);
+              attempts++;
+              if (recovers && attempts > switches) return structuredReviewResult(approvedVerdict);
+              return {
+                stdout: "", exitCode, tokensUsed: 1,
+                terminalStatus: { subtype: "error_during_execution", isError: true },
+                telemetry: { ...NO_RESULT_TELEMETRY, costUsd: 1, ...(agentStage === "implementation" ? { outcome: "max_turns" as const } : {}) },
+                failure: {
+                  category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: params.stage!, attempt: 1,
+                  retryable: false, message: "All accounts exhausted", evidence: { llmErrorMessage: "exhausted profiles", truncated: false },
+                  ...(attempts <= switches ? { accountFallback: { stage: agentStage, from: `p${attempts}`, to: `p${attempts + 1}` } } : {}),
+                },
+              };
+            });
+            const out = await runReview(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
+              prNumber: "42", workspaceDir, maxIterations: agentStage === "review" ? 1 : 2,
+              reviewers: [{ id: "code-review", gates: true }], reviewProviders: [], ghSpawn, gitSpawn,
+            }, { report });
+            const targetCalls = invoke.mock.calls.filter(([p]) => p.agentStage === agentStage);
+            // Two review cycles run after a successful fix; the failed fix itself is retried exactly once per switch.
+            expect(targetCalls).toHaveLength(switches + 1);
+            for (const [index, [params]] of targetCalls.entries()) {
+              const first = targetCalls[0]![0];
+              const continuation = agentStage === "implementation" && index > 0;
+              expect(params).toEqual({ ...first, prompt: continuation ? `${first.prompt}\n\n${IMPLEMENT_CONTINUATION_NOTE}` : first.prompt });
+              expect(params.prompt.split(IMPLEMENT_CONTINUATION_NOTE)).toHaveLength(continuation ? 2 : 1);
+            }
+            expect(out.costUsd).toBe(switches + (recovers ? 0 : 1) || null);
+            if (!recovers) {
+              expect(out.terminationReason).toBe(agentStage === "implementation" ? "fix_failed" : "review_failed");
+              expect(out.failure).toMatchObject({ code: "ACCOUNT_USAGE_LIMIT", evidence: { llmErrorMessage: "exhausted profiles" } });
+              expect(report.mock.calls).toEqual(expect.arrayContaining([
+                [expect.objectContaining({ outputs: expect.objectContaining({ failure: expect.objectContaining({ code: "ACCOUNT_USAGE_LIMIT" }) }) })],
+              ]));
+            } else if (agentStage === "review") expect(out.approved).toBe(true);
+            expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "push")).toHaveLength(agentStage === "implementation" && recovers ? 1 : 0);
+          }
+        }
+      });
+    });
+
+    it.each([
+      { configured: false, exitCode: 0 },
+      { configured: false, exitCode: 1 },
+      { configured: true, exitCode: 0 },
+      { configured: true, exitCode: 1 },
+    ])("commits and pushes a turn-capped fix and reviews again (configured stages: $configured, exit: $exitCode)", async ({ configured, exitCode }) => {
+      gitSpawn.mockClear();
+      const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
+        ? { stdout: "partial fix", exitCode, tokensUsed: 1,
+          terminalStatus: { subtype: "error_max_turns", isError: true },
+          telemetry: { ...NO_RESULT_TELEMETRY, outcome: "max_turns" as const } }
+        : structuredReviewResult(params.stage.endsWith("review-2") ? { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] } : notApproved));
+      const out = await runReview(makeCtx(invoke, configured ? { agentConfig: makeSnapshot() } : {}), {
+        prNumber: "42", workspaceDir, maxIterations: 2,
+        reviewers: [{ id: "code-review", gates: true }], reviewProviders: [], ghSpawn, gitSpawn,
+      }, { report: vi.fn(async () => undefined) });
+      expect(out.approved).toBe(true);
+      expect(invoke.mock.calls.map(([p]) => p.agentStage)).toEqual(["review", "implementation", "review"]);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "commit")).toHaveLength(1);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "push")).toHaveLength(1);
+    });
+
+    it.each([
+      { provider: "Claude", subtype: "error_during_execution" },
+      { provider: "Codex", subtype: "error" },
+    ])("commits and pushes an exit-0 $provider error and reviews again", async ({ subtype }) => {
+      gitSpawn.mockClear();
+      const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
+        ? { stdout: "partial fix", exitCode: 0, tokensUsed: 1,
+          terminalStatus: { subtype, isError: true },
+          telemetry: { ...NO_RESULT_TELEMETRY, outcome: "error" as const } }
+        : structuredReviewResult(params.stage.endsWith("review-2") ? { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] } : notApproved));
+      const out = await runReview(makeCtx(invoke), {
+        prNumber: "42", workspaceDir, maxIterations: 2,
+        reviewers: [{ id: "code-review", gates: true }], reviewProviders: [], ghSpawn, gitSpawn,
+      }, { report: vi.fn(async () => undefined) });
+      expect(out.approved).toBe(true);
+      expect(invoke.mock.calls.map(([p]) => p.agentStage)).toEqual(["review", "implementation", "review"]);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "commit")).toHaveLength(1);
+      expect(gitSpawn.mock.calls.filter(([args]) => args[0] === "push")).toHaveLength(1);
+    });
+
+    it.each([
+      { exitCode: 1, outcome: "error" as const },
+      { exitCode: 1, outcome: "success" as const },
+      { exitCode: 1, outcome: undefined },
+    ])("rejects fix errors with exit $exitCode and outcome $outcome", async ({ exitCode, outcome }) => {
+      gitSpawn.mockClear();
+      const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
+        ? { stdout: "", exitCode, tokensUsed: 0,
+          terminalStatus: { subtype: "error_during_execution", isError: true },
+          telemetry: outcome === undefined ? undefined : { ...NO_RESULT_TELEMETRY, outcome } }
+        : structuredReviewResult(notApproved));
+      const out = await run(makeCtx(invoke), 2);
+      expect(out.terminationReason).toBe("fix_failed");
+      expect(gitSpawn.mock.calls.some(([args]) => args[0] === "commit")).toBe(false);
+      expect(gitSpawn.mock.calls.some(([args]) => args[0] === "push")).toBe(false);
+    });
+
     it("stamps review on reviewers and implementation on the fix call", async () => {
       const invoke = vi.fn()
         .mockResolvedValueOnce(structuredReviewResult(notApproved))
@@ -779,6 +919,9 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(approved);
     expect(out.iterations).toBe(3);
+    expect(out.internalFindings).toEqual([expect.objectContaining({ body: "bug" })]);
+    expect(out.findingDispositions.filter(d => d.disposition === "fixed")).toHaveLength(approved ? 1 : 0);
+
     expect(publicationFetch.calls.map(call => JSON.parse(call.body).iteration)).toEqual([1, 2, 3]);
     expect(gitPushCalls.length).toBe(2);
     expect(publicationsBeforeFix).toEqual([1, 2]);
@@ -786,6 +929,99 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 1/2"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Reviewer found issues") && c.includes("fix pass 2/2"))).toBe(true);
     expect(ghComments.some((c) => approved ? c.includes("✅ Approved (3 iterations)") : (c.includes("The review examined the change 3 times and found problems each time.") && c.includes("(Code: `iterations_exhausted`)")))).toBe(true);
+  });
+
+  it.each(["none", "wait", "ci"] as const)("fixes an early internal finding despite a later %s permission failure", async (permissionFailure) => {
+    let secondReview = false;
+    let secondReviewCheckReads = 0;
+    const approved = true;
+    const notApproved = { approved: false, findings: [{ severity: "blocking", body: "bug" }], summary: "fix the bug", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
+    const ghComments: string[] = [];
+    const gitPushCalls: string[][] = [];
+    const publicationsBeforePush: number[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "push") {
+        gitPushCalls.push(args);
+        publicationsBeforePush.push(publicationFetch.calls.length);
+      }
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tfile.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (secondReview && args.some(arg => arg.includes("/check-runs"))) {
+        secondReviewCheckReads++;
+        // Two empty probes settle the external review as absent; CI reads next.
+        if (permissionFailure === "wait" || (permissionFailure === "ci" && secondReviewCheckReads === 3)) {
+          return { stdout: "", stderr: "HTTP 403: Resource not accessible by integration", exitCode: 1 };
+        }
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const publicationsBeforeFix: number[] = [];
+    const invoke = vi.fn(async (params) => {
+      if (params.stage.startsWith("post-push-review/fix-")) publicationsBeforeFix.push(publicationFetch.calls.length);
+      if (/(?:gap-analysis|code-review)-review-2$/.test(params.stage)) secondReview = true;
+      return structuredReviewResult(approved && /(?:gap-analysis|code-review)-review-2$/.test(params.stage)
+        ? { approved: true, findings: [], summary: "All fixed", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] }
+        : notApproved);
+    });
+    const ctx = makeCtx(invoke);
+
+    const out = await runReview(
+      ctx,
+      { prNumber: "42", workspaceDir, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(permissionFailure === "none");
+    expect(out.terminationReason).toBe(permissionFailure === "none" ? "approved" : "checks_permission_denied");
+    expect(out.iterations).toBe(2);
+    expect(out.internalFindings).toEqual([expect.objectContaining({ body: "bug" })]);
+    expect(out.findingDispositions).toEqual([expect.objectContaining({
+      findingKey: stableReviewFindingKey({ source: "ai-implement-internal", severity: "blocking", body: "bug" }),
+      disposition: "fixed",
+    })]);
+  });
+
+  it.each(["advisory-incomplete", "gating-incomplete", "repeated", "minor"] as const)("reports gating findings and closes them using gating completeness: %s", async (mode) => {
+    const finding = { severity: mode === "minor" ? "minor" as const : "blocking" as const, body: "Gating defect" };
+    const invoke = vi.fn(async (params) => {
+      if (params.stage.includes("fix-")) return structuredReviewResult({});
+      const second = params.stage.endsWith("review-2");
+      if (params.stage.includes("gap-analysis")) {
+        if (second && mode.endsWith("incomplete")) return turnCapResult(undefined, 1);
+        return structuredReviewResult({ approved: true, findings: [] });
+      }
+      return structuredReviewResult({ approved: true, findings: second && mode !== "repeated" ? [] : [finding] });
+    });
+    const out = await runReview(makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }), {
+      prNumber: "42", workspaceDir, maxIterations: 2, reviewProviders: [],
+      reviewers: [{ id: "code-review", gates: true }, { id: "gap-analysis", gates: mode === "gating-incomplete" }],
+      trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("code-review"), selectedReviewerDefinition("gap-analysis")]),
+      ghSpawn: vi.fn((args: string[]) => ({ stdout: args[0] === "pr" && args[1] === "diff" ? "diff" : "", exitCode: 0 })),
+      gitSpawn: vi.fn((args: string[]) => ({
+        stdout: args[0] === "status" ? "M file.ts\n"
+          : args[0] === "rev-parse" ? "ai-implement/aii-200-x\n"
+          : args[0] === "ls-remote" ? "beadfeed\trefs/heads/ai-implement/aii-200-x\n" : "", exitCode: 0,
+      })),
+    }, { report: vi.fn(async () => undefined) });
+    expect(out.internalFindings).toEqual([expect.objectContaining(finding)]);
+    if (mode === "advisory-incomplete") {
+      expect(out.approved).toBe(true);
+      expect(out.findingDispositions).toContainEqual(expect.objectContaining({
+        findingKey: stableReviewFindingKey({ source: "ai-implement-internal", ...finding }), disposition: "fixed",
+      }));
+    } else {
+      expect(out.findingDispositions.filter(d => d.disposition === "fixed")).toEqual([]);
+    }
   });
 
   it("runs a fix pass when reviewer approves but reports actionable issues", async () => {
@@ -1093,6 +1329,7 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(true);
+    expect(out.internalFindings).toEqual([]);
     expect(invoke).toHaveBeenCalledTimes(1);
     const approvalComment = ghComments.find((comment) => comment.includes("Ready to merge"));
     expect(approvalComment).toContain("Advisory custom concern");
@@ -1123,6 +1360,37 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     expect(invoke).toHaveBeenCalledTimes(3);
     expect(invokePrompt(invoke, 2)).toContain("Same defect");
+  });
+
+  it("excludes advisory internal findings when a matching gating GitHub finding wins prompt deduplication", async () => {
+    const body = "Use the shared validator for path params.";
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: JSON.stringify([[{ state: "CHANGES_REQUESTED", body: "", user: { login: "reviewer" } }]]), exitCode: 0 };
+      }
+      if (args[0] === "api" && args[1] === "graphql") {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [{ isResolved: false, isOutdated: false, path: "src/routes.ts", line: 88,
+            comments: { nodes: [{ body, author: { login: "reviewer" }, url: "https://example.com/thread" }] } }],
+          pageInfo: { hasNextPage: false },
+        } } } } }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: false, findings: [{ severity: "blocking", body }] }));
+    const out = await runReview(makeCtx(invoke), {
+      prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn,
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      reviewers: [{ id: "custom-review", gates: false }],
+      trustedReviewerDefinitions: reviewerMap([selectedReviewerDefinition("custom-review")]),
+    }, { report: vi.fn(async () => undefined) });
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invokePrompt(invoke, 1)).toContain("github-review-thread blocking src/routes.ts:88");
+    expect(invokePrompt(invoke, 1)).not.toContain("ai-implement-internal");
+    expect(out.internalFindings).toEqual([]);
   });
 
   it("reports a selected reviewer's own maxTurns when that reviewer exhausts", async () => {
@@ -1177,6 +1445,40 @@ describe("postPushReviewStep", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it("includes readable rejections in the reviewer-selection failure reporter", async () => {
+    // Selection normally fails before any fix pass; exercise the reporter directly
+    // to keep its terminal-comment contract covered with accumulated rejections.
+    const finding = { source: "github-review-thread" as const, severity: "blocking" as const, path: "src/db.ts", line: 42, body: "The index is missing." };
+    const findingKey = stableReviewFindingKey(finding);
+    const reason = "The index already exists.";
+    const rejectedBlock = `\n\n### Rejected by the fix pass\n\n- ${finding.source} · ${finding.path}:${finding.line} — ${finding.body} — ${reason}`;
+    const comments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: githubReply(args) ?? "", exitCode: 0 };
+    });
+    const report = vi.fn(async () => undefined);
+
+    const out = await reportReviewerSelectionFailure(
+      { report }, ghSpawn, "42", "The reviewer selection for this project is empty.", rejectedBlock,
+    );
+
+    expect(out.terminationReason).toBe("invalid_review");
+    expect(report).toHaveBeenCalledWith(expect.objectContaining({ id: "post-push-review.selection", status: "failed" }));
+    expect(comments).toHaveLength(1);
+    const terminal = comments[0];
+    expect(terminal).toContain("reviewer-selection-invalid");
+    expect(terminal).toContain("Manual review required");
+    expect(terminal).toContain("Rejected by the fix pass");
+    expect(terminal).toContain(finding.source);
+    expect(terminal).toContain(`${finding.path}:${finding.line}`);
+    expect(terminal).toContain(finding.body);
+    expect(terminal).toContain(reason);
+    const visible = terminal.replace(/<!--[\s\S]*?-->/g, "");
+    expect(visible).not.toContain(findingKey);
+    expect(visible).not.toMatch(/[a-f0-9]{64}/);
   });
 
   it("fails closed for an empty reviewer selection and for an external-only selection", async () => {
@@ -1419,6 +1721,7 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(true);
+    expect(out.internalFindings).toEqual([]);
     expect(out.terminationReason).toBe("approved");
     expect(invoke.mock.calls.map((call) => call[0].stage)).not.toContain("post-push-review/fix-1");
     const approvalComment = ghComments.find((comment) => comment.includes("Ready to merge"));
@@ -2403,7 +2706,7 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).toContain("Missing UUID validation on path params.");
   });
 
-  it("approves when a Claude issue comment only contributes advisory prose findings", async () => {
+  it("blocks when a trusted Claude issue comment contributes blocking prose findings", async () => {
     const reviewerOutput = { approved: true, findings: [], summary: "Internal reviewer approves.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
@@ -2441,18 +2744,18 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(3);
     expect(ghSpawn).toHaveBeenCalledWith([
       "api",
       "--paginate",
       "--slurp",
       "repos/:owner/:repo/issues/42/comments?per_page=100",
     ]);
-    const reviewComment = ghComments.find((comment) => comment.includes("Approved"));
-    expect(reviewComment).toContain("Advisory external review findings (do not block merge):");
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("Unresolved external review findings:");
     expect(reviewComment).toContain("Validate path params before database access.");
-    expect(reviewComment).toContain("**Merge readiness:** Ready to merge.");
+    expect(reviewComment).not.toContain("Advisory external review findings");
   });
 
   it("blocks when an advisory prose finding and formal review thread share the same body", async () => {
@@ -2479,7 +2782,7 @@ describe("postPushReviewStep", () => {
               "",
               "### Review: PR #42",
               "",
-              "### Blocking",
+              "### Minor",
               "",
               "**Use the shared validator for path params.**",
             ].join("\n"),
@@ -2604,7 +2907,7 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).not.toContain("Advisory external review findings");
   });
 
-  it("approves the PR #557 prose-findings shape as advisory when internal review and CI are clean", async () => {
+  it("blocks the PR #557 prose-findings shape when internal review and CI are clean", async () => {
     const reviewerOutput = { approved: true, findings: [], summary: "Internal reviewer approves.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
@@ -2654,12 +2957,12 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(2);
-    const reviewComment = ghComments.find((comment) => comment.includes("Approved"));
-    expect(reviewComment).toContain("Advisory external review findings (do not block merge):");
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("Unresolved external review findings:");
     expect(reviewComment).toContain("Missing regression test for the actual vulnerability that was fixed.");
-    expect(reviewComment).toContain("**Merge readiness:** Ready to merge.");
+    expect(reviewComment).not.toContain("Advisory external review findings");
   });
 
   it("blocks on the same GitHub Actions prose shape when project settings opt prose into gating", async () => {
@@ -3475,7 +3778,7 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).toBe("invalid_review");
   });
 
-  it("updates an existing marker comment instead of posting a duplicate", async () => {
+  it("creates a fresh start comment instead of trusting an existing marker", async () => {
     const reviewerOutput = { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
@@ -3503,13 +3806,9 @@ describe("postPushReviewStep", () => {
     );
 
     expect(ghSpawn).toHaveBeenCalledWith([
-      "api",
-      "repos/:owner/:repo/issues/comments/123",
-      "-X",
-      "PATCH",
-      "-f",
-      expect.stringContaining("Running post-implementation review"),
+      "pr", "comment", "42", "--body", expect.stringContaining("Running post-implementation review"),
     ]);
+    expect(ghSpawn).not.toHaveBeenCalledWith(expect.arrayContaining(["PATCH"]));
   });
 
   it("passes reviewer issues through a guarded fix prompt", async () => {
@@ -4049,9 +4348,11 @@ describe("postPushReviewStep", () => {
       expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
     }
 
-    it("ai-implement: a blocking verdict plus unreadable findings ends invalid_review", async () => {
+    it("ai-implement: unreadable findings remain pending until timeout", async () => {
       const { out, ghComments } = await runTable({ comments: [blockingComment, unreadableComment] });
-      expectInvalidReview(out, ghComments);
+      expect(out.approved).toBe(false);
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(ghComments.some(c => c.includes("Ready to merge"))).toBe(false);
     });
 
     it("another process: a no-verdict check ends invalid_review", async () => {
@@ -4130,7 +4431,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -4224,8 +4525,8 @@ describe("postPushReviewStep", () => {
         return {
           stdout: JSON.stringify({
             check_runs: [
-              { name: "review", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
-              { name: "code-review-plugin", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
+              { name: "review", started_at: "2026-11-10T20:00:00Z", completed_at: "2026-11-10T20:10:00Z", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
+              { name: "code-review-plugin", started_at: "2026-11-10T20:45:00Z", completed_at: "2026-11-10T20:50:00Z", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
             ],
           }),
           exitCode: 0,
@@ -4237,14 +4538,16 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
     // Both names must be recognised as the external review gate (not absent), causing the step to wait.
     expect(sleep).toHaveBeenCalled();
     expect(checkProbes).toBeGreaterThanOrEqual(2);
+    // Both completed jobs provide a current review window.
     expect(out.approved).toBe(true);
+    expect(sleep.mock.calls.length).toBeLessThan(5);
   });
 
   it("logs a warning when check runs are present but none match the external review gate", async () => {
@@ -4319,7 +4622,7 @@ describe("postPushReviewStep", () => {
     const invoke = vi.fn(async () => (structuredReviewResult(f.reviewerOutput)));
     return runReview(
       makeCtx(invoke),
-      { prNumber: "42", workspaceDir, maxIterations, ghSpawn: f.ghSpawn,
+      { prNumber: "42", workspaceDir, maxIterations, ghSpawn: withCurrentReview(f.ghSpawn),
         gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
         reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
       { report: vi.fn(async () => undefined) },
@@ -4327,6 +4630,32 @@ describe("postPushReviewStep", () => {
   };
   const runs = (r: Array<{ name: string; status: string; conclusion: string | null }>) =>
     ({ stdout: JSON.stringify({ check_runs: r }), exitCode: 0 });
+
+  it.each([
+    { completesAt: 360_000, approved: true, elapsedAtEnd: 360_000 },
+    { completesAt: Infinity, approved: false, elapsedAtEnd: 600_000 },
+  ])("uses the production wait limit (completion at $completesAt ms)", async ({ completesAt, approved, elapsedAtEnd }) => {
+    let elapsed = 0;
+    const sleep = vi.fn(async (ms: number) => { elapsed += ms; });
+    const f = gateFixture(() => {
+      const done = elapsed >= completesAt;
+      return runs([{ name: "claude-review", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null }]);
+    });
+    const out = await runReview(
+      makeCtx(vi.fn(async () => structuredReviewResult(f.reviewerOutput))),
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(f.ghSpawn),
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(elapsed).toBe(elapsedAtEnd);
+    expect(out.approved).toBe(approved);
+    if (!approved) {
+      expect(out.terminationReason).toBe("external_review_pending");
+      expect(out.finalFeedback).toBe(EXTERNAL_REVIEW_PENDING_NEXT_STEP);
+      expect(f.reviewCalls.some((call) => call.some((arg) => arg.includes("approved this pull request")))).toBe(false);
+    }
+  });
 
   it("does not approve when the check-runs probe cannot be read", async () => {
     // A failed `gh api` used to map to "absent", which the caller fails OPEN on — so one
@@ -4804,7 +5133,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5036,7 +5365,7 @@ describe("postPushReviewStep", () => {
       });
       const out = await runReview(
         makeCtx(vi.fn(async () => structuredReviewResult(reviewerOutput))),
-        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+        { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
         { report: vi.fn(async () => undefined) },
       );
       return { out, ghComments };
@@ -5070,7 +5399,7 @@ describe("postPushReviewStep", () => {
     });
 
     it("does not approve on an approving block when the check itself failed", async () => {
-      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      const { out, ghComments } = await runGate({ conclusion: "failure", comments: [contractComment("2026-11-10T20:44:00Z", "approve", [])] });
       expectVerdictUnavailableEnding(out, ghComments);
     });
 
@@ -5096,7 +5425,7 @@ describe("postPushReviewStep", () => {
     });
 
     it("approves on an approving block when the check succeeded", async () => {
-      const { out, ghComments } = await runGate({ conclusion: "success", comments: [contractComment("2026-10-06T17:09:00Z", "approve", [])] });
+      const { out, ghComments } = await runGate({ conclusion: "success", comments: [contractComment("2026-11-10T20:44:00Z", "approve", [])] });
       expect(out.approved).toBe(true);
       expect(out.terminationReason).toBe("approved");
       expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(true);
@@ -5132,7 +5461,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5172,7 +5501,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5227,7 +5556,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5339,13 +5668,13 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(false);
-    expect(out.terminationReason).toBe("invalid_review");
-    expect(out).not.toHaveProperty("reviewedHeadSha");
+    expect(out.terminationReason).toBe("external_review_pending");
+    expect(out.reviewedHeadSha).toBe("deadbeef42");
     expect(invoke).toHaveBeenCalledTimes(2);
-    const approvalComment = ghComments.find((c) => c.includes("invalid-external-review"));
+    const approvalComment = ghComments.find((c) => c.includes("external-pending"));
     expect(approvalComment).toBeDefined();
     expect(approvalComment).not.toContain("late external review");
-    expect(approvalComment).toContain("could not read the findings");
+    expect(approvalComment).toContain("did not finish in the time limit");
     expect(approvalComment).not.toContain("External review findings are blocking");
   });
 
@@ -5395,7 +5724,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -5440,7 +5769,7 @@ describe("postPushReviewStep", () => {
 
     const out = await runReview(
       ctx,
-      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
       { report: vi.fn(async () => undefined) },
     );
 
@@ -6105,16 +6434,17 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
   // Shared review-thread fixture used both by the external-finding collector
   // (review-ledger.ts) at review time and by replyToDispositionThreads' own thread
   // lookup at post-push time — both read the same live PR thread.
-  function ghSpawnWithOneExternalFinding(opts: { onGraphqlMutation?: (args: string[]) => void } = {}) {
+  function ghSpawnWithOneExternalFinding(opts: { onGraphqlMutation?: (args: string[]) => void; history?: unknown[]; ownLogin?: string } = {}) {
     const ghComments: string[] = [];
     const graphqlCalls: string[][] = [];
     const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/issues/comments/999")) return { stdout: JSON.stringify({ user: { login: opts.ownLogin } }), exitCode: 0 };
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
         return { stdout: JSON.stringify([[]]), exitCode: 0 };
       }
       if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
-        return { stdout: JSON.stringify([]), exitCode: 0 };
+        return { stdout: JSON.stringify(opts.history ?? []), exitCode: 0 };
       }
       if (args[0] === "api" && args[1] === "graphql") {
         graphqlCalls.push(args);
@@ -6151,11 +6481,88 @@ describe("finding dispositions in the fix pass (AII-751)", () => {
       }
       if (args[0] === "pr" && args[1] === "comment") {
         ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "https://github.com/owner/repo/pull/42#issuecomment-999", exitCode: 0 };
       }
       return { stdout: "", exitCode: 0 };
     });
     return { ghSpawn, ghComments, graphqlCalls };
   }
+
+  it.each([
+    ["invalid", "deployment-bot", "deployment-bot", true],
+    ["follow-up", "deployment-bot", "deployment-bot", true],
+    ["invalid", "attacker", "deployment-bot", false],
+    ["invalid", "deployment-bot", undefined, false],
+    ["fixed", "deployment-bot", "deployment-bot", false],
+  ] as const)("seeds %s from %s with own identity %s (approved %s)", async (disposition, author, ownLogin, approved) => {
+    const marker = (d: string) => `<!-- ai-implement post-push iter=1 -->
+<!-- ai-implement closed-findings v1 ${JSON.stringify({ [d === "invalid" ? "rejected" : d === "follow-up" ? "deferred" : "fixed"]: [findingKey] })} -->`;
+    const log = vi.spyOn(console, "log");
+    const warn = vi.spyOn(console, "warn");
+    const { ghSpawn } = ghSpawnWithOneExternalFinding({ ownLogin, history: [
+      { user: { login: author }, body: marker("invalid") },
+      { user: { login: author }, body: marker(disposition) },
+    ] });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "Clean.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected diff." }] }));
+    const result = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(result.approved).toBe(approved);
+    expect(log).toHaveBeenCalledWith(`[post-push-review] seeded ${approved ? 1 : 0} closed finding(s) from PR markers`);
+    const rejectedMarkers = warn.mock.calls.filter(([message]) => String(message).includes("ignored closed-findings marker from untrusted author"));
+    expect(rejectedMarkers).toHaveLength(author !== ownLogin && ownLogin ? 2 : 0);
+    log.mockRestore();
+    warn.mockRestore();
+  });
+
+  it.each([false, true])("seeds only K, reopens it on fixed, and publishes all dispositions (pushed=%s)", async (pushed) => {
+    const otherBody = "Validate the exporter input before writing.";
+    const otherKey = stableReviewFindingKey({ source: "github-review-thread", severity: "medium", body: otherBody, path: findingPath, line: findingLine });
+    const deferredKey = "d".repeat(64);
+    const base = ghSpawnWithOneExternalFinding({ ownLogin: "deployment-bot", history: [{
+      user: { login: "deployment-bot" },
+      body: `<!-- ai-implement post-push iter=1 -->
+<!-- ai-implement closed-findings v1 ${JSON.stringify({ rejected: [findingKey] })} -->`,
+    }] });
+    const ghSpawn = vi.fn((args: string[]) => {
+      const result = base.ghSpawn(args);
+      // Keep both findings visible on every iteration, even after thread resolution.
+      if (args.some(arg => arg.includes("reviewThreads(first:"))) {
+        const data = JSON.parse(result.stdout);
+        const threads = data.data.repository.pullRequest.reviewThreads.nodes;
+        threads.push({ ...threads[0], id: "RT_2", comments: { nodes: [{ body: otherBody, author: { login: "reviewer" } }] } });
+        return { ...result, stdout: JSON.stringify(data) };
+      }
+      return result;
+    });
+    const fixPrompts: string[] = [];
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        fixPrompts.push(params.prompt);
+        writeDispositionsFile(workspaceDir, [
+          { findingKey, disposition: "fixed", reason: "Reworked the index." },
+          { findingKey: otherKey, disposition: "invalid", reason: "Already validated." },
+          { findingKey: deferredKey, disposition: "follow-up", reason: "Separate work." },
+        ]);
+      }
+      return structuredReviewResult({ approved: true, findings: [], summary: "Clean.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected diff." }] });
+    });
+    const gitSpawn = pushed ? makeGitSpawn() : vi.fn((args: string[]) => ({ stdout: args[0] === "rev-parse" && args[1] === "--abbrev-ref" ? "ai-implement/aii-200-x\n" : "", exitCode: 0 }));
+    const log = vi.spyOn(console, "log");
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn }, { report: vi.fn(async () => undefined) });
+    expect(log).toHaveBeenCalledWith("[post-push-review] seeded 1 closed finding(s) from PR markers");
+    log.mockRestore();
+    expect(fixPrompts).toHaveLength(2);
+    expect(fixPrompts[0]).toContain(otherKey);
+    expect(fixPrompts[0]).not.toContain(findingKey);
+    expect(fixPrompts[1]).toContain(findingKey);
+    expect(fixPrompts[1]).not.toContain(otherKey);
+    expect(out.approved).toBe(false);
+    const comments = base.ghComments.filter(comment => pushed ? comment.includes("completed and pushed changes") : comment.includes("made no code changes") || comment.includes("completed with no file changes"));
+    expect(comments).toHaveLength(2);
+    for (const comment of comments) {
+      expect(comment.match(/<!-- ai-implement closed-findings v1 /g)).toHaveLength(1);
+      expect(comment).toContain(JSON.stringify({ rejected: [otherKey], deferred: [deferredKey], fixed: [findingKey] }));
+    }
+  });
 
   function makeGitSpawn(opts: { pushFails?: boolean } = {}) {
     return vi.fn((args: string[]) => {
@@ -6286,6 +6693,9 @@ Checks:
       { report: vi.fn(async () => undefined) },
     );
 
+    const fixComment = ghComments.find(comment => comment.includes("completed and pushed changes"));
+    expect(fixComment?.match(/<!-- ai-implement closed-findings v1 /g)).toHaveLength(1);
+    expect(fixComment).toContain(JSON.stringify({ rejected: [], deferred: [findingKey], fixed: [] }));
     const replyCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("addPullRequestReviewThreadReply")));
     expect(replyCall).toBeTruthy();
     const replyBody = replyCall!.find((a) => a.startsWith("body="));
@@ -6337,9 +6747,11 @@ Checks:
     expect(invoke).toHaveBeenCalledTimes(5);
     const dispositionsOnlyComment = ghComments.find((comment) => comment.includes("made no code changes"));
     expect(dispositionsOnlyComment).toBeTruthy();
+    expect(dispositionsOnlyComment?.match(/<!-- ai-implement closed-findings v1 /g)).toHaveLength(1);
+    expect(dispositionsOnlyComment).toContain(JSON.stringify({ rejected: [], deferred: [findingKey], fixed: [] }));
   });
 
-  it("keeps an invalid disposition's finding gating on the next iteration and does not resolve its thread (AC3)", async () => {
+  it("closes a repeated invalid finding and resolves its thread", async () => {
     writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
     const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
     const cleanInternalReview = { approved: true, findings: [], summary: "No internal issues found.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
@@ -6356,16 +6768,15 @@ Checks:
     const replyBody = replyCall!.find((a) => a.startsWith("body="));
     expect(replyBody).toContain("Not changed: The index already exists.");
     const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-    expect(resolveCall).toBeUndefined();
+    expect(resolveCall).toBeTruthy();
 
-    // Still gating on iteration 2: internal review is clean, so approval hinges entirely on
-    // whether the finding still gates. It does, so the run stops on the review cap instead.
-    expect(out.approved).toBe(false);
+    // A repeated key stays closed on iteration 2.
+    expect(out.approved).toBe(true);
     expect(out.terminationReason).not.toBe("external_review_pending");
     expect(invokePrompt(invoke, 2)).toContain(findingKey);
   });
 
-  it("still stops the loop as no_changes when an invalid disposition leaves the finding gating and the fix pass made no code changes", async () => {
+  it("handles an invalid disposition without code changes", async () => {
     writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
     const { ghSpawn, graphqlCalls } = ghSpawnWithOneExternalFinding();
     const cleanInternalReview = { approved: true, findings: [], summary: "No internal issues found.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
@@ -6382,13 +6793,205 @@ Checks:
       { report: vi.fn(async () => undefined) },
     );
 
-    // The disposition is still processed (reply posted, thread left unresolved)...
+    // Reply and resolve even when there is no code change.
     const resolveCall = graphqlCalls.find((call) => call.includes("threadId=RT_1") && call.some((a) => a.includes("resolveReviewThread")));
-    expect(resolveCall).toBeUndefined();
-    // ...but since the finding still gates and no code changed, the pass fails as no_changes
-    // rather than silently looping.
-    expect(out.terminationReason).toBe("no_changes");
-    expect(out.approved).toBe(false);
+    expect(resolveCall).toBeTruthy();
+    // The dispositions-only branch re-reviews and approves.
+    expect(out.terminationReason).toBe("approved");
+    expect(out.approved).toBe(true);
+  });
+
+  it.each(["invalid", "wait-permission", "ci-permission"] as const)("retains readable rejections on a later %s terminal", async (failure) => {
+    const base = ghSpawnWithOneExternalFinding();
+    let fixed = false;
+    let checkReads = 0;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      if (args.some(arg => arg.includes("commits/deadbeef/check-runs"))) {
+        checkReads++;
+        if (fixed && (failure === "wait-permission" || (failure === "ci-permission" && checkReads % 2 === 0))) {
+          return { stdout: "", stderr: "HTTP 403: Resource not accessible by integration", exitCode: 1 };
+        }
+        return { stdout: JSON.stringify({ check_runs: [{ name: "Claude Code Review", status: "completed", conclusion: "success" }] }), exitCode: 0 };
+      }
+      if (fixed && args.some(arg => arg.includes("reviewThreads(first:"))) return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      return base.ghSpawn(args);
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
+        fixed = true;
+      }
+      if (fixed && failure === "invalid") return structuredReviewResult({ malformed: true });
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(out.terminationReason).toBe(failure === "invalid" ? "invalid_review" : "checks_permission_denied");
+    const terminal = base.ghComments.at(-1)!;
+    expect(terminal).toContain("Rejected by the fix pass");
+    expect(terminal).toContain("github-review-thread · src/db.ts:42");
+    expect(terminal).toContain(findingBody);
+    expect(terminal).toContain("The index already exists.");
+    expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toMatch(/[a-f0-9]{64}/);
+  });
+
+  it("renders bounded single-line excerpts with path-only and absent locations", async () => {
+    const findings = [
+      { severity: "blocking" as const, path: "src/api.ts", body: `First line.\nSecond line. ${"detail ".repeat(40)}` },
+      { severity: "blocking" as const, body: "A finding without a location." },
+    ];
+    const keys = findings.map(finding => stableReviewFindingKey({ source: "review-contract", ...finding }));
+    const base = ghSpawnWithOneExternalFinding();
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return {
+        stdout: JSON.stringify([{ user: { login: "claude[bot]", type: "Bot" }, body: [
+          "```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings }), "```",
+        ].join("\n") }]), exitCode: 0,
+      };
+      if (args.some(arg => arg.includes("reviewThreads(first:"))) return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      return base.ghSpawn(args);
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) writeDispositionsFile(workspaceDir, keys.map(findingKey => ({ findingKey, disposition: "invalid", reason: "Already handled." })));
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(base.ghComments[0]).not.toContain("Rejected by the fix pass");
+    const terminal = base.ghComments.at(-1)!;
+    const excerpt = findings[0].body.replace(/\s+/g, " ").trim().slice(0, 157) + "...";
+    expect(terminal).toContain(`- review-contract · src/api.ts — ${excerpt} — Already handled.`);
+    expect(terminal).toContain("- review-contract — A finding without a location. — Already handled.");
+    expect(terminal.match(/Already handled\./g)).toHaveLength(2);
+    expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toMatch(/[a-f0-9]{64}/);
+  });
+
+  it.each(["ai-implement", "claude-code-review"] as const)("%s approves a repeated rejected blocker alongside an undisposed minor finding", async (reviewProcess) => {
+    const blocker = { severity: "blocking" as const, body: "The index is missing." };
+    const minor = { severity: "minor" as const, body: "Consider renaming the index." };
+    const key = stableReviewFindingKey({ source: "review-contract", ...blocker });
+    const base = ghSpawnWithOneExternalFinding();
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      if (args.some(arg => arg.includes("commits/deadbeef/check-runs"))) return { stdout: JSON.stringify({ check_runs: [{ name: "Claude Code Review", app: { slug: "claude" }, status: "completed", conclusion: "success" }] }), exitCode: 0 };
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return {
+        stdout: JSON.stringify([{ user: { login: "claude[bot]", type: "Bot" }, body: [
+          "```json review-findings", JSON.stringify({ schema: "review-findings/v1", verdict: "changes_requested", findings: [blocker, minor] }), "```",
+        ].join("\n") }]), exitCode: 0,
+      };
+      if (args.includes("repos/:owner/:repo/pulls/42/comments?per_page=100")) return { stdout: "[]", exitCode: 0 };
+      // This fixture's unrelated thread must not contribute another open blocker.
+      if (args.some(arg => arg.includes("reviewThreads(first:"))) return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } } }), exitCode: 0 };
+      return base.ghSpawn(args);
+    });
+    let fixPasses = 0;
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        fixPasses++;
+        writeDispositionsFile(workspaceDir, [{ findingKey: key, disposition: "invalid", reason: "The index already exists." }]);
+      }
+      return structuredReviewResult({ approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn: withCurrentReview(ghSpawn), gitSpawn: makeGitSpawn(), reviewProcess }, { report: vi.fn(async () => undefined) });
+    expect(fixPasses).toBe(1);
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("approved");
+    expect(out.findingDispositions).toEqual([{ findingKey: key, disposition: "invalid", reason: "The index already exists." }]);
+    expect(base.ghComments.at(-1)).toContain("The index already exists.");
+    expect(publicationFetch.calls.some(call => JSON.parse(call.body).body.includes("second review approved"))).toBe(true);
+  });
+
+  it.each(["repeat", "none", "new"] as const)("rejects a thread finding with %s findings on the new head", async (next) => {
+    const base = ghSpawnWithOneExternalFinding();
+    let fixed = false;
+    const ghSpawn = vi.fn((args: string[]) => {
+      const result = base.ghSpawn(args);
+      if (fixed && args[1] === "graphql" && args.some((arg) => arg.includes("reviewThreads(first:"))) {
+        const payload = JSON.parse(result.stdout);
+        const threads = payload.data.repository.pullRequest.reviewThreads;
+        if (next === "none") threads.nodes = [];
+        if (next === "new") threads.nodes[0].comments.nodes[0].body = "A different defect.";
+        return { ...result, stdout: JSON.stringify(payload) };
+      }
+      return result;
+    });
+    const clean = { approved: true, findings: [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] };
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        writeDispositionsFile(workspaceDir, [{ findingKey, disposition: "invalid", reason: "The index already exists." }]);
+        fixed = true;
+      }
+      return structuredReviewResult(clean);
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn() }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(next !== "new");
+    const terminal = base.ghComments.at(-1)!;
+    expect(terminal).toContain("Rejected by the fix pass");
+    expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toContain(findingKey);
+    expect(terminal).toContain("github-review-thread · src/db.ts:42");
+    expect(terminal).toContain(findingBody);
+    expect(terminal).toContain("The index already exists.");
+    expect(publicationFetch.calls.some(call => JSON.parse(call.body).body.includes("second review approved"))).toBe(next !== "new");
+  });
+
+  it.each([false, true])("retains every rejection across two fix cycles (terminal blocker=%s)", async (blocked) => {
+    const bodies = ["Validate path params.", "Check database permissions."];
+    const reasons = ["Validation already happens upstream.", "The database enforces permissions."];
+    const keys = bodies.map(body => stableReviewFindingKey({ source: "claude-review-summary", severity: "blocking", body }));
+    let fixCycles = 0;
+    const comments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        // The next review repeats earlier rejected keys while adding a distinct finding.
+        const reported = bodies.slice(0, Math.min(fixCycles + 1, 2));
+        return { stdout: JSON.stringify([{ user: { login: "claude" }, body: `### Code Review\n\n## Blocking\n${reported.map(body => `- ${body}`).join("\n")}` }]), exitCode: 0 };
+      }
+      if (args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) {
+        writeDispositionsFile(workspaceDir, [{ findingKey: keys[fixCycles], disposition: "invalid", reason: reasons[fixCycles] }]);
+        fixCycles++;
+      }
+      const gates = blocked && fixCycles >= 2;
+      return structuredReviewResult({ approved: !gates, findings: gates ? [{ severity: "blocking", body: "Independent defect." }] : [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 3, ghSpawn, gitSpawn: makeGitSpawn(), reviewers: [{ id: "code-review", gates: true }, { id: "claude-review-summary", gates: true }] }, { report: vi.fn(async () => undefined) });
+    expect(fixCycles).toBe(2);
+    expect(out.approved).toBe(!blocked);
+    const terminal = comments.at(-1)!;
+    expect(terminal).toContain("Rejected by the fix pass");
+    for (let i = 0; i < keys.length; i++) {
+      expect(terminal.replace(/<!--[\s\S]*?-->/g, "")).not.toContain(keys[i]);
+      expect(terminal).toContain(bodies[i]);
+      expect(terminal).toContain(reasons[i]);
+    }
+  });
+
+  it.each([false, true])("shows summary-only rejection without thread mutations (internal blocker=%s)", async (blocked) => {
+    const summaryBody = "Validate path params before database access.";
+    const key = stableReviewFindingKey({ source: "claude-review-summary", severity: "blocking", body: summaryBody });
+    const comments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return { stdout: JSON.stringify([{ user: { login: "claude" }, body: `### Code Review\n\n## Blocking\n- ${summaryBody}` }]), exitCode: 0 };
+      if (args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage.startsWith("post-push-review/fix-")) writeDispositionsFile(workspaceDir, [{ findingKey: key, disposition: "invalid", reason: "Validation already happens upstream." }]);
+      return structuredReviewResult({ approved: !blocked, findings: blocked ? [{ severity: "blocking", body: "Independent defect." }] : [], summary: "Checked the diff.", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] });
+    });
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn, gitSpawn: makeGitSpawn(), reviewers: [{ id: "code-review", gates: true }, { id: "claude-review-summary", gates: true }] }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(!blocked);
+    for (const comment of [comments.find(c => c.includes("fix-complete"))!, comments.at(-1)!]) {
+      expect(comment).toContain("Rejected by the fix pass");
+      expect(comment.replace(/<!--[\s\S]*?-->/g, "")).not.toContain(key);
+      expect(comment).toContain(`claude-review-summary — ${summaryBody}`);
+      expect(comment).toContain("Validation already happens upstream.");
+    }
+    expect(ghSpawn.mock.calls.some(([args]) => args.some(a => a.includes("addPullRequestReviewThreadReply") || a.includes("resolveReviewThread")))).toBe(false);
   });
 
   it("posts no thread reply and deletes nothing when the fix-pass push fails (AC7)", async () => {
@@ -6415,8 +7018,7 @@ Checks:
 
   it("reports one disposition per key in outputs.findingDispositions, with the later one across pushes winning (AC5/AC9)", async () => {
     const { ghSpawn } = ghSpawnWithOneExternalFinding();
-    // Iteration 1's fix pass writes "invalid"; the finding still gates, so a second fix
-    // pass runs and this time writes "follow-up" for the same key — the later read wins.
+    // A fixed finding re-reported by the reviewer requires another fix pass.
     let fixPassCount = 0;
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
@@ -6429,7 +7031,7 @@ Checks:
         fixPassCount++;
         writeDispositionsFile(
           workspaceDir,
-          [{ findingKey, disposition: fixPassCount === 1 ? "invalid" : "follow-up", reason: `pass ${fixPassCount}` }],
+          [{ findingKey, disposition: fixPassCount === 1 ? "fixed" : "follow-up", reason: `pass ${fixPassCount}` }],
         );
       }
       return structuredReviewResult(cleanInternalReview);
@@ -6456,7 +7058,7 @@ Checks:
       .map((line) => JSON.parse(line));
     const fix1 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-1");
     const fix2 = summaries.find((s: { id: string }) => s.id === "post-push-review.fix-2");
-    expect(fix1.dispositions).toEqual([{ key: findingKey, disposition: "invalid" }]);
+    expect(fix1.dispositions).toEqual([{ key: findingKey, disposition: "fixed" }]);
     expect(fix2.dispositions).toEqual([{ key: findingKey, disposition: "follow-up" }]);
     expect(fix1.verdict).toMatchObject({ approved: null, reason: "fixed" });
     expect(fix1.outputCommitStatus).toBe("committed");
@@ -6676,6 +7278,7 @@ describe("postPushReviewStep review process gate", () => {
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: SHA } }), exitCode: 0 };
       if (args[0] === "api" && args.some((a) => a.includes(`commits/${SHA}/check-runs`))) {
         return {
@@ -7063,6 +7666,7 @@ describe("postPushReviewStep review process gate", () => {
 
   it("still counts an unresolved thread on an older commit under ai-implement", async () => {
     const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
+    f.ghSpawn.mockImplementation(withCurrentReview(f.ghSpawn.getMockImplementation()!));
     const { out } = await run(f, {
       reviewProcess: "ai-implement",
       reviewers: [{ id: "code-review", gates: true }],
@@ -7100,6 +7704,7 @@ describe("postPushReviewStep review process gate", () => {
 
     it("gates on the external finding once the current head's check completed", async () => {
       const f = fixture({ runs: [actions("success")], threads: [thread("🔴 old finding", "oldsha")] });
+      f.ghSpawn.mockImplementation(withCurrentReview(f.ghSpawn.getMockImplementation()!));
       const { out } = await run(f, aiImplement, { approved: true, findings: [] });
       expect(out.approved).toBe(false);
       expect(out.terminationReason).not.toBe("external_review_pending");
@@ -7311,5 +7916,123 @@ describe("uniform minor ledger gate", () => {
       { source: "ai-implement-internal", severity, reviewerId: "code-review" },
       [{ id: "code-review", gates: false }],
     )).toBe(false);
+  });
+});
+
+describe("Claude GHA comment incident replays", () => {
+  describe.each(["combined", "separate"] as const)("%s heading-only review", (format) => {
+    it.each([
+      ["Blocking issues", "github-actions[bot]", "Bot", false],
+      ["Minor issues", "github-actions[bot]", "Bot", true],
+      ["Blocking issues", "github-actions[bot]", "User", true],
+      ["Blocking issues", "untrusted-reviewer", "Bot", true],
+    ] as const)("handles %s from %s (%s), approved=%s", async (heading, login, type, approved) => {
+      const posted: string[] = [];
+      const reviewBody = `## Claude review\n### ${heading}\n- Fix the regression`;
+      const tracker = "**Claude is working…**";
+      const comments = [
+        { id: 99, user: { login: "github-actions[bot]", type: "Bot" }, body: '## Claude review\n```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' },
+        ...(format === "separate" ? [{ id: 100, user: { login: "github-actions[bot]", type: "Bot" }, body: tracker }] : []),
+        { id: 101, user: { login, type }, body: format === "combined" ? `${tracker}\n\n${reviewBody}` : reviewBody },
+      ].map(c => ({ ...c, created_at: "2026-11-10T20:44:11Z" }));
+      const ghSpawn = vi.fn((args: string[]) => {
+        if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return { stdout: JSON.stringify(comments), exitCode: 0 };
+        if (args.some(a => a.includes("/check-runs"))) return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion: "success", started_at: "2026-11-10T20:38:09Z", completed_at: "2026-11-10T20:44:14Z" }] }), exitCode: 0 };
+        if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+        if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+        if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
+        return { stdout: "", exitCode: 0 };
+      });
+      const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "lgtm", checks: [{ check: "Diff review", result: "passed", evidence: "Read diff." }] }));
+      const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, reviewProcess: "ai-implement", ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) }, { report: vi.fn(async () => undefined) });
+      const pendingTrustedTracker = format === "separate" && (type !== "Bot" || login !== "github-actions[bot]");
+      expect(out.approved).toBe(approved && !pendingTrustedTracker);
+      if (!approved) {
+        expect(posted.join("\n")).toContain("Unresolved external review findings");
+        expect(posted.join("\n")).toContain("Fix the regression");
+      } else if (heading === "Minor issues") {
+        expect(posted.join("\n")).toContain("Advisory external review findings");
+        expect(posted.join("\n")).toContain("Fix the regression");
+      } else {
+        expect(posted.join("\n")).not.toContain("Fix the regression");
+      }
+    });
+  });
+
+  it.each([
+    ["1546 blocking", pr1546, false],
+    ["stale approval", [...pr1546, { id: 997, user: { login: "github-actions[bot]", type: "Bot" }, created_at: "2026-11-10T19:00:00Z", updated_at: "2026-11-10T21:00:00Z", body: '## Claude review\n```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' }], false],
+    ["1541 advisory", pr1541, true],
+    ["missing association", pr1541, false],
+    ["unclassifiable", [{ id: 999, user: { login: "github-actions[bot]", type: "Bot" }, body: "## Claude review\nUnexpected review output." }], false],
+    ["malformed contract", [{ id: 998, user: { login: "github-actions[bot]", type: "Bot" }, body: "## Claude review\n```json review-findings\n{bad json}\n```" }], false],
+  ] as const)("handles %s with a successful review check", async (_label, comments, approved) => {
+    const posted: string[] = [];
+    const logs = vi.spyOn(console, "log");
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) return { stdout: JSON.stringify(comments.map(c => ({ created_at: "2026-11-10T20:44:11Z", ...c }))), exitCode: 0 };
+      if (args.some(a => a.includes("/check-runs"))) return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion: "success", started_at: _label === "missing association" ? "" : _label === "1541 advisory" ? "2026-11-10T19:46:53Z" : "2026-11-10T20:38:09Z", completed_at: _label === "1541 advisory" ? "2026-11-10T19:52:23Z" : "2026-11-10T20:44:14Z" }] }), exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "lgtm", checks: [{ check: "Diff review", result: "passed", evidence: "Read diff." }] }));
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(approved);
+    const selectedId = (_label === "1546 blocking" || _label === "stale approval") ? 6778794145 : _label === "1541 advisory" ? 6777662566 : _label === "unclassifiable" ? 999 : 998;
+    const kind = _label === "unclassifiable" || _label === "malformed contract" ? "unavailable" : "review-contract";
+    if (_label !== "missing association") expect(logs).toHaveBeenCalledWith(`[post-push-review] Claude review comment ${selectedId}: ${kind}`);
+    if (approved) expect(posted.join("\n")).toContain("Advisory external review findings");
+    if (_label === "unclassifiable" || _label === "malformed contract" || _label === "missing association") expect(out.terminationReason).toBe("external_review_pending");
+    logs.mockRestore();
+  });
+});
+
+describe("completed check comment finality", () => {
+  it.each(["approve", "throw-recover", "throw-timeout", "late-created", "incomplete", "malformed", "incomplete-timeout", "malformed-timeout", "blocking", "pending", "unreadable", "stale"] as const)("waits for %s comment evidence", async (mode) => {
+    const approves = ["approve", "throw-recover", "late-created", "incomplete", "malformed"].includes(mode);
+    const settles = approves || mode === "blocking";
+    let reads = 0;
+    let probing = false;
+    const posted: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args.includes("repos/:owner/:repo/pulls/42")) return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      if (args.some(a => a.includes("/check-runs"))) { probing = true; return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "completed", conclusion: "success", started_at: "2026-11-10T20:00:00Z", completed_at: "2026-11-10T20:05:00Z" }] }), exitCode: 0 }; }
+      if (args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        if (!probing) return { stdout: "[]", exitCode: 0 };
+        reads++;
+        // A later status-comment lookup must not replace the final probe snapshot.
+        if (reads > 2 && settles) return { stdout: "[]", exitCode: 0 };
+        if ((mode === "throw-timeout" && reads <= 4) || (mode === "throw-recover" && reads === 1)) {
+          // The 3-second budget permits four probes; later status lookups succeed.
+          probing = false;
+          throw new Error("comment read failed");
+        }
+        if (mode === "unreadable") return { stdout: "unavailable", exitCode: 1 };
+        const final = reads > 1 && !["pending", "incomplete-timeout", "malformed-timeout"].includes(mode);
+        const intermediate = mode.startsWith("incomplete")
+          ? '```json review-findings\n{"schema":"review-findings/v1","verdict":"incomplete","findings":[]}\n```'
+          : mode.startsWith("malformed") ? "## Claude review\n```json review-findings\n{\n```" : "**Claude is working…**";
+        return { stdout: JSON.stringify([{ id: 100, user: { login: "github-actions[bot]", type: "Bot" }, created_at: mode === "stale" ? "2026-11-09T20:01:00Z" : mode === "late-created" ? "2026-11-10T20:06:00Z" : "2026-11-10T20:01:00Z", updated_at: final ? "2026-11-10T20:07:00Z" : "2026-11-10T20:06:00Z", body: final
+          ? `## Claude review\n\`\`\`json review-findings\n${JSON.stringify({ schema: "review-findings/v1", verdict: mode === "blocking" ? "changes_requested" : "approve", findings: mode === "blocking" ? [{ severity: "blocking", body: "Fix the regression" }] : [] })}\n\`\`\``
+          : intermediate }]), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") posted.push(args[args.indexOf("--body") + 1]);
+      if (args.includes("PATCH")) posted.push((args.find(a => a.startsWith("body=")) ?? "").slice(5));
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({ approved: true, findings: [], summary: "lgtm", checks: [{ check: "Diff review", result: "passed", evidence: "Read diff." }] }));
+    const sleep = vi.fn(async () => undefined);
+    const out = await runReview(makeCtx(invoke), { prNumber: "42", workspaceDir, maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 }, { report: vi.fn(async () => undefined) });
+    expect(out.approved).toBe(approves);
+    expect(sleep).toHaveBeenCalled();
+    if (settles) expect(reads).toBe(3);
+    else {
+      expect(reads).toBeGreaterThan(1);
+      expect(out.terminationReason).toBe("external_review_pending");
+    }
+    if (mode === "blocking") expect(posted.join("\n")).toContain("Fix the regression");
   });
 });

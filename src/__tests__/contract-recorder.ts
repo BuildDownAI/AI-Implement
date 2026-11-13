@@ -145,6 +145,8 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
 
 // Tools whose contract test file does not follow the `<tool>-contract.test.ts` convention.
 const CONTRACT_TEST_FILES: Record<string, string> = {
+  get_tenant_health: "src/__tests__/monitor-tools-contract.test.ts",
+  get_fleet_report: "src/__tests__/monitor-tools-contract.test.ts",
   list_job_accounting: "src/__tests__/job-accounting-contract.test.ts",
   start_deploy: "src/__tests__/deploy-tools-contract.test.ts",
   get_deploy_posture: "src/__tests__/deploy-tools-contract.test.ts",

@@ -92,3 +92,49 @@ describe("dispatchLocalGapfill managed input (AII-1392)", () => {
     expect(startMock.start).not.toHaveBeenCalled();
   });
 });
+
+it.each([false, true])("carries named review-fix runs (managed=%s) without returning credentials", async (managed) => {
+  const { makeReviewFixRunConfig } = await import("./helpers/builders.js");
+  const { decodeRunConfig } = await import("../run-config.js");
+  const { buildDockerRunArgs } = await import("../local-docker.js");
+  const reviewFix = makeReviewFixRunConfig({ executionBackend: "local-docker" }).reviewFix;
+  const result = await dispatchLocalGapfill(input({
+    runName: "review-d-1", dispatchId: "d-1", reviewFix,
+    ...(managed ? { managed: { decision: decision(), modelAuthUrl: "http://host.docker.internal:8080" } } : { anthropicApiKey: "key" }),
+  }));
+  const arg = startMock.start.mock.calls[0]![0];
+  expect(arg.containerName).toBe("review-d-1");
+  const envelope = managed ? arg.protectedModelAuth.runConfig : decodeRunConfig(arg.extraEnv.AI_IMPLEMENT_RUN_CONFIG);
+  expect(envelope.reviewFix).toEqual(reviewFix);
+  if (!managed) {
+    const args = buildDockerRunArgs(arg);
+    expect(args[args.indexOf("--name") + 1]).toBe("review-d-1");
+  }
+  expect(Object.keys(result).sort()).toEqual(["containerId", "containerName", "runConfig"]);
+});
+
+it("rejects invalid explicit names before hooks or Docker launch", async () => {
+  const onBeforeLaunch = vi.fn();
+  await expect(dispatchLocalGapfill(input({ runName: "bad/name", anthropicApiKey: "key", onBeforeLaunch }))).rejects.toThrow(/runName/);
+  expect(onBeforeLaunch).not.toHaveBeenCalled();
+  expect(startMock.start).not.toHaveBeenCalled();
+});
+
+it("keeps the legacy envelope byte-identical when optional inputs are omitted", async () => {
+  const { buildEnvelopeDispatchInputs } = await import("../github.js");
+  const args = input({ anthropicApiKey: "key" });
+  await dispatchLocalGapfill(args);
+  const previous = buildEnvelopeDispatchInputs(args.mapping, args.issue, {
+    runnerPhase: "gap-analysis", prNumber: String(args.prNumber), runnerCallbackUrl: args.runnerCallbackUrl,
+    runToken: args.runToken, retryPolicy: args.retryPolicy,
+  });
+  expect(startMock.start.mock.calls[0]![0].extraEnv.AI_IMPLEMENT_RUN_CONFIG).toBe(previous.run_config);
+});
+
+it("retains review-only in the local envelope", async () => {
+  const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+  const result = await dispatchLocalGapfill(input({ anthropicApiKey: "k", reviewOnly }));
+  expect(result.runConfig.reviewOnly).toEqual(reviewOnly);
+  const { decodeRunConfig } = await import("../run-config.js");
+  expect(decodeRunConfig(startMock.start.mock.calls[0][0].extraEnv.AI_IMPLEMENT_RUN_CONFIG).reviewOnly).toEqual(reviewOnly);
+});

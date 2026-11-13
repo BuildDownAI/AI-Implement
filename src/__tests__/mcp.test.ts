@@ -6,7 +6,7 @@ import { handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setKgRefreshToolDeps } from "../restate/tools.js";
-import { getIssueReportCard, getFleetReport } from "../report-card.js";
+import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { refreshRunnerBackendCache } from "../orchestrator-settings.js";
 import type { PreflightCheckResult } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
@@ -23,6 +23,7 @@ import {
   getIssueDispatchStatus,
   getIssueReportCardTool,
   getFleetReportTool,
+  getReviewerScorecardTool,
   getDeployPostureTool,
   getKgStatusTool,
   getReviewFixAttemptTool,
@@ -41,6 +42,7 @@ import {
   setFlyMachineProfileTool,
   setRunProfileTool,
   pauseProjectTool,
+  importEnvironmentCredentialTool,
   addProjectTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
@@ -92,6 +94,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   get_issue_dispatch_status: getIssueDispatchStatus,
   get_issue_report_card: getIssueReportCardTool,
   get_fleet_report: getFleetReportTool,
+  get_reviewer_scorecard: getReviewerScorecardTool,
   get_deploy_posture: getDeployPostureTool,
   get_kg_status: getKgStatusTool,
   get_review_fix_attempt: getReviewFixAttemptTool,
@@ -109,6 +112,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   set_fly_machine_profile: setFlyMachineProfileTool,
   set_run_profile: setRunProfileTool,
   pause_project: pauseProjectTool,
+  import_environment_credential: importEnvironmentCredentialTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
   clear_dispatch_dedup: clearDispatchDedupTool,
@@ -123,6 +127,7 @@ const WRITE_TOOL_NAMES = new Set([
   "set_fly_machine_profile",
   "set_run_profile",
   "pause_project",
+  "import_environment_credential",
   "add_project",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
@@ -208,6 +213,7 @@ vi.mock("../deploy-posture.js", () => ({
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
   getFleetReport: vi.fn(),
+  getReviewerScorecard: vi.fn(),
 }));
 
 vi.mock("../deploy-hold.js", () => ({
@@ -1611,6 +1617,7 @@ describe("handleMcpRequest", () => {
         "trigger_kg_refresh",
         "set_runner_mode",
         "pause_project",
+        "import_environment_credential",
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
@@ -1633,6 +1640,7 @@ describe("handleMcpRequest", () => {
         "trigger_kg_refresh",
         "set_runner_mode",
         "pause_project",
+        "import_environment_credential",
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
@@ -1653,6 +1661,7 @@ describe("handleMcpRequest", () => {
         "get_issue_dispatch_status",
         "get_issue_report_card",
         "get_fleet_report",
+        "get_reviewer_scorecard",
         "get_deploy_posture",
         "get_kg_status",
         "get_session_identity",
@@ -2685,6 +2694,18 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).toBeUndefined();
       expect(JSON.parse(parsed.result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5, merged: true });
+    });
+
+    it("get_reviewer_scorecard forwards days and repo for a user", async () => {
+      mockRole("user");
+      const scores = [{ source: "github-review", total: 1, fixed: 1, rejected: 0, deferred: 0, ignored: 0, rejectedRate: 0 }];
+      vi.mocked(getReviewerScorecard).mockReturnValue(scores);
+      const result = await callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 33, method: "tools/call", params: { name: "get_reviewer_scorecard", arguments: { days: 7, repo: "org/repo" } } }),
+      );
+      expect(getReviewerScorecard).toHaveBeenCalledWith({ days: 7, repo: "org/repo" });
+      expect(JSON.parse(JSON.parse(result.body).result.content[0].text)).toEqual(scores);
     });
 
     it("get_fleet_report threads `days` through /mcp and returns the report verbatim", async () => {

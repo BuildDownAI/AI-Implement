@@ -236,10 +236,12 @@ describe("postRunnerResult", () => {
       outcome: "success",
       prUrl: "https://github.com/o/r/pull/1",
       callbackUrl: "https://cb",
+      internalFindings: [{ source: "ai-implement-internal", severity: "blocking", body: "Fix validation" }],
       findingDispositions,
       fetchImpl: endpoint.fetch,
     });
 
+    expect(sentBody(endpoint).internalFindings).toEqual([{ source: "ai-implement-internal", severity: "blocking", body: "Fix validation" }]);
     expect(sentBody(endpoint).findingDispositions).toEqual(findingDispositions);
   });
 

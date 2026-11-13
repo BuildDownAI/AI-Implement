@@ -85,6 +85,18 @@ function ensureReviewFixEventsColumns(): void {
   }
 }
 
+function ensureReviewFixAttemptsColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(review_fix_attempts)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+  if (!names.has("execution_backend")) {
+    db.exec("ALTER TABLE review_fix_attempts ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'github-actions'");
+  }
+  if (!names.has("execution_ref")) {
+    db.exec("ALTER TABLE review_fix_attempts ADD COLUMN execution_ref TEXT");
+  }
+}
+
 function createRunnerTokensTable(): void {
   if (!db) return;
   db.exec(`
@@ -396,10 +408,21 @@ export function getDb(): Database.Database {
     // the new version field as 1 for old rows without a rewrite or backfill.
     const findingColumns = new Set((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
       .map((column) => column.name));
+    if (!findingColumns.has("disposition")) {
+      db.exec("ALTER TABLE review_findings ADD COLUMN disposition TEXT");
+    }
     if (!findingColumns.has("revision")) {
       db.exec("ALTER TABLE review_findings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
     }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_findings_open ON review_findings(repo, pr_number, status)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS internal_review_finding_reports (
+        dispatch_id TEXT NOT NULL,
+        finding_id INTEGER NOT NULL REFERENCES review_findings(id),
+        revision INTEGER NOT NULL,
+        PRIMARY KEY (dispatch_id, finding_id)
+      )
+    `);
     db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -528,6 +551,8 @@ export function getDb(): Database.Database {
         authority_revoked_at INTEGER,
         github_run_id INTEGER,
         github_run_attempt INTEGER,
+        execution_backend TEXT NOT NULL DEFAULT 'github-actions',
+        execution_ref TEXT,
         task_snapshot_json TEXT NOT NULL,
         finding_versions_json TEXT NOT NULL,
         accepted_result_json TEXT,
@@ -540,6 +565,7 @@ export function getDb(): Database.Database {
         CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
       )
     `);
+    ensureReviewFixAttemptsColumns();
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_attempts_pr_history
       ON review_fix_attempts(installation_id, repository, pr_number, created_at)`);
     // AII-1566: when a record the control plane reads last changed (epoch ms, set by SQLite).

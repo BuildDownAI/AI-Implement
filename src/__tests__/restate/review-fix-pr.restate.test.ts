@@ -130,6 +130,7 @@ describe("ReviewFixPR durable coordination", () => {
       },
       cancel: async () => ({ status: "cancelled" } as const),
       inspectTerminal: async (execution) => {
+        if (execution.backend !== undefined && execution.backend !== "github-actions") return { reached: false };
         const state = [...attempts.values()].find((item) => item.execution?.githubRunId === execution.githubRunId);
         return state?.terminal ? { reached: true, outcome: state.terminal } as const : { reached: false } as const;
       },

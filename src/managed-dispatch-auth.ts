@@ -20,7 +20,7 @@ import {
 import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import { parseExecutionPolicy, parseModelAuthContext, type ModelAuthGrantBootstrapV1, type SafeGrantMetadata } from "./model-auth-contract.js";
 import type { ModelAuthRuntime } from "./model-auth-runtime.js";
-import { copyModelFallbacks, type ResolvedAgentSnapshotV1, type RunCredentialsV1 } from "./run-config.js";
+import { copyAccountFallbacks, type AccountFallbacks, copyModelFallbacks, type ResolvedAgentSnapshotV1, type RunCredentialsV1 } from "./run-config.js";
 
 export interface ManagedDispatchRequest {
   dispatchId: string;
@@ -41,6 +41,7 @@ export type ManagedDispatchDecision =
       readonly projectKey: string;
       readonly backend: DispatchAdmissionBackend;
       readonly snapshot: ResolvedAgentSnapshotV1;
+      readonly accountFallbacks?: AccountFallbacks;
       readonly fallbackModels: Partial<Record<StageName, string>>;
       readonly grant: SafeGrantMetadata;
       readonly takeBootstrap: () => ModelAuthGrantBootstrapV1 | undefined;
@@ -119,6 +120,7 @@ export async function prepareManagedDispatch(
         backend: req.backend,
         snapshot: result.snapshot,
         fallbackModels: result.fallbackModels,
+        ...(result.accountFallbacks ? { accountFallbacks: result.accountFallbacks } : {}),
         grant: result.grant,
         takeBootstrap: result.takeBootstrap,
       };
@@ -231,14 +233,16 @@ export function ghaLaunchOutcome(result: { success: boolean; outcome?: string })
 /** Keep the snapshot and its companion model ids together on every managed transport. */
 export function managedRunConfigFields(
   decision:
-    | { kind: "launch"; snapshot: ResolvedAgentSnapshotV1; fallbackModels?: Partial<Record<StageName, string>> }
+    | { kind: "launch"; snapshot: ResolvedAgentSnapshotV1; accountFallbacks?: AccountFallbacks; fallbackModels?: Partial<Record<StageName, string>> }
     | { kind: Exclude<ManagedDispatchDecision["kind"], "launch"> }
     | null | undefined,
 ): {
   agentConfig?: ResolvedAgentSnapshotV1;
   modelFallbacks?: Partial<Record<StageName, string>>;
+  accountFallbacks?: AccountFallbacks;
 } {
   if (decision?.kind !== "launch") return {};
   const modelFallbacks = copyModelFallbacks(decision.fallbackModels);
-  return { agentConfig: decision.snapshot, ...(modelFallbacks ? { modelFallbacks } : {}) };
+  const accountFallbacks = copyAccountFallbacks(decision.accountFallbacks);
+  return { ...(accountFallbacks ? { accountFallbacks } : {}), agentConfig: decision.snapshot, ...(modelFallbacks ? { modelFallbacks } : {}) };
 }

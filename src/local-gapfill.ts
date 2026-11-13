@@ -1,10 +1,9 @@
 import type { RepoMapping } from "./config.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
-import { buildEnvelopeDispatchInputs } from "./github.js";
 import { generateMachineNonce, generateSessionToken } from "./fly-machines.js";
 import { startLocalRunnerContainer, validateProtectedLocalInput, type LocalRunnerInput, type StartLocalContainerInput } from "./local-docker.js";
 import type { ManagedDispatchDecision } from "./managed-dispatch-auth.js";
-import { decodeRunConfig, encodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { buildRunConfig, decodeRunConfig, encodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import type { RetryPolicy } from "./pipeline/retry-backoff.js";
 
 export interface LocalGapfillIssue {
@@ -15,6 +14,10 @@ export interface LocalGapfillIssue {
 }
 
 export interface DispatchLocalGapfillInput {
+  runName?: string;
+  dispatchId?: string;
+  reviewOnly?: RunConfigV1["reviewOnly"];
+  reviewFix?: RunConfigV1["reviewFix"];
   mapping: RepoMapping;
   issue: LocalGapfillIssue;
   prNumber: number;
@@ -30,7 +33,7 @@ export interface DispatchLocalGapfillInput {
   commentInstruction?: string;
   retryPolicy: RetryPolicy | null;
   /** Called after all local preparation, immediately before the potentially ambiguous Docker launch. */
-  onBeforeLaunch?: () => void;
+  onBeforeLaunch?: (machineNonce: string) => void;
   /** Opted-in project: the run carries the decision's agent snapshot and a protected local grant instead of Anthropic credentials. */
   managed?: {
     decision: Extract<ManagedDispatchDecision, { kind: "launch" }>;
@@ -41,12 +44,13 @@ export interface DispatchLocalGapfillInput {
 export interface DispatchLocalGapfillResult {
   containerId: string;
   containerName: string;
-  machineNonce: string;
-  sessionToken: string;
   runConfig: RunConfigV1;
 }
 
 export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Promise<DispatchLocalGapfillResult> {
+  if (input.runName !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(input.runName)) {
+    throw new Error("Invalid local gap-fill runName");
+  }
   if (!input.image.trim()) throw new Error("Local gap-fill requires a local runner image");
   if (!input.orchestratorUrl.trim()) throw new Error("Local gap-fill requires a local orchestrator URL");
   if (!input.runnerCallbackUrl?.trim() || !input.runToken?.trim()) {
@@ -61,19 +65,17 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
 
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
-  const envelope = buildEnvelopeDispatchInputs(input.mapping, input.issue, {
+  const decoded = decodeRunConfig(encodeRunConfig(buildRunConfig({
+    mapping: input.mapping,
+    issue: input.issue,
     runnerPhase: "gap-analysis",
     prNumber: String(input.prNumber),
     commentInstruction: input.commentInstruction || undefined,
     runnerCallbackUrl: input.runnerCallbackUrl || undefined,
-    runToken: input.runToken,
-    runProgressToken: input.runProgressToken,
     retryPolicy: input.retryPolicy,
-  });
-  if (!envelope.run_config) {
-    throw new Error("Local gap-fill envelope did not include run_config");
-  }
-  const decoded = decodeRunConfig(envelope.run_config);
+    reviewOnly: input.reviewOnly,
+    reviewFix: input.reviewFix,
+  })));
   const runConfig: RunConfigV1 = input.managed ? { ...decoded, ...managedRunConfigFields(input.managed.decision) } : decoded;
 
   let protectedModelAuth: LocalRunnerInput["protectedModelAuth"];
@@ -89,6 +91,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
   }
 
   const localInput: StartLocalContainerInput = {
+    containerName: input.runName,
     image: input.image,
     issueId: input.issue.id,
     issueIdentifier: input.issue.identifier,
@@ -109,7 +112,7 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
     runToken: input.runToken || undefined,
     runProgressToken: input.runProgressToken || undefined,
     runPublicationToken: input.runPublicationToken || undefined,
-    onBeforeLaunch: input.onBeforeLaunch,
+    onBeforeLaunch: () => input.onBeforeLaunch?.(machineNonce),
     extraEnv: (() => {
       const merged = {
         ...input.mapping.extraEnv,
@@ -126,8 +129,6 @@ export async function dispatchLocalGapfill(input: DispatchLocalGapfillInput): Pr
   return {
     containerId: container.containerId,
     containerName: container.containerName,
-    machineNonce,
-    sessionToken,
     runConfig,
   };
 }

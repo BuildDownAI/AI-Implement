@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { ModelPrice } from "../restate/model-prices.js";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as RcModule from "../report-card.js";
 import { testDb } from "./helpers/test-db.js";
@@ -1015,21 +1015,15 @@ describe("getIssueReportCard restate (AII-1129)", () => {
     expect(rc.getIssueReportCard("AII-NT")!.runs[0].restate).toBeNull();
   });
 
-  it("maps kg-refresh, planning and implementation rows; null dispatch_id and non-restate rows are null", () => {
-    const issueIdentifier = "AII-RS";
-    insertDispatch({ issueIdentifier, phase: "kg-refresh", dispatchId: "kg-1", dispatchedAt: 1 });
-    insertDispatch({ issueIdentifier, phase: "planning", dispatchId: "plan-1", dispatchedAt: 2 });
-    insertDispatch({ issueIdentifier, phase: "implementation", dispatchId: "impl-1", dispatchedAt: 3 });
-    insertDispatch({ issueIdentifier, phase: "planning", dispatchedAt: 4 });
-    insertDispatch({ issueIdentifier, phase: "gap-fill", dispatchId: "legacy-1", dispatchedAt: 5 });
-    const card = rc.getIssueReportCard(issueIdentifier)!;
-    expect(card.runs.map((r) => r.restate)).toEqual([
-      { service: "KgRefresh", key: "kg-1" },
-      null,
-      null,
-      null,
-      null,
-    ]);
+  it("returns null without a dispatch id", () => {
+    insertDispatch({ issueIdentifier: "AII-NO-ID", phase: "kg-refresh" });
+    expect(rc.getIssueReportCard("AII-NO-ID")!.runs[0].restate).toBeNull();
+  });
+
+  it("maps kg-refresh to KgRefresh without admissions", () => {
+    dedup.getDb().exec("DROP TABLE dispatch_admissions");
+    insertDispatch({ issueIdentifier: "AII-KG", phase: "kg-refresh", dispatchId: "kg-1" });
+    expect(rc.getIssueReportCard("AII-KG")!.runs[0].restate).toEqual({ service: "KgRefresh", key: "kg-1" });
   });
 
   it("maps a restate-owned implementation row to ImplementationRun and a legacy one to null", async () => {
@@ -1050,10 +1044,18 @@ describe("getIssueReportCard restate (AII-1129)", () => {
     expect(rc.getIssueReportCard("AII-IR")!.runs.map((r) => r.restate)).toEqual([{ service: "ImplementationRun", key: "impl-r" }, null]);
   });
 
-  it("maps a restate-owned non-planning row to ReviewFixAttempt", async () => {
+  it.each([
+    ["rf-1", "ReviewFixAttempt"],
+    ["impl-gap", "ImplementationRun"],
+  ])("maps Restate gap-analysis %s to %s by matching attempt dispatch id", async (dispatchId, service) => {
+    dedup.getDb().prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+      VALUES ('att-rf', 'rf-1', 'm', '1', 'org/repo', 1, 's', 'issue-default',
+              'restate', 'created', 1, 2, '{}', '[]')`).run();
     const admission = await import("../dispatch-admission.js");
     admission.acquire({
-      dispatchId: "rf-1",
+      dispatchId,
       mappingKey: "m",
       scope: { kind: "issue", issueScope: "s", issueId: "issue-default" },
       kind: "gap-fill",
@@ -1061,7 +1063,55 @@ describe("getIssueReportCard restate (AII-1129)", () => {
       lifecycleOwner: { kind: "restate", attemptId: "att-rf" },
       cap: 5,
     });
-    insertDispatch({ issueIdentifier: "AII-RF", phase: "gap-fill", dispatchId: "rf-1" });
-    expect(rc.getIssueReportCard("AII-RF")!.runs[0].restate).toEqual({ service: "ReviewFixAttempt", key: "rf-1" });
+    insertDispatch({ issueIdentifier: "AII-RF", phase: "gap-analysis", dispatchId });
+    expect(rc.getIssueReportCard("AII-RF")!.runs[0].restate).toEqual({ service, key: dispatchId });
+  });
+});
+
+
+describe("getReviewerScorecard", () => {
+  it("returns zero fixed for a source containing only legacy resolved findings", () => {
+    const now = Date.now();
+    dedup.getDb().prepare(`INSERT INTO review_findings
+      (repo, pr_number, finding_key, source, severity, body, status, first_seen_at, last_seen_at)
+      VALUES ('org/legacy', 1, 'legacy', 'github-review', 'blocking', 'legacy', 'resolved', ?, ?)`).run(now, now);
+    expect(rc.getReviewerScorecard()).toEqual([{
+      source: "github-review", total: 1, fixed: 0, rejected: 0, deferred: 0, ignored: 1, rejectedRate: 0,
+    }]);
+  });
+
+  it("counts first-seen cohorts, explicit fixes and merged open rows across sources and repos", () => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const db = dedup.getDb();
+      const insert = db.prepare(`INSERT INTO review_findings
+        (repo, pr_number, finding_key, source, severity, body, status, disposition, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, 'blocking', 'finding', ?, ?, ?, ?)`);
+      let key = 0;
+      const sources = ["claude-review-summary", "github-review-thread", "ai-implement-internal"];
+      for (const source of sources) {
+        for (const repo of ["org/a", "org/b"]) {
+          for (const [status, disposition, pr] of [
+            ["resolved", "fixed", 1], ["resolved", null, 1], ["rejected", null, 1],
+            ["deferred", null, 1], ["open", null, 1], ["open", null, 2],
+          ] as const) insert.run(repo, pr, String(++key), source, status, disposition, now - 86_400_000, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now - 86_400_001, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now + 1, now);
+          db.prepare("INSERT OR IGNORE INTO pr_merge_capture (repo, pr_number, merged_at, captured_at) VALUES (?, 1, ?, ?)").run(repo, now, now);
+        }
+      }
+      expect(rc.getReviewerScorecard({ days: 1 })).toEqual([...sources].sort().map(source => ({
+        source, total: 12, fixed: 2, rejected: 2, deferred: 2, ignored: 4, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ days: 1, repo: "org/a" })).toEqual([...sources].sort().map(source => ({
+        source, total: 6, fixed: 1, rejected: 1, deferred: 1, ignored: 2, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ repo: "missing" })).toEqual([]);
+      db.exec("DROP TABLE pr_merge_capture");
+      expect(rc.getReviewerScorecard({ days: 1 })[0]!.ignored).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

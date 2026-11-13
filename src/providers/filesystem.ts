@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   access,
+  open,
   constants,
   mkdir,
   readFile,
@@ -24,6 +25,7 @@ import type {
   IssueLifecycleState,
   TicketIssue,
   TicketingProvider,
+  TrackerIssuePage,
 } from "./types.js";
 
 export type FilesystemStatus =
@@ -41,6 +43,7 @@ export interface FilesystemState {
   status: FilesystemStatus;
   comments: Array<{ body: string; createdAt: string }>;
   prUrls: string[];
+  parentRef?: { identifier: string };
   failurePhase?: "planning" | "implementation";
   updatedAt: string;
 }
@@ -135,6 +138,22 @@ export class FilesystemProvider implements TicketingProvider {
     return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize: [] };
   }
 
+  async listIssuesPage(mapping: RepoMapping, _cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
+    const tasks = [...(await this.scanTasks()).values()].filter(task =>
+      task.issue.scopeKey === mapping.teamKey && (!filter || task.issue.title.startsWith(filter.titlePrefix)));
+    return {
+      issues: tasks.map(({ issue, state }) => ({
+        id: issue.id, identifier: issue.identifier, title: issue.title,
+        description: issue.description ?? null,
+        parent: state?.parentRef ?? null,
+        state: { name: issue.nativeStatus ?? "ready", type: state && TERMINAL.has(state.status) ? "completed" : "unstarted" },
+        labels: { nodes: [] }, project: null, relations: { nodes: [] },
+        comments: { nodes: (state?.comments ?? []).map(comment => ({ ...comment, user: null })) },
+      })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    };
+  }
+
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {
     const tasks = await this.scanTasks();
     const result = new Map<string, IssueLifecycleState>();
@@ -151,6 +170,48 @@ export class FilesystemProvider implements TicketingProvider {
 
   async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
     return [];
+  }
+
+  async createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    const parent = (await this.scanTasks()).get(parentId);
+    const mapping = this.mappingForScope(scopeKey);
+    if (!parent || parent.issue.scopeKey !== scopeKey || !mapping || mapping.ticketingConfig.kind !== "filesystem") {
+      throw new Error("Filesystem parent not found in scope");
+    }
+    const directory = await existingRealDirectory(mapping.ticketingConfig.directory);
+    if (!directory) throw new Error("Filesystem ticket directory is unavailable");
+    const identifier = `CHILD-${BigInt("0x" + randomUUID().replaceAll("-", "")).toString()}`;
+    const id = `filesystem:${scopeKey}:${identifier}`;
+    const taskPath = join(directory, `${identifier}.md`);
+    const statePath = join(directory, ".state", scopeKey, `${identifier}.json`);
+    // Publish the task only after its parent metadata is durable.
+    await checkStateDirectories(dirname(statePath));
+    await mkdir(dirname(statePath), { recursive: true });
+    await checkStateDirectories(dirname(statePath));
+    const temporaryPath = join(directory, `.${identifier}.${randomUUID()}.tmp`);
+    let stateCreated = false;
+    try {
+      // Reserve state exclusively, but keep partial state writes inside the cleanup boundary.
+      const stateFile = await open(statePath, "wx", 0o600);
+      stateCreated = true;
+      try {
+        await stateFile.writeFile(JSON.stringify({ ...defaultState(mapping.planningEnabled),
+          parentRef: { identifier: parent.issue.identifier } }));
+      } finally {
+        await stateFile.close();
+      }
+      await writeFile(temporaryPath, `---\ntitle: ${JSON.stringify(content.title)}\nid: ${identifier}\n---\n${content.body}`, { flag: "wx" });
+      // link publishes the complete document atomically and refuses an existing destination.
+      await link(temporaryPath, taskPath);
+    } catch (err) {
+      if (stateCreated) await unlink(statePath);
+      throw err;
+    } finally {
+      await unlink(temporaryPath).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+    }
+    return { id, identifier };
   }
 
   async markPlanningStarted(issueId: string, scopeKey: string): Promise<void> {
@@ -410,6 +471,7 @@ export class FilesystemProvider implements TicketingProvider {
                 title: parsed.issue.title,
                 description: parsed.issue.description,
                 scopeKey,
+                ...(state?.parentRef ? { parentRef: state.parentRef } : {}),
                 nativeStatus: state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved"),
                 ...(parsed.baseBranch ? { baseBranch: parsed.baseBranch } : {}),
                 ...(parsed.profiles ? { profiles: parsed.profiles } : {}),
@@ -611,6 +673,7 @@ async function readState(path: string): Promise<FilesystemState | null | "corrup
         typeof parsed.updatedAt !== "string") return "corrupt";
     return {
       version: 1,
+      ...(parsed.parentRef && typeof parsed.parentRef.identifier === "string" ? { parentRef: parsed.parentRef } : {}),
       status: parsed.status,
       comments: Array.isArray(parsed.comments)
         ? parsed.comments.filter(isComment)

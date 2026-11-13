@@ -301,6 +301,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
     expect(terminal.outcome.status).toBe("succeeded");
     const outputCommit = terminal.outcome.status === "succeeded" ? terminal.outcome.outputCommit : "";
 
+    if (!execution || (execution.backend !== undefined && execution.backend !== "github-actions")) throw new Error("expected GitHub execution");
     const result: ReviewFixResultMetadataV1 = {
       version: 1,
       attemptId: attempt!.attemptId,

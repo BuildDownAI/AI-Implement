@@ -1,3 +1,7 @@
+import { listRollupReviewChildren, reconcileRollupReviewChildren, ROLLUP_REVIEW_CHILD_PREFIX } from "./merge-up.js";
+import { getDb } from "./dedup.js";
+import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
+import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import { MAX_PUBLICATION_BYTES, reviewPublicationInputSchema } from "./restate/post-push-review-publication.js";
 import * as restateClients from "@restatedev/restate-sdk-clients";
 import { RESTATE_INGRESS_BASE_URL } from "./restate/server.js";
@@ -39,12 +43,13 @@ import {
   getReviewFindingsByKeys,
   listOpenReviewFindings,
   markReviewFindingsDeferredByKeys,
+  markReviewFindingsRejectedByKeys,
   markReviewFindingsResolvedByIds,
   markReviewFindingsResolvedForPrSeenBefore,
   type StoredReviewFinding,
 } from "./review-ledger-store.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { getCommitAuthorType, getPullRequestState, postOrUpdateStickyComment } from "./github.js";
+import { getCommitAuthorType, getPullRequestState, listPrComments, updatePrComment, postOrUpdateStickyComment } from "./github.js";
 import {
   renderClassification,
   renderFailureRecord,
@@ -175,6 +180,10 @@ export interface RunnerResultBody {
   sources?: SourceResult[];
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
+  /** Internal findings collected across review iterations, validated before storage. */
+  reviewOnly?: boolean;
+  rollupReview?: { headSha: string; verdictUrl: string };
+  internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
   /**
@@ -252,16 +261,9 @@ export interface HandleRunnerResultInput {
   /** `KG_SOURCE_REPO`, from which the `KgRepo` key is derived. Null/absent → 503. */
   kgSourceRepo?: string | null;
   /**
-   * Immediate one-shot backend-termination check for a planning callback's admission
-   * reservation (AII-783 review, third round, on PR #681). The planning branch below
-   * marks the job `completed` with `skipAdmissionRelease` because the callback's own
-   * self-report is not proof the backend has exited — but that write also removes the
-   * job from `getInFlightJobs()`'s `dispatched`/`running` set, so the normal per-poll
-   * monitor never looks at it again. Wired to `tryFastReleasePlanningAdmission` in
-   * index.ts: when the backend is already confirmed terminal it releases the
-   * reservation right away; otherwise it is a no-op and the reservation stays held for
-   * the stale-admission sweep. Absent in tests that don't need it — the reservation
-   * then simply stays held, matching pre-fast-path behavior.
+   * Reports planning completion and usage to the workflow for a Restate-owned admission.
+   * Admissions without a Restate owner are logged and left held for later backend
+   * reconciliation or the stale-admission sweep.
    */
   checkPlanningAdmissionTermination?: (dispatchId: string, usage?: RecordedUsage) => Promise<void | PlanningIngressResult>;
   /**
@@ -367,7 +369,9 @@ export function formatFailureComment(
 ): string {
   const { prUrl, failure, runUrl, lastSuccessfulStage, isInitialRun } = options;
   let c: Classification;
-  if (failureCode === "SENSITIVE_FILES_BLOCKED") {
+  if (failure?.code === "ACCOUNT_USAGE_LIMIT") {
+    return renderFailureRecord(failure, prUrl, runUrl, lastSuccessfulStage, isInitialRun);
+  } else if (failureCode === "SENSITIVE_FILES_BLOCKED") {
     // Pushed through the same redact/cap `classifyCompletion` applies to a persisted
     // FailureRecord's `message` (BAC-27112 follow-up) — otherwise a raw, secret-bearing
     // `failureReason` would render differently here than the byte-identical guardrail
@@ -811,10 +815,12 @@ async function handleRunnerResultInternal(
   // otherwise burn a one-time-use token and lose any chance of retry from
   // the runner.
   const body = input.body as unknown as {
+    reviewOnly?: unknown;
     phase?: unknown;
     outcome?: unknown;
     comments?: unknown;
     failure?: unknown;
+    internalFindings?: unknown;
     findingDispositions?: unknown;
     cycleSummaries?: unknown;
     attribution?: unknown;
@@ -997,7 +1003,8 @@ async function handleRunnerResultInternal(
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
   const owned = readAdmission(preflight.claims.dispatchId)?.lifecycleOwner.kind === "restate";
-  const verified = owned ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
+  // Review-only delivery must retain its credential until pre-write failures can be retried.
+  const verified = owned || body.reviewOnly === true ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     console.warn(
       `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
@@ -1124,6 +1131,21 @@ async function handleRunnerResultInternal(
     }
   };
 
+  if (body.reviewOnly === true) {
+    const job = getJobByDispatchId(claims.dispatchId);
+    let trackerWriteReserved = false;
+    try {
+      await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId, () => { trackerWriteReserved = true; });
+    } catch (err) {
+      warn("roll-up-review", err);
+      if (!trackerWriteReserved) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
+    }
+    if (!owned) verifyAndConsumeRunToken(bearerToken, input.secret);
+    if (job) updateJobStatus(job.id, body.outcome === "success" ? "completed" : "failed", "rollup_review", undefined, { skipAdmissionRelease: true });
+    await sendImplementationReport();
+    return { status: 200, body: { acknowledged: true, warnings } };
+  }
+
   for (const c of input.body.comments) {
     try {
       await provider.postComment(claims.issueId, c.body);
@@ -1146,6 +1168,38 @@ async function handleRunnerResultInternal(
     }
   }
 
+  // New dispatch reports reopen resolved findings; callback retries retain their original revision.
+  const internalJob = getJobByDispatchId(claims.dispatchId);
+  const findingPrUrl = internalJob?.prUrl ?? input.body.prUrl;
+  const findingTarget = findingPrUrl ? parsePrUrlTarget(findingPrUrl) : null;
+  const internalPr = findingTarget && `${findingTarget.owner}/${findingTarget.repo}` === internalJob?.repo
+    ? findingTarget.prNumber : null;
+  if (internalJob?.repo && internalPr !== null && Array.isArray(body.internalFindings)) {
+    for (const raw of body.internalFindings) {
+      if (!raw || typeof raw !== "object") continue;
+      const f = raw as ReviewLedgerFinding;
+      if (f.source !== "ai-implement-internal" || typeof f.body !== "string" || !f.body ||
+          !["blocking", "medium", "minor"].includes(f.severity) ||
+          (f.path !== undefined && typeof f.path !== "string") ||
+          (f.url !== undefined && typeof f.url !== "string") ||
+          (f.line !== undefined && (!Number.isInteger(f.line) || f.line < 1)) ||
+          (f.reviewerId !== undefined && typeof f.reviewerId !== "string")) continue;
+      const key = stableReviewFindingKey(f);
+      const existing = getReviewFindingsByKeys(internalJob.repo, internalPr, [key])[0];
+      // Reports have dispatch identity but no timestamp. When the row advanced after
+      // dispatch, only waive the time guard if this dispatch owns the current revision.
+      const canResolve = !existing || existing.status === "resolved" ||
+        existing.lastSeenAt <= internalJob.dispatchedAt || !getDb().prepare(`
+          SELECT 1 FROM internal_review_finding_reports
+          WHERE finding_id = ? AND revision = ? AND dispatch_id != ? LIMIT 1
+        `).get(existing.id, existing.revision, claims.dispatchId);
+      const report = recordInternalReviewFinding({ ...f, repo: internalJob.repo, prNumber: internalPr }, claims.dispatchId);
+      if (canResolve && sanitizedFindingDispositions.some(d => d.findingKey === key && d.disposition === "fixed")) {
+        markReviewFindingResolvedIfRevision(report.id, report.revision);
+      }
+    }
+  }
+
   // AII-756: a fixing agent may defer a finding as out-of-scope follow-up work. This must
   // run before any phase-specific resolution below (e.g. the gap-analysis snapshot
   // resolution) — resolving first would flip a just-deferred finding back to resolved.
@@ -1154,8 +1208,8 @@ async function handleRunnerResultInternal(
   const followUpDispositions = sanitizedFindingDispositions.filter((d) => d.disposition === "follow-up");
   let deferredCount = 0;
   if (followUpDispositions.length > 0) {
-    const dispositionJob = getJobByDispatchId(claims.dispatchId);
-    const dispositionPrNumber = parsePrNumber(dispositionJob?.prUrl ?? null);
+    const dispositionJob = internalJob;
+    const dispositionPrNumber = internalPr;
     if (dispositionJob?.repo && dispositionPrNumber !== null) {
       const keys = followUpDispositions.map((d) => d.findingKey);
       deferredCount = markReviewFindingsDeferredByKeys(dispositionJob.repo, dispositionPrNumber, keys);
@@ -1168,6 +1222,17 @@ async function handleRunnerResultInternal(
       } catch (err) {
         warn("postComment(deferred-findings)", err);
       }
+    }
+  }
+
+  // Rejections apply to every phase, before fixed-only snapshot resolution.
+  const rejectedKeys = sanitizedFindingDispositions.filter((d) => d.disposition === "invalid").map((d) => d.findingKey);
+  let rejectedCount = 0;
+  if (rejectedKeys.length > 0) {
+    const job = internalJob;
+    const prNumber = internalPr;
+    if (job?.repo && prNumber !== null) {
+      rejectedCount = markReviewFindingsRejectedByKeys(job.repo, prNumber, rejectedKeys);
     }
   }
 
@@ -1419,11 +1484,11 @@ async function handleRunnerResultInternal(
     const prNumber = parsePrNumber(job?.prUrl ?? null);
     if (job?.repo && prNumber !== null) {
       const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
-      // Only findings the agent disposed `fixed` or `invalid` resolve; an
-      // undisposed finding stays open so the next fix run sees it. `follow-up` rows were
-      // deferred above and are no longer open.
+      // Only findings the agent disposed `fixed` resolve; an
+      // undisposed finding stays open so the next fix run sees it. Follow-ups and
+      // rejections were closed above and are no longer open.
       const resolveKeys = sanitizedFindingDispositions
-        .filter((d) => d.disposition === "fixed" || d.disposition === "invalid")
+        .filter((d) => d.disposition === "fixed")
         .map((d) => d.findingKey);
       const openNow = listOpenReviewFindings(snapshot?.repo ?? job.repo, snapshot?.prNumber ?? prNumber);
       const snapshotIds = snapshot ? new Set(snapshot.findingIds) : null;
@@ -1434,7 +1499,7 @@ async function handleRunnerResultInternal(
         ? markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds, resolveKeys)
         : markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt, resolveKeys);
       console.log(
-        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} left_open=${allowedCount - resolvedCount}`,
+        `[runner-callback] gap-analysis findings dispatch=${claims.dispatchId} resolved=${resolvedCount} deferred_on_pr=${deferredCount} rejected=${rejectedCount} left_open=${allowedCount - resolvedCount}`,
       );
       // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
       // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
@@ -1981,4 +2046,80 @@ export async function resubmitPendingGapFillReviews(opts: {
     }
   }
   return submitted;
+}
+
+/** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
+async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
+  scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
+  // Partial findings remain advisory evidence; only a complete review can request a fix.
+  if (input.body.outcome !== "success") return;
+  const review = input.body.rollupReview;
+  if (!review || typeof review.headSha !== "string" || !/^[a-f0-9]{40,64}$/.test(review.headSha) ||
+      typeof review.verdictUrl !== "string" || !job?.prUrl || !input.watchdogConfig) return;
+  const target = parsePrUrlTarget(job.prUrl);
+  if (!target || job.repo !== `${target.owner}/${target.repo}`) return;
+  const { owner, repo, prNumber } = target;
+  if (!provider.listIssuesPage) {
+    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up`);
+    return;
+  }
+  const reservationKey = `roll-up-review:children:${owner}/${repo}#${prNumber}`;
+  const reserved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
+  if (reserved && (JSON.parse(reserved.value) as string[]).includes(review.headSha)) onTrackerWriteReserved();
+  const configuredMapping = getMappings()[scopeKey];
+  const mapping = configuredMapping ? { ...configuredMapping, teamKey: scopeKey } : null;
+  if (!mapping || mapping.owner !== owner || mapping.repo !== repo) return;
+  const verdictMatch = review.verdictUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)#issuecomment-(\d+)$/);
+  if (!verdictMatch || verdictMatch[1] !== owner || verdictMatch[2] !== repo || Number(verdictMatch[3]) !== prNumber) return;
+  const token = await getInstallationToken(input.watchdogConfig.githubAppId, input.watchdogConfig.githubAppPrivateKey, owner);
+  const pr = await getPullRequestState(token, owner, repo, prNumber);
+  if (!pr) throw new Error("Cannot read roll-up PR state");
+  const branch = pr.headRef?.match(/^ai-implement\/(?:feature|multi-issue)\/(.+)$/);
+  if (!branch || branch[1].toLowerCase() !== job.issueIdentifier?.toLowerCase()) return;
+  const parent = await provider.findByKey(job.issueIdentifier!, scopeKey);
+  if (!parent || parent.id !== parentId) return;
+  if (pr.merged || pr.state === "closed") {
+    await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
+    return;
+  }
+  const blockers = (input.body.internalFindings ?? []).filter(f => f && f.severity === "blocking" &&
+    typeof f.body === "string" && f.body.trim() && (f.path === undefined || typeof f.path === "string") &&
+    (f.line === undefined || (Number.isInteger(f.line) && f.line > 0)));
+  if (!blockers.length) return;
+  const children = (await listRollupReviewChildren(provider, mapping)).filter(c =>
+    c.parent?.identifier === parent.identifier && c.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} `));
+  const existingHeads = children.map(c => c.title.split(" ")[2]);
+  if (existingHeads.includes(review.headSha)) onTrackerWriteReserved();
+  // Reserve synchronously before awaiting a write. Never release on an ambiguous tracker failure:
+  // the server may have created the child even when its response was lost.
+  const reservation = getDb().transaction(() => {
+    const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
+    const heads = new Set<string>([...existingHeads, ...(row ? JSON.parse(row.value) as string[] : [])]);
+    if (heads.has(review.headSha)) return { create: false, count: heads.size };
+    if (heads.size >= 2) return { create: false, count: heads.size };
+    heads.add(review.headSha);
+    getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(reservationKey, JSON.stringify([...heads]));
+    return { create: true, count: heads.size };
+  })();
+  let childIdentifier = children.find(c => c.title.split(" ")[2] === review.headSha)?.identifier;
+  if (reservation.create) {
+    onTrackerWriteReserved();
+    const summary = blockers[0].body.replace(/\s+/g, " ").trim().slice(0, 70);
+    const title = `${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} ${review.headSha} ${summary}`.slice(0, 250);
+    const body = `## Problem\n\nBlocking roll-up review findings at head \`${review.headSha}\`.\n\nPR: ${job.prUrl}\nVerdict: ${review.verdictUrl}\n\n## Task\n\nFix every blocking finding below in a PR targeting the parent's feature branch.\n\n` +
+      blockers.map((f, i) => `### Finding ${i + 1}: ${f.path ?? "(general)"}:${f.line ?? "?"}\n\nScenario and finding:\n${f.body}`).join("\n\n") +
+      `\n\n## Files\n\n${[...new Set(blockers.map(f => f.path ?? "(general)"))].map(p => `- ${p}`).join("\n")}\n\n## Acceptance Criteria\n\n- [ ] Address each blocking scenario above and verify the fix with regression coverage.\n- [ ] Merge the fix into the parent's feature branch so the roll-up is reviewed again.\n`;
+    const child = await provider.createChildIssue(parentId, scopeKey, { title, body });
+    childIdentifier = child.identifier;
+    console.log(`[roll-up-review] Filed ${child.identifier} for ${owner}/${repo}#${prNumber} at ${review.headSha}`);
+    // Closure can race the tracker write; the independent poll sweep also retries this cleanup.
+    await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
+  }
+  const comments = await listPrComments(token, owner, repo, prNumber, { strict: true });
+  const verdict = comments.find(c => c.id === Number(verdictMatch[4]));
+  if (!verdict) throw new Error("Cannot find roll-up verdict comment");
+  const marker = "<!-- roll-up-review follow-up -->";
+  const notice = `${marker}\n\n${childIdentifier ? `Blocking findings filed as ${childIdentifier}.` : "No additional child filed."}` +
+    (reservation.count >= 2 ? " The automatic follow-up limit (two children per roll-up PR) is reached; a person decides any further fixes." : "");
+  await updatePrComment(token, owner, repo, verdict.id, verdict.body.split(marker)[0].trimEnd() + "\n\n" + notice);
 }

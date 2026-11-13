@@ -5,7 +5,7 @@ import { parse } from "yaml";
 const workflow = parse(readFileSync(".github/workflows/publish-orchestrator-image.yml", "utf8"));
 
 describe("overlapping orchestrator publications", () => {
-  it("cancels superseded validation but preserves an active publisher through push and notification", () => {
+  it("cancels superseded validation but preserves an active publisher through push and status recording", () => {
     // Workflow cancellation would also cancel the publisher, regardless of its
     // own concurrency group. Only the build job may cancel its predecessor.
     expect(workflow.concurrency).toBeUndefined();
@@ -25,7 +25,10 @@ describe("overlapping orchestrator publications", () => {
     const record = publish.steps.find((step: { id?: string }) => step.id === "published");
     expect(record.if).toContain("always() && steps.push.outcome == 'success'");
     const notify = publish.steps.find((step: { name?: string }) => step.name === "Notify control plane");
-    expect(notify.if).toContain("always() && steps.published.outcome == 'success'");
+    expect(notify).toBeUndefined();
+    const source = readFileSync(".github/workflows/publish-orchestrator-image.yml", "utf8");
+    expect(source).not.toMatch(/CONTROL_PLANE_OPS_TOKEN|auth\.builddown\.ai/);
+    expect(record.run).toContain("-f context=orchestrator-image/published");
   });
 
   it("publishes the validated commit even if a dispatched branch advances", () => {

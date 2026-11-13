@@ -1387,6 +1387,24 @@ describe("LinearProvider.listIssuesPage", () => {
     },
   };
 
+  it("filters review-child enumeration on the server", async () => {
+    const fake = linear(data({ issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } }));
+    await new LinearProvider({}).listIssuesPage(mapping, null, { titlePrefix: "[roll-up-review]" });
+    const body = JSON.parse(fake.calls[0].body);
+    expect(body.query).toContain("title: { startsWith: $title }");
+    expect(body.query).toContain("$title: String");
+    expect(body.variables).toEqual({ teamKey: "ENG", first: 50, after: null, title: "[roll-up-review]" });
+  });
+
+  it("retains the title filter for an explicitly supplied empty prefix", async () => {
+    const fake = linear(data(page));
+    await new LinearProvider({}).listIssuesPage(mapping, "cur", { titlePrefix: "" });
+    const body = JSON.parse(fake.calls[0].body);
+    expect(body.query).toContain("$title: String");
+    expect(body.query).toContain("title: { startsWith: $title }");
+    expect(body.variables).toEqual({ teamKey: "ENG", first: 50, after: "cur", title: "" });
+  });
+
   it("does not stamp sourceSystem or team on the records", async () => {
     linear(data(page));
     const result = await new LinearProvider({}).listIssuesPage(mapping, null);
@@ -1399,6 +1417,13 @@ describe("LinearProvider.listIssuesPage", () => {
     const p = new LinearProvider({});
     await p.listIssuesPage(mapping, null);
     await p.listIssuesPage(mapping, "cur");
+    for (const call of fake.calls) {
+      const { query } = JSON.parse(call.body);
+      expect(query).toContain("issues(filter: { team: { key: { eq: $teamKey } } },");
+      expect(query).not.toContain("$title");
+      expect(query).not.toContain("title:");
+      expect(query).not.toContain("startsWith");
+    }
     expect([variables(fake, 0), variables(fake, 1)]).toEqual([
       { teamKey: "ENG", first: 50, after: null },
       { teamKey: "ENG", first: 50, after: "cur" },
@@ -1561,5 +1586,61 @@ describe("LinearProvider.fetchSetupFacts", () => {
     await expect(read).rejects.toBeInstanceOf(LinearApiError);
     await expect(read).rejects.toMatchObject({ status: 400 });
     expect(fake.calls.map((call) => call.path)).toEqual(["/graphql"]);
+  });
+});
+
+import { runChildIssueContract } from "./contract.js";
+import * as settings from "../../orchestrator-settings.js";
+
+runChildIssueContract("LinearProvider", async () => {
+  vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("Custom Pickup");
+  const fake = linear(
+    data({ issue: { id: "parent", team: { id: "team" } } }),
+    data({ issueLabels: { nodes: [{ id: "pickup", name: "Custom Pickup", team: null }] } }),
+    data({ issueCreate: { success: true, issue: { id: "child", identifier: "TEST-2" } } }),
+  );
+  return { provider: new LinearProvider({}), parentId: "parent", scopeKey: "TEAM", inspect: async () => {
+    const input = variables(fake, 2).input;
+    expect(variables(fake, 1)).toEqual({ name: "Custom Pickup" });
+    return { title: input.title, body: input.description, parentId: input.parentId,
+      scopeKey: input.teamId === "team" ? "TEAM" : "", pickupReady: input.labelIds.includes("pickup") };
+  } };
+});
+
+describe("LinearProvider.createChildIssue", () => {
+  it("reads changed settings on every creation before any poll", async () => {
+    const setting = vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("First");
+    const fake = linear(
+      data({ issue: { id: "p", team: { id: "t" } } }),
+      data({ issueLabels: { nodes: [{ id: "one", name: "First", team: null }] } }),
+      data({ issueCreate: { success: true, issue: { id: "c1", identifier: "T-1" } } }),
+      data({ issue: { id: "p", team: { id: "t" } } }),
+      data({ issueLabels: { nodes: [{ id: "two", name: "Second", team: { id: "t" } }] } }),
+      data({ issueCreate: { success: true, issue: { id: "c2", identifier: "T-2" } } }),
+    );
+    const p = new LinearProvider({});
+    await p.createChildIssue("p", "T", { title: "Title", body: "Body" });
+    setting.mockReturnValue("Second");
+    await p.createChildIssue("p", "T", { title: "Title", body: "Body" });
+    expect(variables(fake, 2).input.labelIds).toEqual(["one"]);
+    expect(variables(fake, 5).input.labelIds).toEqual(["two"]);
+  });
+
+  it("refuses unavailable or wrong-case pickup labels", async () => {
+    vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("Pickup");
+    const fake = linear(
+      data({ issue: { id: "p", team: { id: "t" } } }),
+      data({ issueLabels: { nodes: [{ id: "wrong", name: "pickup", team: null }, { id: "other", name: "Pickup", team: { id: "other" } }] } }),
+    );
+    await expect(new LinearProvider({}).createChildIssue("p", "T", { title: "Title", body: "Body" })).rejects.toThrow(/unavailable/);
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("propagates a refused creation", async () => {
+    vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("Pickup");
+    linear(data({ issue: { id: "p", team: { id: "t" } } }),
+      data({ issueLabels: { nodes: [{ id: "label", name: "Pickup", team: null }] } }),
+      data({ issueCreate: { success: false, issue: null } }));
+    await expect(new LinearProvider({}).createChildIssue("p", "T", { title: "Title", body: "Body" })).rejects.toThrow(/creation failed/);
   });
 });

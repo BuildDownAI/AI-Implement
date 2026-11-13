@@ -131,6 +131,7 @@ describe("GithubReviewFixWorker.prepare", () => {
     const plan = await worker.prepare(attempt);
 
     expect(plan).toEqual({
+      executionBackend: "github-actions",
       attemptId: attempt.attemptId,
       scope: attempt.scope,
       taskText: attempt.taskText,
@@ -440,7 +441,7 @@ describe("GithubReviewFixWorker.launch", () => {
     const plan = await worker.prepare(makeAttempt());
     const outcome = await worker.launch(plan);
 
-    expect(outcome).toEqual({ status: "accepted", execution: { githubRunId: 9001, githubRunAttempt: 1 } });
+    expect(outcome).toEqual({ status: "accepted", execution: { backend: "github-actions" as const, githubRunId: 9001, githubRunAttempt: 1 } });
     expect(t.dispatchCalls).toHaveLength(1);
 
     const dispatched = t.dispatchCalls[0] as { inputs: Record<string, unknown> };
@@ -458,7 +459,7 @@ describe("GithubReviewFixWorker.launch", () => {
     // No token/header/body secret in the returned outcome.
     if (outcome.status === "accepted") {
       expect(Object.keys(outcome)).toEqual(["status", "execution"]);
-      expect(Object.keys(outcome.execution)).toEqual(["githubRunId", "githubRunAttempt"]);
+      expect(Object.keys(outcome.execution)).toEqual(["backend", "githubRunId", "githubRunAttempt"]);
     }
   });
 
@@ -712,7 +713,7 @@ describe("crash recovery: accepted-then-lost-response never double-launches", ()
     const workerB = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const reconciled = await workerB.reconcile(attempt.attemptId, attempt.scope);
 
-    expect(reconciled).toEqual({ status: "found", execution: { githubRunId: 9100, githubRunAttempt: 1 } });
+    expect(reconciled).toEqual({ status: "found", execution: { backend: "github-actions" as const, githubRunId: 9100, githubRunAttempt: 1 } });
     // Still exactly one dispatch call total, across both adapter instances.
     expect(t.dispatchCalls).toHaveLength(1);
   });
@@ -820,7 +821,7 @@ describe("GithubReviewFixWorker.cancel", () => {
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     await worker.prepare(makeAttempt({ attemptId: "attempt-cancel" }));
-    const outcome = await worker.cancel("attempt-cancel", { githubRunId: 5, githubRunAttempt: 1 });
+    const outcome = await worker.cancel("attempt-cancel", { backend: "github-actions" as const, githubRunId: 5, githubRunAttempt: 1 });
 
     expect(outcome).toEqual({ status: "cancelled" });
     expect(t.cancelCalls).toHaveLength(1);
@@ -832,7 +833,7 @@ describe("GithubReviewFixWorker.cancel", () => {
     const t = makeTransport();
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
-    const outcome = await worker.cancel("never-seen", { githubRunId: 5, githubRunAttempt: 1 });
+    const outcome = await worker.cancel("never-seen", { backend: "github-actions" as const, githubRunId: 5, githubRunAttempt: 1 });
 
     expect(outcome).toEqual({ status: "unknown" });
     expect(calls).toHaveLength(0); // no wasted credential fetch when the scope can't be resolved
@@ -847,7 +848,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const t = makeTransport();
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
-    const inspection = await worker.inspectTerminal({ githubRunId: 42, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 42, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: false });
     expect(calls).toHaveLength(0);
@@ -866,7 +867,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
 
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     await worker.reconcile("attempt-poll", SCOPE);
-    const inspection = await worker.inspectTerminal({ githubRunId: 7001, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 7001, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: false });
   });
@@ -885,7 +886,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-success" }));
     await worker.launch(plan);
-    const inspection = await worker.inspectTerminal({ githubRunId: 8001, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8001, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: true, outcome: { status: "succeeded", outputCommit: publishedSha } });
     expect(t.pullRequestHeadShaCalls).toHaveLength(1);
@@ -903,7 +904,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-unreadable-head" }));
     await worker.launch(plan);
-    const inspection = await worker.inspectTerminal({ githubRunId: 8005, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8005, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: false });
   });
@@ -918,7 +919,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-cancelled" }));
     await worker.launch(plan);
-    const inspection = await worker.inspectTerminal({ githubRunId: 8002, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8002, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: true, outcome: { status: "cancelled" } });
     // No PR read for a non-success conclusion.
@@ -935,7 +936,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-failed" }));
     await worker.launch(plan);
-    const inspection = await worker.inspectTerminal({ githubRunId: 8003, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8003, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: true, outcome: { status: "failed", reason: "failure" } });
   });
@@ -951,7 +952,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-wrong-run-attempt" }));
     await worker.launch(plan);
-    const inspection = await worker.inspectTerminal({ githubRunId: 8004, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8004, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: false });
   });
@@ -967,7 +968,7 @@ describe("GithubReviewFixWorker.inspectTerminal", () => {
     const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: t.transport });
     const plan = await worker.prepare(makeAttempt({ attemptId: "attempt-missing-run-attempt" }));
     await worker.launch(plan);
-    const inspection = await worker.inspectTerminal({ githubRunId: 8006, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 8006, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: false });
   });
@@ -1001,11 +1002,11 @@ describe("durable scope lookup: cancel/inspectTerminal after a genuine adapter+s
     });
     const plan = await workerA.prepare(admission.attempt);
     const launchOutcome = await workerA.launch(plan);
-    expect(launchOutcome).toEqual({ status: "accepted", execution: { githubRunId: 9200, githubRunAttempt: 1 } });
+    expect(launchOutcome).toEqual({ status: "accepted", execution: { backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 } });
 
     // The workflow binds the accepted execution to the persisted attempt row — the fact this
     // reconstruction test relies on to resolve scope with no shared in-memory state.
-    const bindOutcome = await storeA.bindExecution(attemptId, { githubRunId: 9200, githubRunAttempt: 1 }, Date.now());
+    const bindOutcome = await storeA.bindExecution(attemptId, { backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 }, Date.now());
     expect(bindOutcome).toEqual({ status: "bound" });
 
     // A genuinely fresh store instance and a genuinely fresh adapter — the only thing shared
@@ -1019,19 +1020,19 @@ describe("durable scope lookup: cancel/inspectTerminal after a genuine adapter+s
     });
 
     t.setRunDetail({ status: "in_progress", conclusion: null, runAttempt: 1 });
-    const midInspection = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
+    const midInspection = await workerC.inspectTerminal({ backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
     expect(midInspection).toEqual({ reached: false });
 
-    const cancelOutcome = await workerC.cancel(attemptId, { githubRunId: 9200, githubRunAttempt: 1 });
+    const cancelOutcome = await workerC.cancel(attemptId, { backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
     expect(cancelOutcome).toEqual({ status: "cancelled" });
     expect(t.cancelCalls).toHaveLength(1);
     // A cancellation acknowledgement is not terminal evidence — only a subsequent getRun
     // reporting "completed" may report a terminal outcome.
-    const stillNotTerminal = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
+    const stillNotTerminal = await workerC.inspectTerminal({ backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
     expect(stillNotTerminal).toEqual({ reached: false });
 
     t.setRunDetail({ status: "completed", conclusion: "cancelled", runAttempt: 1 });
-    const terminalInspection = await workerC.inspectTerminal({ githubRunId: 9200, githubRunAttempt: 1 });
+    const terminalInspection = await workerC.inspectTerminal({ backend: "github-actions" as const, githubRunId: 9200, githubRunAttempt: 1 });
     expect(terminalInspection).toEqual({ reached: true, outcome: { status: "cancelled" } });
   });
 
@@ -1046,9 +1047,54 @@ describe("durable scope lookup: cancel/inspectTerminal after a genuine adapter+s
       transport: t.transport,
       scopeStore: workerModule.reviewFixAttemptStoreScopeStore(store),
     });
-    const inspection = await worker.inspectTerminal({ githubRunId: 12345, githubRunAttempt: 1 });
+    const inspection = await worker.inspectTerminal({ backend: "github-actions" as const, githubRunId: 12345, githubRunAttempt: 1 });
 
     expect(inspection).toEqual({ reached: false });
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("frozen execution backend", () => {
+  it.each([undefined, "github-actions", "fly-machines", "local-docker"] as const)("preserves %s without consulting current runner mode", async (executionBackend) => {
+    const { resolver, calls } = makeCredentials();
+    const transport = makeTransport();
+    const worker = new workerModule.GithubReviewFixWorker({ credentials: resolver, transport: transport.transport });
+    const plan = await worker.prepare(makeAttempt({ executionBackend }));
+    expect(plan.executionBackend).toBe(executionBackend ?? "github-actions");
+    if (executionBackend && executionBackend !== "github-actions") {
+      expect((await worker.launch(plan)).status).toBe("rejected");
+      expect(calls).toHaveLength(0);
+      expect(transport.dispatchCalls).toHaveLength(0);
+    }
+  });
+});
+
+describe("backend router", () => {
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("delegates %s with identical arguments and persisted reconciliation", async backend => {
+    const fake = () => ({ prepare: vi.fn(), launch: vi.fn(), reconcile: vi.fn(), inspectTerminal: vi.fn(), cancel: vi.fn() });
+    const workers = { "github-actions": fake(), "fly-machines": fake(), "local-docker": fake() };
+    const selected = workers[backend];
+    const source = { getPreparedAttempt: vi.fn().mockResolvedValue({ executionBackend: backend }) };
+    const router = new workerModule.ReviewFixWorker(workers, source);
+    const attempt = makeAttempt({ executionBackend: backend });
+    const plan = { executionBackend: backend, attemptId: attempt.attemptId, scope: attempt.scope, taskText: attempt.taskText, deadlineAt: attempt.deadlineAt };
+    const execution = backend === "github-actions" ? { backend, githubRunId: 42, githubRunAttempt: 1 } as const : { backend, runRef: "machine" } as const;
+    await router.prepare(attempt);
+    await router.launch(plan);
+    await router.reconcile(attempt.attemptId, attempt.scope);
+    await router.inspectTerminal(execution);
+    await router.cancel(attempt.attemptId, execution);
+    expect(selected.prepare).toHaveBeenCalledWith(attempt);
+    expect(selected.launch.mock.calls[0][0]).toBe(plan);
+    expect(selected.reconcile).toHaveBeenCalledWith(attempt.attemptId, attempt.scope);
+    expect(selected.inspectTerminal).toHaveBeenCalledWith(execution);
+    expect(selected.cancel).toHaveBeenCalledWith(attempt.attemptId, execution);
+    for (const [key, worker] of Object.entries(workers)) if (key !== backend) expect(worker.launch).not.toHaveBeenCalled();
+  });
+  it("does not guess a backend for a missing persisted attempt", async () => {
+    const worker = { prepare: vi.fn(), launch: vi.fn(), reconcile: vi.fn(), inspectTerminal: vi.fn(), cancel: vi.fn() };
+    const router = new workerModule.ReviewFixWorker({ "github-actions": worker, "fly-machines": worker, "local-docker": worker }, { getPreparedAttempt: async () => null });
+    expect(await router.reconcile("missing", SCOPE)).toEqual({ status: "unknown" });
+    expect(worker.reconcile).not.toHaveBeenCalled();
   });
 });

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { resolveModuleImport, type ImportModuleOptions } from "../resolve-module.js";
 import codeReviewReviewer from "./code-review.js";
 import gapAnalysisReviewer from "./gap-analysis.js";
+import integrationReviewReviewer from "./integration-review.js";
 export { BUILTIN_REVIEWER_VERDICT_SCHEMA, REVIEWER_VERDICT_SCHEMA } from "./schema.js";
 
 export type ReviewerFindingSeverity = "blocking" | "medium" | "minor";
@@ -80,6 +81,7 @@ const TRUSTED_REVIEWER_ROOT = join(fileURLToPath(new URL(".", import.meta.url)),
 const BUILT_IN_REVIEWERS: Record<string, ReviewerDefinition> = {
   [gapAnalysisReviewer.id]: gapAnalysisReviewer,
   [codeReviewReviewer.id]: codeReviewReviewer,
+  [integrationReviewReviewer.id]: integrationReviewReviewer,
 };
 
 export interface ResolveReviewerOptions extends ImportModuleOptions {

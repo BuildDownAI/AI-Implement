@@ -12,7 +12,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isDeepStrictEqual } from "node:util";
-import type { DrainCommentGapfillsInput } from "../comment-gapfill-drain.js";
+import type { ImplementationRunInput } from "../restate/implementation-run-workflow.js";
 import type { KgRefreshSenderDeps } from "../restate/kg-refresh-senders.js";
 import type { KeptMachineFly } from "../restate/kg-refresh-production.js";
 import type { StartLocalContainerInput } from "../local-docker.js";
@@ -23,7 +23,7 @@ import type { ReviewFixWorkerTransport } from "../review-fix-worker.js";
 import { buildLocalRunnerEnv } from "../local-docker.js";
 import { decodeRunConfig, buildKgRefreshRunConfig, type RunConfigV1 } from "../run-config.js";
 import { DEFAULT_RETRY_POLICY, type RetryPolicy } from "../pipeline/retry-backoff.js";
-import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
+import { makeAppConfig, makeAppendLogEntry, makeIssue, makeMapping, makeProvider, makeScopedInstallationToken } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
 import { githubError, githubFile } from "./helpers/replies/github.js";
 import { testDb, type LoadedModules } from "./helpers/test-db.js";
@@ -33,11 +33,11 @@ import { testDb, type LoadedModules } from "./helpers/test-db.js";
 // ---------------------------------------------------------------------------
 
 type Backend = "github-actions" | "fly-machines" | "local-docker";
-type Kind = "implementation" | "gap-fill" | "planning" | "review-fix-attempt" | "legacy-review-fix" | "kg-refresh";
+type Kind = "implementation" | "gap-fill" | "planning" | "review-fix-attempt" | "kg-refresh";
 type Audience = "result" | "progress" | "publication";
 
 const BACKENDS: readonly Backend[] = ["github-actions", "fly-machines", "local-docker"];
-const KINDS: readonly Kind[] = ["implementation", "gap-fill", "planning", "review-fix-attempt", "legacy-review-fix", "kg-refresh"];
+const KINDS: readonly Kind[] = ["implementation", "gap-fill", "planning", "review-fix-attempt", "kg-refresh"];
 
 /** The run kind sets the token set; the backend never does (AII-1311 decision, 2026-10-14).
  *  Planning never pushes, so it carries no publication token (src/publication-token-vending.ts:62-65). */
@@ -46,7 +46,6 @@ const EXPECTED_TOKENS: Record<Kind, readonly Audience[]> = {
   "gap-fill": ["result", "progress", "publication"],
   planning: ["result", "progress"],
   "review-fix-attempt": ["result", "progress", "publication"],
-  "legacy-review-fix": ["result", "progress", "publication"],
   "kg-refresh": ["result", "progress", "publication"],
 };
 
@@ -56,9 +55,6 @@ const KNOWN_GAPS: ReadonlyArray<{ kind: string; backend: string; check: string }
 
 /** Cells the test does not run, each with its reason. Every kind × backend pair is a cell or listed here. */
 const OUT_OF_SCOPE_CELLS: ReadonlyArray<{ kind: Kind; backend: Backend; reason: string }> = [
-  { kind: "review-fix-attempt", backend: "fly-machines", reason: "branch 3 of AII-1308 adds the review-fix launch on Fly" },
-  { kind: "review-fix-attempt", backend: "local-docker", reason: "branch 3 of AII-1308 adds the review-fix launch on local Docker" },
-  { kind: "legacy-review-fix", backend: "fly-machines", reason: "the legacy review-fix queue has no Fly branch" },
 ];
 
 /** Cells whose `image` check is not run, each with its reason. */
@@ -186,6 +182,7 @@ vi.mock("../fly-machines.js", async (importOriginal) => ({
 vi.mock("../local-docker.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../local-docker.js")>()),
   startLocalRunnerContainer: async (input: StartLocalContainerInput) => {
+    input.onBeforeLaunch?.();
     recorder().launches.push({ carrier: "local-input", input });
     return { containerId: "c-1", containerName: "c-1" };
   },
@@ -234,8 +231,10 @@ const MODULES = {
   config: () => import("../config.js"),
   settings: () => import("../orchestrator-settings.js"),
   queue: () => import("../comment-gapfill-queue.js"),
-  drain: () => import("../comment-gapfill-drain.js"),
+  gapfill: () => import("../restate/implementation-run-gapfill.js"),
+  implementationLaunch: () => import("../implementation-launch.js"),
   reviewFixQueue: () => import("../review-fix-queue.js"),
+  containerWorker: () => import("../review-fix-container-worker.js"),
   worker: () => import("../review-fix-worker.js"),
   runnerTokens: () => import("../runner-tokens.js"),
   repoImage: () => import("../repo-image.js"),
@@ -316,14 +315,14 @@ const implementation: Record<Backend, LaunchPath> = {
 };
 
 const planning = (execPath: Backend): LaunchPath => async (w) => {
+  const dispatchId = "parity-planning-1";
+  const reservation = w.gate.acquireDispatch({
+    dispatchId, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, kind: "planning",
+    teamKey: TEAM, maxInProgressAiIssues: MAPPING.maxInProgressAiIssues, backend: execPath,
+    lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+  });
+  if (!reservation.ok) throw new Error("planning reservation refused");
   if (execPath === "github-actions") {
-    const dispatchId = "parity-planning-1";
-    const reservation = w.gate.acquireDispatch({
-      dispatchId, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, kind: "planning",
-      teamKey: TEAM, maxInProgressAiIssues: MAPPING.maxInProgressAiIssues, backend: execPath,
-      lifecycleOwner: { kind: "restate", attemptId: dispatchId },
-    });
-    if (!reservation.ok) throw new Error("planning reservation refused");
     const p = provider();
     const fireBreakerTrip = async () => {};
     const prepared = await w.planningLaunch.preparePlanningLaunch({
@@ -339,11 +338,16 @@ const planning = (execPath: Backend): LaunchPath => async (w) => {
     });
     return;
   }
-  await w.index.dispatchPlanning(CONFIG, provider(), ISSUE, MAPPING, {
-    execPath,
-    runnerMode: "default",
-    resolvedPlanningBranch: BASE_BRANCH,
-    planningFieldValue: null,
+  await w.planningLaunch.launchPlanningSession({
+    config: CONFIG, provider: provider(), issue: ISSUE, mapping: MAPPING, execPath,
+    runnerMode: "default", resolvedPlanningBranch: BASE_BRANCH, planningFieldValue: null,
+    reservation: { dispatchId, admission: reservation },
+    deps: {
+      dispatchSession: w.index.dispatchSession,
+      isDefinitiveFlyRejectionError: () => false,
+      isDefinitiveLocalDockerLaunchFailure: () => false,
+      shouldReleaseAdmissionOnDispatchError: w.index.shouldReleaseAdmissionOnDispatchError,
+    },
   });
 };
 
@@ -368,41 +372,35 @@ const gapFill = (runnerMode: "gha" | "fly" | "local"): LaunchPath => async (w) =
   w.admission.release(entry.dispatchId!, { kind: "legacy" }, taken.record.generation, "finalized");
   const jobId = w.log.appendLog({ ...entry, admissionGeneration: taken.record.generation });
   w.log.updateJobPrUrl(jobId, `https://github.com/${OWNER}/${REPO}/pull/${PR_NUMBER}`);
-  const opts: DrainCommentGapfillsInput = {
-    getMappings: () => ({ [TEAM]: MAPPING }),
-    runnerMode,
-    notifyType: "slack",
-    notifyWebhookUrl: null,
-    runnerCallbackBaseUrl: CALLBACK_URL,
-    runnerTokenSecret: TOKEN_SECRET,
-    getInstallationToken: async () => "gh-token",
-    getTargetRepoToken: async () => "gh-token",
-    getInstallationId: async () => INSTALLATION_ID,
-    resolveRunnerImage: (mapping, token) => w.repoImage.resolveRunnerImageForDispatch({
+  const deps = w.gapfill.createImplementationGapfillDependencies({
+    config: CONFIG,
+    resolveProvider: async () => provider(),
+    resolveRunnerImage: (_config, mapping, token) => w.repoImage.resolveRunnerImageForDispatch({
       owner: mapping.owner, repo: mapping.repo, token,
       defaultImage: CONFIG.sessionImage, runnerImageExplicit: CONFIG.runnerImageExplicit,
     }),
-    checkContract: async () => CAPABILITIES,
-    dispatch: async (_token, _mapping, inputs) => {
-      w.rec.launches.push({ carrier: "workflow-inputs", inputs });
-      return ACCEPTED;
-    },
-    postComment: async () => undefined,
-    listPrComments: async () => [],
-    postTrackerComment: async () => undefined,
-    onDispatchFailure: async () => undefined,
-    flySessionsToken: CONFIG.flySessionsToken,
-    flySessionsApp: CONFIG.flySessionsApp,
-    flySessionsRegion: CONFIG.flySessionsRegion,
-    flyOrchestratorApp: null,
-    tenantId: null,
-    anthropicApiKey: CONFIG.anthropicApiKey,
-    claudeOAuthToken: null,
-    sessionImage: CONFIG.sessionImage,
-    localRunnerImage: CONFIG.localRunnerImage,
-    localRunnerOrchestratorUrl: CONFIG.localRunnerOrchestratorUrl,
+    isGroupingParentDispatch: () => false,
+    fireBreakerTrip: async () => {},
+    prepareImplementationLaunch: w.implementationLaunch.prepareImplementationLaunch,
+    launchImplementationRun: w.implementationLaunch.launchImplementationRun,
+    launchImplementationFlySession: w.implementationLaunch.launchImplementationFlySession,
+    launchImplementationLocalSession: w.implementationLaunch.launchImplementationLocalSession,
+    postDispatch: async () => {},
+    finalizeImplementation: async () => {},
+    remediateStuckJob: async () => false,
+    reportTerminalJob: async () => {},
+  }, () => MAPPING);
+  const run: ImplementationRunInput = {
+    dispatchId: "parity-gapfill", teamKey: TEAM, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier,
+    backend: runnerMode === "fly" ? "fly-machines" : runnerMode === "local" ? "local-docker" : "github-actions",
+    maxJobMinutes: MAPPING.maxJobMinutes!,
+    launchContext: { runnerMode },
+    gapFill: { queueItemId: w.queue.claimPendingCommentGapfills()[0]!.id,
+      repository: `${OWNER}/${REPO}`, installationId: String(INSTALLATION_ID), prNumber: PR_NUMBER,
+      prDispatchBudget: MAPPING.prDispatchBudget!, humanRequested: true },
   };
-  await w.drain.drainCommentGapfillQueue(opts);
+  expect(await deps.reserve(run)).toBe(true);
+  await deps.launch(run);
 };
 
 /** Seeds the prepared attempt `mintPreparedReviewFixToken` reads, as the Restate admission does. */
@@ -457,18 +455,26 @@ const reviewFixAttempt: LaunchPath = async (w) => {
   await reviewFixWorker.launch({ attemptId, scope, taskText: "Address the reported findings", deadlineAt: Date.now() + 60 * 60_000 });
 };
 
-const legacyReviewFix: Partial<Record<Backend, LaunchPath>> = {
-  "github-actions": async (w) => runLegacyReviewFixQueue(w),
-  "local-docker": async (w) => runLegacyReviewFixQueue(w),
-};
-
-async function runLegacyReviewFixQueue(w: World): Promise<void> {
-  w.reviewFixQueue.enqueueReviewFix({
-    issueId: ISSUE.id, issueIdentifier: ISSUE.identifier, repo: `${OWNER}/${REPO}`, prNumber: PR_NUMBER,
-    reason: "changes_requested", sourceEventId: "parity-event-1",
+const containerReviewFixAttempt = (backend: "fly-machines" | "local-docker"): LaunchPath => async (w) => {
+  const attemptId = "parity-attempt-1";
+  seedPreparedAttempt(w, attemptId);
+  w.dedup.getDb().prepare("UPDATE dispatch_admissions SET backend = ? WHERE dispatch_id = ?").run(backend, attemptId);
+  w.dedup.getDb().prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, attemptId);
+  const worker = new w.containerWorker.ContainerReviewFixWorker({
+    credentials: { resolve: async () => ({ token: "gh-token", installationId: INSTALLATION_ID }) },
+    callbackInputs: async (id) => ({
+      run_token: w.runnerTokens.mintPreparedReviewFixToken({ attemptId: id, audience: "result", secret: TOKEN_SECRET }).token,
+      run_progress_token: w.runnerTokens.mintPreparedReviewFixToken({ attemptId: id, audience: "progress", secret: TOKEN_SECRET }).token,
+      run_publication_token: w.runnerTokens.mintPreparedReviewFixToken({ attemptId: id, audience: "publication", secret: TOKEN_SECRET }).token,
+      runner_callback_url: CALLBACK_URL,
+    }),
+    fly: { ...CONFIG, flySessionsToken: CONFIG.flySessionsToken!, flySessionsApp: CONFIG.flySessionsApp! },
+    local: { image: CONFIG.localRunnerImage, orchestratorUrl: CONFIG.localRunnerOrchestratorUrl!, anthropicApiKey: CONFIG.anthropicApiKey },
   });
-  await w.index.processReviewFixQueue(CONFIG, makeRegistry({ provider: provider(), mappings: { [TEAM]: MAPPING } }));
-}
+  await worker.launch({ executionBackend: backend, attemptId,
+    scope: { installationId: INSTALLATION_ID, repository: `${OWNER}/${REPO}`, prNumber: PR_NUMBER },
+    taskText: "Address the reported findings", deadlineAt: Date.now() + 60 * 60_000 });
+};
 
 function kgDeps(w: World, claim: boolean): KgRefreshSenderDeps {
   const fly: KeptMachineFly = {
@@ -546,11 +552,13 @@ const CELLS: readonly Cell[] = [
   ...BACKENDS.map((backend): Cell => ({ kind: "planning", backend, run: planning(backend), reference: sameKind("planning"), imageRuns: [{}] })),
   {
     kind: "review-fix-attempt", backend: "github-actions", run: reviewFixAttempt, imageRuns: [{}],
-    // The attempt has no peer on another backend: it is compared with the legacy queue's GitHub Actions launch.
-    reference: { kind: "legacy-review-fix", ignore: ["issue", "commentInstruction", "reviewFix"] },
+    // Compare the attempt with the active gap-fill launch contract.
+    reference: { kind: "gap-fill", ignore: ["issue", "commentInstruction", "reviewFix"] },
   },
-  { kind: "legacy-review-fix", backend: "github-actions", runnerMode: "gha", run: legacyReviewFix["github-actions"]!, reference: sameKind("legacy-review-fix"), imageRuns: [{}] },
-  { kind: "legacy-review-fix", backend: "local-docker", runnerMode: "local", run: legacyReviewFix["local-docker"]!, reference: sameKind("legacy-review-fix"), imageRuns: [{}] },
+  ...(["fly-machines", "local-docker"] as const).map((backend): Cell => ({
+    kind: "review-fix-attempt", backend, run: containerReviewFixAttempt(backend), imageRuns: [{}],
+    reference: { kind: "review-fix-attempt", ignore: ["issue", "reviewFix"] },
+  })),
   ...BACKENDS.map((backend): Cell => ({
     kind: "kg-refresh", backend, run: kgRefresh(backend), reference: sameKind("kg-refresh"),
     // The kept Fly machine re-resolves its image at every claim, so the claim path is checked as well as the create.
@@ -703,7 +711,7 @@ describe("launch contract parity", () => {
   });
 
   // MAPPING sets maxJobMinutes 240: (240 + 15 grace) * 60 = 15300 s, above the 2 h floor.
-  const TTL_CELLS = CELLS.filter((c) => ["implementation", "gap-fill", "legacy-review-fix"].includes(c.kind));
+  const TTL_CELLS = CELLS.filter((c) => ["implementation", "gap-fill"].includes(c.kind));
   describe.each(TTL_CELLS.map((cell) => [`${cell.kind} · ${cell.backend}`, cell] as const))("callback token TTL: %s", (_name, cell) => {
     it("expires the minted tokens at the job timeout plus grace", { timeout: 60_000 }, async () => {
       let world: World | null = null;

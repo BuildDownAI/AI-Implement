@@ -28,12 +28,14 @@ export const modelsAndProvidersHtml = `
         <div style="overflow-x:auto">
         <table class="tbl">
           <thead>
-            <tr><th>Stage</th><th>Agent</th><th>Provider</th><th>Model</th><th>Fallback model</th><th>Account profile</th><th>Elapsed time limit (ms)</th></tr>
+            <tr><th>Stage</th><th>Agent</th><th>Provider</th><th>Fallback model</th><th>Accounts (in order)</th><th>Elapsed time limit (ms)</th></tr>
           </thead>
           <tbody id="mp-stage-rows"></tbody>
         </table>
         </div>
         <div class="text-tertiary" style="font-size:11px;margin-top:6px">Blank fields inherit. The limit is an elapsed time in milliseconds for either agent. Claude turn caps are separate: Max Turns per project, and Review Max Turns under Retry Policy on the Settings page.</div>
+        <div class="field-hint">The first account is the stage account; later accounts are fallbacks. A fallback model may be blank only when its profile uses the same agent as the first account.</div>
+        <div class="field-hint">A project that overrides the account profile on its Agents tab runs without these fallbacks.</div>
         <div id="mp-stage-hints" class="text-tertiary" style="font-size:11px;margin-top:6px"></div>
         <div id="mp-stage-actions" style="display:flex;gap:6px;margin-top:8px">
           <button class="btn btn-primary btn-sm" onclick="saveStageDefaults()">Save</button>
@@ -52,24 +54,26 @@ export const modelsAndProvidersHtml = `
         <div style="overflow-x:auto">
         <table class="tbl">
           <thead>
-            <tr><th>Profile</th><th>Identity</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Profile</th><th>Readiness</th><th>API key</th></tr>
+            <tr><th>Name</th><th>Agent</th><th>Provider</th><th>Authentication</th><th>Status</th><th>Readiness</th><th>API key</th></tr>
           </thead>
           <tbody id="mp-account-rows"></tbody>
         </table>
         </div>
         <div id="mp-account-empty" class="hidden text-tertiary" style="padding:12px">No account profiles yet. An operator provisions accounts on the host; see the instructions below.</div>
         <div id="mp-account-error" class="error hidden" style="padding:0 12px"></div>
+        <div id="mp-account-notice" class="text-tertiary hidden" style="padding:0 12px"></div>
         <div id="mp-pairing" class="hidden" style="padding:12px"></div>
         <div id="mp-account-form" class="hidden" style="padding:12px">
           <h3 style="font-size:13px;margin:0 0 6px">Add account profile</h3>
           <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-profileId">Profile ID</label><input class="input" id="mp-new-profileId" placeholder="profileId"></span>
-            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-identity">Identity</label><input class="input" id="mp-new-identity" placeholder="identity"></span>
+            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-name">Name</label><input class="input" id="mp-new-name" placeholder="Name"></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-agent">Agent</label><select class="input" id="mp-new-agent"><option value="claude">claude</option><option value="codex">codex</option></select></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-provider">Provider</label><select class="input" id="mp-new-provider"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="bedrock">bedrock</option></select></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-authMode">Authentication</label><select class="input" id="mp-new-authMode"><option value="anthropic-api-key">anthropic-api-key</option><option value="openai-api-key">openai-api-key</option><option value="codex-subscription">codex-subscription</option><option value="claude-subscription">claude-subscription</option><option value="bedrock">bedrock</option></select></span>
             <button class="btn btn-primary btn-sm" onclick="mpAddAccount()">Add account profile</button>
+            <button class="btn btn-sm" id="mp-import-credential" onclick="mpImportCredential()">Import orchestrator credential</button>
           </div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:6px">Import copies the credential the orchestrator uses for legacy runs. Legacy projects keep reading the environment variable until they opt in.</div>
         </div>
         <div class="text-tertiary" style="font-size:11.5px;padding:12px">
           <div><strong>Provisioning.</strong> Add a profile above and set an API key or Claude subscription setup-token per profile; a key is encrypted on save and never shown again. Connect a ChatGPT plan from a laptop with a pairing code; Bedrock credentials are provisioned on the host.</div>
@@ -105,10 +109,21 @@ export const modelsAndProvidersHtml = `
 
 export const modelsAndProvidersScript = `(function () {
   const MP_STAGES = ['planning', 'implementation', 'review'];
-  const MP_AGENTS = ['claude', 'codex'];
-  const MP_PROVIDERS = ['anthropic', 'bedrock', 'openai'];
   let mpDefaults = { mode: 'legacy', stages: {} };
   let mpAccounts = [];
+  const mpAccountEdits = new Map();
+
+  function mpProfileIdFromName(name, existingIds) {
+    const base = String(name).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').replace(/^[^a-z0-9]+/, '').slice(0, 64) || 'account';
+    let id = base;
+    let n = 2;
+    while (existingIds.indexOf(id) !== -1) {
+      const suffix = '-' + n++;
+      id = base.slice(0, 64 - suffix.length) + suffix;
+    }
+    return id;
+  }
+
   // The pairing code lives only here: it is never written to storage and loadStageConfig does not re-render it.
   let mpPairing = null;
   let mpDirty = false;
@@ -147,44 +162,65 @@ export const modelsAndProvidersScript = `(function () {
     el.classList.toggle('hidden', !msg);
   }
 
-  function mpOptions(values, current, labelOf) {
-    let html = '<option value="">(inherit)</option>';
-    const all = values.slice();
-    if (current && all.indexOf(current) === -1) all.push(current);
-    for (const v of all) {
-      html += '<option value="' + window.escAttr(v) + '"' + (v === current ? ' selected' : '') + '>' + window.esc(labelOf ? labelOf(v) : v) + '</option>';
-    }
-    return html;
-  }
 
-  function mpCompatibleProfiles(agent, provider) {
-    return mpAccounts.filter(function (a) {
-      if (a.profileStatus && a.profileStatus !== 'active') return false;
-      if (agent && a.agent !== agent) return false;
-      if (provider && a.provider !== provider) return false;
-      return true;
-    });
-  }
-
-  function mpProfileSelect(stage, agent, provider, current) {
-    const list = mpCompatibleProfiles(agent, provider);
-    let html = '<select class="input" data-stage="' + window.escAttr(stage) + '" data-field="accountProfileId"' + (mpCanEdit() ? '' : ' disabled') + '><option value="">(inherit)</option>';
+  function mpProfileSelect(stage, current) {
+    const list = mpAccounts.filter(function (a) { return a.profileStatus === 'active'; });
+    let html = '<select class="input" aria-label="Account profile for ' + window.escAttr(stage) + '" data-stage="' + window.escAttr(stage) + '" data-field="accountProfileId"' + (mpCanEdit() ? '' : ' disabled') + '><option value="">(inherit)</option>';
     let seen = false;
     for (const a of list) {
       if (a.profileId === current) seen = true;
-      html += '<option value="' + window.escAttr(a.profileId) + '"' + (a.profileId === current ? ' selected' : '') + '>' + window.esc(a.identity + ' (' + a.profileId + ', ' + mpAuthLabel(a.authMode) + ')') + '</option>';
+      html += '<option value="' + window.escAttr(a.profileId) + '"' + (a.profileId === current ? ' selected' : '') + '>' + window.esc(a.identity + ' (' + a.profileId + ')') + '</option>';
     }
     if (current && !seen) {
-      html += '<option value="' + window.escAttr(current) + '" selected>' + window.esc(current + ' (not compatible or not active)') + '</option>';
+      html += '<option value="' + window.escAttr(current) + '" selected>' + window.esc(current + ' (not active)') + '</option>';
     }
     return html + '</select>';
+  }
+
+  function mpAccountRow(stage, entry) {
+    const row = document.createElement('div');
+    row.setAttribute('data-account-row', '');
+    row.innerHTML = mpProfileSelect(stage, entry.accountProfileId || '') +
+      '<input class="input" data-stage="' + window.escAttr(stage) + '" data-field="model" aria-label="Account model for ' + window.escAttr(stage) + '" value="' + window.escAttr(entry.model || '') + '" placeholder="model"' + (mpCanEdit() ? '' : ' disabled') + '>' +
+      ['up', 'down', 'remove'].map(function (action) {
+        return '<button class="btn btn-sm" data-account-action="' + window.escAttr(action) + '">' + window.esc({ up: 'Move up', down: 'Move down', remove: 'Remove' }[action]) + '</button>';
+      }).join('');
+    return row;
+  }
+
+  function mpUpdateAccountButtons(list) {
+    const rows = Array.from(list.children);
+    rows.forEach(function (row, index) {
+      row.querySelector('[data-account-action="up"]').disabled = !mpCanEdit() || index === 0;
+      row.querySelector('[data-account-action="down"]').disabled = !mpCanEdit() || index === rows.length - 1;
+      row.querySelector('[data-account-action="remove"]').disabled = !mpCanEdit() || rows.length === 1;
+    });
+  }
+
+  function mpSyncStageProfile(stage) {
+    const list = document.querySelector('[data-account-list="' + stage + '"]');
+    const profileId = list.querySelector('[data-field="accountProfileId"]').value;
+    const profile = mpAccounts.find(function (a) { return a.profileId === profileId; });
+    const saved = (mpDefaults.stages || {})[stage] || {};
+    for (const field of ['agent', 'provider']) {
+      const display = document.querySelector('#mp-stage-rows [data-stage="' + stage + '"][data-profile-field="' + field + '"]');
+      display.textContent = (profile ? profile[field] : saved[field]) || 'inherit';
+    }
   }
 
   function mpReadForm() {
     const stages = {};
     for (const stage of MP_STAGES) {
-      const patch = {};
-      for (const el of document.querySelectorAll('#mp-stage-rows [data-stage="' + stage + '"]')) {
+      mpSyncStageProfile(stage);
+      const saved = (mpDefaults.stages || {})[stage] || {};
+      const firstProfileId = document.querySelector('[data-account-list="' + stage + '"] [data-field="accountProfileId"]').value;
+      const firstProfile = mpAccounts.find(function (a) { return a.profileId === firstProfileId; });
+      const patch = {
+        agent: (firstProfile ? firstProfile.agent : saved.agent) || null,
+        provider: (firstProfile ? firstProfile.provider : saved.provider) || null
+      };
+      for (const el of document.querySelectorAll('#mp-stage-rows [data-stage="' + stage + '"][data-field]')) {
+        if (el.closest('[data-account-row]')) continue;
         const field = el.getAttribute('data-field');
         const raw = String(el.value || '').trim();
         if (raw === '') { patch[field] = null; continue; }
@@ -196,17 +232,19 @@ export const modelsAndProvidersScript = `(function () {
           patch[field] = raw;
         }
       }
+      const accounts = Array.from(document.querySelectorAll('[data-account-list="' + stage + '"] [data-account-row]')).map(function (row) {
+        return { accountProfileId: row.querySelector('[data-field="accountProfileId"]').value.trim(), model: row.querySelector('[data-field="model"]').value.trim() };
+      });
+      if (accounts.length > 1) patch.accounts = accounts;
+      else {
+        patch.accountProfileId = accounts[0].accountProfileId || null;
+        patch.model = accounts[0].model || null;
+        const profile = mpAccounts.find(function (a) { return a.profileId === patch.accountProfileId; });
+        if (profile) { patch.agent = profile.agent; patch.provider = profile.provider; }
+      }
       stages[stage] = patch;
     }
     return { stages: stages };
-  }
-
-  function mpSnapshotForm() {
-    const snap = {};
-    for (const el of document.querySelectorAll('#mp-stage-rows [data-stage]')) {
-      snap[el.getAttribute('data-stage') + '.' + el.getAttribute('data-field')] = el.value;
-    }
-    return snap;
   }
 
   function mpRenderStages() {
@@ -220,20 +258,24 @@ export const modelsAndProvidersScript = `(function () {
       const sel = stages[stage] || {};
       const limit = sel.invocationTimeoutMs === null || sel.invocationTimeoutMs === undefined ? '' : String(sel.invocationTimeoutMs);
       const attr = 'data-stage="' + window.escAttr(stage) + '"';
-      if (mpCompatibleProfiles(sel.agent || '', sel.provider || '').length === 0) {
-        hints.push(stage + ': no compatible active account profile' + (sel.agent || sel.provider ? ' for ' + [sel.agent, sel.provider].filter(Boolean).join('/') : '') + '. Provision one on the host or change the agent or provider.');
-      }
       html += '<tr>' +
         '<td><span class="mono">' + window.esc(stage) + '</span></td>' +
-        '<td><select class="input" ' + attr + ' data-field="agent"' + dis + '>' + mpOptions(MP_AGENTS, sel.agent || '') + '</select></td>' +
-        '<td><select class="input" ' + attr + ' data-field="provider"' + dis + '>' + mpOptions(MP_PROVIDERS, sel.provider || '') + '</select></td>' +
-        '<td><input class="input" ' + attr + ' data-field="model" value="' + window.escAttr(sel.model || '') + '" placeholder="inherit"' + dis + '></td>' +
+        '<td><span ' + attr + ' data-profile-field="agent"></span></td>' +
+        '<td><span ' + attr + ' data-profile-field="provider"></span></td>' +
         '<td><input class="input" ' + attr + ' data-field="fallbackModel" aria-label="Fallback model for ' + window.escAttr(stage) + '" value="' + window.escAttr(sel.fallbackModel || '') + '" placeholder="none"' + dis + '><div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div></td>' +
-        '<td>' + mpProfileSelect(stage, sel.agent || '', sel.provider || '', sel.accountProfileId || '') + '</td>' +
+        '<td><div data-account-list="' + window.escAttr(stage) + '"></div><button class="btn btn-sm" data-account-action="add" data-stage="' + window.escAttr(stage) + '"' + dis + '>Add account</button></td>' +
         '<td><input class="input" type="number" min="1" step="1" ' + attr + ' data-field="invocationTimeoutMs" value="' + window.escAttr(limit) + '" placeholder="inherit"' + dis + '></td>' +
         '</tr>';
     }
     rowsEl.innerHTML = html;
+    for (const stage of MP_STAGES) {
+      const sel = stages[stage] || {};
+      const list = rowsEl.querySelector('[data-account-list="' + stage + '"]');
+      const accounts = sel.accounts && sel.accounts.length ? sel.accounts : [{ accountProfileId: sel.accountProfileId, model: sel.model }];
+      accounts.forEach(function (entry) { list.appendChild(mpAccountRow(stage, entry)); });
+      mpUpdateAccountButtons(list);
+      mpSyncStageProfile(stage);
+    }
     document.getElementById('mp-stage-hints').textContent = hints.join(' ');
     document.getElementById('mp-stage-actions').classList.toggle('hidden', !edit);
     const modeEl = document.getElementById('mp-stage-mode');
@@ -242,34 +284,41 @@ export const modelsAndProvidersScript = `(function () {
       : 'Defaults are saved but off (legacy). Turn them on in Settings.';
   }
 
-  function mpRerenderKeepingEdits() {
-    const snap = mpSnapshotForm();
-    mpRenderStages();
-    for (const el of document.querySelectorAll('#mp-stage-rows [data-stage]')) {
-      const key = el.getAttribute('data-stage') + '.' + el.getAttribute('data-field');
-      if (Object.prototype.hasOwnProperty.call(snap, key)) el.value = snap[key];
+  // Refresh profile choices in place so credential imports and polling preserve unsaved account order and models.
+  function mpRerenderWithCompat() {
+    for (const stage of MP_STAGES) {
+      const list = document.querySelector('[data-account-list="' + stage + '"]');
+      if (!list) continue;
+      for (const select of list.querySelectorAll('[data-field="accountProfileId"]')) {
+        const holder = document.createElement('div');
+        holder.innerHTML = mpProfileSelect(stage, select.value);
+        select.innerHTML = holder.firstElementChild.innerHTML;
+      }
+      mpSyncStageProfile(stage);
     }
   }
 
   function mpWatchDirty() {
     const rowsEl = document.getElementById('mp-stage-rows');
-    const mark = function (e) {
+    rowsEl.oninput = rowsEl.onchange = function (event) {
+      const stage = event.target.getAttribute('data-stage');
+      if (stage) mpSyncStageProfile(stage);
       mpDirty = true;
-      // Changing agent or provider changes which profiles are compatible.
-      const f = e.target && e.target.getAttribute && e.target.getAttribute('data-field');
-      if (f === 'agent' || f === 'provider') mpRerenderWithCompat();
     };
-    rowsEl.oninput = mark;
-    rowsEl.onchange = mark;
-  }
-
-  function mpRerenderWithCompat() {
-    const form = mpReadForm();
-    if (form.error) { mpRerenderKeepingEdits(); return; }
-    const saved = mpDefaults;
-    mpDefaults = { mode: saved.mode, stages: form.stages, revision: saved.revision };
-    mpRenderStages();
-    mpDefaults = saved;
+    rowsEl.onclick = function (event) {
+      const button = event.target.closest('[data-account-action]');
+      if (!button || button.disabled || !mpCanEdit()) return;
+      const action = button.getAttribute('data-account-action');
+      const row = button.closest('[data-account-row]');
+      const list = row ? row.parentElement : rowsEl.querySelector('[data-account-list="' + button.getAttribute('data-stage') + '"]');
+      if (action === 'add') list.appendChild(mpAccountRow(button.getAttribute('data-stage'), {}));
+      if (action === 'remove' && list.children.length > 1) row.remove();
+      if (action === 'up' && row.previousElementSibling) list.insertBefore(row, row.previousElementSibling);
+      if (action === 'down' && row.nextElementSibling) list.insertBefore(row.nextElementSibling, row);
+      mpUpdateAccountButtons(list);
+      mpSyncStageProfile(list.getAttribute('data-account-list'));
+      mpDirty = true;
+    };
   }
 
   function mpRenderAccounts() {
@@ -297,35 +346,64 @@ export const modelsAndProvidersScript = `(function () {
       if (a.authMode === 'codex-subscription' && a.profileStatus === 'active' && mpCanEdit()) {
         keyCell = '<button class="btn btn-sm" data-act="pair" data-profile="' + window.escAttr(a.profileId) + '">Connect ChatGPT plan</button>';
       }
+      const draft = mpCanEdit() && mpAccountEdits.get(a.profileId);
+      const pid = window.escAttr(a.profileId);
+      const disabled = draft && draft.saving ? ' disabled' : '';
+      const action = function (act, text) { return '<button class="btn btn-sm" data-act="' + window.escAttr(act) + '" data-profile="' + pid + '"' + disabled + '>' + window.esc(text) + '</button>'; };
+      const nameCell = draft
+        ? '<input class="input" aria-label="Name" data-edit-name="' + pid + '" value="' + window.escAttr(draft.identity) + '"' + disabled + '>'
+        : window.esc(a.identity);
+      const statusCell = draft
+        ? '<select class="input" aria-label="Status" data-edit-status="' + pid + '"' + disabled + '>' + ['active', 'disabled', 'archived'].map(function (status) {
+            return '<option value="' + window.escAttr(status) + '"' + (status === draft.status ? ' selected' : '') + '>' + window.esc(status) + '</option>';
+          }).join('') + '</select>'
+        : '<span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span>';
       html += '<tr>' +
-        '<td><span class="mono">' + window.esc(a.profileId) + '</span></td>' +
-        '<td>' + window.esc(a.identity) + '</td>' +
+        '<td>' + nameCell + '<div class="mono text-tertiary" style="font-size:11px">' + window.esc(a.profileId) + '</div>' +
+          (mpCanEdit() ? '<div>' + (draft ? action('save-profile', 'Save') + action('cancel-profile', 'Cancel') : action('edit-profile', 'Edit')) + '</div>' : '') + '</td>' +
         '<td>' + window.esc(a.agent) + '</td>' +
         '<td>' + window.esc(a.provider) + '</td>' +
         '<td>' + window.esc(mpAuthLabel(a.authMode)) + '</td>' +
-        '<td><span class="badge ' + (a.profileStatus === 'active' ? 'success' : 'neutral') + '">' + window.esc(a.profileStatus || 'unknown') + '</span></td>' +
+        '<td>' + statusCell + '</td>' +
         '<td>' + readyCell + '</td>' +
         '<td>' + keyCell + '</td>' +
         '</tr>';
     }
-    // Carry typed (unsubmitted) key values and focus across the rebuild; values live only in the inputs.
+    // Carry unsubmitted keys and focused editing controls across the rebuild.
     const typed = {};
     rowsEl.querySelectorAll('input[data-key-for]').forEach(function (inp) {
       if (inp.value) typed[inp.getAttribute('data-key-for')] = inp.value;
     });
-    const focused = document.activeElement && document.activeElement.getAttribute
-      ? document.activeElement.getAttribute('data-key-for') : null;
+    const active = document.activeElement;
+    const focusAttribute = ['data-key-for', 'data-edit-name', 'data-edit-status'].find(function (attr) {
+      return active && rowsEl.contains(active) && active.hasAttribute(attr);
+    });
+    const focused = focusAttribute ? active.getAttribute(focusAttribute) : null;
+    const selection = focusAttribute === 'data-edit-name'
+      ? [active.selectionStart, active.selectionEnd, active.selectionDirection] : null;
     rowsEl.innerHTML = html;
     rowsEl.querySelectorAll('input[data-key-for]').forEach(function (inp) {
       const id = inp.getAttribute('data-key-for');
       if (Object.prototype.hasOwnProperty.call(typed, id)) inp.value = typed[id];
-      if (focused !== null && id === focused) inp.focus();
     });
+    if (focusAttribute) {
+      rowsEl.querySelectorAll('[' + focusAttribute + ']').forEach(function (control) {
+        if (control.getAttribute(focusAttribute) !== focused) return;
+        control.focus();
+        if (selection) control.setSelectionRange(selection[0], selection[1], selection[2]);
+      });
+    }
     document.getElementById('mp-account-form').classList.toggle('hidden', !mpCanEdit());
   }
 
   function mpAccountError(msg) {
     const el = document.getElementById('mp-account-error');
+    el.textContent = msg || '';
+    el.classList.toggle('hidden', !msg);
+  }
+
+  function mpAccountNotice(msg) {
+    const el = document.getElementById('mp-account-notice');
     el.textContent = msg || '';
     el.classList.toggle('hidden', !msg);
   }
@@ -402,11 +480,41 @@ export const modelsAndProvidersScript = `(function () {
     await loadStageConfig(false);
   }
 
+  async function mpImportCredential() {
+    if (!mpCanEdit()) return;
+    mpAccountError('');
+    mpAccountNotice('');
+    try {
+      const res = await window.api('/api/tools/import_environment_credential', {
+        method: 'POST', body: JSON.stringify({ args: {} }),
+      });
+      const body = await res.json().catch(function () { return {}; });
+      if (!res.ok) { mpAccountError(body.error || 'Import failed (HTTP ' + res.status + ')'); return; }
+      const text = body.content && body.content[0] ? body.content[0].text : 'Import failed';
+      let result = null;
+      try { result = JSON.parse(text); } catch (_) { /* plain-text role error */ }
+      if (!result || (result.status !== 201 && result.status !== 200)) {
+        mpAccountError(result && result.body ? result.body.error : text);
+        return;
+      }
+      const accRes = await window.api('/api/model-accounts');
+      if (!accRes.ok) { mpAccountError(await mpErrorText(accRes, 'Failed to load account profiles')); return; }
+      const data = await accRes.json();
+      mpAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+      mpRenderAccounts();
+      mpRerenderWithCompat();
+      mpAccountNotice(result.body.profileId + ': ' + (result.status === 201 ? 'created' : 'already imported'));
+    } catch (err) {
+      mpAccountError('Import failed: ' + String(err));
+    }
+  }
+
   async function mpAddAccount() {
     if (!mpCanEdit()) return;
     mpAccountError('');
     const val = function (id) { return String(document.getElementById('mp-new-' + id).value || '').trim(); };
-    const body = { profileId: val('profileId'), identity: val('identity'), agent: val('agent'), provider: val('provider'), authMode: val('authMode') };
+    const name = val('name');
+    const body = { profileId: mpProfileIdFromName(name, mpAccounts.map(function (a) { return a.profileId; })), identity: name, agent: val('agent'), provider: val('provider'), authMode: val('authMode') };
     try {
       const res = await window.api('/api/model-accounts', { method: 'POST', body: JSON.stringify(body) });
       if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to add account profile')); return; }
@@ -414,12 +522,42 @@ export const modelsAndProvidersScript = `(function () {
       mpAccountError('Failed to add account profile');
       return;
     }
-    document.getElementById('mp-new-profileId').value = '';
-    document.getElementById('mp-new-identity').value = '';
+    document.getElementById('mp-new-name').value = '';
+    await loadStageConfig(false);
+  }
+
+  async function mpSaveProfile(profileId) {
+    const draft = mpAccountEdits.get(profileId);
+    if (!draft || draft.saving) return;
+    const body = {};
+    if (draft.identity !== draft.originalIdentity) body.identity = draft.identity;
+    if (draft.status !== draft.originalStatus) body.status = draft.status;
+    mpAccountError('');
+    if (Object.keys(body).length) {
+      draft.saving = true;
+      mpRenderAccounts();
+      try {
+        const res = await window.api('/api/model-accounts/' + encodeURIComponent(profileId), { method: 'PATCH', body: JSON.stringify(body) });
+        if (!res.ok) { mpAccountError(await mpErrorText(res, 'Failed to update account profile')); return; }
+        mpAccountEdits.delete(profileId);
+        await loadStageConfig(false);
+      } catch (_) { mpAccountError('Failed to update account profile'); return; }
+      finally { draft.saving = false; mpRenderAccounts(); }
+      return;
+    }
+    mpAccountEdits.delete(profileId);
     await loadStageConfig(false);
   }
 
   function mpWatchKeys() {
+    const updateDraft = function (e) {
+      const nameId = e.target.getAttribute('data-edit-name');
+      const statusId = e.target.getAttribute('data-edit-status');
+      const draft = mpAccountEdits.get(nameId || statusId);
+      if (draft && !draft.saving) draft[nameId !== null ? 'identity' : 'status'] = e.target.value;
+    };
+    document.getElementById('mp-account-rows').oninput = updateDraft;
+    document.getElementById('mp-account-rows').onchange = updateDraft;
     document.getElementById('mp-pairing').onclick = function (e) {
       const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
       if (!btn) return;
@@ -429,11 +567,21 @@ export const modelsAndProvidersScript = `(function () {
     };
     document.getElementById('mp-account-rows').onclick = async function (e) {
       const btn = e.target && e.target.closest ? e.target.closest('button[data-act]') : null;
-      if (!btn) return;
+      if (!btn || btn.disabled || !mpCanEdit()) return;
       const profileId = btn.getAttribute('data-profile');
       const act = btn.getAttribute('data-act');
+      if (act === 'edit-profile') {
+        const a = mpAccounts.find(function (a) { return a.profileId === profileId; });
+        if (!a) return;
+        mpAccountEdits.set(profileId, { identity: a.identity, status: a.profileStatus, originalIdentity: a.identity, originalStatus: a.profileStatus });
+        mpRenderAccounts();
+        return;
+      }
+      if (act === 'cancel-profile') { mpAccountEdits.delete(profileId); mpAccountError(''); mpRenderAccounts(); return; }
+      if (act === 'save-profile') { await mpSaveProfile(profileId); return; }
       if (act === 'pair') { await mpPairingMint(profileId); return; }
       if (act === 'remove-key') { await mpCredentialCall(profileId, 'DELETE'); return; }
+      if (act !== 'set-key') return;
       const inputs = document.querySelectorAll('#mp-account-rows input[data-key-for]');
       let input = null;
       for (const el of inputs) { if (el.getAttribute('data-key-for') === profileId) input = el; }
@@ -445,7 +593,6 @@ export const modelsAndProvidersScript = `(function () {
   }
 
   async function loadStageConfig(force) {
-    if (mpDirty && !force) return;
     const accountErr = document.getElementById('mp-account-error');
     accountErr.classList.add('hidden');
     try {
@@ -457,6 +604,8 @@ export const modelsAndProvidersScript = `(function () {
         accountErr.textContent = await mpErrorText(accRes, 'Failed to load account profiles');
         accountErr.classList.remove('hidden');
       }
+      mpRenderAccounts();
+      if (mpDirty && !force) { mpRerenderWithCompat(); return; }
       const defRes = await window.api('/api/agent-defaults');
       if (defRes.ok) {
         if (mpDirty && !force) return;
@@ -477,6 +626,7 @@ export const modelsAndProvidersScript = `(function () {
   async function saveStageDefaults() {
     if (!mpCanEdit()) return;
     mpShowStageError('');
+    mpDirty = true;
     const form = mpReadForm();
     if (form.error) { mpShowStageError(form.error); return; }
     try {
@@ -509,7 +659,7 @@ export const modelsAndProvidersScript = `(function () {
     const subtitleEl = document.getElementById('mp-subtitle');
 
     errorEl.hidden = true;
-    loadStageConfig(false);
+    await loadStageConfig(false);
 
     const res = await window.api('/api/mappings');
     if (!res.ok) {
@@ -598,6 +748,8 @@ export const modelsAndProvidersScript = `(function () {
   window.loadModelsAndProviders = loadModelsAndProviders;
   window.saveStageDefaults = saveStageDefaults;
   window.mpAddAccount = mpAddAccount;
+  window.mpImportCredential = mpImportCredential;
+  window.mpProfileIdFromName = mpProfileIdFromName;
   window.resetStageDefaults = resetStageDefaults;
   window.registerPage('models', function () { mpWatchDirty(); mpWatchKeys(); loadModelsAndProviders(); setInterval(loadModelsAndProviders, 60000); });
 })();`;
