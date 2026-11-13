@@ -1485,7 +1485,7 @@ async function resolveIssueUrl(
   identifier: string | null,
 ): Promise<string | null> {
   if (!teamKey || !identifier) return null;
-  const mapping = getMappings()[teamKey];
+  const mapping = getOwnMapping(teamKey);
   if (!mapping) return null;
   try {
     const provider = await registry.forMapping(mapping);
@@ -1616,7 +1616,7 @@ async function handleListBlockers(
     // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
     const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
     const fileOverlapCandidates = allIssues.filter(
-      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && !parkedFor(i) && teamRepoMap[i.scopeKey],
+      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && !parkedFor(i) && Object.hasOwn(teamRepoMap, i.scopeKey),
     );
     const planningContexts = await getOrFetchPlanningContexts(
       [...fileOverlapCandidates, ...inFlightSiblings],
@@ -1700,7 +1700,7 @@ async function handleFilesystemIssueDetails(
   }
 
   const [, scopeKey] = match;
-  const mapping = getMappings()[scopeKey];
+  const mapping = getOwnMapping(scopeKey);
   if (!mapping || mapping.ticketingProvider !== "filesystem") {
     json(res, 404, { error: "filesystem issue not found" });
     return;
@@ -1743,7 +1743,7 @@ async function handleRetryFilesystemIssue(req: http.IncomingMessage, res: http.S
   const match = typeof issueId === "string" ? /^filesystem:([A-Za-z0-9_.-]+):([A-Z][A-Z0-9_]*-\d+)$/.exec(issueId) : null;
   if (!match) { json(res, 400, { error: "issueId must be a filesystem issue id" }); return; }
   if (getRunnerMode().mode !== "local") { json(res, 409, { error: "Filesystem retry requires local runner mode" }); return; }
-  const mapping = getMappings()[match[1]];
+  const mapping = getOwnMapping(match[1]);
   if (!mapping || mapping.ticketingProvider !== "filesystem") { json(res, 404, { error: "Filesystem ticket not found" }); return; }
   try {
     const provider = await registry.forMapping(mapping);
@@ -2026,7 +2026,7 @@ async function handleDestroySession(
     // A gap-analysis job's ticket already has a PR; a reset would start a new implementation run.
     if (job.issueId && job.phase !== "gap-analysis") {
       try {
-        const mapping = job.teamKey ? getMappings()[job.teamKey] : undefined;
+        const mapping = job.teamKey ? getOwnMapping(job.teamKey) : undefined;
         if (mapping) {
           const provider = await registry.forMapping(mapping);
           await provider.clearWorkingState(job.issueId, job.teamKey!, job.phase === "planning" ? "planning" : "implementation");
@@ -2161,8 +2161,7 @@ export function triggerWorkflowSyncAction(
   config: AdminConfig,
   teamKey: string,
 ): { status: number; body: Record<string, unknown> } {
-  const mappings = getMappings();
-  const mapping = mappings[teamKey];
+  const mapping = getOwnMapping(teamKey);
   if (!mapping) {
     return { status: 404, body: { error: "Team not found" } };
   }
@@ -2746,8 +2745,7 @@ async function handleListSecrets(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -2774,8 +2772,7 @@ async function handleSetSecret(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -2830,8 +2827,7 @@ async function handleUnsetSecret(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -3361,7 +3357,7 @@ export async function upsertMappingAction(
     return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
   }
 
-  const existingMapping = getMappings()[body.teamKey];
+  const existingMapping = getOwnMapping(body.teamKey);
   const defaultBranch = typeof body.defaultBranch === "string"
     ? body.defaultBranch.trim()
     : (existingMapping?.defaultBranch ?? "");
@@ -4292,8 +4288,14 @@ async function handlePutAgentDefaults(req: http.IncomingMessage, res: http.Serve
   }
 }
 
+/** Only stored mappings qualify; inherited object properties are not projects. */
+function getOwnMapping(key: string): RepoMapping | undefined {
+  const mappings = getMappings();
+  return Object.hasOwn(mappings, key) ? mappings[key] : undefined;
+}
+
 function handleGetProjectAgentConfig(res: http.ServerResponse, projectKey: string): void {
-  if (!getMappings()[projectKey]) {
+  if (!getOwnMapping(projectKey)) {
     json(res, 404, { error: "mapping not found" });
     return;
   }
@@ -4326,8 +4328,7 @@ interface ReadinessRefusal {
 }
 
 /** Read-only readiness of an uncommitted candidate for the backend(s) dispatch would use. Nothing is stored to inspect it. */
-async function readinessRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<ReadinessRefusal | null> {
-  const mapping = getMappings()[projectKey]!;
+async function readinessRefusal(projectKey: string, mapping: RepoMapping, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<ReadinessRefusal | null> {
   try {
     resolveCandidateProjectStageConfig(projectKey, candidate);
   } catch {
@@ -4398,7 +4399,8 @@ async function putProjectAgentConfigLocked(
   actor: string | null,
   body: Record<string, unknown>,
 ): Promise<void> {
-  if (!getMappings()[projectKey]) {
+  const mapping = getOwnMapping(projectKey);
+  if (!mapping) {
     json(res, 404, { error: "mapping not found" });
     return;
   }
@@ -4436,7 +4438,7 @@ async function putProjectAgentConfigLocked(
       json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
       return;
     }
-    const refusal = await readinessRefusal(projectKey, candidate, deps);
+    const refusal = await readinessRefusal(projectKey, mapping, candidate, deps);
     if (refusal) {
       json(res, refusal.status, refusal.body);
       return;
@@ -4457,13 +4459,14 @@ async function putProjectAgentConfigLocked(
 }
 
 function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: string, deps: AdminDeps): void {
-  if (!getMappings()[projectKey]) {
+  const mapping = getOwnMapping(projectKey);
+  if (!mapping) {
     json(res, 404, { error: "mapping not found" });
     return;
   }
   const stored = getProjectStageConfig(projectKey);
   const base = { projectKey, enabled: stored?.config.mode === "configured" };
-  const backends = backendsFor(getMappings()[projectKey]!);
+  const backends = backendsFor(mapping);
   const checkAccount = (entry: StageAccount): AccountFailure | null =>
     entry.authMode === "bedrock" && backends.some(backend => backend !== "github-actions") ? "unsupported_combination" : null;
   let projection;

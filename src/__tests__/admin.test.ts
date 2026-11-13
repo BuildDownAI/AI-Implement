@@ -2381,6 +2381,22 @@ describe("admin secrets", () => {
     return { statusCode: res.statusCode, body: res.body };
   }
 
+  describe.each(["constructor", "toString", "__proto__"])("secrets reject inherited mapping %s", (teamKey) => {
+    it.each([
+      ["GET", "", undefined],
+      ["POST", "", { name: "DATABASE_URL", value: "postgres://localhost/db" }],
+      ["DELETE", "/DATABASE_URL", undefined],
+    ] as const)("%s returns 404 without a secret call", async (method, suffix, body) => {
+      const token = await login("secret");
+      const fake = fakeFetch({}).install();
+      const res = await requestFly(`/api/mappings/${teamKey}/secrets${suffix}`, method, token, body);
+
+      expect.soft(res.statusCode).toBe(404);
+      expect.soft(JSON.parse(res.body)).toEqual({ error: "Team not found" });
+      expect(fake.calls).toHaveLength(0);
+    });
+  });
+
   it("returns 503 when Fly config is not set on GET secrets", async () => {
     const token = await login("secret");
     const res = await request("/api/mappings/ENG/secrets", "GET", "secret", undefined, token);
@@ -3224,6 +3240,38 @@ describe("admin filesystem issue detail endpoint", () => {
     expect(res.statusCode).toBe(401);
   });
 
+  describe.each(["constructor", "toString", "__proto__"])("filesystem routes with inherited name %s", (scopeKey) => {
+    it.each(["details", "retry"])("keeps %s at 404 without inspecting the inherited mapping", async (route) => {
+      await withFilesystemProject(async ({ registry, token }) => {
+        // The old provider guard also returned 404 for Object.prototype values.
+        // Observe property access to prove inherited values are rejected before
+        // either route inspects them, rather than relying on that second guard.
+        const inspectInheritedMapping = vi.fn(() => undefined);
+        const inheritedMapping = Object.defineProperty({}, "ticketingProvider", {
+          get: inspectInheritedMapping,
+        });
+        const mappings = Object.assign(
+          Object.create({ [scopeKey]: inheritedMapping }),
+          config.getMappings(),
+        );
+        const getMappings = vi.spyOn(config, "getMappings").mockReturnValue(mappings);
+        try {
+          const issueId = `filesystem:${scopeKey}:SAN2-001`;
+          const result = route === "details"
+            ? await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry)
+            : await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+          expect(result.statusCode).toBe(404);
+          expect(JSON.parse(result.body)).toEqual({
+            error: route === "details" ? "filesystem issue not found" : "Filesystem ticket not found",
+          });
+          expect(inspectInheritedMapping).not.toHaveBeenCalled();
+        } finally {
+          getMappings.mockRestore();
+        }
+      });
+    });
+  });
+
   it("restores an archived failure once and retains the issue history", async () => {
     await withFilesystemProject(async ({ dir, registry, token }) => {
       const issueId = "filesystem:SAN2:SAN2-001";
@@ -3989,6 +4037,16 @@ describe("async sync on mapping upsert", () => {
     const res = await request("/api/mappings/MAN/sync-workflows", "POST", "secret", undefined, token);
     expect(res.statusCode).toBe(202);
     expect(typeof JSON.parse(res.body).syncJobId).toBe("number");
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("manual sync-workflows rejects inherited mapping %s without queuing work", async (teamKey) => {
+    const token = await login("secret");
+    const jobsBefore = dedup.getDb().prepare("SELECT * FROM workflow_sync_queue").all();
+    const res = await request(`/api/mappings/${teamKey}/sync-workflows`, "POST", "secret", undefined, token);
+
+    expect.soft(res.statusCode).toBe(404);
+    expect.soft(JSON.parse(res.body)).toEqual({ error: "Team not found" });
+    expect(dedup.getDb().prepare("SELECT * FROM workflow_sync_queue").all()).toEqual(jobsBefore);
   });
 
   it("manual sync-workflows returns 404 for an unknown team", async () => {
@@ -6359,6 +6417,32 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
       expect(count("stage_agent_config_revisions")).toBe(before);
     }
+  });
+
+  describe.each(["constructor", "toString", "__proto__"])("own mapping lookup for %s", (projectKey) => {
+    it.each([
+      ["GET", ""],
+      ["GET", "/resolved"],
+      ["PUT", ""],
+    ])("rejects inherited name on %s agent-config%s without writing", async (method, suffix) => {
+      const t = await seed();
+      const before = count("stage_agent_config_revisions");
+      const result = await call(`/api/mappings/${projectKey}/agent-config${suffix}`, method, t,
+        method === "PUT" ? { stages: {} } : undefined, readyDeps());
+      expect.soft(result.status).toBe(404);
+      expect.soft(result.json).toEqual({ error: "mapping not found" });
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    });
+
+    it("upserts the inherited name as a new configured project", async () => {
+      const t = await seed();
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      const before = count("stage_agent_config_revisions");
+      const result = await request("/api/mappings", "POST", "secret", { teamKey: projectKey, owner: "org", repo: "new" }, t);
+      expect(result.statusCode).toBe(202);
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toMatchObject({ config: { mode: "configured" } });
+      expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    });
   });
 
   it("keeps absent-row legacy unchanged and refuses unresolved configuration without writing", async () => {
