@@ -3224,6 +3224,18 @@ describe("admin filesystem issue detail endpoint", () => {
     expect(res.statusCode).toBe(401);
   });
 
+  it.each(["constructor", "toString", "__proto__"])("keeps filesystem routes at 404 for inherited name %s", async (scopeKey) => {
+    await withFilesystemProject(async ({ registry, token }) => {
+      const issueId = `filesystem:${scopeKey}:SAN2-001`;
+      const detail = await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry);
+      expect(detail.statusCode).toBe(404);
+      expect(JSON.parse(detail.body)).toEqual({ error: "filesystem issue not found" });
+      const retry = await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+      expect(retry.statusCode).toBe(404);
+      expect(JSON.parse(retry.body)).toEqual({ error: "Filesystem ticket not found" });
+    });
+  });
+
   it("restores an archived failure once and retains the issue history", async () => {
     await withFilesystemProject(async ({ dir, registry, token }) => {
       const issueId = "filesystem:SAN2:SAN2-001";
@@ -6359,6 +6371,31 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
       expect(count("stage_agent_config_revisions")).toBe(before);
     }
+  });
+
+  describe.each(["constructor", "toString", "__proto__"])("own mapping lookup for %s", (projectKey) => {
+    it.each([
+      ["GET", ""],
+      ["GET", "/resolved"],
+      ["PUT", ""],
+    ])("rejects inherited name on %s agent-config%s without writing", async (method, suffix) => {
+      const t = await seed();
+      const before = count("stage_agent_config_revisions");
+      const result = await call(`/api/mappings/${projectKey}/agent-config${suffix}`, method, t,
+        method === "PUT" ? { stages: {} } : undefined);
+      expect.soft(result.status).toBe(404);
+      expect.soft(result.json).toEqual({ error: "mapping not found" });
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    });
+
+    it("upserts the inherited name as a new configured project", async () => {
+      const t = await seed();
+      const before = count("stage_agent_config_revisions");
+      const result = await request("/api/mappings", "POST", "secret", { teamKey: projectKey, owner: "org", repo: "new" }, t);
+      expect(result.statusCode).toBe(202);
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toMatchObject({ config: { mode: "configured" } });
+      expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    });
   });
 
   it("keeps absent-row legacy unchanged and refuses unresolved configuration without writing", async () => {
