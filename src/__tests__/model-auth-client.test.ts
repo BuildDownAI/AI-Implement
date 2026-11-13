@@ -167,6 +167,12 @@ describe("buildModelInvocationEnv", () => {
     MODEL_AUTH_KEY: "protect-me",
   };
 
+  it("refuses OpenRouter until invocation support is implemented", () => {
+    expect(category(() => buildModelInvocationEnv({
+      authMode: "openrouter-api-key", secret: { kind: "api-key", apiKey: S_API }, inheritedEnv,
+    }))).toBe("unsupported_auth_mode");
+  });
+
   it("passes only the selected API key even when other credentials are inherited", () => {
     const { env, strippedKeys } = buildModelInvocationEnv({
       authMode: "openai-api-key",

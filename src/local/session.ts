@@ -108,7 +108,8 @@ function parseBootstrap(value: unknown): LocalSessionBootstrapV1 {
       r.authMode !== "bedrock" &&
       r.authMode !== "claude-subscription" &&
       r.authMode !== "openai-api-key" &&
-      r.authMode !== "codex-subscription"
+      r.authMode !== "codex-subscription" &&
+      r.authMode !== "openrouter-api-key"
     ) {
       throw bootstrapError("invalid auth mode");
     }

@@ -299,7 +299,7 @@ export interface InvocationAttributionV1 {
   stage: StageName;
   snapshotId: string;
   agent: "claude" | "codex";
-  provider: "anthropic" | "bedrock" | "openai";
+  provider: "anthropic" | "bedrock" | "openai" | "openrouter";
   model: string;
   profileId: string | null;
   authMode: AccountAuthMode;
@@ -310,7 +310,7 @@ export interface InvocationAttributionV1 {
 
 const ATTRIBUTION_KEYS = ["version", "invocationId", "stage", "snapshotId", "agent", "provider", "model", "profileId", "authMode", "limit", "outcome", "usage"];
 const ATTRIBUTION_USAGE_KEYS = ["availability", "tokensIn", "tokensOut", "costUsd", "costStatus"];
-const ATTRIBUTION_AUTH_MODES = ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"];
+const ATTRIBUTION_AUTH_MODES = ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key"];
 const ATTRIBUTION_ID_RE = /^[\w.:/@-]{1,128}$/;
 /** Model ids may carry suffixes such as `[1m]` or `+`: printable non-whitespace ASCII, bounded. */
 const ATTRIBUTION_MODEL_RE = /^[\x21-\x7e]{1,128}$/;
@@ -353,7 +353,7 @@ export function sanitizeAttribution(value: unknown): InvocationAttributionV1 | n
   if (!attrId(value.invocationId) || !attrId(value.snapshotId) || !attrModel(value.model)) return null;
   if (!(STAGE_NAMES as readonly unknown[]).includes(value.stage)) return null;
   if (value.agent !== "claude" && value.agent !== "codex") return null;
-  if (value.provider !== "anthropic" && value.provider !== "bedrock" && value.provider !== "openai") return null;
+  if (value.provider !== "anthropic" && value.provider !== "bedrock" && value.provider !== "openai" && value.provider !== "openrouter") return null;
   if (value.profileId !== null && !attrId(value.profileId)) return null;
   if (!ATTRIBUTION_AUTH_MODES.includes(value.authMode as string)) return null;
   if (!["success", "max_turns", "error", "unknown"].includes(value.outcome as string)) return null;

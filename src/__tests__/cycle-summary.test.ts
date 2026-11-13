@@ -290,8 +290,10 @@ describe("attribution contract (AII-946)", () => {
 
   it("round-trips a valid value, every stage and every auth mode", () => {
     expect(sanitizeAttribution(attr())).toEqual(attr());
+    const openrouter = attr({ provider: "openrouter", authMode: "openrouter-api-key" });
+    expect(sanitizeAttribution(openrouter)).toEqual(openrouter);
     for (const stage of ["planning", "implementation", "review"]) expect(sanitizeAttribution(attr({ stage }))?.stage).toBe(stage);
-    for (const authMode of ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"]) {
+    for (const authMode of ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key"]) {
       expect(sanitizeAttribution(attr({ authMode }))?.authMode).toBe(authMode);
     }
   });

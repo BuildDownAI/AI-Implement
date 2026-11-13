@@ -31,13 +31,14 @@ export const ORCHESTRATOR_SCOPE_KEY = "default";
 export type AccountProfileStatus = "active" | "disabled" | "archived";
 
 const AGENTS: readonly StageAgent[] = ["claude", "codex"];
-const PROVIDERS: readonly ModelProvider[] = ["anthropic", "bedrock", "openai"];
+const PROVIDERS: readonly ModelProvider[] = ["anthropic", "bedrock", "openai", "openrouter"];
 const AUTH_MODES: readonly AccountAuthMode[] = [
   "anthropic-api-key",
   "bedrock",
   "claude-subscription",
   "openai-api-key",
   "codex-subscription",
+  "openrouter-api-key",
 ];
 const AUTH_COMBINATIONS: Record<StageAgent, Partial<Record<ModelProvider, readonly AccountAuthMode[]>>> = {
   claude: { anthropic: ["anthropic-api-key", "claude-subscription"], bedrock: ["bedrock"] },
