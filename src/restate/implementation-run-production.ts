@@ -36,7 +36,7 @@ import {
   type MachineSize,
 } from "../log.js";
 import { trackerAccounting } from "../job-accounting.js";
-import { generateMachineNonce, generateSessionToken, listMachines } from "../fly-machines.js";
+import { generateMachineNonce, generateSessionToken, listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
 import { markDispatched } from "../dedup.js";
 import { recordDispatchFailure } from "../dispatch-breaker.js";
@@ -599,6 +599,16 @@ export function createProductionImplementationRunServices(input: ImplementationR
     const result = await finishImplementationJob(
       {
         getJob: getJobByDispatchId,
+        neverStarted: async (job) => {
+          if (!owner || job.executionMode !== "fly-machines" || !job.machineId) return false;
+          try {
+            const frozenConfig = backendConfig(owner.input);
+            if (!frozenConfig.flySessionsToken || !frozenConfig.flySessionsApp) return false;
+            return machineNeverStarted(await getMachine(frozenConfig.flySessionsToken, frozenConfig.flySessionsApp, job.machineId));
+          } catch {
+            return false;
+          }
+        },
         closeRow: (job, status, conclusion, opts) => updateJobStatus(job.id, status, conclusion, undefined, opts),
         isPrMerged: async (_job, prUrl) => {
           const target = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(prUrl);

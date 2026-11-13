@@ -806,3 +806,33 @@ it("renders all exhausted account profiles from terminal error evidence", () => 
   const message = "Usage limit reached on every account: A, B, C";
   expect(renderFailureRecord({ category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message, evidence: { truncated: false, llmErrorMessage: message } })).toContain("A, B, C");
 });
+
+it("explains a Fly machine removed before start, including when no PR exists", () => {
+  expect(classifyCompletion(jobOf("failed", "implementation", "fly_machine_never_started"))).toMatchObject({
+    detail: "Fly removed the machine before it started.",
+    remediation: "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).",
+  });
+});
+
+it("keeps structured failure detail and remediation authoritative over the Fly never-started conclusion", () => {
+  const failure: FailureRecord = {
+    category: "transient",
+    code: "PROVIDER_OVERLOADED",
+    stage: "implement",
+    attempt: 3,
+    retryable: true,
+    message: "The model provider was overloaded.",
+    evidence: { truncated: false },
+  };
+  const expected = classificationForFailure(failure);
+  expect(expected.detail).toContain(failure.message);
+  expect(expected.remediation).toBeTruthy();
+
+  const classification = classifyCompletion(
+    jobOf("failed", "implementation", "fly_machine_never_started", null, failure),
+  );
+  expect(classification).toMatchObject({
+    detail: expected.detail,
+    remediation: expected.remediation,
+  });
+});
