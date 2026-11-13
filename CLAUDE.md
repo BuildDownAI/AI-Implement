@@ -185,6 +185,10 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 
 ## Running tests
 
+Follow the [Rules for a reliable test](docs/unit-tests.md#rules-for-a-reliable-test) when writing or repairing tests.
+
+A test never proves a result with a wall-clock limit or a fixed sleep; see [Timing rules](docs/restate-testing.md#timing-rules).
+
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit, then tsc --noEmit -p tsconfig.tests.json (test files included)
@@ -228,7 +232,9 @@ A change that adds or alters an architectural feature must update the matching `
 
 1. Add the mapping at `/admin` via the **New project** stepper. On the Source step, **Check installation** probes whether the App is installed and can see the repo, linking straight to the fix — install the App, or add the repo to an existing install. The check is advisory; you can save regardless.
 2. **Save.** The mapping persists immediately and sync runs in the background, polling to a terminal state. The mapping is saved however the sync resolves.
-3. Merge the sync PR in the target repo.
+3. Merge the sync PR in the target repo. Add the pickup label to the first issue only after the sync pull request merges.
+
+A new project starts configured when the orchestrator stage defaults are on (unless a stored project row already exists or configuration fails to resolve); existing projects keep their mode.
 
 The GitHub App needs **Workflows** permission alongside **Contents** — GitHub rejects writes under `.github/workflows/` without it, and the sync fails with "permission denied" before opening its PR. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a stale window.
 

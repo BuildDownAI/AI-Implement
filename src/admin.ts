@@ -65,6 +65,7 @@ import {
   saveAccountProfileRevision,
   setOrchestratorDefaults,
   setProjectStageConfig,
+  setProjectConfigured,
   StaleStageInputsError,
   type AccountProfileProjection,
 } from "./agent-config-store.js";
@@ -2095,6 +2096,23 @@ async function handleAuth(
   }
 }
 
+export function setProjectAgentModeAction(
+  projectKey: string,
+  mode: "configured" | "legacy",
+  actor: string | null,
+): { ok: true; teamKey: string; agentMode: "configured" | "legacy" } | { ok: false; code: "mapping-not-found" | "resolution-failed" } {
+  if (!Object.hasOwn(getMappings(), projectKey)) {
+    return { ok: false, code: "mapping-not-found" };
+  }
+  try {
+    setProjectConfigured(projectKey, mode === "configured", actor);
+    return { ok: true, teamKey: projectKey, agentMode: mode };
+  } catch (err) {
+    console.error("[admin] set project agent mode failed:", err);
+    return { ok: false, code: "resolution-failed" };
+  }
+}
+
 export function pauseProjectAction(
   teamKey: string,
   paused: boolean,
@@ -3640,6 +3658,14 @@ export async function upsertMappingAction(
   }
 
   upsertMapping(body.teamKey, mapping);
+  try {
+    if (!existingMapping && !getProjectStageConfig(body.teamKey) && getOrchestratorDefaults()?.config.mode === "configured") {
+      setProjectConfigured(body.teamKey, true);
+    }
+  } catch (err) {
+    console.error("[admin] configure new project failed:", err);
+    warnings.push("Project saved in legacy mode: resolution-failed");
+  }
   registry.invalidate();
 
   // Kick the workflow sync off in the background and return immediately
@@ -4294,13 +4320,13 @@ function backendsFor(mapping: { executionMode: "github-actions" | "fly-machines"
 const WORKFLOW_SYNC_ACTION =
   "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows.";
 
-interface OptInRefusal {
+interface ReadinessRefusal {
   status: number;
   body: Record<string, unknown>;
 }
 
 /** Read-only readiness of an uncommitted candidate for the backend(s) dispatch would use. Nothing is stored to inspect it. */
-async function optInRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<OptInRefusal | null> {
+async function readinessRefusal(projectKey: string, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<ReadinessRefusal | null> {
   const mapping = getMappings()[projectKey]!;
   try {
     resolveCandidateProjectStageConfig(projectKey, candidate);
@@ -4376,16 +4402,12 @@ async function putProjectAgentConfigLocked(
     json(res, 404, { error: "mapping not found" });
     return;
   }
-  const extra = unsupportedKeys(body, ["enabled", "stages"]);
+  const extra = unsupportedKeys(body, ["stages"]);
   if (extra.length > 0) {
     json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}` });
     return;
   }
   const previous = getProjectStageConfig(projectKey);
-  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
-    json(res, 400, { error: "enabled must be a boolean" });
-    return;
-  }
   if (body.stages !== undefined) {
     const bad = validateStagesBody(body.stages);
     if (bad) {
@@ -4393,7 +4415,7 @@ async function putProjectAgentConfigLocked(
       return;
     }
   }
-  const enabled = body.enabled ?? previous?.config.mode === "configured";
+  const enabled = previous?.config.mode === "configured";
   if (enabled && !deps.agentConfig) {
     json(res, 501, { error: "agent configuration readiness inspection is not configured", code: "readiness_unavailable" });
     return;
@@ -4414,7 +4436,7 @@ async function putProjectAgentConfigLocked(
       json(res, 400, { error: err instanceof Error ? err.message : "invalid stage configuration" });
       return;
     }
-    const refusal = await optInRefusal(projectKey, candidate, deps);
+    const refusal = await readinessRefusal(projectKey, candidate, deps);
     if (refusal) {
       json(res, refusal.status, refusal.body);
       return;

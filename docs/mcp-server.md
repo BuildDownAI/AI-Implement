@@ -16,11 +16,11 @@ Every caller `/mcp` sees is resolved to one `Caller` (`src/mcp-identity.ts`): `{
 
 A handler declares its required role separately from its mutability. Most reads are `role: "user"` and every allowlisted identity can see and call them. Existing `role: "admin"` handlers default to writes for compatibility; privileged review-fix reads declare `role: "admin"` plus explicit read operation semantics, so they are admin-only reads and opt out of write audit and idempotency behavior. `list_projects` and `get_project_binding` both select their fields explicitly and omit `extraEnv`, so runner environment values never leave through a read.
 
-A **write** exists on `/mcp` only if it is a handler on the `orchestratorTools` Restate service and is included in `RESTATE_WRITE_TOOL_NAMES` for idempotency handling. Write handlers declare `role: "admin"` in their `mcp.role` metadata (`tool()`, `src/restate/tools.ts`); the role is asserted inside that wrapper, not by the adapter, so the check holds regardless of which entry point reaches the handler. The nine write handlers are the whole write surface: there is no tool that calls an arbitrary admin route, and every mutation not among them — allowlist edits, secrets, deploys, page grants — stays on the admin API and its UI.
+A **write** exists on `/mcp` only if it is a handler on the `orchestratorTools` Restate service and is included in `RESTATE_WRITE_TOOL_NAMES` for idempotency handling. Write handlers declare `role: "admin"` in their `mcp.role` metadata (`tool()`, `src/restate/tools.ts`); the role is asserted inside that wrapper, not by the adapter, so the check holds regardless of which entry point reaches the handler. The fifteen write handlers are the whole write surface: there is no tool that calls an arbitrary admin route, and every mutation not among them — allowlist edits, secrets, deploys, page grants — stays on the admin API and its UI.
 
 A caller's role satisfies a handler's declared role when it equals that role or is `admin` (the same superset rule `docs/access-model.md` § Roles uses). A caller whose role does not satisfy it gets a tool result with `isError: true` and the text `forbidden: <tool> requires the <role> role`; `tools/list` also omits the tools the caller's role cannot use, but the check inside `tool()` is the boundary. Each write call, allowed or refused, is logged as one line with the actor's email, the tool, the role, and the result — written by the wrapper itself, so a call that reaches a handler through `POST /api/tools/<name>` or `callToolAsSystem` (see "Entry points" below) is audited too, not just a call through `/mcp`. (Mechanism: [AII-381](https://linear.app/eudoxus/issue/AII-381/mcp-write-tier-admin-role-tools-add-project-set-runner-mode-pause), moved onto the tools service by [AII-713](https://linear.app/eudoxus/issue/AII-713/migrate-the-declared-mcp-writes-into-the-tools-service-as-durable); decision record: ADR 015.)
 
-`grants` is a readonly array of `"deploy"`, empty for human and system callers and for read-scoped service tokens. The wrapper accepts the required role **or** an explicitly declared matching `grant: "deploy"`. An admin/deploy tool therefore admits human admins, `systemCaller()`, and deploy-scoped control-plane tokens; human users and read-scoped tokens are forbidden. No existing production tool declares a grant. Deploy authority never promotes a service caller to `admin` and cannot reach other admin tools. Missing grants in older journaled wire inputs default to `[]`.
+`grants` is a readonly array of `"deploy" | "projects"`, empty for human and system callers and for read-scoped service tokens. The wrapper accepts the required role **or** an explicitly declared matching grant. Two production tools declare a grant: `start_deploy` declares `grant: "deploy"`, and `set_project_agent_mode` declares `grant: "projects"`. Each admits human admins, `systemCaller()`, and control-plane tokens with its matching scope; human users and read-scoped tokens are forbidden. A grant never promotes a service caller to `admin` and cannot reach admin tools without a matching grant declaration. Missing grants in older journaled wire inputs default to `[]`.
 
 ## Which client holds which token
 
@@ -54,7 +54,7 @@ An identity's ability to keep using its current or next token:
 Tools come from two places and are merged into one list:
 
 * **`get_session_identity`**, the one tool the door itself serves, because it reports the door's own state for this request.
-* **Every other tool** is a handler on the `orchestratorTools` Restate service (`src/restate/tools.ts`, `docs/restate.md` § "The tools service"), discovered from Restate's admin API on each `tools/list` and called through the ingress on `tools/call`. Ordinary reads (`get_*`, `list_*`, and the seven `kg_*` tools) are `role: "user"`; privileged review-fix reads are `role: "admin"` with explicit read operation semantics; the nine declared writes are `role: "admin"` and are the only names in `RESTATE_WRITE_TOOL_NAMES`. Every tool's role lives on the handler's own `mcp.role` metadata, asserted inside the shared `tool()` wrapper, rather than in a separate list in `src/mcp.ts`.
+* **Every other tool** is a handler on the `orchestratorTools` Restate service (`src/restate/tools.ts`, `docs/restate.md` § "The tools service"), discovered from Restate's admin API on each `tools/list` and called through the ingress on `tools/call`. Ordinary reads (`get_*`, `list_*`, and the seven `kg_*` tools) are `role: "user"`; privileged review-fix reads are `role: "admin"` with explicit read operation semantics; the fifteen declared write handlers are `role: "admin"`; fourteen are in `RESTATE_WRITE_TOOL_NAMES` (the exception is `import_environment_credential`). Every tool's role lives on the handler's own `mcp.role` metadata, asserted inside the shared `tool()` wrapper, rather than in a separate list in `src/mcp.ts`.
 
 The `kg_*` handlers call the KG sidecar through `MemoryProvider.callKgTool` (`src/kg-provider.ts`) rather than proxying the HTTP request; absent a provider, or when the provider lacks the tool's capability, the handler answers a tool result with `isError: true` and the same text `/mcp` always used, and `tools/list` omits those tools. When Restate itself is unreachable, a handler call — read or write — answers `503 restate-unavailable` and the discovered tools drop out of `tools/list` until it recovers. A write carries a Restate idempotency key only when the caller supplies one explicitly via the MCP `_meta` extension point — `params._meta.idempotencyKey` on `tools/call`, validated against `^[A-Za-z0-9._:-]{1,128}$` (a key outside that shape answers `-32602` and the tool never runs; the shape is shared with `src/admin.ts` via `IDEMPOTENCY_KEY_SHAPE`, `src/mcp.ts`) — prefixed with the caller's identity (`scopeIdempotencyKey`, `src/mcp.ts`, so two callers that reuse one literal key cannot collide; the caller's own key stays the suffix) and forwarded as `deps.idempotencyKey` to `callTool` (`src/mcp.ts`, `RESTATE_WRITE_TOOL_NAMES`). `/mcp` never derives one: it is stateless (no session id, and an MCP client restarts its JSON-RPC ids on every connection), so nothing in the request names "one connection's attempt at this call" except what the caller states. Omitting `_meta.idempotencyKey` means no key at all — the write runs every time, which is correct for a stateless door where a repeat is ordinarily a new intent, not a lost-response retry. Reads ignore the field entirely, valid or not. `POST /api/tools/<name>` (`src/admin.ts`) honours the same contract via an `Idempotency-Key` request header, for a caller such as CI with no MCP client.
 
@@ -67,7 +67,7 @@ Three ways to reach a tool's result, all going through the same handler and the 
 | Entry point | Credential | Notes |
 | -- | -- | -- |
 | `/mcp` | OAuth bearer token | `tools/call`, described above. |
-| `POST /api/tools/<name>` | Admin session (the same session every other `/api/` route requires), **or** a BuildDown control-plane token as `Authorization: Bearer` (`src/control-plane-token.ts`) | For a caller with no MCP client, such as CI. Maps the session to `Caller { kind: "human", email, role, grants: [] }` using the session's own resolved role — never defaulted to `admin`. `<name>` must match `^[a-z][a-z0-9_]{0,63}$`; anything else answers `404 { error: "unknown tool" }` before the ingress is reached. A control-plane token is a JWT from `BUILDDOWN_OIDC_ISSUER` (https; keys from the discovery `jwks_uri`, which must be https on the issuer's host) whose `aud` contains this orchestrator's `OAUTH_REDIRECT_BASE_URL` (exact string match, no trailing-slash normalisation), whose `scope` includes `orchestrator:read`, `orchestrator:deploy`, or both, and whose `exp` is in the future (60 s leeway). It maps to `Caller { kind: "service", role: "user", grants }`: deploy scope adds `["deploy"]`; otherwise grants are `[]`. Every admin tool without a matching grant is refused by the wrapper. It is accepted on this route only; every other `/api/` route answers 401 to it. Inactive when either env var is unset. A refused token records one `401` auth event (`expired` or `invalid`, no token text). A run capability ([AII-688](https://linear.app/eudoxus/issue/AII-688/run-identity-on-restate-for-kg-refresh-capabilities-mcp-reads-and-the)) is a later, separate entry point. |
+| `POST /api/tools/<name>` | Admin session (the same session every other `/api/` route requires), **or** a BuildDown control-plane token as `Authorization: Bearer` (`src/control-plane-token.ts`) | For a caller with no MCP client, such as CI. Maps the session to `Caller { kind: "human", email, role, grants: [] }` using the session's own resolved role — never defaulted to `admin`. `<name>` must match `^[a-z][a-z0-9_]{0,63}$`; anything else answers `404 { error: "unknown tool" }` before the ingress is reached. A control-plane token is a JWT from `BUILDDOWN_OIDC_ISSUER` (https; keys from the discovery `jwks_uri`, which must be https on the issuer's host) whose `aud` contains this orchestrator's `OAUTH_REDIRECT_BASE_URL` (exact string match, no trailing-slash normalisation), whose `scope` includes at least one of `orchestrator:read`, `orchestrator:deploy`, or `orchestrator:projects`, and whose `exp` is in the future (60 s leeway). It maps to `Caller { kind: "service", role: "user", grants }`: deploy scope adds `deploy`, projects scope adds `projects`, independently; read scope adds no grant. Every admin tool without a matching grant is refused by the wrapper. It is accepted on this route only; every other `/api/` route answers 401 to it. Inactive when either env var is unset. A refused token records one `401` auth event (`expired` or `invalid`, no token text). A run capability ([AII-688](https://linear.app/eudoxus/issue/AII-688/run-identity-on-restate-for-kg-refresh-capabilities-mcp-reads-and-the)) is a later, separate entry point. |
 | In-process | None | `callToolAsSystem` (`src/restate/tools-client.ts`) calls the handler directly with `systemCaller()` — for orchestrator code that wants a tool result without an HTTP hop. |
 
 ## Tools
@@ -115,6 +115,7 @@ Writes, declared:
 | `start_deploy` | admin | Starts a self-deploy of this orchestrator through `SelfDeploy.start`; also reachable with the control plane's `orchestrator:deploy` token ([AII-1612](https://linear.app/eudoxus/issue/AII-1612)). Request: `POST /api/tools/start_deploy` with body `{ "args": { "branch": "testing" \| "main", "requestedBy": string (1..200 characters) } }`; no other argument is accepted (an unknown key or another `branch` is the route's 400 `isError`). Success: `{ deployId, commit, image, alreadyActive }`. **Reads shared `SelfDeploy.status` first: during `draining`, `applying` or `verifying`, returns the active deploy immediately with `alreadyActive: true`, without calling or queueing `SelfDeploy.start`.** When no deploy is active, calls `SelfDeploy.start`, which retains its own `alreadyActive` check for concurrent callers that pass the status pre-check together. `SelfDeploy.start` sets the self-deploy hold, so `start_deploy` is one of the tools the hold lets through: a retry during a drain reads shared status and answers `alreadyActive: true` with the same `deployId`. A refusal is one fixed code as the error text (`isError: true`, not JSON): `image-not-published`, `head-unknown` or `not-configured`; a caller without the admin role or the deploy grant gets `forbidden: start_deploy requires the admin role`. A human `user` and a token with only `orchestrator:read` are refused. It is a write: it carries an idempotency key, so two calls with one key and no active deploy run `SelfDeploy.start` once. Progress is `get_deploy_posture`'s `selfDeploy`, which also answers during a hold (`selfDeploy.phase` is `draining` while the deploy drains). Recorded exchanges (`started`, `already-active`, `image-not-published`, `read-scope-refused`, `invalid-args`) are in [contracts/start_deploy/](contracts/start_deploy/), the request rules in [contracts/start_deploy/args.schema.json](contracts/start_deploy/args.schema.json); `src/__tests__/deploy-tools-contract.test.ts` fails when a response differs and `UPDATE_CONTRACT_FIXTURES=1` rewrites them. |
 | `import_environment_credential` | admin | Import the orchestrator environment credential as an account profile; leaves stage defaults unchanged. |
 | `pause_project` | admin | Same as the `paused` update of `PATCH /api/mappings/<teamKey>`. |
+| `set_project_agent_mode` | admin | Arguments: `{ teamKey: string, mode: "configured" \| "legacy" }` (strict). Changes the project mode without inspection. Success text: JSON `{ teamKey, agentMode }`. Refusals: `isError: true` with bare text `mapping-not-found` or `resolution-failed`. |
 | `add_project` | admin | Same as `POST /api/mappings`: create or update a project mapping, the upsert behind the admin UI's New project stepper. |
 | `trigger_workflow_sync` | admin | Same as `POST /api/mappings/<teamKey>/sync-workflows`: re-sync the workflow templates for one project. |
 | `clear_dispatch_dedup` | admin | Same as `DELETE /api/dedup/<issueId>`: clear a dedup entry so the issue can be re-dispatched. |
@@ -128,6 +129,32 @@ A tool that the BuildDown control plane calls with its `service` token (for exam
 * **The semantics:** write down every rule a consumer depends on: how paging ends (for example a `null` cursor on a page that is not full), what `null` means, units, ordering, and what can change after a read.
 * **Recorded exchanges:** a test calls the real handler through the real route for each scenario and writes the request and response bodies to `docs/contracts/<tool>/<scenario>.json`. It fails when the output differs, and rewrites only with an explicit environment variable. The control plane copies these files and its fake answers only from them.
 * **Changes:** a change to the request, the response or a rule regenerates the files, and the PR names the Control-Plane issue that takes the new files. Ship this repo first, then the control plane.
+
+### Project agent mode
+
+The control plane uses `set_project_agent_mode` for [CON-137](https://linear.app/eudoxus/issue/CON-137/see-and-change-each-orchestrators-project-agent-modes-on-the-control).
+A token with `orchestrator:projects` receives the `projects` grant and keeps the
+`service` identity's `user` role. This grant authorizes only this tool; it cannot
+start a deploy. A deploy-only or read-only token cannot change project modes.
+All three recognized scopes allow read tools; a token with none is refused (401).
+
+Request: `POST /api/tools/set_project_agent_mode` with
+`{ "args": { "teamKey": "BDS", "mode": "configured" } }`.
+`mode` is `configured` or `legacy`; the strict schema accepts no other keys.
+Arguments must be inside `args`.
+Success is HTTP 200 with MCP text containing JSON:
+`{ "content": [{ "type": "text", "text": "{\"teamKey\":\"BDS\",\"agentMode\":\"configured\"}" }] }`.
+Moving to legacy returns the same shape with `agentMode: "legacy"`.
+
+A refusal is an HTTP 200 MCP envelope with `isError: true` and one text item.
+The entire text is the bare code `mapping-not-found` (unknown project) or
+`resolution-failed` (configured agents cannot be resolved). A caller without
+admin role or projects grant receives
+`forbidden: set_project_agent_mode requires the admin role`.
+Recorded schema and exchanges (`set-configured`, `resolution-failed`,
+`read-scope-refused`) live in [contracts/set_project_agent_mode/](contracts/set_project_agent_mode/).
+`src/__tests__/set-project-agent-mode-contract.test.ts` checks them; regenerate
+with `UPDATE_CONTRACT_FIXTURES=1`. CON-137 takes these files after this repo ships.
 
 ### Monitor tools: health and fleet
 
@@ -145,9 +172,16 @@ probe; `lastError` is `null` without a probe error. `restateRetentionDays` and
 `volumeSnapshotRetentionDays` are days. `kgRefreshPreflight` is `null` without a
 configured KG source repo; `setupChecks` is `null` before the first setup-check
 run, otherwise the summary described in [setup-checks.md](setup-checks.md).
+`stageAgents` contains `defaultsMode` (`configured` or `legacy`) and `projects`,
+an array of `{ teamKey, agentMode }` with modes from the latest stored project rows.
+Missing defaults or project rows mean `legacy`. Only mapped projects appear,
+in ascending `teamKey` order; no mappings means `[]`, and unmapped project rows
+are omitted. These additional reads use SQLite only and expose no mapping values
+or runner environment values. This reports stored modes without changing any run.
 See the [argument schema](contracts/get_tenant_health/args.schema.json) and
 recorded [healthy](contracts/get_tenant_health/healthy.json) and
-[KG degraded](contracts/get_tenant_health/degraded.json) exchanges.
+[KG degraded](contracts/get_tenant_health/degraded.json), and
+[stage agents](contracts/get_tenant_health/stage-agents.json) exchanges.
 
 `get_fleet_report` takes `{ "args": {} }` for the default 30-day look-back, or
 `{ "args": { "days": 7 } }` for seven days. `days` is an optional number;

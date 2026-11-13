@@ -395,10 +395,10 @@ export const projectsHtml = `
       </div>
       <div data-md-panel="agents" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Agents</h3>
-        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 12px">Opt this project in to per-stage agent settings. Each field inherits the orchestrator default or overrides it for this project only. Legacy projects keep the Provider tab behavior.</p>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 12px">Each field inherits the orchestrator default or overrides it for this project only. Legacy runs ignore these overrides until the project becomes configured.</p>
         <div id="md-agents-new" class="field-hint hidden">Save the mapping first. Agent settings attach to an existing project key.</div>
         <div id="md-agents-body">
-          <label class="checkbox-row"><input id="md-agents-enabled" type="checkbox"> Opt in to stage agent configuration</label>
+          <div id="md-agents-mode" class="field-hint"></div>
           <div id="md-agents-profiles" style="margin:12px 0"></div>
           <div id="md-agents-stages"></div>
           <div class="field-hint" style="margin-top:12px">Changes apply to the next run only; runs already in flight keep their settings. Prompts and review rules stay in the repository, and there is no per-issue override. Agent settings are saved with their own button, separately from the mapping.</div>
@@ -774,7 +774,7 @@ export const projectsScript = `
   }
 
 
-  // ---- Agents tab: opt-in and inherited stage settings (AII-968) ----
+  // ---- Agents tab: mode and inherited stage settings (AII-968) ----
   var AG_STAGES = ['planning', 'implementation', 'review'];
   var AG_FIELDS = ['agent', 'provider', 'model', 'fallbackModel', 'accountProfileId', 'invocationTimeoutMs'];
   var AG_LABELS = { agent: 'Agent', provider: 'Provider', model: 'Model', fallbackModel: 'Fallback model', accountProfileId: 'Account profile', invocationTimeoutMs: 'Invocation timeout (ms)' };
@@ -828,19 +828,6 @@ export const projectsScript = `
     return ok ? '' : 'The profile for ' + stage + ' is not active, or does not match the agent and provider.';
   }
 
-  function agEnableProblem() {
-    for (var i = 0; i < AG_STAGES.length; i++) {
-      var p = agStageProblem(AG_STAGES[i]);
-      if (p) return p;
-      var t = agDraft(AG_STAGES[i], 'invocationTimeoutMs');
-      if (t.mode === 'override' && !(Number.isInteger(Number(t.value)) && Number(t.value) > 0)) return 'Timeout for ' + AG_STAGES[i] + ' must be a positive whole number.';
-      for (var j = 0; j < AG_FIELDS.length; j++) {
-        if (AG_FIELDS[j] !== 'fallbackModel' && agEffective(AG_STAGES[i], AG_FIELDS[j]).value === undefined) return AG_LABELS[AG_FIELDS[j]] + ' for ' + AG_STAGES[i] + ' has no value.';
-      }
-    }
-    return '';
-  }
-
   function agPreviewText(stage, field) {
     var e = agEffective(stage, field);
     return 'Effective: ' + (e.value === undefined ? 'not set' : String(e.value)) + ' (source: ' + e.source + ')';
@@ -887,7 +874,7 @@ export const projectsScript = `
 
   function agRender() {
     if (!agentState) return;
-    document.getElementById('md-agents-enabled').checked = agentState.draftEnabled;
+    document.getElementById('md-agents-mode').textContent = 'Mode: ' + agentState.mode + '. An admin changes it with the tool set_project_agent_mode.';
     agRenderProfiles();
     document.getElementById('md-agents-stages').innerHTML = AG_STAGES.map(function (stage) {
       var rows = AG_FIELDS.map(function (field) {
@@ -917,7 +904,7 @@ export const projectsScript = `
   function agBuildState(key, cfg, defaults, accounts) {
     var stored = (cfg && cfg.stages && typeof cfg.stages === 'object') ? cfg.stages : {};
     var defs = (defaults && defaults.stages && typeof defaults.stages === 'object') ? defaults.stages : {};
-    agentState = { key: key, enabled: !!(cfg && cfg.enabled), draftEnabled: !!(cfg && cfg.enabled), stored: stored, defaults: defs, accounts: Array.isArray(accounts) ? accounts : [], draft: {} };
+    agentState = { key: key, mode: cfg && cfg.mode === 'configured' ? 'configured' : 'legacy', stored: stored, defaults: defs, accounts: Array.isArray(accounts) ? accounts : [], draft: {} };
     AG_STAGES.forEach(function (stage) {
       agentState.draft[stage] = {};
       AG_FIELDS.forEach(function (field) {
@@ -968,7 +955,6 @@ export const projectsScript = `
 
   function agDiff() {
     var body = {};
-    if (agentState.draftEnabled !== agentState.enabled) body.enabled = agentState.draftEnabled;
     var stages = {};
     AG_STAGES.forEach(function (stage) {
       AG_FIELDS.forEach(function (field) {
@@ -1025,15 +1011,6 @@ export const projectsScript = `
     if (overrideProblem) { agShowError(overrideProblem); return; }
     var body = agDiff();
     if (!Object.keys(body).length) { agShowError('Nothing to save: no agent setting changed.'); return; }
-    if (agentState.draftEnabled) {
-      var problem = agEnableProblem();
-      if (problem) {
-        agentState.draftEnabled = agentState.enabled;
-        agRender();
-        agShowError('Cannot enable: ' + problem);
-        return;
-      }
-    }
     saveBtn.disabled = true;
     var res, data = {};
     try {
@@ -1041,7 +1018,6 @@ export const projectsScript = `
       try { data = await res.json(); } catch (_) {}
     } catch (_) {
       saveBtn.disabled = false;
-      agentState.draftEnabled = agentState.enabled;
       agRender();
       agShowError('Could not confirm the save. Reload and check the project before retrying.');
       return;
@@ -1052,7 +1028,7 @@ export const projectsScript = `
       var msg = AG_ERRORS[code]
         || (data && typeof data.error === 'string' ? data.error : (res.status === 400 ? AG_ERRORS.resolution_failed : 'Could not save agent settings (HTTP ' + res.status + ').'));
       if (code === 'stale_inputs') await loadAgentConfig(key);
-      else { agentState.draftEnabled = agentState.enabled; agRender(); }
+      else agRender();
       agShowError(msg + (data && typeof data.action === 'string' ? ' ' + data.action : ''));
       return;
     }
@@ -1078,7 +1054,6 @@ export const projectsScript = `
     panel.addEventListener('change', function (ev) {
       if (!agentState) return;
       var t = ev.target;
-      if (t.id === 'md-agents-enabled') { agentState.draftEnabled = t.checked; return; }
       var stage = t.dataset.stage, field = t.dataset.field;
       if (!stage || !field) return;
       var d = agDraft(stage, field);

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "teamKey": {
+      "type": "string"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "configured",
+        "legacy"
+      ]
+    }
+  },
+  "required": [
+    "teamKey",
+    "mode"
+  ],
+  "additionalProperties": false
+}

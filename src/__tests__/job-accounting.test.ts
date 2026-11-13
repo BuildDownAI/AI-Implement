@@ -660,7 +660,9 @@ describe("published value limits are enforced where the record is served (AII-15
   /** A finished job stored under a literal dispatch id (the helpers above map names to UUIDs). */
   function rawJob(dispatchId: string, at: number): number {
     const id = log.appendLog({ issueId: `issue-${at}`, dispatchId, executionMode: "fly-machines" });
-    dedup.getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ?, changed_at = ? WHERE id = ?").run(at, at, id);
+    dedup.getDb().prepare("UPDATE dispatch_log SET status = 'completed', conclusion = 'success', completed_at = ? WHERE id = ?").run(at, id);
+    // The trigger stamps the wall clock; pin changed_at to the completion time like a job that never changed again.
+    dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(at, id);
     return id;
   }
 
@@ -764,10 +766,16 @@ describe("published value limits are enforced where the record is served (AII-15
   });
 
   it("pages past unservable ids without ending the walk early", () => {
-    rawJob(U("first"), OLD);
-    rawJob("job-a", OLD + 1);
-    rawJob("job-b", OLD + 2);
-    rawJob(U("last"), OLD + 3);
+    const ids = [
+      rawJob(U("first"), OLD),
+      rawJob("job-a", OLD + 1),
+      rawJob("job-b", OLD + 2),
+      rawJob(U("last"), OLD + 3),
+    ];
+    const changedAt = dedup.getDb().prepare("SELECT changed_at FROM dispatch_log WHERE id = ?");
+    expect(ids.map((id) => changedAt.get(id))).toEqual([
+      { changed_at: OLD }, { changed_at: OLD + 1 }, { changed_at: OLD + 2 }, { changed_at: OLD + 3 },
+    ]);
     const page = acc.listJobAccounting({ pageSize: 2, now: NOW });
     expect(page.records.map((r) => nm(r.dispatchId))).toEqual(["first", "last"]);
     expect(page.nextCursor).not.toBeNull();
@@ -791,7 +799,10 @@ describe("published value limits are enforced where the record is served (AII-15
 
   it("matches every dispatch id generator, within the 200-character cap", () => {
     const legacy = log.appendLog({ issueId: "legacy", executionMode: "fly-machines" });
-    dedup.getDb().prepare("UPDATE dispatch_log SET dispatch_id = NULL, status = 'completed', completed_at = ?, changed_at = ? WHERE id = ?").run(OLD, OLD, legacy);
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatch_id = NULL, status = 'completed', completed_at = ? WHERE id = ?").run(OLD, legacy);
+    // The trigger stamps the wall clock; pin changed_at to the completion time like a job that never changed again.
+    dedup.getDb().prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(OLD, legacy);
+    expect(dedup.getDb().prepare("SELECT changed_at FROM dispatch_log WHERE id = ?").get(legacy)).toEqual({ changed_at: OLD });
     const synthetic = acc.listJobAccounting({ now: NOW }).records.map((r) => r.dispatchId);
     expect(synthetic).toEqual([`log-${legacy}`]);
 

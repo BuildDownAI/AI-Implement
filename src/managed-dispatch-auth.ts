@@ -11,7 +11,7 @@
  * and `code` only.
  */
 import type { StageName } from "./agent-config.js";
-import { getProjectOptIn, resolveProjectStageConfig } from "./agent-config-store.js";
+import { isProjectConfigured, resolveProjectStageConfig } from "./agent-config-store.js";
 import {
   loadStoredSnapshot,
   prepareAgentRun,
@@ -58,7 +58,7 @@ export type ManagedDispatchDecision =
 export function isManagedProject(projectKey: string, dispatchId?: string): boolean {
   if (typeof projectKey !== "string" || projectKey.length === 0) return false;
   if (dispatchId && loadStoredSnapshot(dispatchId) !== null) return true;
-  return getProjectOptIn(projectKey);
+  return isProjectConfigured(projectKey);
 }
 
 /** Frozen selection wins for an existing dispatch; used by read-only GHA capability admission. */

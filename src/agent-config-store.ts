@@ -556,24 +556,24 @@ export function clearProjectStageField(
     .immediate();
 }
 
-/** Opt-in is the project config `mode`; absent project config means not opted in. */
-export function getProjectOptIn(projectKey: string): boolean {
+/** A project is configured when its config `mode` is configured; absent config means false. */
+export function isProjectConfigured(projectKey: string): boolean {
   return parseConfig(latestConfigRow(getDb(), "project", projectKey))?.mode === "configured";
 }
 
-export function setProjectOptIn(projectKey: string, optedIn: boolean, createdBy: string | null = null): boolean {
+export function setProjectConfigured(projectKey: string, configured: boolean, createdBy: string | null = null): boolean {
   assertNonEmptyProjectKey(projectKey);
-  if (typeof optedIn !== "boolean") throw new Error("optedIn must be a boolean");
+  if (typeof configured !== "boolean") throw new Error("configured must be a boolean");
   const db = getDb();
   return db
     .transaction(() => {
       const current = parseConfig(latestConfigRow(db, "project", projectKey));
-      const currentlyOptedIn = current?.mode === "configured";
-      if (currentlyOptedIn === optedIn) return optedIn;
-      const next: StageAgentConfigurationV1 = { ...(current ?? LEGACY_CONFIG), mode: optedIn ? "configured" : "legacy" };
-      if (optedIn) assertProjectResolves(db, next);
+      const currentlyConfigured = current?.mode === "configured";
+      if (currentlyConfigured === configured) return configured;
+      const next: StageAgentConfigurationV1 = { ...(current ?? LEGACY_CONFIG), mode: configured ? "configured" : "legacy" };
+      if (configured) assertProjectResolves(db, next);
       appendConfig(db, "project", projectKey, next, createdBy);
-      return optedIn;
+      return configured;
     })
     .immediate();
 }

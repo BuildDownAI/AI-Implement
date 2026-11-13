@@ -126,6 +126,15 @@ A builder makes a value a test passes in. A harness makes something the code und
 
 **Per-file helpers.** A test file keeps a helper over a harness for what only it needs, most often a function that installs `fakeFetch` with the routes one service answers in that file, each with the reply production's handler sends, such as `commentTriggerApi` in `webhook.test.ts`. `MockRequest` and `MockResponse`, a request and response pair for calling an HTTP handler directly, are still copied across the files that do so; they are not a harness yet.
 
+## Rules for a reliable test
+
+1. **The verdict does not depend on the clock.** A wall-clock limit or a fixed sleep is never the proof. Example: [Restate Timing rules](restate-testing.md#timing-rules), rule 5, compares recorded completion and wake-up times to prove that cancellation interrupts a backed-off wait.
+2. **A fixture pins each value that a trigger or a default sets from the clock.** Example: `finishedJob` and `rawJob` in [job-accounting.test.ts](../src/__tests__/job-accounting.test.ts) set `changed_at` in a second statement after `trg_dispatch_log_changed_at` stamps the wall clock.
+3. **A test that asserts an order gives each row a different sort key, and proves that the stored keys are the keys it set.** Example: “pages past unservable ids without ending the walk early” in [job-accounting.test.ts](../src/__tests__/job-accounting.test.ts) asserts that the four stored `changed_at` values equal `OLD` through `OLD + 3` before asserting the served order.
+4. **A test does not depend on the test before it. It restores each shared value that it changes.** Example: the stage-default scenarios in [tools.restate.test.ts](../src/__tests__/restate/tools.restate.test.ts) restore orchestrator defaults in `finally` ([AII-1882](https://linear.app/eudoxus/issue/AII-1882)).
+5. **A test must be able to fail. For a fix, say which change in the product code makes the test fail.** Example: [Bug-fix tests](bug-fix-tests.md) records the workflow-sync test failing when the fix that selects the mapping's workflow file name is removed. For a fixture fix, retain the assertion and restore the old helper: the stored-key assertion above fails.
+6. **For a test that fails only at times, find what decides the verdict and remove that dependence.** A longer limit, a retry and a skip are not fixes. Example: [AII-1900](https://linear.app/eudoxus/issue/AII-1900) proposed a longer limit for the backed-off-wait scenario and was rejected; [AII-1901](https://linear.app/eudoxus/issue/AII-1901) proves the order from recorded times.
+
 ## CI
 
 `.github/workflows/unit-tests.yml` runs on each pull request into `testing`, `main`, `ai-implement/feature/**` and `ai-implement/multi-issue/**`:

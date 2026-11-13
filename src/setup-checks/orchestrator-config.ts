@@ -49,7 +49,7 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
       if (pending.length > 0) return [{
         state: "warn",
         detail: `Projects without configured model access: ${pending.join(", ")}`,
-        fix: "Run node dist/model-account-cli.js adopt-projects. Existing legacy rows are explicit opt-outs and are skipped; configure those projects explicitly.",
+        fix: "Run node dist/model-account-cli.js adopt-projects. Projects with a stored legacy row are skipped; use set_project_agent_mode to set those projects to configured.",
       }];
       return [{ state: "pass", detail: hasEnv
         ? "Defaults and all mapped projects are configured; environment credential is unused"

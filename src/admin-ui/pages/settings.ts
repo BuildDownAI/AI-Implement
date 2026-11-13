@@ -33,13 +33,13 @@ export const settingsHtml = `
     <div class="card">
       <div class="card-header"><h2 class="card-title">Orchestrator Agent Defaults</h2></div>
       <div class="card-body">
-        <p class="text-secondary" style="margin-bottom:12px">Stage defaults for planning, implementation and review live in the orchestrator, not in a target repository. Turning them on here does not enrol any project: each project opts in separately, and a legacy project keeps its current behavior. Changes apply to the next run. Edit the per-stage agent, provider, model, account profile and elapsed time limit on the <a href="#models">Models &amp; providers</a> page.</p>
+        <p class="text-secondary" style="margin-bottom:12px">Stage defaults for planning, implementation and review live in the orchestrator, not in a target repository. When defaults are on, a new project starts configured. An existing project keeps its mode. Changes apply to the next run. Edit the per-stage agent, provider, model, account profile and elapsed time limit on the <a href="#models">Models &amp; providers</a> page.</p>
         <div class="field">
           <label>Defaults mode</label>
           <div style="display:flex;gap:6px">
             <select class="input" id="settings-agent-defaults-mode" style="flex:1">
               <option value="legacy">legacy (stage defaults off)</option>
-              <option value="configured">configured (stage defaults on for opted-in projects)</option>
+              <option value="configured">configured (stage defaults on; new projects start configured, existing projects keep their mode)</option>
             </select>
             <button class="btn btn-primary btn-sm" id="settings-agent-defaults-save" onclick="saveAgentDefaultsMode()">Save</button>
           </div>

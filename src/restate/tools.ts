@@ -28,6 +28,7 @@ import {
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
+import { getOrchestratorDefaults, isProjectConfigured } from "../agent-config-store.js";
 import { summarizeSetupChecks } from "../setup-checks/index.js";
 import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
@@ -55,6 +56,7 @@ import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../rep
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
+  setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -70,7 +72,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
-  grants: z.array(z.literal("deploy")).readonly().default([]),
+  grants: z.array(z.enum(["deploy", "projects"])).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -91,7 +93,7 @@ interface ToolOptions<I extends z.ZodType> {
   input: I;
   role: AccessRole;
   /** Alternate authority, accepted only by tools that explicitly request it. */
-  grant?: "deploy";
+  grant?: "deploy" | "projects";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -201,7 +203,7 @@ export function tool<I extends z.ZodType>(
 }
 
 export const GET_TENANT_HEALTH_DESCRIPTION =
-  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
+  "Returns an orchestrator health summary: runner mode, in-flight job count, `awaitingDecisionCount` (kg-refresh rows held at the decision gate, which are not in flight), pending gap-fill queue count, project count, stage agent modes (`stageAgents`: defaultsMode and projects with teamKey and agentMode only, sorted by teamKey; missing defaults or project rows mean legacy; only mapped projects appear), and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant), and the last setup-check run (`setupChecks`: each check's id, title and state, and the count of failing core checks; null before the first run). Use as a first-pass check before digging deeper.";
 
 export const GetTenantHealthArgsSchema = z.object({});
 
@@ -221,7 +223,16 @@ export const getTenantHealth = tool(
     const { n: awaitingDecisionCount } = db
       .prepare("SELECT COUNT(*) as n FROM dispatch_log WHERE phase = 'kg-refresh' AND status = 'completed' AND conclusion = 'awaiting_decision'")
       .get() as { n: number };
-    const projectCount = Object.keys(getMappings()).length;
+    const projectKeys = Object.keys(getMappings()).sort();
+    const projectCount = projectKeys.length;
+    // Explicit projection: mapping values can contain runner environment secrets.
+    const stageAgents = {
+      defaultsMode: getOrchestratorDefaults()?.config.mode ?? "legacy",
+      projects: projectKeys.map(teamKey => ({
+        teamKey,
+        agentMode: isProjectConfigured(teamKey) ? "configured" : "legacy",
+      })),
+    };
     const kgSourceRepo = readKgSourceRepo(process.env.KG_SOURCE_REPO);
     const kgRefreshPreflight = kgSourceRepo
       ? await runKgRefreshPreflight({
@@ -238,6 +249,7 @@ export const getTenantHealth = tool(
       awaitingDecisionCount,
       pendingGapfillCount,
       projectCount,
+      stageAgents,
       kgDegraded: isKgDegraded(),
       ...sidecarHealthFields(),
       restate: getRestateStatus(),
@@ -1511,6 +1523,30 @@ export const addProjectArgsSchema = z.object({
   ),
 });
 
+export const SetProjectAgentModeArgsSchema = z.object({
+  teamKey: z.string(),
+  mode: z.enum(["configured", "legacy"]),
+}).strict();
+
+export const setProjectAgentModeTool = tool(
+  {
+    description: "Change a project's agent mode to configured or legacy without readiness inspection. Refusals: mapping-not-found, resolution-failed.",
+    input: SetProjectAgentModeArgsSchema,
+    grant: "projects",
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input) => `teamKey=${input.args.teamKey} mode=${input.args.mode}`,
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("set-project-agent-mode", () =>
+      setProjectAgentModeAction(input.args.teamKey, input.args.mode, auditActor(input.caller, "system")),
+    { maxRetryAttempts: 1 });
+    if (!result.ok) return toolError(result.code);
+    return { content: [{ type: "text", text: JSON.stringify({ teamKey: result.teamKey, agentMode: result.agentMode }) }] };
+  },
+);
+
 export const addProjectTool = tool(
   {
     description: ADD_PROJECT_DESCRIPTION,
@@ -1673,6 +1709,7 @@ export const orchestratorTools = restate.service({
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,
     add_project: addProjectTool,
+    set_project_agent_mode: setProjectAgentModeTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
     list_dispatch_reservations: listDispatchReservationsTool,

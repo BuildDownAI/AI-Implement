@@ -6343,10 +6343,101 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 
+  it("refuses mode changes for a missing mapping before writing", () => {
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction("MISSING", mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+    }
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("refuses inherited mapping name %s in both modes without writing", async (projectKey) => {
+    await seed();
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction(projectKey, mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
+  it("keeps absent-row legacy unchanged and refuses unresolved configuration without writing", async () => {
+    await seed();
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it("logs a failed agent mode write and preserves its refusal code", async () => {
+    await seed();
+    const err = new Error("database write failed");
+    const write = vi.spyOn(modules.agentConfigStore, "setProjectConfigured").mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] set project agent mode failed:", err);
+    } finally {
+      write.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it.each(["getProjectStageConfig", "getOrchestratorDefaults"] as const)("keeps creation successful when %s throws", async (readName) => {
+    await seed();
+    const registry = makeFakeRegistry(provider);
+    const invalidate = vi.spyOn(registry, "invalidate");
+    const queue = await import("../workflow-sync-queue.js");
+    const sync = vi.spyOn(queue, "runWorkflowSync").mockResolvedValueOnce(undefined);
+    const err = new Error("stored configuration unreadable");
+    const read = vi.spyOn(modules.agentConfigStore, readName).mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await requestWithRegistry("/api/mappings", "POST", adminTok(), registry, { teamKey: "NEW", owner: "org", repo: "new", defaultBranch: "main" });
+      expect(result.statusCode).toBe(202);
+      const body = JSON.parse(result.body);
+      expect(body.warnings).toEqual(["Project saved in legacy mode: resolution-failed"]);
+      expect(config.getMappings().NEW).toBeDefined();
+      expect(modules.agentConfigStore.isProjectConfigured("NEW")).toBe(false);
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(sync).toHaveBeenCalledExactlyOnceWith(body.syncJobId, expect.anything());
+      expect(queue.getWorkflowSyncById(body.syncJobId)).toMatchObject({ teamKey: "NEW" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] configure new project failed:", err);
+    } finally {
+      read.mockRestore();
+      sync.mockRestore();
+      invalidate.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("changes both modes preserving stages and actor, and unchanged modes append nothing even with invalid defaults", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", false);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { planning: { model: "project-model" } } });
+    const stages = modules.agentConfigStore.getProjectStageConfig("APP")!.config.stages;
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "configured" });
+    expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "operator", config: { mode: "configured", stages } });
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const unchanged = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged);
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "other", config: { mode: "legacy", stages } });
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+  });
+
   it("preserves resolution failure diagnostics when defaults become legacy", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
-      enabled: true, stages: { planning: { model: "project-model" } },
+      stages: { planning: { model: "project-model" } },
     }, readyDeps())).status).toBe(200);
     expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy" })).status).toBe(200);
 
@@ -6356,7 +6447,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       enabled: true, mode: "configured", resolved: false,
       error: {
         code: "resolution_failed",
-        message: "project opted into stage configuration but orchestrator defaults are not configured",
+        message: "project is configured for stage agents but the orchestrator stage defaults are off",
       },
     });
     for (const stage of ["planning", "implementation", "review"]) {
@@ -6366,6 +6457,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("names the stage when every default account is later disabled", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     for (const profileId of ["review-1", "review-2"]) {
       expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId }))).status).toBe(201);
     }
@@ -6375,13 +6467,14 @@ describe("model accounts and stage configuration (AII-962)", () => {
     for (const profileId of ["review-1", "review-2"]) {
       expect((await call(`/api/model-accounts/${profileId}`, "PATCH", t, { status: "disabled" })).status).toBe(200);
     }
-    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     expect(result.status).toBe(400);
     expect(result.json.error).toBe("review.accounts: no entry resolves (resolution_failed)");
   });
 
   it("stores singleton accounts flat, refuses project lists, and exposes failed entries", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const config = structuredClone(defaults);
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }] });
     const singleton = await call("/api/agent-defaults", "PUT", t, config);
@@ -6393,7 +6486,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "oai-2" }));
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }, { accountProfileId: "oai-2", model: "" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
-    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
     const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(resolved.json.stages.planning.entries).toMatchObject([
@@ -6440,7 +6533,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "m" }, { accountProfileId: "other", model: "claude" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
     // Simulate an existing project override; the save route correctly refuses this configuration.
-    modules.agentConfigStore.setProjectOptIn("APP", true);
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     dedup.getDb().prepare("INSERT INTO stage_agent_config_revisions (config_revision_id, scope_kind, scope_key, revision, version, config_json, created_at) VALUES ('override-test', 'project', 'APP', 2, 1, ?, ?)").run(
       JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
     const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
@@ -6470,7 +6563,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     }
     expect(saved.status).toBe(200);
     expect((await call("/api/mappings/FLY/agent-config", "PUT", t, {
-      enabled: true, stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
+      stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
     }, readyDeps())).status).toBe(200);
     const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
     expect(resolved.status).toBe(200);
@@ -6489,7 +6582,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     const config = structuredClone(defaults);
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "claude" }, { accountProfileId: "cl-api", model: "claude-api-model" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
-    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps())).status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: {} }, readyDeps())).status).toBe(200);
     const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
     expect(resolved.json.stages.planning.entries).toMatchObject([{ passes: false, reason: "unsupported_combination" }, { passes: true }]);
     expect(resolved.json.stages.planning.values.accountProfileId).toBe("cl-api");
@@ -6508,7 +6601,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       ["/api/model-accounts", "POST", profileBody({ profileId: "x1" })],
       ["/api/model-accounts/oai-1", "PATCH", { status: "disabled" }],
       ["/api/agent-defaults", "PUT", defaults],
-      ["/api/mappings/APP/agent-config", "PUT", { enabled: false }],
+      ["/api/mappings/APP/agent-config", "PUT", { stages: {} }],
     ] as const) {
       expect((await call(url, method, u, body, readyDeps())).status).toBe(403);
     }
@@ -6560,6 +6653,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("keeps old revisions on PATCH of a disabled profile", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const store = modules.agentConfigStore;
     const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
     expect(patched.json).toMatchObject({ revision: 2, identity: "Renamed", profileStatus: "active" });
@@ -6568,7 +6662,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
     expect(store.getAccountProfile("oai-1")?.revision).toBe(3);
     // A disabled profile is refused by a new project config.
-    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     expect(put.status).toBe(400);
     expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
   });
@@ -6603,10 +6697,11 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("saves and resolves fallback models with field provenance", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const deps = readyDeps();
     const configuredDefaults = { ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, fallbackModel: "backup" } } };
     expect((await call("/api/agent-defaults", "PUT", t, configuredDefaults)).status).toBe(200);
-    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, deps)).status).toBe(200);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, deps)).status).toBe(200);
     const resolved = async () => (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json.stages.review;
     expect(await resolved()).toMatchObject({ values: { fallbackModel: "backup" }, sources: { fallbackModel: "orchestrator-default" } });
     expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel: "project-backup" } } }, deps)).status).toBe(200);
@@ -6638,10 +6733,11 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect((await call("/api/agent-defaults", "GET", t)).json).toMatchObject({ configured: true, enabled: true });
   });
 
-  it("round-trips opt-in and individual inheritance fields", async () => {
+  it("round-trips individual inheritance fields on a configured project", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const deps = readyDeps();
-    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } }, deps);
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } }, deps);
     expect(put.status).toBe(200);
     let got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
     expect(got).toMatchObject({ enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } });
@@ -6663,57 +6759,59 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(resolved.stages.review.sources.model).toBe("orchestrator-default");
     expect(resolved.stages.review.sources.invocationTimeoutMs).toBe("project");
 
-    // Disabling needs no readiness and keeps the overrides.
-    const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false });
-    expect(off.status).toBe(200);
-    expect((await call("/api/mappings/APP/agent-config", "GET", t)).json).toMatchObject({ enabled: false, stages: { review: { invocationTimeoutMs: 900000 } } });
     expect((await call("/api/mappings/NOPE/agent-config", "GET", t)).status).toBe(404);
   });
 
   it("returns actionable resolution errors instead of a 500", async () => {
     const t = await seed();
-    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
     const r = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(r.status).toBe(200);
     expect(r.json).toMatchObject({ resolved: false, error: { code: "resolution_failed" } });
   });
 
-  describe("readiness gate on opt-in", () => {
-    const optIn = (t: string, inspect: (r: any) => Promise<unknown>) =>
-      call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps(inspect));
+  describe("readiness gate on configured stage changes", () => {
+    const optIn = (t: string, inspect: (r: any) => Promise<unknown>) => {
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      return call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps(inspect));
+    };
 
-    it("refuses an unready GitHub Actions project, names the workflow-sync action and restores legacy", async () => {
+    it("refuses an unready GitHub Actions project, names the workflow-sync action and preserves configured mode", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       for (const code of ["runner_incompatible", "retired_workflow_present"]) {
         const r = await optIn(t, async () => ({ status: "not-ready", code }));
         expect(r.status).toBe(409);
         expect(r.json).toMatchObject({ code, backend: "github-actions" });
         expect(r.json.action).toMatch(/workflow sync/);
-        expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+        expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
       }
     });
 
     it("serialises concurrent PUTs so a refusal's rollback cannot clobber a later valid write", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       let release!: () => void;
       const gate = new Promise<void>((r) => (release = r));
       const first = optIn(t, async () => {
         await gate;
         return { status: "not-ready", code: "runner_incompatible" };
       });
-      const second = call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false, stages: { review: { model: "m-2" } } });
+      const second = call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "m-2" } } }, readyDeps());
       release();
       const [a, b] = await Promise.all([first, second]);
       expect(a.status).toBe(409);
       expect(b.status).toBe(200);
       const head = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
-      expect(head.enabled).toBe(false);
+      expect(head.enabled).toBe(true);
       expect(head.stages.review.model).toBe("m-2");
     });
 
-    it("inspects the candidate without publishing it: nothing is stored while inspection is pending or after a refusal", async () => {
+    it("inspects the candidate without publishing it: no revision is appended while inspection is pending or after a refusal", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       const revs = count("stage_agent_config_revisions");
       let release!: () => void;
@@ -6728,25 +6826,26 @@ describe("model accounts and stage configuration (AII-962)", () => {
         return { status: "not-ready", code: "runner_incompatible" };
       });
       await inside;
-      expect(store.getProjectOptIn("APP")).toBe(false);
-      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(store.isProjectConfigured("APP")).toBe(true);
+      expect(store.getProjectStageConfig("APP")?.config.mode).toBe("configured");
       expect(count("stage_agent_config_revisions")).toBe(revs);
       release();
       expect((await pending).status).toBe(409);
-      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(store.getProjectStageConfig("APP")?.config.mode).toBe("configured");
       expect(count("stage_agent_config_revisions")).toBe(revs);
       expect(seen).toHaveLength(1);
     });
 
     it("refuses to commit readiness when the defaults, a profile or the project head moved during inspection", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       const moves: Array<[string, () => void]> = [
         ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
         ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", metadata: { credentialRef: SENTINEL } } as never)],
         ["project", () => void store.setProjectStageConfig("APP", { version: 1, mode: "legacy", stages: { review: { model: "newer" } } } as never)],
       ];
-      for (const [, move] of moves) {
+      for (const [name, move] of moves) {
         const before = store.getProjectStageConfig("APP")?.revision ?? 0;
         const r = await optIn(t, async () => {
           move();
@@ -6754,48 +6853,52 @@ describe("model accounts and stage configuration (AII-962)", () => {
         });
         expect(r.status).toBe(409);
         expect(r.json.code).toBe("stale_inputs");
-        expect(store.getProjectOptIn("APP")).toBe(false);
+        expect(store.isProjectConfigured("APP")).toBe(name !== "project");
         // Only the concurrent writer's own revision (project move) may exist; the stale candidate never lands.
         expect(store.getProjectStageConfig("APP")?.revision ?? 0).toBeLessThanOrEqual(before + 1);
       }
       expect(store.getProjectStageConfig("APP")?.config.stages?.review?.model).toBe("newer");
     });
 
-    it("rejects invalid candidates, skips readiness when disabled and stores nothing on inspection failure", async () => {
+    it("rejects invalid candidates, skips readiness in legacy mode and appends nothing on inspection failure", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
-      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
       expect(r.status).toBe(400);
       expect(inspect).not.toHaveBeenCalled();
-      const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false }, readyDeps(inspect));
+      store.setProjectConfigured("APP", false);
+      const off = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps(inspect));
       expect(off.status).toBe(200);
       expect(inspect).not.toHaveBeenCalled();
       const backendFail = await optIn(t, async () => {
         throw new Error("boom");
       });
       expect(backendFail.status).toBe(503);
-      expect(store.getProjectOptIn("APP")).toBe(false);
+      expect(store.isProjectConfigured("APP")).toBe(true);
     });
 
-    it("refuses unreadable GitHub Actions workflows with the sync action and stores nothing", async () => {
+    it("refuses unreadable GitHub Actions workflows with the sync action and appends nothing", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const revs = count("stage_agent_config_revisions");
       const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));
       expect(r.status).toBe(409);
       expect(r.json).toMatchObject({ code: "delivery_unreadable", backend: "github-actions",
         action: "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows." });
-      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(false);
-      expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(true);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")?.config.mode).toBe("configured");
       expect(count("stage_agent_config_revisions")).toBe(revs);
     });
 
-    it("enables a ready GitHub Actions project after inspecting readiness", async () => {
+    it("saves a configured GitHub Actions project after inspecting readiness", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
       expect((await optIn(t, inspect)).status).toBe(200);
       expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions", projectKey: "APP" }), expect.objectContaining({ mode: "configured" }));
-      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(true);
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(true);
       expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
     });
 
@@ -6803,7 +6906,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const t = await seed();
       await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
       const seen: string[] = [];
-      const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps(async (req: any) => {
+      const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: {} }, readyDeps(async (req: any) => {
         seen.push(req.backend);
         return { status: "ready", profiles: [] };
       }));
@@ -6813,31 +6916,32 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("fails closed when no readiness inspection is configured", async () => {
       const t = await seed();
-      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true });
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} });
       expect(r.status).toBe(501);
-      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
     });
 
-    it.each([true, false])("continues Claude subscription opt-in to readiness (ready: %s)", async (ready) => {
+    it.each([true, false])("continues Claude subscription stage changes to readiness (ready: %s)", async (ready) => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
       expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
-        enabled: false, stages: { review: { model: "previous-model" } },
-      })).status).toBe(200);
+        stages: { review: { model: "previous-model" } },
+      }, readyDeps())).status).toBe(200);
       const previousConfig = store.getProjectStageConfig("APP");
       const revs = count("stage_agent_config_revisions");
       const inspect = vi.fn(async () => ready
         ? { status: "ready", profiles: [] }
         : { status: "not-ready", code: "runner_incompatible" });
       const r = await call("/api/mappings/APP/agent-config", "PUT", t, {
-        enabled: true,
         stages: { review: { agent: "claude", provider: "anthropic", accountProfileId: "cl-sub", model: "m" } },
       }, readyDeps(inspect));
       expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ projectKey: "APP" }),
         expect.objectContaining({ stages: expect.objectContaining({ review: expect.objectContaining({ accountProfileId: "cl-sub" }) }) }));
       expect(r.status).toBe(ready ? 200 : 409);
-      expect(store.getProjectOptIn("APP")).toBe(ready);
+      expect(store.isProjectConfigured("APP")).toBe(true);
       if (ready) {
         expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
         const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, readyDeps());
@@ -6852,13 +6956,86 @@ describe("model accounts and stage configuration (AII-962)", () => {
     });
   });
 
+  it.each([true, false, null, 0, "yes", {}, []])("refuses enabled without storing (%j)", async (enabled) => {
+    const t = await seed();
+    for (const mode of ["absent", "legacy", "configured"] as const) {
+      if (mode !== "absent") modules.agentConfigStore.setProjectStageConfig("APP", { version: 1, mode });
+      const before = count("stage_agent_config_revisions");
+      const row = modules.agentConfigStore.getProjectStageConfig("APP");
+      const result = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled });
+      expect(result).toMatchObject({ status: 400, json: { error: "unsupported field(s): enabled" } });
+      expect(count("stage_agent_config_revisions")).toBe(before);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")).toEqual(row);
+    }
+  });
+
+  it.each(["absent", "legacy", "configured"] as const)("stores stages preserving %s mode", async (mode) => {
+    const t = await seed();
+    if (mode !== "absent") modules.agentConfigStore.setProjectStageConfig("APP", { version: 1, mode });
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "override" } } }, readyDeps());
+    expect(result.status).toBe(200);
+    expect(result.json.mode).toBe(mode === "configured" ? "configured" : "legacy");
+  });
+
+  it.each([
+    { body: {}, status: 200 },
+    { body: { stages: {} }, status: 200 },
+    { body: { stages: null }, status: 400 },
+    { body: { stages: [] }, status: 400 },
+    { body: { stages: { unknown: {} } }, status: 400 },
+    { body: { mode: "configured" }, status: 400 },
+  ])("preserves other body validation: $body", async ({ body, status }) => {
+    const t = await seed();
+    const before = count("stage_agent_config_revisions");
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, body);
+    expect(result.status).toBe(status);
+    expect(count("stage_agent_config_revisions")).toBe(before + (status === 200 ? 1 : 0));
+  });
+
+  it.each(["configured", "legacy", "absent", "failure", "existing-legacy", "existing-configured"])("creates with defaults and project state %s", async (state) => {
+    const t = state === "absent" ? adminTok() : await seed();
+    const store = modules.agentConfigStore;
+    if (state === "legacy") store.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    if (state.startsWith("existing-")) store.setProjectStageConfig("NEW", { version: 1, mode: state === "existing-configured" ? "configured" : "legacy" });
+    if (state === "failure") await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const row = store.getProjectStageConfig("NEW");
+    const before = count("stage_agent_config_revisions");
+    const result = await request("/api/mappings", "POST", "secret", { teamKey: "NEW", owner: "org", repo: "new" }, t);
+    expect(result.statusCode).toBe(202);
+    const body = JSON.parse(result.body);
+    expect(config.getMappings().NEW).toBeDefined();
+    if (state === "configured") {
+      expect(store.getProjectStageConfig("NEW")).toMatchObject({ createdBy: null, config: { mode: "configured" } });
+      expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    } else {
+      expect(store.getProjectStageConfig("NEW")).toEqual(row);
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+    if (state === "failure") expect(body.warnings).toEqual(["Project saved in legacy mode: resolution-failed"]);
+    else expect(body.warnings).toBeUndefined();
+  });
+
+  it.each(["absent", "legacy", "configured"] as const)("mapping updates preserve %s with defaults on for every body", async (mode) => {
+    const t = await seed();
+    const store = modules.agentConfigStore;
+    if (mode !== "absent") store.setProjectStageConfig("APP", { version: 1, mode });
+    const before = count("stage_agent_config_revisions");
+    const row = store.getProjectStageConfig("APP");
+    for (const body of [{}, { enabled: true }, { enabled: false }, { agentConfig: { mode: "configured" } }]) {
+      const r = await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
+      expect(r.statusCode).toBe(202);
+      expect(store.getProjectStageConfig("APP")).toEqual(row);
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
   it("keeps ordinary mapping CRUD from touching agent configuration", async () => {
     const t = await seed();
     const store = modules.agentConfigStore;
     const body = { enabled: true, agentConfig: { mode: "configured" } };
     await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
     await request("/api/mappings/APP", "PATCH", "secret", body, t);
-    expect(store.getProjectOptIn("APP")).toBe(false);
+    expect(store.isProjectConfigured("APP")).toBe(false);
     expect(store.getProjectStageConfig("APP")).toBeNull();
   });
 

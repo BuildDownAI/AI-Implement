@@ -29,6 +29,8 @@ import {
   setRunnerModeTool,
   pauseProjectTool,
   addProjectTool,
+  setProjectAgentModeTool,
+  SetProjectAgentModeArgsSchema,
   addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
@@ -53,6 +55,7 @@ import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
+  setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -63,7 +66,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as InFlightModule from "../in-flight-work.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
-import { makeAppendLogEntry, makeMapping, makeRegistry } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeMapping, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -82,10 +85,11 @@ vi.mock("../config.js", async (importOriginal) => ({
   getMappings: vi.fn(),
 }));
 
-// The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
-// wholesale (no importOriginal) since tools.ts only imports these five names from admin.ts
+// The six non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
+// wholesale (no importOriginal) since tools.ts only imports these six names from admin.ts
 // and nothing here needs the rest of that module's (much heavier) real behaviour.
 vi.mock("../admin.js", () => ({
+  setProjectAgentModeAction: vi.fn(),
   setRunnerModeAction: vi.fn(),
   pauseProjectAction: vi.fn(),
   upsertMappingAction: vi.fn(),
@@ -1061,6 +1065,48 @@ describe("migrated read handlers (AII-711)", () => {
   });
 });
 
+describe("get_tenant_health stageAgents", () => {
+  let tools: typeof ToolsModule;
+  let store: typeof import("../agent-config-store.js");
+
+  beforeEach(async () => {
+    ({ tools, store } = (await testDb({ modules: {
+      tools: () => import("../restate/tools.js"),
+      store: () => import("../agent-config-store.js"),
+    } })).modules);
+    vi.mocked(getMappings).mockReturnValue({});
+  });
+
+  const health = async () => JSON.parse((await tools.getTenantHealth(fakeContext("get_tenant_health"), { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
+
+  it("defaults to legacy without a defaults row and returns no projects without mappings", async () => {
+    expect((await health()).stageAgents).toEqual({ defaultsMode: "legacy", projects: [] });
+  });
+
+  it("reports mapped keys only, sorted, with missing project rows treated as legacy", async () => {
+    store.saveAccountProfileRevision(makeStageAgentProfile());
+    store.setOrchestratorDefaults(makeStageAgentDefaults());
+    store.setProjectConfigured("UNMAPPED", true);
+    store.setProjectConfigured("AII", true);
+    store.setProjectConfigured("EXPLICIT", true);
+    store.setProjectConfigured("EXPLICIT", false);
+    vi.mocked(getMappings).mockReturnValue({
+      EXPLICIT: makeMapping(), BDS: makeMapping(),
+      AII: makeMapping({ extraEnv: { SECRET: "must-not-leak" } }),
+    });
+    expect((await health()).stageAgents).toEqual({
+      defaultsMode: "configured",
+      projects: [
+        { teamKey: "AII", agentMode: "configured" },
+        { teamKey: "BDS", agentMode: "legacy" },
+        { teamKey: "EXPLICIT", agentMode: "legacy" },
+      ],
+    });
+    store.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    expect((await health()).stageAgents.defaultsMode).toBe("legacy");
+  });
+});
+
 // ---- get_tenant_health's restate field (AII-807): reports the shared status contract
 // (src/restate/status.ts, AII-773) the same way GET / does — same source of truth, no
 // second copy of sidecar/registration state.
@@ -1341,12 +1387,12 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
   });
 });
 
-// ---- The six writes AII-713 moved off WRITE_TOOLS in src/mcp.ts. Each action call, its args
+// ---- The five writes AII-713 moved off WRITE_TOOLS in src/mcp.ts. Each action call, its args
 // validation, and its status-to-text mapping are unchanged — see mcp.test.ts for the same
 // cases exercised through the /mcp adapter, and tools.restate.test.ts for the idempotency
 // scenario and the forbidden-role case over a real ingress.
 //
-// AII-717: every one of these six also now runs its side effect through ctx.run with
+// AII-717: every one of these writes also now runs its side effect through ctx.run with
 // { maxRetryAttempts: 1 } and declares retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" }
 // on its tool() definition — see the "retryPolicy declarations (AII-717)" describe below for
 // the latter. fakeContext's `run` records each call so a scenario here can assert the step
@@ -1717,6 +1763,29 @@ describe("migrated write handlers (AII-713)", () => {
     });
   });
 
+  describe("set_project_agent_mode", () => {
+    it("journals the action once with its mode and actor", async () => {
+      vi.mocked(setProjectAgentModeAction).mockReturnValue({ ok: true, teamKey: "AII", agentMode: "configured" });
+      const calls: RunCall[] = [];
+      const result = await setProjectAgentModeTool(fakeContext("set_project_agent_mode", calls), {
+        caller: admin, args: { teamKey: "AII", mode: "configured" },
+      });
+      expect(setProjectAgentModeAction).toHaveBeenCalledWith("AII", "configured", "system");
+      expect(result).toEqual({ content: [{ type: "text", text: '{"teamKey":"AII","agentMode":"configured"}' }] });
+      expect(calls).toEqual([{ name: "set-project-agent-mode", options: { maxRetryAttempts: 1 },
+        result: { ok: true, teamKey: "AII", agentMode: "configured" } }]);
+    });
+    it.each(["mapping-not-found", "resolution-failed"] as const)("returns the bare refusal %s", async (code) => {
+      vi.mocked(setProjectAgentModeAction).mockReturnValue({ ok: false, code });
+      expect(await setProjectAgentModeTool(fakeContext("set_project_agent_mode"), {
+        caller: admin, args: { teamKey: "AII", mode: "configured" },
+      })).toEqual({ isError: true, content: [{ type: "text", text: code }] });
+    });
+    it.each(["action", "attemptId", "pipeline", "backend", "patch", "schedule", "paused", "issueId", "dispatchId"])("rejects unknown argument %s", (key) => {
+      expect(SetProjectAgentModeArgsSchema.safeParse({ teamKey: "AII", mode: "legacy", [key]: "x" }).success).toBe(false);
+    });
+  });
+
   describe("add_project", () => {
     it("has no separate pre-validation — a partial args object reaches upsertMappingAction through ctx.run, whose own 400 comes back verbatim", async () => {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 400, body: { error: "teamKey, owner, and repo are required" } });
@@ -1861,7 +1930,7 @@ describe("migrated write handlers (AII-713)", () => {
 // dead attempt from ever being re-delivered; no read handler does. Read off the handler
 // function's own closed-over options isn't possible from outside the module, so this checks
 // the same thing restate-boundary.test.ts's static check does — the declaration is present in
-// source — for the six write definitions specifically, plus a negative check on a read.
+// source — for the write definitions specifically, plus a negative check on a read.
 describe("retryPolicy declarations (AII-717)", () => {
   const TOOLS_SOURCE = readFileSync("src/restate/tools.ts", "utf8");
 
@@ -1878,6 +1947,7 @@ describe("retryPolicy declarations (AII-717)", () => {
     "setRunnerModeTool",
     "pauseProjectTool",
     "addProjectTool",
+    "setProjectAgentModeTool",
     "triggerWorkflowSyncTool",
     "clearDispatchDedupTool",
   ])("%s declares retryPolicy: { maxAttempts: 1, onMaxAttempts: \"kill\" }", (exportName) => {
