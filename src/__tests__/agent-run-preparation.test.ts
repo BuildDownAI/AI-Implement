@@ -860,8 +860,12 @@ describe("ordered account preparation", () => {
     configure();
     store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { implementation: accountOverride ? { accountProfileId: "brk" } : { model: "project-model" } } });
     const result = ready(await prep.prepareAgentRun(request(), deps));
-    expect(result.accountFallbacks?.implementation?.map(entry => entry.accountProfileId) ?? []).toEqual(accountOverride ? [] : ["api"]);
+    expect(result.accountFallbacks?.implementation?.map(entry => entry.accountProfileId)).toEqual(["api"]);
     expect(result.snapshot.stages.implementation.model).toBe(accountOverride ? "m" : "project-model");
+    const persisted = JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string);
+    expect(persisted.accountFallbacks).toEqual(result.accountFallbacks);
+    store.retireAccountProfile("api");
+    expect(ready(await prep.prepareAgentRun(request(), deps)).accountFallbacks).toEqual(result.accountFallbacks);
   });
   it("returns the concurrent insert winner's metadata rather than its candidate", async () => {
     configure();
