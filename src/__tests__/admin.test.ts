@@ -6610,7 +6610,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
   it.each([
     { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
     { agent: "claude", provider: "bedrock", authMode: "bedrock" },
-  ])("skips an incompatible account-only override ($provider)", async profile => {
+  ])("refuses an incompatible account-only override ($provider)", async profile => {
     const t = await seed();
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "other", ...profile }));
     const config = structuredClone(defaults);
@@ -6622,12 +6622,12 @@ describe("model accounts and stage configuration (AII-962)", () => {
       JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
     const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(resolved.status).toBe(200);
-    expect(resolved.json.resolved).toBe(true);
+    expect(resolved.json.resolved).toBe(false);
     expect(resolved.json.stages.planning.entries).toMatchObject([
       { accountProfileId: "other", passes: false, reason: "resolution_failed" },
       { accountProfileId: "oai-1", passes: true },
     ]);
-    expect(resolved.json.stages.planning.values.accountProfileId).toBe("oai-1");
+    expect(resolved.json.stages.planning.values).toBeUndefined();
   });
 
   it.each([
@@ -6708,6 +6708,9 @@ describe("model accounts and stage configuration (AII-962)", () => {
     const failed = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(failed.json.resolved).toBe(false);
     expect(failed.json.stages.implementation.fallbacksDropped).toBe(true);
+    expect(failed.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(failed.json.stages.planning.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
   });
 
   it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {

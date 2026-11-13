@@ -306,7 +306,7 @@ describe("resolveStageAgentConfig", () => {
     expect(err.message).not.toContain("sk-secret-agent");
   });
 
-  it("rejects incompatible fields and skips incompatible project accounts", () => {
+  it("rejects incompatible fields and project accounts", () => {
     expectError(
       () =>
         resolveStageAgentConfig({
@@ -317,21 +317,19 @@ describe("resolveStageAgentConfig", () => {
       /provider does not match/,
     );
 
-    const result = resolveStageAgentConfig({
+    expect(() => resolveStageAgentConfig({
       orchestratorDefaults,
       projectConfig: configuredProject({ implementation: { accountProfileId: "claude-api" } }),
       accountProfiles,
-    });
-    expect(result.mode === "configured" && result.stages.implementation.accountProfileId).toBe("openai-api");
+    })).toThrow(StageAccountError);
   });
 
-  it("falls back from unknown project profiles and rejects disabled defaults", () => {
-    const result = resolveStageAgentConfig({
+  it("rejects unknown project profiles and disabled defaults", () => {
+    expect(() => resolveStageAgentConfig({
       orchestratorDefaults,
       projectConfig: configuredProject({ implementation: { accountProfileId: "missing" } }),
       accountProfiles,
-    });
-    expect(result.mode === "configured" && result.stages.implementation.accountProfileId).toBe("openai-api");
+    })).toThrow(StageAccountError);
 
     expectError(
       () =>
@@ -549,30 +547,24 @@ describe("project accounts followed by orchestrator defaults", () => {
     expect(result.accountEntries!.planning!.map(e => e.accountProfileId)).toEqual(["claude-bedrock", "claude-api", "claude-subscription"]);
   });
 
-  it.each(["missing", "disabled", "backend"] as const)("skips a %s project account and attributes flat default fields correctly", reason => {
+  it.each(["missing", "disabled", "backend"] as const)("refuses a %s project account even when a default passes", reason => {
     const defaults = structuredClone(orchestratorDefaults);
     Object.assign(defaults.stages!.review!, { accountProfileId: "claude-subscription", provider: "anthropic" });
-    const result = resolveStageAgentConfig({ orchestratorDefaults: defaults,
+    expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults,
       projectConfig: configuredProject({ planning: { accountProfileId: reason === "missing" ? "missing" : "claude-bedrock", provider: "bedrock", model: "project-model" } }),
       accountProfiles: accountProfiles.map(p => ({ ...p, disabled: reason === "disabled" && p.id === "claude-bedrock" })),
       checkAccount: e => reason === "backend" && e.accountProfileId === "claude-bedrock" ? "unsupported_combination" : null,
-    });
-    if (result.mode !== "configured") throw new Error("expected configured");
-    expect(result.stages.planning.accountProfileId).toBe("claude-api");
-    expect(result.sources.planning.model).toBe("orchestrator-default");
-    expect(result.selection.planning).toEqual({ chosen: 1, skipped: [{ index: 0, accountProfileId: reason === "missing" ? "missing" : "claude-bedrock", reason: reason === "backend" ? "unsupported_combination" : "resolution_failed" }] });
+    })).toThrow(new StageAccountError("planning", reason === "backend" ? "unsupported_combination" : "resolution_failed"));
   });
 });
 
-it.each([false, true])("drops redundant fallback models after skipping a project account (list=%s)", accounts => {
+it.each([false, true])("refuses a failed project account before handling fallback model collisions (list=%s)", accounts => {
   const defaults = structuredClone(orchestratorDefaults);
   defaults.stages!.planning!.fallbackModel = defaults.stages!.planning!.model;
   if (accounts) defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: defaults.stages!.planning!.model! }];
-  const result = resolveStageAgentConfig({ orchestratorDefaults: defaults,
-    projectConfig: configuredProject({ planning: { accountProfileId: "missing", model: "project-model" } }), accountProfiles });
-  if (result.mode !== "configured") throw new Error("expected configured");
-  expect(result.fallbackModels).toEqual({});
-  expect(result.fallbackModelSources).toEqual({});
+  expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults,
+    projectConfig: configuredProject({ planning: { accountProfileId: "missing", model: "project-model" } }), accountProfiles
+  })).toThrow(new StageAccountError("planning", "resolution_failed"));
 });
 
 it("checks appended defaults and preserves their diagnostic failure reasons", () => {
@@ -593,10 +585,41 @@ it("checks appended defaults and preserves their diagnostic failure reasons", ()
   expect(result.accountFallbacks.planning?.map(e => [e.accountProfileId, e.model])).toEqual([["claude-subscription", "default-model"]]);
 });
 
-it("drops fallback model metadata when a rejected project falls back to another provider", () => {
-  const result = resolveStageAgentConfig({ orchestratorDefaults,
-    projectConfig: configuredProject({ planning: { accountProfileId: "missing", provider: "bedrock", model: "project-model", fallbackModel: "bedrock-fallback" } }), accountProfiles });
+it("refuses a failed project account before considering another provider", () => {
+  expect(() => resolveStageAgentConfig({ orchestratorDefaults,
+    projectConfig: configuredProject({ planning: { accountProfileId: "missing", provider: "bedrock", model: "project-model", fallbackModel: "bedrock-fallback" } }), accountProfiles
+  })).toThrow(new StageAccountError("planning", "resolution_failed"));
+});
+
+it.each([false, true])("retains flat-default fallback metadata for a passing project account (provider change=%s)", changesProvider => {
+  const defaults = structuredClone(orchestratorDefaults);
+  defaults.stages!.planning!.fallbackModel = "default-backup";
+  const result = resolveStageAgentConfig({ orchestratorDefaults: defaults,
+    projectConfig: configuredProject({ planning: {
+      accountProfileId: changesProvider ? "claude-bedrock" : "claude-api",
+      provider: changesProvider ? "bedrock" : "anthropic", model: "project-model", fallbackModel: "project-backup",
+    } }), accountProfiles });
   if (result.mode !== "configured") throw new Error("expected configured");
-  expect(result.stages.planning.provider).toBe("anthropic");
-  expect(result.fallbackModels).toEqual({});
+  expect(result.selection.planning).toEqual({ chosen: 0, skipped: [] });
+  expect(result.sources.planning).toMatchObject({ accountProfileId: "project", provider: "project", model: "project" });
+  expect(result.profiles.planning).toMatchObject({ id: changesProvider ? "claude-bedrock" : "claude-api" });
+  expect(result.fallbackModels).toEqual({ planning: "project-backup" });
+  expect(result.fallbackModelSources).toEqual({ planning: "project" });
+  expect(result.accountFallbacks.planning ?? []).toEqual(changesProvider ? [expect.objectContaining({
+    accountProfileId: "claude-api", model: "claude-sonnet-5-5", provider: "anthropic", profileRevision: 1, authMode: "anthropic-api-key",
+  })] : []);
+});
+
+it.each([false, true])("checks fallback model collisions with a passing project account (list=%s)", accounts => {
+  const defaults = structuredClone(orchestratorDefaults);
+  defaults.stages!.planning!.fallbackModel = "default-backup";
+  if (accounts) defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: "default-model" }];
+  const resolve = (model: string) => resolveStageAgentConfig({ orchestratorDefaults: defaults,
+    projectConfig: configuredProject({ planning: { accountProfileId: "claude-bedrock", provider: "bedrock", model } }), accountProfiles });
+  const result = resolve("project-model");
+  if (result.mode !== "configured") throw new Error("expected configured");
+  expect(result.fallbackModels).toEqual({ planning: "default-backup" });
+  expect(result.fallbackModelSources).toEqual({ planning: "orchestrator-default" });
+  expect(result.accountFallbacks.planning?.[0].accountProfileId).toBe("claude-api");
+  expect(() => resolve("default-backup")).toThrow("planning.fallbackModel must differ from model");
 });

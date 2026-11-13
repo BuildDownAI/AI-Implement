@@ -369,6 +369,11 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       fallbackModelSources[stage] = projectFallback != null ? "project" : "orchestrator-default";
     }
     const choice = chooseStageAccount(entries, check);
+    // A project account is mandatory; appended defaults are runtime fallbacks.
+    if (input.projectConfig.stages?.[stage]?.accountProfileId != null &&
+        (!choice.chosen || choice.chosen.index !== 0)) {
+      throw new StageAccountError(stage, choice.chosen ? choice.skipped[0].reason : choice.failure);
+    }
     if (!choice.chosen) {
       // Preserve the existing fixed resolver messages for flat configurations.
       if (!defaults?.accounts && choice.failure === "resolution_failed") {
