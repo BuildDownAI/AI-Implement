@@ -7,6 +7,7 @@ import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MAX_TRACKED_PRS } from "../../kg-refresh.js";
 import { createKgRepo, type KgRepoEnqueueResult, type KgRepoTriggerResult } from "../../restate/kg-repo.js";
+import type { KgRefreshResume } from "../../restate/kg-refresh-workflow.js";
 import { VARIANTS, attachInvocation, awaitSentInvocations, callObject, callService, cancelInvocation, eventually, killInvocation, queryInvocations, setObjectState, settle, startVariants, stopAll } from "./harness.js";
 
 const FAKE_WORKFLOW_NAME = "FakeKgRefresh";
@@ -15,7 +16,7 @@ const HOLD_MS = 24 * 60 * 60 * 1000;
 
 interface RunSend {
   key: string;
-  parameter: { triggerId: string; dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string } };
+  parameter: { triggerId: string; dryRun?: boolean; kgSourceRef?: string; acceptNewBaseline?: boolean; report?: { repo: string; prNumber: number; sha: string }; resume?: KgRefreshResume };
 }
 
 // release, expire and recordDryRunOutcome are ingressPrivate (AII-976): only another handler
@@ -767,13 +768,16 @@ describe("KgRepo durable single-flight lock", () => {
     async (label) => {
       const env = envFor(label);
       const slug = newKey();
-      const before = runSends.length;
       const triggerId = ((await trigger(env.baseUrl(), slug)) as { triggerId: string }).triggerId;
       // A hold already due (delay 0): the scheduled send itself fires, with no test-side call and no wall-clock margin.
       await callPrivate(env.baseUrl(), slug, "hold", { ...holdFor(triggerId), decideBy: Date.now() - 1 });
-      await eventually(() => runSends.length - before >= 2, (ok) => ok, { label: "the timeout run send" });
+      // Earlier fixtures can still send while this case runs. Observe this hold's
+      // timeout rather than counting unrelated sends in the shared array.
+      const timeoutSend = await eventually(() => runSends.find((send) =>
+        send.parameter.resume?.action === "timeout" && send.parameter.resume.hold.triggerId === triggerId),
+      (send) => send !== undefined, { label: "the timeout run send" });
       expect(await status(env.baseUrl(), slug)).toMatchObject({ triggerId: expect.not.stringMatching(triggerId), held: null });
-      expect(runSends[runSends.length - 1].parameter).toMatchObject({ resume: { action: "timeout", hold: { triggerId } } });
+      expect(timeoutSend!.parameter).toMatchObject({ resume: { action: "timeout", hold: { triggerId } } });
       expect(await scheduledDecides(env, slug)).toBe(0);
     },
   );
