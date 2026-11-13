@@ -1616,7 +1616,7 @@ async function handleListBlockers(
     // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
     const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
     const fileOverlapCandidates = allIssues.filter(
-      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && !parkedFor(i) && teamRepoMap[i.scopeKey],
+      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && !parkedFor(i) && Object.hasOwn(teamRepoMap, i.scopeKey),
     );
     const planningContexts = await getOrFetchPlanningContexts(
       [...fileOverlapCandidates, ...inFlightSiblings],
@@ -2161,8 +2161,7 @@ export function triggerWorkflowSyncAction(
   config: AdminConfig,
   teamKey: string,
 ): { status: number; body: Record<string, unknown> } {
-  const mappings = getMappings();
-  const mapping = mappings[teamKey];
+  const mapping = getOwnMapping(teamKey);
   if (!mapping) {
     return { status: 404, body: { error: "Team not found" } };
   }
@@ -2746,8 +2745,7 @@ async function handleListSecrets(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -2774,8 +2772,7 @@ async function handleSetSecret(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -2830,8 +2827,7 @@ async function handleUnsetSecret(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
