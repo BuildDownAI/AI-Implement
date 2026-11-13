@@ -6371,6 +6371,48 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(count("stage_agent_config_revisions")).toBe(before);
   });
 
+  it("logs a failed agent mode write and preserves its refusal code", async () => {
+    await seed();
+    const err = new Error("database write failed");
+    const write = vi.spyOn(modules.agentConfigStore, "setProjectConfigured").mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] set project agent mode failed:", err);
+    } finally {
+      write.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it.each(["getProjectStageConfig", "getOrchestratorDefaults"] as const)("keeps creation successful when %s throws", async (readName) => {
+    await seed();
+    const registry = makeFakeRegistry(provider);
+    const invalidate = vi.spyOn(registry, "invalidate");
+    const queue = await import("../workflow-sync-queue.js");
+    const sync = vi.spyOn(queue, "runWorkflowSync").mockResolvedValueOnce(undefined);
+    const err = new Error("stored configuration unreadable");
+    const read = vi.spyOn(modules.agentConfigStore, readName).mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await requestWithRegistry("/api/mappings", "POST", adminTok(), registry, { teamKey: "NEW", owner: "org", repo: "new", defaultBranch: "main" });
+      expect(result.statusCode).toBe(202);
+      const body = JSON.parse(result.body);
+      expect(body.warnings).toEqual(["Project saved in legacy mode: resolution-failed"]);
+      expect(config.getMappings().NEW).toBeDefined();
+      expect(modules.agentConfigStore.isProjectConfigured("NEW")).toBe(false);
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(sync).toHaveBeenCalledExactlyOnceWith(body.syncJobId, expect.anything());
+      expect(queue.getWorkflowSyncById(body.syncJobId)).toMatchObject({ teamKey: "NEW" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] configure new project failed:", err);
+    } finally {
+      read.mockRestore();
+      sync.mockRestore();
+      invalidate.mockRestore();
+      log.mockRestore();
+    }
+  });
+
   it("changes both modes preserving stages and actor, and unchanged modes append nothing even with invalid defaults", async () => {
     const t = await seed();
     modules.agentConfigStore.setProjectConfigured("APP", false);
