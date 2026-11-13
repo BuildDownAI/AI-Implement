@@ -80,6 +80,56 @@ Updating the graph therefore means updating the snapshot upstream **and** rebuil
 
 The container runs as the unprivileged `node` user.
 
+## Serving from a remote store
+
+Set `KG_BACKEND=stardog_run` in the orchestrator environment to serve the graph
+from Stardog. The sidecar code comes from the public base KG repo; no customer
+KG repo is needed. These values are environment-only for now;
+[AII-1880](https://linear.app/eudoxus/issue/AII-1880) moves them to the admin KG page.
+
+| Variable | Purpose |
+| -- | -- |
+| `KG_BACKEND` | Set to `stardog_run` to select the remote store. |
+| `KG_STARDOG_RUN_TOKEN` | Access token, passed to the sidecar without logging it. |
+| `KG_STARDOG_DB` | Database name. |
+| `KG_STARDOG_RUN_ENDPOINT` | SPARQL endpoint URL. |
+| `KG_STARDOG_DATASET` | Dataset sent as `default-graph-uri`. Necessary for a graph installed as a Knowledge Graph: the database default graph is empty, and queries without this parameter see no data. |
+| `KG_STARDOG_RUN_CONSOLE` | Endpoint console URL. |
+| `KG_NAMESPACE` | Graph IRI namespace; a nonempty value takes precedence over `sources.yml`, including for the boot probe. |
+
+| `KG_BACKEND` in the orchestrator environment | Staged overlay with `parts/` | Child `KG_BACKEND` | Overlay variables | `KG_EMBEDDINGS_DEGRADED` |
+| -- | -- | -- | -- | -- |
+| not set | no | not set (as today) | none | as today |
+| not set | yes | `nt_parts` (as today) | `KG_DATA_DIR`, `KG_PARTS_DIR` (as today) | as today |
+| `stardog_run` | no | `stardog_run` | none | never set |
+| `stardog_run` | yes | `stardog_run` | none: the remote store wins | never set |
+| a different value | any | as today | as today | as today |
+
+Remote serving ignores local overlays, including inherited `KG_DATA_DIR` and
+`KG_PARTS_DIR`, and clears any stale embeddings-degraded flag. Database search
+needs no local embeddings. Removing `KG_BACKEND` and restarting restores the
+local selection behavior.
+
+Build a local image with the base repository:
+
+```bash
+docker build -t ai-implement:stardog-local \
+  --build-arg KG_SOURCE_REPO=BuildDownAI/bd-knowledge-graph-base \
+  --secret id=kg_token,env=GH_TOKEN .
+```
+
+The build clones the default branch (`main`); the KGB store changes must land
+there before the operator's live check. Run the image locally with the variables
+above, using `KG_STARDOG_DB=builddown-kg`,
+`KG_STARDOG_DATASET=tag:stardog:kit:alias:builddown_kg` (underscore), and
+`KG_NAMESPACE=https://kg.builddown.dev/`, then call `kg_neighbors` through `/mcp`.
+Do not set these variables on a deployed orchestrator for this check.
+
+Each Stardog request is billed, including probes. The console counts usage in
+Stardog Units (SDUs) for the time the endpoint is active. An inactive endpoint can
+take five minutes to wake; the AII-1888 hand check observed about two minutes.
+Remote probe and timeout behavior is follow-up work; this change preserves it.
+
 ## Deploying
 
 **A plain `fly deploy` silently produces a sidecar-less image.** Deploy through the orchestrator itself, or with the manual command in [deployment.md](deployment.md#deploy-paths) when there is no orchestrator to ask.
