@@ -127,6 +127,8 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 
 ### OpenRouter API credentials
 
+`OPENROUTER_API_KEY` is a reserved name; do not use it in a project's Extra Env or as a forwarded secret name.
+
 For an `openrouter-api-key` profile, the selected model environment contains these four values:
 
 | Variable | Value |
@@ -250,3 +252,17 @@ OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key`
 
 A provider or auth mode change requires removing the stored key first. Delete the credential,
 PATCH the profile, then store the key for its new destination. See [Stored key safety](key-safety.md).
+
+## Roll back after OpenRouter
+
+Complete these steps in order before deploying code from before OpenRouter support:
+
+1. On each project, clear **Use the open model for implementation** and save. Then, for every stored project config containing `stages.implementation.preferOpenModel`, remove that key entirely: in a maintenance script using the current code and the orchestrator database, call `clearProjectStageField(projectKey, "implementation", "preferOpenModel")` from `src/agent-config-store.ts`. Verify with `getProjectStageConfig(projectKey)` that the key is absent. Unchecking saves `false`; neither `false` nor `null` removes the key. This preference is inactive in current runs, but older code rejects the unknown key during shape validation (see [Open-model preference](stage-agent-configuration.md#open-model-preference-inactive-stub)).
+2. Remove each OpenRouter account from the orchestrator stage defaults and from each project.
+3. For each OpenRouter account, including disabled and archived accounts, remove its key with `DELETE /api/model-accounts/:id/credential`.
+4. For each OpenRouter account, including disabled and archived accounts, use `PATCH /api/model-accounts/:id` to set a provider and auth mode the old code knows, with `status: "disabled"`:
+   - For a `claude` profile: `{ "provider": "anthropic", "authMode": "anthropic-api-key", "status": "disabled" }`.
+   - For a `codex` profile: `{ "provider": "openai", "authMode": "openai-api-key", "status": "disabled" }`.
+5. Then deploy the old code.
+
+Step 4 is necessary because a disabled OpenRouter profile still stops the old resolver: it validates every stored profile head, including disabled and archived accounts. Remove the key before changing its provider or auth mode because the stored key is bound to its destination. This procedure comes from code reading and was not run against the old code.
