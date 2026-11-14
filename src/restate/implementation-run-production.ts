@@ -604,7 +604,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
           try {
             const frozenConfig = backendConfig(owner.input);
             if (!frozenConfig.flySessionsToken || !frozenConfig.flySessionsApp) return false;
-            return machineNeverStarted(await getMachine(frozenConfig.flySessionsToken, frozenConfig.flySessionsApp, job.machineId));
+            return machineNeverStarted(await getMachine(frozenConfig.flySessionsToken, frozenConfig.flySessionsApp, job.machineId, 10_000));
           } catch {
             return false;
           }

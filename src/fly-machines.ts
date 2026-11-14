@@ -150,16 +150,23 @@ export async function getMachine(
   token: string,
   appName: string,
   machineId: string,
+  timeoutMs?: number,
 ): Promise<Machine> {
   const url = `${FLY_API_BASE}/apps/${appName}/machines/${machineId}`;
-  const res = await fetch(url, { headers: flyHeaders(token) });
+  const ac = timeoutMs === undefined ? undefined : new AbortController();
+  const timer = ac ? setTimeout(() => ac.abort(), timeoutMs) : undefined;
+  try {
+    const res = await fetch(url, { headers: flyHeaders(token), ...(ac ? { signal: ac.signal } : {}) });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new FlyApiError(`Failed to get machine ${machineId} (${res.status}): ${body}`, res);
+    if (!res.ok) {
+      const body = await res.text();
+      throw new FlyApiError(`Failed to get machine ${machineId} (${res.status}): ${body}`, res);
+    }
+
+    return (await res.json()) as Machine;
+  } finally {
+    clearTimeout(timer);
   }
-
-  return (await res.json()) as Machine;
 }
 
 export async function listMachines(
