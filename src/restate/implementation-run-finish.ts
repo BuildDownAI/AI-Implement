@@ -14,6 +14,7 @@ import type { ImplementationFinishOutcome, ImplementationFinishResult } from "./
 const CALLBACK_OWNED_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending", "rollup_review"]);
 
 export interface ImplementationFinishDependencies {
+  neverStarted?(job: Job): Promise<boolean>;
   getJob(dispatchId: string): Job | null;
   /** `updateJobStatus`: owned terminal writes always defer admission release to the workflow. */
   closeRow(job: Job, status: JobStatus, conclusion: string, opts?: { backendTerminated?: boolean; skipAdmissionRelease?: boolean }): void;
@@ -83,8 +84,9 @@ export async function finishImplementationJob(
 
   if (!facts.reported) {
     // The backend ended and no callback came: the failure fix-up.
-    deps.closeRow(job, "failed", "ended_without_callback", closeOpts);
-    await deps.finalize({ kind: "failed", conclusion: "ended_without_callback" }, job);
+    const conclusion = await deps.neverStarted?.(job) ? "fly_machine_never_started" : "ended_without_callback";
+    deps.closeRow(job, "failed", conclusion, closeOpts);
+    await deps.finalize({ kind: "failed", conclusion }, job);
     return {};
   }
 

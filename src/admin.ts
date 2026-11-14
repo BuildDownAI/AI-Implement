@@ -1,4 +1,4 @@
-import { hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
+import { MODEL_AUTH_ENV, hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
 import http from "node:http";
 import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { existsSync, readFileSync } from "node:fs";
@@ -3218,7 +3218,7 @@ async function handleListGlobalSecrets(
     const allSecrets = await listAppSecrets(config.flySessionsToken, config.flySessionsApp);
     const teamPrefixes = Object.keys(getMappings()).map((k) => `${k.toUpperCase()}_`);
     const globalSecrets = allSecrets
-      .filter((s) => !teamPrefixes.some((prefix) => s.name.startsWith(prefix)))
+      .filter((s) => s.name !== MODEL_AUTH_ENV.protectionKey && !teamPrefixes.some((prefix) => s.name.startsWith(prefix)))
       .map((s) => ({ name: s.name, createdAt: s.created_at }));
     json(res, 200, globalSecrets);
   } catch (err) {
@@ -3257,6 +3257,10 @@ async function handleSetGlobalSecret(
     json(res, 400, { error: "name must contain only letters, digits, and underscores" });
     return;
   }
+  if (name === MODEL_AUTH_ENV.protectionKey) {
+    json(res, 400, { error: "Secret name is reserved" });
+    return;
+  }
   const teamPrefixes = Object.keys(getMappings()).map((k) => `${k.toUpperCase()}_`);
   if (teamPrefixes.some((prefix) => name.startsWith(prefix))) {
     json(res, 400, { error: `Secret name must not start with a team key prefix (${teamPrefixes.join(", ")})` });
@@ -3285,6 +3289,10 @@ async function handleUnsetGlobalSecret(
   const upperName = secretName.toUpperCase();
   if (!/^[A-Z0-9_]+$/.test(upperName)) {
     json(res, 400, { error: "name must contain only letters, digits, and underscores" });
+    return;
+  }
+  if (upperName === MODEL_AUTH_ENV.protectionKey) {
+    json(res, 400, { error: "Secret name is reserved" });
     return;
   }
   const teamPrefixes = Object.keys(getMappings()).map((k) => `${k.toUpperCase()}_`);

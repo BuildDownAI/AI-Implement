@@ -473,7 +473,9 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     );
   }
   const exit = job.conclusion?.startsWith("exit_") ? job.conclusion.slice(5) : null;
+  const neverStarted = job.conclusion === "fly_machine_never_started";
   const detail =
+    neverStarted ? "Fly removed the machine before it started." :
     exit && exit !== "0"
       ? `The runner exited with code ${exit}.`
       : job.phase === "implementation" && !job.prUrl
@@ -489,6 +491,7 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     summary: "The run did not complete.",
     detail,
     remediation:
+      neverStarted ? "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly)." :
       job.phase === "implementation"
         ? "Check the run logs — the run likely errored before pushing — then run it again."
         : "Check the run logs for the planning failure, then run it again.",
