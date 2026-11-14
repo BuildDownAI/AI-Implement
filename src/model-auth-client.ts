@@ -489,8 +489,8 @@ export interface ModelAuthClientOptions {
 export interface ModelInvocation {
   readonly env: Record<string, string>;
   readonly strippedKeys: readonly string[];
-  /** Set only when the secret is a ChatGPT plan access token. */
-  readonly codexProvider?: "chatgpt-plan";
+  /** Explicit Codex provider selected from the trusted auth mode; omitted for OpenAI API keys. */
+  readonly codexProvider?: "chatgpt-plan" | "openrouter";
 }
 
 export interface ModelInvokeOptions {
@@ -958,7 +958,9 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
         result = await run({
           env: built.env,
           strippedKeys: built.strippedKeys,
-          ...(entry.secret.kind === "chatgpt-access-token" ? { codexProvider: "chatgpt-plan" as const } : {}),
+          ...(entry.authMode === "openrouter-api-key"
+            ? { codexProvider: "openrouter" as const }
+            : entry.authMode === "codex-subscription" ? { codexProvider: "chatgpt-plan" as const } : {}),
         });
       } catch (e) {
         runFailed = true;

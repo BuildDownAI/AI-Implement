@@ -589,12 +589,31 @@ describe("client", () => {
     await client.checkout({ profileId: "api", authMode: "openai-api-key" });
     expect(readdirSync(authRoot)).toEqual([]);
     await client.invoke("api", async (inv) => {
+      expect(inv.codexProvider).toBeUndefined();
       expect(inv.env.CODEX_API_KEY).toBe(S_API);
       expect(inv.env).not.toHaveProperty("OPENAI_API_KEY");
       expect(inv.env).not.toHaveProperty("ANTHROPIC_API_KEY");
     });
     await client.finish("api", "completed");
     expect(calls.map((c) => c.route)).toEqual([MODEL_AUTH_ROUTES.checkout, MODEL_AUTH_ROUTES.finish]);
+  });
+
+  it("selects the Codex OpenRouter provider from auth mode for an API-key secret", async () => {
+    const { transport } = fakeTransport(() => ({
+      status: 200,
+      body: { version: 1, ok: true, profileId: "router", authMode: "openrouter-api-key", secret: { kind: "api-key", apiKey: S_API } },
+    }));
+    const client = make(transport, {}, grant({ bindings: [
+      { stage: "implementation", profileId: "router", profileRevision: 1, authMode: "openrouter-api-key" },
+    ] }));
+    await client.checkout({ profileId: "router", authMode: "openrouter-api-key" });
+    await client.invoke("router", async (inv) => {
+      expect(inv.codexProvider).toBe("openrouter");
+      expect(inv.env.OPENROUTER_API_KEY).toBe(S_API);
+      expect(inv.env).not.toHaveProperty("CODEX_API_KEY");
+      expect(inv.env).not.toHaveProperty("OPENAI_BASE_URL");
+    });
+    await client.dispose();
   });
 
   it("Bedrock checkout yields the AWS bundle for the invocation", async () => {
