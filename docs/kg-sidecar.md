@@ -169,12 +169,18 @@ With `KG_BACKEND=stardog_run`, a sleeping endpoint is normal and each store call
 | Boot probe: `tools/list` fails | Unavailable, as today |
 | Boot probe: `kg_neighbors` answers | Healthy |
 | Boot probe: `kg_neighbors` stops with `ETIMEDOUT` | Healthy, `lastError` null. Log `[kg] remote store did not answer in 10 s; it is possibly starting` |
-| Boot probe: `kg_neighbors` returns a JSON-RPC error | Unavailable; `lastError` is the sidecar's message |
+| Boot probe: `kg_neighbors` returns a store failure result | Unavailable; `lastError` and the recorded store error are the first text message, cut to 200 characters (or `store call failed` if absent) |
+| Boot probe: `kg_neighbors` returns a JSON-RPC error | Unavailable; the recorded store error and `lastError` are the sidecar's message, cut to 200 characters |
+| Boot probe: the `kg_neighbors` step has a handshake failure or an unparseable response | Unavailable with the normal probe diagnostic. No store error is recorded; a successful list-only probe clears it |
+| Post-deploy warm-up probe | `tools/list` only. It never calls the store and keeps a recorded store error |
+| A tool call returns a store failure result | The caller receives the original result. No recorded store error is cleared, no healthy result is recorded, and no re-probe runs |
 | `maybeReprobe()` after a failed call | `tools/list` only. It never calls the store |
 | `probeKgSidecarIfUnavailable()` each poll cycle | `tools/list` only. It never calls the store, and it does not clear a store error from the boot probe |
-| A tool call succeeds | Clears a recorded store error: health becomes `reachable`, `toolsListed`, `lastError` null |
+| A tool call returns a result that is not a store failure | Clears a recorded store error: health becomes `reachable`, `toolsListed`, `lastError` null |
 | A tool call stops with `ETIMEDOUT` | Returns `{ ok: false, error: "The knowledge graph store is starting. Try again in one minute." }`. No health change, no re-probe |
 | A tool call returns a JSON-RPC error | The sidecar's message, as today |
+
+A store failure result has `result.isError: true`. The Python MCP SDK returns raised tool exceptions as `{ result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }`, rather than a JSON-RPC `error`. The first content entry of type `text` supplies the message, limited to 200 characters; without one, the message is `store call failed`. These rules apply only to remote stores; local behavior is unchanged.
 
 The request timeout remains 10 seconds so boot stays bounded. The store call continues in the sidecar after the orchestrator stops waiting, allowing the endpoint to wake for a later user call. Successful list-only probes preserve boot store errors until a user tool call succeeds.
 

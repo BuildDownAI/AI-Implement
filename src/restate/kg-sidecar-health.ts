@@ -30,7 +30,7 @@ export function createKgSidecarHealth(deps: KgSidecarHealthDeps) {
       check: restate.handlers.object.exclusive(
         async (ctx: ObjectContext): Promise<SidecarHealth | null> => {
           const health = await ctx.run("probe", () => deps.probe());
-          if (health && !health.lastError) {
+          if (health && health.lastError === null) {
             try {
               await ctx.run("notify-recovery", () => (deps.notifyRecovery ?? postKgRecoveryNotice)(), {
                 maxRetryAttempts: 3,
@@ -54,6 +54,11 @@ export function createKgSidecarHealth(deps: KgSidecarHealthDeps) {
 
 export type KgSidecarHealthDefinition = ReturnType<typeof createKgSidecarHealth>;
 
+/** Recovery and deploy warm-up must not wake a billed remote store. */
+export function probeKgSidecarAfterBoot(provider: SidecarMemoryProvider, timeoutMs?: number): Promise<SidecarHealth> {
+  return probeWithTimeout(provider, timeoutMs, isRemoteKgStore() ? "list-only" : "full");
+}
+
 /**
  * The production probe. Does nothing (and sends no sidecar request) once the sidecar is no longer
  * marked unavailable, so a `check` queued behind a recovery is a no-op. `probeWithTimeout` never throws.
@@ -62,7 +67,7 @@ export async function probeKgSidecarIfUnavailable(): Promise<SidecarHealth | nul
   if (!isKgUnavailable() && !hasKgRecoveryNotice()) return null;
   const provider = getKgMemoryProvider();
   if (!(provider instanceof SidecarMemoryProvider)) return null;
-  return probeWithTimeout(provider, undefined, isRemoteKgStore() ? "list-only" : "full");
+  return probeKgSidecarAfterBoot(provider);
 }
 
 // --- the poll-loop caller -------------------------------------------------------------------------
