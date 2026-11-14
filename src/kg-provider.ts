@@ -1,6 +1,6 @@
 import http from "node:http";
 import https from "node:https";
-import { getServedNamespace } from "./kg-sidecar.js";
+import { isRemoteKgStore, getServedNamespace } from "./kg-sidecar.js";
 
 export interface MemoryProviderCapabilities {
   hybridSearch: boolean;
@@ -211,6 +211,9 @@ export class SidecarMemoryProvider implements MemoryProvider {
    */
   private sessionId: string | null = null;
 
+  // A list-only recovery proves transport health, not store health.
+  private storeError: string | null = null;
+
   constructor(
     private readonly kgSidecarUrl: string,
     private readonly resolveServedNamespace: () => Promise<string | null> = getServedNamespace,
@@ -363,7 +366,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
    * `scheduleReprobe`, this method itself is never throttled, so the first boot-time
    * call is never skipped.
    */
-  async probe(): Promise<SidecarHealth> {
+  async probe(mode: "full" | "list-only" = "full"): Promise<SidecarHealth> {
     const target = new URL(this.kgSidecarUrl);
     const transport = target.protocol === "https:" ? https : http;
     const forwardHeaders: SidecarHeaders = { ...PROBE_HEADERS };
@@ -398,6 +401,10 @@ export class SidecarMemoryProvider implements MemoryProvider {
       });
     }
 
+    if (mode === "list-only") {
+      return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: this.storeError });
+    }
+
     const namespace = await this.resolveServedNamespace().catch(() => null);
     if (!namespace) {
       return recordSidecarHealth({
@@ -422,7 +429,17 @@ export class SidecarMemoryProvider implements MemoryProvider {
       return this.sendToSidecar(target, transport, "POST", reqHeaders, callBody);
     };
     const callOutcome = await this.sendWithSessionRetry(target, transport, forwardHeaders, sendCall);
-    const callError = this.describeSendFailure(callOutcome, "kg_neighbors probe call");
+    if (isRemoteKgStore() && !callOutcome.result.ok && callOutcome.result.error.code === "ETIMEDOUT") {
+      console.log("[kg] remote store did not answer in 10 s; it is possibly starting");
+      this.storeError = null;
+      return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
+    }
+    let callError = this.describeSendFailure(callOutcome, "kg_neighbors probe call");
+    if (isRemoteKgStore()) {
+      const error = callOutcome.parsed?.error as { message?: unknown } | undefined;
+      if (typeof error?.message === "string") callError = error.message;
+      this.storeError = callError;
+    }
     if (callError) return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: callError });
 
     return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
@@ -441,7 +458,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
     const last = sidecarHealth.checkedAt;
     if (last !== null && Date.now() - last < PROBE_THROTTLE_MS) return;
     try {
-      await this.probe();
+      await this.probe(isRemoteKgStore() ? "list-only" : "full");
     } catch (err) {
       // probe() itself never throws in practice (every internal failure resolves to a
       // recorded health rather than a rejection) — this is a last-resort backstop so an
@@ -523,6 +540,9 @@ export class SidecarMemoryProvider implements MemoryProvider {
 
     const { result, parsed, handshakeError } = await this.sendWithSessionRetry(target, transport, PROBE_HEADERS, send);
     if (!result.ok) {
+      if (isRemoteKgStore() && result.error.code === "ETIMEDOUT") {
+        return { ok: false, error: "The knowledge graph store is starting. Try again in one minute." };
+      }
       void this.maybeReprobe();
       return { ok: false, error: this.describeConnectionFailure(result.error) };
     }
@@ -540,6 +560,15 @@ export class SidecarMemoryProvider implements MemoryProvider {
     if (parsed.error) {
       const err = parsed.error as { message?: string };
       return { ok: false, error: typeof err.message === "string" ? err.message : JSON.stringify(parsed.error) };
+    }
+    if (!parsed.result || typeof parsed.result !== "object" || Array.isArray(parsed.result)) {
+      console.error(`[mcp] KG sidecar ${name} returned no valid result (status ${result.status})`);
+      void this.maybeReprobe();
+      return { ok: false, error: "KG sidecar error" };
+    }
+    if (isRemoteKgStore()) {
+      this.storeError = null;
+      recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
     }
     return { ok: true, result: parsed.result };
   }
@@ -567,6 +596,7 @@ export const BOOT_PROBE_TIMEOUT_MS = 30_000;
 export function probeWithTimeout(
   provider: SidecarMemoryProvider,
   timeoutMs: number = BOOT_PROBE_TIMEOUT_MS,
+  mode: "full" | "list-only" = "full",
 ): Promise<SidecarHealth> {
   return new Promise<SidecarHealth>((resolve) => {
     let settled = false;
@@ -576,7 +606,7 @@ export function probeWithTimeout(
       resolve(recordSidecarHealth({ reachable: false, toolsListed: false, lastError: `KG sidecar probe timed out after ${timeoutMs}ms` }));
     }, timeoutMs);
     timer.unref();
-    provider.probe().then(
+    provider.probe(mode).then(
       (health) => {
         clearTimeout(timer);
         if (settled) return;

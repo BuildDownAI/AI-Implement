@@ -8,6 +8,7 @@ import * as restate from "@restatedev/restate-sdk";
 import type { ObjectContext } from "@restatedev/restate-sdk";
 import { clearKgRecoveryNotice, hasKgRecoveryNotice, postKgRecoveryNotice } from "../deploy-notify.js";
 import { isDeployHeld } from "../deploy-hold.js";
+import { isRemoteKgStore } from "../kg-sidecar.js";
 import type { SidecarHealth } from "../kg-provider.js";
 import { SidecarMemoryProvider, getKgMemoryProvider, isKgUnavailable, probeWithTimeout } from "../kg-provider.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
@@ -61,7 +62,7 @@ export async function probeKgSidecarIfUnavailable(): Promise<SidecarHealth | nul
   if (!isKgUnavailable() && !hasKgRecoveryNotice()) return null;
   const provider = getKgMemoryProvider();
   if (!(provider instanceof SidecarMemoryProvider)) return null;
-  return probeWithTimeout(provider);
+  return probeWithTimeout(provider, undefined, isRemoteKgStore() ? "list-only" : "full");
 }
 
 // --- the poll-loop caller -------------------------------------------------------------------------

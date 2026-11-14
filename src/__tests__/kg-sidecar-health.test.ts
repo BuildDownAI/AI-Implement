@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as deployNotify from "../deploy-notify.js";
 import { testDb } from "./helpers/test-db.js";
 import http from "node:http";
-import { SidecarMemoryProvider, setKgMemoryProvider, sidecarHealth } from "../kg-provider.js";
+import { PassThrough } from "node:stream";
+import { KG_TOOL_CAPABILITY, SidecarMemoryProvider, setKgMemoryProvider, sidecarHealth } from "../kg-provider.js";
 import { checkKgSidecarHealth, probeKgSidecarIfUnavailable } from "../restate/kg-sidecar-health.js";
 import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
 
@@ -85,6 +86,49 @@ describe("probeKgSidecarIfUnavailable", () => {
     setKgMemoryProvider(new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => "https://kg.example.test/"));
     await expect(probeKgSidecarIfUnavailable()).resolves.toBeNull();
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("makes zero store calls during ten remote unavailable poll cycles and preserves the boot error", async () => {
+    vi.stubEnv("KG_BACKEND", "stardog_run");
+    const methods: string[] = [];
+    let boot = true;
+    vi.spyOn(http, "request").mockImplementation(((_options: unknown, cb: (res: unknown) => void) => {
+      const req = new PassThrough();
+      req.on("data", (body) => {
+        const method = JSON.parse(body.toString()).method;
+        methods.push(method);
+        const res = new PassThrough();
+        Object.assign(res, { statusCode: 200, headers: { "content-type": "application/json" } });
+        process.nextTick(() => {
+          cb(res);
+          res.end(JSON.stringify(method === "tools/call" && boot
+            ? { error: { message: "bad token" } }
+            : { result: { tools: Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name })) } }));
+        });
+      });
+      return req;
+    }) as never);
+    try {
+      const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => "https://kg.example.test/");
+      setKgMemoryProvider(p);
+      await p.probe();
+      expect(sidecarHealth.lastError).toBe("bad token");
+      boot = false;
+      methods.length = 0;
+      for (let cycle = 0; cycle < 10; cycle++) {
+        await checkKgSidecarHealth({ deployHeld: () => false, restateReady: () => true,
+          fetchImpl: async () => {
+            await probeKgSidecarIfUnavailable();
+            return new Response("{}");
+          },
+        });
+        expect(sidecarHealth.lastError).toBe("bad token");
+      }
+      expect(methods.filter((method) => method === "tools/call")).toHaveLength(0);
+      expect(methods).toHaveLength(10);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("returns null without throwing when there is no sidecar provider", async () => {
