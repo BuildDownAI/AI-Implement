@@ -8,7 +8,7 @@ This document is the orchestrator's half. For the graph's full lifecycle — the
 
 ## Deploy shape
 
-The sidecar runs **inside the orchestrator container on loopback** — no separate service, no public port, no second Fly app. `docker-entrypoint.sh` starts it on `127.0.0.1:8765`, waits for it, exports `KG_SIDECAR_URL`, and only then executes Node.
+The sidecar runs **inside the orchestrator container on loopback** — no separate service, no public port, no second Fly app. `KgSidecar.start()` starts it on `127.0.0.1:8765`, waits for readiness, and sets `KG_SIDECAR_URL` before `loadConfig()` reads it. Each call first deletes any existing value, so an operator-supplied URL is ignored.
 
 Startup has two entry points, tried in order: `kg/start.sh` (preferred — the vendor script knows its own arguments, and is generated at build time) or a bare `kg/server.py` with a pre-built `.venv`. Neither present means no sidecar.
 
@@ -16,18 +16,18 @@ Readiness is polled for up to 30 seconds. **Any HTTP response counts as ready**,
 
 **Sidecar failure is non-fatal at every stage.** A missing entry point, a crash, or a readiness timeout all leave `KG_SIDECAR_URL` unset and let the orchestrator boot normally; `/mcp` still serves, without the `kg_*` tools, and every other route is unaffected.
 
-For local development, start the sidecar yourself and set `KG_SIDECAR_URL` in `.env`, or leave it blank to run `/mcp` without the `kg_*` tools.
+For local development, `npm run dev` on a laptop serves `/mcp` without the `kg_*` tools because the default KG directory, `/app/kg`, has no startup entry point. To test the sidecar locally, run a locally built orchestrator image containing the KG source, using the build credentials described under [Building the image](#building-the-image). `/mcp` still requires its OAuth configuration.
 
 ## What `/mcp` tells you, and what it hides
 
 The endpoint needs `OAUTH_REDIRECT_BASE_URL`; `KG_SIDECAR_URL` only adds the `kg_*` tools. The two are not equally visible from outside, because the auth gate sits between their checks.
 
 - **`OAUTH_REDIRECT_BASE_URL` unset** — `/mcp` answers **503** to every caller.
-- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. An authenticated `tools/list` answers **200**, listing every non-`kg_*` tool the caller's role allows; the `kg_*` tools are left out. A `kg_*` call from a stale list is not a 503 either: it answers 200 with a tool result `isError: true` and the text `no memory provider is configured` (`src/restate/tools.ts`). Set `KG_SIDECAR_URL` and restart to serve them.
+- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. An authenticated `tools/list` answers **200**, listing every non-`kg_*` tool the caller's role allows; the `kg_*` tools are left out. A `kg_*` call from a stale list is not a 503 either: it answers 200 with a tool result `isError: true` and the text `no memory provider is configured` (`src/restate/tools.ts`). To serve them, run an image containing the KG source and ensure the sidecar reaches readiness at startup.
 
 **So an unauthenticated probe of `/mcp` cannot distinguish a sidecar-less release from a healthy one — both answer 401.** Neither can the OAuth routes: `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server` and `/mcp/*` (`routeMcpOAuth`, `src/mcp-oauth.ts`) gate on `OAUTH_REDIRECT_BASE_URL` alone, so a client can sign in and reach the non-`kg_*` tools on a sidecar-less image. They used to 503 without a sidecar too — a leftover from when `/mcp` was only a sidecar proxy — which locked every client out of those tools. The public signal is the health check **`GET /`**: `sidecar.reachable: true` with `toolsListed: true` means the boot-time probe passed, and `sidecar.checkedAt: null` means no sidecar was ever probed — a sidecar-less release.
 
-Inside the container the question is settled without a request at all: `docker-entrypoint.sh` exports `KG_SIDECAR_URL` only after the sidecar answers its readiness check, so an absent value is the sidecar-less signal. That is what the orchestrator itself reads at boot.
+Inside the orchestrator process, `KgSidecar.start()` sets `KG_SIDECAR_URL` only after the sidecar answers its readiness check, so an absent value is the sidecar-less signal. That is what `loadConfig()` reads at boot.
 
 ## Building the image
 
