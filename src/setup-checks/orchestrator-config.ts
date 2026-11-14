@@ -1,6 +1,7 @@
 /** Checks of the orchestrator's own environment and settings: the `orchestrator` group. */
 
 import { dirname } from "node:path";
+import { isRemoteKgStore } from "../kg-sidecar.js";
 import { allowlistFromEnv, hasAdminAddress } from "../access-entries.js";
 import { effectiveAccessCode } from "../admin-session.js";
 import { resolveProviders } from "../oauth/providers.js";
@@ -106,6 +107,26 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
         detail: `RUNNER_MODE=${env.RUNNER_MODE} is not a runner mode, so it is ignored`,
         fix: `Set RUNNER_MODE to one of ${VALID_RUNNER_MODES.join(", ")}, or unset it.`,
       }];
+    },
+  },
+  {
+    id: "kg.remote-store",
+    title: "KG remote store values",
+    group: "orchestrator",
+    tier: "feature",
+    onAdminPath: false,
+    run: ({ env }) => {
+      if (!isRemoteKgStore(env)) return [{
+        state: "not-applicable",
+        detail: "The knowledge graph is served from the local sidecar store",
+      }];
+      const missing = ["KG_STARDOG_RUN_TOKEN", "KG_STARDOG_DB", "KG_NAMESPACE"].filter((name) => !env[name]);
+      if (missing.length > 0) return [{
+        state: "fail",
+        detail: `Missing: ${missing.join(", ")}`,
+        fix: "Set the listed variables in the orchestrator environment and restart.",
+      }];
+      return [{ state: "pass", detail: "The Stardog store values are set" }];
     },
   },
   {

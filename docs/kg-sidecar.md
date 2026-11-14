@@ -80,6 +80,56 @@ Updating the graph therefore means updating the snapshot upstream **and** rebuil
 
 The container runs as the unprivileged `node` user.
 
+## Serving from a remote store
+
+Set `KG_BACKEND=stardog_run` in the orchestrator environment to serve the graph
+from Stardog. The sidecar code comes from the public base KG repo; no customer
+KG repo is needed. These values are environment-only for now;
+[AII-1880](https://linear.app/eudoxus/issue/AII-1880) moves them to the admin KG page.
+
+| Variable | Purpose |
+| -- | -- |
+| `KG_BACKEND` | Set to `stardog_run` to select the remote store. |
+| `KG_STARDOG_RUN_TOKEN` | Access token, passed to the sidecar without logging it. |
+| `KG_STARDOG_DB` | Database name. |
+| `KG_STARDOG_RUN_ENDPOINT` | SPARQL endpoint URL. |
+| `KG_STARDOG_DATASET` | Dataset sent as `default-graph-uri`. Necessary for a graph installed as a Knowledge Graph: the database default graph is empty, and queries without this parameter see no data. |
+| `KG_STARDOG_RUN_CONSOLE` | Endpoint console URL. |
+| `KG_NAMESPACE` | Graph IRI namespace; a nonempty value takes precedence over `sources.yml`, including for the boot probe. |
+
+| `KG_BACKEND` in the orchestrator environment | Staged overlay with `parts/` | Child `KG_BACKEND` | Overlay variables | `KG_EMBEDDINGS_DEGRADED` |
+| -- | -- | -- | -- | -- |
+| not set | no | not set (as today) | none | as today |
+| not set | yes | `nt_parts` (as today) | `KG_DATA_DIR`, `KG_PARTS_DIR` (as today) | as today |
+| `stardog_run` | no | `stardog_run` | none | never set |
+| `stardog_run` | yes | `stardog_run` | none: the remote store wins | never set |
+| a different value | any | as today | as today | as today |
+
+Remote serving ignores local overlays, including inherited `KG_DATA_DIR` and
+`KG_PARTS_DIR`, and clears any stale embeddings-degraded flag. Database search
+needs no local embeddings. Removing `KG_BACKEND` and restarting restores the
+local selection behavior.
+
+Build a local image with the base repository:
+
+```bash
+docker build -t ai-implement:stardog-local \
+  --build-arg KG_SOURCE_REPO=BuildDownAI/bd-knowledge-graph-base \
+  --secret id=kg_token,env=GH_TOKEN .
+```
+
+The build clones the default branch (`main`); the KGB store changes must land
+there before the operator's live check. Run the image locally with the variables
+above, using `KG_STARDOG_DB=builddown-kg`,
+`KG_STARDOG_DATASET=tag:stardog:kit:alias:builddown_kg` (underscore), and
+`KG_NAMESPACE=https://kg.builddown.dev/`, then call `kg_neighbors` through `/mcp`.
+Do not set these variables on a deployed orchestrator for this check.
+
+Each Stardog request is billed, including probes. The console counts usage in
+Stardog Units (SDUs) for the time the endpoint is active. An inactive endpoint can
+take five minutes to wake; the AII-1888 hand check observed about two minutes.
+Remote probe and timeout behavior is described below.
+
 ## Deploying
 
 **A plain `fly deploy` silently produces a sidecar-less image.** Deploy through the orchestrator itself, or with the manual command in [deployment.md](deployment.md#deploy-paths) when there is no orchestrator to ask.
@@ -109,6 +159,30 @@ The clone copies the KG's `sources.yml`, which pins the IRI namespace. Without i
 The result lives in a module-level `sidecarHealth` record (`{ reachable, toolsListed, lastError, checkedAt }`, exported from `src/kg-provider.ts`) and `isKgUnavailable()`, which is `true` only when the *last completed* probe failed — a sidecar that has never been probed is not reported as unavailable. Every failed `listTools` or `callKgTool` also triggers a re-probe, throttled to at most one real sidecar round-trip per 60 seconds so a persistently down sidecar doesn't double every failing request's latency. The boot-time probe itself is never subject to that throttle — the first check always runs.
 
 Every buffered sidecar request the provider makes — the session handshake, `listTools`, `callKgTool`, and both probe steps — carries a 10-second request timeout, the same bounding pattern `KgSidecar`'s own readiness poll uses (2s, scaled up here because these calls run a real query rather than just checking that the port accepts connections). Without this, a sidecar that accepts the connection but never answers — the process is up, `[kg] sidecar ready` already logged, but `tools/list` or `kg_neighbors` hangs — would leave `main()`'s `await memoryProvider.probe()` unresolved forever, which blocks `startServer()` (so the health check, admin UI, and poll loop never come up) and `postBootNotice()` (so not even `deployed-not-serving` gets recorded) — a strictly worse outcome than the silently-wrong `deployed-ok` this issue exists to fix. A timed-out request resolves `ok: false` rather than retrying the session handshake, so the worst case for a hung `tools/list` is one timeout, not a multiple of it.
+
+### Remote store wake-up and probes
+
+With `KG_BACKEND=stardog_run`, a sleeping endpoint is normal and each store call is billed. Boot makes one store query to wake the endpoint and detect configuration errors. After boot, recovery probes use `tools/list` only; they never query the store. Local stores retain the behavior described above.
+
+| Event on a remote store | Result |
+| -- | -- |
+| Boot probe: `tools/list` fails | Unavailable, as today |
+| Boot probe: `kg_neighbors` answers | Healthy |
+| Boot probe: `kg_neighbors` stops with `ETIMEDOUT` | Healthy, `lastError` null. Log `[kg] remote store did not answer in 10 s; it is possibly starting` |
+| Boot probe: `kg_neighbors` returns a store failure result | Unavailable; `lastError` and the recorded store error are the first text message, cut to 200 characters (or `store call failed` if absent) |
+| Boot probe: `kg_neighbors` returns a JSON-RPC error | Unavailable; the recorded store error and `lastError` are the sidecar's message, cut to 200 characters |
+| Boot probe: the `kg_neighbors` step has a handshake failure or an unparseable response | Unavailable with the normal probe diagnostic. No store error is recorded; a successful list-only probe clears it |
+| Post-deploy warm-up probe | `tools/list` only. It never calls the store and keeps a recorded store error |
+| A tool call returns a store failure result | The caller receives the original result. No recorded store error is cleared, no healthy result is recorded, and no re-probe runs |
+| `maybeReprobe()` after a failed call | `tools/list` only. It never calls the store |
+| `probeKgSidecarIfUnavailable()` each poll cycle | `tools/list` only. It never calls the store, and it does not clear a store error from the boot probe |
+| A tool call returns a result that is not a store failure | Clears a recorded store error: health becomes `reachable`, `toolsListed`, `lastError` null |
+| A tool call stops with `ETIMEDOUT` | Returns `{ ok: false, error: "The knowledge graph store is starting. Try again in one minute." }`. No health change, no re-probe |
+| A tool call returns a JSON-RPC error | The sidecar's message, as today |
+
+A store failure result has `result.isError: true`. The Python MCP SDK returns raised tool exceptions as `{ result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }`, rather than a JSON-RPC `error`. The first content entry of type `text` supplies the message, limited to 200 characters; without one, the message is `store call failed`. These rules apply only to remote stores; local behavior is unchanged.
+
+The request timeout remains 10 seconds so boot stays bounded. The store call continues in the sidecar after the orchestrator stops waiting, allowing the endpoint to wake for a later user call. Successful list-only probes preserve boot store errors until a user tool call succeeds.
 
 **The deploy record now reflects the probe, not just the env var.** **Superseded:** the boot-time `decideDeployOutcome` that wrote `deployed-not-serving` from the probe is gone; the outcome now comes from the `SelfDeploy` object (`deployed-ok` on `succeeded`), and probe health is reported by `GET /` and `get_kg_status`. This is the detection half only (AII-648); a follow-on issue plumbs `isKgUnavailable()` and `sidecarHealth` into `GET /`, `get_kg_status`, `get_tenant_health`, and the Deployments admin page.
 

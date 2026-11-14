@@ -170,7 +170,7 @@ import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANN
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
-import { checkKgSidecarHealth } from "./restate/kg-sidecar-health.js";
+import { checkKgSidecarHealth, probeKgSidecarAfterBoot } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
@@ -5276,7 +5276,7 @@ async function main(): Promise<void> {
   setKgMemoryProvider(memoryProvider);
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
-    if (health.lastError) {
+    if (health.lastError !== null) {
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
       console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);
@@ -5507,7 +5507,7 @@ async function main(): Promise<void> {
     // Notice settings writes happen synchronously before its first await.
     // A hanging webhook must not delay the first poll.
     postBootNotice: () => { void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
-      ? { probe: remainingMs => probeWithTimeout(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
+      ? { probe: remainingMs => probeKgSidecarAfterBoot(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
       : undefined); },
     poll: () => poll(config, registry),
     startInterval: () => {

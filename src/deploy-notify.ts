@@ -227,7 +227,7 @@ export async function postBootNotice(
         if (remaining <= 0) break;
         const health = await warmup.probe(remaining);
         recordedHealth = sidecarHealthFields().sidecar;
-        payload.kgUnavailable = !!health.lastError;
+        payload.kgUnavailable = health.lastError !== null;
         payload.sidecarError = health.lastError;
         if (!payload.kgUnavailable) break;
       }

@@ -6,10 +6,16 @@ import {
   writeFileSync,
   chmodSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { spawn as realSpawn } from "node:child_process";
 import { join } from "node:path";
-import { checkDegraded, COMPLETION_MARKER, getServedNamespace, KgSidecar } from "../kg-sidecar.js";
+import { checkDegraded, COMPLETION_MARKER, getServedNamespace, isRemoteKgStore, KgSidecar } from "../kg-sidecar.js";
 import { testDir } from "./helpers/test-dir.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:fs/promises")>(),
+  readFile: vi.fn((await importOriginal<typeof import("node:fs/promises")>()).readFile),
+}));
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -39,6 +45,7 @@ function testSpawn(cmd: string, args: string[], opts: object) {
 afterEach(() => {
   delete process.env.KG_SIDECAR_URL;
   delete process.env.KG_EMBEDDINGS_DEGRADED;
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -715,4 +722,86 @@ describe("env var cleanup", () => {
     expect(process.env.KG_SIDECAR_URL).toBeUndefined();
     expect(process.env.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
   });
+});
+
+
+describe("remote store selection", () => {
+  it.each([undefined, "", "stardog", "STARDOG_RUN", "stardog_run ", "nt_parts", "stardog_run"])(
+    "recognizes only the exact remote backend: %s", (backend) => {
+      expect(isRemoteKgStore({ KG_BACKEND: backend })).toBe(backend === "stardog_run");
+      vi.stubEnv("KG_BACKEND", backend);
+      expect(isRemoteKgStore()).toBe(backend === "stardog_run");
+    },
+  );
+
+  it.each([
+    [undefined, false], [undefined, true],
+    ["stardog_run", false], ["stardog_run", true],
+    ["other", false], ["other", true],
+  ] as const)("backend %s, staged parts %s", async (backend, parts) => {
+    vi.stubEnv("KG_BACKEND", backend);
+    vi.stubEnv("KG_DATA_DIR", undefined);
+    vi.stubEnv("KG_PARTS_DIR", undefined);
+    vi.stubEnv("KG_EMBEDDINGS_DEGRADED", "1");
+    const remote = backend === "stardog_run";
+    if (remote) {
+      vi.stubEnv("KG_DATA_DIR", "/stale/data");
+      vi.stubEnv("KG_PARTS_DIR", "/stale/parts");
+    }
+    const values = {
+      KG_STARDOG_RUN_TOKEN: "sentinel-token",
+      KG_STARDOG_DB: "sentinel-db",
+      KG_STARDOG_RUN_ENDPOINT: "sentinel-endpoint",
+      KG_STARDOG_DATASET: "sentinel-dataset",
+      KG_STARDOG_RUN_CONSOLE: "sentinel-console",
+      KG_NAMESPACE: "https://sentinel.example/",
+    };
+    for (const [key, value] of Object.entries(values)) vi.stubEnv(key, value);
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const kgDir = makeKgDir(); // No embeddings; remote searches run in the database.
+    if (parts) touch(join(kgDir, ".embeddings-failed"));
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+    const runtimeDir = join(testDir("kg-sidecar"), "current");
+    if (parts) {
+      mkdirSync(join(runtimeDir, "parts"), { recursive: true });
+      touch(join(runtimeDir, COMPLETION_MARKER));
+    }
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const sidecar = new KgSidecar({ kgDir, runtimeDataDir: runtimeDir }, {
+      httpGet: async () => true,
+      spawn: (cmd, args, opts) => {
+        childEnv = (opts as { env: NodeJS.ProcessEnv }).env;
+        return testSpawn(cmd, args, opts);
+      },
+    });
+    try {
+      await sidecar.start();
+      expect(childEnv?.KG_BACKEND).toBe(remote ? backend : parts ? "nt_parts" : backend);
+      expect(childEnv?.KG_DATA_DIR).toBe(!remote && parts ? runtimeDir : undefined);
+      expect(childEnv?.KG_PARTS_DIR).toBe(!remote && parts ? join(runtimeDir, "parts") : undefined);
+      expect(childEnv?.KG_EMBEDDINGS_DEGRADED).toBeUndefined();
+      expect(process.env.KG_EMBEDDINGS_DEGRADED).toBe(remote ? undefined : "1");
+      expect(childEnv).toMatchObject(values);
+      const lines = logs.mock.calls.map((args) => args.join(" "));
+      expect(lines.filter((line) => line === "[kg] serving remote store stardog_run")).toHaveLength(remote ? 1 : 0);
+      for (const value of Object.values(values)) expect(lines.join("\n")).not.toContain(value);
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+it("uses KG_NAMESPACE before reading sources.yml", async () => {
+  vi.stubEnv("KG_NAMESPACE", "https://kg.builddown.dev/");
+  const read = vi.mocked(fsPromises.readFile);
+  read.mockClear();
+  expect(await getServedNamespace("/unused/baked", "/unused/runtime")).toBe("https://kg.builddown.dev/");
+  expect(read).not.toHaveBeenCalled();
+});
+
+it("falls back to sources.yml for an empty KG_NAMESPACE", async () => {
+  vi.stubEnv("KG_NAMESPACE", "");
+  const kgDir = makeKgDir();
+  writeFileSync(join(kgDir, "sources.yml"), "namespace: https://baked.example/\n");
+  expect(await getServedNamespace(kgDir, testDir("kg-sidecar"))).toBe("https://baked.example/");
 });
