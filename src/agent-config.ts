@@ -378,7 +378,8 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
     const defaults = input.orchestratorDefaults.stages?.[stage];
     const { resolved, entries, check } = stageAccountCandidates(input, stage, profileById);
     const projectFallback = input.projectConfig.stages?.[stage]?.fallbackModel;
-    const fallback = projectFallback ?? input.orchestratorDefaults.stages?.[stage]?.fallbackModel;
+    const inheritsFallback = resolved.sources.provider !== "project" && resolved.sources.accountProfileId !== "project";
+    const fallback = projectFallback ?? (inheritsFallback ? defaults?.fallbackModel : undefined);
     if (fallback != null) {
       fallbackModels[stage] = fallback;
       fallbackModelSources[stage] = projectFallback != null ? "project" : "orchestrator-default";
