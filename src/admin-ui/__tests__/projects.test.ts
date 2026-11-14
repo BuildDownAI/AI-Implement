@@ -679,6 +679,26 @@ describe("projects page agents tab", () => {
     expect(options).toEqual(expect.arrayContaining(["acct-a", "acct-b"]));
     expect(options).not.toContain("acct-off");
   });
+  it.each(["claude", "codex"])("offers compatible OpenRouter accounts for %s", async (agent) => {
+    const m = mountAgents({ accounts: [
+      account({ profileId: "router", agent, provider: "openrouter", authMode: "openrouter-api-key" }),
+      account({ profileId: "disabled", agent, provider: "openrouter", profileStatus: "disabled" }),
+      account({ profileId: "other-agent", agent: agent === "claude" ? "codex" : "claude", provider: "openrouter" }),
+      account(),
+    ] });
+    await open(m);
+    for (const [name, value] of [["agent", agent], ["provider", "openrouter"], ["accountProfileId", "router"]]) {
+      const mode = field(m.doc, "mode", "review", name);
+      mode.value = "override";
+      fire(m.doc, mode);
+      const control = field(m.doc, "value", "review", name);
+      control.value = value;
+      expect(control.value).toBe(value);
+      fire(m.doc, control);
+    }
+    expect(Array.from(field(m.doc, "value", "review", "accountProfileId").querySelectorAll("option"), o => o.value)).toEqual(["", "router"]);
+  });
+
   it("lists only active, compatible profiles and shows readiness without retired session recovery", async () => {
     const m = mountAgents({
       accounts: [
