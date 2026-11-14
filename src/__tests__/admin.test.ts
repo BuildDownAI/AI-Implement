@@ -2425,7 +2425,7 @@ describe("admin secrets", () => {
       { name: "ENG_STRIPE_KEY", digest: "def", created_at: "2026-01-02T00:00:00Z" },
       { name: "OTHER_SECRET", digest: "ghi", created_at: "2026-01-03T00:00:00Z" },
     ];
-    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: flySecrets } }).install();
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: { secrets: flySecrets } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2459,7 +2459,7 @@ describe("admin secrets", () => {
         Object.assign(stored, JSON.parse(call.body).values);
         return { json: { version: 99, secrets: Object.entries(stored).map(([name, value]) => ({ name, value })) } };
       },
-      [`GET ${FLY_SECRETS}`]: () => ({ json: Object.keys(stored).map((name) => ({ name, digest: "digest", created_at: "2026-11-13" })) }),
+      [`GET ${FLY_SECRETS}`]: () => ({ json: { secrets: Object.keys(stored).map((name) => ({ name, digest: "digest", created_at: "2026-11-13" })) } }),
     }).install();
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2905,12 +2905,12 @@ describe("admin global secrets", () => {
   });
 
   it("GET lists secrets that have no team prefix", async () => {
-    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: [
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: { secrets: [
       { name: "ANTHROPIC_API_KEY", digest: "aaa", created_at: "2026-01-01" },
       { name: "ENG_DATABASE_URL", digest: "bbb", created_at: "2026-01-02" },
       { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", created_at: "2026-01-03" },
       { name: "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", digest: "ddd", created_at: "2026-01-04" },
-    ] } }).install();
+    ] } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
