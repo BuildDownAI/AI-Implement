@@ -136,13 +136,15 @@ For an `openrouter-api-key` profile, the selected model environment contains the
 | `ANTHROPIC_API_KEY` | Empty string |
 | `OPENROUTER_API_KEY` | The selected API key |
 
-The endpoint is fixed in code; inherited endpoints and credentials cannot override it. Claude Code uses the bearer token, with the Anthropic API key explicitly empty. The same environment shape provides `OPENROUTER_API_KEY` for the subsequent Codex provider integration. Other auth modes receive neither the OpenRouter key nor the Anthropic base URL. Configured repository processes (install, setup, verify and teardown) receive neither the key nor the endpoint.
+The endpoint is fixed in code; inherited endpoints and credentials cannot override it. Claude Code uses the bearer token, with the Anthropic API key explicitly empty. Codex reads `OPENROUTER_API_KEY` through its dedicated OpenRouter provider. Other auth modes receive neither the OpenRouter key nor the Anthropic base URL. Configured repository processes (install, setup, verify and teardown) receive neither the key nor the endpoint.
 
 The model name passes through unchanged: use an OpenRouter model ID such as `anthropic/<model>`. Environment tests cover construction and stripping; a post-landing operator run against the pinned Claude Code version remains the integration proof.
 
 ### API keys and Codex stages
 
 An `openai-api-key` profile works for every Codex stage, including review and planning, which run `codex app-server`. The invocation env carries the key as `CODEX_API_KEY`. `codex exec` reads that variable directly. The app-server path has no `auth.json`, and its built-in `openai` provider does not read the variable, so the executor selects a provider named `openai_api_key` whose `env_key` is `CODEX_API_KEY` (`base_url` is `OPENAI_BASE_URL` when the invocation sets an allowed one, else `https://api.openai.com/v1`). The provider is chosen the same way in the view's `config.toml`, the argv and the thread request. `CODEX_API_KEY` stays in the shell-environment exclusion list, so the Codex process has the key and the commands the model runs do not. A run without `CODEX_API_KEY` in its env keeps the built-in provider.
+
+An `openrouter-api-key` profile selects the `openrouter` provider (`name = "OpenRouter"`) for both `codex exec` and `codex app-server` (planning and review), including the generated `config.toml` and thread request. Its fixed code endpoint is `https://openrouter.ai/api/v1`, with `env_key = "OPENROUTER_API_KEY"`, `wire_api = "responses"`, `requires_openai_auth = false` and `supports_websockets = false`. The model ID passes unchanged, for example `openai/<model>` or an open model ID. The URL never travels through `OPENAI_BASE_URL`; that variable still permits only the existing local test endpoints. `OPENROUTER_API_KEY` and the shared invocation environment’s `ANTHROPIC_AUTH_TOKEN` alias are excluded from model-run shell commands. Live compatibility with the pinned Codex requires an operator test; the unknown-model metadata warning for non-OpenAI models is accepted.
 
 ## Check which profile a run used
 

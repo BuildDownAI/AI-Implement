@@ -11,9 +11,9 @@ import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type Failure
 import { CODEX_SKILLS_SUBDIR } from "./steps/install-skills.js";
 import { computeBackoffMs } from "./retry-backoff.js";
 import { suspendOriginWriteCredential } from "./executor.js";
-import { CHATGPT_PLAN_ACCESS_TOKEN_ENV, ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
+import { CHATGPT_PLAN_ACCESS_TOKEN_ENV, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 
-/** Default provider for Codex invocations; the trusted-selected credential kind switches it to `CHATGPT_PLAN_PROVIDER` for a ChatGPT plan access token. */
+/** Default provider; the selected invocation can choose a ChatGPT plan or OpenRouter provider. */
 export const CODEX_PROVIDER = "openai";
 
 /** Provider id for a ChatGPT plan access token, sent to the Responses API with no `auth.json`. */
@@ -53,9 +53,27 @@ export const openaiApiKeyProviderArgs = (baseUrl?: string): string[] => {
   ].flatMap((pair) => ["-c", pair]);
 };
 
-/** App-server only: a non-plan invocation whose selected env carries an API key needs the provider that reads it. */
+/** Fixed destination for the selected OpenRouter credential. */
+export const OPENROUTER_PROVIDER = "openrouter";
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY";
+
+export const openrouterProviderArgs = (): string[] => {
+  const t = `model_providers.${OPENROUTER_PROVIDER}`;
+  return [
+    `model_provider="${OPENROUTER_PROVIDER}"`,
+    `${t}.name="OpenRouter"`,
+    `${t}.base_url=${JSON.stringify(OPENROUTER_BASE_URL)}`,
+    `${t}.env_key=${JSON.stringify(OPENROUTER_API_KEY_ENV)}`,
+    `${t}.wire_api="responses"`,
+    `${t}.requires_openai_auth=false`,
+    `${t}.supports_websockets=false`,
+  ].flatMap((pair) => ["-c", pair]);
+};
+
+/** App-server only: an OpenAI invocation with an API key needs the provider that reads it. */
 const usesApiKeyProvider = (provider: CodexProviderKind | undefined, env: Record<string, string>): boolean =>
-  provider !== "chatgpt-plan" && !!env[OPENAI_API_KEY_ENV];
+  provider === undefined && !!env[OPENAI_API_KEY_ENV];
 
 type CodexProviderKind = ModelInvocation["codexProvider"];
 
@@ -69,6 +87,9 @@ export const CODEX_SHELL_ENV_EXCLUDE = [
   "CHATGPT_PLAN_ACCESS_TOKEN",
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
+  "OPENROUTER_API_KEY",
+  // The shared OpenRouter invocation environment also carries Claude's bearer-token alias.
+  "ANTHROPIC_AUTH_TOKEN",
 ] as const;
 
 /** Pinned Codex 0.159.2 flag accepted by both `exec` and `exec resume`; intended for externally sandboxed environments. */
@@ -591,11 +612,6 @@ export class CodexExecutor implements LLMExecutor {
       // profile "invoking" (no second invocation, no dispose), while the race below surfaces the
       // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
-        // OpenRouter currently supports Claude Code only. Refuse before either Codex
-        // launch path can fall back to the built-in OpenAI provider.
-        if (Object.hasOwn(selected.env, "OPENROUTER_API_KEY")) {
-          throw new ModelAuthClientError("unsupported_auth_mode", { profileId: this.options.profileId });
-        }
         try {
           return await this.runChild(params, selected.env, deadlineAt, state, selected.codexProvider);
         } catch (err) {
@@ -658,9 +674,9 @@ export class CodexExecutor implements LLMExecutor {
       "--ignore-rules",
       "--model",
       params.model,
-      ...(provider === "chatgpt-plan" ? chatgptPlanProviderArgs() : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
+      ...(provider === "openrouter" ? openrouterProviderArgs() : provider === "chatgpt-plan" ? chatgptPlanProviderArgs() : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
       ...shellEnvPolicyArgs(),
-      ...(baseUrl && provider !== "chatgpt-plan" ? ["-c", `openai_base_url=${JSON.stringify(baseUrl)}`] : []),
+      ...(baseUrl && provider === undefined ? ["-c", `openai_base_url=${JSON.stringify(baseUrl)}`] : []),
       ...(resumeThreadId ? this.resumeSandboxArgs(params) : this.sandboxArgs(params)),
     ];
     if (schemaPath) args.push("--output-schema", schemaPath);
@@ -680,11 +696,13 @@ export class CodexExecutor implements LLMExecutor {
       "--strict-config",
       "-c",
       `model=${JSON.stringify(params.model)}`,
-      ...(provider === "chatgpt-plan"
-        ? chatgptPlanProviderArgs()
-        : apiKey
-          ? openaiApiKeyProviderArgs(baseUrl)
-          : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
+      ...(provider === "openrouter"
+        ? openrouterProviderArgs()
+        : provider === "chatgpt-plan"
+          ? chatgptPlanProviderArgs()
+          : apiKey
+            ? openaiApiKeyProviderArgs(baseUrl)
+            : ["-c", `model_provider="${CODEX_PROVIDER}"`]),
       "-c",
       'approval_policy="never"',
       "-c",
@@ -738,6 +756,7 @@ export class CodexExecutor implements LLMExecutor {
     apiKey = false,
   ): AppServerView {
     const plan = provider === "chatgpt-plan";
+    const openrouter = provider === "openrouter";
     mkdirSync(home, { mode: 0o700, recursive: true });
     mkdirSync(userHome, { mode: 0o700, recursive: true });
     mkdirSync(cwd, { mode: 0o700, recursive: true });
@@ -745,12 +764,12 @@ export class CodexExecutor implements LLMExecutor {
       join(home, "config.toml"),
       [
         `model = ${JSON.stringify(model)}`,
-        `model_provider = "${plan ? CHATGPT_PLAN_PROVIDER : apiKey ? OPENAI_API_KEY_PROVIDER : CODEX_PROVIDER}"`,
+        `model_provider = "${openrouter ? OPENROUTER_PROVIDER : plan ? CHATGPT_PLAN_PROVIDER : apiKey ? OPENAI_API_KEY_PROVIDER : CODEX_PROVIDER}"`,
         'approval_policy = "never"',
         'sandbox_mode = "read-only"',
-        // The only sanctioned provider redirect: the SELECTED invoke env's OPENAI_BASE_URL (trusted, set by
+        // The selected OpenAI provider redirect: the SELECTED invoke env's OPENAI_BASE_URL (trusted, set by
         // the auth client or a synthetic test), never the selected home's or repository's config.
-        ...(baseUrl && !plan && !apiKey ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
+        ...(baseUrl && !openrouter && !plan && !apiKey ? [`openai_base_url = ${JSON.stringify(baseUrl)}`] : []),
         ...(plan
           ? [
               "",
@@ -758,6 +777,18 @@ export class CodexExecutor implements LLMExecutor {
               'name = "ChatGPT plan"',
               'base_url = "https://api.openai.com/v1"',
               `env_key = ${JSON.stringify(CHATGPT_PLAN_ACCESS_TOKEN_ENV)}`,
+              'wire_api = "responses"',
+              "requires_openai_auth = false",
+              "supports_websockets = false",
+            ]
+          : []),
+        ...(openrouter
+          ? [
+              "",
+              `[model_providers.${OPENROUTER_PROVIDER}]`,
+              'name = "OpenRouter"',
+              `base_url = ${JSON.stringify(OPENROUTER_BASE_URL)}`,
+              `env_key = ${JSON.stringify(OPENROUTER_API_KEY_ENV)}`,
               'wire_api = "responses"',
               "requires_openai_auth = false",
               "supports_websockets = false",
@@ -962,11 +993,13 @@ export class CodexExecutor implements LLMExecutor {
           io: { stdin: proc.stdin, stdout: proc.stdout, halt: haltController.signal },
           prompt: params.prompt,
           model: params.model,
-          ...(provider === "chatgpt-plan"
-            ? { modelProvider: CHATGPT_PLAN_PROVIDER }
-            : usesApiKeyProvider(provider, env)
-              ? { modelProvider: OPENAI_API_KEY_PROVIDER }
-              : {}),
+          ...(provider === "openrouter"
+            ? { modelProvider: OPENROUTER_PROVIDER }
+            : provider === "chatgpt-plan"
+              ? { modelProvider: CHATGPT_PLAN_PROVIDER }
+              : usesApiKeyProvider(provider, env)
+                ? { modelProvider: OPENAI_API_KEY_PROVIDER }
+                : {}),
           ...(resumeThreadId ? { resumeThreadId } : {}),
           workspaceDir: this.workspaceDir,
           ...(view ? { protocolCwd: view.cwd } : {}),

@@ -167,23 +167,79 @@ const base = { prompt: "do the thing", model: "gpt-synthetic", stage: "implement
 const retry = { retry: { policy: { ...DEFAULT_RETRY_POLICY, requestRetries: 2, backoffInitialMs: 1, backoffMaxMs: 5 }, toolUseIsSafe: false } };
 
 describe("CodexExecutor result contract", () => {
-  it.each(["implementation", "planning", "review"] as const)("fails closed for OpenRouter in %s before launching Codex", async (agentStage) => {
+  it.each(["implementation", "planning", "review"] as const)("routes OpenRouter in %s", async (agentStage) => {
     const selected = buildModelInvocationEnv({
       authMode: "openrouter-api-key",
       secret: { kind: "api-key", apiKey: SYNTHETIC_KEY },
-      inheritedEnv: { CODEX_API_KEY: "ambient-key", CODEX_HOME: "/tmp/ambient-auth" },
+      inheritedEnv: {},
     });
-    const run = vi.fn<CodexProtocolDriver["run"]>();
-    const { executor, log, sleeps } = make([], {
-      auth: { invoke: async (_id, cb) => cb(selected) },
+    let config: string | undefined;
+    const run = vi.fn<CodexProtocolDriver["run"]>(async (input) => {
+      expect(input.modelProvider).toBe("openrouter");
+      expect(input.model).toBe("openai/example");
+      config = readFileSync(join(log[0].env.CODEX_HOME, "config.toml"), "utf8");
+      return {
+        result: { stdout: "done", stderr: "", exitCode: 0, tokensUsed: 0,
+          terminalStatus: { subtype: "success", isError: false }, signal: null },
+        sawUnsafe: false, stopReason: null,
+      };
+    });
+    const { executor, log } = make([agentStage === "implementation" ? { stdout: message("done") } : { hang: true, dieOn: ["SIGTERM"] }], {
+      auth: { invoke: async (_id, cb) => cb({ ...selected, codexProvider: "openrouter", env: { ...selected.env, CODEX_API_KEY: "synthetic-collision", OPENAI_BASE_URL: "http://127.0.0.1:8080/v1" } }) },
       ...(agentStage !== "implementation" ? { protocolDriver: { policy: agentStage, run } } : {}),
     });
-    await expect(executor.invoke({ ...base, ...retry, agentStage })).rejects.toMatchObject({
-      category: "unsupported_auth_mode",
+    const result = await executor.invoke({ ...base, model: "openai/example", agentStage });
+    expect(result.terminalStatus?.isError).toBe(false);
+    const args = log[0].args;
+    const policyArg = args.find((arg) => arg.startsWith("shell_environment_policy.exclude="));
+    expect(policyArg).toBeDefined();
+    const excluded = JSON.parse(policyArg!.slice("shell_environment_policy.exclude=".length)) as string[];
+    const credentialNames = Object.keys(selected.env).filter((name) => selected.env[name] === SYNTHETIC_KEY);
+    expect(credentialNames).toEqual(expect.arrayContaining(["OPENROUTER_API_KEY", "ANTHROPIC_AUTH_TOKEN"]));
+    for (const name of credentialNames) {
+      expect(log[0].env[name]).toBe(SYNTHETIC_KEY);
+      expect(excluded).toContain(name);
+    }
+    for (const pair of [
+      'model_provider="openrouter"',
+      'model_providers.openrouter.name="OpenRouter"',
+      'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
+      'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
+      'model_providers.openrouter.wire_api="responses"',
+      'model_providers.openrouter.requires_openai_auth=false',
+      'model_providers.openrouter.supports_websockets=false',
+    ]) expect(args).toContain(pair);
+    expect(args.join(" ")).not.toMatch(/openai_api_key|chatgpt_plan|openai_base_url/);
+    expect(args.join(" ")).not.toContain(SYNTHETIC_KEY);
+    expect(args.join(" ")).toContain("openai/example");
+    if (agentStage !== "implementation") {
+      expect(parseToml(config!)).toMatchObject({
+        model: "openai/example",
+        model_provider: "openrouter",
+        model_providers: { openrouter: {
+          name: "OpenRouter", base_url: "https://openrouter.ai/api/v1",
+          env_key: "OPENROUTER_API_KEY", wire_api: "responses",
+          requires_openai_auth: false, supports_websockets: false,
+        } },
+      });
+      expect(Object.keys((parseToml(config!) as { model_providers: object }).model_providers)).toEqual(["openrouter"]);
+      expect(config).not.toContain(SYNTHETIC_KEY);
+      expect(config).not.toContain("openai_base_url");
+    }
+  });
+
+  it.each(["implementation", "planning", "review"] as const)("rejects unsafe OPENAI_BASE_URL for OpenRouter in %s before spawn", async (agentStage) => {
+    const run = vi.fn<CodexProtocolDriver["run"]>();
+    const { executor, log } = make([], {
+      auth: { invoke: async (_id, cb) => cb({
+        codexProvider: "openrouter", strippedKeys: [],
+        env: { OPENROUTER_API_KEY: SYNTHETIC_KEY, OPENAI_BASE_URL: "https://openrouter.ai/api/v1" },
+      }) },
+      ...(agentStage !== "implementation" ? { protocolDriver: { policy: agentStage, run } } : {}),
     });
+    await expect(executor.invoke({ ...base, agentStage })).rejects.toThrow(/OPENAI_BASE_URL/);
     expect(log).toEqual([]);
     expect(run).not.toHaveBeenCalled();
-    expect(sleeps).toEqual([]);
   });
 
   it("returns a success result with nullable usage preserved and the prompt on stdin", async () => {
@@ -666,7 +722,7 @@ const SHELL_POLICY = `shell_environment_policy.exclude=${JSON.stringify(CODEX_SH
 
 describe("shell environment exclude list (AII-1193)", () => {
   it("names exactly the credential variables, in order", () => {
-    expect([...CODEX_SHELL_ENV_EXCLUDE]).toEqual(["CODEX_API_KEY", "CODEX_HOME", "CHATGPT_PLAN_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+    expect([...CODEX_SHELL_ENV_EXCLUDE]).toEqual(["CODEX_API_KEY", "CODEX_HOME", "CHATGPT_PLAN_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
   });
 });
 
