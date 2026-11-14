@@ -2,19 +2,20 @@ export const STAGE_AGENT_CONFIG_VERSION = 1;
 export const STAGE_NAMES = ["planning", "implementation", "review"] as const;
 export const STAGE_SELECTION_FIELDS = ["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"] as const;
 
-export const STORED_STAGE_SELECTION_FIELDS = [...STAGE_SELECTION_FIELDS, "fallbackModel", "accounts"] as const;
+export const STORED_STAGE_SELECTION_FIELDS = [...STAGE_SELECTION_FIELDS, "fallbackModel", "accounts", "preferOpenModel"] as const;
 export type StoredStageSelectionField = (typeof STORED_STAGE_SELECTION_FIELDS)[number];
 
 export type StageName = (typeof STAGE_NAMES)[number];
 export type StageSelectionField = (typeof STAGE_SELECTION_FIELDS)[number];
 export type StageAgent = "claude" | "codex";
-export type ModelProvider = "anthropic" | "bedrock" | "openai";
+export type ModelProvider = "anthropic" | "bedrock" | "openai" | "openrouter";
 export type AccountAuthMode =
   | "anthropic-api-key"
   | "bedrock"
   | "claude-subscription"
   | "openai-api-key"
-  | "codex-subscription";
+  | "codex-subscription"
+  | "openrouter-api-key";
 export type StageConfigMode = "legacy" | "configured";
 export type FieldSource = "orchestrator-default" | "project" | "job-deadline";
 
@@ -38,7 +39,7 @@ export interface StageSelection {
 
 export type StageSelectionPatch = {
   [K in StageSelectionField]?: StageSelection[K] | null;
-} & { fallbackModel?: string | null; accounts?: AccountEntry[] };
+} & { fallbackModel?: string | null; accounts?: AccountEntry[]; preferOpenModel?: boolean };
 
 export interface AccountEntry { accountProfileId: string; model: string }
 export interface StageAccount extends AccountEntry {
@@ -155,6 +156,17 @@ export function validateFallbackModel(value: unknown, stage: string): void {
   }
 }
 
+/** Stored project metadata only; execution selection deliberately excludes this field. */
+export function validatePreferOpenModel(patch: object, stage: string, project: boolean): void {
+  if (!Object.prototype.hasOwnProperty.call(patch, "preferOpenModel")) return;
+  if (!project || stage !== "implementation") {
+    throw new Error("preferOpenModel is only supported in project implementation settings");
+  }
+  if (typeof (patch as Record<string, unknown>).preferOpenModel !== "boolean") {
+    throw new Error("implementation.preferOpenModel must be a boolean");
+  }
+}
+
 function validateConfigShape(config: StageAgentConfigurationV1, name: string): void {
   if (!isRecord(config)) throw new Error(`${name} must be an object`);
   assertKnownKeys(config, ["version", "mode", "stages"], name);
@@ -175,6 +187,7 @@ function validateConfigShape(config: StageAgentConfigurationV1, name: string): v
       if (name === "projectConfig") throw new Error("accounts is only supported in orchestrator defaults");
       validateAccounts(patch.accounts, stage);
     }
+    validatePreferOpenModel(patch, stage, name === "projectConfig");
     validateFallbackModel(patch.fallbackModel, stage);
     assertKnownKeys(patch, STORED_STAGE_SELECTION_FIELDS, `${name}.stages.${stage}`);
   }
@@ -190,7 +203,7 @@ function asStageSelection(value: Partial<Record<StageSelectionField, unknown>>, 
   if (selection.agent !== "claude" && selection.agent !== "codex") {
     throw new Error(`${stage}.agent is unsupported`);
   }
-  if (selection.provider !== "anthropic" && selection.provider !== "bedrock" && selection.provider !== "openai") {
+  if (selection.provider !== "anthropic" && selection.provider !== "bedrock" && selection.provider !== "openai" && selection.provider !== "openrouter") {
     throw new Error(`${stage}.provider is unsupported`);
   }
   if (typeof selection.model !== "string" || selection.model.trim() === "") {
@@ -224,6 +237,7 @@ function validateAgentProvider(stage: StageName, selection: StageSelection, prof
   if (profile.provider !== selection.provider) {
     throw new Error(`${stage}.accountProfileId provider does not match selected provider`);
   }
+  if (selection.provider === "openrouter" && profile.authMode === "openrouter-api-key") return;
   if (selection.agent === "claude") {
     if (selection.provider === "anthropic" && profile.authMode === "anthropic-api-key") return;
     if (selection.provider === "anthropic" && profile.authMode === "claude-subscription") return;
@@ -250,7 +264,7 @@ function validateAccountProfile(profile: AccountProfile): void {
   if (profile.agent !== "claude" && profile.agent !== "codex") {
     throw new Error("account profile agent is unsupported");
   }
-  if (profile.provider !== "anthropic" && profile.provider !== "bedrock" && profile.provider !== "openai") {
+  if (profile.provider !== "anthropic" && profile.provider !== "bedrock" && profile.provider !== "openai" && profile.provider !== "openrouter") {
     throw new Error("account profile provider is unsupported");
   }
   if (
@@ -258,7 +272,8 @@ function validateAccountProfile(profile: AccountProfile): void {
     profile.authMode !== "bedrock" &&
     profile.authMode !== "claude-subscription" &&
     profile.authMode !== "openai-api-key" &&
-    profile.authMode !== "codex-subscription"
+    profile.authMode !== "codex-subscription" &&
+    profile.authMode !== "openrouter-api-key"
   ) {
     throw new Error("account profile authentication mode is unsupported");
   }
@@ -304,7 +319,24 @@ function stageAccountCandidates(input: ResolveStageAgentConfigInput, stage: Stag
   const firstProfile = first && profileById.get(first.accountProfileId);
   const base = first ? { ...defaults, ...first, agent: firstProfile?.agent ?? defaults?.agent ?? "claude", provider: firstProfile?.provider ?? defaults?.provider ?? "anthropic" } : defaults;
   const resolved = resolveStage(stage, base, override, input.remainingJobMs);
-  const raw = defaults?.accounts && override?.accountProfileId == null ? defaults.accounts : [{ accountProfileId: resolved.selection.accountProfileId, model: resolved.selection.model }];
+  const projectAccount = override?.accountProfileId != null;
+  const raw = defaults?.accounts && !projectAccount ? defaults.accounts : [{ accountProfileId: resolved.selection.accountProfileId, model: resolved.selection.model }];
+  if (projectAccount) {
+    // Normalize defaults before appending: blank models belong to the defaults,
+    // even when their first entry is deduplicated against the project account.
+    const defaultEntries = defaults?.accounts ?? (defaults?.accountProfileId && defaults.model
+      ? [{ accountProfileId: defaults.accountProfileId, model: defaults.model }] : []);
+    const seen = new Set([resolved.selection.accountProfileId]);
+    let subscription = profileById.get(resolved.selection.accountProfileId)?.authMode.endsWith("subscription") ?? false;
+    for (const entry of defaultEntries) {
+      if (seen.has(entry.accountProfileId)) continue;
+      const isSubscription = profileById.get(entry.accountProfileId)?.authMode.endsWith("subscription") ?? false;
+      if (subscription && !isSubscription) continue;
+      seen.add(entry.accountProfileId);
+      subscription ||= isSubscription;
+      raw.push({ ...entry, model: entry.model.trim() ? entry.model : defaultEntries[0].model });
+    }
+  }
   const entries = raw.map((entry, index) => {
     const p = profileById.get(entry.accountProfileId);
     return { ...entry, ...(index === 0 ? resolved.selection : {}), profileRevision: p?.revision ?? 0,
@@ -352,6 +384,11 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       fallbackModelSources[stage] = projectFallback != null ? "project" : "orchestrator-default";
     }
     const choice = chooseStageAccount(entries, check);
+    // A project account is mandatory; appended defaults are runtime fallbacks.
+    if (input.projectConfig.stages?.[stage]?.accountProfileId != null &&
+        (!choice.chosen || choice.chosen.index !== 0)) {
+      throw new StageAccountError(stage, choice.chosen ? choice.skipped[0].reason : choice.failure);
+    }
     if (!choice.chosen) {
       // Preserve the existing fixed resolver messages for flat configurations.
       if (!defaults?.accounts && choice.failure === "resolution_failed") {
@@ -361,13 +398,14 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       }
       throw new StageAccountError(stage, choice.failure);
     }
-    if (defaults?.accounts) {
+    if (defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null) {
       selection[stage] = { chosen: choice.chosen.index, skipped: choice.skipped };
       if (choice.fallbacks.length) accountFallbacks[stage] = choice.fallbacks;
     }
     if (choice.chosen.index > 0) {
       // Later entries supply their own profile fields; a blank model inherits
-      // the first candidate's effective model, including its project override.
+      // the first candidate's effective model for model-only overrides.
+      // Appended defaults have already had their blank models resolved.
       for (const field of ["accountProfileId", "agent", "provider"] as const) {
         resolved.sources[field] = "orchestrator-default";
       }
@@ -378,7 +416,7 @@ export function resolveStageAgentConfig(input: ResolveStageAgentConfigInput): St
       delete fallbackModels[stage];
       delete fallbackModelSources[stage];
     } else if (fallback === resolved.selection.model) {
-      if (!defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null) {
+      if (choice.chosen.index === 0 && (!defaults?.accounts || input.projectConfig.stages?.[stage]?.accountProfileId != null)) {
         throw new Error(`${stage}.fallbackModel must differ from model`);
       }
       // Backend selection can make the stage fallback redundant for this run.

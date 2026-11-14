@@ -1,3 +1,4 @@
+import { accountCombinations } from "./helpers/account-combinations.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import type * as StoreModule from "../agent-config-store.js";
 import type * as DedupModule from "../dedup.js";
@@ -90,6 +91,13 @@ describe("stage inputs fingerprint", () => {
 });
 
 describe("profiles", () => {
+  it.each(accountCombinations)("save combination $agent/$provider/$authMode: $permitted", ({ permitted, ...combo }) => {
+    const before = dump();
+    const save = () => store.saveAccountProfileRevision(claudeProfile(combo));
+    if (permitted) expect(save().authMode).toBe(combo.authMode);
+    else { expect(save).toThrow("combination is unsupported"); expect(dump()).toBe(before); }
+  });
+
   it.each([
     ["claude", "anthropic", "anthropic-api-key"],
     ["claude", "anthropic", "claude-subscription"],
@@ -110,7 +118,7 @@ describe("profiles", () => {
     ["codex", "openai", "bedrock"],
   ] as const)("rejects mismatch %s/%s/%s without changes", (agent, provider, authMode) => {
     const before = dump();
-    expect(() => store.saveAccountProfileRevision(claudeProfile({ agent, provider, authMode }))).toThrow();
+    expect(() => store.saveAccountProfileRevision(claudeProfile({ agent, provider, authMode }))).toThrow("profile agent/provider/authentication combination is unsupported");
     expect(dump()).toBe(before);
   });
 
@@ -425,6 +433,16 @@ describe("default account list writes", () => {
     expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error(message));
     expect(dump()).toBe(before);
   });
+  it("refuses OpenRouter after a subscription without saving a revision", () => {
+    store.saveAccountProfileRevision(claudeProfile({ profileId: "plan", authMode: "claude-subscription" }));
+    store.saveAccountProfileRevision(claudeProfile({ profileId: "router", provider: "openrouter", authMode: "openrouter-api-key" }));
+    const config = defaults();
+    config.stages!.planning!.accounts = [{ accountProfileId: "plan", model: "m" }, { accountProfileId: "router", model: "m" }];
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults(config)).toThrow("cannot use paid API after subscription");
+    expect(dump()).toBe(before);
+  });
+
   it("accepts Claude subscriptions and refuses paid entries after them", () => {
     store.saveAccountProfileRevision(claudeProfile({ profileId: "plan", authMode: "claude-subscription" }));
     const config = defaults();
@@ -459,4 +477,61 @@ it("refuses a historical incompatible profile without writing", () => {
   const before = dump();
   expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error("planning.accounts[0] does not resolve"));
   expect(dump()).toBe(before);
+});
+
+describe("stored open-model preference", () => {
+  it.each(["legacy", "configured"] as const)("clears optional implementation metadata in %s mode", (mode) => {
+    seed();
+    for (const preferOpenModel of [true, false]) {
+      const saved = store.setProjectStageConfig("AII", {
+        version: 1, mode, stages: { implementation: { model: "custom-model", preferOpenModel }, review: { model: "review-model" } },
+      });
+      const beforeResolution = store.resolveProjectStageConfig("AII").resolution;
+      const cleared = store.clearProjectStageField("AII", "implementation", "preferOpenModel");
+      expect(cleared.revision).toBe(saved.revision + 1);
+      expect(cleared.supersedesRevisionId).toBe(saved.configRevisionId);
+      expect(cleared.config).toEqual({
+        version: 1, mode, stages: { implementation: { model: "custom-model" }, review: { model: "review-model" } },
+      });
+      expect(store.getProjectStageConfig("AII")!.config).toEqual(cleared.config);
+      expect(store.resolveProjectStageConfig("AII").resolution).toEqual(beforeResolution);
+    }
+  });
+  it.each(["legacy", "configured"] as const)("rejects clearing metadata in invalid stages atomically in %s mode", (mode) => {
+    seed();
+    store.setProjectStageConfig("AII", { version: 1, mode, stages: { implementation: { preferOpenModel: true } } });
+    const before = dump();
+    for (const stage of ["planning", "review"] as const) {
+      expect(() => store.clearProjectStageField("AII", stage, "preferOpenModel")).toThrow("only supported in project implementation");
+      expect(dump()).toBe(before);
+    }
+    expect(() => store.clearProjectStageField("AII", "unknown" as never, "preferOpenModel")).toThrow("unknown stage");
+    expect(dump()).toBe(before);
+  });
+  it.each(["legacy", "configured"] as const)("round-trips booleans and old configs in %s mode", (mode) => {
+    seed();
+    for (const patch of [{}, { preferOpenModel: true }, { preferOpenModel: false }]) {
+      const config: StageAgentConfigurationV1 = { version: 1, mode, stages: { implementation: patch } };
+      store.setProjectStageConfig("AII", config);
+      expect(store.getProjectStageConfig("AII")!.config).toEqual(config);
+    }
+  });
+  it.each(["legacy", "configured"] as const)("rejects invalid project writes atomically in %s mode", (mode) => {
+    seed();
+    const before = dump();
+    for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
+      expect(() => store.setProjectStageConfig("AII", {
+        version: 1, mode, stages: { [stage as string]: { preferOpenModel: value } },
+      } as StageAgentConfigurationV1)).toThrow();
+      expect(dump()).toBe(before);
+    }
+  });
+  it.each(["planning", "implementation", "review"])("rejects defaults %s without appending a revision", (stage) => {
+    seed();
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults({
+      ...defaults(), stages: { ...defaults().stages, [stage]: { preferOpenModel: false } },
+    })).toThrow("only supported");
+    expect(dump()).toBe(before);
+  });
 });

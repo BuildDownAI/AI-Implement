@@ -441,6 +441,30 @@ describe("projects page agents tab", () => {
   const preview = (doc: Document, stage: string, f: string) => doc.querySelector(`[data-ag-preview="${stage}.${f}"]`)!.textContent;
   const puts = (m: ReturnType<typeof mountAgents>) => m.calls.filter((c) => c.method === "PUT");
 
+  it.each(["legacy", "configured"])("saves and reloads the open-model checkbox in %s mode", async (mode) => {
+    const stored: Mapping = { mode, stages: {} };
+    const m = mountAgents({ stored });
+    await open(m);
+    const checkbox = () => m.doc.querySelector<HTMLInputElement>("#md-agents-open-model")!;
+    expect(m.doc.querySelectorAll("#md-agents-open-model")).toHaveLength(1);
+    expect(checkbox().closest("label")!.textContent).toContain("Use the open model for implementation");
+    expect(checkbox().parentElement!.nextElementSibling!.textContent).toBe("Not active yet. The value is saved, and no run uses it.");
+    expect(checkbox().checked).toBe(false);
+    expect(m.doc.getElementById("md-agents-save")!.textContent).toBe("Save agent settings");
+    for (const value of [true, false]) {
+      checkbox().checked = value;
+      fire(m.doc, checkbox());
+      // A normal stage rerender must retain the checkbox draft.
+      fire(m.doc, field(m.doc, "mode", "review", "model"));
+      expect(checkbox().checked).toBe(value);
+      stored.stages = { implementation: { preferOpenModel: value } };
+      await m.win.saveAgentConfig();
+      expect(puts(m).at(-1)!.body).toEqual({ stages: { implementation: { preferOpenModel: value } } });
+      await open(m);
+      expect(checkbox().checked).toBe(value);
+    }
+  });
+
   const claudeAccount = (overrides: Mapping = {}) => account({
     profileId: "acct-claude", agent: "claude", provider: "anthropic", authMode: "claude-subscription", ...overrides,
   });
@@ -679,6 +703,26 @@ describe("projects page agents tab", () => {
     expect(options).toEqual(expect.arrayContaining(["acct-a", "acct-b"]));
     expect(options).not.toContain("acct-off");
   });
+  it.each(["claude", "codex"])("offers compatible OpenRouter accounts for %s", async (agent) => {
+    const m = mountAgents({ accounts: [
+      account({ profileId: "router", agent, provider: "openrouter", authMode: "openrouter-api-key" }),
+      account({ profileId: "disabled", agent, provider: "openrouter", profileStatus: "disabled" }),
+      account({ profileId: "other-agent", agent: agent === "claude" ? "codex" : "claude", provider: "openrouter" }),
+      account(),
+    ] });
+    await open(m);
+    for (const [name, value] of [["agent", agent], ["provider", "openrouter"], ["accountProfileId", "router"]]) {
+      const mode = field(m.doc, "mode", "review", name);
+      mode.value = "override";
+      fire(m.doc, mode);
+      const control = field(m.doc, "value", "review", name);
+      control.value = value;
+      expect(control.value).toBe(value);
+      fire(m.doc, control);
+    }
+    expect(Array.from(field(m.doc, "value", "review", "accountProfileId").querySelectorAll("option"), o => o.value)).toEqual(["", "router"]);
+  });
+
   it("lists only active, compatible profiles and shows readiness without retired session recovery", async () => {
     const m = mountAgents({
       accounts: [

@@ -6636,19 +6636,24 @@ describe("model accounts and stage configuration (AII-962)", () => {
   it.each([
     { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
     { agent: "claude", provider: "bedrock", authMode: "bedrock" },
-  ])("reports an incompatible account-only override ($provider)", async profile => {
+  ])("refuses an incompatible account-only override ($provider)", async profile => {
     const t = await seed();
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "other", ...profile }));
     const config = structuredClone(defaults);
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "m" }, { accountProfileId: "other", model: "claude" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
-    // Simulate an existing project override; the save route correctly refuses this configuration.
+    // Simulate an existing project override with profile fields inherited from defaults.
     modules.agentConfigStore.setProjectConfigured("APP", true);
     dedup.getDb().prepare("INSERT INTO stage_agent_config_revisions (config_revision_id, scope_kind, scope_key, revision, version, config_json, created_at) VALUES ('override-test', 'project', 'APP', 2, 1, ?, ?)").run(
       JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
     const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(resolved.status).toBe(200);
-    expect(resolved.json.stages.planning.entries).toMatchObject([{ accountProfileId: "other", passes: false, reason: "resolution_failed" }]);
+    expect(resolved.json.resolved).toBe(false);
+    expect(resolved.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "other", passes: false, reason: "resolution_failed" },
+      { accountProfileId: "oai-1", passes: true },
+    ]);
+    expect(resolved.json.stages.planning.values).toBeUndefined();
   });
 
   it.each([
@@ -6684,7 +6689,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     });
   });
 
-  it("shows unsupported backend entries and project fallback suppression", async () => {
+  it("shows unsupported backend entries after a project account override", async () => {
     const t = await seed();
     await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "brk", agent: "claude", provider: "bedrock", authMode: "bedrock" }));
@@ -6698,8 +6703,52 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(resolved.json.stages.planning.values.accountProfileId).toBe("cl-api");
     expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: { planning: { accountProfileId: "cl-api", provider: "anthropic" } } }, readyDeps())).status).toBe(200);
     const overridden = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
-    expect(overridden.json.stages.planning.fallbacksDropped).toBe(true);
-    expect(overridden.json.stages.planning.entries).toHaveLength(1);
+    expect(overridden.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(overridden.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "cl-api", passes: true },
+      { accountProfileId: "brk", passes: false, reason: "unsupported_combination" },
+    ]);
+    expect(resolved.json.stages.planning.fallbacksDropped).toBe(false);
+    // A later profile change can make resolution fail; diagnostics retain the merged list.
+    expect((await call("/api/model-accounts/cl-api", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const failed = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(failed.json.resolved).toBe(false);
+    expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(failed.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "cl-api", passes: false, reason: "resolution_failed" },
+      { accountProfileId: "brk", passes: false, reason: "unsupported_combination" },
+    ]);
+  });
+
+  it("reports dropped fallbacks only when an override has no following default entry", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+      stages: { implementation: { accountProfileId: "oai-1" } },
+    }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.json.resolved).toBe(true);
+    expect(resolved.json.stages.implementation.fallbacksDropped).toBe(true);
+    expect(resolved.json.stages.implementation.entries).toHaveLength(1);
+    expect(resolved.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
+    expect(resolved.json.stages.planning.fallbacksDropped).toBe(false);
+    for (const stage of ["planning", "review"]) {
+      expect(resolved.json.stages[stage].fallbacksDropped).toBe(false);
+      expect(resolved.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
+      expect(resolved.json.stages[stage].entries).toHaveLength(1);
+    }
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const failed = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(failed.json.resolved).toBe(false);
+    expect(failed.json.stages.implementation.fallbacksDropped).toBe(true);
+    expect(failed.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(failed.json.stages.planning.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(failed.json.stages[stage].entries).toHaveLength(1);
+      expect(failed.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: false }]);
+    }
+    expect(failed.json.stages.review.fallbacksDropped).toBe(false);
   });
 
   it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
@@ -6803,6 +6852,24 @@ describe("model accounts and stage configuration (AII-962)", () => {
     const patch = await call("/api/model-accounts/oai-1", "PATCH", t, retired);
     expect(patch.status).toBe(400);
     expect(patch.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
+  });
+
+  it.each([false, true])("saves the inactive preference for configured=%s and rejects invalid scope/types", async (configured) => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", configured);
+    const deps = readyDeps();
+    for (const preferOpenModel of [true, false]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { implementation: { preferOpenModel } } }, deps)).status).toBe(200);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t, undefined, deps)).json.stages.implementation.preferOpenModel).toBe(preferOpenModel);
+    }
+    const revs = count("stage_agent_config_revisions");
+    for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { [stage as string]: { preferOpenModel: value } } }, deps)).status).toBe(400);
+    }
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect((await call("/api/agent-defaults", "PUT", t, { mode: "configured", stages: { [stage]: { preferOpenModel: false } } })).status).toBe(400);
+    }
+    expect(count("stage_agent_config_revisions")).toBe(revs);
   });
 
   it("saves and resolves fallback models with field provenance", async () => {

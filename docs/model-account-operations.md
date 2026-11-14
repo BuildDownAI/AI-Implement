@@ -13,8 +13,10 @@ On Models & providers an admin adds a profile with the form (`POST /api/model-ac
 |---|---|
 | Name | A label for the account behind the profile, stored as `identity`. Nothing at run time depends on it, and it can be changed later |
 | Agent | `claude` or `codex` |
-| Provider | `anthropic`, `openai` or `bedrock` |
-| Authentication | `anthropic-api-key`, `openai-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
+| Provider | `anthropic`, `openai`, `openrouter` or `bedrock` |
+| Authentication | `anthropic-api-key`, `openai-api-key`, `openrouter-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
+
+To add OpenRouter, enter a Name, choose either `claude` or `codex` as Agent, `openrouter` as Provider and `openrouter-api-key` as Authentication, then click **Add account profile**. In its row, enter the key and click **Set key**; use the same control to replace it or **Remove key** to delete it. The badge shows **set** after saving; the saved key is never displayed. OpenRouter has no environment credential to import. Select the profile in Orchestrator stage defaults or the project's Agents tab; the model field takes an OpenRouter model ID (for example, `anthropic/claude-sonnet-4`). Illegal combinations show the server's validation error and leave the form values available to correct.
 
 The page makes the profile ID from the Name: lowercase, each run outside `[a-z0-9._-]` replaced by `-`, leading and trailing hyphens removed, then leading punctuation removed so the ID starts with a letter or digit. It cuts the result to 64 characters and uses `account` when nothing is left. When an ID is loaded already, it adds `-2`, `-3`, …, shortening the base so the entire ID stays within 64 characters. If another admin creates the same ID before submission, the form shows the route's error message.
 
@@ -123,9 +125,26 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 - **Backup and restore.** Rows are sealed under a key derived from the current `RUNNER_TOKEN_SECRET` and bound to their reference. A restored database works only under the same secret, and a row copied to another reference fails authentication.
 - **Rotation.** Rotating `RUNNER_TOKEN_SECRET` orphans every stored credential. Re-import each one after the rotation.
 
+### OpenRouter API credentials
+
+For an `openrouter-api-key` profile, the selected model environment contains these four values:
+
+| Variable | Value |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | `https://openrouter.ai/api` |
+| `ANTHROPIC_AUTH_TOKEN` | The selected API key |
+| `ANTHROPIC_API_KEY` | Empty string |
+| `OPENROUTER_API_KEY` | The selected API key |
+
+The endpoint is fixed in code; inherited endpoints and credentials cannot override it. Claude Code uses the bearer token, with the Anthropic API key explicitly empty. Codex reads `OPENROUTER_API_KEY` through its dedicated OpenRouter provider. Other auth modes receive neither the OpenRouter key nor the Anthropic base URL. Configured repository processes (install, setup, verify and teardown) receive neither the key nor the endpoint.
+
+The model name passes through unchanged: use an OpenRouter model ID such as `anthropic/<model>`. Environment tests cover construction and stripping; a post-landing operator run against the pinned Claude Code version remains the integration proof.
+
 ### API keys and Codex stages
 
 An `openai-api-key` profile works for every Codex stage, including review and planning, which run `codex app-server`. The invocation env carries the key as `CODEX_API_KEY`. `codex exec` reads that variable directly. The app-server path has no `auth.json`, and its built-in `openai` provider does not read the variable, so the executor selects a provider named `openai_api_key` whose `env_key` is `CODEX_API_KEY` (`base_url` is `OPENAI_BASE_URL` when the invocation sets an allowed one, else `https://api.openai.com/v1`). The provider is chosen the same way in the view's `config.toml`, the argv and the thread request. `CODEX_API_KEY` stays in the shell-environment exclusion list, so the Codex process has the key and the commands the model runs do not. A run without `CODEX_API_KEY` in its env keeps the built-in provider.
+
+An `openrouter-api-key` profile selects the `openrouter` provider (`name = "OpenRouter"`) for both `codex exec` and `codex app-server` (planning and review), including the generated `config.toml` and thread request. Its fixed code endpoint is `https://openrouter.ai/api/v1`, with `env_key = "OPENROUTER_API_KEY"`, `wire_api = "responses"`, `requires_openai_auth = false` and `supports_websockets = false`. The model ID passes unchanged, for example `openai/<model>` or an open model ID. The URL never travels through `OPENAI_BASE_URL`; that variable still permits only the existing local test endpoints. `OPENROUTER_API_KEY` and the shared invocation environment’s `ANTHROPIC_AUTH_TOKEN` alias are excluded from model-run shell commands. Live compatibility with the pinned Codex requires an operator test; the unknown-model metadata warning for non-OpenAI models is accepted.
 
 ## Check which profile a run used
 
@@ -226,3 +245,5 @@ After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. 
 ### Stage fallback accounts
 
 On Models & providers, use Add account and Move up/Move down in the Orchestrator stage defaults card, then Save. This sets the stage's ordered `accounts: [{ accountProfileId, model }]` list in the stage defaults configuration (see [stage agent configuration](stage-agent-configuration.md)). The first account is primary; later accounts are fallback candidates, in order. Profiles must be configured and authorized in the run grant. Implementation and review switch once per account after a usage limit, preserving workspace changes and reporting the account that actually ran. Planning does not switch. Exhaustion names all exhausted profile ids; a checkout failure stops with its own authentication or recovery error.
+
+OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key` with either `claude` or `codex`, on every backend. Create the profile and set its write-only key on Models & providers (see [Add an account profile](#add-an-account-profile)). OpenRouter is a paid API mode, so it cannot follow a subscription in an account list. Claude Code routing uses the environment described in [OpenRouter API credentials](#openrouter-api-credentials); Codex provider routing is delivered separately; until then, Codex runs fail closed with `unsupported_auth_mode`.

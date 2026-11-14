@@ -4,11 +4,11 @@ Stage agent configuration decides, for each stage of a run, which agent runs, th
 
 ## Stages and selections
 
-There are three stages: `planning`, `implementation` and `review` (`STAGE_NAMES`, `src/agent-config.ts`). Each stage resolves to one selection: `agent` (`claude` or `codex`), `provider` (`anthropic`, `bedrock` or `openai`), `model`, `accountProfileId` and `invocationTimeoutMs`.
+There are three stages: `planning`, `implementation` and `review` (`STAGE_NAMES`, `src/agent-config.ts`). Each stage resolves to one selection: `agent` (`claude` or `codex`), `provider` (`anthropic`, `bedrock`, `openrouter` or `openai`), `model`, `accountProfileId` and `invocationTimeoutMs`.
 
 ## Account profiles
 
-An account profile is a named account an operator creates on Models & providers. Its revisions are immutable (`model_account_profile_revisions`): each change saves a new revision. A profile has an agent, a provider, an auth mode (`anthropic-api-key`, `openai-api-key`, `bedrock`, `codex-subscription`, `claude-subscription`) and a status (`active`, `disabled`, `archived`). Every active profile is usable by every project. Its credential lives encrypted on the orchestrator; a profile names it by `credentialRef`, and no read returns it. See [model-account-operations.md](model-account-operations.md).
+An account profile is a named account an operator creates on Models & providers, or through the admin API for OpenRouter. Its revisions are immutable (`model_account_profile_revisions`): each change saves a new revision. A profile has an agent, a provider, an auth mode (`anthropic-api-key`, `openai-api-key`, `openrouter-api-key`, `bedrock`, `codex-subscription`, `claude-subscription`) and a status (`active`, `disabled`, `archived`). Every active profile is usable by every project. Its credential lives encrypted on the orchestrator; a profile names it by `credentialRef`, and no read returns it. See [model-account-operations.md](model-account-operations.md).
 
 ## Defaults, overrides and the account list
 
@@ -16,20 +16,38 @@ A new project starts configured when the orchestrator stage defaults are on and 
 
 The orchestrator holds the default configuration, and each project may override it field by field (`stage_agent_config_revisions`, every write a new revision). In the defaults, each stage can hold an ordered list of account entries, `accounts: [{ accountProfileId, model }]`. The first entry supplies the stage's initial account; the later entries are candidates for fallbacks. An entry's agent and provider come from its profile, and a blank model means the first entry's model. The first entry must have a nonblank model. When both flat fields and `accounts` are supplied, the first account's profile and model take precedence. A stage with a single entry is stored in the flat shape (`agent`, `provider`, `model`, `accountProfileId`), for rollback compatibility. Configuration version remains 1.
 
-On Models & providers, the Orchestrator stage defaults card edits this list with Add account, Remove, Move up and Move down controls. Each row selects an active profile by Name and ID and supplies its model; row 1 supplies the stage model. A later model may be blank only for the same agent as row 1. Save displays server validation errors and keeps unsaved edits. A project that overrides the account profile on its Agents tab runs without these defaults fallbacks.
+On Models & providers, the Orchestrator stage defaults card edits this list with Add account, Remove, Move up and Move down controls. Each row selects an active profile by Name and ID and supplies its model; row 1 supplies the stage model. A later model may be blank only for the same agent as row 1. Save displays server validation errors and keeps unsaved edits. A project that overrides the account profile on its Agents tab uses these defaults as fallbacks after its project account.
 
-- Projects do not store a list. A project that overrides `accountProfileId` runs with no fallbacks; a project that overrides other fields keeps the default's fallbacks.
+- Projects do not store a list. A project that overrides `accountProfileId` runs with its project account first, followed by the defaults in order without repeating that profile. Blank default models inherit the first default model, not the project model. Defaults that would move from a subscription to paid API use are omitted. A project that overrides other fields keeps the default's fallbacks.
 - `invocationTimeoutMs` and `fallbackModel` are stage fields, merged field by field.
 
-Saving refuses an entry that does not resolve, a profile listed twice, an entry of another agent with a blank model, and an API-key or Bedrock entry after a subscription entry: a run never moves from subscription use to paid API use by itself. Errors name the stage and account index (starting at zero). The local harness uses these same rules for `stages`; its project-like `selections` block refuses lists.
+A project account that does not resolve is refused at save; the default accounts after it are fallbacks for a failure during a run. Saving refuses an entry that does not resolve, a profile listed twice, an entry of another agent with a blank model, and an API-key or Bedrock entry after a subscription entry: a run never moves from subscription use to paid API use by itself. Errors name the stage and account index (starting at zero). The local harness uses these same rules for `stages`; its project-like `selections` block refuses lists.
 
 The Projects Agents tab has no mode control. It shows the project mode and names the admin tool `set_project_agent_mode` for changing it. Stage overrides and their save button remain available for both modes; saves send only `stages`. Legacy runs ignore stored overrides until the project becomes configured. Unsaved projects show “Save the mapping first”.
 
 `PUT /api/mappings/:key/agent-config` inspects readiness for a configured project, so a new configured project receives `409` when saving stage overrides until its workflow sync pull request merges.
 
+### Open-model preference (inactive stub)
+
+Project settings may store an optional boolean `preferOpenModel` in the
+`implementation` stage only. Absent means false. Other types (including null),
+other stages, and orchestrator defaults reject this field.
+
+The project Agents tab exposes “Use the open model for implementation” and saves
+it with **Save agent settings**, including for legacy projects. It is not active:
+no run reads it, and it does not change resolved selections, account lists or
+execution snapshot fields. There is no setting to choose an open model yet.
+
+Before rolling back this feature, remove the `preferOpenModel` key entirely from
+every stored project config that contains it. Unchecking stores false and does
+not remove the key; setting null also does not remove it. Older code rejects the
+unknown key during shape validation.
+
 ## Run preparation and the snapshot
 
-When a run is prepared (`prepareAgentRun`, `src/agent-run-preparation.ts`, called inside the ImplementationRun prelaunch), `chooseStageAccount` takes each stage's first entry that passes the configuration checks (its profile resolves, and its backend is supported) and lists the later passing entries as fallbacks. Bedrock is supported only on GitHub Actions. The chosen entries become the run's snapshot, stored once per dispatch in `run_agent_config_snapshots` and never updated; a retried preparation reuses it. Beside it, `resolved_config_json` records per stage the chosen index, each entry passed over with its reason, and the fallback list, including profile revision and auth mode. Before freezing a new dispatch, preparation checks fallback credentials using each entry's own provider, profile revision and auth mode. Unready fallbacks are dropped without refusing the run; `droppedAccountFallbacks` records profile ids and safe reason codes in `resolved_config_json`, and grants include only retained entries. Reserved subscription sessions are verified at checkout under their owner generation. The binding budget may also trim the fallback list. Repeated preparation reuses the frozen list and grant. Primary credential failures still stop preparation. When no entry passes, the run fails with the first entry's failure.
+When a run is prepared (`prepareAgentRun`, `src/agent-run-preparation.ts`, called inside the ImplementationRun prelaunch), `chooseStageAccount` takes each stage's first entry that passes the configuration checks (its profile resolves, and its backend is supported) and lists the later passing entries as fallbacks. When a project overrides `accountProfileId`, entry zero must pass its check or resolution fails with its reason; defaults cannot replace a failed project account. Without that override, selection can skip failed defaults. Bedrock is supported only on GitHub Actions. The chosen entries become the run's snapshot, stored once per dispatch in `run_agent_config_snapshots` and never updated; a retried preparation reuses it. Beside it, `resolved_config_json` records per stage the chosen index, each entry passed over with its reason, and the fallback list, including profile revision and auth mode. Before freezing a new dispatch, preparation checks fallback credentials using each entry's own provider, profile revision and auth mode. Unready fallbacks are dropped without refusing the run; `droppedAccountFallbacks` records profile ids and safe reason codes in `resolved_config_json`, and grants include only retained entries. Reserved subscription sessions are verified at checkout under their owner generation. The binding budget may also trim the fallback list. Repeated preparation reuses the frozen list and grant. Primary credential failures still stop preparation. When no entry passes, the run fails with the first entry's failure.
+
+During implementation and review, `ACCOUNT_USAGE_LIMIT`, `PROVIDER_AUTH` and `PROVIDER_CONFIG` move the run to the next unused fallback account, preserving partial work. After exhaustion, the last failure code is reported; auth/config failures retain the provider’s message. Transient provider failures keep their retry and model-fallback behavior. Planning uses its existing overload model fallback and does not rotate accounts.
 
 The primary credential is checked after the choice. A missing or unreadable primary credential fails the run as `authentication-required` and never moves the run to the next entry. Runner delivery and switching accounts during a run are separate work.
 
@@ -41,7 +59,7 @@ Projects are sorted by ascending team key. Missing defaults or project rows mean
 `legacy`; no mappings produces an empty project array, and unmapped project rows
 are omitted. The tool reads these modes from SQLite and exposes no runner environment values.
 
-`GET /api/mappings/:key/agent-config/resolved` shows each stage's entries in order, whether each passes the configuration checks now, and the reason when it does not. It also shows whether a project account override drops the default fallbacks. These diagnostics check profile compatibility and support on the project's current dispatch backend(s). Preparation checks the backend of its actual request. If a stage cannot form a complete selection, its entries are empty and the route preserves the structured resolution error. The Reports page shows the profile each invocation used.
+`GET /api/mappings/:key/agent-config/resolved` shows each stage's entries in order, whether each passes the configuration checks now, and the reason when it does not. It also shows whether a project account override has no remaining default entries after it. These diagnostics check profile compatibility and support on the project's current dispatch backend(s). Preparation checks the backend of its actual request. If a stage cannot form a complete selection, its entries are empty and the route preserves the structured resolution error. The Reports page shows the profile each invocation used.
 
 ## Configured agent environment
 
@@ -72,3 +90,5 @@ was started." with the prefix "Planning failed:" or "Implementation failed:".
 Repeated refusals count as dispatch failures and park the issue at the limit.
 Recover by setting the project to legacy, or by merging the workflow sync pull request
 and removing the park.
+
+OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key` with either `claude` or `codex`, on every backend. Create the profile through `POST /api/model-accounts` and store its write-only key through `PUT /api/model-accounts/:id/credential`. OpenRouter is a paid API mode, so it cannot follow a subscription in an account list. Claude Code routes requests through the fixed OpenRouter endpoint using the selected key. Codex routes requests through its `openrouter` model provider at `https://openrouter.ai/api/v1`, using the selected key in `OPENROUTER_API_KEY`.

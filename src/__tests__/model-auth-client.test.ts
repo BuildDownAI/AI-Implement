@@ -160,12 +160,60 @@ describe("buildModelInvocationEnv", () => {
     PATH: "/bin",
     ANTHROPIC_API_KEY: S_INHERITED,
     OPENAI_API_KEY: S_INHERITED,
+    OPENROUTER_API_KEY: S_INHERITED,
+    ANTHROPIC_BASE_URL: "https://sentinel.example",
+    ANTHROPIC_AUTH_TOKEN: S_INHERITED,
     CLAUDE_CODE_OAUTH_TOKEN: S_INHERITED,
     AWS_ACCESS_KEY_ID: S_INHERITED,
     AWS_PROFILE: "x",
     CODEX_HOME: "/inherited",
     MODEL_AUTH_KEY: "protect-me",
   };
+
+  it.each([{}, inheritedEnv])("builds exactly the OpenRouter environment with inherited context %j", (inheritedEnv) => {
+    const { env } = buildModelInvocationEnv({
+      authMode: "openrouter-api-key", secret: { kind: "api-key", apiKey: S_API }, inheritedEnv,
+    });
+    expect(env).toEqual({
+      ...("PATH" in inheritedEnv ? { PATH: "/bin" } : {}),
+      ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
+      ANTHROPIC_AUTH_TOKEN: S_API,
+      ANTHROPIC_API_KEY: "",
+      OPENROUTER_API_KEY: S_API,
+    });
+    expect(JSON.stringify(env)).not.toContain(S_INHERITED);
+  });
+
+  it("rejects non-API-key OpenRouter secrets", () => {
+    const secrets = [
+      { kind: "session", sessionData: S_SESSION, stateSequence: 0 },
+      { kind: "claude-oauth-token", token: S_API },
+      { kind: "chatgpt-access-token", accessToken: S_API, expiresAt: NOW + 60_000 },
+      { kind: "aws-bedrock", region: "us-east-1", accessKeyId: "synthetic", secretAccessKey: S_AWS_SECRET },
+    ] as const;
+    for (const secret of secrets) {
+      expect(category(() => buildModelInvocationEnv({
+        authMode: "openrouter-api-key", secret, inheritedEnv,
+      }))).toBe("credential_source_mismatch");
+    }
+  });
+
+  it("strips OpenRouter routing and credentials for every other auth mode", () => {
+    const selections = [
+      { authMode: "anthropic-api-key", secret: { kind: "api-key", apiKey: S_API } },
+      { authMode: "openai-api-key", secret: { kind: "api-key", apiKey: S_API } },
+      { authMode: "claude-subscription", secret: { kind: "claude-oauth-token", token: S_API } },
+      { authMode: "claude-subscription", secret: { kind: "session", sessionData: S_SESSION, stateSequence: 0 } },
+      { authMode: "codex-subscription", secret: { kind: "chatgpt-access-token", accessToken: S_API, expiresAt: NOW + 60_000 } },
+      { authMode: "bedrock", secret: { kind: "aws-bedrock", region: "us-east-1", accessKeyId: "synthetic", secretAccessKey: S_AWS_SECRET } },
+    ] as const;
+    for (const selection of selections) {
+      const { env } = buildModelInvocationEnv({ ...selection, authDir: "/private", inheritedEnv });
+      expect(env).not.toHaveProperty("ANTHROPIC_BASE_URL");
+      expect(env).not.toHaveProperty("OPENROUTER_API_KEY");
+      expect(JSON.stringify(env)).not.toContain(S_INHERITED);
+    }
+  });
 
   it("passes only the selected API key even when other credentials are inherited", () => {
     const { env, strippedKeys } = buildModelInvocationEnv({
@@ -541,12 +589,31 @@ describe("client", () => {
     await client.checkout({ profileId: "api", authMode: "openai-api-key" });
     expect(readdirSync(authRoot)).toEqual([]);
     await client.invoke("api", async (inv) => {
+      expect(inv.codexProvider).toBeUndefined();
       expect(inv.env.CODEX_API_KEY).toBe(S_API);
       expect(inv.env).not.toHaveProperty("OPENAI_API_KEY");
       expect(inv.env).not.toHaveProperty("ANTHROPIC_API_KEY");
     });
     await client.finish("api", "completed");
     expect(calls.map((c) => c.route)).toEqual([MODEL_AUTH_ROUTES.checkout, MODEL_AUTH_ROUTES.finish]);
+  });
+
+  it("selects the Codex OpenRouter provider from auth mode for an API-key secret", async () => {
+    const { transport } = fakeTransport(() => ({
+      status: 200,
+      body: { version: 1, ok: true, profileId: "router", authMode: "openrouter-api-key", secret: { kind: "api-key", apiKey: S_API } },
+    }));
+    const client = make(transport, {}, grant({ bindings: [
+      { stage: "implementation", profileId: "router", profileRevision: 1, authMode: "openrouter-api-key" },
+    ] }));
+    await client.checkout({ profileId: "router", authMode: "openrouter-api-key" });
+    await client.invoke("router", async (inv) => {
+      expect(inv.codexProvider).toBe("openrouter");
+      expect(inv.env.OPENROUTER_API_KEY).toBe(S_API);
+      expect(inv.env).not.toHaveProperty("CODEX_API_KEY");
+      expect(inv.env).not.toHaveProperty("OPENAI_BASE_URL");
+    });
+    await client.dispose();
   });
 
   it("Bedrock checkout yields the AWS bundle for the invocation", async () => {

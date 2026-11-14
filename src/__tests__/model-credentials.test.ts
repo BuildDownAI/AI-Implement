@@ -133,6 +133,15 @@ describe("codex-subscription (hosted ChatGPT plan record)", () => {
 });
 
 describe("resolveModelCredential", () => {
+  it.each(["claude", "codex"] as const)("resolves an OpenRouter key for %s without session reads", agent => {
+    save({ agent, provider: "openrouter", authMode: "openrouter-api-key" });
+    const result = cred.resolveModelCredential(req({ provider: "openrouter", authMode: "openrouter-api-key" }), deps());
+    expect(result).toEqual({ ok: true, profileId: "anth", revision: 1, authMode: "openrouter-api-key", secret: { kind: "api-key", apiKey: API_SENTINEL } });
+    expect(resolverCalls).toEqual(["model-account:anth"]);
+    expect(readCalls).toEqual([]);
+    expect(planReads).toEqual([]);
+  });
+
   it("returns exactly one api-key secret", () => {
     save();
     const r = cred.resolveModelCredential(req(), deps());

@@ -3988,7 +3988,7 @@ function credentialView(p: AccountProfileProjection): { credentialSet: boolean; 
   }
 }
 
-const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "anthropic-api-key", "claude-subscription"];
+const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "openrouter-api-key", "anthropic-api-key", "claude-subscription"];
 
 const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
   invalid_ref: "the reference is not a valid model-account reference",
@@ -4081,7 +4081,7 @@ async function handleModelAccountCredential(
     return;
   }
   if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
-    json(res, 400, { error: "only openai-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
+    json(res, 400, { error: "only openai-api-key, openrouter-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
     return;
   }
   const existingRef = lookupCredentialReference(profileId, head.revision);
@@ -4255,6 +4255,10 @@ function validateStagesBody(stages: unknown, defaults = false): string | null {
       if (field === "accounts") {
         if (!defaults) return "accounts is only supported in orchestrator defaults";
         try { validateAccounts(value, stage); } catch (err) { return (err as Error).message; }
+        continue;
+      }
+      if (field === "preferOpenModel") {
+        if (defaults || stage !== "implementation" || typeof value !== "boolean") return "preferOpenModel must be a boolean in project implementation settings";
         continue;
       }
       if (value === null) continue;
@@ -4466,6 +4470,11 @@ async function putProjectAgentConfigLocked(
   json(res, 200, { projectKey, ...storedConfigView(stored) });
 }
 
+/**
+ * The response's fallbacksDropped field is true only when a project account
+ * override has no following diagnostic entry; an override alone does not imply
+ * that its default fallbacks were dropped. This applies to both response paths.
+ */
 function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: string, deps: AdminDeps): void {
   const mapping = getOwnMapping(projectKey);
   if (!mapping) {
@@ -4487,7 +4496,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
       ...base,
       mode: "configured",
       resolved: false,
-      stages: Object.fromEntries(STAGE_NAMES.map(stage => [stage, { entries: accountEntries[stage], fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null }])),
+      stages: Object.fromEntries(STAGE_NAMES.map(stage => [stage, { entries: accountEntries[stage], fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null && (accountEntries[stage]?.length ?? 0) <= 1 }])),
       error: { code: "resolution_failed", message: err instanceof Error ? err.message : "stage configuration does not resolve" },
     });
     return;
@@ -4503,7 +4512,7 @@ function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: stri
     const projectionProfile = getAccountProfile(profile.id);
     stages[stage] = {
       entries: resolution.accountEntries?.[stage],
-      fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null,
+      fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null && (resolution.accountEntries?.[stage]?.length ?? 0) <= 1,
       values: { ...resolution.stages[stage], fallbackModel: resolution.fallbackModels[stage] ?? null },
       sources: { ...resolution.sources[stage], fallbackModel: resolution.fallbackModelSources[stage] ?? null },
       profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },

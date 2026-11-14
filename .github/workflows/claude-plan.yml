@@ -216,7 +216,7 @@ jobs:
             def posint: type == "number" and . > 0 and . <= 9007199254740991 and . == floor;
             def b64u($min; $max): type == "string" and length >= $min and length <= $max and test("\\A[A-Za-z0-9_-]+\\z");
             def token: type == "string" and length >= 1 and length <= 4096 and (test("\\s") | not);
-            def modes: ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"];
+            def modes: ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key"];
             def stage_names: ["planning", "implementation", "review"];
             def binding:
               isobj and only(["stage", "profileId", "profileRevision", "authMode", "ownerGeneration"])
@@ -259,7 +259,7 @@ jobs:
             def revref: isobj and only(["configRevisionId", "revision"]) and (.configRevisionId | snapstr) and (.revision | posint);
             def sel:
               isobj and only(["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"])
-              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai"))
+              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai", "openrouter"))
               and (.model | snapstr) and (.accountProfileId | snapstr) and (.invocationTimeoutMs | posint);
             def src:
               isobj and only(["agent", "provider", "model", "accountProfileId", "invocationTimeoutMs"])
@@ -268,10 +268,11 @@ jobs:
             def prof:
               isobj and only(["id", "identity", "revision", "agent", "provider", "authMode"])
               and (.id | snapstr) and (.identity | snapstr) and (.revision | posint)
-              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai"))
+              and (.agent | IN("claude", "codex")) and (.provider | IN("anthropic", "bedrock", "openai", "openrouter"))
               and (.authMode | IN(modes[]));
             def combo($a; $p; $m):
-              if $a == "claude"
+              if $p == "openrouter" then $m == "openrouter-api-key"
+              elif $a == "claude"
               then ($p == "anthropic" and ($m == "anthropic-api-key" or $m == "claude-subscription"))
                    or ($p == "bedrock" and $m == "bedrock")
               else $p == "openai" and ($m == "openai-api-key" or $m == "codex-subscription") end;
