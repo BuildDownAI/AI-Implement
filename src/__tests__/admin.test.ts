@@ -7396,6 +7396,56 @@ describe("model accounts and stage configuration (AII-962)", () => {
       } else expect(store().resolve(REF)).toBeNull();
     });
 
+    it.each(["PUT", "PATCH"] as const)("a disconnected %s cannot stall mutations behind paused ingress", async (method) => {
+      const t = await seedProfile();
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const first = call(url("oai-1"), "PUT", t, { apiKey: KEY }, {
+        bindKey: async (ref, destination) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered();
+          await paused;
+          return "bound";
+        },
+      });
+      await started;
+      try {
+        // A partial request loses its socket while the earlier PUT waits on ingress.
+        // Its body reader must already be listening, outside the mutation queue.
+        const req = new MockRequest(method === "PUT" ? url("oai-1") : "/api/model-accounts/oai-1", method,
+          { authorization: `Bearer ${t}` });
+        req.removeAllListeners("newListener");
+        const res = new MockResponse();
+        admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await vi.waitFor(() => expect(req.listenerCount("data")).toBe(1));
+        req.emit("data", Buffer.from('{"'));
+        Object.assign(req, { destroyed: true, aborted: true });
+        req.emit("aborted");
+        req.emit("close");
+        await res.done;
+        expect(res.statusCode).toBe(400);
+
+        // A request that was destroyed before routing must also settle immediately.
+        const dead = new MockRequest(req.url!, method, { authorization: `Bearer ${t}` });
+        dead.removeAllListeners("newListener");
+        Object.assign(dead, { destroyed: true, aborted: true });
+        const deadRes = new MockResponse();
+        admin.handleAdminRequest(dead as never, deadRes as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await deadRes.done;
+        expect(deadRes.statusCode).toBe(400);
+      } finally {
+        release();
+      }
+      expect((await first).status).toBe(200);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      expect(store().resolve(REF)).toBe(KEY);
+      expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF))
+        .toEqual({ destination: "openai/openai-api-key" });
+    });
+
     it.each(["conflict", "unavailable"] as const)("PUT fails closed on %s before storing", async (outcome) => {
       const t = await seedProfile();
       const bindKey = vi.fn(async () => outcome);
