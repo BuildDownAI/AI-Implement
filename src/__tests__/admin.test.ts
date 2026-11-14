@@ -13,7 +13,7 @@ import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { AIImplementSnapshot } from "../providers/types.js";
 import { makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
-import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb, type LoadedModules, type TestDb } from "./helpers/test-db.js";
 import { testDir } from "./helpers/test-dir.js";
 
@@ -2352,14 +2352,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
   });
 });
 
-// Fly's GraphQL API, which carries app secrets (src/fly-machines.ts).
-const FLY_GRAPHQL = "POST /graphql";
-
-/** The variables of a Fly GraphQL request. */
-function flyVariables(fake: FakeFetch, index = 0): { input: { secrets?: Array<{ key: string; value: string }>; keys?: string[] } } {
-  expect(fake.calls[index].url.href).toBe("https://api.fly.io/graphql");
-  return JSON.parse(fake.calls[index].body).variables;
-}
+const FLY_SECRETS = "/v1/apps/ai-implement-sessions/secrets";
 
 describe("admin secrets", () => {
   function secretsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
@@ -2428,11 +2421,11 @@ describe("admin secrets", () => {
 
   it("GET secrets lists only team-prefixed secrets with prefix stripped", async () => {
     const flySecrets = [
-      { name: "ENG_DATABASE_URL", digest: "abc", createdAt: "2026-01-01T00:00:00Z" },
-      { name: "ENG_STRIPE_KEY", digest: "def", createdAt: "2026-01-02T00:00:00Z" },
-      { name: "OTHER_SECRET", digest: "ghi", createdAt: "2026-01-03T00:00:00Z" },
+      { name: "ENG_DATABASE_URL", digest: "abc", created_at: "2026-01-01T00:00:00Z" },
+      { name: "ENG_STRIPE_KEY", digest: "def", created_at: "2026-01-02T00:00:00Z" },
+      { name: "OTHER_SECRET", digest: "ghi", created_at: "2026-01-03T00:00:00Z" },
     ];
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { app: { secrets: flySecrets } } } } }).install();
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: flySecrets } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2445,8 +2438,8 @@ describe("admin secrets", () => {
     expect(data[1].name).toBe("STRIPE_KEY");
   });
 
-  it("POST secrets sets a secret with team prefix via GraphQL", async () => {
-    const fake = fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 101 } } } } } }).install();
+  it("POST secrets sets a secret with team prefix via Machines REST", async () => {
+    const fake = fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 101 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2455,9 +2448,35 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).name).toBe("DATABASE_URL");
 
-    const { input } = flyVariables(fake);
-    expect(input.secrets?.[0].key).toBe("ENG_DATABASE_URL");
-    expect(input.secrets?.[0].value).toBe("postgres://localhost/db");
+    expect(fake.calls[0].url.origin).toBe("https://api.machines.dev");
+    expect(JSON.parse(fake.calls[0].body)).toEqual({ values: { ENG_DATABASE_URL: "postgres://localhost/db" } });
+  });
+
+  it("an admin-set secret appears in the launch reader", async () => {
+    const stored: Record<string, string> = {};
+    const fake = fakeFetch({
+      [`POST ${FLY_SECRETS}`]: (call) => {
+        Object.assign(stored, JSON.parse(call.body).values);
+        return { json: { version: 99, secrets: Object.entries(stored).map(([name, value]) => ({ name, value })) } };
+      },
+      [`GET ${FLY_SECRETS}`]: () => ({ json: Object.keys(stored).map((name) => ({ name, digest: "digest", created_at: "2026-11-13" })) }),
+    }).install();
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    const res = await requestFly("/api/mappings/ENG/secrets", "POST", token, { name: "DATABASE_URL", value: "secret" });
+    expect(res.statusCode).toBe(200);
+    const { listAppSecrets } = await import("../fly-machines.js");
+    expect((await listAppSecrets("fly-token", "ai-implement-sessions")).map((s) => s.name)).toEqual(["ENG_DATABASE_URL"]);
+    for (const call of fake.calls) expect(call.url.origin).toBe("https://api.machines.dev");
+  });
+
+  it("DELETE missing team secret succeeds", async () => {
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_MISSING`]: { json: { version: 100 } } }).install();
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    const res = await requestFly("/api/mappings/ENG/secrets/MISSING", "DELETE", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ deleted: true });
   });
 
   it("POST secrets returns 400 when name is missing", async () => {
@@ -2479,7 +2498,7 @@ describe("admin secrets", () => {
   });
 
   it("POST secrets normalizes lowercase names to uppercase", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 1 } } } } } }).install();
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 1 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2489,8 +2508,8 @@ describe("admin secrets", () => {
     expect(JSON.parse(res.body).name).toBe("DATABASE_URL");
   });
 
-  it("DELETE secret unsets the team-prefixed secret via GraphQL", async () => {
-    const fake = fakeFetch({ [FLY_GRAPHQL]: { json: { data: { unsetSecrets: { release: { version: 102 } } } } } }).install();
+  it("DELETE secret unsets the team-prefixed secret via Machines REST", async () => {
+    const fake = fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_DATABASE_URL`]: { json: { version: 102 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2499,22 +2518,11 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).deleted).toBe(true);
 
-    expect(flyVariables(fake).input.keys?.[0]).toBe("ENG_DATABASE_URL");
+    expect(fake.calls[0].url.href).toBe(`https://api.machines.dev${FLY_SECRETS}/ENG_DATABASE_URL`);
   });
 
   it("DELETE secret returns 404 when Fly returns HTTP 404 for unknown secret", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { status: 404, text: "not found" } }).install();
-
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
-
-    const res = await requestFly("/api/mappings/ENG/secrets/NONEXISTENT", "DELETE", token);
-    expect(res.statusCode).toBe(404);
-    expect(JSON.parse(res.body).error).toContain("not found");
-  });
-
-  it("DELETE secret returns 404 when Fly GraphQL reports the secret was not found", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { errors: [{ message: "Could not find secret ENG_NONEXISTENT" }] } } }).install();
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_NONEXISTENT`]: { status: 404 } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2897,21 +2905,12 @@ describe("admin global secrets", () => {
   });
 
   it("GET lists secrets that have no team prefix", async () => {
-    fakeFetch({
-      [FLY_GRAPHQL]: {
-        json: {
-          data: {
-            app: {
-              secrets: [
-                { name: "ANTHROPIC_API_KEY", digest: "aaa", createdAt: "2026-01-01T00:00:00Z" },
-                { name: "ENG_DATABASE_URL",  digest: "bbb", createdAt: "2026-01-02T00:00:00Z" },
-                { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", createdAt: "2026-01-03T00:00:00Z" },
-              ],
-            },
-          },
-        },
-      },
-    }).install();
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: [
+      { name: "ANTHROPIC_API_KEY", digest: "aaa", created_at: "2026-01-01" },
+      { name: "ENG_DATABASE_URL", digest: "bbb", created_at: "2026-01-02" },
+      { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", created_at: "2026-01-03" },
+      { name: "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", digest: "ddd", created_at: "2026-01-04" },
+    ] } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2922,8 +2921,35 @@ describe("admin global secrets", () => {
     expect(body.map((s) => s.name)).toEqual(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]);
   });
 
+  it.each(["AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", "ai_implement_model_auth_protection_key"])("protects reserved global key %s", async (name) => {
+    const fake = fakeFetch({}).install();
+    const token = await login("secret");
+    const set = await requestFlyGlobal("/api/global-secrets", "POST", token, { name, value: "evil" });
+    const unset = await requestFlyGlobal(`/api/global-secrets/${name}`, "DELETE", token);
+    expect(set.statusCode).toBe(400);
+    expect(unset.statusCode).toBe(400);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("DELETE missing global secret succeeds", async () => {
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/MISSING`]: { json: { version: 100 } } }).install();
+    const res = await requestFlyGlobal("/api/global-secrets/MISSING", "DELETE", await login("secret"));
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ deleted: true });
+  });
+
+  it.each([200, 422, 201])("never exposes set reply values (status %s)", async (status) => {
+    const marker = "SECRET_REPLY_MARKER";
+    const logs = [vi.spyOn(console, "error").mockImplementation(() => {}), vi.spyOn(console, "log").mockImplementation(() => {}), vi.spyOn(console, "warn").mockImplementation(() => {})];
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: status === 201 ? { status, text: marker } : { status, json: { version: 88, secrets: [{ value: marker }] } } }).install();
+    const res = await requestFlyGlobal("/api/global-secrets", "POST", await login("secret"), { name: "KEY", value: marker });
+    expect(res.statusCode).toBe(status === 200 ? 200 : 500);
+    expect(res.body).not.toContain(marker);
+    for (const log of logs) expect(log.mock.calls.map((args) => args.map(String).join(" ")).join("\n")).not.toContain(marker);
+  });
+
   it("POST sets a global secret", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 5 } } } } } }).install();
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 5 } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets", "POST", token, {
@@ -2953,7 +2979,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE removes a global secret", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { unsetSecrets: { release: { version: 6 } } } } } }).install();
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ANTHROPIC_API_KEY`]: { json: { version: 6 } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/ANTHROPIC_API_KEY", "DELETE", token);
@@ -2962,7 +2988,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE returns 404 when Fly reports not found", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { status: 422, text: "could not find secret" } }).install();
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/NONEXISTENT`]: { status: 404 } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/NONEXISTENT", "DELETE", token);
