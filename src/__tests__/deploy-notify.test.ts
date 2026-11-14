@@ -537,11 +537,10 @@ describe("boot KG warm-up", () => {
   afterEach(() => vi.useRealTimers());
   const health = (lastError: string | null) => ({ reachable: !lastError, toolsListed: !lastError, lastError, checkedAt: Date.now() });
 
-  it("runs remote warm-up to its deadline without any store calls", async () => {
+  it.each(["Error executing tool kg_neighbors: bad token", ""])("runs remote warm-up to its deadline without any store calls for %j", async (message) => {
     vi.stubEnv("KG_BACKEND", "stardog_run");
     const { probeKgSidecarAfterBoot } = await import("../restate/kg-sidecar-health.js");
     const methods: string[] = [];
-    const message = "Error executing tool kg_neighbors: bad token";
     const request = vi.spyOn(http, "request").mockImplementation(((_options: unknown, cb: (res: unknown) => void) => {
       const req = new PassThrough();
       req.on("data", body => {

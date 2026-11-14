@@ -595,6 +595,7 @@ describe("SidecarMemoryProvider probe", () => {
     );
 
     it.each([
+      [{ result: { isError: true, content: [{ type: "text", text: "" }, { type: "text", text: "ignored" }] } }, ""],
       [{ result: { isError: true, content: [{ type: "image" }, { type: "text", text: "x".repeat(250) }, { type: "text", text: "ignored" }] } }, "x".repeat(200)],
       [{ result: { isError: true, content: [] } }, "store call failed"],
       [{ error: { message: "x".repeat(250) } }, "x".repeat(200)],
@@ -606,6 +607,7 @@ describe("SidecarMemoryProvider probe", () => {
       expect(isKgUnavailable()).toBe(true);
       queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
       expect((await p.probe("list-only")).lastError).toBe(message);
+      expect(isKgUnavailable()).toBe(true);
     });
 
     it.each(["handshake", "unparseable"])("clears a transient %s failure after list-only recovery", async (failure) => {

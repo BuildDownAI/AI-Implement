@@ -455,7 +455,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
       this.storeError = callOutcome.handshakeError ? null : this.storeFailureMessage(callOutcome.parsed);
       callError = this.storeError ?? callError;
     }
-    if (callError) return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: callError });
+    if (callError !== null) return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: callError });
 
     return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
   }

@@ -5276,7 +5276,7 @@ async function main(): Promise<void> {
   setKgMemoryProvider(memoryProvider);
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
-    if (health.lastError) {
+    if (health.lastError !== null) {
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
       console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);

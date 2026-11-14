@@ -30,7 +30,7 @@ export function createKgSidecarHealth(deps: KgSidecarHealthDeps) {
       check: restate.handlers.object.exclusive(
         async (ctx: ObjectContext): Promise<SidecarHealth | null> => {
           const health = await ctx.run("probe", () => deps.probe());
-          if (health && !health.lastError) {
+          if (health && health.lastError === null) {
             try {
               await ctx.run("notify-recovery", () => (deps.notifyRecovery ?? postKgRecoveryNotice)(), {
                 maxRetryAttempts: 3,
