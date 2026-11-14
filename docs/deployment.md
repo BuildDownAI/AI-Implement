@@ -277,7 +277,7 @@ fly ssh console --app <app_name>             # shell into the machine
 
 Secrets set through the admin UI Secrets panel are stored as classic Fly app secrets on the **shared sessions app**, prefixed with the team key — for example, a secret named `QA_PROBE` on the `SAN` mapping is stored as `SAN_QA_PROBE`.
 
-Names are read from the Fly Machines API (`GET /v1/apps/{app}/secrets`), the same store Fly uses when starting a machine. Admin set and delete operations use that API too. Admin writes deliberately ignore secrets versions and leave version pinning off; protected-run bootstrap still manages its own version.
+Names are read from the Fly Machines API (`GET /v1/apps/{app}/secrets`), the same store Fly uses when starting a machine. The reply is an object that holds the list (`{ "secrets": [{ name, digest, created_at, updated_at }] }`), not a bare list; `listAppSecrets` reads `.secrets` and rejects any other shape. Admin set and delete operations use that API too. Admin writes deliberately ignore secrets versions and leave version pinning off; protected-run bootstrap still manages its own version.
 
 Before merging this change, compare `fly secrets list -a <sessions app>` with the historical GraphQL list on **each sessions app**. REST-only global names become visible to launch and pass to every machine in process-level mode. On `ai-implement-testing-sessions` on 2026-11-13, the only REST-only name was the protection key, which ordinary launch skips. The global admin list hides that key and rejects attempts to overwrite or delete it.
 
