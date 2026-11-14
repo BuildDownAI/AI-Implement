@@ -516,6 +516,80 @@ describe("SidecarMemoryProvider probe", () => {
     return new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => namespace);
   }
 
+  describe("remote store", () => {
+    beforeEach(() => vi.stubEnv("KG_BACKEND", "stardog_run"));
+    afterEach(() => vi.unstubAllEnvs());
+
+    it("keeps a failed tools/list unavailable", async () => {
+      queueConnectionError("ECONNREFUSED");
+      expect((await makeProvider().probe()).lastError).toContain("ECONNREFUSED");
+      expect(sidecarHealth.toolsListed).toBe(false);
+    });
+
+    it("still requires all core tools", async () => {
+      queueResponse(200, toolsListResult([]));
+      expect((await makeProvider().probe()).lastError).toContain("missing");
+      expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it("records a successful boot query as healthy", async () => {
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, neighborsOk());
+      expect(await makeProvider().probe()).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+    });
+
+    it("accepts a boot query timeout and logs the wake-up explanation", async () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueHang();
+      expect(await makeProvider().probe()).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+      expect(log).toHaveBeenCalledWith("[kg] remote store did not answer in 10 s; it is possibly starting");
+    });
+
+    it("preserves a boot store error across list failures and recovery until a user query succeeds", async () => {
+      const p = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ error: { code: -32000, message: "bad token" } }));
+      expect((await p.probe()).lastError).toBe("bad token");
+      queueConnectionError("ECONNREFUSED");
+      await p.probe("list-only");
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBe("bad token");
+      queueResponse(200, neighborsOk());
+      expect((await p.callKgTool("kg_neighbors", {})).ok).toBe(true);
+      expect(sidecarHealth).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBeNull();
+    });
+
+    it("answers a user timeout without changing health or re-probing", async () => {
+      Object.assign(sidecarHealth, { reachable: true, toolsListed: true, lastError: "bad token", checkedAt: 1 });
+      const before = { ...sidecarHealth };
+      queueHang();
+      expect(await makeProvider().callKgTool("kg_search", {})).toEqual({
+        ok: false, error: "The knowledge graph store is starting. Try again in one minute.",
+      });
+      expect(sidecarHealth).toEqual(before);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns the sidecar's JSON-RPC error to a caller", async () => {
+      queueResponse(200, JSON.stringify({ error: { message: "bad query" } }));
+      expect(await makeProvider().callKgTool("kg_search", {})).toEqual({ ok: false, error: "bad query" });
+    });
+
+    it("re-probes after a failed call using tools/list only", async () => {
+      const p = makeProvider();
+      queueConnectionError("ECONNREFUSED");
+      const list = queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      const completed = new Promise<void>((resolve) => list.on("finish", resolve));
+      await p.callKgTool("kg_search", {});
+      await completed;
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(list.read().toString()).method).toBe("tools/list");
+    });
+  });
+
   it("probe requests carry Accept: application/json, text/event-stream (the transport answers 406 without it)", async () => {
 
     queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", result: { tools: Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name })) } }));

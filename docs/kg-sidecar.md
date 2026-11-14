@@ -128,7 +128,7 @@ Do not set these variables on a deployed orchestrator for this check.
 Each Stardog request is billed, including probes. The console counts usage in
 Stardog Units (SDUs) for the time the endpoint is active. An inactive endpoint can
 take five minutes to wake; the AII-1888 hand check observed about two minutes.
-Remote probe and timeout behavior is follow-up work; this change preserves it.
+Remote probe and timeout behavior is described below.
 
 ## Deploying
 
@@ -159,6 +159,24 @@ The clone copies the KG's `sources.yml`, which pins the IRI namespace. Without i
 The result lives in a module-level `sidecarHealth` record (`{ reachable, toolsListed, lastError, checkedAt }`, exported from `src/kg-provider.ts`) and `isKgUnavailable()`, which is `true` only when the *last completed* probe failed — a sidecar that has never been probed is not reported as unavailable. Every failed `listTools` or `callKgTool` also triggers a re-probe, throttled to at most one real sidecar round-trip per 60 seconds so a persistently down sidecar doesn't double every failing request's latency. The boot-time probe itself is never subject to that throttle — the first check always runs.
 
 Every buffered sidecar request the provider makes — the session handshake, `listTools`, `callKgTool`, and both probe steps — carries a 10-second request timeout, the same bounding pattern `KgSidecar`'s own readiness poll uses (2s, scaled up here because these calls run a real query rather than just checking that the port accepts connections). Without this, a sidecar that accepts the connection but never answers — the process is up, `[kg] sidecar ready` already logged, but `tools/list` or `kg_neighbors` hangs — would leave `main()`'s `await memoryProvider.probe()` unresolved forever, which blocks `startServer()` (so the health check, admin UI, and poll loop never come up) and `postBootNotice()` (so not even `deployed-not-serving` gets recorded) — a strictly worse outcome than the silently-wrong `deployed-ok` this issue exists to fix. A timed-out request resolves `ok: false` rather than retrying the session handshake, so the worst case for a hung `tools/list` is one timeout, not a multiple of it.
+
+### Remote store wake-up and probes
+
+With `KG_BACKEND=stardog_run`, a sleeping endpoint is normal and each store call is billed. Boot makes one store query to wake the endpoint and detect configuration errors. After boot, recovery probes use `tools/list` only; they never query the store. Local stores retain the behavior described above.
+
+| Event on a remote store | Result |
+| -- | -- |
+| Boot probe: `tools/list` fails | Unavailable, as today |
+| Boot probe: `kg_neighbors` answers | Healthy |
+| Boot probe: `kg_neighbors` stops with `ETIMEDOUT` | Healthy, `lastError` null. Log `[kg] remote store did not answer in 10 s; it is possibly starting` |
+| Boot probe: `kg_neighbors` returns a JSON-RPC error | Unavailable; `lastError` is the sidecar's message |
+| `maybeReprobe()` after a failed call | `tools/list` only. It never calls the store |
+| `probeKgSidecarIfUnavailable()` each poll cycle | `tools/list` only. It never calls the store, and it does not clear a store error from the boot probe |
+| A tool call succeeds | Clears a recorded store error: health becomes `reachable`, `toolsListed`, `lastError` null |
+| A tool call stops with `ETIMEDOUT` | Returns `{ ok: false, error: "The knowledge graph store is starting. Try again in one minute." }`. No health change, no re-probe |
+| A tool call returns a JSON-RPC error | The sidecar's message, as today |
+
+The request timeout remains 10 seconds so boot stays bounded. The store call continues in the sidecar after the orchestrator stops waiting, allowing the endpoint to wake for a later user call. Successful list-only probes preserve boot store errors until a user tool call succeeds.
 
 **The deploy record now reflects the probe, not just the env var.** **Superseded:** the boot-time `decideDeployOutcome` that wrote `deployed-not-serving` from the probe is gone; the outcome now comes from the `SelfDeploy` object (`deployed-ok` on `succeeded`), and probe health is reported by `GET /` and `get_kg_status`. This is the detection half only (AII-648); a follow-on issue plumbs `isKgUnavailable()` and `sidecarHealth` into `GET /`, `get_kg_status`, `get_tenant_health`, and the Deployments admin page.
 
