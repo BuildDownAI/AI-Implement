@@ -277,8 +277,9 @@ describe("generateMachineNonce", () => {
 describe("app secrets through Machines REST", () => {
   const path = `/v1/apps/${APP}/secrets`;
   it("lists start-store metadata and empty lists", async () => {
-    const secrets = [{ name: "ENG_DB", digest: "abc", created_at: "2026-01-01" }];
-    const fake = fakeFetch({ [`GET ${path}`]: [{ json: secrets }, { json: [] }] }).install();
+    // The reply shape Fly returned on 2026-11-14: an object that holds the list, not a bare list.
+    const secrets = [{ name: "ENG_DB", digest: "abc", created_at: "2026-01-01", updated_at: "2026-01-02" }];
+    const fake = fakeFetch({ [`GET ${path}`]: [{ json: { secrets } }, { json: { secrets: [] } }] }).install();
     expect(await listAppSecrets(TOKEN, APP)).toEqual(secrets);
     expect(await listAppSecrets(TOKEN, APP)).toEqual([]);
     expect(fake.calls[0].url.href).toBe(`https://api.machines.dev${path}`);
@@ -304,6 +305,11 @@ describe("app secrets through Machines REST", () => {
     await expect(setAppSecrets(TOKEN, APP, { KEY: marker })).rejects.toThrow(/^Fly app secrets write failed \(422\)$/);
     await expect(setAppSecrets(TOKEN, APP, { KEY: marker })).rejects.toThrow(/^Fly app secrets write returned no integer version$/);
     expect(JSON.stringify(logs.mock.calls)).not.toContain(marker);
+  });
+  it("rejects a list reply that holds no secrets list", async () => {
+    fakeFetch({ [`GET ${path}`]: [{ json: [] }, { json: {} }] }).install();
+    await expect(listAppSecrets(TOKEN, APP)).rejects.toThrow(/^Fly app secrets list returned no secrets list$/);
+    await expect(listAppSecrets(TOKEN, APP)).rejects.toThrow(/^Fly app secrets list returned no secrets list$/);
   });
   it("reports list and delete HTTP status", async () => {
     fakeFetch({ [`GET ${path}`]: { status: 403 }, [`DELETE ${path}/KEY`]: { status: 404 } }).install();
