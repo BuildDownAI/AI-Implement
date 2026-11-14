@@ -5,6 +5,9 @@ export function initKeyBindingsTable(): void {
   getDb().exec(`CREATE TABLE IF NOT EXISTS key_bindings (
     key_ref TEXT PRIMARY KEY, destination TEXT NOT NULL, bound_at INTEGER NOT NULL
   )`);
+  getDb().exec(`CREATE TABLE IF NOT EXISTS key_binding_operations (
+    operation_id TEXT PRIMARY KEY, key_ref TEXT NOT NULL
+  )`);
 }
 
 export function readKeyBinding(keyRef: string): { destination: string; bound_at: number } | undefined {

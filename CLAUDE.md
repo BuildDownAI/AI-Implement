@@ -204,7 +204,7 @@ Fixing a bug: write the failing test first, then the fix, in one pull request �
 
 ## Data layer
 
-One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 57 tables (including tables initialized on first use). `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 58 tables (including tables initialized on first use). `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
 
 Schema changes run at boot and a trigger can block a column change — read [docs/sqlite-schema.md](docs/sqlite-schema.md) before changing a table or column.
 

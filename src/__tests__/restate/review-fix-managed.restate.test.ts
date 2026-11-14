@@ -1,3 +1,4 @@
+import { initKeyBindingsTable } from "../../key-bindings.js";
 // Managed Codex review-fix on GHA (AII-1444), against the real `restate-server` binary and the *production*
 // composition: `createProductionReviewFixServices` (PR coordinator, attempt workflow, SQLite store, finalizer, GitHub
 // adapter, `GithubReviewFixWorker` with the protected managed preparation) and a real model-auth runtime. Only the
@@ -175,6 +176,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
     initDispatchBreakerTable();
     initLogTable();
     initSettingsTable();
+    initKeyBindingsTable();
     runtime = createModelAuthRuntime({ config: CONFIG, env: { RUNNER_TOKEN_SECRET: SECRET }, fetchImpl: githubFetch });
     profiles.saveAccountProfileRevision({ profileId: "cdx", identity: "cdx", revision: 1, agent: "codex", provider: "openai",
       authMode: "codex-subscription", });

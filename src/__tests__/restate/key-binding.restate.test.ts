@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { closeDb } from "../../dedup.js";
+import { closeDb, getDb } from "../../dedup.js";
 import { keyBinding, initKeyBindingsTable, readKeyBinding, bindKey, clearKeyBinding, type KeyBindStatus } from "../../restate/key-binding.js";
 import { VARIANTS, callObject, startVariants, stopAll, type RestateEnvironment } from "./harness.js";
 
@@ -36,6 +36,19 @@ describe("KeyBinding", () => {
         bindKey(key, destination, { baseUrl: base() })));
       expect(results.sort()).toEqual(["bound", "conflict"]);
       expect(await clearKeyBinding(key, { baseUrl: base() })).toBe(1);
+    });
+    it("fences a clear whose ingress request arrives after client failure", async () => {
+      const key = `model-account:${randomUUID()}`;
+      expect(await bindKey(key, "anthropic/anthropic-api-key", { baseUrl: base() })).toBe("bound");
+      let deliver!: () => Promise<Response>;
+      await expect(clearKeyBinding(key, { baseUrl: base(), fetchImpl: (async (input, init) => {
+        deliver = () => fetch(input, { ...init, signal: undefined });
+        throw new Error("ambiguous timeout");
+      }) as typeof fetch })).rejects.toThrow("key binding service unavailable");
+      expect(await bindKey(key, "anthropic/anthropic-api-key", { baseUrl: base() })).toBe("already-bound");
+      expect((await deliver()).ok).toBe(true);
+      expect(readKeyBinding(key)?.destination).toBe("anthropic/anthropic-api-key");
+      expect(getDb().prepare("SELECT * FROM key_binding_operations").all()).toEqual([]);
     });
     it("fails closed when ingress is unavailable", async () => {
       const key = `model-account:${randomUUID()}`;

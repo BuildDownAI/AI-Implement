@@ -7363,6 +7363,39 @@ describe("model accounts and stage configuration (AII-962)", () => {
       return t;
     }
 
+    it.each(["PUT", "DELETE"] as const)("orders overlapping operations while %s ingress response is delayed", async (first) => {
+      const t = await seedProfile();
+      if (first === "DELETE") expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const deps = first === "PUT" ? {
+        bindKey: async (ref: string, destination: string) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered(); await paused; return "bound" as const;
+        },
+      } : {
+        clearKeyBinding: async (ref: string) => {
+          const removed = dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes;
+          entered(); await paused; return removed;
+        },
+      };
+      const a = call(url("oai-1"), first, t, first === "PUT" ? { apiKey: KEY } : undefined, deps);
+      await started;
+      const second = first === "PUT" ? "DELETE" : "PUT";
+      const b = call(url("oai-1"), second, t, second === "PUT" ? { apiKey: KEY } : undefined);
+      const patch = call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      release();
+      expect((await a).status).toBe(200);
+      expect((await b).status).toBe(200);
+      expect((await patch).status).toBe(first === "DELETE" ? 409 : 200);
+      if (first === "DELETE") {
+        expect(store().resolve(REF)).toBe(KEY);
+        expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF)).toEqual({ destination: "openai/openai-api-key" });
+      } else expect(store().resolve(REF)).toBeNull();
+    });
+
     it.each(["conflict", "unavailable"] as const)("PUT fails closed on %s before storing", async (outcome) => {
       const t = await seedProfile();
       const bindKey = vi.fn(async () => outcome);
@@ -7596,6 +7629,11 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(500);
       expect(count("model_protected_secrets")).toBe(0);
       spy.mockRestore();
+      expect(count("key_bindings")).toBe(1);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect(count("key_bindings")).toBe(0);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" })).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
     });
 
     it.each(["openai-api-key", "claude-subscription"])("refuses a non-admin with every page granted for %s", async (authMode) => {

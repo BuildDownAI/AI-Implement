@@ -30,7 +30,10 @@ function request(method: string, url: string, body?: unknown): Promise<{ status:
       end(text: string) { resolve({ status, body: JSON.parse(text), text }); },
     };
     loaded.admin.handleAdminRequest(req as IncomingMessage, res as ServerResponse,
-      { adminAccessCode: "test" } as never, {} as never);
+      { adminAccessCode: "test" } as never, { bindKey: async (ref: string, destination: string) => {
+        loaded.dedup.getDb().prepare("INSERT OR IGNORE INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, Date.now());
+        return "bound";
+      } } as never);
   });
 }
 

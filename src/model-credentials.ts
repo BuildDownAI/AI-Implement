@@ -254,7 +254,9 @@ export function resolveModelCredential(req: CredentialRequest, deps: ModelCreden
 
   const ref = lookupRef(profile, deps);
   if (!ref.ok) return ref;
-  const binding = readKeyBinding(ref.ref);
+  let binding: ReturnType<typeof readKeyBinding>;
+  try { binding = readKeyBinding(ref.ref); }
+  catch { return fail("persistence_failed", "secret_unavailable"); }
   if (binding && binding.destination !== `${req.provider}/${req.authMode}`) return fail("unauthorized", "account_mismatch");
   let raw: ProtectedSecretValue | null | undefined;
   try {

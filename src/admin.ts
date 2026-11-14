@@ -1051,13 +1051,13 @@ export function handleAdminRequest(
     }
     const modelAccountMatch = url.match(/^\/api\/model-accounts\/([^/]+)$/);
     if (modelAccountMatch && method === "PATCH") {
-      runAsync(res, handlePatchModelAccount(req, res, decodeURIComponent(modelAccountMatch[1]), deps));
+      runAsync(res, mutateModelAccounts(() => handlePatchModelAccount(req, res, decodeURIComponent(modelAccountMatch[1]), deps)));
       return true;
     }
     const credentialMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/credential$/);
     if (credentialMatch && (method === "PUT" || method === "DELETE")) {
       const actor = gate.identity?.email ?? "access-code";
-      runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor, deps));
+      runAsync(res, mutateModelAccounts(() => handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor, deps)));
       return true;
     }
     const pairingMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-pairing$/);
@@ -4061,6 +4061,14 @@ function handleChatGptPairingMint(req: http.IncomingMessage, res: http.ServerRes
   });
 }
 
+// Account mutations share references across profiles; keep the entire HTTP lifecycle ordered.
+let modelAccountMutation: Promise<unknown> = Promise.resolve();
+function mutateModelAccounts(operation: () => Promise<void>): Promise<void> {
+  const next = modelAccountMutation.then(operation);
+  modelAccountMutation = next.catch(() => {});
+  return next;
+}
+
 async function handleModelAccountCredential(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -4102,8 +4110,8 @@ async function handleModelAccountCredential(
     existingRef === null &&
     listAccountProfiles().some((p) => p.profileId !== profileId && lookupCredentialReference(p.profileId, p.revision) === ref);
   if (!isPut) {
-    if (existingRef === null) {
-      // No reference of its own: nothing to remove, and the fallback row may belong to another profile.
+    if (fallbackClash) {
+      // The fallback belongs to another profile; otherwise also clear orphaned bindings.
       json(res, 200, { ref, result: "removed" });
       return;
     }

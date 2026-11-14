@@ -20,7 +20,8 @@ Other modules own their tables and run their own `CREATE TABLE IF NOT EXISTS` an
 `ALTER TABLE` statements from an init function that `main()` in `src/index.ts` calls at boot:
 `initMappingsTable()`, `initDispatchBreakerTable()`, `initSettingsTable()`,
 `initAccessEntriesTable()` (`src/access-entries.ts`), `initKeyBindingsTable()`
-(`src/key-bindings.ts`), `initReconciliationTable()`,
+(`src/key-bindings.ts`, also creates the secret-free ingress fence table
+`key_binding_operations`), `initReconciliationTable()`,
 `initStepLogTable()` (`src/step-log.ts`), `initMcpOAuthTables()` (`src/mcp-oauth.ts`),
 `initAccessAuditTable()`, `initAccessPageGrantsTable()`, `initAuthEventsTable()`
 (`src/mcp-auth-events.ts`) and `initReviewFixEvidenceTable()` (`src/review-fix-evidence.ts`).

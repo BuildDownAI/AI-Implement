@@ -35,6 +35,17 @@ Both handlers are exclusive and execute one SQLite transaction in one `ctx.run`.
 The ingress helpers have a five-second timeout and log each result with the reference
 and, for bind, destination. They never log key values or raw failures.
 
+Admin credential mutations and profile PATCH operations share a process queue, including
+both the ingress round trip and local writes. References can be shared across profiles.
+Each ingress helper registers a random operation token in `key_binding_operations`
+(`operation_id` primary key, `key_ref`) and sends it as a transport header. The object
+checks this fence inside its mutation transaction. The helper removes the token on
+completion or timeout, so a delayed invocation cannot mutate a subsequent binding.
+Tokens also belong to a process epoch: a restart invalidates outstanding old tokens.
+Handler bodies remain destination-only for bind and empty for clear; no secret enters Restate.
+DELETE also clears an unowned fallback reference, allowing recovery after a failed
+profile revision save left a harmless orphan binding.
+
 ## Fail closed
 
 Admin credential PUT binds the head revision's destination before storing anything.
