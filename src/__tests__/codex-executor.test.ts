@@ -191,6 +191,15 @@ describe("CodexExecutor result contract", () => {
     const result = await executor.invoke({ ...base, model: "openai/example", agentStage });
     expect(result.terminalStatus?.isError).toBe(false);
     const args = log[0].args;
+    const policyArg = args.find((arg) => arg.startsWith("shell_environment_policy.exclude="));
+    expect(policyArg).toBeDefined();
+    const excluded = JSON.parse(policyArg!.slice("shell_environment_policy.exclude=".length)) as string[];
+    const credentialNames = Object.keys(selected.env).filter((name) => selected.env[name] === SYNTHETIC_KEY);
+    expect(credentialNames).toEqual(expect.arrayContaining(["OPENROUTER_API_KEY", "ANTHROPIC_AUTH_TOKEN"]));
+    for (const name of credentialNames) {
+      expect(log[0].env[name]).toBe(SYNTHETIC_KEY);
+      expect(excluded).toContain(name);
+    }
     for (const pair of [
       'model_provider="openrouter"',
       'model_providers.openrouter.name="OpenRouter"',
@@ -713,7 +722,7 @@ const SHELL_POLICY = `shell_environment_policy.exclude=${JSON.stringify(CODEX_SH
 
 describe("shell environment exclude list (AII-1193)", () => {
   it("names exactly the credential variables, in order", () => {
-    expect([...CODEX_SHELL_ENV_EXCLUDE]).toEqual(["CODEX_API_KEY", "CODEX_HOME", "CHATGPT_PLAN_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY"]);
+    expect([...CODEX_SHELL_ENV_EXCLUDE]).toEqual(["CODEX_API_KEY", "CODEX_HOME", "CHATGPT_PLAN_ACCESS_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENROUTER_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
   });
 });
 

@@ -88,6 +88,8 @@ export const CODEX_SHELL_ENV_EXCLUDE = [
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
   "OPENROUTER_API_KEY",
+  // The shared OpenRouter invocation environment also carries Claude's bearer-token alias.
+  "ANTHROPIC_AUTH_TOKEN",
 ] as const;
 
 /** Pinned Codex 0.159.2 flag accepted by both `exec` and `exec resume`; intended for externally sandboxed environments. */
