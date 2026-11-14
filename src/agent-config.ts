@@ -225,6 +225,7 @@ function validateAgentProvider(stage: StageName, selection: StageSelection, prof
   if (profile.provider !== selection.provider) {
     throw new Error(`${stage}.accountProfileId provider does not match selected provider`);
   }
+  if (selection.provider === "openrouter" && profile.authMode === "openrouter-api-key") return;
   if (selection.agent === "claude") {
     if (selection.provider === "anthropic" && profile.authMode === "anthropic-api-key") return;
     if (selection.provider === "anthropic" && profile.authMode === "claude-subscription") return;

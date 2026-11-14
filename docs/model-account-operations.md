@@ -16,6 +16,8 @@ On Models & providers an admin adds a profile with the form (`POST /api/model-ac
 | Provider | `anthropic`, `openai` or `bedrock` |
 | Authentication | `anthropic-api-key`, `openai-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
 
+OpenRouter setup is currently API-only; the form does not yet offer it. An admin creates a profile with `POST /api/model-accounts`, sending `profileId`, `identity`, `agent` (`claude` or `codex`), `provider: "openrouter"` and `authMode: "openrouter-api-key"`, then stores the key with `PUT /api/model-accounts/:id/credential` and body `{ "apiKey": "..." }`. Models & providers UI support is delivered separately.
+
 The page makes the profile ID from the Name: lowercase, each run outside `[a-z0-9._-]` replaced by `-`, leading and trailing hyphens removed, then leading punctuation removed so the ID starts with a letter or digit. It cuts the result to 64 characters and uses `account` when nothing is left. When an ID is loaded already, it adds `-2`, `-3`, …, shortening the base so the entire ID stays within 64 characters. If another admin creates the same ID before submission, the form shows the route's error message.
 
 The ID is the profile's key and never changes. A caller of the route itself sends its own `profileId`; use lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit, because the fallback reference `model-account:<profileId>` is lowercase-only (`MODEL_ACCOUNT_REF_PATTERN`, `src/model-credentials.ts`).
@@ -226,3 +228,5 @@ After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. 
 ### Stage fallback accounts
 
 On Models & providers, use Add account and Move up/Move down in the Orchestrator stage defaults card, then Save. This sets the stage's ordered `accounts: [{ accountProfileId, model }]` list in the stage defaults configuration (see [stage agent configuration](stage-agent-configuration.md)). The first account is primary; later accounts are fallback candidates, in order. Profiles must be configured and authorized in the run grant. Implementation and review switch once per account after a usage limit, preserving workspace changes and reporting the account that actually ran. Planning does not switch. Exhaustion names all exhausted profile ids; a checkout failure stops with its own authentication or recovery error.
+
+OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key` with either `claude` or `codex`, on every backend. Create the profile through `POST /api/model-accounts` and store its write-only key through `PUT /api/model-accounts/:id/credential`. OpenRouter is a paid API mode, so it cannot follow a subscription in an account list. Runner support is delivered separately; until then, runs fail closed with `unsupported_auth_mode`.
