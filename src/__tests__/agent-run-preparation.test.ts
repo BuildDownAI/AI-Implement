@@ -440,7 +440,7 @@ describe("delivery and runner capability", () => {
     }
   });
 
-  it("requires OpenRouter support for a fallback even without an OpenRouter snapshot profile", async () => {
+  it.each([false, true])("checks OpenRouter workflow support for a fallback without an OpenRouter snapshot profile (marker: %s)", async (marker) => {
     store.saveAccountProfileRevision({
       profileId: "router", identity: "Router", revision: 1, agent: "codex", provider: "openrouter",
       authMode: "openrouter-api-key", metadata: { credentialRef: "model-account:router" },
@@ -452,14 +452,21 @@ describe("delivery and runner capability", () => {
       { accountProfileId: "router", model: "openai/gpt-oss-120b" },
     ];
     store.setOrchestratorDefaults(config);
+    files = { ...(files as Record<string, string | null>),
+      ".github/workflows/claude-implement.yml": WORKFLOW + (marker ? "# ai-implement-capability: openrouter-accounts-v1\n" : ""),
+    };
     const before = counts();
-    expect(await prep.inspectAgentReadiness(request(), deps)).toEqual({ status: "not-ready", code: "runner_incompatible" });
-    expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code: "runner_incompatible" });
+    expect(await prep.inspectAgentReadiness(request(), deps)).toMatchObject(marker
+      ? { status: "ready" } : { status: "not-ready", code: "runner_incompatible" });
+    expect(await prep.prepareAgentRun(request(), deps)).toMatchObject(marker
+      ? { status: "ready" } : { status: "configuration-error", code: "runner_incompatible" });
     const stored = JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string);
     expect(Object.values(stored.profiles).some((p: any) => p.authMode === "openrouter-api-key")).toBe(false);
     expect(stored.accountFallbacks.implementation).toContainEqual(expect.objectContaining({ authMode: "openrouter-api-key" }));
-    expect(counts().grants).toBe(0);
-    expect(counts().reservations).toBe(before.reservations);
+    if (!marker) {
+      expect(counts().grants).toBe(0);
+      expect(counts().reservations).toBe(before.reservations);
+    }
   });
 
   it("requires the launch-context marker as well as the stage-agent marker on GitHub Actions", async () => {
