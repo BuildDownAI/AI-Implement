@@ -10,6 +10,7 @@ import {
   STAGE_NAMES,
   STORED_STAGE_SELECTION_FIELDS,
   validateFallbackModel,
+  validatePreferOpenModel,
   validateDefaultAccounts,
   validateAccounts,
   inspectStageAccounts,
@@ -196,6 +197,7 @@ function assertConfigShape(config: StageAgentConfigurationV1, name: string): voi
       if (name === "projectConfig") throw new Error("accounts is only supported in orchestrator defaults");
       validateAccounts(patch.accounts, stage);
     }
+    validatePreferOpenModel(patch, stage, name === "projectConfig");
     validateFallbackModel(patch.fallbackModel, stage);
     if (Object.keys(patch).some((f) => !(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(f))) {
       throw new Error(`${name}.stages.${stage} contains unknown key(s)`);
@@ -532,7 +534,7 @@ export function getProjectStageConfig(projectKey: string): StoredStageConfig | n
   return row ? toStored(row) : null;
 }
 
-/** Sets one stage field to null so it inherits the orchestrator default again; appends a revision. */
+/** Clears a stage override (removes optional project metadata); appends a revision. */
 export function clearProjectStageField(
   projectKey: string,
   stage: StageName,
@@ -542,6 +544,9 @@ export function clearProjectStageField(
   assertNonEmptyProjectKey(projectKey);
   if (!(STAGE_NAMES as readonly string[]).includes(stage)) throw new Error("unknown stage");
   if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) throw new Error("unknown stage field");
+  if (field === "preferOpenModel" && stage !== "implementation") {
+    throw new Error("preferOpenModel is only supported in project implementation settings");
+  }
   const db = getDb();
   return db
     .transaction(() => {
@@ -551,6 +556,8 @@ export function clearProjectStageField(
         ...current,
         stages: { ...current.stages, [stage]: { ...current.stages?.[stage], [field]: null } },
       };
+      if (field === "preferOpenModel") delete next.stages![stage]!.preferOpenModel;
+      assertConfigShape(next, "projectConfig");
       if (next.mode === "configured") assertProjectResolves(db, next);
       return appendConfig(db, "project", projectKey, next, createdBy);
     })

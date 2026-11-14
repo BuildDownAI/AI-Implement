@@ -6854,6 +6854,24 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(patch.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
   });
 
+  it.each([false, true])("saves the inactive preference for configured=%s and rejects invalid scope/types", async (configured) => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", configured);
+    const deps = readyDeps();
+    for (const preferOpenModel of [true, false]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { implementation: { preferOpenModel } } }, deps)).status).toBe(200);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t, undefined, deps)).json.stages.implementation.preferOpenModel).toBe(preferOpenModel);
+    }
+    const revs = count("stage_agent_config_revisions");
+    for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { [stage as string]: { preferOpenModel: value } } }, deps)).status).toBe(400);
+    }
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect((await call("/api/agent-defaults", "PUT", t, { mode: "configured", stages: { [stage]: { preferOpenModel: false } } })).status).toBe(400);
+    }
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+  });
+
   it("saves and resolves fallback models with field provenance", async () => {
     const t = await seed();
     modules.agentConfigStore.setProjectConfigured("APP", true);

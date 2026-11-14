@@ -4257,6 +4257,10 @@ function validateStagesBody(stages: unknown, defaults = false): string | null {
         try { validateAccounts(value, stage); } catch (err) { return (err as Error).message; }
         continue;
       }
+      if (field === "preferOpenModel") {
+        if (defaults || stage !== "implementation" || typeof value !== "boolean") return "preferOpenModel must be a boolean in project implementation settings";
+        continue;
+      }
       if (value === null) continue;
       if (field === "invocationTimeoutMs" ? !Number.isSafeInteger(value) || (value as number) <= 0 : typeof value !== "string" || value.trim() === "") {
         return `stages.${stage}.${field} is malformed`;
