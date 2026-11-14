@@ -437,7 +437,10 @@ export async function listAppSecrets(
     headers: flyHeaders(token),
   });
   if (!res.ok) throw new Error(`Fly app secrets list failed (${res.status})`);
-  return await res.json() as FlySecret[];
+  // Fly answers an object that holds the list (`{ secrets: [...] }`), not a bare list.
+  const body = await res.json() as { secrets?: unknown } | null;
+  if (!Array.isArray(body?.secrets)) throw new Error("Fly app secrets list returned no secrets list");
+  return body.secrets as FlySecret[];
 }
 
 export async function setAppSecrets(
