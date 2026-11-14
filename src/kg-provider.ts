@@ -56,7 +56,7 @@ const OPTIONAL_KG_TOOLS: ReadonlySet<string> = new Set(["kg_repo_history"]);
 export const REQUIRED_KG_TOOL_COUNT = Object.keys(KG_TOOL_CAPABILITY).filter((n) => !OPTIONAL_KG_TOOLS.has(n)).length;
 
 interface SidecarRpcResponse {
-  result?: { tools?: unknown[] };
+  result?: { tools?: unknown[]; isError?: unknown; content?: unknown };
   error?: unknown;
 }
 
@@ -358,6 +358,22 @@ export class SidecarMemoryProvider implements MemoryProvider {
     return null;
   }
 
+  /** The SDK wraps raised tool exceptions in an ordinary MCP result. */
+  private storeFailureMessage(parsed: SidecarRpcResponse | null): string | null {
+    if (parsed?.result?.isError === true) {
+      const content = parsed.result.content;
+      const firstText = Array.isArray(content)
+        ? content.find((entry: unknown) => entry !== null && typeof entry === "object" && "type" in entry && entry.type === "text")
+        : undefined;
+      return (typeof firstText?.text === "string" ? firstText.text : "store call failed").slice(0, 200);
+    }
+    if (parsed?.error) {
+      const error = parsed.error as { message?: unknown };
+      return (typeof error.message === "string" ? error.message : JSON.stringify(parsed.error)).slice(0, 200);
+    }
+    return null;
+  }
+
   /**
    * Liveness probe (AII-648): a session-tolerant `tools/list` that must return the
    * six `kg_*` tools, then one cheap `kg_neighbors` call on the served graph's spine
@@ -430,15 +446,14 @@ export class SidecarMemoryProvider implements MemoryProvider {
     };
     const callOutcome = await this.sendWithSessionRetry(target, transport, forwardHeaders, sendCall);
     if (isRemoteKgStore() && !callOutcome.result.ok && callOutcome.result.error.code === "ETIMEDOUT") {
-      console.log("[kg] remote store did not answer in 10 s; it is possibly starting");
+      console.error("[kg] remote store did not answer in 10 s; it is possibly starting");
       this.storeError = null;
       return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
     }
     let callError = this.describeSendFailure(callOutcome, "kg_neighbors probe call");
     if (isRemoteKgStore()) {
-      const error = callOutcome.parsed?.error as { message?: unknown } | undefined;
-      if (typeof error?.message === "string") callError = error.message;
-      this.storeError = callError;
+      this.storeError = callOutcome.handshakeError ? null : this.storeFailureMessage(callOutcome.parsed);
+      callError = this.storeError ?? callError;
     }
     if (callError) return recordSidecarHealth({ reachable: true, toolsListed: true, lastError: callError });
 
@@ -566,7 +581,7 @@ export class SidecarMemoryProvider implements MemoryProvider {
       void this.maybeReprobe();
       return { ok: false, error: "KG sidecar error" };
     }
-    if (isRemoteKgStore()) {
+    if (isRemoteKgStore() && this.storeFailureMessage(parsed) === null) {
       this.storeError = null;
       recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
     }

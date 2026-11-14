@@ -1,3 +1,5 @@
+import http from "node:http";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as DeployNotifyModule from "../deploy-notify.js";
@@ -534,6 +536,52 @@ describe("boot KG warm-up", () => {
   });
   afterEach(() => vi.useRealTimers());
   const health = (lastError: string | null) => ({ reachable: !lastError, toolsListed: !lastError, lastError, checkedAt: Date.now() });
+
+  it("runs remote warm-up to its deadline without any store calls", async () => {
+    vi.stubEnv("KG_BACKEND", "stardog_run");
+    const { probeKgSidecarAfterBoot } = await import("../restate/kg-sidecar-health.js");
+    const methods: string[] = [];
+    const message = "Error executing tool kg_neighbors: bad token";
+    const request = vi.spyOn(http, "request").mockImplementation(((_options: unknown, cb: (res: unknown) => void) => {
+      const req = new PassThrough();
+      req.on("data", body => {
+        const method = JSON.parse(body.toString()).method;
+        methods.push(method);
+        const res = new PassThrough();
+        Object.assign(res, { statusCode: 200, headers: { "content-type": "application/json" } });
+        cb(res);
+        res.end(JSON.stringify(method === "tools/call"
+          ? { result: { isError: true, content: [{ type: "text", text: message }] } }
+          : { result: { tools: Object.keys(kgProvider.KG_TOOL_CAPABILITY).map(name => ({ name })) } }));
+      });
+      return req;
+    }) as never);
+    try {
+      const provider = new kgProvider.SidecarMemoryProvider(SIDECAR, async () => "https://kg.example.test/");
+      const boot = provider.probe();
+      await vi.advanceTimersByTimeAsync(0);
+      expect((await boot).lastError).toBe(message);
+      methods.length = 0;
+      const posted = deployNotify.postBootNotice(config, {
+        probe: remaining => probeKgSidecarAfterBoot(provider, remaining), retryMs: 5, deadlineMs: 16,
+      });
+      await vi.advanceTimersByTimeAsync(16);
+      await posted;
+      expect(methods).toEqual(["tools/list", "tools/list", "tools/list"]);
+      expect(methods.filter(method => method === "tools/call")).toHaveLength(0);
+      expect(kgProvider.sidecarHealth.lastError).toBe(message);
+      expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgUnavailable: true, sidecarError: message });
+    } finally { request.mockRestore(); }
+  });
+
+  it("uses a full post-boot probe for a local store", async () => {
+    vi.stubEnv("KG_BACKEND", "local");
+    const { probeKgSidecarAfterBoot } = await import("../restate/kg-sidecar-health.js");
+    const provider = new kgProvider.SidecarMemoryProvider(SIDECAR);
+    const probe = vi.spyOn(provider, "probe").mockResolvedValue(health(null));
+    await probeKgSidecarAfterBoot(provider, 100);
+    expect(probe).toHaveBeenCalledWith("full");
+  });
 
   it("waits for a passing re-probe and omits the warning", async () => {
     const probe = vi.fn(async () => health(null));

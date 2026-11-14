@@ -3,7 +3,7 @@ import * as deployNotify from "../deploy-notify.js";
 import { testDb } from "./helpers/test-db.js";
 import http from "node:http";
 import { PassThrough } from "node:stream";
-import { KG_TOOL_CAPABILITY, SidecarMemoryProvider, setKgMemoryProvider, sidecarHealth } from "../kg-provider.js";
+import { KG_TOOL_CAPABILITY, SidecarMemoryProvider, setKgMemoryProvider, isKgUnavailable, sidecarHealth } from "../kg-provider.js";
 import { checkKgSidecarHealth, probeKgSidecarIfUnavailable } from "../restate/kg-sidecar-health.js";
 import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
 
@@ -102,7 +102,7 @@ describe("probeKgSidecarIfUnavailable", () => {
         process.nextTick(() => {
           cb(res);
           res.end(JSON.stringify(method === "tools/call" && boot
-            ? { error: { message: "bad token" } }
+            ? { result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }
             : { result: { tools: Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name })) } }));
         });
       });
@@ -112,7 +112,8 @@ describe("probeKgSidecarIfUnavailable", () => {
       const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => "https://kg.example.test/");
       setKgMemoryProvider(p);
       await p.probe();
-      expect(sidecarHealth.lastError).toBe("bad token");
+      expect(sidecarHealth.lastError).toBe("Error executing tool kg_neighbors: bad token");
+      expect(isKgUnavailable()).toBe(true);
       boot = false;
       methods.length = 0;
       for (let cycle = 0; cycle < 10; cycle++) {
@@ -122,7 +123,7 @@ describe("probeKgSidecarIfUnavailable", () => {
             return new Response("{}");
           },
         });
-        expect(sidecarHealth.lastError).toBe("bad token");
+        expect(sidecarHealth.lastError).toBe("Error executing tool kg_neighbors: bad token");
       }
       expect(methods.filter((method) => method === "tools/call")).toHaveLength(0);
       expect(methods).toHaveLength(10);
