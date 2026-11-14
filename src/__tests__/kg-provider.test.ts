@@ -562,6 +562,25 @@ describe("SidecarMemoryProvider probe", () => {
       expect((await p.probe("list-only")).lastError).toBeNull();
     });
 
+    it.each([{}, { result: null }, { result: false }, { result: [] }, { result: "invalid" }])(
+      "preserves the boot store error after a malformed tool response %j",
+      async (response) => {
+        const p = makeProvider();
+        queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+        queueResponse(200, JSON.stringify({ error: { code: -32000, message: "bad token" } }));
+        expect((await p.probe()).lastError).toBe("bad token");
+        const before = { ...sidecarHealth };
+
+        queueResponse(200, JSON.stringify(response));
+        expect(await p.callKgTool("kg_search", {})).toEqual({ ok: false, error: "KG sidecar error" });
+        expect(sidecarHealth).toEqual(before);
+
+        queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+        expect((await p.probe("list-only")).lastError).toBe("bad token");
+        expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+      },
+    );
+
     it("answers a user timeout without changing health or re-probing", async () => {
       Object.assign(sidecarHealth, { reachable: true, toolsListed: true, lastError: "bad token", checkedAt: 1 });
       const before = { ...sidecarHealth };

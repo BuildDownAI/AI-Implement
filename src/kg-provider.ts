@@ -561,6 +561,11 @@ export class SidecarMemoryProvider implements MemoryProvider {
       const err = parsed.error as { message?: string };
       return { ok: false, error: typeof err.message === "string" ? err.message : JSON.stringify(parsed.error) };
     }
+    if (!parsed.result || typeof parsed.result !== "object" || Array.isArray(parsed.result)) {
+      console.error(`[mcp] KG sidecar ${name} returned no valid result (status ${result.status})`);
+      void this.maybeReprobe();
+      return { ok: false, error: "KG sidecar error" };
+    }
     if (isRemoteKgStore()) {
       this.storeError = null;
       recordSidecarHealth({ reachable: true, toolsListed: true, lastError: null });
