@@ -10,6 +10,7 @@ import {
   STAGE_NAMES,
   STORED_STAGE_SELECTION_FIELDS,
   validateFallbackModel,
+  validatePreferOpenModel,
   validateDefaultAccounts,
   validateAccounts,
   inspectStageAccounts,
@@ -196,6 +197,7 @@ function assertConfigShape(config: StageAgentConfigurationV1, name: string): voi
       if (name === "projectConfig") throw new Error("accounts is only supported in orchestrator defaults");
       validateAccounts(patch.accounts, stage);
     }
+    validatePreferOpenModel(patch, stage, name === "projectConfig");
     validateFallbackModel(patch.fallbackModel, stage);
     if (Object.keys(patch).some((f) => !(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(f))) {
       throw new Error(`${name}.stages.${stage} contains unknown key(s)`);

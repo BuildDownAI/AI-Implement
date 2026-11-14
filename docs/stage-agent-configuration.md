@@ -76,3 +76,19 @@ Recover by setting the project to legacy, or by merging the workflow sync pull r
 and removing the park.
 
 OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key` with either `claude` or `codex`, on every backend. Create the profile through `POST /api/model-accounts` and store its write-only key through `PUT /api/model-accounts/:id/credential`. OpenRouter is a paid API mode, so it cannot follow a subscription in an account list. Runner support is delivered separately; until then, runs fail closed with `unsupported_auth_mode`.
+
+### Open-model preference (inactive stub)
+
+Project settings may store an optional boolean `preferOpenModel` in the
+`implementation` stage only. Absent means false. Other types (including null),
+other stages, and orchestrator defaults reject this field.
+
+The project Agents tab exposes “Use the open model for implementation” and saves
+it with **Save agent settings**, including for legacy projects. It is not active:
+no run reads it, and it does not change resolved selections, account lists or
+execution snapshot fields. There is no setting to choose an open model yet.
+
+Before rolling back this feature, remove the `preferOpenModel` key entirely from
+every stored project config that contains it. Unchecking stores false and does
+not remove the key; setting null also does not remove it. Older code rejects the
+unknown key during shape validation.

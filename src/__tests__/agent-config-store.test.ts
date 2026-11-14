@@ -478,3 +478,32 @@ it("refuses a historical incompatible profile without writing", () => {
   expect(() => store.setOrchestratorDefaults(config)).toThrow(new Error("planning.accounts[0] does not resolve"));
   expect(dump()).toBe(before);
 });
+
+describe("stored open-model preference", () => {
+  it.each(["legacy", "configured"] as const)("round-trips booleans and old configs in %s mode", (mode) => {
+    seed();
+    for (const patch of [{}, { preferOpenModel: true }, { preferOpenModel: false }]) {
+      const config: StageAgentConfigurationV1 = { version: 1, mode, stages: { implementation: patch } };
+      store.setProjectStageConfig("AII", config);
+      expect(store.getProjectStageConfig("AII")!.config).toEqual(config);
+    }
+  });
+  it.each(["legacy", "configured"] as const)("rejects invalid project writes atomically in %s mode", (mode) => {
+    seed();
+    const before = dump();
+    for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
+      expect(() => store.setProjectStageConfig("AII", {
+        version: 1, mode, stages: { [stage as string]: { preferOpenModel: value } },
+      } as StageAgentConfigurationV1)).toThrow();
+      expect(dump()).toBe(before);
+    }
+  });
+  it.each(["planning", "implementation", "review"])("rejects defaults %s without appending a revision", (stage) => {
+    seed();
+    const before = dump();
+    expect(() => store.setOrchestratorDefaults({
+      ...defaults(), stages: { ...defaults().stages, [stage]: { preferOpenModel: false } },
+    })).toThrow("only supported");
+    expect(dump()).toBe(before);
+  });
+});

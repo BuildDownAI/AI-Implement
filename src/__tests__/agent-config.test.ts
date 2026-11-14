@@ -633,3 +633,56 @@ it.each([false, true])("checks fallback model collisions with a passing project 
   expect(result.accountFallbacks.planning?.[0].accountProfileId).toBe("claude-api");
   expect(() => resolve("default-backup")).toThrow("planning.fallbackModel must differ from model");
 });
+
+describe("preferOpenModel stored stub", () => {
+  const resolve = (patch: Record<string, unknown>) => resolveStageAgentConfig({
+    orchestratorDefaults, accountProfiles,
+    projectConfig: { version: 1, mode: "configured", stages: { implementation: patch } } as StageAgentConfigurationV1,
+  });
+
+  it.each([true, false, undefined])("accepts project implementation value %s without changing resolution", (value) => {
+    expect(resolve(value === undefined ? {} : { preferOpenModel: value })).toEqual(resolve({}));
+  });
+  it("resolves true and false identically, including account selections and fallbacks", () => {
+    const resolveWithAccounts = (preferOpenModel: boolean) => resolveStageAgentConfig({
+      orchestratorDefaults: {
+        ...orchestratorDefaults,
+        stages: {
+          ...orchestratorDefaults.stages,
+          implementation: {
+            ...orchestratorDefaults.stages!.implementation,
+            accounts: [
+              { accountProfileId: "openai-api", model: "gpt-5.5-codex" },
+              { accountProfileId: "openai-subscription", model: "" },
+            ],
+          },
+        },
+      },
+      accountProfiles,
+      projectConfig: { version: 1, mode: "configured", stages: { implementation: { preferOpenModel } } },
+    });
+    const enabled = resolveWithAccounts(true);
+    expect(enabled).toEqual(resolveWithAccounts(false));
+    expect(enabled.mode).toBe("configured");
+    if (enabled.mode === "configured") {
+      expect(enabled.accountFallbacks.implementation).toHaveLength(1);
+      expect(enabled.stages.implementation).not.toHaveProperty("preferOpenModel");
+      expect(enabled.sources.implementation).not.toHaveProperty("preferOpenModel");
+    }
+  });
+  it.each([null, "true", 1, {}, []])("rejects nonboolean %s", (value) => {
+    expect(() => resolve({ preferOpenModel: value })).toThrow("must be a boolean");
+  });
+  it.each(["planning", "review"] as const)("rejects project %s presence", (stage) => {
+    expect(() => resolveStageAgentConfig({
+      orchestratorDefaults, accountProfiles,
+      projectConfig: { version: 1, mode: "configured", stages: { [stage]: { preferOpenModel: false } } },
+    })).toThrow("only supported");
+  });
+  it.each(["planning", "implementation", "review"] as const)("rejects defaults %s presence", (stage) => {
+    expect(() => resolveStageAgentConfig({
+      orchestratorDefaults: { ...orchestratorDefaults, stages: { ...orchestratorDefaults.stages, [stage]: { preferOpenModel: false } } },
+      accountProfiles, projectConfig: { version: 1, mode: "configured" },
+    })).toThrow("only supported");
+  });
+});
