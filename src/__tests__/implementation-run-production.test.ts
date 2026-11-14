@@ -1,3 +1,4 @@
+import { getCommentGapfillLaunch } from "../comment-gapfill-queue.js";
 import type { DispatchAdmissionReleaseReason } from "../dispatch-admission.js";
 import { readOptionalModelPrices } from "../restate/implementation-run-workflow.js";
 import { readFileSync } from "node:fs";
@@ -55,7 +56,7 @@ vi.mock("../dispatch-breaker.js", () => ({ recordDispatchFailure: vi.fn().mockRe
 vi.mock("../base-branch.js", () => ({ postBranchComment: vi.fn() }));
 vi.mock("../status-events.js", () => ({ postStatusComment: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../fly-machines.js", () => ({
-  getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
+  machineNeverStarted: vi.fn().mockReturnValue(false), getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn(),
   generateSessionToken: () => "SESSION-TOKEN", generateMachineNonce: () => "MACHINE-NONCE",
 }));
 vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), removeLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn().mockResolvedValue(null) }));
@@ -82,7 +83,7 @@ import { cancelWorkflowRun, getPullRequestState, getWorkflowRunStatus } from "..
 import { appendLogIfAbsent, getJobByDispatchId, updateJobRunId, updateJobStatus } from "../log.js";
 import { markDispatched } from "../dedup.js";
 import { read as readAdmission, release as releaseAdmission } from "../dispatch-admission.js";
-import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
+import { destroyMachine, getMachine, listMachines, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer } from "../local-docker.js";
 import { classifyLaunchError, isManagedProject, prepareManagedDispatch, settleLaunch } from "../managed-dispatch-auth.js";
 import {
@@ -224,6 +225,8 @@ describe("production deps", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     intents.clear();
+    vi.mocked(machineNeverStarted).mockReturnValue(false);
+    vi.mocked(getCommentGapfillLaunch).mockReturnValue(null);
     vi.mocked(getJobByDispatchId).mockReset();
     provider.findByKey.mockResolvedValue(issue);
     vi.mocked(readAdmission).mockReturnValue({ dispatchId: "d-1", generation: 3, releasedAt: null } as never);
@@ -555,7 +558,9 @@ describe("production deps", () => {
 
     it("github: a throw in the preparation returns rejected; a throw after the launch call propagates", async () => {
       expect(await compose({ prepareImplementationLaunch: vi.fn().mockRejectedValue(new Error("mint")) as never }).d.launch(INPUT)).toEqual({ outcome: "rejected" });
-      intents.clear(); // Independent dispatch scenario; the prior preparation is intentionally durable.
+      intents.clear();
+    vi.mocked(machineNeverStarted).mockReturnValue(false);
+    vi.mocked(getCommentGapfillLaunch).mockReturnValue(null); // Independent dispatch scenario; the prior preparation is intentionally durable.
       await expect(compose({ launchImplementationRun: vi.fn().mockRejectedValue(new Error("lost ack")) as never }).d.launch(INPUT)).rejects.toThrow("lost ack");
       expect(appendLogIfAbsent).not.toHaveBeenCalled();
     });
@@ -571,7 +576,9 @@ describe("production deps", () => {
       vi.mocked(classifyLaunchError).mockReturnValueOnce("rejected");
       expect(await compose({ [key]: vi.fn().mockRejectedValue(new Error("no")) as never }).d.launch({ ...INPUT, backend })).toEqual({ outcome: "rejected" });
       expect(settleLaunch).toHaveBeenCalledWith({ kind: "legacy" }, "rejected", expect.anything());
-      intents.clear(); // Independent dispatch scenario.
+      intents.clear();
+    vi.mocked(machineNeverStarted).mockReturnValue(false);
+    vi.mocked(getCommentGapfillLaunch).mockReturnValue(null); // Independent dispatch scenario.
       vi.mocked(classifyLaunchError).mockReturnValueOnce("unknown");
       await expect(compose({ [key]: vi.fn().mockRejectedValue(new Error("lost")) as never }).d.launch({ ...INPUT, backend })).rejects.toThrow("lost");
       expect(appendLogIfAbsent).not.toHaveBeenCalled();
@@ -735,6 +742,28 @@ describe("production deps", () => {
 
   describe("finishJob", () => {
     const failedJob = makeJob({ id: 7, dispatchId: "d-1", teamKey: "ENG", issueId: "i-1", status: "failed", conclusion: "REVIEW_UNAPPROVED", failure: null, prUrl: null, executionMode: "github-actions" });
+
+    it.each([false, true])("uses the frozen Fly app for the diagnostic (gapFill=%s)", async gapFill => {
+      const run = { ...INPUT, backend: "fly-machines" as const, ...(gapFill ? { gapFill: { queueItemId: 1, repository: "Org/repo", installationId: "1", prNumber: 3, prDispatchBudget: 0, humanRequested: true } } : {}) };
+      intents.set("owner:d-1", { snapshot: { input: run, flyApp: "frozen-app" }, done: false });
+      if (gapFill) vi.mocked(getCommentGapfillLaunch).mockReturnValue({ flyApp: "gapfill-app" } as ReturnType<typeof getCommentGapfillLaunch>);
+      vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ status: "running", executionMode: "fly-machines", machineId: "m-1" }));
+      vi.mocked(machineNeverStarted).mockReturnValue(true);
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(getMachine).toHaveBeenCalledWith("fly-token", gapFill ? "gapfill-app" : "frozen-app", "m-1");
+      expect(updateJobStatus).toHaveBeenCalledWith(expect.anything(), "failed", "fly_machine_never_started", undefined, { skipAdmissionRelease: true });
+    });
+
+    it.each(["no-owner", "no-app", "github-actions", "local-docker", "no-id", "404", "read-error", "started"])("keeps the existing conclusion for %s", async scenario => {
+      if (scenario !== "no-owner") intents.set("owner:d-1", { snapshot: { input: { ...INPUT, backend: "fly-machines" }, ...(scenario === "no-app" ? {} : { flyApp: "frozen-app" }) }, done: false });
+      vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ status: "running", executionMode: scenario === "github-actions" || scenario === "local-docker" ? scenario : "fly-machines", machineId: scenario === "no-id" ? null : "m-1" }));
+      if (scenario === "404" || scenario === "read-error") vi.mocked(getMachine).mockRejectedValueOnce(new Error(scenario));
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: "run_ended" });
+      expect(updateJobStatus).toHaveBeenCalledWith(expect.anything(), "failed", "ended_without_callback", undefined, { skipAdmissionRelease: true });
+      if (["no-owner", "no-app", "github-actions", "local-docker", "no-id"].includes(scenario)) expect(getMachine).not.toHaveBeenCalled();
+    });
 
     it("returns {} for a missing job row", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue(null);

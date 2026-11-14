@@ -114,3 +114,21 @@ describe("finishImplementationJob", () => {
     expect(deps.finalize).not.toHaveBeenCalled();
   });
 });
+
+describe("never-started diagnostic", () => {
+  it.each([true, false])("preserves the conclusion on retry (neverStarted=%s)", async value => {
+    const job = makeJob({ status: "running" });
+    const deps: ImplementationFinishDependencies = {
+      ...setup(job),
+      neverStarted: vi.fn(async () => value),
+      closeRow: vi.fn((row, status, conclusion) => { Object.assign(row, { status, conclusion }); }),
+    };
+    const conclusion = value ? "fly_machine_never_started" : "ended_without_callback";
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.closeRow).toHaveBeenCalledWith(job, "failed", conclusion, { skipAdmissionRelease: true });
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.neverStarted).toHaveBeenCalledTimes(1);
+    expect(deps.finalize).toHaveBeenNthCalledWith(2, { kind: "failed", conclusion }, job);
+    expect(job.conclusion).toBe(conclusion);
+  });
+});
