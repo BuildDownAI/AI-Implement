@@ -27,6 +27,22 @@ The Projects Agents tab has no mode control. It shows the project mode and names
 
 `PUT /api/mappings/:key/agent-config` inspects readiness for a configured project, so a new configured project receives `409` when saving stage overrides until its workflow sync pull request merges.
 
+### Open-model preference (inactive stub)
+
+Project settings may store an optional boolean `preferOpenModel` in the
+`implementation` stage only. Absent means false. Other types (including null),
+other stages, and orchestrator defaults reject this field.
+
+The project Agents tab exposes “Use the open model for implementation” and saves
+it with **Save agent settings**, including for legacy projects. It is not active:
+no run reads it, and it does not change resolved selections, account lists or
+execution snapshot fields. There is no setting to choose an open model yet.
+
+Before rolling back this feature, remove the `preferOpenModel` key entirely from
+every stored project config that contains it. Unchecking stores false and does
+not remove the key; setting null also does not remove it. Older code rejects the
+unknown key during shape validation.
+
 ## Run preparation and the snapshot
 
 When a run is prepared (`prepareAgentRun`, `src/agent-run-preparation.ts`, called inside the ImplementationRun prelaunch), `chooseStageAccount` takes each stage's first entry that passes the configuration checks (its profile resolves, and its backend is supported) and lists the later passing entries as fallbacks. When a project overrides `accountProfileId`, entry zero must pass its check or resolution fails with its reason; defaults cannot replace a failed project account. Without that override, selection can skip failed defaults. Bedrock is supported only on GitHub Actions. The chosen entries become the run's snapshot, stored once per dispatch in `run_agent_config_snapshots` and never updated; a retried preparation reuses it. Beside it, `resolved_config_json` records per stage the chosen index, each entry passed over with its reason, and the fallback list, including profile revision and auth mode. Before freezing a new dispatch, preparation checks fallback credentials using each entry's own provider, profile revision and auth mode. Unready fallbacks are dropped without refusing the run; `droppedAccountFallbacks` records profile ids and safe reason codes in `resolved_config_json`, and grants include only retained entries. Reserved subscription sessions are verified at checkout under their owner generation. The binding budget may also trim the fallback list. Repeated preparation reuses the frozen list and grant. Primary credential failures still stop preparation. When no entry passes, the run fails with the first entry's failure.
@@ -76,19 +92,3 @@ Recover by setting the project to legacy, or by merging the workflow sync pull r
 and removing the park.
 
 OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key` with either `claude` or `codex`, on every backend. Create the profile through `POST /api/model-accounts` and store its write-only key through `PUT /api/model-accounts/:id/credential`. OpenRouter is a paid API mode, so it cannot follow a subscription in an account list. Runner support is delivered separately; until then, runs fail closed with `unsupported_auth_mode`.
-
-### Open-model preference (inactive stub)
-
-Project settings may store an optional boolean `preferOpenModel` in the
-`implementation` stage only. Absent means false. Other types (including null),
-other stages, and orchestrator defaults reject this field.
-
-The project Agents tab exposes “Use the open model for implementation” and saves
-it with **Save agent settings**, including for legacy projects. It is not active:
-no run reads it, and it does not change resolved selections, account lists or
-execution snapshot fields. There is no setting to choose an open model yet.
-
-Before rolling back this feature, remove the `preferOpenModel` key entirely from
-every stored project config that contains it. Unchecking stores false and does
-not remove the key; setting null also does not remove it. Older code rejects the
-unknown key during shape validation.
