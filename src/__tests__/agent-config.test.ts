@@ -405,6 +405,43 @@ describe("resolveStageAgentConfig", () => {
 });
 
 describe("fallback models", () => {
+  it.each([
+    { provider: "anthropic" },
+    { provider: "bedrock", accountProfileId: "claude-bedrock" },
+    { accountProfileId: "claude-api" },
+    { accountProfileId: "claude-subscription" },
+  ] as const)("does not inherit a fallback for project provider or account overrides: %j", patch => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.fallbackModel = "backup";
+    for (const fallbackModel of [undefined, null]) {
+      const result = resolveStageAgentConfig({ orchestratorDefaults: defaults,
+        projectConfig: configuredProject({ planning: { ...patch, fallbackModel } }), accountProfiles });
+      if (result.mode !== "configured") throw new Error("expected configured");
+      expect(result.fallbackModels).toEqual({});
+      expect(result.fallbackModelSources).toEqual({});
+    }
+  });
+
+  it.each([{ provider: "anthropic" }, { accountProfileId: "claude-api" }] as const)("uses an explicit project fallback with an override: %j", patch => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.fallbackModel = "backup";
+    const result = resolveStageAgentConfig({ orchestratorDefaults: defaults,
+      projectConfig: configuredProject({ planning: { ...patch, fallbackModel: "project-backup" } }), accountProfiles });
+    if (result.mode !== "configured") throw new Error("expected configured");
+    expect(result.fallbackModels).toEqual({ planning: "project-backup" });
+    expect(result.fallbackModelSources).toEqual({ planning: "project" });
+  });
+
+  it.each([{}, { model: "project-model" }] as const)("inherits the default fallback without provider or account overrides: %j", patch => {
+    const defaults = structuredClone(orchestratorDefaults);
+    defaults.stages!.planning!.fallbackModel = "backup";
+    const result = resolveStageAgentConfig({ orchestratorDefaults: defaults,
+      projectConfig: configuredProject({ planning: patch }), accountProfiles });
+    if (result.mode !== "configured") throw new Error("expected configured");
+    expect(result.fallbackModels).toEqual({ planning: "backup" });
+    expect(result.fallbackModelSources).toEqual({ planning: "orchestrator-default" });
+  });
+
   it("inherits, overrides and restores inheritance without changing selection keys", () => {
     const defaults = structuredClone(orchestratorDefaults);
     defaults.stages!.planning!.fallbackModel = "backup";
@@ -439,7 +476,7 @@ describe("fallback models", () => {
     if (result.mode !== "configured") throw new Error("expected configured");
     expect(result.fallbackModels).toEqual({});
     expect(result.fallbackModelSources).toEqual({});
-    expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: { accountProfileId: "claude-api" } }), accountProfiles })).toThrow("planning.fallbackModel must differ from model");
+    expect(() => resolveStageAgentConfig({ orchestratorDefaults: defaults, projectConfig: configuredProject({ planning: { accountProfileId: "claude-api", fallbackModel: "backup" } }), accountProfiles })).toThrow("planning.fallbackModel must differ from model");
   });
 });
 
@@ -625,11 +662,11 @@ it.each([false, true])("checks fallback model collisions with a passing project 
   defaults.stages!.planning!.fallbackModel = "default-backup";
   if (accounts) defaults.stages!.planning!.accounts = [{ accountProfileId: "claude-api", model: "default-model" }];
   const resolve = (model: string) => resolveStageAgentConfig({ orchestratorDefaults: defaults,
-    projectConfig: configuredProject({ planning: { accountProfileId: "claude-bedrock", provider: "bedrock", model } }), accountProfiles });
+    projectConfig: configuredProject({ planning: { accountProfileId: "claude-bedrock", provider: "bedrock", model, fallbackModel: "default-backup" } }), accountProfiles });
   const result = resolve("project-model");
   if (result.mode !== "configured") throw new Error("expected configured");
   expect(result.fallbackModels).toEqual({ planning: "default-backup" });
-  expect(result.fallbackModelSources).toEqual({ planning: "orchestrator-default" });
+  expect(result.fallbackModelSources).toEqual({ planning: "project" });
   expect(result.accountFallbacks.planning?.[0].accountProfileId).toBe("claude-api");
   expect(() => resolve("default-backup")).toThrow("planning.fallbackModel must differ from model");
 });
