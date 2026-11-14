@@ -2901,6 +2901,67 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
   });
 
+  it.each(["restate", "legacy", "structured", "retry", "initial"] as const)("preserves failure reporting behavior for %s", async mode => {
+    const phase = mode === "initial" ? "implementation" : "gap-analysis";
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    dispatchAdmission.acquire({
+      dispatchId, mappingKey: "ENG", scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: "implementation", backend: "github-actions", cap: 1,
+      lifecycleOwner: mode === "legacy" ? { kind: "legacy" } : { kind: "restate", attemptId: dispatchId },
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, phase });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    const failure = {
+      category: "crash" as const, code: "REVIEW_UNAPPROVED", stage: "feedback-loop/review-3",
+      attempt: 1, retryable: false, message: "Review did not approve",
+      evidence: { stderrTail: "review evidence", truncated: false },
+    };
+    const hook = vi.fn(async () => ({ status: "accepted" as const }));
+    if (mode === "retry") hook.mockRejectedValueOnce(new Error("unavailable"));
+    const provider = new FakeProvider({ recordCalls: true });
+    const input: RunnerCallbackModule.HandleRunnerResultInput = {
+      authorization: `Bearer ${token}`, secret: SECRET,
+      resolveProvider: makeResolve(provider), checkImplementationAdmissionTermination: hook,
+      body: {
+        phase, outcome: "failure" as const, failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "iterations_exhausted after 3/3 iterations", comments: [{ body: "Review exhausted" }],
+        prUrl: "https://github.com/org/repo/pull/12",
+        ...(mode === "structured" ? { failure } : {}),
+      },
+    };
+    expect((await runnerCallback.handleRunnerResult(input)).status).toBe(mode === "retry" ? 503 : 200);
+    const job = log.getJobById(jobId);
+    if (mode === "legacy" || mode === "initial") {
+      expect(job?.status).toBe("dispatched");
+      expect(job?.failure).toBeNull();
+    } else {
+      expect(job).toMatchObject({ status: "failed", conclusion: "REVIEW_UNAPPROVED", approved: false });
+      expect(job?.failure).toMatchObject(mode === "structured" ? failure : {
+        code: "REVIEW_UNAPPROVED", message: input.body.failureReason, retryable: false,
+      });
+      expect(job?.failureCommentedAt).toBeNull();
+    }
+    expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
+    expect(hook).toHaveBeenCalledTimes(mode === "legacy" ? 0 : 1);
+    if (mode === "retry") {
+      const effects = provider.recordedCalls();
+      expect(effects.filter(call => call.method === "postComment")).toHaveLength(1);
+      expect(log.hasCompletedCallbackLifecycle(dispatchId)).toBe(true);
+      expect((await runnerCallback.handleRunnerResult(input)).status).toBe(200);
+      expect(log.getJobById(jobId)).toEqual(job);
+      expect(provider.recordedCalls()).toEqual(effects);
+      expect(hook).toHaveBeenCalledTimes(2);
+      // Lost ACK after delivery: effects stay suppressed; ingress deduplicates the report.
+      expect((await runnerCallback.handleRunnerResult(input)).status).toBe(200);
+      expect(log.getJobById(jobId)).toEqual(job);
+      expect(provider.recordedCalls()).toEqual(effects);
+      expect(hook).toHaveBeenCalledTimes(3);
+    }
+  });
+
   it("does NOT stamp runner_approved when gap-analysis outcome is failure (REVIEW_UNAPPROVED)", async () => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
