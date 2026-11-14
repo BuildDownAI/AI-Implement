@@ -114,7 +114,8 @@ Nothing undoes a schema change. If you deploy older code over a newer database:
   columns are nullable.
 - The triggers stay in the database and keep working under old code.
 - The OpenRouter rebuilds keep their wider provider and auth mode CHECK lists. Reverting
-  the code does not narrow them; an older orchestrator runs correctly with these lists.
+  the code does not narrow them; an older orchestrator runs correctly only when no account
+  profile has provider `openrouter`. See [Roll back after OpenRouter](model-account-operations.md#roll-back-after-openrouter).
 - The prune trigger's deletes (section 4) stay active.
 
 ## 4. The one irreversible change
