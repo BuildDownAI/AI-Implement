@@ -228,6 +228,7 @@ const INHERITED_CREDENTIAL_KEYS: readonly string[] = [
   "CLAUDE_CODE_USE_BEDROCK",
   "CLAUDE_CONFIG_DIR",
   "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
   "CODEX_API_KEY",
   "CODEX_HOME",
 ];
@@ -346,6 +347,14 @@ export function buildModelInvocationEnv(input: {
     case "anthropic-api-key":
       if (secret.kind !== "api-key") fail("credential_source_mismatch");
       env.ANTHROPIC_API_KEY = secret.apiKey;
+      break;
+    case "openrouter-api-key":
+      if (secret.kind !== "api-key") fail("credential_source_mismatch");
+      // Keep the destination fixed: an outside endpoint could receive the key and source code.
+      env.ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
+      env.ANTHROPIC_AUTH_TOKEN = secret.apiKey;
+      env.ANTHROPIC_API_KEY = "";
+      env.OPENROUTER_API_KEY = secret.apiKey;
       break;
     case "openai-api-key":
       if (secret.kind !== "api-key") fail("credential_source_mismatch");

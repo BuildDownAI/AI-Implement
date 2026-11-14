@@ -6,7 +6,7 @@ import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from "n
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { CHATGPT_PLAN_PROVIDER, CODEX_SHELL_ENV_EXCLUDE, CodexExecutor, chatgptPlanProviderArgs, CodexPlanningPolicyUnprovenError, CodexRecoveryRequiredError, matchesSchema, type CodexExecutorOptions } from "../pipeline/codex-executor.js";
-import { ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
+import { buildModelInvocationEnv, ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import { READ_ONLY_TOOL_PARAMS } from "../pipeline/steps/read-only-tools.js";
 import type { CodexProtocolDriver, CodexTransportResult, CodexTransportRunInput } from "../pipeline/codex-planning-adapter.js";
@@ -167,6 +167,25 @@ const base = { prompt: "do the thing", model: "gpt-synthetic", stage: "implement
 const retry = { retry: { policy: { ...DEFAULT_RETRY_POLICY, requestRetries: 2, backoffInitialMs: 1, backoffMaxMs: 5 }, toolUseIsSafe: false } };
 
 describe("CodexExecutor result contract", () => {
+  it.each(["implementation", "planning", "review"] as const)("fails closed for OpenRouter in %s before launching Codex", async (agentStage) => {
+    const selected = buildModelInvocationEnv({
+      authMode: "openrouter-api-key",
+      secret: { kind: "api-key", apiKey: SYNTHETIC_KEY },
+      inheritedEnv: { CODEX_API_KEY: "ambient-key", CODEX_HOME: "/tmp/ambient-auth" },
+    });
+    const run = vi.fn<CodexProtocolDriver["run"]>();
+    const { executor, log, sleeps } = make([], {
+      auth: { invoke: async (_id, cb) => cb(selected) },
+      ...(agentStage !== "implementation" ? { protocolDriver: { policy: agentStage, run } } : {}),
+    });
+    await expect(executor.invoke({ ...base, ...retry, agentStage })).rejects.toMatchObject({
+      category: "unsupported_auth_mode",
+    });
+    expect(log).toEqual([]);
+    expect(run).not.toHaveBeenCalled();
+    expect(sleeps).toEqual([]);
+  });
+
   it("returns a success result with nullable usage preserved and the prompt on stdin", async () => {
     const { executor, log } = make([{ stdout: message("done") }]);
     const result = await executor.invoke(base);

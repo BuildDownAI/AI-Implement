@@ -11,7 +11,7 @@ import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type Failure
 import { CODEX_SKILLS_SUBDIR } from "./steps/install-skills.js";
 import { computeBackoffMs } from "./retry-backoff.js";
 import { suspendOriginWriteCredential } from "./executor.js";
-import { CHATGPT_PLAN_ACCESS_TOKEN_ENV, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
+import { CHATGPT_PLAN_ACCESS_TOKEN_ENV, ModelAuthClientError, type ModelAuthClient, type ModelInvocation } from "../model-auth-client.js";
 
 /** Default provider for Codex invocations; the trusted-selected credential kind switches it to `CHATGPT_PLAN_PROVIDER` for a ChatGPT plan access token. */
 export const CODEX_PROVIDER = "openai";
@@ -591,6 +591,11 @@ export class CodexExecutor implements LLMExecutor {
       // profile "invoking" (no second invocation, no dispose), while the race below surfaces the
       // recovery-required error to the caller.
       const invocation = this.options.auth.invoke(this.options.profileId, async (selected) => {
+        // OpenRouter currently supports Claude Code only. Refuse before either Codex
+        // launch path can fall back to the built-in OpenAI provider.
+        if (Object.hasOwn(selected.env, "OPENROUTER_API_KEY")) {
+          throw new ModelAuthClientError("unsupported_auth_mode", { profileId: this.options.profileId });
+        }
         try {
           return await this.runChild(params, selected.env, deadlineAt, state, selected.codexProvider);
         } catch (err) {
