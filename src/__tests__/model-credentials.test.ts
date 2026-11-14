@@ -288,3 +288,21 @@ describe("getCredentialStatus", () => {
     expect(cred.getCredentialStatus(req({ authMode: "bedrock" }), deps())).toMatchObject({ usable: false, matchesRequest: false });
   });
 });
+
+describe("stored key destination", () => {
+  it.each([null, "anthropic/anthropic-api-key", "openrouter/openrouter-api-key"])("checks binding %s before reading a secret", async (destination) => {
+    save();
+    if (destination) {
+      const { getDb } = await import("../dedup.js");
+      getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run("model-account:anth", destination, 1);
+    }
+    const result = cred.resolveModelCredential(req(), deps());
+    if (destination === "openrouter/openrouter-api-key") {
+      expect(result).toMatchObject({ ok: false, code: "account_mismatch" });
+      expect(resolverCalls).toEqual([]);
+    } else {
+      expect(result).toMatchObject({ ok: true });
+      expect(resolverCalls).toEqual(["model-account:anth"]);
+    }
+  });
+});

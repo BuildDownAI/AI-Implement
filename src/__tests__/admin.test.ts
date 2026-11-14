@@ -6393,7 +6393,16 @@ describe("model accounts and stage configuration (AII-962)", () => {
   });
 
   async function call(url: string, method: string, token: string, body?: unknown, deps: Deps = {}) {
-    const res = await requestWithDeps(url, method, token, deps, body);
+    const bindingDeps: Deps = {
+      bindKey: async (ref, destination) => {
+        const row = dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(ref) as { destination: string } | undefined;
+        if (row) return row.destination === destination ? "already-bound" : "conflict";
+        dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+        return "bound";
+      },
+      clearKeyBinding: async (ref) => dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes,
+    };
+    const res = await requestWithDeps(url, method, token, { ...bindingDeps, ...deps }, body);
     return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null, raw: res.body };
   }
 
@@ -7354,6 +7363,139 @@ describe("model accounts and stage configuration (AII-962)", () => {
       return t;
     }
 
+    it.each(["PUT", "DELETE"] as const)("orders overlapping operations while %s ingress response is delayed", async (first) => {
+      const t = await seedProfile();
+      if (first === "DELETE") expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const deps = first === "PUT" ? {
+        bindKey: async (ref: string, destination: string) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered(); await paused; return "bound" as const;
+        },
+      } : {
+        clearKeyBinding: async (ref: string) => {
+          const removed = dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes;
+          entered(); await paused; return removed;
+        },
+      };
+      const a = call(url("oai-1"), first, t, first === "PUT" ? { apiKey: KEY } : undefined, deps);
+      await started;
+      const second = first === "PUT" ? "DELETE" : "PUT";
+      const b = call(url("oai-1"), second, t, second === "PUT" ? { apiKey: KEY } : undefined);
+      const patch = call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      release();
+      expect((await a).status).toBe(200);
+      expect((await b).status).toBe(200);
+      expect((await patch).status).toBe(first === "DELETE" ? 409 : 200);
+      if (first === "DELETE") {
+        expect(store().resolve(REF)).toBe(KEY);
+        expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF)).toEqual({ destination: "openai/openai-api-key" });
+      } else expect(store().resolve(REF)).toBeNull();
+    });
+
+    it.each(["PUT", "PATCH"] as const)("a disconnected %s cannot stall mutations behind paused ingress", async (method) => {
+      const t = await seedProfile();
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const first = call(url("oai-1"), "PUT", t, { apiKey: KEY }, {
+        bindKey: async (ref, destination) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered();
+          await paused;
+          return "bound";
+        },
+      });
+      await started;
+      try {
+        // A partial request loses its socket while the earlier PUT waits on ingress.
+        // Its body reader must already be listening, outside the mutation queue.
+        const req = new MockRequest(method === "PUT" ? url("oai-1") : "/api/model-accounts/oai-1", method,
+          { authorization: `Bearer ${t}` });
+        req.removeAllListeners("newListener");
+        const res = new MockResponse();
+        admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await vi.waitFor(() => expect(req.listenerCount("data")).toBe(1));
+        req.emit("data", Buffer.from('{"'));
+        Object.assign(req, { destroyed: true, aborted: true });
+        req.emit("aborted");
+        req.emit("close");
+        await res.done;
+        expect(res.statusCode).toBe(400);
+
+        // A request that was destroyed before routing must also settle immediately.
+        const dead = new MockRequest(req.url!, method, { authorization: `Bearer ${t}` });
+        dead.removeAllListeners("newListener");
+        Object.assign(dead, { destroyed: true, aborted: true });
+        const deadRes = new MockResponse();
+        admin.handleAdminRequest(dead as never, deadRes as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await deadRes.done;
+        expect(deadRes.statusCode).toBe(400);
+      } finally {
+        release();
+      }
+      expect((await first).status).toBe(200);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      expect(store().resolve(REF)).toBe(KEY);
+      expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF))
+        .toEqual({ destination: "openai/openai-api-key" });
+    });
+
+    it.each(["conflict", "unavailable"] as const)("PUT fails closed on %s before storing", async (outcome) => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => outcome);
+      const r = await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey });
+      expect(r.status).toBe(outcome === "conflict" ? 409 : 503);
+      expect(bindKey).toHaveBeenCalledWith(REF, "openai/openai-api-key");
+      expect(count("model_protected_secrets")).toBe(0);
+    });
+
+    it.each(["binding", "legacy"])("PATCH refuses a provider change with a %s key and preserves revision", async (kind) => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      if (kind === "legacy") dedup.getDb().prepare("DELETE FROM key_bindings").run();
+      const before = count("model_account_profile_revisions");
+      const r = await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toContain("remove the stored key first");
+      expect(count("model_account_profile_revisions")).toBe(before);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "renamed", status: "disabled" })).status).toBe(200);
+    });
+
+    it("PATCH refuses a manually selected reference bound to another destination", async () => {
+      const t = await seedProfile();
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run("model-account:other", "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { credentialRef: "model-account:other" })).status).toBe(409);
+    });
+
+    it("PATCH refuses an auth mode change when only the binding remains", async () => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(REF, "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { authMode: "claude-subscription" })).status).toBe(409);
+    });
+
+    it("binds before writing and clears after deletion, returning a safe failure if clear fails", async () => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        return "bound" as const;
+      });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey })).status).toBe(200);
+      const clearKeyBinding = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        throw new Error(KEY);
+      });
+      const r = await call(url("oai-1"), "DELETE", t, undefined, { clearKeyBinding });
+      expect(r.status).toBe(503);
+      expect(r.raw).not.toContain(KEY);
+      expect(clearKeyBinding).toHaveBeenCalledWith(REF);
+    });
+
     it.each([
       { agent: "codex", provider: "openai", authMode: "openai-api-key" },
       { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
@@ -7537,6 +7679,11 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(500);
       expect(count("model_protected_secrets")).toBe(0);
       spy.mockRestore();
+      expect(count("key_bindings")).toBe(1);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect(count("key_bindings")).toBe(0);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" })).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
     });
 
     it.each(["openai-api-key", "claude-subscription"])("refuses a non-admin with every page granted for %s", async (authMode) => {

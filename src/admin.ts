@@ -1,3 +1,5 @@
+import { readKeyBinding } from "./key-bindings.js";
+import type { KeyBindOutcome } from "./restate/key-binding.js";
 import { MODEL_AUTH_ENV, hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
 import http from "node:http";
 import type { InvocationAttributionV1 } from "./pipeline/types.js";
@@ -264,7 +266,15 @@ function getAdminJiraClient(): JiraClient | null {
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (req.destroyed || req.aborted) {
+      reject(new Error("request aborted"));
+      return;
+    }
     const chunks: Buffer[] = [];
+    req.once("aborted", () => reject(new Error("request aborted")));
+    req.once("close", () => {
+      if (!req.complete) reject(new Error("request closed before body completed"));
+    });
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => resolve(Buffer.concat(chunks).toString()));
     req.on("error", reject);
@@ -508,6 +518,9 @@ export interface AdminDeps {
    * don't exercise the route, where it answers 503. There is no direct-delete fallback.
    */
   clearAccessBindings?: (address: string, actor: string | null) => Promise<number>;
+  /** Secret-free KeyBinding ingress helpers, wired by index.ts. Missing services fail closed. */
+  bindKey?: (keyRef: string, destination: string) => Promise<KeyBindOutcome>;
+  clearKeyBinding?: (keyRef: string) => Promise<number>;
   /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected to keep runtime Restate imports outside admin.ts; absent in tests, where the status reports `unknown`. */
   readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
@@ -1052,7 +1065,7 @@ export function handleAdminRequest(
     const credentialMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/credential$/);
     if (credentialMatch && (method === "PUT" || method === "DELETE")) {
       const actor = gate.identity?.email ?? "access-code";
-      runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor));
+      runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor, deps));
       return true;
     }
     const pairingMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-pairing$/);
@@ -4056,12 +4069,22 @@ function handleChatGptPairingMint(req: http.IncomingMessage, res: http.ServerRes
   });
 }
 
+// Account mutations share references across profiles. Read and validate bodies before
+// joining this queue so incomplete or disconnected requests cannot hold the lock.
+let modelAccountMutation: Promise<unknown> = Promise.resolve();
+function mutateModelAccounts(operation: () => Promise<void>): Promise<void> {
+  const next = modelAccountMutation.then(operation);
+  modelAccountMutation = next.catch(() => {});
+  return next;
+}
+
 async function handleModelAccountCredential(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   profileId: string,
   method: string,
   actor: string,
+  deps: AdminDeps,
 ): Promise<void> {
   const isPut = method === "PUT";
   let apiKey = "";
@@ -4075,76 +4098,91 @@ async function handleModelAccountCredential(
     }
     apiKey = body.apiKey;
   }
-  const head = getAccountProfile(profileId);
-  if (!head) {
-    json(res, 404, { error: "account profile not found" });
-    return;
-  }
-  if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
-    json(res, 400, { error: "only openai-api-key, openrouter-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
-    return;
-  }
-  const existingRef = lookupCredentialReference(profileId, head.revision);
-  const ref = existingRef ?? `model-account:${profileId}`;
-  if (!MODEL_ACCOUNT_REF_PATTERN.test(ref)) {
-    json(res, 400, { error: "this profile has no usable credential reference; set a credentialRef by hand (model-account:<lowercase-name>)" });
-    return;
-  }
-  const store = createModelProtectedSecrets({ env: process.env });
-  // The fallback reference is only this profile's when no other profile's head revision resolves to it.
-  const fallbackClash =
-    existingRef === null &&
-    listAccountProfiles().some((p) => p.profileId !== profileId && lookupCredentialReference(p.profileId, p.revision) === ref);
-  if (!isPut) {
-    if (existingRef === null) {
-      // No reference of its own: nothing to remove, and the fallback row may belong to another profile.
+  return mutateModelAccounts(async () => {
+    const head = getAccountProfile(profileId);
+    if (!head) {
+      json(res, 404, { error: "account profile not found" });
+      return;
+    }
+    if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
+      json(res, 400, { error: "only openai-api-key, openrouter-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
+      return;
+    }
+    const existingRef = lookupCredentialReference(profileId, head.revision);
+    const ref = existingRef ?? `model-account:${profileId}`;
+    if (!MODEL_ACCOUNT_REF_PATTERN.test(ref)) {
+      json(res, 400, { error: "this profile has no usable credential reference; set a credentialRef by hand (model-account:<lowercase-name>)" });
+      return;
+    }
+    const store = createModelProtectedSecrets({ env: process.env });
+    // The fallback reference is only this profile's when no other profile's head revision resolves to it.
+    const fallbackClash =
+      existingRef === null &&
+      listAccountProfiles().some((p) => p.profileId !== profileId && lookupCredentialReference(p.profileId, p.revision) === ref);
+    if (!isPut) {
+      if (fallbackClash) {
+        // The fallback belongs to another profile; otherwise also clear orphaned bindings.
+        json(res, 200, { ref, result: "removed" });
+        return;
+      }
+      if (!store.delete(ref).ok) {
+        json(res, 500, { error: "could not delete the credential" });
+        return;
+      }
+      try {
+        if (!deps.clearKeyBinding) throw new Error("unavailable");
+        await deps.clearKeyBinding(ref);
+      } catch {
+        json(res, 503, { error: "key binding service unavailable" });
+        return;
+      }
+      console.log(`[admin] model-account credential remove actor=${actor} profile=${profileId} ref=${ref}`);
       json(res, 200, { ref, result: "removed" });
       return;
     }
-    if (!store.delete(ref).ok) {
-      json(res, 500, { error: "could not delete the credential" });
+    if (!process.env.RUNNER_TOKEN_SECRET) {
+      json(res, 503, { error: CREDENTIAL_FAILURES.key_unavailable });
       return;
     }
-    console.log(`[admin] model-account credential remove actor=${actor} profile=${profileId} ref=${ref}`);
-    json(res, 200, { ref, result: "removed" });
-    return;
-  }
-  if (!process.env.RUNNER_TOKEN_SECRET) {
-    json(res, 503, { error: CREDENTIAL_FAILURES.key_unavailable });
-    return;
-  }
-  if (fallbackClash) {
-    json(res, 409, { error: "another profile already uses this credential reference; set a credentialRef on this profile by hand" });
-    return;
-  }
-  const prior = store.open(ref);
-  const written = store.write(ref, apiKey as never);
-  if (!written.ok) {
-    json(res, written.code === "invalid_value" ? 400 : 500, { error: CREDENTIAL_FAILURES[written.code] });
-    return;
-  }
-  if (existingRef === null) {
-    try {
-      saveAccountProfileRevision({
-        profileId,
-        identity: head.identity,
-        revision: head.revision + 1,
-        agent: head.agent as never,
-        provider: head.provider as never,
-        authMode: head.authMode as never,
-        status: head.status as never,
-        metadata: { credentialRef: ref },
-      });
-    } catch {
-      // Undo only this request's write: restore a row that existed, delete one it created.
-      if (prior.ok) store.write(ref, prior.value);
-      else if (prior.code === "row_missing") store.delete(ref);
-      json(res, 500, { error: "could not save the profile revision" });
+    if (fallbackClash) {
+      json(res, 409, { error: "another profile already uses this credential reference; set a credentialRef on this profile by hand" });
       return;
     }
-  }
-  console.log(`[admin] model-account credential set actor=${actor} profile=${profileId} ref=${ref}`);
-  json(res, 200, { ref, result: "set" });
+    let binding: KeyBindOutcome = "unavailable";
+    try { binding = await deps.bindKey?.(ref, `${head.provider}/${head.authMode}`) ?? "unavailable"; } catch { /* fail closed */ }
+    if (binding === "conflict" || binding === "unavailable") {
+      json(res, binding === "conflict" ? 409 : 503, { error: binding === "conflict" ? "stored key is bound to another destination; remove the stored key first" : "key binding service unavailable" });
+      return;
+    }
+    const prior = store.open(ref);
+    const written = store.write(ref, apiKey as never);
+    if (!written.ok) {
+      json(res, written.code === "invalid_value" ? 400 : 500, { error: CREDENTIAL_FAILURES[written.code] });
+      return;
+    }
+    if (existingRef === null) {
+      try {
+        saveAccountProfileRevision({
+          profileId,
+          identity: head.identity,
+          revision: head.revision + 1,
+          agent: head.agent as never,
+          provider: head.provider as never,
+          authMode: head.authMode as never,
+          status: head.status as never,
+          metadata: { credentialRef: ref },
+        });
+      } catch {
+        // Undo only this request's write: restore a row that existed, delete one it created.
+        if (prior.ok) store.write(ref, prior.value);
+        else if (prior.code === "row_missing") store.delete(ref);
+        json(res, 500, { error: "could not save the profile revision" });
+        return;
+      }
+    }
+    console.log(`[admin] model-account credential set actor=${actor} profile=${profileId} ref=${ref}`);
+    json(res, 200, { ref, result: "set" });
+  });
 }
 
 const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "credentialRef", "status"] as const;
@@ -4186,25 +4224,36 @@ async function handlePatchModelAccount(req: http.IncomingMessage, res: http.Serv
     json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}. Account writes carry metadata and a protected credentialRef, never credential values` });
     return;
   }
-  const head = getAccountProfile(profileId);
-  if (!head) {
-    json(res, 404, { error: "account profile not found" });
-    return;
-  }
-  const merged: Record<string, unknown> = {
-    identity: head.identity,
-    agent: head.agent,
-    provider: head.provider,
-    authMode: head.authMode,
-    status: head.status,
-  };
-  const currentRef = lookupCredentialReference(profileId, head.revision);
-  if (currentRef !== null) merged.credentialRef = currentRef;
-  for (const [k, v] of Object.entries(body)) {
-    if (k === "credentialRef" && v === null) delete merged.credentialRef;
-    else merged[k] = v;
-  }
-  saveAccountWrite(res, deps, profileId, head.revision + 1, merged, 200);
+  return mutateModelAccounts(async () => {
+    const head = getAccountProfile(profileId);
+    if (!head) {
+      json(res, 404, { error: "account profile not found" });
+      return;
+    }
+    const merged: Record<string, unknown> = {
+      identity: head.identity,
+      agent: head.agent,
+      provider: head.provider,
+      authMode: head.authMode,
+      status: head.status,
+    };
+    const currentRef = lookupCredentialReference(profileId, head.revision);
+    if (currentRef !== null) merged.credentialRef = currentRef;
+    for (const [k, v] of Object.entries(body)) {
+      if (k === "credentialRef" && v === null) delete merged.credentialRef;
+      else merged[k] = v;
+    }
+    if (typeof merged.credentialRef === "string") {
+      const binding = readKeyBinding(merged.credentialRef);
+      const destinationChanged = merged.provider !== head.provider || merged.authMode !== head.authMode;
+      const stored = binding || getDb().prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(merged.credentialRef);
+      if ((destinationChanged && stored) || (binding && binding.destination !== `${merged.provider}/${merged.authMode}`)) {
+        json(res, 409, { error: "remove the stored key first before changing its destination" });
+        return;
+      }
+    }
+    saveAccountWrite(res, deps, profileId, head.revision + 1, merged, 200);
+  });
 }
 
 function saveAccountWrite(

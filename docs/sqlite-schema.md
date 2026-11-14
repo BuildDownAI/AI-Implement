@@ -19,7 +19,9 @@ Each table has an init step that runs at boot. Two of them hold most of the sche
 Other modules own their tables and run their own `CREATE TABLE IF NOT EXISTS` and
 `ALTER TABLE` statements from an init function that `main()` in `src/index.ts` calls at boot:
 `initMappingsTable()`, `initDispatchBreakerTable()`, `initSettingsTable()`,
-`initAccessEntriesTable()` (`src/access-entries.ts`), `initReconciliationTable()`,
+`initAccessEntriesTable()` (`src/access-entries.ts`), `initKeyBindingsTable()`
+(`src/key-bindings.ts`, also creates the secret-free ingress fence table
+`key_binding_operations`), `initReconciliationTable()`,
 `initStepLogTable()` (`src/step-log.ts`), `initMcpOAuthTables()` (`src/mcp-oauth.ts`),
 `initAccessAuditTable()`, `initAccessPageGrantsTable()`, `initAuthEventsTable()`
 (`src/mcp-auth-events.ts`) and `initReviewFixEvidenceTable()` (`src/review-fix-evidence.ts`).

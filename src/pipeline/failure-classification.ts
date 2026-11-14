@@ -277,6 +277,7 @@ const FIXED_REDACTION_PATTERNS: RegExp[] = [
   /ghs_[A-Za-z0-9]+/g,
   /ghp_[A-Za-z0-9]+/g,
   /github_pat_[A-Za-z0-9_]+/g,
+  /sk-or-[A-Za-z0-9-]+/g,
   /sk-ant-[A-Za-z0-9-]+/g,
   /Bearer\s+\S+/g,
   /x-api-key:\s*\S+/gi,
