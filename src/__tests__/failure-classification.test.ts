@@ -1269,3 +1269,7 @@ describe("projectFailureRecord", () => {
     expect(projected).not.toHaveProperty("alsoSneaky");
   });
 });
+
+it("redacts invented OpenRouter keys without a secrets list", () => {
+  expect(redactEvidence("failure sk-or-Invented-123-ABC retry", [])).toBe("failure *** retry");
+});

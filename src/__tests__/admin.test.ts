@@ -6393,7 +6393,16 @@ describe("model accounts and stage configuration (AII-962)", () => {
   });
 
   async function call(url: string, method: string, token: string, body?: unknown, deps: Deps = {}) {
-    const res = await requestWithDeps(url, method, token, deps, body);
+    const bindingDeps: Deps = {
+      bindKey: async (ref, destination) => {
+        const row = dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(ref) as { destination: string } | undefined;
+        if (row) return row.destination === destination ? "already-bound" : "conflict";
+        dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+        return "bound";
+      },
+      clearKeyBinding: async (ref) => dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes,
+    };
+    const res = await requestWithDeps(url, method, token, { ...bindingDeps, ...deps }, body);
     return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null, raw: res.body };
   }
 
@@ -7353,6 +7362,56 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(r.status).toBe(201);
       return t;
     }
+
+    it.each(["conflict", "unavailable"] as const)("PUT fails closed on %s before storing", async (outcome) => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => outcome);
+      const r = await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey });
+      expect(r.status).toBe(outcome === "conflict" ? 409 : 503);
+      expect(bindKey).toHaveBeenCalledWith(REF, "openai/openai-api-key");
+      expect(count("model_protected_secrets")).toBe(0);
+    });
+
+    it.each(["binding", "legacy"])("PATCH refuses a provider change with a %s key and preserves revision", async (kind) => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      if (kind === "legacy") dedup.getDb().prepare("DELETE FROM key_bindings").run();
+      const before = count("model_account_profile_revisions");
+      const r = await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toContain("remove the stored key first");
+      expect(count("model_account_profile_revisions")).toBe(before);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "renamed", status: "disabled" })).status).toBe(200);
+    });
+
+    it("PATCH refuses a manually selected reference bound to another destination", async () => {
+      const t = await seedProfile();
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run("model-account:other", "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { credentialRef: "model-account:other" })).status).toBe(409);
+    });
+
+    it("PATCH refuses an auth mode change when only the binding remains", async () => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(REF, "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { authMode: "claude-subscription" })).status).toBe(409);
+    });
+
+    it("binds before writing and clears after deletion, returning a safe failure if clear fails", async () => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        return "bound" as const;
+      });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey })).status).toBe(200);
+      const clearKeyBinding = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        throw new Error(KEY);
+      });
+      const r = await call(url("oai-1"), "DELETE", t, undefined, { clearKeyBinding });
+      expect(r.status).toBe(503);
+      expect(r.raw).not.toContain(KEY);
+      expect(clearKeyBinding).toHaveBeenCalledWith(REF);
+    });
 
     it.each([
       { agent: "codex", provider: "openai", authMode: "openai-api-key" },

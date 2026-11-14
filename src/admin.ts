@@ -1,3 +1,5 @@
+import { readKeyBinding } from "./key-bindings.js";
+import type { KeyBindOutcome } from "./restate/key-binding.js";
 import { MODEL_AUTH_ENV, hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
 import http from "node:http";
 import type { InvocationAttributionV1 } from "./pipeline/types.js";
@@ -508,6 +510,9 @@ export interface AdminDeps {
    * don't exercise the route, where it answers 503. There is no direct-delete fallback.
    */
   clearAccessBindings?: (address: string, actor: string | null) => Promise<number>;
+  /** Secret-free KeyBinding ingress helpers, wired by index.ts. Missing services fail closed. */
+  bindKey?: (keyRef: string, destination: string) => Promise<KeyBindOutcome>;
+  clearKeyBinding?: (keyRef: string) => Promise<number>;
   /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected to keep runtime Restate imports outside admin.ts; absent in tests, where the status reports `unknown`. */
   readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
@@ -1052,7 +1057,7 @@ export function handleAdminRequest(
     const credentialMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/credential$/);
     if (credentialMatch && (method === "PUT" || method === "DELETE")) {
       const actor = gate.identity?.email ?? "access-code";
-      runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor));
+      runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor, deps));
       return true;
     }
     const pairingMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-pairing$/);
@@ -4062,6 +4067,7 @@ async function handleModelAccountCredential(
   profileId: string,
   method: string,
   actor: string,
+  deps: AdminDeps,
 ): Promise<void> {
   const isPut = method === "PUT";
   let apiKey = "";
@@ -4105,6 +4111,13 @@ async function handleModelAccountCredential(
       json(res, 500, { error: "could not delete the credential" });
       return;
     }
+    try {
+      if (!deps.clearKeyBinding) throw new Error("unavailable");
+      await deps.clearKeyBinding(ref);
+    } catch {
+      json(res, 503, { error: "key binding service unavailable" });
+      return;
+    }
     console.log(`[admin] model-account credential remove actor=${actor} profile=${profileId} ref=${ref}`);
     json(res, 200, { ref, result: "removed" });
     return;
@@ -4115,6 +4128,12 @@ async function handleModelAccountCredential(
   }
   if (fallbackClash) {
     json(res, 409, { error: "another profile already uses this credential reference; set a credentialRef on this profile by hand" });
+    return;
+  }
+  let binding: KeyBindOutcome = "unavailable";
+  try { binding = await deps.bindKey?.(ref, `${head.provider}/${head.authMode}`) ?? "unavailable"; } catch { /* fail closed */ }
+  if (binding === "conflict" || binding === "unavailable") {
+    json(res, binding === "conflict" ? 409 : 503, { error: binding === "conflict" ? "stored key is bound to another destination; remove the stored key first" : "key binding service unavailable" });
     return;
   }
   const prior = store.open(ref);
@@ -4203,6 +4222,15 @@ async function handlePatchModelAccount(req: http.IncomingMessage, res: http.Serv
   for (const [k, v] of Object.entries(body)) {
     if (k === "credentialRef" && v === null) delete merged.credentialRef;
     else merged[k] = v;
+  }
+  if (typeof merged.credentialRef === "string") {
+    const binding = readKeyBinding(merged.credentialRef);
+    const destinationChanged = merged.provider !== head.provider || merged.authMode !== head.authMode;
+    const stored = binding || getDb().prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(merged.credentialRef);
+    if ((destinationChanged && stored) || (binding && binding.destination !== `${merged.provider}/${merged.authMode}`)) {
+      json(res, 409, { error: "remove the stored key first before changing its destination" });
+      return;
+    }
   }
   saveAccountWrite(res, deps, profileId, head.revision + 1, merged, 200);
 }

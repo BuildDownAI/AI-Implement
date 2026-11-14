@@ -118,6 +118,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
+| Stored key destination bindings and redaction | `src/restate/key-binding.ts`, `src/model-credentials.ts` | [docs/key-safety.md](docs/key-safety.md) |
 | Admin SPA | `src/admin-ui/` | |
 | Restate engine: sidecar, endpoint, workflows, test job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 | Unit test suite: setup files, the environment allowlist, shared fixture builders and harnesses, type checking, CI jobs | `src/__tests__/setup/`, `src/__tests__/helpers/`, `vitest.config.ts` | [docs/unit-tests.md](docs/unit-tests.md) |
@@ -203,7 +204,7 @@ Fixing a bug: write the failing test first, then the fix, in one pull request �
 
 ## Data layer
 
-One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 26 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 57 tables (including tables initialized on first use). `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
 
 Schema changes run at boot and a trigger can block a column change — read [docs/sqlite-schema.md](docs/sqlite-schema.md) before changing a table or column.
 
