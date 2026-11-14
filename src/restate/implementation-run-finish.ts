@@ -34,10 +34,11 @@ function callbackFacts(job: Job) {
   // A `noWork` success writes only the tracker (`markMerged`), never the row: a grouping parent that ended
   // clean with no PR and no failure is that case, as the Legacy monitors read it (D7).
   const noWork = job.groupingParent && job.prUrl === null && job.failure === null && job.status !== "failed";
-  const reported = job.approved || job.failure !== null || job.failureCommentedAt !== null || job.status === "failed" || noWork
+  const reported = job.approved || job.failure !== null || job.failureCommentedAt !== null || job.status === "failed"
     || (job.conclusion !== null && CALLBACK_OWNED_CONCLUSIONS.has(job.conclusion));
   return {
-    reported,
+    reported: reported || noWork,
+    inferredNoWork: noWork && !reported,
     reviewOnly: job.conclusion === "rollup_review",
     operatorCancelled: job.conclusion === "operator_cancelled",
     // The callback's ticket move for an approved run, or one pending its external review.
@@ -82,9 +83,12 @@ export async function finishImplementationJob(
 
   const closeOpts = { skipAdmissionRelease: true };
 
-  if (!facts.reported) {
+  // Inferred no-work is not callback evidence: a grouping parent's machine may never have started.
+  // Explicit callback outcomes remain authoritative, including on retries of this failure.
+  const neverStarted = (!facts.reported || facts.inferredNoWork) && await deps.neverStarted?.(job);
+  if (!facts.reported || neverStarted) {
     // The backend ended and no callback came: the failure fix-up.
-    const conclusion = await deps.neverStarted?.(job) ? "fly_machine_never_started" : "ended_without_callback";
+    const conclusion = neverStarted ? "fly_machine_never_started" : "ended_without_callback";
     deps.closeRow(job, "failed", conclusion, closeOpts);
     await deps.finalize({ kind: "failed", conclusion }, job);
     return {};

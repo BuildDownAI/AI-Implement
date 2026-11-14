@@ -624,10 +624,13 @@ What `finish-job` does for the row it reads (`finishImplementationJob`), and the
 | Deadline, no callback seen | the bounded stuck cleanup (`remediateStuckJob`, `ttl_expired`) | its requeue or give-up | `deadline_exceeded` |
 | Run ended, no callback seen | `failed` / `ended_without_callback` (or `fly_machine_never_started` when Fly events contain no start) | `finalize` as failed | `finalized` |
 | Callback reported a failure | `failed` if not terminal | `finalize` as failed only when the row has no PR | `finalized` |
-| Callback reported success, no PR | `completed` if not terminal | `finalize` as no-work for a grouping parent | `finalized` |
+| Inferred grouping-parent no-work, no explicit callback outcome, `deps.neverStarted` returns true | `failed` / `fly_machine_never_started` | `finalize` as failed; no no-work finalization | `finalized` |
+| Callback reported success, no PR, or inferred grouping-parent no-work without never-started evidence | `completed` if not terminal | `finalize` as no-work for a grouping parent | `finalized` |
 | Callback reported success, PR merged | `completed` if not terminal | `finalize` as merged | `finalized` |
 | Callback reported success, PR open, no transition made yet | `completed` if not terminal | `finalize` as ready | `finalized` |
 | Callback reported success, transition already made (approved, or `external_review_pending`) | `completed` if not terminal | none | `finalized` |
+
+For inferred grouping-parent no-work (no PR, no failure record, and a non-failed status), `finish-job` checks `deps.neverStarted` before accepting success, including on the deadline path. Explicit callback outcomes remain authoritative and skip this diagnostic. In production the diagnostic applies only to Fly machines; missing configuration or machine lookup errors return false and retain the existing no-work behavior.
 
 ## Reading a run's journal
 
