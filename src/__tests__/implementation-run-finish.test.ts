@@ -116,8 +116,48 @@ describe("finishImplementationJob", () => {
 });
 
 describe("never-started diagnostic", () => {
-  it.each([true, false])("preserves the conclusion on retry (neverStarted=%s)", async value => {
-    const job = makeJob({ status: "running" });
+  it("retains inferred grouping-parent no_work when the machine started", async () => {
+    const job = makeJob({ status: "running", groupingParent: true });
+    const deps = { ...setup(job), neverStarted: vi.fn(async () => false) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.neverStarted).toHaveBeenCalledExactlyOnceWith(job);
+    expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "no_work" }, job);
+  });
+
+  it.each([
+    { approved: true, conclusion: "runner_approved", prUrl: PR },
+    { failure: FAILURE, conclusion: "boom" },
+    { conclusion: "external_review_pending", prUrl: PR },
+    { conclusion: "rollup_review", prUrl: PR },
+    { status: "failed" as const, conclusion: "operator_cancelled" },
+  ])("preserves explicit $conclusion over the diagnostic", async callback => {
+    const job = makeJob({ status: "running", groupingParent: true, ...callback });
+    const deps = { ...setup(job), neverStarted: vi.fn(async () => true) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.neverStarted).not.toHaveBeenCalled();
+    expect(deps.closeRow).not.toHaveBeenCalledWith(job, "failed", "fly_machine_never_started", expect.anything());
+    if (callback.conclusion === "boom") {
+      expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion: "boom" }, job);
+    } else {
+      expect(deps.finalize).not.toHaveBeenCalled();
+    }
+  });
+
+  it("fails a never-started grouping parent instead of finalizing no_work", async () => {
+    const job = makeJob({ status: "running", groupingParent: true, prUrl: null });
+    const deps = { ...setup(job), neverStarted: vi.fn(async () => true) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.closeRow).toHaveBeenCalledExactlyOnceWith(job, "failed", "fly_machine_never_started", { skipAdmissionRelease: true });
+    expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion: "fly_machine_never_started" }, job);
+    expect(deps.finalize).not.toHaveBeenCalledWith({ kind: "no_work" }, expect.anything());
+  });
+
+  it.each([
+    { value: true, groupingParent: false },
+    { value: false, groupingParent: false },
+    { value: true, groupingParent: true },
+  ])("preserves the conclusion on retry ($value, groupingParent=$groupingParent)", async ({ value, groupingParent }) => {
+    const job = makeJob({ status: "running", groupingParent });
     const deps: ImplementationFinishDependencies = {
       ...setup(job),
       neverStarted: vi.fn(async () => value),
