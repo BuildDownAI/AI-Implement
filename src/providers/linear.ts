@@ -60,6 +60,10 @@ type AncestorNode = {
   parent?: AncestorNode | null;
 } | null;
 
+function isTerminalStateType(type: string | null | undefined): boolean {
+  return type === "completed" || type === "canceled" || type === "duplicate";
+}
+
 /**
  * Walks up the ancestor chain from `parent` while each ancestor carries the AI-Implement
  * label, returning the contiguous run of labeled ancestors base-most first, each paired with
@@ -73,14 +77,14 @@ type AncestorNode = {
  */
 /** Maps a Linear children-query node list to the provider-agnostic child-readiness shape
  *  (see src/feature-branch.ts). Designated = carries the pickup label; terminal =
- *  tracker state is completed or cancelled — never inferred from a job row. */
+ *  tracker state is completed, cancelled or duplicate — never inferred from a job row. */
 function childFeatureStates(
   children: Array<{ identifier: string; state?: { type: string } | null; labels?: { nodes: Array<{ name: string }> } }>,
 ): FeatureChildState[] {
   return children.map((c) => ({
     identifier: c.identifier,
     designated: (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
-    terminal: c.state?.type === "completed" || c.state?.type === "canceled",
+    terminal: isTerminalStateType(c.state?.type),
   }));
 }
 
@@ -323,7 +327,7 @@ export class LinearProvider implements TicketingProvider {
           filter: {
             labels: { name: { eq: $label } }
             state: {
-              type: { nin: ["completed", "canceled"] }
+              type: { nin: ["completed", "canceled", "duplicate"] }
             }
           }
         ) {
@@ -475,8 +479,7 @@ export class LinearProvider implements TicketingProvider {
         issue.inverseRelations?.nodes?.some(
           (r) =>
             r.type === "blocks" &&
-            r.issue?.state?.type !== "completed" &&
-            r.issue?.state?.type !== "canceled",
+            !isTerminalStateType(r.issue?.state?.type),
         ) ?? false;
       if (isBlocked) {
         console.log(`[linear] Skipping ${issue.identifier}: blocked by an incomplete issue`);
@@ -523,8 +526,7 @@ export class LinearProvider implements TicketingProvider {
         const anyUndesignatedActive = children.some(
           (c) =>
             !(c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL) &&
-            c.state?.type !== "completed" &&
-            c.state?.type !== "canceled",
+            !isTerminalStateType(c.state?.type),
         );
         if (anyUndesignatedActive) {
           console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent has undesignated non-terminal children`);
@@ -676,7 +678,7 @@ export class LinearProvider implements TicketingProvider {
     for (const node of data.issues.nodes) {
       let lifecycle: IssueLifecycleState;
       if (node.state.type === "completed") lifecycle = "completed";
-      else if (node.state.type === "canceled") lifecycle = "cancelled";
+      else if (isTerminalStateType(node.state.type)) lifecycle = "cancelled";
       else lifecycle = "active";
       result.set(node.id, lifecycle);
     }
@@ -962,7 +964,7 @@ export class LinearProvider implements TicketingProvider {
     );
     const issue = data.issue;
     if (!issue) return;
-    if (issue.state.type === "completed" || issue.state.type === "canceled") return;
+    if (isTerminalStateType(issue.state.type)) return;
     const stateId = await this.getCompletedStateId(issue.team.key);
     const labelIds = issue.labels.nodes
       .filter((l) => l.name !== LINEAR_LABELS.readyForReview.name)
@@ -989,13 +991,13 @@ export class LinearProvider implements TicketingProvider {
     return true;
   }
   async parkForHuman(issueId: string, _scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
-    // Refuse a completed/canceled issue: the caller must keep dedup (same as Jira's Merged guard).
+    // Refuse a terminal issue: the caller must keep dedup (same as Jira's Merged guard).
     const data = await this.linearMutation<{ issue: { state: { type: string }; team: { key: string } } | null }>(
       `query($id: String!) { issue(id: $id) { state { type } team { key } } }`,
       { id: issueId },
     );
     const type = data.issue?.state?.type;
-    if (!data.issue || type === "completed" || type === "canceled") return false;
+    if (!data.issue || isTerminalStateType(type)) return false;
     // Marker first: once it is on, pickup skips the issue even if a removal below fails. The
     // pickup label stays, so the issue keeps its place in the feature-branch grouping tree and,
     // being non-terminal, keeps holding its parent's roll-up.
