@@ -34,6 +34,8 @@ function callbackFacts(job: Job) {
   // A `noWork` success writes only the tracker (`markMerged`), never the row: a grouping parent that ended
   // clean with no PR and no failure is that case, as the Legacy monitors read it (D7).
   const noWork = job.groupingParent && job.prUrl === null && job.failure === null && job.status !== "failed";
+  // Owned gap-fill failures close the row in the callback, even without structured failure.
+  // Status alone is sufficient; arbitrary conclusions must not hide a missing callback.
   const reported = job.approved || job.failure !== null || job.failureCommentedAt !== null || job.status === "failed"
     || (job.conclusion !== null && CALLBACK_OWNED_CONCLUSIONS.has(job.conclusion));
   return {

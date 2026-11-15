@@ -45,6 +45,19 @@ describe("finishImplementationJob", () => {
     expect(deps.finalize).not.toHaveBeenCalled();
   });
 
+  describe.each(["run_ended", "deadline"] as const)("reported gap-fill failure after %s", kind => {
+    it.each([FAILURE, null])("preserves the failed row (failure=%s)", async failure => {
+      const job = makeJob({ phase: "gap-analysis", status: "failed", conclusion: "REVIEW_UNAPPROVED", prUrl: PR, failure });
+      const deps = { ...setup(job), neverStarted: vi.fn(async () => true) };
+      await finishImplementationJob(deps, "d", { kind });
+      expect(deps.closeRow).not.toHaveBeenCalled();
+      expect(deps.neverStarted).not.toHaveBeenCalled();
+      expect(deps.finalize).not.toHaveBeenCalled();
+      expect(deps.remediateStuck).not.toHaveBeenCalled();
+      expect(job).toMatchObject({ status: "failed", conclusion: "REVIEW_UNAPPROVED", failure });
+    });
+  });
+
   it("callback failure with no PR runs the failure fix-up", async () => {
     const deps = setup(makeJob({ status: "failed", failure: FAILURE, failureCommentedAt: 1, conclusion: "boom", prUrl: null }));
     await finishImplementationJob(deps, "d", { kind: "run_ended" });

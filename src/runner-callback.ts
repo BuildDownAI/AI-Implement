@@ -793,6 +793,9 @@ export async function handleRunnerResult(input: HandleRunnerResultInput): Promis
   });
   if (result.status >= 300) return result;
   // Persist before the fallible forward: workflow closure may still be pending.
+  // In particular, gap-fill failure already closed the row. Its terminal-row guard
+  // skips lifecycle effects on retry, but must not skip this forward. Restate uses
+  // the dispatch id as the report idempotency key, including after a lost ACK.
   markCallbackLifecycleCompleted(verified.claims.dispatchId);
   try {
     const forwarded = await hook(verified.claims.dispatchId, toRecordedUsage(input.body));
@@ -1382,8 +1385,24 @@ async function handleRunnerResultInternal(
         }
       }
       await sendImplementationReport();
+    } else if (job && owned && input.body.phase === "gap-analysis") {
+      // A gap-fill can report failure without a structured record (older runners).
+      // Keep the reported code/reason without guessing a retryable classification.
+      const reportedFailure: FailureRecord = failure ?? {
+        category: "unknown",
+        code: input.body.failureCode ?? "gap_analysis_failed",
+        stage: "gap-analysis",
+        attempt: 1,
+        retryable: false,
+        message: input.body.failureReason || input.body.failureCode || "Gap-fill failed",
+        evidence: { truncated: false },
+      };
+      if (!failure) updateJobFailure(job.id, reportedFailure);
+      // The callback is not proof the backend stopped: the workflow releases admission.
+      updateJobStatus(job.id, "failed", reportedFailure.code, undefined, { skipAdmissionRelease: true });
+      await sendImplementationReport();
     }
-    // gap-analysis failure: no status transition (PR already terminal)
+    // Legacy gap-analysis failure remains for its monitor to close.
   } else if (input.body.phase === "planning") {
     let planStatusFailure: string | null = null;
     // A missing mapping defaults to auto-approve.
