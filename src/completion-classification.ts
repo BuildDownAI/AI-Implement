@@ -1,3 +1,5 @@
+export const FLY_MACHINE_NEVER_STARTED_REMEDIATION = "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).";
+
 import type { Job } from "./log.js";
 import { reasonCodeTag, SECOND_REVIEW } from "./run-autopsy.js";
 import { GUARDRAIL_REASON_MAX_CHARS, providerUnavailablePhrase, redactAndCap } from "./pipeline/failure-classification.js";
@@ -491,7 +493,7 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     summary: "The run did not complete.",
     detail,
     remediation:
-      neverStarted ? "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly)." :
+      neverStarted ? FLY_MACHINE_NEVER_STARTED_REMEDIATION :
       job.phase === "implementation"
         ? "Check the run logs — the run likely errored before pushing — then run it again."
         : "Check the run logs for the planning failure, then run it again.",

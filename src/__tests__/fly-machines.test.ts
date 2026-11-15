@@ -34,7 +34,7 @@ import { DURABLE_UNTIL_KEY, SCRUB_SETTLE_MS } from "../restate/fly-machine-profi
 import { sealModelAuthBootstrap } from "../model-auth-seal.js";
 import { MODEL_AUTH_ENV } from "../model-auth-contract.js";
 import { makeMapping } from "./helpers/builders.js";
-import { fakeFetch, type ReplyInit } from "./helpers/fake-fetch.js";
+import { fakeFetch, hangUntilAborted, type ReplyInit } from "./helpers/fake-fetch.js";
 import { flySecretsUpdated } from "./helpers/replies/fly.js";
 
 const TOKEN = "fly-test-token";
@@ -143,6 +143,39 @@ describe("createMachine", () => {
 });
 
 describe("getMachine", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it.each(["headers", "json", "error text"])("bounds stalled %s with the abort signal", async stage => {
+    vi.useFakeTimers();
+    let bodyStarted = false;
+    const fly = fakeFetch({ [`GET ${MACHINE}`]: stage === "headers" ? hangUntilAborted : ({ signal }) =>
+      new Response(new ReadableStream({
+        start(controller) {
+          bodyStarted = true;
+          signal!.addEventListener("abort", () => controller.error(signal!.reason), { once: true });
+        },
+      }), { status: stage === "json" ? 200 : 503 }),
+    }).install();
+    const result = getMachine(TOKEN, APP, "machine-123", 10_000);
+    const rejected = expect(result).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(fly.calls[0].signal?.aborted).toBe(false);
+    expect(bodyStarted).toBe(stage !== "headers");
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([200, 404])("clears the timeout after a completed %s response", async status => {
+    vi.useFakeTimers();
+    fakeFetch({ [`GET ${MACHINE}`]: { status, json: mockMachine } }).install();
+    const result = getMachine(TOKEN, APP, "machine-123", 10_000);
+    if (status === 200) await expect(result).resolves.toEqual(mockMachine);
+    else await expect(result).rejects.toThrow("(404)");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("fetches machine by ID", async () => {
     const fly = fakeFetch({ [`GET ${MACHINE}`]: { json: mockMachine } }).install();
 
@@ -150,6 +183,7 @@ describe("getMachine", () => {
     expect(result.id).toBe("machine-123");
     expect(result.state).toBe("started");
     expect(fly.calls[0].url.href).toBe(MACHINE_URL);
+    expect(fly.calls[0].signal).toBeUndefined();
   });
 
   it("throws on 404", async () => {
