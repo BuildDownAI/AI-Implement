@@ -28,6 +28,7 @@ import { HOST_ID_KEY, SafeError, importChatGptRecord, latestPlanSequence, orches
 import { getDb, useReadOnlyDb } from "./dedup.js";
 import { createModelProtectedSecrets } from "./model-protected-secrets.js";
 import type { ModelProtectedSecrets, ProtectedSecretFailure } from "./model-protected-secrets.js";
+import { initKeyBindingsTable, readKeyBinding } from "./key-bindings.js";
 import { MODEL_ACCOUNT_REF_PATTERN } from "./model-credentials.js";
 import { createModelSessionKeyProvider } from "./model-session-keys.js";
 import { createModelSessionStore } from "./model-session-store.js";
@@ -191,6 +192,14 @@ async function secretImport(ref: string, deps: CliDeps): Promise<void> {
 }
 
 async function secretDelete(ref: string, deps: CliDeps): Promise<void> {
+  let binding: ReturnType<typeof readKeyBinding>;
+  try {
+    initKeyBindingsTable();
+    binding = readKeyBinding(ref);
+  } catch {
+    throw new CliError("could not read the credential binding");
+  }
+  if (binding) throw new CliError("this key was stored on Models & providers; remove it there or with DELETE /api/model-accounts/:id/credential");
   const result = deps.secrets().delete(ref);
   if (!result.ok) throw new CliError("could not delete the credential");
   deps.stdout(`ref=${ref} secret-delete ok`);

@@ -121,7 +121,7 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 
   A Bedrock credential is a JSON object on stdin with `region`, `accessKeyId`, `secretAccessKey` and optional `sessionToken`. Stdin that parses as a JSON object is always read as a bundle, so an API key that is itself JSON object text cannot be imported. The reference must match `model-account:` followed by lowercase letters, digits, `.`, `_` or `-`. A bad reference or value, or an unset `RUNNER_TOKEN_SECRET`, fails before anything is written.
 - **Replace.** Importing again to the same reference overwrites the stored value.
-- **Delete.** `node dist/model-account-cli.js secret-delete --ref model-account:team-key` removes the row and succeeds when none exists. Afterwards the profile prepares as `authentication-required`.
+- **Delete.** `node dist/model-account-cli.js secret-delete --ref model-account:team-key` refuses a key that was stored on Models & providers and has a destination binding; remove it there or with `DELETE /api/model-accounts/:id/credential`. For an unbound key, it removes the row and succeeds when none exists. Afterwards the profile prepares as `authentication-required`.
 - **Backup and restore.** Rows are sealed under a key derived from the current `RUNNER_TOKEN_SECRET` and bound to their reference. A restored database works only under the same secret, and a row copied to another reference fails authentication.
 - **Rotation.** Rotating `RUNNER_TOKEN_SECRET` orphans every stored credential. Re-import each one after the rotation.
 
@@ -216,8 +216,10 @@ changes. Adoption writes are atomic.
 
 Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode`
 is `configured`, and all three stages name the adopted profile. New projects start configured when defaults are on; existing projects keep their mode. To roll back, revert the defaults and delete the
-profile on Models & providers; remove its encrypted credential with `secret-delete`
-if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
+profile on Models & providers; if its encrypted credential is no longer needed,
+remove it with `secret-delete` while it remains unbound. If a later key save on
+Models & providers established a binding, remove the key there or with
+`DELETE /api/model-accounts/:id/credential` before deleting the profile. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
 with `secret-import`, the profile's credential editor, or
 `import_environment_credential` when the credential is still available in the
 orchestrator environment. The tool and `adopt-env` share the same import and
