@@ -103,7 +103,7 @@ const MAX_CONFIG_BYTES = 65536;
 const MAX_IDENTITY_LENGTH = 256;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SECRET_KEY_PATTERN = /(key|secret|token|password|session|bearer|credential|auth)/i;
-const API_KEY_MODES: readonly AccountAuthMode[] = ["anthropic-api-key", "openai-api-key"];
+const API_KEY_MODES: readonly AccountAuthMode[] = ["anthropic-api-key", "openai-api-key", "openrouter-api-key"];
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -299,7 +299,7 @@ function parseProfile(raw: unknown, index: number): ParsedProfile {
     fail("config_invalid", `${ctx}.authMode is unsupported`);
   }
   if (raw.agent !== "claude" && raw.agent !== "codex") fail("config_invalid", `${ctx}.agent is unsupported`);
-  if (raw.provider !== "anthropic" && raw.provider !== "openai") fail("config_invalid", `${ctx}.provider is unsupported`);
+  if (raw.provider !== "anthropic" && raw.provider !== "openai" && raw.provider !== "openrouter") fail("config_invalid", `${ctx}.provider is unsupported`);
 
   let path: unknown;
   if (isSubscription) {

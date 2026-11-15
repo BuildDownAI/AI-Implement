@@ -1,5 +1,6 @@
 ---
 model: claude-sonnet-5-5
+verify: scripts/ci/ai-verify.sh
 ---
 
 <!--

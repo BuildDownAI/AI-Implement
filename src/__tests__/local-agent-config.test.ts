@@ -123,6 +123,49 @@ describe("loadLocalAgentConfig", () => {
     expect([...references.keys()].sort()).toEqual(["api-a", "api-b", "sub-a"]);
   });
 
+  it.each([
+    ["claude", "openrouter", "openrouter-api-key"],
+    ["codex", "openrouter", "openrouter-api-key"],
+    ["claude", "anthropic", "anthropic-api-key"],
+    ["codex", "openai", "openai-api-key"],
+  ] as const)("resolves and loads a protected %s/%s API key without ownership", async (agent, provider, authMode) => {
+    const apiKey = "sk-invented-local-profile-1940";
+    const credentialPath = await privateFile(join(outside, "provider.key"), `${apiKey}\n`);
+    const cfg = baseConfig();
+    cfg.profiles[0] = { id: "api-a", identity: "a", revision: 1, agent, provider, authMode, credentialPath };
+    cfg.stages.planning = stageBlock("api-a", agent, provider);
+    const { resolution, references } = await loadLocalAgentConfig(opts(await writeConfig(cfg)));
+    expect(resolution.mode).toBe("configured");
+    if (resolution.mode !== "configured") throw new Error("expected configured");
+    expect(resolution.profiles.planning).toMatchObject({ agent, provider, authMode });
+    expect(references.get("api-a")).toMatchObject({ kind: "api-key", authMode, canonicalPath: credentialPath });
+    const port = createLocalCredentialPort({ references, forbiddenRoots: [repo] });
+    expect(await port.load({ profileId: "api-a", authMode })).toEqual({ kind: "api-key", apiKey });
+  });
+
+  it.each([
+    ["claude", "anthropic-api-key"],
+    ["codex", "openai-api-key"],
+  ])("rejects an OpenRouter %s profile with incompatible auth mode %s in the resolver", async (agent, authMode) => {
+    const cfg = baseConfig();
+    Object.assign(cfg.profiles[0], { agent, provider: "openrouter", authMode });
+    cfg.stages.planning = stageBlock("api-a", agent, "openrouter");
+    await expectCategory(loadLocalAgentConfig(opts(await writeConfig(cfg))), "resolution_rejected");
+  });
+
+  it.each([false, true])("rejects OpenRouter sessionPath with credentialPath present: %s", async (withCredentialPath) => {
+    const cfg = baseConfig();
+    Object.assign(cfg.profiles[0], {
+      provider: "openrouter", authMode: "openrouter-api-key", sessionPath: join(outside, "session.json"),
+    });
+    if (!withCredentialPath) delete (cfg.profiles[0] as Record<string, unknown>).credentialPath;
+    cfg.stages.planning = stageBlock("api-a", "codex", "openrouter");
+    await expect(loadLocalAgentConfig(opts(await writeConfig(cfg)))).rejects.toMatchObject({
+      category: "config_invalid",
+      message: "profiles[0] API-key profiles reference credentialPath only",
+    });
+  });
+
   it("applies explicit selections over file defaults", async () => {
     const cfg = baseConfig({ selections: { review: { accountProfileId: "api-a" } } });
     const { resolution } = await loadLocalAgentConfig(opts(await writeConfig(cfg)));

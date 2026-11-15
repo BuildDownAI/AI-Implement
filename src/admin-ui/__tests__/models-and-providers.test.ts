@@ -84,7 +84,7 @@ describe("models-and-providers page", () => {
 });
 
 
-describe("Claude subscription credentials", () => {
+describe.each(["claude-subscription", "openrouter-api-key"])("%s credentials", (authMode) => {
   it.each([true, false])("renders credential badges and readiness (admin=%s)", async (admin) => {
     const dom = new JSDOM(modelsAndProvidersHtml, { runScripts: "outside-only" });
     const win = dom.window;
@@ -93,8 +93,8 @@ describe("Claude subscription credentials", () => {
       profileId: i === 0 ? profileId : "claude-empty",
       identity: "Claude subscription",
       agent: "claude",
-      provider: "anthropic",
-      authMode: "claude-subscription",
+      provider: authMode === "openrouter-api-key" ? "openrouter" : "anthropic",
+      authMode,
       profileStatus: "active",
       credentialSet,
       account: {
@@ -126,6 +126,8 @@ describe("Claude subscription credentials", () => {
       activate();
       await win.loadModelsAndProviders();
       await vi.waitFor(() => expect(win.document.querySelectorAll("#mp-account-rows tr")).toHaveLength(2));
+      expect(Array.from(win.document.querySelectorAll<HTMLSelectElement>('#mp-stage-rows select[data-field="accountProfileId"]')).every(select =>
+        Array.from(select.options).some(option => option.value === profileId))).toBe(true);
       const rows = win.document.querySelectorAll<HTMLTableRowElement>("#mp-account-rows tr");
       const headers = rows[0].closest("table")!.querySelectorAll("th");
       expect(Array.from(headers, h => h.textContent)).not.toContain("Busy / recovery");
@@ -142,7 +144,7 @@ describe("Claude subscription credentials", () => {
       if (admin) {
         const input = rows[0].querySelector<HTMLInputElement>("input")!;
         expect(input.value).toBe("");
-        expect(input.placeholder).toBe("setup-token");
+        expect(input.placeholder).toBe(authMode === "claude-subscription" ? "setup-token" : "API key");
         expect(input.getAttribute("data-key-for")).toBe(profileId);
         expect(rows[0].querySelector('[data-act="set-key"]')?.getAttribute("data-profile")).toBe(profileId);
         expect(rows[0].querySelector('[data-act="remove-key"]')?.textContent).toBe("Remove key");
@@ -237,6 +239,47 @@ describe("account profile names and editing", () => {
       change("#mp-new-name", "Team");
       await win.mpAddAccount();
       expect(win.document.querySelector("#mp-account-error")?.textContent).toContain("Profile already exists");
+    } finally { win.close(); }
+  });
+
+  it.each(["claude", "codex"])("creates an OpenRouter profile for %s and preserves rejected combinations", async (agent) => {
+    const { win, api, change, setConflict } = await setup();
+    try {
+      change("#mp-new-name", "Router");
+      change("#mp-new-agent", agent);
+      const provider = win.document.querySelector<HTMLSelectElement>("#mp-new-provider")!;
+      const auth = win.document.querySelector<HTMLSelectElement>("#mp-new-authMode")!;
+      const button = win.document.getElementById("mp-import-credential")!;
+      expect(button.hidden).toBe(false);
+      const select = (el: HTMLSelectElement, value: string) => {
+        el.value = value;
+        expect(el.value).toBe(value);
+        el.dispatchEvent(new win.Event("change", { bubbles: true }));
+      };
+      select(provider, "openrouter");
+      expect(button.hidden).toBe(true);
+      select(provider, "anthropic");
+      expect(button.hidden).toBe(false);
+      select(auth, "openrouter-api-key");
+      expect(button.hidden).toBe(true);
+      select(provider, "openrouter");
+      await win.mpAddAccount();
+      expect(api).toHaveBeenCalledWith("/api/model-accounts", {
+        method: "POST", body: JSON.stringify({ profileId: "router", identity: "Router", agent, provider: "openrouter", authMode: "openrouter-api-key" }),
+      });
+      change("#mp-new-name", "Invalid");
+      select(auth, "openai-api-key");
+      setConflict();
+      const originalApi = win.api;
+      win.api = async (path: string, options?: { method?: string; body?: string }) =>
+        options?.method === "POST" ? { ok: false, status: 400, json: async () => ({ error: "<b>Unsupported combination</b>" }) } : originalApi(path, options);
+      await win.mpAddAccount();
+      expect(win.document.getElementById("mp-account-error")!.textContent).toContain("<b>Unsupported combination</b>");
+      expect(win.document.querySelector("#mp-account-error b")).toBeNull();
+      expect(win.document.querySelector<HTMLInputElement>("#mp-new-name")!.value).toBe("Invalid");
+      expect(win.document.querySelector<HTMLSelectElement>("#mp-new-agent")!.value).toBe(agent);
+      expect(provider.value).toBe("openrouter");
+      expect(auth.value).toBe("openai-api-key");
     } finally { win.close(); }
   });
 

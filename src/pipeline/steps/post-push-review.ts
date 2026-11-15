@@ -45,7 +45,7 @@ import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinitio
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
 import { DEFAULT_MODEL } from "../default-model.js";
-import { safeLimitLabel } from "../stage-executor.js";
+import { ACCOUNT_FALLBACK_CODES, safeLimitLabel } from "../stage-executor.js";
 import { reasonCodeTag, terminationReasonSentence } from "../../run-autopsy.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
@@ -1798,8 +1798,7 @@ async function runSelectedInternalReviewers(params: {
         expectsStructuredOutput: true,
         elapsedMs: reviewResult.telemetry?.durationMs ?? undefined,
       });
-      const accountSwitched = reviewStageClassified.code === "ACCOUNT_USAGE_LIMIT"
-        && reviewStageClassified.accountFallback?.stage === "review";
+      const accountSwitched = reviewStageClassified.accountFallback?.stage === "review";
       if (!accountSwitched && (reviewStageClassified.category !== "transient" || transientRetries >= params.retryPolicy.stageRetries)) break;
       await params.reporter.report({
         id: `${reportId}.retry${reviewStageAttempt}`,
@@ -2753,8 +2752,8 @@ ${externalFindingsFixBlock}
       });
       let fixResult = await invokeFix();
       let fixAttempt = 1;
-      while (isLlmResultFailure(fixResult, false) && fixResult.failure?.code === "ACCOUNT_USAGE_LIMIT"
-        && fixResult.failure.accountFallback?.stage === "implementation") {
+      while (isLlmResultFailure(fixResult, false)
+        && fixResult.failure?.accountFallback?.stage === "implementation") {
         await reporter.report({
           id: `post-push-review.fix-${iteration}.retry${fixAttempt++}`,
           type: "custom",
@@ -2773,9 +2772,9 @@ ${externalFindingsFixBlock}
       const fixFailure = fixResult.failure ?? (isLlmResultFailure(fixResult, false) ? classifyLlmResult(fixResult, {
         stage: `post-push-review/fix-${iteration}`, attempt: fixResult.attempts ?? 1, expectsStructuredOutput: false,
       }) : null);
-      // Preserve partial work from capped passes and exit-0 errors, except when usage-limit retries are exhausted.
-      if ((fixResult.exitCode !== 0 && fixResult.telemetry?.outcome !== "max_turns") || fixFailure?.code === "ACCOUNT_USAGE_LIMIT") {
-        if (fixFailure?.code === "ACCOUNT_USAGE_LIMIT") reviewerFailure = fixFailure;
+      // Preserve partial work from capped passes and exit-0 errors, except when account fallbacks are exhausted.
+      if ((fixResult.exitCode !== 0 && fixResult.telemetry?.outcome !== "max_turns") || (fixFailure && ACCOUNT_FALLBACK_CODES.has(fixFailure.code))) {
+        if (fixFailure && ACCOUNT_FALLBACK_CODES.has(fixFailure.code)) reviewerFailure = fixFailure;
         priorLlmFailure = true;
         terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);

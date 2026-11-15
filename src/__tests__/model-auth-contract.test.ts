@@ -129,7 +129,7 @@ describe("grant bootstrap", () => {
   });
 
   describe("owner generation by auth mode", () => {
-    it.each(["anthropic-api-key", "openai-api-key", "bedrock", "codex-subscription", "claude-subscription"])(
+    it.each(["anthropic-api-key", "openai-api-key", "bedrock", "codex-subscription", "claude-subscription", "openrouter-api-key"])(
       "%s rejects any generation",
       (authMode) => {
         const base = { ...apiBinding, authMode };
@@ -150,6 +150,7 @@ describe("grant bootstrap", () => {
     it("names the one secret kind each mode accepts", () => {
       expect(expectedSecretKind("anthropic-api-key")).toBe("api-key");
       expect(expectedSecretKind("openai-api-key")).toBe("api-key");
+      expect(expectedSecretKind("openrouter-api-key")).toBe("api-key");
       expect(expectedSecretKind("bedrock")).toBe("aws-bedrock");
       expect(expectedSecretKind("claude-subscription")).toBe("claude-oauth-token");
       expect(expectedSecretKind("codex-subscription")).toBe("chatgpt-access-token");
@@ -211,6 +212,8 @@ describe("checkout", () => {
       secret: { kind: "api-key", apiKey: SECRET },
     };
     expect(parseModelAuthCheckoutResponse(api).ok).toBe(true);
+    const openrouter = { ...api, authMode: "openrouter-api-key" };
+    expect(parseModelAuthCheckoutResponse(openrouter)).toEqual({ ok: true, value: openrouter });
     const sub = {
       version: 1, ok: true, profileId: "prof-sub", authMode: "claude-subscription",
       secret: { kind: "claude-oauth-token", token: SECRET },

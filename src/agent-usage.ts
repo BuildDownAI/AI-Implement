@@ -53,7 +53,7 @@ export interface InvocationUsageRow {
   invocationId: string | null;
   stage: StageName;
   agent: "claude" | "codex";
-  provider: "anthropic" | "bedrock" | "openai";
+  provider: "anthropic" | "bedrock" | "openai" | "openrouter";
   model: string;
   profileId: string;
   authMode: AccountAuthMode;

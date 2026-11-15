@@ -35,7 +35,7 @@ export const modelsAndProvidersHtml = `
         </div>
         <div class="text-tertiary" style="font-size:11px;margin-top:6px">Blank fields inherit. The limit is an elapsed time in milliseconds for either agent. Claude turn caps are separate: Max Turns per project, and Review Max Turns under Retry Policy on the Settings page.</div>
         <div class="field-hint">The first account is the stage account; later accounts are fallbacks. A fallback model may be blank only when its profile uses the same agent as the first account.</div>
-        <div class="field-hint">A project that overrides the account profile on its Agents tab runs without these fallbacks.</div>
+        <div class="field-hint">A project that overrides the account profile on its Agents tab uses these defaults as fallbacks after its project account, subject to subscription ordering.</div>
         <div id="mp-stage-hints" class="text-tertiary" style="font-size:11px;margin-top:6px"></div>
         <div id="mp-stage-actions" style="display:flex;gap:6px;margin-top:8px">
           <button class="btn btn-primary btn-sm" onclick="saveStageDefaults()">Save</button>
@@ -68,8 +68,8 @@ export const modelsAndProvidersHtml = `
           <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-name">Name</label><input class="input" id="mp-new-name" placeholder="Name"></span>
             <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-agent">Agent</label><select class="input" id="mp-new-agent"><option value="claude">claude</option><option value="codex">codex</option></select></span>
-            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-provider">Provider</label><select class="input" id="mp-new-provider"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="bedrock">bedrock</option></select></span>
-            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-authMode">Authentication</label><select class="input" id="mp-new-authMode"><option value="anthropic-api-key">anthropic-api-key</option><option value="openai-api-key">openai-api-key</option><option value="codex-subscription">codex-subscription</option><option value="claude-subscription">claude-subscription</option><option value="bedrock">bedrock</option></select></span>
+            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-provider">Provider</label><select class="input" id="mp-new-provider"><option value="anthropic">anthropic</option><option value="openai">openai</option><option value="openrouter">openrouter</option><option value="bedrock">bedrock</option></select></span>
+            <span style="display:inline-flex;gap:6px;align-items:center"><label for="mp-new-authMode">Authentication</label><select class="input" id="mp-new-authMode"><option value="anthropic-api-key">anthropic-api-key</option><option value="openai-api-key">openai-api-key</option><option value="openrouter-api-key">openrouter-api-key</option><option value="codex-subscription">codex-subscription</option><option value="claude-subscription">claude-subscription</option><option value="bedrock">bedrock</option></select></span>
             <button class="btn btn-primary btn-sm" onclick="mpAddAccount()">Add account profile</button>
             <button class="btn btn-sm" id="mp-import-credential" onclick="mpImportCredential()">Import orchestrator credential</button>
           </div>
@@ -334,7 +334,7 @@ export const modelsAndProvidersScript = `(function () {
         readyCell += '<div class="text-tertiary" style="font-size:11px">Run <span class="mono">node dist/chatgpt-plan-login.js login</span> or <span class="mono">chatgpt-import</span> on the host.</div>';
       }
       let keyCell = '<span class="text-tertiary">—</span>';
-      if (a.authMode === 'openai-api-key' || a.authMode === 'anthropic-api-key' || a.authMode === 'claude-subscription') {
+      if (a.authMode === 'openai-api-key' || a.authMode === 'openrouter-api-key' || a.authMode === 'anthropic-api-key' || a.authMode === 'claude-subscription') {
         const pid = window.escAttr(a.profileId);
         keyCell = '<span class="badge ' + (a.credentialSet ? 'success' : 'neutral') + '">' + (a.credentialSet ? 'set' : 'not set') + '</span>' +
           (mpCanEdit()
@@ -549,6 +549,17 @@ export const modelsAndProvidersScript = `(function () {
     await loadStageConfig(false);
   }
 
+  function mpWatchImport() {
+    const provider = document.getElementById('mp-new-provider');
+    const authMode = document.getElementById('mp-new-authMode');
+    const update = function () {
+      document.getElementById('mp-import-credential').hidden =
+        provider.value === 'openrouter' || authMode.value === 'openrouter-api-key';
+    };
+    provider.onchange = authMode.onchange = update;
+    update();
+  }
+
   function mpWatchKeys() {
     const updateDraft = function (e) {
       const nameId = e.target.getAttribute('data-edit-name');
@@ -751,5 +762,5 @@ export const modelsAndProvidersScript = `(function () {
   window.mpImportCredential = mpImportCredential;
   window.mpProfileIdFromName = mpProfileIdFromName;
   window.resetStageDefaults = resetStageDefaults;
-  window.registerPage('models', function () { mpWatchDirty(); mpWatchKeys(); loadModelsAndProviders(); setInterval(loadModelsAndProviders, 60000); });
+  window.registerPage('models', function () { mpWatchDirty(); mpWatchKeys(); mpWatchImport(); loadModelsAndProviders(); setInterval(loadModelsAndProviders, 60000); });
 })();`;

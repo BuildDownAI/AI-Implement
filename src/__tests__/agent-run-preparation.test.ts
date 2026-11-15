@@ -409,6 +409,66 @@ describe("delivery and runner capability", () => {
     expect(counts().grants).toBe(0);
   });
 
+  it.each([
+    { openrouter: true, marker: false },
+    { openrouter: true, marker: true },
+    { openrouter: false, marker: false },
+    { openrouter: false, marker: true },
+  ])("checks OpenRouter workflow support: %j", async ({ openrouter, marker }) => {
+    store.saveAccountProfileRevision({
+      profileId: "router", identity: "Router", revision: 1, agent: "codex", provider: "openrouter",
+      authMode: "openrouter-api-key", metadata: { credentialRef: "model-account:router" },
+    });
+    secrets.set("model-account:router", API_SENTINEL);
+    if (openrouter) {
+      store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: {
+        implementation: { agent: "codex", provider: "openrouter", model: "openai/gpt-oss-120b", accountProfileId: "router" },
+      } });
+    }
+    files = { ...(files as Record<string, string | null>),
+      ".github/workflows/claude-implement.yml": WORKFLOW + (marker ? "# ai-implement-capability: openrouter-accounts-v1\n" : ""),
+    };
+    const before = counts();
+    const refused = openrouter && !marker;
+    expect(await prep.inspectAgentReadiness(request(), deps)).toMatchObject(refused
+      ? { status: "not-ready", code: "runner_incompatible" } : { status: "ready" });
+    expect(await prep.prepareAgentRun(request(), deps)).toMatchObject(refused
+      ? { status: "configuration-error", code: "runner_incompatible" } : { status: "ready" });
+    if (refused) {
+      expect(counts().grants).toBe(0);
+      expect(counts().reservations).toBe(before.reservations);
+    }
+  });
+
+  it.each([false, true])("checks OpenRouter workflow support for a fallback without an OpenRouter snapshot profile (marker: %s)", async (marker) => {
+    store.saveAccountProfileRevision({
+      profileId: "router", identity: "Router", revision: 1, agent: "codex", provider: "openrouter",
+      authMode: "openrouter-api-key", metadata: { credentialRef: "model-account:router" },
+    });
+    secrets.set("model-account:router", API_SENTINEL);
+    const config = store.getOrchestratorDefaults()!.config;
+    config.stages!.implementation!.accounts = [
+      { accountProfileId: "api", model: "primary" },
+      { accountProfileId: "router", model: "openai/gpt-oss-120b" },
+    ];
+    store.setOrchestratorDefaults(config);
+    files = { ...(files as Record<string, string | null>),
+      ".github/workflows/claude-implement.yml": WORKFLOW + (marker ? "# ai-implement-capability: openrouter-accounts-v1\n" : ""),
+    };
+    const before = counts();
+    expect(await prep.inspectAgentReadiness(request(), deps)).toMatchObject(marker
+      ? { status: "ready" } : { status: "not-ready", code: "runner_incompatible" });
+    expect(await prep.prepareAgentRun(request(), deps)).toMatchObject(marker
+      ? { status: "ready" } : { status: "configuration-error", code: "runner_incompatible" });
+    const stored = JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string);
+    expect(Object.values(stored.profiles).some((p: any) => p.authMode === "openrouter-api-key")).toBe(false);
+    expect(stored.accountFallbacks.implementation).toContainEqual(expect.objectContaining({ authMode: "openrouter-api-key" }));
+    if (!marker) {
+      expect(counts().grants).toBe(0);
+      expect(counts().reservations).toBe(before.reservations);
+    }
+  });
+
   it("requires the launch-context marker as well as the stage-agent marker on GitHub Actions", async () => {
     files = { ...(files as Record<string, string | null>), ".github/workflows/claude-implement.yml": "# ai-implement-capability: stage-agent-config-v1\n" };
     expect(await prep.prepareAgentRun(request(), deps)).toEqual({ status: "configuration-error", code: "runner_incompatible" });
@@ -860,8 +920,12 @@ describe("ordered account preparation", () => {
     configure();
     store.setProjectStageConfig("AII", { version: 1, mode: "configured", stages: { implementation: accountOverride ? { accountProfileId: "brk" } : { model: "project-model" } } });
     const result = ready(await prep.prepareAgentRun(request(), deps));
-    expect(result.accountFallbacks?.implementation?.map(entry => entry.accountProfileId) ?? []).toEqual(accountOverride ? [] : ["api"]);
+    expect(result.accountFallbacks?.implementation?.map(entry => entry.accountProfileId)).toEqual(["api"]);
     expect(result.snapshot.stages.implementation.model).toBe(accountOverride ? "m" : "project-model");
+    const persisted = JSON.parse(rows("run_agent_config_snapshots")[0]!.resolved_config_json as string);
+    expect(persisted.accountFallbacks).toEqual(result.accountFallbacks);
+    store.retireAccountProfile("api");
+    expect(ready(await prep.prepareAgentRun(request(), deps)).accountFallbacks).toEqual(result.accountFallbacks);
   });
   it("returns the concurrent insert winner's metadata rather than its candidate", async () => {
     configure();

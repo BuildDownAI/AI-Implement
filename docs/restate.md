@@ -703,3 +703,13 @@ The token exists only inside that step: it is never returned, stored in object
 state, passed to another handler, or included in errors. Dependency exceptions
 are replaced with a fixed message before reaching Restate's journal. Only plain
 publication results cross the step boundary.
+
+## The KeyBinding object
+
+`KeyBinding` (`src/restate/key-binding.ts`) serializes binding and clearing a stored key
+reference to one destination. Its exclusive handlers own `key_bindings`; each performs one
+SQLite transaction in one `ctx.run`. Synchronous reads check destinations before secret use.
+Only admin HTTP handlers call its timed ingress helpers. Inputs contain a destination only
+(or `{}` for clear), never a secret. PUT fails closed if binding conflicts or ingress is
+unavailable; DELETE removes the secret before clearing. See [Stored key safety](key-safety.md)
+for the schema, handler contract, legacy behavior and adoption rules.
