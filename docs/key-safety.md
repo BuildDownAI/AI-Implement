@@ -55,6 +55,10 @@ binding may survive a later storage failure or a timeout; a binding without a ke
 DELETE removes the secret first, then clears through the object. A clear failure returns
 a sanitized 503 and leaves the binding available for a retry. It never restores the key.
 
+`secret-delete` refuses a key stored on Models & providers that has a destination binding; remove it there or with `DELETE /api/model-accounts/:id/credential`.
+To repair an account whose key was deleted by an older `secret-delete`, send
+`DELETE /api/model-accounts/:id/credential` to clear the remaining binding.
+
 PATCH refuses a provider or auth mode change while retaining a reference backed by either
 a binding or a protected-secret row, including an unreadable secret. Remove the stored key
 first. A manually selected reference bound to another destination also returns 409.

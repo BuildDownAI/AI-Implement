@@ -29,6 +29,7 @@ let dedup: typeof DedupModule;
 let cli: typeof CliModule;
 let protectedSecrets: typeof ProtectedSecretsModule;
 let sessionStore: typeof SessionStoreModule;
+let keyBindings: typeof import("../key-bindings.js");
 let store: ModelSessionStore;
 let out: string[];
 let err: string[];
@@ -74,8 +75,9 @@ const run = (argv: string[], stdin = JSON.stringify(record()), env?: NodeJS.Proc
   cli.main(argv, deps(stdin, env));
 
 beforeEach(async () => {
-  ({ dedup, cli, protectedSecrets, sessionStore, accounts } = (await testDb({
+  ({ dedup, cli, protectedSecrets, sessionStore, accounts, keyBindings } = (await testDb({
     modules: {
+      keyBindings: () => import("../key-bindings.js"),
       accounts: () => import("../agent-config-store.js"),
       dedup: () => import("../dedup.js"),
       cli: () => import("../model-account-cli.js"),
@@ -308,6 +310,60 @@ describe("secret-import / secret-delete", () => {
     expect(secrets().open(REF)).toEqual({ ok: false, code: "row_missing" });
     expect(await run(["secret-delete", "--ref", REF])).toBe(0);
     leaks();
+  });
+
+  it.each([true, false])("refuses a bound reference (secret present: %s)", async (present) => {
+    if (present) expect(secrets().write(REF, KEY).ok).toBe(true);
+    dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(REF, "openai/openai-api-key", 123);
+    const binding = keyBindings.readKeyBinding(REF);
+    const d = deps("");
+    const secretStore = secrets();
+    const deleteSecret = vi.spyOn(secretStore, "delete");
+    d.secrets = () => secretStore;
+
+    expect(await cli.main(["secret-delete", "--ref", REF], d)).toBe(1);
+    expect(deleteSecret).not.toHaveBeenCalled();
+    expect(secrets().resolve(REF)).toBe(present ? KEY : null);
+    expect(keyBindings.readKeyBinding(REF)).toEqual(binding);
+    expect(out).toEqual([]);
+    expect(err).toEqual([`ref=${REF} secret-delete failed: this key was stored on Models & providers; remove it there or with DELETE /api/model-accounts/:id/credential`]);
+    leaks();
+  });
+
+  it("deletes an unbound stored key", async () => {
+    expect(secrets().write(REF, KEY).ok).toBe(true);
+    expect(await run(["secret-delete", "--ref", REF])).toBe(0);
+    expect(secrets().open(REF)).toEqual({ ok: false, code: "row_missing" });
+    expect(out).toEqual([`ref=${REF} secret-delete ok`]);
+    expect(err).toEqual([]);
+    leaks();
+  });
+
+  it("succeeds for an absent unbound key and initializes the binding schema", async () => {
+    dedup.getDb().exec("DROP TABLE key_bindings; DROP TABLE key_binding_operations");
+    expect(await run(["secret-delete", "--ref", REF])).toBe(0);
+    expect(keyBindings.readKeyBinding(REF)).toBeUndefined();
+    expect(out).toEqual([`ref=${REF} secret-delete ok`]);
+    expect(err).toEqual([]);
+  });
+
+  it.each(["readKeyBinding", "initKeyBindingsTable"] as const)("fails closed when %s throws", async (method) => {
+    expect(secrets().write(REF, KEY).ok).toBe(true);
+    const d = deps("");
+    const secretStore = secrets();
+    const deleteSecret = vi.spyOn(secretStore, "delete");
+    d.secrets = () => secretStore;
+    const failure = vi.spyOn(keyBindings, method).mockImplementation(() => { throw new Error(`database failure ${KEY}`); });
+    try {
+      expect(await cli.main(["secret-delete", "--ref", REF], d)).toBe(1);
+      expect(deleteSecret).not.toHaveBeenCalled();
+      expect(secrets().resolve(REF)).toBe(KEY);
+      expect(out).toEqual([]);
+      expect(err).toEqual([`ref=${REF} secret-delete failed: could not read the credential binding`]);
+      leaks();
+    } finally {
+      failure.mockRestore();
+    }
   });
 
   it("imports a Bedrock bundle", async () => {
