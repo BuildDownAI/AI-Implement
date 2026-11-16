@@ -228,6 +228,7 @@ const INHERITED_CREDENTIAL_KEYS: readonly string[] = [
   "CLAUDE_CODE_USE_BEDROCK",
   "CLAUDE_CONFIG_DIR",
   "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
   "CODEX_API_KEY",
   "CODEX_HOME",
 ];
@@ -346,6 +347,14 @@ export function buildModelInvocationEnv(input: {
     case "anthropic-api-key":
       if (secret.kind !== "api-key") fail("credential_source_mismatch");
       env.ANTHROPIC_API_KEY = secret.apiKey;
+      break;
+    case "openrouter-api-key":
+      if (secret.kind !== "api-key") fail("credential_source_mismatch");
+      // Keep the destination fixed: an outside endpoint could receive the key and source code.
+      env.ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
+      env.ANTHROPIC_AUTH_TOKEN = secret.apiKey;
+      env.ANTHROPIC_API_KEY = "";
+      env.OPENROUTER_API_KEY = secret.apiKey;
       break;
     case "openai-api-key":
       if (secret.kind !== "api-key") fail("credential_source_mismatch");
@@ -480,8 +489,8 @@ export interface ModelAuthClientOptions {
 export interface ModelInvocation {
   readonly env: Record<string, string>;
   readonly strippedKeys: readonly string[];
-  /** Set only when the secret is a ChatGPT plan access token. */
-  readonly codexProvider?: "chatgpt-plan";
+  /** Explicit Codex provider selected from the trusted auth mode; omitted for OpenAI API keys. */
+  readonly codexProvider?: "chatgpt-plan" | "openrouter";
 }
 
 export interface ModelInvokeOptions {
@@ -949,7 +958,9 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
         result = await run({
           env: built.env,
           strippedKeys: built.strippedKeys,
-          ...(entry.secret.kind === "chatgpt-access-token" ? { codexProvider: "chatgpt-plan" as const } : {}),
+          ...(entry.authMode === "openrouter-api-key"
+            ? { codexProvider: "openrouter" as const }
+            : entry.authMode === "codex-subscription" ? { codexProvider: "chatgpt-plan" as const } : {}),
         });
       } catch (e) {
         runFailed = true;

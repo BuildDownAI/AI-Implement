@@ -1,3 +1,4 @@
+import { keyBinding } from "./key-binding.js";
 // The SDK endpoint for the run lifecycle's durable-execution engine (ADR 017, ADR 018),
 // the `Operator` Virtual Object (AII-709), and the `orchestratorTools` service /mcp
 // discovers and calls tools through (AII-710). kg-refresh is migrated: `src/index.ts`
@@ -29,7 +30,7 @@ export type RestateService =
 // `Operator` (AII-709) is the first bound object, `orchestratorTools` (AII-710) the first
 // bound service; a run kind's workflow module joins them here once one migrates (ADR 018
 // case 1: kg-refresh); the `PlanningRun` and `ImplementationRun` workflows are passed in by `src/index.ts`. `ChatGptPlanAccount` (AII-1200) refreshes hosted ChatGPT plan tokens.
-export const RESTATE_SERVICES: RestateService[] = [operatorObject, orchestratorTools, runnerBackend, chatGptPlanAccount, accessBinding, modelPrices, setupChecks];
+export const RESTATE_SERVICES: RestateService[] = [keyBinding, operatorObject, orchestratorTools, runnerBackend, chatGptPlanAccount, accessBinding, modelPrices, setupChecks];
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9080;

@@ -133,6 +133,15 @@ describe("codex-subscription (hosted ChatGPT plan record)", () => {
 });
 
 describe("resolveModelCredential", () => {
+  it.each(["claude", "codex"] as const)("resolves an OpenRouter key for %s without session reads", agent => {
+    save({ agent, provider: "openrouter", authMode: "openrouter-api-key" });
+    const result = cred.resolveModelCredential(req({ provider: "openrouter", authMode: "openrouter-api-key" }), deps());
+    expect(result).toEqual({ ok: true, profileId: "anth", revision: 1, authMode: "openrouter-api-key", secret: { kind: "api-key", apiKey: API_SENTINEL } });
+    expect(resolverCalls).toEqual(["model-account:anth"]);
+    expect(readCalls).toEqual([]);
+    expect(planReads).toEqual([]);
+  });
+
   it("returns exactly one api-key secret", () => {
     save();
     const r = cred.resolveModelCredential(req(), deps());
@@ -277,5 +286,23 @@ describe("getCredentialStatus", () => {
     save();
     expect(cred.getCredentialStatus(req(), deps())).toMatchObject({ usable: true, referenceConfigured: true, failure: null });
     expect(cred.getCredentialStatus(req({ authMode: "bedrock" }), deps())).toMatchObject({ usable: false, matchesRequest: false });
+  });
+});
+
+describe("stored key destination", () => {
+  it.each([null, "anthropic/anthropic-api-key", "openrouter/openrouter-api-key"])("checks binding %s before reading a secret", async (destination) => {
+    save();
+    if (destination) {
+      const { getDb } = await import("../dedup.js");
+      getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run("model-account:anth", destination, 1);
+    }
+    const result = cred.resolveModelCredential(req(), deps());
+    if (destination === "openrouter/openrouter-api-key") {
+      expect(result).toMatchObject({ ok: false, code: "account_mismatch" });
+      expect(resolverCalls).toEqual([]);
+    } else {
+      expect(result).toMatchObject({ ok: true });
+      expect(resolverCalls).toEqual(["model-account:anth"]);
+    }
   });
 });

@@ -22,7 +22,7 @@ Every project mapping carries `ticketingProvider` and a matching `ticketingConfi
 
 ## How each provider finds work
 
-- **Linear** fetches every issue in the workspace that carries the pickup label and is not completed or cancelled. Each issue's `scopeKey` is its **Linear team key**.
+- **Linear** fetches every issue in the workspace that carries the pickup label and is not terminal: completed, cancelled, or Duplicate (state types `completed`, `canceled`, and `duplicate`). Each issue's `scopeKey` is its **Linear team key**.
 - **Jira** runs each Jira mapping's `jql` wrapped with the `AI-Implement Status` filter. Each issue's `scopeKey` is the **mapping key** it was found under.
 
 ## Knowledge-graph export (`listIssuesPage`)

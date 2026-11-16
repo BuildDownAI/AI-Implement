@@ -1,3 +1,4 @@
+import { ACCOUNT_FALLBACK_CODES } from "./stage-executor.js";
 import type { InvocationAttributionV1, RunTelemetry, Step } from "./types.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 import { wrapWithPlanningGuard } from "../planning-context-assembly.js";
@@ -327,7 +328,7 @@ export async function runFeedbackLoop(
         const invocationFailure = outputs.invocationFailure as FailureRecord | undefined;
         // Exit-zero fatal results normally retain partial work for review. A capacity
         // switch must instead reach the same retry rail as a thrown invocation failure.
-        if (invocationFailure?.accountFallback || invocationFailure?.code === "ACCOUNT_USAGE_LIMIT" || invocationFailure?.modelFallback || (invocationFailure?.code === "PROVIDER_OVERLOADED" && fallbackOrigins.implementation)) {
+        if (invocationFailure?.accountFallback || (invocationFailure && ACCOUNT_FALLBACK_CODES.has(invocationFailure.code)) || invocationFailure?.modelFallback || (invocationFailure?.code === "PROVIDER_OVERLOADED" && fallbackOrigins.implementation)) {
           throw Object.assign(new Error(invocationFailure.message), { failure: invocationFailure, telemetry: outputs.telemetry });
         }
         implementSubStep.status = "passed";
@@ -392,7 +393,7 @@ export async function runFeedbackLoop(
           continue;
         }
 
-        if (isTransient || implementFailure.code === "ACCOUNT_USAGE_LIMIT" || (implementationAccountSwitched && implementFailure.code.startsWith("MODEL_AUTH_"))) {
+        if (isTransient || ACCOUNT_FALLBACK_CODES.has(implementFailure.code) || (implementationAccountSwitched && implementFailure.code.startsWith("MODEL_AUTH_"))) {
           const providerUnavailableFailure: FailureRecord = {
             ...implementFailure,
             stage: "implement",
@@ -688,7 +689,7 @@ export async function runFeedbackLoop(
             `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
           );
           // Preserve terminal usage-limit and checkout failures for the run's notice.
-          if (reviewFailure.code === "ACCOUNT_USAGE_LIMIT" || reviewFailure.code.startsWith("MODEL_AUTH_")) {
+          if (ACCOUNT_FALLBACK_CODES.has(reviewFailure.code) || reviewFailure.code.startsWith("MODEL_AUTH_")) {
             failureForOutputs = reviewFailure;
           }
           feedback = `Review step failed and was skipped: ${String(err)}`;

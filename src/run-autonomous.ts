@@ -50,7 +50,7 @@ import {
 } from "./model-auth-client.js";
 import { EXECUTION_POLICY_ENV, MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
 import { STAGE_NAMES } from "./agent-config.js";
-import { AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
+import { ACCOUNT_FALLBACK_CODES, AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
 import { CodexRecoveryRequiredError } from "./pipeline/codex-executor.js";
 import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
@@ -1648,9 +1648,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // The verify hook still failed after the last iteration. Never a review verdict, so it gets
     // its own failureCode/wording; the hook's output tail rides in finalFeedback.
     const verifyFailed = terminationReason === "verify_failed";
-    const accountUsageLimit = reviewerFailure?.code === "ACCOUNT_USAGE_LIMIT";
-    const failureCode = accountUsageLimit
-      ? "ACCOUNT_USAGE_LIMIT"
+    const accountFailure = reviewerFailure && ACCOUNT_FALLBACK_CODES.has(reviewerFailure.code);
+    const failureCode = accountFailure
+      ? reviewerFailure.code
       : verifyFailed
       ? "VERIFY_FAILED"
       : reviewerTurnsExhausted
@@ -1685,7 +1685,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const sentences = [lead, terminationReasonSentence(terminationReason, iterations), draft, reasonCodeTag(terminationReason)];
       return sentences.filter(Boolean).join(" ") + notes;
     };
-    const failureReason = accountUsageLimit
+    const failureReason = accountFailure
       ? reviewerFailure.message
       : verifyFailed
       ? `The repository's verify hook still failed after ${iterations} iteration(s), so the review did not examine the last pass.\n\n${finalFeedback}`
@@ -1708,8 +1708,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
-    disposition = accountUsageLimit
-      ? `${prDisposition} — accounts reached their usage limit`
+    disposition = accountFailure
+      ? reviewerFailure.code === "ACCOUNT_USAGE_LIMIT"
+        ? `${prDisposition} — accounts reached their usage limit`
+        : `${prDisposition} — accounts exhausted (${reviewerFailure.code})`
       : verifyFailed
       ? `${prDisposition} — verify hook failed after ${iterations} iteration(s) (${terminationReason})`
       : reviewerTurnsExhausted

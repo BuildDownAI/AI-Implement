@@ -108,10 +108,10 @@ without the parent being worked prematurely. Log line:
 A feature node is **not** implemented while any of its `AI-Implement` children are still
 in flight (`Skipping <key>: feature-node parent waiting on in-flight AI-Implement
 children`). Only once **all** its labelled children reach a terminal state does its own
-work dispatch — onto its own feature branch. "Terminal" means completed *or* cancelled, so
-a cancelled child doesn't block the parent forever.
+work dispatch — onto its own feature branch. "Terminal" means completed or cancelled, and for Linear also Duplicate
+(state type `duplicate`), so these closed children do not block the parent forever.
 
-On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
+On both Linear and Jira, unlabelled children must also be terminal (Done or Cancelled, and also Duplicate for Linear) before closing work (or blank-spec finalization), and consequently the roll-up PR, can proceed (AII-349).
 
 The internal gap-analysis and in-loop review grade a grouping parent's closing-work PR
 only against the requirements the parent keeps for itself. Child-owned requirements are

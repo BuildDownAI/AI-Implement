@@ -751,13 +751,14 @@ describe("production deps", () => {
       vi.mocked(machineNeverStarted).mockReturnValue(true);
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });
-      expect(getMachine).toHaveBeenCalledWith("fly-token", gapFill ? "gapfill-app" : "frozen-app", "m-1");
+      expect(getMachine).toHaveBeenCalledWith("fly-token", gapFill ? "gapfill-app" : "frozen-app", "m-1", 10_000);
       expect(updateJobStatus).toHaveBeenCalledWith(expect.anything(), "failed", "fly_machine_never_started", undefined, { skipAdmissionRelease: true });
     });
 
-    it.each(["no-owner", "no-app", "github-actions", "local-docker", "no-id", "404", "read-error", "started"])("keeps the existing conclusion for %s", async scenario => {
+    it.each(["no-owner", "no-app", "github-actions", "local-docker", "no-id", "404", "read-error", "timeout", "started"])("keeps the existing conclusion for %s", async scenario => {
       if (scenario !== "no-owner") intents.set("owner:d-1", { snapshot: { input: { ...INPUT, backend: "fly-machines" }, ...(scenario === "no-app" ? {} : { flyApp: "frozen-app" }) }, done: false });
       vi.mocked(getJobByDispatchId).mockReturnValue(makeJob({ status: "running", executionMode: scenario === "github-actions" || scenario === "local-docker" ? scenario : "fly-machines", machineId: scenario === "no-id" ? null : "m-1" }));
+      if (scenario === "timeout") vi.mocked(getMachine).mockRejectedValueOnce(new DOMException("Timed out", "AbortError"));
       if (scenario === "404" || scenario === "read-error") vi.mocked(getMachine).mockRejectedValueOnce(new Error(scenario));
       const { d } = compose();
       await d.finishJob("d-1", { kind: "run_ended" });

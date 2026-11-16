@@ -1,5 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
+import { initKeyBindingsTable } from "./key-bindings.js";
 import { buildHealthBody } from "./health-body.js";
 import { createSetupCheckContext, getLastSetupCheckRun } from "./setup-checks/index.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
@@ -4123,9 +4125,12 @@ export function makeKgRefreshAdminDeps(
   client: KgRefreshIngressClient,
   callAsSystem: typeof callToolAsSystem = callToolAsSystem,
   deployHeld: () => boolean = isDeployHeld,
+  callAsCaller: typeof callTool = callTool,
 ): NonNullable<AdminDeps["kgRefresh"]> {
   return {
-    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts }), deployHeld),
+    trigger: async (opts, caller) => kgToolAnswer(await (caller
+      ? callAsCaller("trigger_kg_refresh", { ...opts }, caller)
+      : callAsSystem("trigger_kg_refresh", { ...opts })), deployHeld),
     status: async () => {
       const r = await callAsSystem("get_kg_status", {});
       if (r.status === "unavailable" || r.status === "deploy-held") {
@@ -4888,7 +4893,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, bindKey, clearKeyBinding, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -5235,6 +5240,7 @@ async function main(): Promise<void> {
   initSettingsTable();
   seedSettingsFromEnv(); // SEED_ONCE_SETTINGS: each seeds once, inert thereafter (ADR 022)
   initAccessEntriesTable();
+  initKeyBindingsTable();
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();

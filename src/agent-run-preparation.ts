@@ -79,6 +79,8 @@ import { copyAccountFallbacks, validateResolvedAgentSnapshot, type AccountFallba
 
 /** Marker a synced `claude-implement.yml` must carry to execute an opted-in snapshot. Older templates ignore the snapshot. */
 export const AGENT_CONFIG_TEMPLATE_CAPABILITY = "ai-implement-capability: stage-agent-config-v1";
+/** GHA templates whose bootstrap validators accept OpenRouter accounts. */
+export const OPENROUTER_ACCOUNTS_TEMPLATE_CAPABILITY = "ai-implement-capability: openrouter-accounts-v1";
 /** GHA templates that deliver the independent trusted model-auth context (AII-1427) to the Run step. */
 export const AGENT_LAUNCH_CONTEXT_TEMPLATE_CAPABILITY = "ai-implement-capability: stage-agent-launch-context-v1";
 
@@ -398,7 +400,7 @@ function backendSupported(snapshot: ResolvedAgentSnapshotV1, backend: DispatchAd
   return backend === "github-actions" || !profileList(snapshot).some((p) => p.authMode === "bedrock");
 }
 
-async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDeps): Promise<ConfigurationErrorCode | null> {
+async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDeps, authModes: readonly AccountAuthMode[]): Promise<ConfigurationErrorCode | null> {
   if (request.backend !== "github-actions") {
     let capable = false;
     try {
@@ -426,6 +428,7 @@ async function checkCapability(request: AgentRunRequest, deps: AgentReadinessDep
   return typeof template === "string"
     && template.includes(AGENT_CONFIG_TEMPLATE_CAPABILITY)
     && template.includes(AGENT_LAUNCH_CONTEXT_TEMPLATE_CAPABILITY)
+    && (!authModes.includes("openrouter-api-key") || template.includes(OPENROUTER_ACCOUNTS_TEMPLATE_CAPABILITY))
     ? null
     : "runner_incompatible";
 }
@@ -435,9 +438,13 @@ async function checkSelection(
   snapshot: ResolvedAgentSnapshotV1,
   request: AgentRunRequest,
   deps: AgentReadinessDeps,
+  accountFallbacks: AccountFallbacks,
 ): Promise<ConfigurationErrorCode | null> {
   if (!backendSupported(snapshot, request.backend)) return "unsupported_combination";
-  return checkCapability(request, deps);
+  return checkCapability(request, deps, [
+    ...profileList(snapshot).map(p => p.authMode),
+    ...Object.values(accountFallbacks).flatMap(entries => entries?.map(entry => entry.authMode) ?? []),
+  ]);
 }
 
 function credentialRequest(snapshot: ResolvedAgentSnapshotV1, p: PreparedProfile, ownerGeneration?: number) {
@@ -477,7 +484,7 @@ export async function inspectAgentReadiness(
   if (resolved.kind === "legacy") return { status: "legacy" };
   if (resolved.kind === "error") return { status: "not-ready", code: resolved.code };
   const { snapshot } = resolved;
-  const failure = await checkSelection(snapshot, request, deps);
+  const failure = await checkSelection(snapshot, request, deps, resolved.metadata.accountFallbacks);
   if (failure) return { status: "not-ready", code: failure };
   const profiles: (PreparedProfile & { credential: "reference-configured" | "deferred" })[] = [];
   for (const p of profileList(snapshot)) {
@@ -654,7 +661,7 @@ export async function prepareAgentRun(request: AgentRunRequest, deps: AgentRunPr
     return { status: "recovery-required", code: "grant_mismatch" };
   }
 
-  const failure = await checkSelection(snapshot, request, deps);
+  const failure = await checkSelection(snapshot, request, deps, resolved.metadata.accountFallbacks);
   if (failure) return { status: "configuration-error", code: failure };
 
   const profiles = profileList(snapshot);

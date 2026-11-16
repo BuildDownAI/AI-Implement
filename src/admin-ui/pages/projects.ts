@@ -838,7 +838,7 @@ export const projectsScript = `
     var dis = d.mode === 'inherit' ? ' disabled' : '';
     var attrs = ' data-ag-value data-stage="' + window.escAttr(stage) + '" data-field="' + window.escAttr(field) + '" aria-label="' + window.escAttr(AG_LABELS[field] + ' for ' + stage) + '"' + dis;
     if (field === 'agent' || field === 'provider') {
-      var opts = field === 'agent' ? ['claude', 'codex'] : ['anthropic', 'bedrock', 'openai'];
+      var opts = field === 'agent' ? ['claude', 'codex'] : ['anthropic', 'bedrock', 'openai', 'openrouter'];
       var shown = d.mode === 'inherit' ? agText(agDefaultValue(stage, field)) : agText(d.value);
       return '<select class="select"' + attrs + '><option value=""' + (opts.indexOf(shown) === -1 ? ' selected' : '') + ' disabled>Inherited</option>' + opts.map(function (o) {
         return '<option value="' + window.escAttr(o) + '"' + (shown === o ? ' selected' : '') + '>' + window.esc(o) + '</option>';
@@ -886,6 +886,7 @@ export const projectsScript = `
           + '<label class="field-label" style="margin:0">' + window.esc(AG_LABELS[field]) + '</label>' + sel
           + '<div>' + agValueControl(stage, field) + (field === 'fallbackModel' ? '<div class="field-hint">Used for the rest of the run after this stage&#39;s model reports it is at capacity.</div>' : '') + '<div class="field-hint" data-ag-preview="' + window.escAttr(stage + '.' + field) + '">' + window.esc(agPreviewText(stage, field)) + '</div></div></div>';
       }).join('');
+      if (stage === 'implementation') rows += '<label><input type="checkbox" id="md-agents-open-model"' + (agentState.preferOpenModel ? ' checked' : '') + '> Use the open model for implementation</label><div class="field-hint">Not active yet. The value is saved, and no run uses it.</div>';
       var problem = agStageProblem(stage);
       return '<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:8px">' + window.esc(stage) + '</div>' + rows
         + (problem ? '<div class="field-hint" data-ag-problem="' + window.escAttr(stage) + '">' + window.esc(problem) + '</div>' : '') + '</div>';
@@ -905,6 +906,7 @@ export const projectsScript = `
     var stored = (cfg && cfg.stages && typeof cfg.stages === 'object') ? cfg.stages : {};
     var defs = (defaults && defaults.stages && typeof defaults.stages === 'object') ? defaults.stages : {};
     agentState = { key: key, mode: cfg && cfg.mode === 'configured' ? 'configured' : 'legacy', stored: stored, defaults: defs, accounts: Array.isArray(accounts) ? accounts : [], draft: {} };
+    agentState.preferOpenModel = !!(stored.implementation && stored.implementation.preferOpenModel);
     AG_STAGES.forEach(function (stage) {
       agentState.draft[stage] = {};
       AG_FIELDS.forEach(function (field) {
@@ -972,6 +974,10 @@ export const projectsScript = `
         stages[stage][field] = next;
       });
     });
+    if (agentState.preferOpenModel !== !!agStoredValue('implementation', 'preferOpenModel')) {
+      stages.implementation = stages.implementation || {};
+      stages.implementation.preferOpenModel = agentState.preferOpenModel;
+    }
     if (Object.keys(stages).length) body.stages = stages;
     return body;
   }
@@ -1054,6 +1060,10 @@ export const projectsScript = `
     panel.addEventListener('change', function (ev) {
       if (!agentState) return;
       var t = ev.target;
+      if (t.id === 'md-agents-open-model') {
+        agentState.preferOpenModel = t.checked;
+        return;
+      }
       var stage = t.dataset.stage, field = t.dataset.field;
       if (!stage || !field) return;
       var d = agDraft(stage, field);
