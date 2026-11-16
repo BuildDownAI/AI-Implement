@@ -107,8 +107,10 @@ remediation. Ordinary comment gap-fills are unchanged.
 
 A Restate-owned gap-fill reporting `outcome: "failure"` posts its existing run autopsy
 on the job's PR, as well as the unchanged ticket delivery. The autopsy says the PR
-is unchanged and includes final reviewer feedback, or run notes when review did not
-run. The PR comment adds guidance to post a new `/ai-implement` comment with a
+is unchanged for an unapproved round and includes final reviewer feedback, or run
+notes when review did not run. An `INSTALL_FAILED` callback also carries a shared
+autopsy with the installation diagnostics; it explains that the approved change
+was not built or tested and that the existing PR was updated. The PR comment adds guidance to post a new `/ai-implement` comment with a
 changed instruction. Unapproved changes remain discarded; no diff is published.
 
 Callback lifecycle effects are serialized per dispatch before checking the persisted

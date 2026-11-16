@@ -14,6 +14,7 @@ import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
 import type * as ReviewFixAttemptStoreModule from "../review-fix-attempt-store.js";
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
+import { formatRunAutopsy } from "../run-autopsy.js";
 import { FakeProvider } from "./providers/fake.js";
 import { createImplementationAdmissionTerminationHook } from "../restate/implementation-run-client.js";
 import { STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
@@ -2930,8 +2931,12 @@ describe("handleRunnerResult — gap-analysis", () => {
     hoisted.postPrComment.mockClear();
     if (mode === "post-error") hoisted.postPrComment.mockRejectedValueOnce(new Error("GitHub unavailable"));
     config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo" }));
-    const autopsy = "## 🔎 Run autopsy — ENG-1\n\nThe review did not approve the change.\nThe existing PR is unchanged by this run: https://github.com/org/repo/pull/12\n\n" +
-      (["VERIFY_FAILED", "INSTALL_FAILED"].includes(mode) ? "Run notes: installation or verification stopped" : "Reviewer's final feedback: fix the boundary");
+    const autopsy = mode === "INSTALL_FAILED" ? formatRunAutopsy({
+      issueIdentifier: "ENG-1", terminationReason: "install_failed", iterations: 1,
+      finalFeedback: "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.\n\nnpm ci failed again: dependency conflict",
+      passes: [], existingPrUrl: "https://github.com/org/repo/pull/12",
+    }) : "## 🔎 Run autopsy — ENG-1\n\nThe review did not approve the change.\nThe existing PR is unchanged by this run: https://github.com/org/repo/pull/12\n\n" +
+      (mode === "VERIFY_FAILED" ? "Run notes: verification stopped" : "Reviewer's final feedback: fix the boundary");
     const phase = mode === "initial" ? "implementation" : "gap-analysis";
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase,
@@ -2959,8 +2964,8 @@ describe("handleRunnerResult — gap-analysis", () => {
       watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
       body: {
         phase, outcome: "failure" as const, failureCode: ["VERIFY_FAILED", "INSTALL_FAILED"].includes(mode) ? mode : "REVIEW_UNAPPROVED",
-        failureReason: "iterations_exhausted after 3/3 iterations", comments: [{ body: "Other summary" }, ...(mode === "missing-autopsy" ? [] : [{ body: autopsy }])],
-        prUrl: "https://github.com/org/repo/pull/12",
+        failureReason: mode === "INSTALL_FAILED" ? "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.\n\ndependency conflict" : "iterations_exhausted after 3/3 iterations", comments: [{ body: "Other summary" }, ...(mode === "missing-autopsy" ? [] : [{ body: autopsy }])],
+        ...(mode === "INSTALL_FAILED" ? {} : { prUrl: "https://github.com/org/repo/pull/12" }),
         ...(mode === "structured" ? { failure } : {}),
       },
     };
