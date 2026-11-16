@@ -586,6 +586,24 @@ describe("runAutonomous", () => {
     expect(capturedPrompt).toContain("Gap-fill run");
   });
 
+  it.each([undefined, "", "   ", "Document both editing surfaces"])(
+    "routes only a non-empty comment instruction to the review rubric (%s)",
+    async instruction => {
+      if (instruction !== undefined) vi.stubEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION", instruction);
+      let rubric: string | undefined;
+      const { pipeline, runner } = makeSingleStepPipeline("check-rubric", {
+        run: vi.fn(async ctx => { rubric = ctx.data.reviewRubric; return {}; }),
+      });
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor() });
+      if (instruction?.trim()) {
+        expect(rubric).toContain(instruction);
+        expect(rubric).toContain("scope of this run");
+      } else {
+        expect(rubric).toBeUndefined();
+      }
+    },
+  );
+
   it("does not duplicate pipeline-owned git instructions from custom prompts", async () => {
     writeFileSync(
       join(workspaceDir, "WORKFLOW.md"),
