@@ -1496,7 +1496,12 @@ describe("migrated write handlers (AII-713)", () => {
         { kind: "human", email: "user@example.com", role: "admin", grants: [] },
       ));
       expect(res).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
-      expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com" });
+      expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com", trigger: "manual" });
+    });
+
+    it("records a manual trigger for an admin session without an email", async () => {
+      await call({}, { kind: "human", email: null, role: "admin", grants: [] });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined, trigger: "manual" });
     });
 
     it("passes ref through as kgSourceRef to KgRepo.trigger", async () => {
@@ -1506,7 +1511,7 @@ describe("migrated write handlers (AII-713)", () => {
 
     it("omits ref and leaves actorEmail undefined for a null-email caller", async () => {
       await call();
-      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined, trigger: "schedule" });
     });
 
     it.each(["dryRun", "acceptNewBaseline"])("refuses %s:true with option-removed before any other gate, with no side effect", async (option) => {
@@ -1521,7 +1526,7 @@ describe("migrated write handlers (AII-713)", () => {
 
     it("runs a real refresh for dryRun:false and acceptNewBaseline:false", async () => {
       expect(answer(await call({ dryRun: false, acceptNewBaseline: false })).status).toBe(202);
-      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined, trigger: "schedule" });
     });
 
     it("answers 409 refresh-in-progress when KgRepo reports a live refresh", async () => {

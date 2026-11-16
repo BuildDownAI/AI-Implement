@@ -241,7 +241,7 @@ export function recordKgDispatchDetails(dispatchId: string, d: KgDispatchRowDeta
 export function recordKgDispatchRow(record: KgDispatchRecord): void {
   appendLogIfAbsent({
     issueId: record.issueId, phase: record.phase, dispatchId: record.dispatchId,
-    executionMode: record.executionMode, repo: record.repo,
+    executionMode: record.executionMode, repo: record.repo, trigger: record.trigger,
   });
 }
 

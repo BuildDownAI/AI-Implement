@@ -235,6 +235,17 @@ export const pipelinesScript = `
           return makeBadge('neutral', 'impl');
         }
 
+        function isIssuelessRunKind(phase) {
+          return phase === 'kg-refresh';
+        }
+        function issueCell(entry) {
+          if (isIssuelessRunKind(entry.phase)) {
+            const label = entry.trigger === 'schedule' ? 'scheduled' : entry.trigger === 'manual' ? 'manual' : null;
+            return 'KG refresh' + (label ? ' ' + makeBadge('neutral', label) : '');
+          }
+          return window.esc(entry.issueIdentifier || entry.issueId) + (entry.issueTitle ? ': ' + window.esc(entry.issueTitle) : '');
+        }
+
         function logsButton(entry) {
           if (!entry.machineId) return '';
           const target = entry.executionMode === 'local-docker'
@@ -250,7 +261,7 @@ export const pipelinesScript = `
         for (let i = 0; i < data.length; i++) {
           if (consumed.has(i)) continue;
           const e = data[i];
-          if (e.phase !== 'planning') {
+          if (e.phase !== 'planning' && !isIssuelessRunKind(e.phase)) {
             const dn = e.dispatchNumber || 1;
             const planIdx = data.findIndex(function (p, j) {
               return !consumed.has(j) && j !== i &&
@@ -279,13 +290,13 @@ export const pipelinesScript = `
             tr.setAttribute('data-planning-job-id', String(plan.id));
             const impl = item.impl;
             const dt = new Date(plan.dispatchedAt).toLocaleString();
-            const issueLabel = window.esc(impl.issueIdentifier || impl.issueId) + (impl.issueTitle ? ': ' + window.esc(impl.issueTitle) : '');
+            const issueLabel = issueCell(impl);
             const dn2 = plan.dispatchNumber || 1;
-            const isRedispatch = dn2 > 1;
+            const isRedispatch = !isIssuelessRunKind(impl.phase) && dn2 > 1;
             if (isRedispatch) tr.classList.add('redispatch-row');
             const dnBadge = isRedispatch
               ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + window.esc(dn2) + '</span>'
-              : window.esc(dn2);
+              : window.esc((isIssuelessRunKind(impl.phase) ? 'run #' : '') + dn2);
             const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
             const imageCell = impl.sessionImage
               ? '<td class="mono" title="' + window.escAttr(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
@@ -312,13 +323,13 @@ export const pipelinesScript = `
           } else {
             const entry = item.entry;
             const dt = new Date(entry.dispatchedAt).toLocaleString();
-            const issueLabel = window.esc(entry.issueIdentifier || entry.issueId) + (entry.issueTitle ? ': ' + window.esc(entry.issueTitle) : '');
+            const issueLabel = issueCell(entry);
             const dn3 = entry.dispatchNumber || 1;
-            const isRedispatch = dn3 > 1;
+            const isRedispatch = !isIssuelessRunKind(entry.phase) && dn3 > 1;
             if (isRedispatch) tr.classList.add('redispatch-row');
             const dnBadge = isRedispatch
               ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + window.esc(dn3) + '</span>'
-              : window.esc(dn3);
+              : window.esc((isIssuelessRunKind(entry.phase) ? 'run #' : '') + dn3);
             const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
             const imageCell = entry.sessionImage
               ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'

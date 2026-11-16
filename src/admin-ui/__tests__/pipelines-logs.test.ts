@@ -12,7 +12,7 @@ const job = {
   runnerMode: "local", machineId: "a".repeat(64), status: "running", dispatchedAt: Date.now(),
 };
 
-async function setup(entries = [job], logsStatus = 200) {
+async function setup(entries: Array<typeof job & { trigger?: string | null }> = [job], logsStatus = 200) {
   const dom = new JSDOM(pipelinesHtml + localJobLogsHtml, { runScripts: "outside-only" });
   const { window } = dom;
   window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
@@ -259,5 +259,40 @@ describe("grouped row drawer integration", () => {
       expect(document.getElementById("job-drawer-wrap")?.hasAttribute("hidden")).toBe(true);
       expect(api.mock.calls.every(([url]) => url.startsWith("/api/log?"))).toBe(true);
     } finally { window.close(); }
+  });
+});
+
+describe("recurring dispatch presentation", () => {
+  it.each([1, 21])("renders KG run #%s with only recognized trigger badges", async dispatchNumber => {
+    for (const trigger of ["schedule", "manual", null, undefined, '<img src=x onerror="alert(1)">']) {
+      const { dom, window, document } = await setup([{ ...job, phase: "kg-refresh", dispatchNumber, trigger }]);
+      try {
+        document.body.insertAdjacentHTML("beforeend", kgPipelinesHtml);
+        await window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" }).load();
+        for (const prefix of ["log", "kglog"]) {
+          const row = document.querySelector(`#${prefix}-body tr`)!;
+          expect(row.classList.contains("redispatch-row")).toBe(false);
+          expect(row.children[1].textContent).toBe(`run #${dispatchNumber}`);
+          expect(row.children[1].querySelector("span")).toBeNull();
+          expect(row.children[2].textContent).toBe("KG refresh" + (trigger === "schedule" ? " scheduled" : trigger === "manual" ? " manual" : ""));
+          expect(row.children[2].querySelectorAll(".badge")).toHaveLength(trigger === "schedule" || trigger === "manual" ? 1 : 0);
+          expect(row.children[2].querySelector("img")).toBeNull();
+          expect(row.children[3].textContent).toBe("—");
+          expect(row.children[4].textContent).toBe("—");
+        }
+      } finally { dom.window.close(); }
+    }
+  });
+
+  it.each([false, true])("keeps issue re-dispatch styling (grouped: %s)", async grouped => {
+    const entries = [{ ...job, dispatchNumber: grouped ? 4 : 3 }];
+    if (grouped) entries.push({ ...job, id: 395, phase: "planning", dispatchNumber: 3 });
+    const { dom, document } = await setup(entries);
+    try {
+      const row = document.querySelector("#log-body tr")!;
+      expect(row.classList.contains("redispatch-row")).toBe(true);
+      expect(row.children[1].querySelector('[title="Re-dispatch"]')?.textContent).toBe("3");
+      expect(row.children[1].innerHTML).toContain("#d63384");
+    } finally { dom.window.close(); }
   });
 });

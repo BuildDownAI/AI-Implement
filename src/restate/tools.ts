@@ -1229,6 +1229,7 @@ export const triggerKgRefreshTool = tool(
     const opts = {
       ...(input.args.ref !== undefined ? { kgSourceRef: input.args.ref } : {}),
       actorEmail: input.caller.email ?? undefined,
+      trigger: input.caller.kind === "human" ? "manual" as const : "schedule" as const,
     };
     const result = await ctx.objectClient(KgRepo, toolDeps.kgSourceRepo).trigger(opts);
     if ("status" in result) return answer(409, { error: "refresh-in-progress" });
