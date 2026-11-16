@@ -72,7 +72,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
-  grants: z.array(z.enum(["deploy", "projects"])).readonly().default([]),
+  grants: z.array(z.enum(["deploy", "projects", "secrets"])).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -93,7 +93,7 @@ interface ToolOptions<I extends z.ZodType> {
   input: I;
   role: AccessRole;
   /** Alternate authority, accepted only by tools that explicitly request it. */
-  grant?: "deploy" | "projects";
+  grant?: "deploy" | "projects" | "secrets";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
