@@ -31,11 +31,14 @@ export function resolveOpenPullWorkflow(input: WorkflowInput): WorkflowVerdict |
     .get(prUrl, issueIdentifier, repo)) {
     return { state: "active", reason: "job-running" };
   }
-  if (db.prepare(`SELECT 1 FROM dispatch_admissions
-      WHERE repository = ? AND pr_number = ? AND released_at IS NULL LIMIT 1`).get(repo, prNumber)
-    || db.prepare(`SELECT 1 FROM review_fix_attempts
+  if (db.prepare(`SELECT 1 FROM review_fix_attempts
       WHERE repository = ? AND pr_number = ? AND completed_at IS NULL LIMIT 1`).get(repo, prNumber)) {
     return { state: "active", reason: "review-fix-running" };
+  }
+  // Admissions also reserve ordinary gap-fill work; only an attempt identifies a review fix.
+  if (db.prepare(`SELECT 1 FROM dispatch_admissions
+      WHERE repository = ? AND pr_number = ? AND released_at IS NULL LIMIT 1`).get(repo, prNumber)) {
+    return { state: "active", reason: "job-running" };
   }
   if (db.prepare(`SELECT 1 FROM review_fix_queue
       WHERE repo = ? AND pr_number = ? AND status = 'pending' LIMIT 1`).get(repo, prNumber)) {

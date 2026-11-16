@@ -79,18 +79,43 @@ it("running takes precedence over parked (rows 2 and 8)", () => {
   parked();
   check({ state: "active", reason: "job-running" });
 });
-it.each([false, true])("row 3: unfinished review fix (attempt=%s)", (attempt) => {
-  if (attempt) insert("review_fix_attempts", {
+function attempt() {
+  insert("review_fix_attempts", {
     attempt_id: "a", dispatch_id: "d", mapping_key: "APP", installation_id: "7",
     repository: input.repo, pr_number: 42, issue_scope: "pr", issue_id: "issue", owner: "restate",
     state: "running", created_at: 1, deadline_at: 2, task_snapshot_json: "{}", finding_versions_json: "[]",
   });
-  else insert("dispatch_admissions", {
+}
+function admission(values: Record<string, string | number | null> = {}) {
+  insert("dispatch_admissions", {
     dispatch_id: "d", mapping_key: "APP", issue_scope: "pr", issue_id: "issue", installation_id: "7",
-    repository: input.repo, pr_number: 42, lifecycle_owner: "restate", phase: "implementation",
-    backend: "github-actions", created_at: 1,
+    repository: input.repo, pr_number: 42, lifecycle_owner: "restate", phase: "gap-fill",
+    backend: "github-actions", created_at: 1, ...values,
   });
+}
+it("row 3: unfinished review-fix attempt", () => {
+  attempt();
   check({ state: "active", reason: "review-fix-running" });
+});
+it("row 3: bare gap-fill admission represents active work without claiming a review fix", () => {
+  admission();
+  check({ state: "active", reason: "job-running" });
+});
+it("review-fix attempt identifies the work when an admission also exists", () => {
+  admission();
+  attempt();
+  check({ state: "active", reason: "review-fix-running" });
+});
+it("admitted gap-fill takes precedence over parked", () => {
+  admission();
+  parked();
+  check({ state: "active", reason: "job-running" });
+});
+it.each([
+  { released_at: 2 }, { repository: "other/repo" }, { pr_number: 43 },
+])("released or unrelated admission has no verdict: %j", (values) => {
+  admission(values);
+  check(null);
 });
 it.each(["pending", "dispatched"])("row 4: review-fix queue %s", (status) => {
   insert("review_fix_queue", { issue_id: "issue", repo: input.repo, pr_number: 42,
