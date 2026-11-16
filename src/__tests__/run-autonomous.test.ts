@@ -2243,7 +2243,10 @@ describe("runAutonomous", () => {
       expect(body.failureReason.length).toBeLessThan(700);
 
       expect(existsSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"))).toBe(false);
-      expect(existsSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"))).toBe(false);
+      const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+      expect(autopsy).toContain("**Run notes:**");
+      expect(autopsy).toContain(body.failureReason.split("\n")[0]);
+      expect(resultBody(fake).comments).toContainEqual({ body: autopsy });
 
       const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
       expect(warnings).toContain(
@@ -2330,6 +2333,13 @@ describe("runAutonomous", () => {
       expect(body.outcome).toBe("failure");
       expect(body.failureCode).toBe("INSTALL_FAILED");
       expect(body.prUrl).toBeFalsy();
+      const comments = resultBody(fake).comments as Array<{ body: string }>;
+      const autopsy = comments.find(c => c.body.startsWith("## 🔎 Run autopsy — "))?.body;
+      expect(autopsy).toContain("**Run notes:**");
+      expect(autopsy).toContain("npm ci failed again: dependency conflict");
+      expect(autopsy).toContain("The existing PR was updated by this run, but the change was not verified: https://github.com/acme/app/pull/42");
+      expect(autopsy).not.toContain("unchanged");
+      expect(autopsy).not.toContain("**Reviewer's final feedback:**");
 
       const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
       expect(warnings).toContain(

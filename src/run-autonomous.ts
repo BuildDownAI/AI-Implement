@@ -1507,9 +1507,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       // The change was approved but dependencies never installed — build and tests
       // never ran, so this must not report success or carry the runner-approval mark
       // that lets feature-branch child PRs auto-merge unverified. Report a coded
-      // failure instead, mirroring the REVIEW_UNAPPROVED path below but skipping the
-      // autopsy (AII-823's install comment covers it) while keeping exitCode 0 so the
-      // GHA job stays green with a warning.
+      // failure instead, including the shared autopsy for ticket and PR reporting,
+      // while keeping exitCode 0 so the GHA job stays green with a warning.
       if (dependenciesMissing(context)) {
         const installRetryOutputs = context.getOutputs("install-retry");
         const installMethod =
@@ -1530,6 +1529,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           `::warning::AI-Implement: dependency install failed — ` +
             (prUrl ? `${prKind} opened: ${prUrl}` : prNumber ? `gap-fill on PR #${prNumber}` : "no PR opened"),
         );
+        writeRunAutopsy(workspaceDir, {
+          issueIdentifier,
+          terminationReason: "install_failed",
+          iterations: typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : 0,
+          finalFeedback: failureReason,
+          passes: Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [],
+          prUrl,
+          existingPrUrl: prNumber ? `https://github.com/${githubOwner}/${githubRepo}/pull/${prNumber}` : undefined,
+        });
         await reportRunnerResult(reviewFix, outputCommit, process.env, {
           workspaceDir,
           phase: runnerPhase,

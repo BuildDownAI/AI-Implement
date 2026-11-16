@@ -14,6 +14,7 @@ import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
 import type * as ReviewFixAttemptStoreModule from "../review-fix-attempt-store.js";
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
+import { formatRunAutopsy } from "../run-autopsy.js";
 import { FakeProvider } from "./providers/fake.js";
 import { createImplementationAdmissionTerminationHook } from "../restate/implementation-run-client.js";
 import { STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
@@ -43,6 +44,7 @@ import { testDb } from "./helpers/test-db.js";
 // (which never mocked github.js/github-app-auth.js) keeps exercising the
 // real code.
 const hoisted = vi.hoisted(() => ({
+  postPrComment: vi.fn(async (..._args: unknown[]) => {}),
   getInstallationToken: vi.fn<() => Promise<string>>(() => Promise.resolve("fake-installation-token")),
   getPullRequestState: vi.fn<
     () => Promise<{ merged: boolean; state: "open" | "closed"; headRef: string | null } | null>
@@ -61,6 +63,7 @@ vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
   return {
     ...actual,
+    postPrComment: hoisted.postPrComment,
     getPullRequestState: hoisted.getPullRequestState,
     getCommitAuthorType: hoisted.getCommitAuthorType,
     postOrUpdateStickyComment: hoisted.postOrUpdateStickyComment,
@@ -2901,7 +2904,39 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
   });
 
-  it.each(["restate", "legacy", "structured", "retry", "initial"] as const)("preserves failure reporting behavior for %s", async mode => {
+  it.each(["planning", "implementation", "gap-analysis"] as const)("does not post a failure PR comment for planning failure or approved %s", async phase => {
+    hoisted.postPrComment.mockClear();
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    dispatchAdmission.acquire({ dispatchId, mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: phase === "planning" ? "planning" : "implementation", backend: "github-actions", cap: 1,
+      lifecycleOwner: { kind: "restate", attemptId: dispatchId } });
+    const id = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, phase });
+    log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(async () => ({ status: "accepted" as const }));
+    const result = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`, secret: SECRET, resolveProvider: makeResolve(new FakeProvider()),
+      checkPlanningAdmissionTermination: hook, checkImplementationAdmissionTermination: hook,
+      body: { phase, outcome: phase === "planning" ? "failure" : "success", comments: [], prUrl: "https://github.com/org/repo/pull/12" },
+    });
+    expect(result.status).toBe(200);
+    expect(hoisted.postPrComment).not.toHaveBeenCalled();
+  });
+
+  it.each(["restate", "legacy", "structured", "retry", "overlapping", "initial", "post-error", "VERIFY_FAILED", "INSTALL_FAILED", "no-pr", "missing-autopsy"] as const)("preserves failure reporting behavior for %s", async mode => {
+    const config = await import("../config.js");
+    hoisted.postPrComment.mockClear();
+    if (mode === "post-error") hoisted.postPrComment.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo" }));
+    const autopsy = mode === "INSTALL_FAILED" ? formatRunAutopsy({
+      issueIdentifier: "ENG-1", terminationReason: "install_failed", iterations: 1,
+      finalFeedback: "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.\n\nnpm ci failed again: dependency conflict",
+      passes: [], existingPrUrl: "https://github.com/org/repo/pull/12",
+    }) : "## 🔎 Run autopsy — ENG-1\n\nThe review did not approve the change.\nThe existing PR is unchanged by this run: https://github.com/org/repo/pull/12\n\n" +
+      (mode === "VERIFY_FAILED" ? "Run notes: verification stopped" : "Reviewer's final feedback: fix the boundary");
     const phase = mode === "initial" ? "implementation" : "gap-analysis";
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase,
@@ -2914,6 +2949,7 @@ describe("handleRunnerResult — gap-analysis", () => {
     });
     const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, phase });
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    if (mode === "no-pr") log.updateJobPrUrl(jobId, "");
     const failure = {
       category: "crash" as const, code: "REVIEW_UNAPPROVED", stage: "feedback-loop/review-3",
       attempt: 1, retryable: false, message: "Review did not approve",
@@ -2925,30 +2961,63 @@ describe("handleRunnerResult — gap-analysis", () => {
     const input: RunnerCallbackModule.HandleRunnerResultInput = {
       authorization: `Bearer ${token}`, secret: SECRET,
       resolveProvider: makeResolve(provider), checkImplementationAdmissionTermination: hook,
+      watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
       body: {
-        phase, outcome: "failure" as const, failureCode: "REVIEW_UNAPPROVED",
-        failureReason: "iterations_exhausted after 3/3 iterations", comments: [{ body: "Review exhausted" }],
-        prUrl: "https://github.com/org/repo/pull/12",
+        phase, outcome: "failure" as const, failureCode: ["VERIFY_FAILED", "INSTALL_FAILED"].includes(mode) ? mode : "REVIEW_UNAPPROVED",
+        failureReason: mode === "INSTALL_FAILED" ? "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.\n\ndependency conflict" : "iterations_exhausted after 3/3 iterations", comments: [{ body: "Other summary" }, ...(mode === "missing-autopsy" ? [] : [{ body: autopsy }])],
+        ...(mode === "INSTALL_FAILED" ? {} : { prUrl: "https://github.com/org/repo/pull/12" }),
         ...(mode === "structured" ? { failure } : {}),
       },
     };
-    expect((await runnerCallback.handleRunnerResult(input)).status).toBe(mode === "retry" ? 503 : 200);
+    let overlapping: Promise<RunnerCallbackModule.HandleRunnerResultOutput>[] = [];
+    let releasePost!: () => void;
+    let enteredPost!: () => void;
+    const postEntered = new Promise<void>(resolve => { enteredPost = resolve; });
+    const postReleased = new Promise<void>(resolve => { releasePost = resolve; });
+    if (mode === "overlapping") {
+      hoisted.postPrComment.mockImplementationOnce(async () => {
+        enteredPost();
+        await postReleased;
+      });
+      hook.mockRejectedValueOnce(new Error("report unavailable"));
+    }
+    const first = runnerCallback.handleRunnerResult(input);
+    if (mode === "overlapping") {
+      await postEntered;
+      // Both retries arrive while the first callback is paused inside GitHub.
+      overlapping = [runnerCallback.handleRunnerResult(input), runnerCallback.handleRunnerResult(input)];
+      releasePost();
+    }
+    const result = await first;
+    const retries = await Promise.all(overlapping);
+    expect(retries.map(r => r.status)).toEqual(mode === "overlapping" ? [200, 200] : []);
+    expect(result.status).toBe(mode === "retry" || mode === "overlapping" ? 503 : 200);
+    if (mode === "post-error") expect(result.body.warnings).toContain("postPrComment: GitHub unavailable");
+    const shouldPost = !["legacy", "initial", "no-pr", "missing-autopsy"].includes(mode);
+    expect(hoisted.postPrComment).toHaveBeenCalledTimes(shouldPost ? 1 : 0);
+    if (shouldPost) expect(hoisted.postPrComment).toHaveBeenCalledWith("fake-installation-token", "org", "repo", 12,
+      autopsy + "\n\nTo start a new round, post a new `/ai-implement` comment with a changed instruction.");
+    if (mode !== "missing-autopsy") expect(provider.recordedCalls()).toContainEqual(expect.objectContaining({ method: "postComment", args: ["i", autopsy] }));
     const job = log.getJobById(jobId);
     if (mode === "legacy" || mode === "initial") {
       expect(job?.status).toBe("dispatched");
       expect(job?.failure).toBeNull();
     } else {
-      expect(job).toMatchObject({ status: "failed", conclusion: "REVIEW_UNAPPROVED", approved: false });
+      expect(job).toMatchObject({ status: "failed", conclusion: input.body.failureCode, approved: false });
       expect(job?.failure).toMatchObject(mode === "structured" ? failure : {
-        code: "REVIEW_UNAPPROVED", message: input.body.failureReason, retryable: false,
+        code: input.body.failureCode, message: input.body.failureReason, retryable: false,
       });
       expect(job?.failureCommentedAt).toBeNull();
     }
     expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
-    expect(hook).toHaveBeenCalledTimes(mode === "legacy" ? 0 : 1);
+    expect(hook).toHaveBeenCalledTimes(mode === "legacy" ? 0 : mode === "overlapping" ? 3 : 1);
+    if (mode === "overlapping") {
+      expect(provider.recordedCalls().filter(call => call.method === "postComment")).toHaveLength(2);
+      expect(log.hasCompletedCallbackLifecycle(dispatchId)).toBe(true);
+    }
     if (mode === "retry") {
       const effects = provider.recordedCalls();
-      expect(effects.filter(call => call.method === "postComment")).toHaveLength(1);
+      expect(effects.filter(call => call.method === "postComment")).toHaveLength(2);
       expect(log.hasCompletedCallbackLifecycle(dispatchId)).toBe(true);
       expect((await runnerCallback.handleRunnerResult(input)).status).toBe(200);
       expect(log.getJobById(jobId)).toEqual(job);
@@ -2959,6 +3028,7 @@ describe("handleRunnerResult — gap-analysis", () => {
       expect(log.getJobById(jobId)).toEqual(job);
       expect(provider.recordedCalls()).toEqual(effects);
       expect(hook).toHaveBeenCalledTimes(3);
+      expect(hoisted.postPrComment).toHaveBeenCalledTimes(1);
     }
   });
 

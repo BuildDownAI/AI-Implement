@@ -49,7 +49,7 @@ import {
   type StoredReviewFinding,
 } from "./review-ledger-store.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { getCommitAuthorType, getPullRequestState, listPrComments, updatePrComment, postOrUpdateStickyComment } from "./github.js";
+import { postPrComment, getCommitAuthorType, getPullRequestState, listPrComments, updatePrComment, postOrUpdateStickyComment } from "./github.js";
 import {
   renderClassification,
   renderFailureRecord,
@@ -768,6 +768,25 @@ export function describeTrackerWriteError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// The orchestrator owns one local callback/database writer. Reserve a dispatch before
+// the first await so overlapping deliveries cannot both pass the persisted guard.
+// Entries exist only while callbacks are running; completion survives in the database.
+const callbackLifecycleTails = new Map<string, Promise<void>>();
+
+async function withCallbackLifecycleLock<T>(dispatchId: string, effect: () => Promise<T>): Promise<T> {
+  const previous = callbackLifecycleTails.get(dispatchId);
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  callbackLifecycleTails.set(dispatchId, current);
+  try {
+    await previous;
+    return await effect();
+  } finally {
+    release();
+    if (callbackLifecycleTails.get(dispatchId) === current) callbackLifecycleTails.delete(dispatchId);
+  }
+}
+
 /**
  * Preserve callback-owned lifecycle outcomes, then deliver owned accounting through
  * the workflow intake. Persisted lifecycle completion skips effects on retry; the reusable
@@ -786,17 +805,19 @@ export async function handleRunnerResult(input: HandleRunnerResultInput): Promis
     console.warn(`[runner-callback] forward failed kind=${input.body.phase} dispatch=${verified.claims.dispatchId}`);
     return bad(503, "owned_result_intake_unavailable");
   }
-  const result = await handleRunnerResultInternal({
-    ...input,
-    checkPlanningAdmissionTermination: undefined,
-    checkImplementationAdmissionTermination: undefined,
+  const result = await withCallbackLifecycleLock(verified.claims.dispatchId, async () => {
+    const result = await handleRunnerResultInternal({
+      ...input,
+      checkPlanningAdmissionTermination: undefined,
+      checkImplementationAdmissionTermination: undefined,
+    });
+    // Persist before releasing the lock and before the fallible forward. A retry
+    // skips lifecycle effects but still delivers its report through workflow intake.
+    if (result.status < 300) markCallbackLifecycleCompleted(verified.claims.dispatchId);
+    return result;
   });
   if (result.status >= 300) return result;
-  // Persist before the fallible forward: workflow closure may still be pending.
-  // In particular, gap-fill failure already closed the row. Its terminal-row guard
-  // skips lifecycle effects on retry, but must not skip this forward. Restate uses
-  // the dispatch id as the report idempotency key, including after a lost ACK.
-  markCallbackLifecycleCompleted(verified.claims.dispatchId);
+  // Restate uses the dispatch id as the report idempotency key, even after a lost ACK.
   try {
     const forwarded = await hook(verified.claims.dispatchId, toRecordedUsage(input.body));
     if (forwarded?.status === "conflict") return bad(409, "conflicting_report");
@@ -1398,6 +1419,26 @@ async function handleRunnerResultInternal(
         evidence: { truncated: false },
       };
       if (!failure) updateJobFailure(job.id, reportedFailure);
+      // Keep this best-effort effect inside the lifecycle guard, before closing the row.
+      // Report retries forward again without reposting to GitHub or the tracker.
+      if (job.prUrl) {
+        try {
+          const autopsy = input.body.comments.find(c => c.body.startsWith("## 🔎 Run autopsy — "));
+          if (!autopsy) throw new Error("Gap-fill callback has no run autopsy");
+          const target = parsePrUrlTarget(job.prUrl);
+          const mapping = getMappings()[mappingTeamKey];
+          if (!target || job.repo !== `${target.owner}/${target.repo}` ||
+              mapping?.owner !== target.owner || mapping?.repo !== target.repo || !input.watchdogConfig) {
+            throw new Error("Gap-fill PR target or GitHub credentials unavailable");
+          }
+          const token = await getInstallationToken(input.watchdogConfig.githubAppId,
+            input.watchdogConfig.githubAppPrivateKey, target.owner);
+          await postPrComment(token, target.owner, target.repo, target.prNumber,
+            autopsy.body + "\n\nTo start a new round, post a new `/ai-implement` comment with a changed instruction.");
+        } catch (err) {
+          warn("postPrComment", err);
+        }
+      }
       // The callback is not proof the backend stopped: the workflow releases admission.
       updateJobStatus(job.id, "failed", reportedFailure.code, undefined, { skipAdmissionRelease: true });
       await sendImplementationReport();
