@@ -35,12 +35,12 @@ async function setup() {
 describe("listIssueStatuses", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("keeps merged state and phase despite parks, but still updates its time (row 1)", async () => {
+  it.each([null, "planning", "implementation"] as const)("keeps merged state and phase %s despite parks, but still updates its time (row 1)", async (phase) => {
     const s = await setup();
-    s.read.mockResolvedValue([record({ state: "merged" })]);
-    s.park("planning");
-    s.job("planning", 50, 150);
-    expect(await s.list()).toMatchObject([{ state: "merged", phase: null, changedAt: 150 }]);
+    s.read.mockResolvedValue([record({ state: "merged", phase })]);
+    s.park(phase === "planning" ? "implementation" : "planning");
+    s.job(phase === "planning" ? "implementation" : "planning", 50, 150);
+    expect(await s.list()).toMatchObject([{ state: "merged", phase, changedAt: 150 }]);
   });
 
   it.each(["planning", "implementation", "gap-analysis"])("overlays a ready issue parked in %s (row 2)", async (phase) => {
