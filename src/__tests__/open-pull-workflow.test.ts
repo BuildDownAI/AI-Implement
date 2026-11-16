@@ -14,7 +14,7 @@ const day = 24 * 60 * 60 * 1000;
 beforeEach(async () => {
   const { modules } = await testDb({ modules: {
     dedup: () => import("../dedup.js"), workflow: () => import("../open-pull-workflow.js"),
-    late: () => import("../restate/late-external-review.js"),
+    late: () => import("../late-review-policy.js"),
   } });
   db = modules.dedup.getDb();
   resolve = modules.workflow.resolveOpenPullWorkflow;

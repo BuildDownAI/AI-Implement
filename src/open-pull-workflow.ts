@@ -2,7 +2,7 @@ import { getDb } from "./dedup.js";
 import { getRunRecordMergeVerdict, countGapfillDispatchesForPr } from "./log.js";
 import { isParked } from "./dispatch-breaker.js";
 import { isGroupingBranch } from "./auto-merge.js";
-import { LATE_EXTERNAL_REVIEW_DEADLINE_MS } from "./restate/late-external-review.js";
+import { LATE_EXTERNAL_REVIEW_DEADLINE_MS } from "./late-review-policy.js";
 
 export type WorkflowVerdict = { state: "active" | "settled"; reason: string };
 export interface WorkflowInput {
