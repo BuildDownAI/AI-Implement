@@ -720,6 +720,11 @@ describe("ImplementationRun durable workflow", () => {
       report: true, release: "finalized", close: [], finalize: [{ kind: "failed", conclusion: "boom" }] },
     { name: "callback external review pending, then the backend ended", row: { status: "completed", conclusion: "external_review_pending", prUrl: PR },
       report: true, release: "finalized", close: [], finalize: [] },
+    ...(["completed", "failed"] as const).map(status => ({
+      name: `review-only callback ${status}, then the backend ended`,
+      row: { status, conclusion: "rollup_review", approved: false, prUrl: PR },
+      report: true, release: "finalized" as const, close: [], finalize: [],
+    })),
     { name: "backend ended with no callback", row: {},
       report: false, release: "finalized", close: [["failed", "ended_without_callback", ENDED]], finalize: [{ kind: "failed", conclusion: "ended_without_callback" }] },
     { name: "operator cancel", row: { status: "failed", conclusion: "operator_cancelled" },
@@ -741,6 +746,29 @@ describe("ImplementationRun durable workflow", () => {
       expect(w.sc.clearCalls).toBe(state.clear ?? 0);
       expect(releasesOf(w.dispatchId)).toEqual([state.release]);
       expect(w.sc.stopCalls).toEqual([]);
+    }, 60_000);
+  });
+
+  describe.each(["completed", "failed"] as const)("review-only callback %s before deadline", status => {
+    it.each(labels)("preserves the row and releases without remediation (%s)", async label => {
+      const w = begin(deadline, label, { status: "started", endOnStop: true });
+      await waitForStep(w.read, "wait");
+      w.sc.tickGate = gate("tick after callback");
+      const row = makeJob({ dispatchId: w.dispatchId, status, conclusion: "rollup_review", approved: false, prUrl: PR });
+      w.sc.row = row;
+      await w.report();
+      await pastDeadlineAtTick(w.sc, DEADLINE.totalMs, "the total deadline");
+      w.sc.tickGate!.release();
+
+      expect(await w.done).toEqual({ reason: "deadline_exceeded" });
+      expect(w.sc.finishCalls).toEqual([{ kind: "deadline" }]);
+      expect(w.sc.closeCalls).toEqual([]);
+      expect(w.sc.finalizeCalls).toEqual([]);
+      expect(w.sc.stuckCalls).toEqual([]);
+      expect(w.sc.clearCalls).toBe(0);
+      expect(w.sc.row).toEqual(row);
+      expect(w.sc.events).toEqual(["finish", "cleanup", "outcome", "release"]);
+      expect(releasesOf(w.dispatchId)).toEqual(["deadline_exceeded"]);
     }, 60_000);
   });
 

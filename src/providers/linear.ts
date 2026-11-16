@@ -86,6 +86,10 @@ type AncestorNode = {
   parent?: AncestorNode | null;
 } | null;
 
+function isTerminalStateType(type: string | null | undefined): boolean {
+  return type === "completed" || type === "canceled" || type === "duplicate";
+}
+
 /**
  * Walks up the ancestor chain from `parent` while each ancestor carries the AI-Implement
  * label, returning the contiguous run of labeled ancestors base-most first, each paired with
@@ -99,14 +103,14 @@ type AncestorNode = {
  */
 /** Maps a Linear children-query node list to the provider-agnostic child-readiness shape
  *  (see src/feature-branch.ts). Designated = carries the pickup label; terminal =
- *  tracker state is completed or cancelled — never inferred from a job row. */
+ *  tracker state is completed, cancelled or duplicate — never inferred from a job row. */
 function childFeatureStates(
   children: Array<{ identifier: string; state?: { type: string } | null; labels?: { nodes: Array<{ name: string }> } }>,
 ): FeatureChildState[] {
   return children.map((c) => ({
     identifier: c.identifier,
     designated: (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
-    terminal: c.state?.type === "completed" || c.state?.type === "canceled",
+    terminal: isTerminalStateType(c.state?.type),
   }));
 }
 
@@ -167,6 +171,25 @@ export class LinearProvider implements TicketingProvider {
     return `${this.workspaceUrl}/issue/${issue.identifier}`;
   }
 
+  async createChildIssue(parentId: string, _scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    const { issue: parent } = await this.linearMutation<{ issue: { id: string; team: { id: string } } | null }>(
+      `query($parentId: String!) { issue(id: $parentId) { id team { id } } }`, { parentId },
+    );
+    if (!parent) throw new Error("Linear parent issue not found");
+    const name = getLinearPickupLabel();
+    const labels = await this.linearMutation<{ issueLabels: { nodes: Array<{ id: string; name: string; team: { id: string } | null }> } }>(
+      `query($name: String!) { issueLabels(filter: { name: { eq: $name } }) { nodes { id name team { id } } } }`, { name },
+    );
+    const label = reusableLabel(labels.issueLabels.nodes.filter((l) => l.name === name), (l) => l.team?.id ?? null, parent.team.id);
+    if (!label) throw new Error(`Linear pickup label "${name}" is unavailable for the parent's team`);
+    const result = await this.linearMutation<{ issueCreate: { success: boolean; issue: { id: string; identifier: string } | null } }>(
+      `mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier } } }`,
+      { input: { parentId: parent.id, teamId: parent.team.id, title: content.title, description: content.body, labelIds: [label.id] } },
+    );
+    if (!result.issueCreate.success || !result.issueCreate.issue) throw new Error("Linear child issue creation failed");
+    return result.issueCreate.issue;
+  }
+
   async findByKey(key: string): Promise<TicketIssue | null> {
     const match = /^([A-Z][A-Z0-9_]*)-(\d+)$/.exec(key);
     if (!match) return null;
@@ -200,12 +223,13 @@ export class LinearProvider implements TicketingProvider {
     return fetchLinearPlanningContext({ issueId });
   }
 
-  async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
     if (!isLinearAuthConfigured()) throw new TrackerUnavailableError("Linear credential not configured");
     if (!mapping.teamKey) throw new TrackerUnavailableError("mapping carries no team key");
+    const hasTitlePrefix = filter?.titlePrefix !== undefined;
     const data = await this.linearMutation<{ issues?: { nodes: TrackerIssuePage["issues"]; pageInfo: TrackerIssuePage["pageInfo"] } }>(
-      `query($teamKey: String!, $first: Int!, $after: String) {
-        issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
+      `query($teamKey: String!, $first: Int!, $after: String${hasTitlePrefix ? ", $title: String" : ""}) {
+        issues(filter: { team: { key: { eq: $teamKey } }${hasTitlePrefix ? ", title: { startsWith: $title }" : ""} }, first: $first, after: $after, orderBy: updatedAt) {
           nodes {
             id identifier title description branchName
             state { name type }
@@ -218,7 +242,7 @@ export class LinearProvider implements TicketingProvider {
           pageInfo { hasNextPage endCursor }
         }
       }`,
-      { teamKey: mapping.teamKey, first: 50, after: cursor },
+      { teamKey: mapping.teamKey, first: 50, after: cursor, ...(hasTitlePrefix ? { title: filter.titlePrefix } : {}) },
     );
     return {
       issues: data.issues?.nodes ?? [],
@@ -341,7 +365,7 @@ export class LinearProvider implements TicketingProvider {
           filter: {
             labels: { name: { eq: $label } }
             state: {
-              type: { nin: ["completed", "canceled"] }
+              type: { nin: ["completed", "canceled", "duplicate"] }
             }
           }
         ) {
@@ -493,8 +517,7 @@ export class LinearProvider implements TicketingProvider {
         issue.inverseRelations?.nodes?.some(
           (r) =>
             r.type === "blocks" &&
-            r.issue?.state?.type !== "completed" &&
-            r.issue?.state?.type !== "canceled",
+            !isTerminalStateType(r.issue?.state?.type),
         ) ?? false;
       if (isBlocked) {
         console.log(`[linear] Skipping ${issue.identifier}: blocked by an incomplete issue`);
@@ -541,8 +564,7 @@ export class LinearProvider implements TicketingProvider {
         const anyUndesignatedActive = children.some(
           (c) =>
             !(c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL) &&
-            c.state?.type !== "completed" &&
-            c.state?.type !== "canceled",
+            !isTerminalStateType(c.state?.type),
         );
         if (anyUndesignatedActive) {
           console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent has undesignated non-terminal children`);
@@ -694,7 +716,7 @@ export class LinearProvider implements TicketingProvider {
     for (const node of data.issues.nodes) {
       let lifecycle: IssueLifecycleState;
       if (node.state.type === "completed") lifecycle = "completed";
-      else if (node.state.type === "canceled") lifecycle = "cancelled";
+      else if (isTerminalStateType(node.state.type)) lifecycle = "cancelled";
       else lifecycle = "active";
       result.set(node.id, lifecycle);
     }
@@ -1017,7 +1039,7 @@ export class LinearProvider implements TicketingProvider {
     );
     const issue = data.issue;
     if (!issue) return;
-    if (issue.state.type === "completed" || issue.state.type === "canceled") return;
+    if (isTerminalStateType(issue.state.type)) return;
     const stateId = await this.getCompletedStateId(issue.team.key);
     const labelIds = issue.labels.nodes
       .filter((l) => l.name !== LINEAR_LABELS.readyForReview.name)
@@ -1045,13 +1067,13 @@ export class LinearProvider implements TicketingProvider {
     return true;
   }
   async parkForHuman(issueId: string, _scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
-    // Refuse a completed/canceled issue: the caller must keep dedup (same as Jira's Merged guard).
+    // Refuse a terminal issue: the caller must keep dedup (same as Jira's Merged guard).
     const data = await this.linearMutation<{ issue: { state: { type: string }; team: { key: string } } | null }>(
       `query($id: String!) { issue(id: $id) { state { type } team { key } } }`,
       { id: issueId },
     );
     const type = data.issue?.state?.type;
-    if (!data.issue || type === "completed" || type === "canceled") return false;
+    if (!data.issue || isTerminalStateType(type)) return false;
     // Marker first: once it is on, pickup skips the issue even if a removal below fails. The
     // pickup label stays, so the issue keeps its place in the feature-branch grouping tree and,
     // being non-terminal, keeps holding its parent's roll-up.

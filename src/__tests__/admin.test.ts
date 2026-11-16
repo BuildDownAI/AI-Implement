@@ -13,7 +13,7 @@ import { FakeProvider } from "./providers/fake.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 import type { AIImplementSnapshot } from "../providers/types.js";
 import { makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
-import { fakeFetch, type FakeFetch } from "./helpers/fake-fetch.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb, type LoadedModules, type TestDb } from "./helpers/test-db.js";
 import { testDir } from "./helpers/test-dir.js";
 
@@ -2272,12 +2272,12 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
-  it("POST /api/kg/refresh with no body reaches the trigger with no option — the unchanged real refresh", async () => {
+  it("POST /api/kg/refresh with no body forwards the authenticated human caller", async () => {
     const token = await login("secret");
     const res = await kgRequest("/api/kg/refresh", "POST", token);
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith(undefined, { kind: "human", email: null, role: "admin", grants: [] });
     expect(JSON.parse(res.body)).toMatchObject({ refreshing: true });
   });
 
@@ -2285,7 +2285,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     const token = await login("secret");
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith(undefined, { kind: "human", email: null, role: "admin", grants: [] });
     expect(JSON.parse(res.body)).toEqual({ refreshing: true, triggerId: "t-0" });
   });
 
@@ -2352,14 +2352,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
   });
 });
 
-// Fly's GraphQL API, which carries app secrets (src/fly-machines.ts).
-const FLY_GRAPHQL = "POST /graphql";
-
-/** The variables of a Fly GraphQL request. */
-function flyVariables(fake: FakeFetch, index = 0): { input: { secrets?: Array<{ key: string; value: string }>; keys?: string[] } } {
-  expect(fake.calls[index].url.href).toBe("https://api.fly.io/graphql");
-  return JSON.parse(fake.calls[index].body).variables;
-}
+const FLY_SECRETS = "/v1/apps/ai-implement-sessions/secrets";
 
 describe("admin secrets", () => {
   function secretsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
@@ -2380,6 +2373,22 @@ describe("admin secrets", () => {
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
+
+  describe.each(["constructor", "toString", "__proto__"])("secrets reject inherited mapping %s", (teamKey) => {
+    it.each([
+      ["GET", "", undefined],
+      ["POST", "", { name: "DATABASE_URL", value: "postgres://localhost/db" }],
+      ["DELETE", "/DATABASE_URL", undefined],
+    ] as const)("%s returns 404 without a secret call", async (method, suffix, body) => {
+      const token = await login("secret");
+      const fake = fakeFetch({}).install();
+      const res = await requestFly(`/api/mappings/${teamKey}/secrets${suffix}`, method, token, body);
+
+      expect.soft(res.statusCode).toBe(404);
+      expect.soft(JSON.parse(res.body)).toEqual({ error: "Team not found" });
+      expect(fake.calls).toHaveLength(0);
+    });
+  });
 
   it("returns 503 when Fly config is not set on GET secrets", async () => {
     const token = await login("secret");
@@ -2412,11 +2421,11 @@ describe("admin secrets", () => {
 
   it("GET secrets lists only team-prefixed secrets with prefix stripped", async () => {
     const flySecrets = [
-      { name: "ENG_DATABASE_URL", digest: "abc", createdAt: "2026-01-01T00:00:00Z" },
-      { name: "ENG_STRIPE_KEY", digest: "def", createdAt: "2026-01-02T00:00:00Z" },
-      { name: "OTHER_SECRET", digest: "ghi", createdAt: "2026-01-03T00:00:00Z" },
+      { name: "ENG_DATABASE_URL", digest: "abc", created_at: "2026-01-01T00:00:00Z" },
+      { name: "ENG_STRIPE_KEY", digest: "def", created_at: "2026-01-02T00:00:00Z" },
+      { name: "OTHER_SECRET", digest: "ghi", created_at: "2026-01-03T00:00:00Z" },
     ];
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { app: { secrets: flySecrets } } } } }).install();
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: { secrets: flySecrets } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2429,8 +2438,8 @@ describe("admin secrets", () => {
     expect(data[1].name).toBe("STRIPE_KEY");
   });
 
-  it("POST secrets sets a secret with team prefix via GraphQL", async () => {
-    const fake = fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 101 } } } } } }).install();
+  it("POST secrets sets a secret with team prefix via Machines REST", async () => {
+    const fake = fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 101 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2439,9 +2448,35 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).name).toBe("DATABASE_URL");
 
-    const { input } = flyVariables(fake);
-    expect(input.secrets?.[0].key).toBe("ENG_DATABASE_URL");
-    expect(input.secrets?.[0].value).toBe("postgres://localhost/db");
+    expect(fake.calls[0].url.origin).toBe("https://api.machines.dev");
+    expect(JSON.parse(fake.calls[0].body)).toEqual({ values: { ENG_DATABASE_URL: "postgres://localhost/db" } });
+  });
+
+  it("an admin-set secret appears in the launch reader", async () => {
+    const stored: Record<string, string> = {};
+    const fake = fakeFetch({
+      [`POST ${FLY_SECRETS}`]: (call) => {
+        Object.assign(stored, JSON.parse(call.body).values);
+        return { json: { version: 99, secrets: Object.entries(stored).map(([name, value]) => ({ name, value })) } };
+      },
+      [`GET ${FLY_SECRETS}`]: () => ({ json: { secrets: Object.keys(stored).map((name) => ({ name, digest: "digest", created_at: "2026-11-13" })) } }),
+    }).install();
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    const res = await requestFly("/api/mappings/ENG/secrets", "POST", token, { name: "DATABASE_URL", value: "secret" });
+    expect(res.statusCode).toBe(200);
+    const { listAppSecrets } = await import("../fly-machines.js");
+    expect((await listAppSecrets("fly-token", "ai-implement-sessions")).map((s) => s.name)).toEqual(["ENG_DATABASE_URL"]);
+    for (const call of fake.calls) expect(call.url.origin).toBe("https://api.machines.dev");
+  });
+
+  it("DELETE missing team secret succeeds", async () => {
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_MISSING`]: { json: { version: 100 } } }).install();
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    const res = await requestFly("/api/mappings/ENG/secrets/MISSING", "DELETE", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ deleted: true });
   });
 
   it("POST secrets returns 400 when name is missing", async () => {
@@ -2463,7 +2498,7 @@ describe("admin secrets", () => {
   });
 
   it("POST secrets normalizes lowercase names to uppercase", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 1 } } } } } }).install();
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 1 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2473,8 +2508,8 @@ describe("admin secrets", () => {
     expect(JSON.parse(res.body).name).toBe("DATABASE_URL");
   });
 
-  it("DELETE secret unsets the team-prefixed secret via GraphQL", async () => {
-    const fake = fakeFetch({ [FLY_GRAPHQL]: { json: { data: { unsetSecrets: { release: { version: 102 } } } } } }).install();
+  it("DELETE secret unsets the team-prefixed secret via Machines REST", async () => {
+    const fake = fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_DATABASE_URL`]: { json: { version: 102 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2483,22 +2518,11 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).deleted).toBe(true);
 
-    expect(flyVariables(fake).input.keys?.[0]).toBe("ENG_DATABASE_URL");
+    expect(fake.calls[0].url.href).toBe(`https://api.machines.dev${FLY_SECRETS}/ENG_DATABASE_URL`);
   });
 
   it("DELETE secret returns 404 when Fly returns HTTP 404 for unknown secret", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { status: 404, text: "not found" } }).install();
-
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
-
-    const res = await requestFly("/api/mappings/ENG/secrets/NONEXISTENT", "DELETE", token);
-    expect(res.statusCode).toBe(404);
-    expect(JSON.parse(res.body).error).toContain("not found");
-  });
-
-  it("DELETE secret returns 404 when Fly GraphQL reports the secret was not found", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { errors: [{ message: "Could not find secret ENG_NONEXISTENT" }] } } }).install();
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_NONEXISTENT`]: { status: 404 } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2881,21 +2905,12 @@ describe("admin global secrets", () => {
   });
 
   it("GET lists secrets that have no team prefix", async () => {
-    fakeFetch({
-      [FLY_GRAPHQL]: {
-        json: {
-          data: {
-            app: {
-              secrets: [
-                { name: "ANTHROPIC_API_KEY", digest: "aaa", createdAt: "2026-01-01T00:00:00Z" },
-                { name: "ENG_DATABASE_URL",  digest: "bbb", createdAt: "2026-01-02T00:00:00Z" },
-                { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", createdAt: "2026-01-03T00:00:00Z" },
-              ],
-            },
-          },
-        },
-      },
-    }).install();
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: { secrets: [
+      { name: "ANTHROPIC_API_KEY", digest: "aaa", created_at: "2026-01-01" },
+      { name: "ENG_DATABASE_URL", digest: "bbb", created_at: "2026-01-02" },
+      { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", created_at: "2026-01-03" },
+      { name: "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", digest: "ddd", created_at: "2026-01-04" },
+    ] } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2906,8 +2921,35 @@ describe("admin global secrets", () => {
     expect(body.map((s) => s.name)).toEqual(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]);
   });
 
+  it.each(["AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", "ai_implement_model_auth_protection_key"])("protects reserved global key %s", async (name) => {
+    const fake = fakeFetch({}).install();
+    const token = await login("secret");
+    const set = await requestFlyGlobal("/api/global-secrets", "POST", token, { name, value: "evil" });
+    const unset = await requestFlyGlobal(`/api/global-secrets/${name}`, "DELETE", token);
+    expect(set.statusCode).toBe(400);
+    expect(unset.statusCode).toBe(400);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("DELETE missing global secret succeeds", async () => {
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/MISSING`]: { json: { version: 100 } } }).install();
+    const res = await requestFlyGlobal("/api/global-secrets/MISSING", "DELETE", await login("secret"));
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ deleted: true });
+  });
+
+  it.each([200, 422, 201])("never exposes set reply values (status %s)", async (status) => {
+    const marker = "SECRET_REPLY_MARKER";
+    const logs = [vi.spyOn(console, "error").mockImplementation(() => {}), vi.spyOn(console, "log").mockImplementation(() => {}), vi.spyOn(console, "warn").mockImplementation(() => {})];
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: status === 201 ? { status, text: marker } : { status, json: { version: 88, secrets: [{ value: marker }] } } }).install();
+    const res = await requestFlyGlobal("/api/global-secrets", "POST", await login("secret"), { name: "KEY", value: marker });
+    expect(res.statusCode).toBe(status === 200 ? 200 : 500);
+    expect(res.body).not.toContain(marker);
+    for (const log of logs) expect(log.mock.calls.map((args) => args.map(String).join(" ")).join("\n")).not.toContain(marker);
+  });
+
   it("POST sets a global secret", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { setSecrets: { release: { version: 5 } } } } } }).install();
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 5 } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets", "POST", token, {
@@ -2937,7 +2979,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE removes a global secret", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { json: { data: { unsetSecrets: { release: { version: 6 } } } } } }).install();
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ANTHROPIC_API_KEY`]: { json: { version: 6 } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/ANTHROPIC_API_KEY", "DELETE", token);
@@ -2946,7 +2988,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE returns 404 when Fly reports not found", async () => {
-    fakeFetch({ [FLY_GRAPHQL]: { status: 422, text: "could not find secret" } }).install();
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/NONEXISTENT`]: { status: 404 } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/NONEXISTENT", "DELETE", token);
@@ -3222,6 +3264,38 @@ describe("admin filesystem issue detail endpoint", () => {
   it("requires auth to retry", async () => {
     const res = await request("/api/filesystem-issue/retry", "POST", "secret", { issueId: "filesystem:SAN2:SAN2-001" });
     expect(res.statusCode).toBe(401);
+  });
+
+  describe.each(["constructor", "toString", "__proto__"])("filesystem routes with inherited name %s", (scopeKey) => {
+    it.each(["details", "retry"])("keeps %s at 404 without inspecting the inherited mapping", async (route) => {
+      await withFilesystemProject(async ({ registry, token }) => {
+        // The old provider guard also returned 404 for Object.prototype values.
+        // Observe property access to prove inherited values are rejected before
+        // either route inspects them, rather than relying on that second guard.
+        const inspectInheritedMapping = vi.fn(() => undefined);
+        const inheritedMapping = Object.defineProperty({}, "ticketingProvider", {
+          get: inspectInheritedMapping,
+        });
+        const mappings = Object.assign(
+          Object.create({ [scopeKey]: inheritedMapping }),
+          config.getMappings(),
+        );
+        const getMappings = vi.spyOn(config, "getMappings").mockReturnValue(mappings);
+        try {
+          const issueId = `filesystem:${scopeKey}:SAN2-001`;
+          const result = route === "details"
+            ? await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry)
+            : await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+          expect(result.statusCode).toBe(404);
+          expect(JSON.parse(result.body)).toEqual({
+            error: route === "details" ? "filesystem issue not found" : "Filesystem ticket not found",
+          });
+          expect(inspectInheritedMapping).not.toHaveBeenCalled();
+        } finally {
+          getMappings.mockRestore();
+        }
+      });
+    });
   });
 
   it("restores an archived failure once and retains the issue history", async () => {
@@ -3989,6 +4063,16 @@ describe("async sync on mapping upsert", () => {
     const res = await request("/api/mappings/MAN/sync-workflows", "POST", "secret", undefined, token);
     expect(res.statusCode).toBe(202);
     expect(typeof JSON.parse(res.body).syncJobId).toBe("number");
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("manual sync-workflows rejects inherited mapping %s without queuing work", async (teamKey) => {
+    const token = await login("secret");
+    const jobsBefore = dedup.getDb().prepare("SELECT * FROM workflow_sync_queue").all();
+    const res = await request(`/api/mappings/${teamKey}/sync-workflows`, "POST", "secret", undefined, token);
+
+    expect.soft(res.statusCode).toBe(404);
+    expect.soft(JSON.parse(res.body)).toEqual({ error: "Team not found" });
+    expect(dedup.getDb().prepare("SELECT * FROM workflow_sync_queue").all()).toEqual(jobsBefore);
   });
 
   it("manual sync-workflows returns 404 for an unknown team", async () => {
@@ -6309,7 +6393,16 @@ describe("model accounts and stage configuration (AII-962)", () => {
   });
 
   async function call(url: string, method: string, token: string, body?: unknown, deps: Deps = {}) {
-    const res = await requestWithDeps(url, method, token, deps, body);
+    const bindingDeps: Deps = {
+      bindKey: async (ref, destination) => {
+        const row = dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(ref) as { destination: string } | undefined;
+        if (row) return row.destination === destination ? "already-bound" : "conflict";
+        dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+        return "bound";
+      },
+      clearKeyBinding: async (ref) => dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes,
+    };
+    const res = await requestWithDeps(url, method, token, { ...bindingDeps, ...deps }, body);
     return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null, raw: res.body };
   }
 
@@ -6343,10 +6436,127 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 
+  it("refuses mode changes for a missing mapping before writing", () => {
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction("MISSING", mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+    }
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("refuses inherited mapping name %s in both modes without writing", async (projectKey) => {
+    await seed();
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction(projectKey, mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
+  describe.each(["constructor", "toString", "__proto__"])("own mapping lookup for %s", (projectKey) => {
+    it.each([
+      ["GET", ""],
+      ["GET", "/resolved"],
+      ["PUT", ""],
+    ])("rejects inherited name on %s agent-config%s without writing", async (method, suffix) => {
+      const t = await seed();
+      const before = count("stage_agent_config_revisions");
+      const result = await call(`/api/mappings/${projectKey}/agent-config${suffix}`, method, t,
+        method === "PUT" ? { stages: {} } : undefined, readyDeps());
+      expect.soft(result.status).toBe(404);
+      expect.soft(result.json).toEqual({ error: "mapping not found" });
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    });
+
+    it("upserts the inherited name as a new configured project", async () => {
+      const t = await seed();
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      const before = count("stage_agent_config_revisions");
+      const result = await request("/api/mappings", "POST", "secret", { teamKey: projectKey, owner: "org", repo: "new" }, t);
+      expect(result.statusCode).toBe(202);
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toMatchObject({ config: { mode: "configured" } });
+      expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    });
+  });
+
+  it("keeps absent-row legacy unchanged and refuses unresolved configuration without writing", async () => {
+    await seed();
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it("logs a failed agent mode write and preserves its refusal code", async () => {
+    await seed();
+    const err = new Error("database write failed");
+    const write = vi.spyOn(modules.agentConfigStore, "setProjectConfigured").mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] set project agent mode failed:", err);
+    } finally {
+      write.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it.each(["getProjectStageConfig", "getOrchestratorDefaults"] as const)("keeps creation successful when %s throws", async (readName) => {
+    await seed();
+    const registry = makeFakeRegistry(provider);
+    const invalidate = vi.spyOn(registry, "invalidate");
+    const queue = await import("../workflow-sync-queue.js");
+    const sync = vi.spyOn(queue, "runWorkflowSync").mockResolvedValueOnce(undefined);
+    const err = new Error("stored configuration unreadable");
+    const read = vi.spyOn(modules.agentConfigStore, readName).mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await requestWithRegistry("/api/mappings", "POST", adminTok(), registry, { teamKey: "NEW", owner: "org", repo: "new", defaultBranch: "main" });
+      expect(result.statusCode).toBe(202);
+      const body = JSON.parse(result.body);
+      expect(body.warnings).toEqual(["Project saved in legacy mode: resolution-failed"]);
+      expect(config.getMappings().NEW).toBeDefined();
+      expect(modules.agentConfigStore.isProjectConfigured("NEW")).toBe(false);
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(sync).toHaveBeenCalledExactlyOnceWith(body.syncJobId, expect.anything());
+      expect(queue.getWorkflowSyncById(body.syncJobId)).toMatchObject({ teamKey: "NEW" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] configure new project failed:", err);
+    } finally {
+      read.mockRestore();
+      sync.mockRestore();
+      invalidate.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("changes both modes preserving stages and actor, and unchanged modes append nothing even with invalid defaults", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", false);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { planning: { model: "project-model" } } });
+    const stages = modules.agentConfigStore.getProjectStageConfig("APP")!.config.stages;
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "configured" });
+    expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "operator", config: { mode: "configured", stages } });
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const unchanged = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged);
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "other", config: { mode: "legacy", stages } });
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+  });
+
   it("preserves resolution failure diagnostics when defaults become legacy", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
-      enabled: true, stages: { planning: { model: "project-model" } },
+      stages: { planning: { model: "project-model" } },
     }, readyDeps())).status).toBe(200);
     expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy" })).status).toBe(200);
 
@@ -6356,7 +6566,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       enabled: true, mode: "configured", resolved: false,
       error: {
         code: "resolution_failed",
-        message: "project opted into stage configuration but orchestrator defaults are not configured",
+        message: "project is configured for stage agents but the orchestrator stage defaults are off",
       },
     });
     for (const stage of ["planning", "implementation", "review"]) {
@@ -6366,6 +6576,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("names the stage when every default account is later disabled", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     for (const profileId of ["review-1", "review-2"]) {
       expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId }))).status).toBe(201);
     }
@@ -6375,13 +6586,14 @@ describe("model accounts and stage configuration (AII-962)", () => {
     for (const profileId of ["review-1", "review-2"]) {
       expect((await call(`/api/model-accounts/${profileId}`, "PATCH", t, { status: "disabled" })).status).toBe(200);
     }
-    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     expect(result.status).toBe(400);
     expect(result.json.error).toBe("review.accounts: no entry resolves (resolution_failed)");
   });
 
   it("stores singleton accounts flat, refuses project lists, and exposes failed entries", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const config = structuredClone(defaults);
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }] });
     const singleton = await call("/api/agent-defaults", "PUT", t, config);
@@ -6393,7 +6605,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "oai-2" }));
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }, { accountProfileId: "oai-2", model: "" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
-    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
     const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(resolved.json.stages.planning.entries).toMatchObject([
@@ -6433,19 +6645,24 @@ describe("model accounts and stage configuration (AII-962)", () => {
   it.each([
     { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
     { agent: "claude", provider: "bedrock", authMode: "bedrock" },
-  ])("reports an incompatible account-only override ($provider)", async profile => {
+  ])("refuses an incompatible account-only override ($provider)", async profile => {
     const t = await seed();
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "other", ...profile }));
     const config = structuredClone(defaults);
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "m" }, { accountProfileId: "other", model: "claude" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
-    // Simulate an existing project override; the save route correctly refuses this configuration.
-    modules.agentConfigStore.setProjectOptIn("APP", true);
+    // Simulate an existing project override with profile fields inherited from defaults.
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     dedup.getDb().prepare("INSERT INTO stage_agent_config_revisions (config_revision_id, scope_kind, scope_key, revision, version, config_json, created_at) VALUES ('override-test', 'project', 'APP', 2, 1, ?, ?)").run(
       JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
     const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(resolved.status).toBe(200);
-    expect(resolved.json.stages.planning.entries).toMatchObject([{ accountProfileId: "other", passes: false, reason: "resolution_failed" }]);
+    expect(resolved.json.resolved).toBe(false);
+    expect(resolved.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "other", passes: false, reason: "resolution_failed" },
+      { accountProfileId: "oai-1", passes: true },
+    ]);
+    expect(resolved.json.stages.planning.values).toBeUndefined();
   });
 
   it.each([
@@ -6470,7 +6687,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     }
     expect(saved.status).toBe(200);
     expect((await call("/api/mappings/FLY/agent-config", "PUT", t, {
-      enabled: true, stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
+      stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
     }, readyDeps())).status).toBe(200);
     const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
     expect(resolved.status).toBe(200);
@@ -6481,7 +6698,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     });
   });
 
-  it("shows unsupported backend entries and project fallback suppression", async () => {
+  it("shows unsupported backend entries after a project account override", async () => {
     const t = await seed();
     await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
     await call("/api/model-accounts", "POST", t, profileBody({ profileId: "brk", agent: "claude", provider: "bedrock", authMode: "bedrock" }));
@@ -6489,14 +6706,58 @@ describe("model accounts and stage configuration (AII-962)", () => {
     const config = structuredClone(defaults);
     Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "claude" }, { accountProfileId: "cl-api", model: "claude-api-model" }] });
     expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
-    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps())).status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: {} }, readyDeps())).status).toBe(200);
     const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
     expect(resolved.json.stages.planning.entries).toMatchObject([{ passes: false, reason: "unsupported_combination" }, { passes: true }]);
     expect(resolved.json.stages.planning.values.accountProfileId).toBe("cl-api");
     expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: { planning: { accountProfileId: "cl-api", provider: "anthropic" } } }, readyDeps())).status).toBe(200);
     const overridden = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
-    expect(overridden.json.stages.planning.fallbacksDropped).toBe(true);
-    expect(overridden.json.stages.planning.entries).toHaveLength(1);
+    expect(overridden.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(overridden.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "cl-api", passes: true },
+      { accountProfileId: "brk", passes: false, reason: "unsupported_combination" },
+    ]);
+    expect(resolved.json.stages.planning.fallbacksDropped).toBe(false);
+    // A later profile change can make resolution fail; diagnostics retain the merged list.
+    expect((await call("/api/model-accounts/cl-api", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const failed = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(failed.json.resolved).toBe(false);
+    expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(failed.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "cl-api", passes: false, reason: "resolution_failed" },
+      { accountProfileId: "brk", passes: false, reason: "unsupported_combination" },
+    ]);
+  });
+
+  it("reports dropped fallbacks only when an override has no following default entry", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+      stages: { implementation: { accountProfileId: "oai-1" } },
+    }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.json.resolved).toBe(true);
+    expect(resolved.json.stages.implementation.fallbacksDropped).toBe(true);
+    expect(resolved.json.stages.implementation.entries).toHaveLength(1);
+    expect(resolved.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
+    expect(resolved.json.stages.planning.fallbacksDropped).toBe(false);
+    for (const stage of ["planning", "review"]) {
+      expect(resolved.json.stages[stage].fallbacksDropped).toBe(false);
+      expect(resolved.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
+      expect(resolved.json.stages[stage].entries).toHaveLength(1);
+    }
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const failed = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(failed.json.resolved).toBe(false);
+    expect(failed.json.stages.implementation.fallbacksDropped).toBe(true);
+    expect(failed.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(failed.json.stages.planning.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(failed.json.stages[stage].entries).toHaveLength(1);
+      expect(failed.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: false }]);
+    }
+    expect(failed.json.stages.review.fallbacksDropped).toBe(false);
   });
 
   it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
@@ -6508,7 +6769,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       ["/api/model-accounts", "POST", profileBody({ profileId: "x1" })],
       ["/api/model-accounts/oai-1", "PATCH", { status: "disabled" }],
       ["/api/agent-defaults", "PUT", defaults],
-      ["/api/mappings/APP/agent-config", "PUT", { enabled: false }],
+      ["/api/mappings/APP/agent-config", "PUT", { stages: {} }],
     ] as const) {
       expect((await call(url, method, u, body, readyDeps())).status).toBe(403);
     }
@@ -6560,6 +6821,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
   it("keeps old revisions on PATCH of a disabled profile", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const store = modules.agentConfigStore;
     const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
     expect(patched.json).toMatchObject({ revision: 2, identity: "Renamed", profileStatus: "active" });
@@ -6568,7 +6830,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
     expect(store.getAccountProfile("oai-1")?.revision).toBe(3);
     // A disabled profile is refused by a new project config.
-    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     expect(put.status).toBe(400);
     expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
   });
@@ -6601,12 +6863,31 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(patch.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
   });
 
+  it.each([false, true])("saves the inactive preference for configured=%s and rejects invalid scope/types", async (configured) => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", configured);
+    const deps = readyDeps();
+    for (const preferOpenModel of [true, false]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { implementation: { preferOpenModel } } }, deps)).status).toBe(200);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t, undefined, deps)).json.stages.implementation.preferOpenModel).toBe(preferOpenModel);
+    }
+    const revs = count("stage_agent_config_revisions");
+    for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { [stage as string]: { preferOpenModel: value } } }, deps)).status).toBe(400);
+    }
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect((await call("/api/agent-defaults", "PUT", t, { mode: "configured", stages: { [stage]: { preferOpenModel: false } } })).status).toBe(400);
+    }
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+  });
+
   it("saves and resolves fallback models with field provenance", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const deps = readyDeps();
     const configuredDefaults = { ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, fallbackModel: "backup" } } };
     expect((await call("/api/agent-defaults", "PUT", t, configuredDefaults)).status).toBe(200);
-    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, deps)).status).toBe(200);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, deps)).status).toBe(200);
     const resolved = async () => (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json.stages.review;
     expect(await resolved()).toMatchObject({ values: { fallbackModel: "backup" }, sources: { fallbackModel: "orchestrator-default" } });
     expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel: "project-backup" } } }, deps)).status).toBe(200);
@@ -6638,10 +6919,11 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect((await call("/api/agent-defaults", "GET", t)).json).toMatchObject({ configured: true, enabled: true });
   });
 
-  it("round-trips opt-in and individual inheritance fields", async () => {
+  it("round-trips individual inheritance fields on a configured project", async () => {
     const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
     const deps = readyDeps();
-    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } }, deps);
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } }, deps);
     expect(put.status).toBe(200);
     let got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
     expect(got).toMatchObject({ enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } });
@@ -6663,57 +6945,59 @@ describe("model accounts and stage configuration (AII-962)", () => {
     expect(resolved.stages.review.sources.model).toBe("orchestrator-default");
     expect(resolved.stages.review.sources.invocationTimeoutMs).toBe("project");
 
-    // Disabling needs no readiness and keeps the overrides.
-    const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false });
-    expect(off.status).toBe(200);
-    expect((await call("/api/mappings/APP/agent-config", "GET", t)).json).toMatchObject({ enabled: false, stages: { review: { invocationTimeoutMs: 900000 } } });
     expect((await call("/api/mappings/NOPE/agent-config", "GET", t)).status).toBe(404);
   });
 
   it("returns actionable resolution errors instead of a 500", async () => {
     const t = await seed();
-    await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps());
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
     await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
     const r = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
     expect(r.status).toBe(200);
     expect(r.json).toMatchObject({ resolved: false, error: { code: "resolution_failed" } });
   });
 
-  describe("readiness gate on opt-in", () => {
-    const optIn = (t: string, inspect: (r: any) => Promise<unknown>) =>
-      call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true }, readyDeps(inspect));
+  describe("readiness gate on configured stage changes", () => {
+    const optIn = (t: string, inspect: (r: any) => Promise<unknown>) => {
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      return call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps(inspect));
+    };
 
-    it("refuses an unready GitHub Actions project, names the workflow-sync action and restores legacy", async () => {
+    it("refuses an unready GitHub Actions project, names the workflow-sync action and preserves configured mode", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       for (const code of ["runner_incompatible", "retired_workflow_present"]) {
         const r = await optIn(t, async () => ({ status: "not-ready", code }));
         expect(r.status).toBe(409);
         expect(r.json).toMatchObject({ code, backend: "github-actions" });
         expect(r.json.action).toMatch(/workflow sync/);
-        expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+        expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
       }
     });
 
     it("serialises concurrent PUTs so a refusal's rollback cannot clobber a later valid write", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       let release!: () => void;
       const gate = new Promise<void>((r) => (release = r));
       const first = optIn(t, async () => {
         await gate;
         return { status: "not-ready", code: "runner_incompatible" };
       });
-      const second = call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false, stages: { review: { model: "m-2" } } });
+      const second = call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "m-2" } } }, readyDeps());
       release();
       const [a, b] = await Promise.all([first, second]);
       expect(a.status).toBe(409);
       expect(b.status).toBe(200);
       const head = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
-      expect(head.enabled).toBe(false);
+      expect(head.enabled).toBe(true);
       expect(head.stages.review.model).toBe("m-2");
     });
 
-    it("inspects the candidate without publishing it: nothing is stored while inspection is pending or after a refusal", async () => {
+    it("inspects the candidate without publishing it: no revision is appended while inspection is pending or after a refusal", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       const revs = count("stage_agent_config_revisions");
       let release!: () => void;
@@ -6728,25 +7012,26 @@ describe("model accounts and stage configuration (AII-962)", () => {
         return { status: "not-ready", code: "runner_incompatible" };
       });
       await inside;
-      expect(store.getProjectOptIn("APP")).toBe(false);
-      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(store.isProjectConfigured("APP")).toBe(true);
+      expect(store.getProjectStageConfig("APP")?.config.mode).toBe("configured");
       expect(count("stage_agent_config_revisions")).toBe(revs);
       release();
       expect((await pending).status).toBe(409);
-      expect(store.getProjectStageConfig("APP")).toBeNull();
+      expect(store.getProjectStageConfig("APP")?.config.mode).toBe("configured");
       expect(count("stage_agent_config_revisions")).toBe(revs);
       expect(seen).toHaveLength(1);
     });
 
     it("refuses to commit readiness when the defaults, a profile or the project head moved during inspection", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       const moves: Array<[string, () => void]> = [
         ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
         ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", metadata: { credentialRef: SENTINEL } } as never)],
         ["project", () => void store.setProjectStageConfig("APP", { version: 1, mode: "legacy", stages: { review: { model: "newer" } } } as never)],
       ];
-      for (const [, move] of moves) {
+      for (const [name, move] of moves) {
         const before = store.getProjectStageConfig("APP")?.revision ?? 0;
         const r = await optIn(t, async () => {
           move();
@@ -6754,48 +7039,52 @@ describe("model accounts and stage configuration (AII-962)", () => {
         });
         expect(r.status).toBe(409);
         expect(r.json.code).toBe("stale_inputs");
-        expect(store.getProjectOptIn("APP")).toBe(false);
+        expect(store.isProjectConfigured("APP")).toBe(name !== "project");
         // Only the concurrent writer's own revision (project move) may exist; the stale candidate never lands.
         expect(store.getProjectStageConfig("APP")?.revision ?? 0).toBeLessThanOrEqual(before + 1);
       }
       expect(store.getProjectStageConfig("APP")?.config.stages?.review?.model).toBe("newer");
     });
 
-    it("rejects invalid candidates, skips readiness when disabled and stores nothing on inspection failure", async () => {
+    it("rejects invalid candidates, skips readiness in legacy mode and appends nothing on inspection failure", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
-      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true, stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
       expect(r.status).toBe(400);
       expect(inspect).not.toHaveBeenCalled();
-      const off = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: false }, readyDeps(inspect));
+      store.setProjectConfigured("APP", false);
+      const off = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps(inspect));
       expect(off.status).toBe(200);
       expect(inspect).not.toHaveBeenCalled();
       const backendFail = await optIn(t, async () => {
         throw new Error("boom");
       });
       expect(backendFail.status).toBe(503);
-      expect(store.getProjectOptIn("APP")).toBe(false);
+      expect(store.isProjectConfigured("APP")).toBe(true);
     });
 
-    it("refuses unreadable GitHub Actions workflows with the sync action and stores nothing", async () => {
+    it("refuses unreadable GitHub Actions workflows with the sync action and appends nothing", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const revs = count("stage_agent_config_revisions");
       const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));
       expect(r.status).toBe(409);
       expect(r.json).toMatchObject({ code: "delivery_unreadable", backend: "github-actions",
         action: "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows." });
-      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(false);
-      expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(true);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")?.config.mode).toBe("configured");
       expect(count("stage_agent_config_revisions")).toBe(revs);
     });
 
-    it("enables a ready GitHub Actions project after inspecting readiness", async () => {
+    it("saves a configured GitHub Actions project after inspecting readiness", async () => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
       expect((await optIn(t, inspect)).status).toBe(200);
       expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions", projectKey: "APP" }), expect.objectContaining({ mode: "configured" }));
-      expect(modules.agentConfigStore.getProjectOptIn("APP")).toBe(true);
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(true);
       expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
     });
 
@@ -6803,7 +7092,7 @@ describe("model accounts and stage configuration (AII-962)", () => {
       const t = await seed();
       await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
       const seen: string[] = [];
-      const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { enabled: true }, readyDeps(async (req: any) => {
+      const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: {} }, readyDeps(async (req: any) => {
         seen.push(req.backend);
         return { status: "ready", profiles: [] };
       }));
@@ -6813,31 +7102,32 @@ describe("model accounts and stage configuration (AII-962)", () => {
 
     it("fails closed when no readiness inspection is configured", async () => {
       const t = await seed();
-      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled: true });
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} });
       expect(r.status).toBe(501);
-      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(false);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
     });
 
-    it.each([true, false])("continues Claude subscription opt-in to readiness (ready: %s)", async (ready) => {
+    it.each([true, false])("continues Claude subscription stage changes to readiness (ready: %s)", async (ready) => {
       const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
       const store = modules.agentConfigStore;
       await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
       expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
-        enabled: false, stages: { review: { model: "previous-model" } },
-      })).status).toBe(200);
+        stages: { review: { model: "previous-model" } },
+      }, readyDeps())).status).toBe(200);
       const previousConfig = store.getProjectStageConfig("APP");
       const revs = count("stage_agent_config_revisions");
       const inspect = vi.fn(async () => ready
         ? { status: "ready", profiles: [] }
         : { status: "not-ready", code: "runner_incompatible" });
       const r = await call("/api/mappings/APP/agent-config", "PUT", t, {
-        enabled: true,
         stages: { review: { agent: "claude", provider: "anthropic", accountProfileId: "cl-sub", model: "m" } },
       }, readyDeps(inspect));
       expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ projectKey: "APP" }),
         expect.objectContaining({ stages: expect.objectContaining({ review: expect.objectContaining({ accountProfileId: "cl-sub" }) }) }));
       expect(r.status).toBe(ready ? 200 : 409);
-      expect(store.getProjectOptIn("APP")).toBe(ready);
+      expect(store.isProjectConfigured("APP")).toBe(true);
       if (ready) {
         expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
         const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, readyDeps());
@@ -6852,13 +7142,86 @@ describe("model accounts and stage configuration (AII-962)", () => {
     });
   });
 
+  it.each([true, false, null, 0, "yes", {}, []])("refuses enabled without storing (%j)", async (enabled) => {
+    const t = await seed();
+    for (const mode of ["absent", "legacy", "configured"] as const) {
+      if (mode !== "absent") modules.agentConfigStore.setProjectStageConfig("APP", { version: 1, mode });
+      const before = count("stage_agent_config_revisions");
+      const row = modules.agentConfigStore.getProjectStageConfig("APP");
+      const result = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled });
+      expect(result).toMatchObject({ status: 400, json: { error: "unsupported field(s): enabled" } });
+      expect(count("stage_agent_config_revisions")).toBe(before);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")).toEqual(row);
+    }
+  });
+
+  it.each(["absent", "legacy", "configured"] as const)("stores stages preserving %s mode", async (mode) => {
+    const t = await seed();
+    if (mode !== "absent") modules.agentConfigStore.setProjectStageConfig("APP", { version: 1, mode });
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "override" } } }, readyDeps());
+    expect(result.status).toBe(200);
+    expect(result.json.mode).toBe(mode === "configured" ? "configured" : "legacy");
+  });
+
+  it.each([
+    { body: {}, status: 200 },
+    { body: { stages: {} }, status: 200 },
+    { body: { stages: null }, status: 400 },
+    { body: { stages: [] }, status: 400 },
+    { body: { stages: { unknown: {} } }, status: 400 },
+    { body: { mode: "configured" }, status: 400 },
+  ])("preserves other body validation: $body", async ({ body, status }) => {
+    const t = await seed();
+    const before = count("stage_agent_config_revisions");
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, body);
+    expect(result.status).toBe(status);
+    expect(count("stage_agent_config_revisions")).toBe(before + (status === 200 ? 1 : 0));
+  });
+
+  it.each(["configured", "legacy", "absent", "failure", "existing-legacy", "existing-configured"])("creates with defaults and project state %s", async (state) => {
+    const t = state === "absent" ? adminTok() : await seed();
+    const store = modules.agentConfigStore;
+    if (state === "legacy") store.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    if (state.startsWith("existing-")) store.setProjectStageConfig("NEW", { version: 1, mode: state === "existing-configured" ? "configured" : "legacy" });
+    if (state === "failure") await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const row = store.getProjectStageConfig("NEW");
+    const before = count("stage_agent_config_revisions");
+    const result = await request("/api/mappings", "POST", "secret", { teamKey: "NEW", owner: "org", repo: "new" }, t);
+    expect(result.statusCode).toBe(202);
+    const body = JSON.parse(result.body);
+    expect(config.getMappings().NEW).toBeDefined();
+    if (state === "configured") {
+      expect(store.getProjectStageConfig("NEW")).toMatchObject({ createdBy: null, config: { mode: "configured" } });
+      expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    } else {
+      expect(store.getProjectStageConfig("NEW")).toEqual(row);
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+    if (state === "failure") expect(body.warnings).toEqual(["Project saved in legacy mode: resolution-failed"]);
+    else expect(body.warnings).toBeUndefined();
+  });
+
+  it.each(["absent", "legacy", "configured"] as const)("mapping updates preserve %s with defaults on for every body", async (mode) => {
+    const t = await seed();
+    const store = modules.agentConfigStore;
+    if (mode !== "absent") store.setProjectStageConfig("APP", { version: 1, mode });
+    const before = count("stage_agent_config_revisions");
+    const row = store.getProjectStageConfig("APP");
+    for (const body of [{}, { enabled: true }, { enabled: false }, { agentConfig: { mode: "configured" } }]) {
+      const r = await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
+      expect(r.statusCode).toBe(202);
+      expect(store.getProjectStageConfig("APP")).toEqual(row);
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
   it("keeps ordinary mapping CRUD from touching agent configuration", async () => {
     const t = await seed();
     const store = modules.agentConfigStore;
     const body = { enabled: true, agentConfig: { mode: "configured" } };
     await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
     await request("/api/mappings/APP", "PATCH", "secret", body, t);
-    expect(store.getProjectOptIn("APP")).toBe(false);
+    expect(store.isProjectConfigured("APP")).toBe(false);
     expect(store.getProjectStageConfig("APP")).toBeNull();
   });
 
@@ -6999,6 +7362,139 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect(r.status).toBe(201);
       return t;
     }
+
+    it.each(["PUT", "DELETE"] as const)("orders overlapping operations while %s ingress response is delayed", async (first) => {
+      const t = await seedProfile();
+      if (first === "DELETE") expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const deps = first === "PUT" ? {
+        bindKey: async (ref: string, destination: string) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered(); await paused; return "bound" as const;
+        },
+      } : {
+        clearKeyBinding: async (ref: string) => {
+          const removed = dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes;
+          entered(); await paused; return removed;
+        },
+      };
+      const a = call(url("oai-1"), first, t, first === "PUT" ? { apiKey: KEY } : undefined, deps);
+      await started;
+      const second = first === "PUT" ? "DELETE" : "PUT";
+      const b = call(url("oai-1"), second, t, second === "PUT" ? { apiKey: KEY } : undefined);
+      const patch = call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      release();
+      expect((await a).status).toBe(200);
+      expect((await b).status).toBe(200);
+      expect((await patch).status).toBe(first === "DELETE" ? 409 : 200);
+      if (first === "DELETE") {
+        expect(store().resolve(REF)).toBe(KEY);
+        expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF)).toEqual({ destination: "openai/openai-api-key" });
+      } else expect(store().resolve(REF)).toBeNull();
+    });
+
+    it.each(["PUT", "PATCH"] as const)("a disconnected %s cannot stall mutations behind paused ingress", async (method) => {
+      const t = await seedProfile();
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const first = call(url("oai-1"), "PUT", t, { apiKey: KEY }, {
+        bindKey: async (ref, destination) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered();
+          await paused;
+          return "bound";
+        },
+      });
+      await started;
+      try {
+        // A partial request loses its socket while the earlier PUT waits on ingress.
+        // Its body reader must already be listening, outside the mutation queue.
+        const req = new MockRequest(method === "PUT" ? url("oai-1") : "/api/model-accounts/oai-1", method,
+          { authorization: `Bearer ${t}` });
+        req.removeAllListeners("newListener");
+        const res = new MockResponse();
+        admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await vi.waitFor(() => expect(req.listenerCount("data")).toBe(1));
+        req.emit("data", Buffer.from('{"'));
+        Object.assign(req, { destroyed: true, aborted: true });
+        req.emit("aborted");
+        req.emit("close");
+        await res.done;
+        expect(res.statusCode).toBe(400);
+
+        // A request that was destroyed before routing must also settle immediately.
+        const dead = new MockRequest(req.url!, method, { authorization: `Bearer ${t}` });
+        dead.removeAllListeners("newListener");
+        Object.assign(dead, { destroyed: true, aborted: true });
+        const deadRes = new MockResponse();
+        admin.handleAdminRequest(dead as never, deadRes as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await deadRes.done;
+        expect(deadRes.statusCode).toBe(400);
+      } finally {
+        release();
+      }
+      expect((await first).status).toBe(200);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      expect(store().resolve(REF)).toBe(KEY);
+      expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF))
+        .toEqual({ destination: "openai/openai-api-key" });
+    });
+
+    it.each(["conflict", "unavailable"] as const)("PUT fails closed on %s before storing", async (outcome) => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => outcome);
+      const r = await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey });
+      expect(r.status).toBe(outcome === "conflict" ? 409 : 503);
+      expect(bindKey).toHaveBeenCalledWith(REF, "openai/openai-api-key");
+      expect(count("model_protected_secrets")).toBe(0);
+    });
+
+    it.each(["binding", "legacy"])("PATCH refuses a provider change with a %s key and preserves revision", async (kind) => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      if (kind === "legacy") dedup.getDb().prepare("DELETE FROM key_bindings").run();
+      const before = count("model_account_profile_revisions");
+      const r = await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toContain("remove the stored key first");
+      expect(count("model_account_profile_revisions")).toBe(before);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "renamed", status: "disabled" })).status).toBe(200);
+    });
+
+    it("PATCH refuses a manually selected reference bound to another destination", async () => {
+      const t = await seedProfile();
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run("model-account:other", "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { credentialRef: "model-account:other" })).status).toBe(409);
+    });
+
+    it("PATCH refuses an auth mode change when only the binding remains", async () => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(REF, "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { authMode: "claude-subscription" })).status).toBe(409);
+    });
+
+    it("binds before writing and clears after deletion, returning a safe failure if clear fails", async () => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        return "bound" as const;
+      });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey })).status).toBe(200);
+      const clearKeyBinding = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        throw new Error(KEY);
+      });
+      const r = await call(url("oai-1"), "DELETE", t, undefined, { clearKeyBinding });
+      expect(r.status).toBe(503);
+      expect(r.raw).not.toContain(KEY);
+      expect(clearKeyBinding).toHaveBeenCalledWith(REF);
+    });
 
     it.each([
       { agent: "codex", provider: "openai", authMode: "openai-api-key" },
@@ -7183,6 +7679,11 @@ describe("model accounts and stage configuration (AII-962)", () => {
       expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(500);
       expect(count("model_protected_secrets")).toBe(0);
       spy.mockRestore();
+      expect(count("key_bindings")).toBe(1);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect(count("key_bindings")).toBe(0);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" })).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
     });
 
     it.each(["openai-api-key", "claude-subscription"])("refuses a non-admin with every page granted for %s", async (authMode) => {

@@ -46,6 +46,7 @@ export interface Job {
   sessionImage: string | null;
   phase: string;
   contract: string | null;
+  trigger?: string | null;
   /** True when the dispatch was a grouping parent's own closing-work run (chain ends at
    *  self). Lets the monitors treat a clean exit with no PR as Case-B finalize instead of
    *  pr_not_found (AII-264 r5). */
@@ -1087,6 +1088,7 @@ function mapRows(rows: RawRow[]): Job[] {
     sessionImage: (row.session_image as string | null) ?? null,
     phase: row.phase ?? "implementation",
     contract: row.contract ?? null,
+    trigger: row.trigger ?? null,
     groupingParent: row.grouping_parent === 1,
     approved: row.approved === 1,
     failure: parseFailureJson(row.failure_json),

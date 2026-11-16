@@ -573,7 +573,7 @@ describe("postPushReviewStep", () => {
               return {
                 stdout: "", exitCode, tokensUsed: 1,
                 terminalStatus: { subtype: "error_during_execution", isError: true },
-                telemetry: { ...NO_RESULT_TELEMETRY, costUsd: 1 },
+                telemetry: { ...NO_RESULT_TELEMETRY, costUsd: 1, ...(agentStage === "implementation" ? { outcome: "max_turns" as const } : {}) },
                 failure: {
                   category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: params.stage!, attempt: 1,
                   retryable: false, message: "All accounts exhausted", evidence: { llmErrorMessage: "exhausted profiles", truncated: false },
@@ -608,10 +608,15 @@ describe("postPushReviewStep", () => {
       });
     });
 
-    it.each([false, true])("commits and pushes a turn-capped fix and reviews again (configured stages: %s)", async (configured) => {
+    it.each([
+      { configured: false, exitCode: 0 },
+      { configured: false, exitCode: 1 },
+      { configured: true, exitCode: 0 },
+      { configured: true, exitCode: 1 },
+    ])("commits and pushes a turn-capped fix and reviews again (configured stages: $configured, exit: $exitCode)", async ({ configured, exitCode }) => {
       gitSpawn.mockClear();
       const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
-        ? { stdout: "partial fix", exitCode: 0, tokensUsed: 1,
+        ? { stdout: "partial fix", exitCode, tokensUsed: 1,
           terminalStatus: { subtype: "error_max_turns", isError: true },
           telemetry: { ...NO_RESULT_TELEMETRY, outcome: "max_turns" as const } }
         : structuredReviewResult(params.stage.endsWith("review-2") ? { approved: true, findings: [], summary: "ok", checks: [{ check: "Diff review", result: "passed", evidence: "Inspected the supplied diff." }] } : notApproved));
@@ -646,16 +651,19 @@ describe("postPushReviewStep", () => {
     });
 
     it.each([
-      { exitCode: 1, outcome: "max_turns" as const },
+      { exitCode: 1, outcome: "error" as const },
+      { exitCode: 1, outcome: "success" as const },
+      { exitCode: 1, outcome: undefined },
     ])("rejects fix errors with exit $exitCode and outcome $outcome", async ({ exitCode, outcome }) => {
       gitSpawn.mockClear();
       const invoke = vi.fn(async (params: any) => params.agentStage === "implementation"
         ? { stdout: "", exitCode, tokensUsed: 0,
           terminalStatus: { subtype: "error_during_execution", isError: true },
-          telemetry: { ...NO_RESULT_TELEMETRY, outcome } }
+          telemetry: outcome === undefined ? undefined : { ...NO_RESULT_TELEMETRY, outcome } }
         : structuredReviewResult(notApproved));
       const out = await run(makeCtx(invoke), 2);
       expect(out.terminationReason).toBe("fix_failed");
+      expect(gitSpawn.mock.calls.some(([args]) => args[0] === "commit")).toBe(false);
       expect(gitSpawn.mock.calls.some(([args]) => args[0] === "push")).toBe(false);
     });
 
@@ -4784,6 +4792,60 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).not.toBe("checks_permission_denied");
     expect(sleep.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(probes).toBeGreaterThan(1);
+  });
+
+  it.each(["failing", "unreadable"] as const)("omits earlier %s CI gate issues from reviewer history while retaining fix evidence", async (ciState) => {
+    let reviewCount = 0;
+    const checkName = "restate-tests-binary (2, 2)";
+    const gateTitle = ciState === "failing" ? "CI check failing" : "CI check status could not be verified";
+    const reviewerPrompts: string[] = [];
+    const fixPrompts: string[] = [];
+    const invoke = vi.fn(async ({ prompt }: { prompt: string }) => {
+      if (prompt.startsWith("You are fixing reviewer feedback")) {
+        fixPrompts.push(prompt);
+        return { stdout: '{"fixed":["Repaired defect"],"testing":[],"notes":""}', exitCode: 0, tokensUsed: 0 };
+      }
+      reviewerPrompts.push(prompt);
+      reviewCount++;
+      return structuredReviewResult({
+        approved: reviewCount > 1,
+        findings: reviewCount === 1 ? [{ severity: "blocking", body: "Ordinary reviewer defect in widget handling." }] : [],
+        summary: "Inspected widget behavior.",
+        checks: [{ check: "Diff review", result: "passed", evidence: "Inspected supplied diff." }],
+      });
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args.some(a => a.includes("/check-runs"))) {
+        // External-review probes succeed; only the separate CI gate read fails.
+        if (!args.includes("--paginate") && reviewCount === 1) {
+          if (ciState === "unreadable") return { stdout: "", exitCode: 1, stderr: "HTTP 500 Internal Server Error" };
+          return { stdout: JSON.stringify({ check_runs: [{ name: checkName, status: "completed", conclusion: "failure" }] }), exitCode: 0 };
+        }
+        return { stdout: JSON.stringify({ check_runs: [] }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const report = vi.fn(async () => undefined);
+    const out = await runReview(makeCtx(invoke), {
+      prNumber: "42", workspaceDir, maxIterations: 2, ghSpawn,
+      gitSpawn: vi.fn((args: string[]) => ({ stdout: args[0] === "status" ? "M file.ts\n" : args[0] === "rev-parse" && args[1] === "--abbrev-ref" ? "ai-implement/aii-200-x\n" : "", exitCode: 0 })),
+      reviewers: [{ id: "code-review", gates: true }],
+    }, { report });
+
+    expect(reviewerPrompts).toHaveLength(2);
+    expect(fixPrompts).toHaveLength(1);
+    expect(fixPrompts[0]).toContain(gateTitle);
+    if (ciState === "failing") expect(fixPrompts[0]).toContain(checkName);
+    expect(report).toHaveBeenCalledWith(expect.objectContaining({
+      id: "post-push-review.1", outputs: expect.objectContaining({
+        approved: false, blockingIssues: expect.arrayContaining([expect.objectContaining({ title: gateTitle })]),
+      }),
+    }));
+    expect(reviewerPrompts[1]).not.toContain(gateTitle);
+    expect(reviewerPrompts[1]).not.toContain(checkName);
+    expect(reviewerPrompts[1]).toContain("Ordinary reviewer defect in widget handling.");
+    expect(out.approved).toBe(true);
   });
 
   it("does not treat a CI check-runs read failure as 'no failing checks' (AII-736)", async () => {

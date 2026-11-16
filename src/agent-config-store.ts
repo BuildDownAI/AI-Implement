@@ -10,6 +10,7 @@ import {
   STAGE_NAMES,
   STORED_STAGE_SELECTION_FIELDS,
   validateFallbackModel,
+  validatePreferOpenModel,
   validateDefaultAccounts,
   validateAccounts,
   inspectStageAccounts,
@@ -31,17 +32,18 @@ export const ORCHESTRATOR_SCOPE_KEY = "default";
 export type AccountProfileStatus = "active" | "disabled" | "archived";
 
 const AGENTS: readonly StageAgent[] = ["claude", "codex"];
-const PROVIDERS: readonly ModelProvider[] = ["anthropic", "bedrock", "openai"];
+const PROVIDERS: readonly ModelProvider[] = ["anthropic", "bedrock", "openai", "openrouter"];
 const AUTH_MODES: readonly AccountAuthMode[] = [
   "anthropic-api-key",
   "bedrock",
   "claude-subscription",
   "openai-api-key",
   "codex-subscription",
+  "openrouter-api-key",
 ];
 const AUTH_COMBINATIONS: Record<StageAgent, Partial<Record<ModelProvider, readonly AccountAuthMode[]>>> = {
-  claude: { anthropic: ["anthropic-api-key", "claude-subscription"], bedrock: ["bedrock"] },
-  codex: { openai: ["openai-api-key", "codex-subscription"] },
+  claude: { anthropic: ["anthropic-api-key", "claude-subscription"], bedrock: ["bedrock"], openrouter: ["openrouter-api-key"] },
+  codex: { openai: ["openai-api-key", "codex-subscription"], openrouter: ["openrouter-api-key"] },
 };
 
 /** Public projection. Never carries metadata, credential references, keys or session state. */
@@ -195,6 +197,7 @@ function assertConfigShape(config: StageAgentConfigurationV1, name: string): voi
       if (name === "projectConfig") throw new Error("accounts is only supported in orchestrator defaults");
       validateAccounts(patch.accounts, stage);
     }
+    validatePreferOpenModel(patch, stage, name === "projectConfig");
     validateFallbackModel(patch.fallbackModel, stage);
     if (Object.keys(patch).some((f) => !(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(f))) {
       throw new Error(`${name}.stages.${stage} contains unknown key(s)`);
@@ -531,7 +534,7 @@ export function getProjectStageConfig(projectKey: string): StoredStageConfig | n
   return row ? toStored(row) : null;
 }
 
-/** Sets one stage field to null so it inherits the orchestrator default again; appends a revision. */
+/** Clears a stage override (removes optional project metadata); appends a revision. */
 export function clearProjectStageField(
   projectKey: string,
   stage: StageName,
@@ -541,6 +544,9 @@ export function clearProjectStageField(
   assertNonEmptyProjectKey(projectKey);
   if (!(STAGE_NAMES as readonly string[]).includes(stage)) throw new Error("unknown stage");
   if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) throw new Error("unknown stage field");
+  if (field === "preferOpenModel" && stage !== "implementation") {
+    throw new Error("preferOpenModel is only supported in project implementation settings");
+  }
   const db = getDb();
   return db
     .transaction(() => {
@@ -550,30 +556,32 @@ export function clearProjectStageField(
         ...current,
         stages: { ...current.stages, [stage]: { ...current.stages?.[stage], [field]: null } },
       };
+      if (field === "preferOpenModel") delete next.stages![stage]!.preferOpenModel;
+      assertConfigShape(next, "projectConfig");
       if (next.mode === "configured") assertProjectResolves(db, next);
       return appendConfig(db, "project", projectKey, next, createdBy);
     })
     .immediate();
 }
 
-/** Opt-in is the project config `mode`; absent project config means not opted in. */
-export function getProjectOptIn(projectKey: string): boolean {
+/** A project is configured when its config `mode` is configured; absent config means false. */
+export function isProjectConfigured(projectKey: string): boolean {
   return parseConfig(latestConfigRow(getDb(), "project", projectKey))?.mode === "configured";
 }
 
-export function setProjectOptIn(projectKey: string, optedIn: boolean, createdBy: string | null = null): boolean {
+export function setProjectConfigured(projectKey: string, configured: boolean, createdBy: string | null = null): boolean {
   assertNonEmptyProjectKey(projectKey);
-  if (typeof optedIn !== "boolean") throw new Error("optedIn must be a boolean");
+  if (typeof configured !== "boolean") throw new Error("configured must be a boolean");
   const db = getDb();
   return db
     .transaction(() => {
       const current = parseConfig(latestConfigRow(db, "project", projectKey));
-      const currentlyOptedIn = current?.mode === "configured";
-      if (currentlyOptedIn === optedIn) return optedIn;
-      const next: StageAgentConfigurationV1 = { ...(current ?? LEGACY_CONFIG), mode: optedIn ? "configured" : "legacy" };
-      if (optedIn) assertProjectResolves(db, next);
+      const currentlyConfigured = current?.mode === "configured";
+      if (currentlyConfigured === configured) return configured;
+      const next: StageAgentConfigurationV1 = { ...(current ?? LEGACY_CONFIG), mode: configured ? "configured" : "legacy" };
+      if (configured) assertProjectResolves(db, next);
       appendConfig(db, "project", projectKey, next, createdBy);
-      return optedIn;
+      return configured;
     })
     .immediate();
 }

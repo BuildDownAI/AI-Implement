@@ -7,7 +7,7 @@ import { getMappings, type RepoMapping } from "../config.js";
 import { acquire, read } from "../dispatch-admission.js";
 import { isParked } from "../dispatch-breaker.js";
 import { confirmCommentGapfillLaunch, getCommentGapfillLaunch, stageCommentGapfillLaunch, rejectCommentGapfillLaunch, CONFLICT_COMMENTER, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
-import { buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
+import { rollupReviewMode, buildCommentGapfillInstruction, gapfillAccounting, resolveManagedDecision } from "../comment-gapfill-drain.js";
 import { listOpenReviewFindings } from "../review-ledger-store.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, getClaimedRunIds, updateJobPrUrl, attachJobRunIdIfMissing, updateJobStatus, suppressStaleNotifications, setJobMachineId } from "../log.js";
 import { getInstallationToken, getScopedInstallationToken } from "../github-app-auth.js";
@@ -23,6 +23,7 @@ import { mintLaunchTokens, implementationTtlSeconds } from "../runner-tokens.js"
 import { dispatchLocalGapfill } from "../local-gapfill.js";
 import { findLocalContainerIdByName } from "../local-docker.js";
 import { listMachines } from "../fly-machines.js";
+import { resolveSessionImage } from "../repo-image.js";
 import { getRetryPolicy } from "../orchestrator-settings.js";
 
 // Kept private, as in implementation-launch: child credentials must be repository scoped.
@@ -197,6 +198,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
       let prepared!: Awaited<ReturnType<typeof prepareGhaGapfillLaunch>>;
       let tokens: ReturnType<typeof mintLaunchTokens> | undefined;
       let commentInstruction: string | undefined;
+      let reviewOnly: import("../run-config.js").RunConfigV1["reviewOnly"];
       let ghToken: string;
       let mapping: RepoMapping;
       const issue: { issueId: string; issueIdentifier: string; issueTitle?: string } = { issueId: run.issueId, issueIdentifier: run.issueIdentifier };
@@ -204,6 +206,18 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         const target = initialTarget(run);
         mapping = target.mapping;
         const { item } = target;
+        reviewOnly = rollupReviewMode(item.commenter, mapping);
+        // Only the image paired with this orchestrator is known to honor reviewOnly.
+        // Local Docker builds its runner alongside the orchestrator.
+        if (reviewOnly && run.backend !== "local-docker") {
+          const image = await resolveSessionImage({ owner: mapping.owner, repo: mapping.repo,
+            token: await getTargetRepoToken(config, mapping.owner, mapping.repo), defaultImage: config.sessionImage });
+          if (image.source !== "default") {
+            console.log(`[comment-gapfill] Roll-up review for ${gap.repository} PR #${gap.prNumber} skipped: runner image is not paired with the orchestrator`);
+            markCommentGapfillProcessed(item.id, "skipped");
+            return { outcome: "rejected" };
+          }
+        }
         if (run.backend !== "github-actions") {
           const backendLabel = run.backend === "fly-machines" ? "Fly Machines" : "local Docker";
           const reason = run.backend === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)
@@ -243,13 +257,13 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
           return { outcome: "rejected" };
         }
         decision = resolved;
-        commentInstruction = buildCommentGapfillInstruction(item.instruction, item.commenter === CONFLICT_COMMENTER ? [] : listOpenReviewFindings(gap.repository, gap.prNumber).map(f => ({
+        commentInstruction = buildCommentGapfillInstruction(item.instruction, (item.commenter === CONFLICT_COMMENTER || reviewOnly) ? [] : listOpenReviewFindings(gap.repository, gap.prNumber).map(f => ({
           finding_key: f.findingKey, source: f.source, severity: f.severity, path: f.path ?? null, line: f.line ?? null, body: f.body, url: f.url ?? null,
         })));
         tokens = config.runnerCallbackBaseUrl && config.runnerTokenSecret ? mintLaunchTokens({ issueId: run.issueId, mappingTeamKey: run.teamKey, phase: "gap-analysis", dispatchId: run.dispatchId,
           repository: gap.repository, ttlSeconds: implementationTtlSeconds(mapping.maxJobMinutes), secret: config.runnerTokenSecret }) : undefined;
         ghToken = run.backend === "github-actions" ? await token(mapping.owner) : await getTargetRepoToken(config, mapping.owner, mapping.repo);
-        if (run.backend === "github-actions") prepared = await prepareGhaGapfillLaunch({ mapping, issue, item, ghToken, decision,
+        if (run.backend === "github-actions") prepared = await prepareGhaGapfillLaunch({ mapping, issue, item, ghToken, decision, reviewOnly,
           runnerCallbackBaseUrl: config.runnerCallbackBaseUrl, runnerCallbackUrl: config.runnerCallbackBaseUrl ?? "",
           runToken: tokens?.runToken ?? "", runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,
           commentInstruction, resolveRunnerImage: (m, t) => input.resolveRunnerImage(config, m, t), checkContract: resolveWorkflowCapabilities });
@@ -286,7 +300,7 @@ export function createImplementationGapfillDependencies(input: ImplementationRun
         };
         let machineId: string;
         try {
-          const common = { mapping, prNumber: gap.prNumber, githubToken: ghToken,
+          const common = { mapping, reviewOnly, prNumber: gap.prNumber, githubToken: ghToken,
             runName: `gap-fill-${run.dispatchId}`, dispatchId: run.dispatchId,
             runnerCallbackUrl: config.runnerCallbackBaseUrl ?? "", runToken: tokens?.runToken ?? "",
             runProgressToken: tokens?.runProgressToken ?? "", runPublicationToken: tokens?.runPublicationToken,

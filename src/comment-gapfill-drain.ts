@@ -1,3 +1,5 @@
+import { ROLLUP_REVIEW_COMMENTER } from "./comment-gapfill-queue.js";
+import { resolveReviewerSelection } from "./config.js";
 import { createImplementationRunIngressClient, type ImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { restateCanServe } from "./restate/status.js";
 import { normalizeGithubActionsJobTimeoutMinutes } from "./github-actions-watchdog.js";
@@ -335,6 +337,11 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         // The PR's own run still in flight: canDispatch's in_flight refusal below leaves
         // the item pending, and a later drain retries it once the run sets pr_url.
         if (!prLog) prLog = resolveInFlightDispatch(item.owner, item.repo, headRef);
+        if (!prLog && item.commenter === ROLLUP_REVIEW_COMMENTER) {
+          console.log(`[comment-gapfill] Roll-up review for ${fullRepo} PR #${item.prNumber} skipped: no parent dispatch log`);
+          markCommentGapfillProcessed(item.id, "skipped");
+          continue;
+        }
         if (!prLog) {
           console.warn(`[comment-gapfill] No dispatch log for ${fullRepo} PR #${item.prNumber}`);
           await opts.postComment(
@@ -368,7 +375,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
 
       const prBudget = resolvePrDispatchBudget(mapping);
-      const humanRequested = item.commentId > 0;
+      const humanRequested = item.commentId > 0 && item.commenter !== ROLLUP_REVIEW_COMMENTER;
       const gateDecision = canDispatch({
         issueId: prLog.issueId,
         kind: "gap-fill",
@@ -437,4 +444,13 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       markCommentGapfillProcessed(item.id, "failed");
     }
   }
+}
+
+/** Advisory roll-up review selection; project authority is retained for trusted resolution only. */
+export function rollupReviewMode(commenter: string, mapping: RepoMapping) {
+  if (commenter !== ROLLUP_REVIEW_COMMENTER) return undefined;
+  const reviewers = new Map(resolveReviewerSelection(mapping)
+    .filter(r => r.gates).map(r => [r.id, r]));
+  reviewers.set("integration-review", { id: "integration-review", gates: true });
+  return { reviewers: [...reviewers.values()] };
 }

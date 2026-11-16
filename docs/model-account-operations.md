@@ -13,8 +13,10 @@ On Models & providers an admin adds a profile with the form (`POST /api/model-ac
 |---|---|
 | Name | A label for the account behind the profile, stored as `identity`. Nothing at run time depends on it, and it can be changed later |
 | Agent | `claude` or `codex` |
-| Provider | `anthropic`, `openai` or `bedrock` |
-| Authentication | `anthropic-api-key`, `openai-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
+| Provider | `anthropic`, `openai`, `openrouter` or `bedrock` |
+| Authentication | `anthropic-api-key`, `openai-api-key`, `openrouter-api-key`, `codex-subscription`, `claude-subscription` or `bedrock` |
+
+To add OpenRouter, enter a Name, choose either `claude` or `codex` as Agent, `openrouter` as Provider and `openrouter-api-key` as Authentication, then click **Add account profile**. In its row, enter the key and click **Set key**; use the same control to replace it or **Remove key** to delete it. The badge shows **set** after saving; the saved key is never displayed. OpenRouter has no environment credential to import. Select the profile in Orchestrator stage defaults or the project's Agents tab; the model field takes an OpenRouter model ID (for example, `anthropic/claude-sonnet-4`). Illegal combinations show the server's validation error and leave the form values available to correct.
 
 The page makes the profile ID from the Name: lowercase, each run outside `[a-z0-9._-]` replaced by `-`, leading and trailing hyphens removed, then leading punctuation removed so the ID starts with a letter or digit. It cuts the result to 64 characters and uses `account` when nothing is left. When an ID is loaded already, it adds `-2`, `-3`, …, shortening the base so the entire ID stays within 64 characters. If another admin creates the same ID before submission, the form shows the route's error message.
 
@@ -27,7 +29,7 @@ The table reads Name, Agent, Provider, Authentication, Status, Readiness and API
 The admin-only route may accept `identity`, `agent`, `provider`, `authMode`, `credentialRef` and `status`; any other key is a 400. It copies the current head, applies the body, and saves a new revision (`handlePatchModelAccount`, `src/admin.ts`). The credential reference is kept unless the body sets `credentialRef` to `null`. The profile ID is the path and cannot change: stage defaults, credential references and run attribution store it. The same validation as create applies (`validateProfileInput`, `src/agent-config-store.ts`).
 
 - **Readiness.** Credential readiness comes from the profile's own credential status (`accountStatus`, `src/admin.ts`), whether or not any project uses it. Every active profile is usable by every project; disable or archive a profile to stop its use.
-- **Every stage needs a profile.** A project that opts into configured runs needs a usable profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown, disabled or archived profile, or one whose agent or provider does not match the stage, throws. A project that wants Codex only for review must still give planning and implementation a profile.
+- **Every stage needs a profile.** A configured project needs a usable profile for each of planning, implementation and review (`STAGE_NAMES` loop in `resolveStageAgentConfig`, `src/agent-config.ts`). A stage with an unknown, disabled or archived profile, or one whose agent or provider does not match the stage, throws. A project that wants Codex only for review must still give planning and implementation a profile.
 
 ## ChatGPT plan accounts
 
@@ -119,13 +121,32 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 
   A Bedrock credential is a JSON object on stdin with `region`, `accessKeyId`, `secretAccessKey` and optional `sessionToken`. Stdin that parses as a JSON object is always read as a bundle, so an API key that is itself JSON object text cannot be imported. The reference must match `model-account:` followed by lowercase letters, digits, `.`, `_` or `-`. A bad reference or value, or an unset `RUNNER_TOKEN_SECRET`, fails before anything is written.
 - **Replace.** Importing again to the same reference overwrites the stored value.
-- **Delete.** `node dist/model-account-cli.js secret-delete --ref model-account:team-key` removes the row and succeeds when none exists. Afterwards the profile prepares as `authentication-required`.
+- **Delete.** `node dist/model-account-cli.js secret-delete --ref model-account:team-key` refuses a key that was stored on Models & providers and has a destination binding; remove it there or with `DELETE /api/model-accounts/:id/credential`. For an unbound key, it removes the row and succeeds when none exists. Afterwards the profile prepares as `authentication-required`.
 - **Backup and restore.** Rows are sealed under a key derived from the current `RUNNER_TOKEN_SECRET` and bound to their reference. A restored database works only under the same secret, and a row copied to another reference fails authentication.
 - **Rotation.** Rotating `RUNNER_TOKEN_SECRET` orphans every stored credential. Re-import each one after the rotation.
+
+### OpenRouter API credentials
+
+`OPENROUTER_API_KEY` is a reserved name; do not use it in a project's Extra Env or as a forwarded secret name.
+
+For an `openrouter-api-key` profile, the selected model environment contains these four values:
+
+| Variable | Value |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | `https://openrouter.ai/api` |
+| `ANTHROPIC_AUTH_TOKEN` | The selected API key |
+| `ANTHROPIC_API_KEY` | Empty string |
+| `OPENROUTER_API_KEY` | The selected API key |
+
+The endpoint is fixed in code; inherited endpoints and credentials cannot override it. Claude Code uses the bearer token, with the Anthropic API key explicitly empty. Codex reads `OPENROUTER_API_KEY` through its dedicated OpenRouter provider. Other auth modes receive neither the OpenRouter key nor the Anthropic base URL. Configured repository processes (install, setup, verify and teardown) receive neither the key nor the endpoint.
+
+The model name passes through unchanged: use an OpenRouter model ID such as `anthropic/<model>`. Environment tests cover construction and stripping; a post-landing operator run against the pinned Claude Code version remains the integration proof.
 
 ### API keys and Codex stages
 
 An `openai-api-key` profile works for every Codex stage, including review and planning, which run `codex app-server`. The invocation env carries the key as `CODEX_API_KEY`. `codex exec` reads that variable directly. The app-server path has no `auth.json`, and its built-in `openai` provider does not read the variable, so the executor selects a provider named `openai_api_key` whose `env_key` is `CODEX_API_KEY` (`base_url` is `OPENAI_BASE_URL` when the invocation sets an allowed one, else `https://api.openai.com/v1`). The provider is chosen the same way in the view's `config.toml`, the argv and the thread request. `CODEX_API_KEY` stays in the shell-environment exclusion list, so the Codex process has the key and the commands the model runs do not. A run without `CODEX_API_KEY` in its env keeps the built-in provider.
+
+An `openrouter-api-key` profile selects the `openrouter` provider (`name = "OpenRouter"`) for both `codex exec` and `codex app-server` (planning and review), including the generated `config.toml` and thread request. Its fixed code endpoint is `https://openrouter.ai/api/v1`, with `env_key = "OPENROUTER_API_KEY"`, `wire_api = "responses"`, `requires_openai_auth = false` and `supports_websockets = false`. The model ID passes unchanged, for example `openai/<model>` or an open model ID. The URL never travels through `OPENAI_BASE_URL`; that variable still permits only the existing local test endpoints. `OPENROUTER_API_KEY` and the shared invocation environment’s `ANTHROPIC_AUTH_TOKEN` alias are excluded from model-run shell commands. Live compatibility with the pinned Codex requires an operator test; the unknown-model metadata warning for non-OpenAI models is accepted.
 
 ## Check which profile a run used
 
@@ -165,7 +186,7 @@ The supported setup-token checkout shape is `{ kind: "claude-oauth-token", token
 The admin tool `import_environment_credential` (no arguments, through MCP or
 `POST /api/tools/import_environment_credential` with `{ "args": {} }`) imports the
 credential as an ordinary account profile named `Adopted environment credential`.
-It does not change stage defaults, project grants, or project opt-ins. Repeating
+It does not change stage defaults, project grants, or project modes. Repeating
 the import returns `already-imported` (200) without writing when the stored
 credential opens. If the stored credential is missing or unreadable, the tool
 reseals the value from the current orchestrator environment and returns `created`
@@ -183,7 +204,7 @@ The command creates `adopted-env-claude-subscription` or
 `model-account:<profile-id>` reference, and configures planning, implementation
 and review with that profile, agent `claude`, provider `anthropic` and the built-in
 `DEFAULT_MODEL`. Each stage uses 90 minutes because configured stages require a
-timeout. It creates no project grants and opts no project into configured runs.
+timeout. It creates no project grants and changes no existing project mode.
 
 Output lists each stage and profile id, never the credential. Existing configured
 defaults are a no-op, including when the environment no longer has the credential;
@@ -194,10 +215,11 @@ when existing defaults reference it. Identifier or reference collisions fail wit
 changes. Adoption writes are atomic.
 
 Verify with authenticated `GET /api/agent-defaults`: `configured` is true, `mode`
-is `configured`, and all three stages name the adopted profile. Projects still
-need their own explicit opt-in. To roll back, revert the defaults and delete the
-profile on Models & providers; remove its encrypted credential with `secret-delete`
-if it is no longer needed. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
+is `configured`, and all three stages name the adopted profile. New projects start configured when defaults are on; existing projects keep their mode. To roll back, revert the defaults and delete the
+profile on Models & providers; if its encrypted credential is no longer needed,
+remove it with `secret-delete` while it remains unbound. If a later key save on
+Models & providers established a binding, remove the key there or with
+`DELETE /api/model-accounts/:id/credential` before deleting the profile. Rotating `RUNNER_TOKEN_SECRET` requires re-importing it
 with `secret-import`, the profile's credential editor, or
 `import_environment_credential` when the credential is still available in the
 orchestrator environment. The tool and `adopt-env` share the same import and
@@ -208,7 +230,7 @@ credential.
 
 ## Adopting existing projects
 
-Existing projects remain legacy until an operator runs `adopt-projects`:
+Existing projects keep their mode. To configure projects without a stored row, an operator can run `adopt-projects`; for a stored legacy row, use `set_project_agent_mode`:
 
 ```bash
 npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --dry-run
@@ -217,13 +239,32 @@ npx tsx --env-file-if-exists=.env src/model-account-cli.ts adopt-projects --proj
 
 Run `adopt-env` first to establish configured defaults. Each project line reports the outcome and each stage's model and source. Adoption reads `.ai-implement/config.yml`, `WORKFLOW.md` and `PLANNING.md` at one commit resolved from the configured dispatch branch (`mapping.defaultBranch`). Implementation and review prefer `models.implement` / `models.review`, then observable `mapping.extraEnv.CLAUDE_MODEL` on Fly/local, then WORKFLOW front matter. Planning prefers that mapping model on Fly/local, then PLANNING front matter. Legacy GitHub Actions does not receive mapping Extra Env, so adoption ignores it on that backend. Shadow implementation/review must resolve the same model on both backends; a difference reports `model_conflict` with the stage, backend values and sources, and skips the project without writes. Shadow planning uses GitHub Actions only. Stages without a repository model retain the legacy `DEFAULT_MODEL` fallback (shown as `DEFAULT_MODEL` in the report). Each effective legacy model becomes a stage override when it differs from configured defaults; matching models need no override. If repository reads fail, the report says “model not carried” and all stages inherit defaults.
 
-Runner-only environment settings (for example, Fly secrets, image environment, or GitHub Actions variables/secrets) are not observable through these readers. Adoption cannot preserve those unknown model overrides; inspect the preview against your runner configuration before opting in. The command does not read credentials or guess their values.
+Runner-only environment settings (for example, Fly secrets, image environment, or GitHub Actions variables/secrets) are not observable through these readers. Adoption cannot preserve those unknown model overrides; inspect the preview against your runner configuration before adopting projects. The command does not read credentials or guess their values.
 
-Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and explicit legacy opt-outs are skipped. After readiness, adoption rechecks that branch head before synchronously revalidating local inputs and writing. An observed push or disappeared branch reports `inputs_changed`; retry to inspect the new snapshot. A failed final revision check reports `repository_unavailable` without writing or replacing the checked candidate. Dry-run uses the same guard. This last GitHub observation does not lock remote pushes: a push after it is a later repository change. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
+Readiness must pass for every effective execution backend, including both shadow backends. Failed checks are reported by code. Dry-run performs the same inspection without writes. Already configured projects and projects with stored legacy rows are skipped. After readiness, adoption rechecks that branch head before synchronously revalidating local inputs and writing. An observed push or disappeared branch reports `inputs_changed`; retry to inspect the new snapshot. A failed final revision check reports `repository_unavailable` without writing or replacing the checked candidate. Dry-run uses the same guard. This last GitHub observation does not lock remote pushes: a push after it is a later repository change. Repeating the command is safe; changes during inspection refuse the guarded write. Every active account profile remains usable by every project; adoption changes no profiles or credentials.
 
-After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, write an explicit legacy row on the project's **Agents** tab; future adoption runs preserve that opt-out.
+After adoption, gap-fill runs read the snapshot, not config.yml at the PR head. Repository model changes no longer select a configured run's model. To roll back, use the admin tool `set_project_agent_mode` with mode `legacy`; future adoption runs preserve that mode.
 
 
 ### Stage fallback accounts
 
 On Models & providers, use Add account and Move up/Move down in the Orchestrator stage defaults card, then Save. This sets the stage's ordered `accounts: [{ accountProfileId, model }]` list in the stage defaults configuration (see [stage agent configuration](stage-agent-configuration.md)). The first account is primary; later accounts are fallback candidates, in order. Profiles must be configured and authorized in the run grant. Implementation and review switch once per account after a usage limit, preserving workspace changes and reporting the account that actually ran. Planning does not switch. Exhaustion names all exhausted profile ids; a checkout failure stops with its own authentication or recovery error.
+
+OpenRouter profiles use provider `openrouter` and auth mode `openrouter-api-key` with either `claude` or `codex`, on every backend. Create the profile and set its write-only key on Models & providers (see [Add an account profile](#add-an-account-profile)). OpenRouter is a paid API mode, so it cannot follow a subscription in an account list. Claude Code routing uses the environment described in [OpenRouter API credentials](#openrouter-api-credentials); Codex routing is delivered ([AII-1893](https://linear.app/eudoxus/issue/AII-1893/send-codex-through-openrouter-for-an-openrouter-account)).
+
+A provider or auth mode change requires removing the stored key first. Delete the credential,
+PATCH the profile, then store the key for its new destination. See [Stored key safety](key-safety.md).
+
+## Roll back after OpenRouter
+
+Complete these steps in order before deploying code from before OpenRouter support:
+
+1. On each project, clear **Use the open model for implementation** and save. Then, for every stored project config containing `stages.implementation.preferOpenModel`, remove that key entirely: in a maintenance script using the current code and the orchestrator database, call `clearProjectStageField(projectKey, "implementation", "preferOpenModel")` from `src/agent-config-store.ts`. Verify with `getProjectStageConfig(projectKey)` that the key is absent. Unchecking saves `false`; neither `false` nor `null` removes the key. This preference is inactive in current runs, but older code rejects the unknown key during shape validation (see [Open-model preference](stage-agent-configuration.md#open-model-preference-inactive-stub)).
+2. Remove each OpenRouter account from the orchestrator stage defaults and from each project.
+3. For each OpenRouter account, including disabled and archived accounts, remove its key with `DELETE /api/model-accounts/:id/credential`.
+4. For each OpenRouter account, including disabled and archived accounts, use `PATCH /api/model-accounts/:id` to set a provider and auth mode the old code knows, with `status: "disabled"`:
+   - For a `claude` profile: `{ "provider": "anthropic", "authMode": "anthropic-api-key", "status": "disabled" }`.
+   - For a `codex` profile: `{ "provider": "openai", "authMode": "openai-api-key", "status": "disabled" }`.
+5. Then deploy the old code.
+
+Step 4 is necessary because a disabled OpenRouter profile still stops the old resolver: it validates every stored profile head, including disabled and archived accounts. Remove the key before changing its provider or auth mode because the stored key is bound to its destination. This procedure comes from code reading and was not run against the old code.

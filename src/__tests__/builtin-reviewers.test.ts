@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import {
   BUILTIN_REVIEWER_VERDICT_SCHEMA,
   resolveReviewer,
@@ -22,6 +23,36 @@ function keys(definition: ReviewerDefinition): string[] {
 }
 
 describe("built-in reviewers", () => {
+  it("keeps the default selection unchanged", () => {
+    expect(DEFAULT_REVIEWER_SELECTION).toEqual([
+      { id: "gap-analysis", gates: true },
+      { id: "code-review", gates: true },
+    ]);
+  });
+
+  it("integration-review traces cross-file contracts and reports evidence honestly", async () => {
+    const reviewer = await resolveReviewer("integration-review", { customRoot: "/workspace", existsSyncImpl: () => false });
+    expect(reviewer?.outputSchema).toBe(BUILTIN_REVIEWER_VERDICT_SCHEMA);
+    expect(keys(reviewer!)).toEqual(["buildPrompt", "id", "outputSchema"]);
+    expect(reviewer?.maxTurns).toBeUndefined();
+    const prompt = reviewer!.buildPrompt(input);
+    for (const text of [
+      "each value, field, row, status, or failure code that the diff writes",
+      "every reader, inside and outside the",
+      "contracts that two parts of the diff change in different ways",
+      "each changed return and failure path to what consumes the result",
+      "merge commits from the base for dropped or duplicated changes",
+      "If merge evidence is", 'result="not_verified"',
+      "No style nits", "self-contained and immediately actionable",
+      "findings[] as the only internal finding list",
+      "top-level checks JSON array and a concise plain-prose summary even when approved",
+      "Distinguish inspecting test source from executing",
+      "On follow-up reviews, first verify every previous issue is fixed",
+      input.issueIdentifier, input.issueTitle, input.prNumber,
+      input.issueDescription, input.diff, input.previousFindings,
+    ]) expect(prompt).toContain(text);
+  });
+
   it("resolves the gap-analysis and code-review built-ins", async () => {
     await expect(resolveReviewer("gap-analysis", { customRoot: "/workspace", existsSyncImpl: () => false }))
       .resolves.toMatchObject({ id: "gap-analysis" });

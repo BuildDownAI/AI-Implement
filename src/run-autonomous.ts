@@ -1,3 +1,4 @@
+import { commentInstructionReviewRubric } from "./pipeline/feedback-loop-core.js";
 import type { RunModelPrices } from "./run-config.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
@@ -50,7 +51,7 @@ import {
 } from "./model-auth-client.js";
 import { EXECUTION_POLICY_ENV, MODEL_AUTH_BACKENDS, MODEL_AUTH_ENV, type ModelAuthBackend, type ModelAuthFinishHandling } from "./model-auth-contract.js";
 import { STAGE_NAMES } from "./agent-config.js";
-import { AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
+import { ACCOUNT_FALLBACK_CODES, AgentRecoveryRequiredError, createStageExecutor, type StageExecutorOptions } from "./pipeline/stage-executor.js";
 import { CodexRecoveryRequiredError } from "./pipeline/codex-executor.js";
 import type { ReviewFixMetadataV1, ReviewFixResultMetadataV1 } from "./review-fix-contract.js";
 import { ActivityReporter, type ActivityDetailValue } from "./pipeline/activity-reporter.js";
@@ -451,6 +452,7 @@ export interface ResolvedRunnerInputs {
   issueIdentifier: string;
   issueTitle: string;
   issueDescription: string;
+  reviewOnly?: import("./run-config.js").RunConfigV1["reviewOnly"];
   prNumber: string;
   commentInstruction: string | null;
   runnerPhase: "implementation" | "gap-analysis";
@@ -697,6 +699,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     sensitiveFiles: cfg.sensitiveFiles,
     dependencyTokenScope: cfg.dependencyTokenScope,
     referenceRepos: cfg.referenceRepos,
+    reviewOnly: cfg.reviewOnly,
     reviewers: validReviewerSelectionArray(cfg.reviewers) ? cfg.reviewers : DEFAULT_REVIEWER_SELECTION,
     reviewProcess: cfg.reviewProcess ?? "ai-implement",
     trustedReviewAuthors: cfg.trustedReviewAuthors ?? [],
@@ -1260,6 +1263,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     claudeModel,
     groupingParent,
     retryPolicy,
+    reviewOnly,
     reviewFix,
     agentConfig,
     modelPrices,
@@ -1273,7 +1277,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     options: opts.configured,
   });
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
-  const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewers);
+  const trustedReviewerDefinitions = await resolveTrustedReviewerDefinitions(reviewOnly?.reviewers ?? reviewers);
 
   // Planning context is fetched from the orchestrator's provider-agnostic
   // endpoint using the reusable progress token — the runner never calls the
@@ -1361,6 +1365,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       workspaceDir,
       planningContext,
       implementationPrompt,
+      reviewRubric: commentInstructionReviewRubric(commentInstruction),
       prNumber,
       githubOwner,
       githubRepo,
@@ -1376,6 +1381,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       sensitiveFiles,
       dependencyTokenScope,
       referenceRepos,
+      reviewOnly,
       reviewers,
       reviewProcess,
       trustedReviewAuthors,
@@ -1425,6 +1431,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 
     referenceRepoResults = readReferenceRepoResults();
 
+    if (reviewOnly) {
+      const review = context.getOutputs("feedback-loop");
+      await reportRunnerResult(undefined, null, process.env, {
+        workspaceDir, phase: runnerPhase, outcome: review.terminationReason === "review_error" ? "failure" : "success",
+        reviewOnly: true, internalFindings: review.internalFindings as import("./pipeline/review-ledger.js").ReviewLedgerFinding[],
+        rollupReview: review.rollupReview as { headSha: string; verdictUrl: string },
+        callbackUrl, retryPolicy, fetchImpl: opts.fetchImpl,
+      });
+      runCompleted = true;
+      return { exitCode: 0 };
+    }
     const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
     const postPushReviewOutputs = context.getOutputs("post-push-review");
@@ -1490,9 +1507,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       // The change was approved but dependencies never installed — build and tests
       // never ran, so this must not report success or carry the runner-approval mark
       // that lets feature-branch child PRs auto-merge unverified. Report a coded
-      // failure instead, mirroring the REVIEW_UNAPPROVED path below but skipping the
-      // autopsy (AII-823's install comment covers it) while keeping exitCode 0 so the
-      // GHA job stays green with a warning.
+      // failure instead, including the shared autopsy for ticket and PR reporting,
+      // while keeping exitCode 0 so the GHA job stays green with a warning.
       if (dependenciesMissing(context)) {
         const installRetryOutputs = context.getOutputs("install-retry");
         const installMethod =
@@ -1513,6 +1529,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
           `::warning::AI-Implement: dependency install failed — ` +
             (prUrl ? `${prKind} opened: ${prUrl}` : prNumber ? `gap-fill on PR #${prNumber}` : "no PR opened"),
         );
+        writeRunAutopsy(workspaceDir, {
+          issueIdentifier,
+          terminationReason: "install_failed",
+          iterations: typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : 0,
+          finalFeedback: failureReason,
+          passes: Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [],
+          prUrl,
+          existingPrUrl: prNumber ? `https://github.com/${githubOwner}/${githubRepo}/pull/${prNumber}` : undefined,
+        });
         await reportRunnerResult(reviewFix, outputCommit, process.env, {
           workspaceDir,
           phase: runnerPhase,
@@ -1633,9 +1658,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // The verify hook still failed after the last iteration. Never a review verdict, so it gets
     // its own failureCode/wording; the hook's output tail rides in finalFeedback.
     const verifyFailed = terminationReason === "verify_failed";
-    const accountUsageLimit = reviewerFailure?.code === "ACCOUNT_USAGE_LIMIT";
-    const failureCode = accountUsageLimit
-      ? "ACCOUNT_USAGE_LIMIT"
+    const accountFailure = reviewerFailure && ACCOUNT_FALLBACK_CODES.has(reviewerFailure.code);
+    const failureCode = accountFailure
+      ? reviewerFailure.code
       : verifyFailed
       ? "VERIFY_FAILED"
       : reviewerTurnsExhausted
@@ -1670,7 +1695,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const sentences = [lead, terminationReasonSentence(terminationReason, iterations), draft, reasonCodeTag(terminationReason)];
       return sentences.filter(Boolean).join(" ") + notes;
     };
-    const failureReason = accountUsageLimit
+    const failureReason = accountFailure
       ? reviewerFailure.message
       : verifyFailed
       ? `The repository's verify hook still failed after ${iterations} iteration(s), so the review did not examine the last pass.\n\n${finalFeedback}`
@@ -1693,8 +1718,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
-    disposition = accountUsageLimit
-      ? `${prDisposition} — accounts reached their usage limit`
+    disposition = accountFailure
+      ? reviewerFailure.code === "ACCOUNT_USAGE_LIMIT"
+        ? `${prDisposition} — accounts reached their usage limit`
+        : `${prDisposition} — accounts exhausted (${reviewerFailure.code})`
       : verifyFailed
       ? `${prDisposition} — verify hook failed after ${iterations} iteration(s) (${terminationReason})`
       : reviewerTurnsExhausted
@@ -1764,7 +1791,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const { valid: findingDispositions } = readFindingDispositions(workspaceDir);
     const pushOutputsOnError = context.getOutputs("push");
     const pushFailed = Boolean(pushOutputsOnError.error);
-    if (prNumber && !pushFailed) {
+    if (prNumber && !pushFailed && !reviewOnly) {
       replyToDispositionThreads(ghSpawn, prNumber, findingDispositions);
     }
     // A step can throw after push already ran and published a commit (e.g. post-push-review
@@ -1776,6 +1803,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       phase: runnerPhase,
       ...attributionField(errorAttribution(err) ?? finalAttribution()),
       outcome: "failure",
+      ...(reviewOnly ? { reviewOnly: true } : {}),
       failureReason: err instanceof Error ? err.message : String(err),
       failureCode: err instanceof SensitiveFilesError ? err.code
         : err instanceof OperatorCancelledError ? err.code
@@ -1796,7 +1824,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     } catch (summaryErr) {
       console.error(`timing summary failed: ${summaryErr}`);
     }
-    if (teardownHook) {
+    if (teardownHook && !reviewOnly) {
       try {
         const result = await runHookScript("teardown", teardownHook, workspaceDir);
         if (result.exitCode !== 0) {

@@ -82,6 +82,7 @@ export const kgRefreshOptionsSchema = z.object({
   kgSourceRef: z.string().optional(),
   acceptNewBaseline: z.boolean().optional(), // tolerated for in-flight inputs; remove after 2026-11-13
   actorEmail: z.string().optional(),
+  trigger: z.enum(["schedule", "manual"]).optional(),
 }).strict();
 
 /** The `decide` actor: who decided, as it appears on the PR note and in the log. */
@@ -179,9 +180,15 @@ export interface KgDispatchInput {
   machineNonce: string | null;
 }
 
-/** The `dispatch_log` row's values, journaled by the `resolve` step and projected by `reserve`. */
+/** Explicit caller category covers admin sessions without email; older inputs use actorEmail. */
+export function kgRefreshTrigger(options: { actorEmail?: string; trigger?: "schedule" | "manual" }): "schedule" | "manual" {
+  return options.trigger ?? (options.actorEmail !== undefined ? "manual" : "schedule");
+}
+
+/** The dispatch row journaled by resolve and projected by reserve; older records omit trigger. */
 export interface KgDispatchRecord {
   dispatchId: string;
+  trigger?: "schedule" | "manual";
   issueId: "kg-refresh";
   phase: "kg-refresh";
   repo: string;
@@ -654,7 +661,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // it ends in are function declarations below, hoisted to the top of this block.
       if (resume) return await resumeFromHold(resume);
 
-      const record = await ctx.run("resolve", () => deps.resolveDispatchRecord(dispatchId));
+      const record = await ctx.run("resolve", () => ({ ...deps.resolveDispatchRecord(dispatchId), trigger: kgRefreshTrigger(input) }));
       await ctx.run("reserve", () => deps.recordDispatchRow(record));
       const { executionMode } = record;
 

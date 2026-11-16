@@ -224,9 +224,9 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     return /role:\s*"admin"/.test(block) && /operation:\s*"read"/.test(block);
   });
 
-  it("found the fourteen documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
+  it("found the fifteen documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
-      ["add_project", "clear_dispatch_dedup", "decide_kg_refresh", "import_environment_credential", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_pipeline_schedule", "set_run_profile", "set_runner_backend", "set_runner_mode", "start_deploy", "trigger_kg_refresh", "trigger_workflow_sync"],
+      ["add_project", "clear_dispatch_dedup", "decide_kg_refresh", "import_environment_credential", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_pipeline_schedule", "set_project_agent_mode", "set_run_profile", "set_runner_backend", "set_runner_mode", "start_deploy", "trigger_kg_refresh", "trigger_workflow_sync"],
     );
   });
 

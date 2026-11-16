@@ -1,0 +1,17 @@
+{
+  "request": {
+    "args": {
+      "teamKey": "BDS",
+      "mode": "configured"
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"teamKey\":\"BDS\",\"agentMode\":\"configured\"}"
+      }
+    ]
+  }
+}

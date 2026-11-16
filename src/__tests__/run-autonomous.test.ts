@@ -209,6 +209,29 @@ describe("runAutonomous", () => {
     vi.unstubAllEnvs();
   });
 
+  it.each([false, true])("reports review-only completion without dispositions or teardown (failed: %s)", async (failed) => {
+    const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig({ v: 1,
+      issue: { id: "i", identifier: "ENG-1", title: "review", description: "review" },
+      runnerPhase: "gap-analysis", prNumber: "42", reviewOnly, runnerCallbackUrl: "https://orch.test",
+    }));
+    vi.stubEnv("RUN_TOKEN", "test-run-token");
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nReview\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), "touch teardown-ran");
+    const fake = fakeFetch({ [RESULT]: resultAccepted });
+    const gh = vi.fn<GhSpawn>(() => ({ stdout: "", exitCode: 0 }));
+    const { pipeline, runner } = makeSingleStepPipeline("feedback-loop", { run: async ctx => {
+      expect(ctx.data.reviewOnly).toEqual(reviewOnly);
+      return { terminationReason: failed ? "review_error" : "approved", approved: !failed };
+    } });
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(),
+      llmExecutor: makeExecutor(), ghSpawn: gh, fetchImpl: fake.fetch });
+    expect(resultBody(fake)).toMatchObject({ reviewOnly: true, phase: "gap-analysis", outcome: failed ? "failure" : "success" });
+    expect(resultBody(fake)).not.toHaveProperty("findingDispositions");
+    expect(existsSync(join(workspaceDir, "teardown-ran"))).toBe(false);
+    expect(gh).not.toHaveBeenCalled();
+  });
+
   it("removes the publication bearer before any pipeline step runs", async () => {
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
     const mod: StepModule = {
@@ -562,6 +585,24 @@ describe("runAutonomous", () => {
     expect(capturedPrompt).toContain("fix the implementation, do NOT weaken the test");
     expect(capturedPrompt).toContain("Gap-fill run");
   });
+
+  it.each([undefined, "", "   ", "Document both editing surfaces"])(
+    "routes only a non-empty comment instruction to the review rubric (%s)",
+    async instruction => {
+      if (instruction !== undefined) vi.stubEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION", instruction);
+      let rubric: string | undefined;
+      const { pipeline, runner } = makeSingleStepPipeline("check-rubric", {
+        run: vi.fn(async ctx => { rubric = ctx.data.reviewRubric; return {}; }),
+      });
+      await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeExecutor() });
+      if (instruction?.trim()) {
+        expect(rubric).toContain(instruction);
+        expect(rubric).toContain("scope of this run");
+      } else {
+        expect(rubric).toBeUndefined();
+      }
+    },
+  );
 
   it("does not duplicate pipeline-owned git instructions from custom prompts", async () => {
     writeFileSync(
@@ -2202,7 +2243,10 @@ describe("runAutonomous", () => {
       expect(body.failureReason.length).toBeLessThan(700);
 
       expect(existsSync(join(workspaceDir, "ai-output", "comments", "95-run-stats.md"))).toBe(false);
-      expect(existsSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"))).toBe(false);
+      const autopsy = readFileSync(join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md"), "utf-8");
+      expect(autopsy).toContain("**Run notes:**");
+      expect(autopsy).toContain(body.failureReason.split("\n")[0]);
+      expect(resultBody(fake).comments).toContainEqual({ body: autopsy });
 
       const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
       expect(warnings).toContain(
@@ -2289,6 +2333,13 @@ describe("runAutonomous", () => {
       expect(body.outcome).toBe("failure");
       expect(body.failureCode).toBe("INSTALL_FAILED");
       expect(body.prUrl).toBeFalsy();
+      const comments = resultBody(fake).comments as Array<{ body: string }>;
+      const autopsy = comments.find(c => c.body.startsWith("## 🔎 Run autopsy — "))?.body;
+      expect(autopsy).toContain("**Run notes:**");
+      expect(autopsy).toContain("npm ci failed again: dependency conflict");
+      expect(autopsy).toContain("The existing PR was updated by this run, but the change was not verified: https://github.com/acme/app/pull/42");
+      expect(autopsy).not.toContain("unchanged");
+      expect(autopsy).not.toContain("**Reviewer's final feedback:**");
 
       const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
       expect(warnings).toContain(

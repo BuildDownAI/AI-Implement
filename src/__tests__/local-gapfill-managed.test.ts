@@ -130,3 +130,11 @@ it("keeps the legacy envelope byte-identical when optional inputs are omitted", 
   });
   expect(startMock.start.mock.calls[0]![0].extraEnv.AI_IMPLEMENT_RUN_CONFIG).toBe(previous.run_config);
 });
+
+it("retains review-only in the local envelope", async () => {
+  const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+  const result = await dispatchLocalGapfill(input({ anthropicApiKey: "k", reviewOnly }));
+  expect(result.runConfig.reviewOnly).toEqual(reviewOnly);
+  const { decodeRunConfig } = await import("../run-config.js");
+  expect(decodeRunConfig(startMock.start.mock.calls[0][0].extraEnv.AI_IMPLEMENT_RUN_CONFIG).reviewOnly).toEqual(reviewOnly);
+});

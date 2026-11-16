@@ -1,5 +1,7 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
+import { bindKey, clearKeyBinding } from "./restate/key-binding.js";
+import { initKeyBindingsTable } from "./key-bindings.js";
 import { checkTrackerWrites } from "./tracker-write-gate.js";
 import { buildHealthBody } from "./health-body.js";
 import { createSetupCheckContext, getLastSetupCheckRun } from "./setup-checks/index.js";
@@ -132,7 +134,7 @@ import { pickPrForRun } from "./monitor-status.js";
 import { type RunCredentialsV1 } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr, resolvePlanningBranch } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
-import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
+import { runMergeUps, reconcileRollupReviewChildren, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, listReviewFixEvents, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix, acceptReviewFixWebhookEvent, prepareReviewFixTask, previewReviewFixText } from "./review-fix-queue.js";
 import { initReviewFixEvidenceTable, sweepExpiredReviewFixEvidence } from "./review-fix-evidence.js";
@@ -171,7 +173,7 @@ import { createProductionPlanningRunServices, PLANNING_CONTEXT_BRANCH_KEY, PLANN
 import { createPlanningAdmissionTerminationHook, createPlanningRunIngressClient } from "./restate/planning-run-client.js";
 import { setKgRefreshToolDeps } from "./restate/tools.js";
 import { checkPipelineSchedules } from "./restate/pipeline-schedule.js";
-import { checkKgSidecarHealth } from "./restate/kg-sidecar-health.js";
+import { checkKgSidecarHealth, probeKgSidecarAfterBoot } from "./restate/kg-sidecar-health.js";
 import type { RestateRegisterOutcome, RestateRegisterResult } from "./restate/endpoint.js";
 import { resolveReviewProcess } from "./review-process.js";
 import { createProductionTrackerExportServices, createTrackerExportIngressClient } from "./restate/tracker-export.js";
@@ -571,6 +573,20 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
   }
 
   try {
+    // Parking changes pickup eligibility. Reconcile before taking either planning or
+    // implementation snapshots so this poll cannot dispatch a child just handed to a person.
+    const reconciliationFailedScopes = new Set<string>();
+    for (const provider of providers) {
+      for (const [scopeKey, mapping] of Object.entries(getMappings())) {
+        if (mapping.ticketingProvider !== provider.id) continue;
+        try {
+          await reconcileRollupReviewChildren(provider, { ...mapping, teamKey: scopeKey }, scopeKey, config);
+        } catch (err) {
+          reconciliationFailedScopes.add(scopeKey);
+          console.error(`[roll-up-review] ${provider.id}/${scopeKey} reconciliation failed; its issues sit out this cycle:`, err);
+        }
+      }
+    }
     const { entries, snapshot: mergedSnapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
     for (const { providerId, error } of failed) {
       console.error(`[poll] ${providerId} snapshot failed, its issues sit out this cycle:`, error);
@@ -580,6 +596,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     // existing roll-up path opens the top-of-tree PR without dispatching a junk implement pass.
     for (const { provider, snapshot } of entries) {
       for (const entry of snapshot.parentsToFinalize) {
+        if (reconciliationFailedScopes.has(entry.scopeKey)) continue;
         // An entry whose key belongs to another tracker's mapping must not touch that repo.
         if (getMappings()[entry.scopeKey] && !mappingForProvider(provider.id, entry.scopeKey, getMappings())) continue;
         console.log(`[${provider.id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
@@ -612,6 +629,7 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     const allMappingsForDispatch = getMappings();
     const teamRepoMap: Record<string, RepoMapping> = {};
     for (const [k, m] of Object.entries(allMappingsForDispatch)) {
+      if (reconciliationFailedScopes.has(k)) continue;
       if (m.paused) {
         console.log(`[poll] Skipping paused project ${k} (${m.owner}/${m.repo})`);
         continue;
@@ -4114,9 +4132,12 @@ export function makeKgRefreshAdminDeps(
   client: KgRefreshIngressClient,
   callAsSystem: typeof callToolAsSystem = callToolAsSystem,
   deployHeld: () => boolean = isDeployHeld,
+  callAsCaller: typeof callTool = callTool,
 ): NonNullable<AdminDeps["kgRefresh"]> {
   return {
-    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts }), deployHeld),
+    trigger: async (opts, caller) => kgToolAnswer(await (caller
+      ? callAsCaller("trigger_kg_refresh", { ...opts }, caller)
+      : callAsSystem("trigger_kg_refresh", { ...opts })), deployHeld),
     status: async () => {
       const r = await callAsSystem("get_kg_status", {});
       if (r.status === "unavailable" || r.status === "deploy-held") {
@@ -4879,7 +4900,7 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, bindKey, clearKeyBinding, readSetupChecks: readSetupChecksViaObject, runSetupChecks: runSetupChecksViaObject,
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -5226,6 +5247,7 @@ async function main(): Promise<void> {
   initSettingsTable();
   seedSettingsFromEnv(); // SEED_ONCE_SETTINGS: each seeds once, inert thereafter (ADR 022)
   initAccessEntriesTable();
+  initKeyBindingsTable();
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();
@@ -5267,7 +5289,7 @@ async function main(): Promise<void> {
   setKgMemoryProvider(memoryProvider);
   if (memoryProvider instanceof SidecarMemoryProvider) {
     const health = await probeWithTimeout(memoryProvider);
-    if (health.lastError) {
+    if (health.lastError !== null) {
       console.error(`[kg] sidecar probe FAILED: ${health.lastError}`);
     } else {
       console.error(`[kg] sidecar probe: ok (${REQUIRED_KG_TOOL_COUNT} required tools)`);
@@ -5498,7 +5520,7 @@ async function main(): Promise<void> {
     // Notice settings writes happen synchronously before its first await.
     // A hanging webhook must not delay the first poll.
     postBootNotice: () => { void postBootNotice(config, memoryProvider instanceof SidecarMemoryProvider
-      ? { probe: remainingMs => probeWithTimeout(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
+      ? { probe: remainingMs => probeKgSidecarAfterBoot(memoryProvider, Math.min(BOOT_PROBE_TIMEOUT_MS, remainingMs)) }
       : undefined); },
     poll: () => poll(config, registry),
     startInterval: () => {

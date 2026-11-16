@@ -555,7 +555,7 @@ After a stop the workflow waits up to `PLANNING_RUN_STOP_MARGIN_MS` (10 minutes)
 
 **One count per run.** A step retry must not count a second time. An owner call writes the breaker count and marks the row notified in one transaction, and returns at once for a row that is already notified, so a retried `outcome` counts one breaker failure. `finishJob` writes the tracker status only while `failureCommentedAt` is unset, so a retried `finish-job` does not repeat it.
 
-**No callback or deadline: failed and parked, never requeued (AII-1519).** When a run ends with no planning result (`ended_without_callback`) or passes its deadline (`deadline_exceeded`), `finishJob` writes local state first: it closes the row, then parks the issue (`parkIssue(issueId, "planning", conclusion)`), so no poll dispatches planning for it on any tracker, even if the tracker is down. Then it calls `provider.markPlanningFailed` with a reason that names the cause, the run link, and the next action, and `markJobFailureCommented`. A tracker error is logged, not thrown, so the release never waits on the tracker; `failureCommentedAt` then stays unset and the `outcome` step posts its own classification comment. The ticket gets one failure comment either way. The path does not call `clearWorkingState` or `remediateFailedJob`, and it does not delete the dedup entry: a requeue would write `Plan Approved` on Jira (starting implementation with no plan) or remove `AI-Planning` on Linear (planning again). To recover, press **Unpark** at `/admin#runners`, then set the status to `Ready` (Jira) or keep the label (Linear). `operator_cancelled` still clears the working state.
+**No callback or deadline: failed and parked, never requeued (AII-1519).** For a Fly machine with recorded events and no `start` event, the planning cause says "Fly removed the machine before it started"; the conclusion and park reason remain `ended_without_callback`. The diagnostic machine read has a 10-second limit, covering the reply and its body. Failed reads, including timeouts, retain the usual cause and allow cleanup and admission release to continue. Check the project's Fly secrets and the runner image, then run it again (see [Per-project secrets (Fly)](deployment.md#per-project-secrets-fly)). Implementation uses `fly_machine_never_started` for this diagnostic and gives the same operator checks. When a run ends with no planning result (`ended_without_callback`) or passes its deadline (`deadline_exceeded`), `finishJob` writes local state first: it closes the row, then parks the issue (`parkIssue(issueId, "planning", conclusion)`), so no poll dispatches planning for it on any tracker, even if the tracker is down. Then it calls `provider.markPlanningFailed` with a reason that names the cause, the run link, and the next action, and `markJobFailureCommented`. A tracker error is logged, not thrown, so the release never waits on the tracker; `failureCommentedAt` then stays unset and the `outcome` step posts its own classification comment. The ticket gets one failure comment either way. The path does not call `clearWorkingState` or `remediateFailedJob`, and it does not delete the dedup entry: a requeue would write `Plan Approved` on Jira (starting implementation with no plan) or remove `AI-Planning` on Linear (planning again). To recover, press **Unpark** at `/admin#runners`, then set the status to `Ready` (Jira) or keep the label (Linear). `operator_cancelled` still clears the working state.
 
 **Plan success and approval.** The callback passes `awaitApproval: !mapping.autoApprovePlans` to `markPlanComplete`. On Jira a project with "Auto-approve plans" off stops at `Awaiting Approval` until a person sets `Plan Approved`. A refused `markPlanComplete` still answers 200 (the plan comments are recorded) but fails the run: the callback closes the row `failed` / `plan_status_write_failed`, stores a `PLAN_STATUS_WRITE_FAILED` failure whose message names the refused value, the tracker's own error (Jira: `Jira answered <status>: <body>`) and the Unpark next step, parks the issue (`parkIssue(issueId, "planning", ...)`) and only then calls `markPlanningFailed`, so the park holds even when the tracker refuses that write too. `get_issue_dispatch_status` shows the message as `failureMessage`. See [the outcome table](ticketing-providers.md#tracker-state-after-each-planning-outcome).
 
@@ -622,12 +622,15 @@ What `finish-job` does for the row it reads (`finishImplementationJob`), and the
 | Conclusion `operator_cancelled` | none | `clearWorkingState` | `cancelled` |
 | Restate cancel or error (`cancelled`) | `failed` / `workflow_cancelled` if not terminal, no admission release | `finalize` as failed | `cancelled` (escape path) |
 | Deadline, no callback seen | the bounded stuck cleanup (`remediateStuckJob`, `ttl_expired`) | its requeue or give-up | `deadline_exceeded` |
-| Run ended, no callback seen | `failed` / `ended_without_callback` | `finalize` as failed | `finalized` |
+| Run ended, no callback seen | `failed` / `ended_without_callback` (or `fly_machine_never_started` when Fly events contain no start) | `finalize` as failed | `finalized` |
 | Callback reported a failure | `failed` if not terminal | `finalize` as failed only when the row has no PR | `finalized` |
-| Callback reported success, no PR | `completed` if not terminal | `finalize` as no-work for a grouping parent | `finalized` |
+| Inferred grouping-parent no-work, no explicit callback outcome, `deps.neverStarted` returns true | `failed` / `fly_machine_never_started` | `finalize` as failed; no no-work finalization | `finalized` |
+| Callback reported success, no PR, or inferred grouping-parent no-work without never-started evidence | `completed` if not terminal | `finalize` as no-work for a grouping parent | `finalized` |
 | Callback reported success, PR merged | `completed` if not terminal | `finalize` as merged | `finalized` |
 | Callback reported success, PR open, no transition made yet | `completed` if not terminal | `finalize` as ready | `finalized` |
 | Callback reported success, transition already made (approved, or `external_review_pending`) | `completed` if not terminal | none | `finalized` |
+
+For inferred grouping-parent no-work (no PR, no failure record, and a non-failed status), `finish-job` checks `deps.neverStarted` before accepting success, including on the deadline path. Explicit callback outcomes remain authoritative and skip this diagnostic. In production the diagnostic applies only to Fly machines; missing configuration or machine lookup errors return false and retain the existing no-work behavior.
 
 ## Reading a run's journal
 
@@ -700,3 +703,13 @@ The token exists only inside that step: it is never returned, stored in object
 state, passed to another handler, or included in errors. Dependency exceptions
 are replaced with a fixed message before reaching Restate's journal. Only plain
 publication results cross the step boundary.
+
+## The KeyBinding object
+
+`KeyBinding` (`src/restate/key-binding.ts`) serializes binding and clearing a stored key
+reference to one destination. Its exclusive handlers own `key_bindings`; each performs one
+SQLite transaction in one `ctx.run`. Synchronous reads check destinations before secret use.
+Only admin HTTP handlers call its timed ingress helpers. Inputs contain a destination only
+(or `{}` for clear), never a secret. PUT fails closed if binding conflicts or ingress is
+unavailable; DELETE removes the secret before clearing. See [Stored key safety](key-safety.md)
+for the schema, handler contract, legacy behavior and adoption rules.

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { getDb } from "./dedup.js";
 
 export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed" | "completed";
@@ -37,10 +38,10 @@ interface CommentGapfillQueueRow {
   processed_at: number | null;
 }
 
-export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number {
+function insertCommentGapfill(input: EnqueueCommentGapfillInput): boolean {
   const now = Date.now();
   const db = getDb();
-  db.prepare(`
+  const result = db.prepare(`
     INSERT OR IGNORE INTO comment_gapfill_queue
       (owner, repo, pr_number, comment_id, commenter, instruction, status, created_at, processed_at)
     VALUES
@@ -55,7 +56,12 @@ export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number
     now,
   });
 
-  const row = db
+  return result.changes > 0;
+}
+
+export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number {
+  insertCommentGapfill(input);
+  const row = getDb()
     .prepare("SELECT id FROM comment_gapfill_queue WHERE comment_id = ?")
     .get(input.commentId) as { id: number };
   return row.id;
@@ -104,6 +110,24 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
     processedAt: row.processed_at,
   };
 }
+
+export const ROLLUP_REVIEW_COMMENTER = "ai-implement-rollup-review";
+
+/** Returns true only for a newly inserted head, including across terminal states. */
+export function enqueueRollupReview(input: { owner: string; repo: string; prNumber: number; headSha: string }): boolean {
+  // 48 hash bits fit exactly in a JS number; reserve IDs below the existing
+  // synthetic helpers' -2 billion range and keep real webhook IDs positive.
+  const digest = createHash("sha256")
+    .update(JSON.stringify(["rollup-review", input.owner, input.repo, input.prNumber, input.headSha]))
+    .digest();
+  const commentId = -(digest.readUIntBE(0, 6) + 2_000_000_001);
+  return insertCommentGapfill({
+    owner: input.owner, repo: input.repo, prNumber: input.prNumber,
+    commentId, commenter: ROLLUP_REVIEW_COMMENTER,
+    instruction: `Review the feature-branch roll-up at head ${input.headSha}. Post an advisory verdict in the PR conversation.`,
+  });
+}
+
 
 export const CONFLICT_COMMENTER = "ai-implement-orchestrator";
 

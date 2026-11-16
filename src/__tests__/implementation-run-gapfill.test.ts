@@ -5,6 +5,8 @@ import type { ImplementationRunProductionInput } from "../restate/implementation
 vi.mock("../agent-run-preparation.js", async original => ({ ...await original<object>(), persistedPreparationState: vi.fn(() => "absent"), loadStoredSnapshot: vi.fn(() => null) }));
 vi.mock("../backend-run.js", () => ({ classifyFlyMachine: vi.fn(async () => "started"), stopBackendRun: vi.fn(async () => true), destroyMachineRecorded: vi.fn(async () => {}) }));
 import { classifyFlyMachine, stopBackendRun, destroyMachineRecorded } from "../backend-run.js";
+vi.mock("../repo-image.js", () => ({ resolveSessionImage: vi.fn() }));
+import { resolveSessionImage } from "../repo-image.js";
 const intents = vi.hoisted(() => new Map<string, unknown>());
 // The ordinary launch path now persists its own recovery intent (AII-1555).
 const ordinaryIntents = vi.hoisted(() => new Map<string, { snapshot: unknown; done: boolean }>());
@@ -29,8 +31,8 @@ vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...awa
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
-vi.mock("../comment-gapfill-drain.js", () => ({ buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), ROLLUP_REVIEW_COMMENTER: "ai-implement-rollup-review", CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-drain.js", async original => ({ ...await original<typeof import("../comment-gapfill-drain.js")>(), buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), setJobMachineId: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn(async () => ({ token: "TOKEN-SENTINEL" })) }));
 vi.mock("../github.js", async original => ({ ...await original<object>(), dispatchWorkflow: vi.fn(), getWorkflowRunStatus: vi.fn(async () => null), cancelWorkflowRun: vi.fn(async () => true) }));
@@ -78,6 +80,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(listMachines).mockReset().mockResolvedValue([]);
   vi.mocked(findLocalContainerIdByName).mockReset().mockResolvedValue(null);
+  vi.mocked(resolveSessionImage).mockReset().mockResolvedValue({ image: "paired-image", source: "default" });
   intents.clear();
   ordinaryIntents.clear();
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ workflow_runs: [] }) })));
@@ -439,6 +442,42 @@ function configureContainer() {
     return { containerId: "machine", containerName: args.runName!, runConfig: { bootstrap: "BOOTSTRAP-SENTINEL" } as never };
   });
 }
+
+it.each(["github-actions", "fly-machines"] as const)("quietly skips roll-up review on an override image: %s", async backend => {
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: "ai-implement-rollup-review" });
+  vi.mocked(resolveSessionImage).mockResolvedValue({ image: "custom-image", source: "override" });
+  expect(await d.launch({ ...run, backend })).toEqual({ outcome: "rejected" });
+  expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "skipped");
+  expect(dispatchGhaGapfill).not.toHaveBeenCalled();
+  expect(dispatchFlyGapfill).not.toHaveBeenCalled();
+  expect(dispatchLocalGapfill).not.toHaveBeenCalled();
+  expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
+  expect(resolveManagedDecision).not.toHaveBeenCalled();
+  expect(mintLaunchTokens).not.toHaveBeenCalled();
+  expect(surfaceDispatchFailure).not.toHaveBeenCalled();
+  expect(postBranchComment).not.toHaveBeenCalled();
+  expect(appendLogIfAbsent).not.toHaveBeenCalled();
+  expect(intents.size).toBe(0);
+});
+
+it.each(["github-actions", "fly-machines", "local-docker"] as const)("launches paired roll-up review on %s", async backend => {
+  configureContainer();
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: "ai-implement-rollup-review" });
+  expect(await d.launch({ ...run, backend })).toEqual({ outcome: "accepted", jobId: backend === "github-actions" ? "88" : "machine" });
+  const helper = backend === "github-actions" ? prepareGhaGapfillLaunch : backend === "fly-machines" ? dispatchFlyGapfill : dispatchLocalGapfill;
+  expect(helper).toHaveBeenCalledWith(expect.objectContaining({ reviewOnly: { reviewers: expect.arrayContaining([{ id: "integration-review", gates: true }]) } }));
+  expect(resolveSessionImage).toHaveBeenCalledTimes(backend === "local-docker" ? 0 : 1);
+});
+
+it.each((["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend => (["default", "override"] as const).map(source => ({ backend, source }))))("ordinary gap-fill bypasses review capability: $backend / $source", async ({ backend, source }) => {
+  configureContainer();
+  vi.mocked(resolveSessionImage).mockResolvedValue({ image: "image", source });
+  expect(await d.launch({ ...run, backend })).toEqual({ outcome: "accepted", jobId: backend === "github-actions" ? "88" : "machine" });
+  expect(resolveSessionImage).not.toHaveBeenCalled();
+});
+
 it.each(containerBackends)("%s accepted launch records compute privately and returns only id", async backend => {
   configureContainer();
   const result = await d.launch({ ...run, backend });
@@ -764,7 +803,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
   m.config.saveAccountProfileRevision({ profileId: "api", identity: "API", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
   const stage = { agent: "claude" as const, provider: "anthropic" as const, model: "m", accountProfileId: "api", invocationTimeoutMs: 60000 };
   m.config.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  m.config.setProjectOptIn("ENG", true);
+  m.config.setProjectConfigured("ENG", true);
   const actual = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
   const req = { dispatchId: "before-intent", projectKey: "ENG", backend: "github-actions" as const, owner: "Org", repo: "repo", workflowFile: "claude-implement.yml" };
   const initialRuntime = makeRuntime(m);
@@ -775,7 +814,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
     const frozen = m.prep.loadStoredSnapshot(req.dispatchId);
     expect(frozen).not.toBeNull();
     expect(m.dedup.getDb().prepare("SELECT * FROM model_credential_grants").all()).toEqual([]);
-    m.config.setProjectOptIn("ENG", false);
+    m.config.setProjectConfigured("ENG", false);
     const reopened = await database.reopen();
     const managed = await import("../managed-dispatch-auth.js");
     const replay = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
@@ -821,7 +860,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
   // Prove the actual retry returns no credential and cannot create another grant.
   expect(await replay.prepareManagedDispatch(req, runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
   if (configuration === "missing") input.getMapping = () => undefined;
-  if (configuration === "opted-out") reopened.config.setProjectOptIn("ENG", false);
+  if (configuration === "opted-out") reopened.config.setProjectConfigured("ENG", false);
   reopened.production.createProductionImplementationRunServices(input);
   const deps = captured.deps as ImplementationRunDependencies;
   const db = reopened.dedup.getDb();
@@ -934,4 +973,15 @@ it.each(["retarget", "remove"].flatMap(drift => ["insert", "binding"].map(failur
   expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
   expect(dispatchGhaGapfill).not.toHaveBeenCalled();
   expect(resolveManagedDecision).not.toHaveBeenCalled();
+});
+
+it("dispatches synthetic roll-up review without fix instructions", async () => {
+  const { ROLLUP_REVIEW_COMMENTER } = await import("../comment-gapfill-queue.js");
+  const item = vi.mocked(getCommentGapfillItem).getMockImplementation()!(1)!;
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ ...item, commenter: ROLLUP_REVIEW_COMMENTER });
+  expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
+  expect(buildCommentGapfillInstruction).toHaveBeenCalledWith(item.instruction, []);
+  expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({
+    reviewOnly: { reviewers: expect.arrayContaining([{ id: "integration-review", gates: true }]) },
+  }));
 });

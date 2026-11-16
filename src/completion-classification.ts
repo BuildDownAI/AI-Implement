@@ -1,3 +1,5 @@
+export const FLY_MACHINE_NEVER_STARTED_REMEDIATION = "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).";
+
 import type { Job } from "./log.js";
 import { reasonCodeTag, SECOND_REVIEW } from "./run-autopsy.js";
 import { GUARDRAIL_REASON_MAX_CHARS, providerUnavailablePhrase, redactAndCap } from "./pipeline/failure-classification.js";
@@ -477,7 +479,9 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     );
   }
   const exit = job.conclusion?.startsWith("exit_") ? job.conclusion.slice(5) : null;
+  const neverStarted = job.conclusion === "fly_machine_never_started";
   const detail =
+    neverStarted ? "Fly removed the machine before it started." :
     exit && exit !== "0"
       ? `The runner exited with code ${exit}.`
       : job.phase === "implementation" && !job.prUrl
@@ -493,6 +497,7 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
     summary: "The run did not complete.",
     detail,
     remediation:
+      neverStarted ? FLY_MACHINE_NEVER_STARTED_REMEDIATION :
       job.phase === "implementation"
         ? "Check the run logs — the run likely errored before pushing — then run it again."
         : "Check the run logs for the planning failure, then run it again.",
@@ -506,19 +511,13 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
  * `classificationForFailure`'s summary is deliberately phase-free (see its own doc comment) —
  * the callback supplies the phase via this prefix, so the monitor's backstop comment
  * (`reportJobCompletion` in `src/index.ts`) must prepend the same prefix itself for an actual
- * failure (`job.status === "failed"`), or a gap-analysis failure (which the callback never
- * comments for, so the monitor is the only commenter) would post without naming a phase at
- * all. gap-analysis has no comment shape of its own — it is implementation's retry path, so it
- * takes implementation's phrase. `reportJobCompletion` does NOT apply this prefix for
- * `review_failed` or `timed_out`: those statuses are not failures — markImplementationFailed/
- * markPlanningFailed never runs for them either — so prefixing would assert a failure the run
- * didn't have (a review_failed run completed and opened a PR the ticket already got a
- * "ready for review" comment about).
+ * failure (`job.status === "failed"`). Gap-fill failures use their own phase name.
  */
 export function monitorFailureCommentPrefix(phase: string): string {
   // kg-refresh has no tracker issue and its outcome notice is owned by notifyKgRefreshOutcome
   // (`shouldSkipCompletionNotice` in index.ts returns before this is reached) — the case exists
   // so a caller that does route one here never labels it "Implementation".
+  if (phase === "gap-analysis") return "⚠️ Gap-fill failed: ";
   if (phase === "kg-refresh") return "⚠️ KG refresh failed: ";
   return phase === "planning" ? "⚠️ Planning failed: " : "⚠️ Implementation failed: ";
 }

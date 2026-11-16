@@ -94,3 +94,19 @@ it("preserves reviewFix in protected delivery and falls back to the managed disp
   expect(config.config.metadata.dispatch_id).toBe("d-1");
   expect(decodeTrustedRunConfig(config.config.env.AI_IMPLEMENT_RUN_CONFIG).reviewFix).toEqual(reviewFix);
 });
+
+it("carries advisory mode in Fly and GHA envelopes and rejects legacy GHA", async () => {
+  const reviewOnly = { reviewers: [{ id: "integration-review", gates: true }] };
+  await dispatchFlyGapfill(input({ reviewOnly }));
+  expect(decodeRunConfig(mocks.create.mock.calls[0][2].config.env.AI_IMPLEMENT_RUN_CONFIG).reviewOnly).toEqual(reviewOnly);
+  const { prepareGhaGapfillLaunch } = await import("../gapfill-launch.js");
+  const args = {
+    mapping: makeMapping(), issue: { issueId: "i" }, item: { owner: "acme", repo: "billing", prNumber: 7 },
+    ghToken: "gh", decision: { kind: "legacy" as const }, runnerCallbackBaseUrl: null,
+    runnerCallbackUrl: "", runToken: "", runProgressToken: "", reviewOnly,
+    resolveRunnerImage: async () => undefined, checkContract: async () => "envelope" as const,
+  };
+  const launch = await prepareGhaGapfillLaunch(args);
+  expect(decodeRunConfig(launch.inputs.run_config!).reviewOnly).toEqual(reviewOnly);
+  await expect(prepareGhaGapfillLaunch({ ...args, checkContract: async () => "legacy" as const })).rejects.toThrow(/review-only requires/);
+});

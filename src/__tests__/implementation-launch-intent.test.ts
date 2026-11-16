@@ -55,7 +55,7 @@ it.each([
   m.config.saveAccountProfileRevision({ profileId: "api", identity: "API", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
   const stage = { agent: "claude", provider: "anthropic", model: "test", accountProfileId: "api", invocationTimeoutMs: 60_000 } as const;
   m.config.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  m.config.setProjectOptIn("ENG", true);
+  m.config.setProjectConfigured("ENG", true);
   expect(m.secrets.createModelProtectedSecrets().write("model-account:api", "API-CREDENTIAL-SENTINEL").ok).toBe(true);
   const run: ImplementationRunInput = { dispatchId: "staged-dispatch", teamKey: "ENG", issueId: "issue-1", issueIdentifier: "ENG-1", backend: "local-docker", maxJobMinutes: 60, launchContext: {} };
   const mapping = makeMapping({ owner: "Org", repo: "repo", extraEnv: { REGISTRY_TOKEN: "REGISTRY-SENTINEL" } });
@@ -87,7 +87,7 @@ it.each([
   if (preIntent) {
     expect(m.intent.implementationIntentStore().read(run.dispatchId)).toBeNull();
     const restarted = await db.reopen();
-    if (configuration === "opted-out") restarted.config.setProjectOptIn("ENG", false);
+    if (configuration === "opted-out") restarted.config.setProjectConfigured("ENG", false);
     restarted.production.createProductionImplementationRunServices({ ...input,
       getMapping: () => configuration === "missing" ? undefined : mapping,
       resolveProvider: configuration === "provider-failure" ? async () => { throw new Error("unavailable"); } : input.resolveProvider,
@@ -197,7 +197,7 @@ it.each([true, false].flatMap(managed => (["github-actions", "fly-machines"] as 
   m.config.saveAccountProfileRevision({ profileId: "api", identity: "API", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
   const stage = { agent: "claude", provider: "anthropic", model: "test", accountProfileId: "api", invocationTimeoutMs: 60_000 } as const;
   m.config.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  m.config.setProjectOptIn("ENG", managed);
+  m.config.setProjectConfigured("ENG", managed);
   expect(m.secrets.createModelProtectedSecrets().write("model-account:api", "API-CREDENTIAL-SENTINEL").ok).toBe(true);
   const run: ImplementationRunInput = { dispatchId: `preparation-${backend}`, teamKey: "ENG", issueId: "issue-1", issueIdentifier: "ENG-1", backend, maxJobMinutes: 60, launchContext: {} };
   const mapping = makeMapping({ owner: "Org", repo: "repo" });

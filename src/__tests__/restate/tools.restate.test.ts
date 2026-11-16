@@ -1,6 +1,7 @@
 import { getReviewerScorecard } from "../../report-card.js";
 import { createModelProtectedSecrets } from "../../model-protected-secrets.js";
-import { getOrchestratorDefaults } from "../../agent-config-store.js";
+import { makeStageAgentDefaults, makeStageAgentProfile } from "../helpers/builders.js";
+import { getOrchestratorDefaults, saveAccountProfileRevision, setOrchestratorDefaults, setProjectConfigured } from "../../agent-config-store.js";
 import { createSession } from "../../admin-session.js";
 import { handleAdminRequest } from "../../admin.js";
 import { initReconciliationTable } from "../../reconciliation.js";
@@ -130,6 +131,7 @@ const authorizationTools = restate.service({
   handlers: {
     read: tool({ description: "test read", input: z.object({}), role: "user" }, authorizationHandler),
     admin: tool({ description: "test admin", input: z.object({}), role: "admin" }, authorizationHandler),
+    projects: tool({ description: "test projects", input: z.object({}), role: "admin", grant: "projects" }, authorizationHandler),
     deploy: tool({ description: "test deploy", input: z.object({}), role: "admin", grant: "deploy" }, authorizationHandler),
   },
 });
@@ -241,15 +243,17 @@ describe("orchestratorTools (Restate)", () => {
   it.each(VARIANTS.map(([label]) => label))("enforces every authorization state-table cell (%s)", async (label) => {
     const env = environments.get(label)!;
     const rows: Array<[string, Caller, boolean[]]> = [
-      ["read token", serviceCaller(), [true, false, false]],
-      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true]],
-      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true]],
-      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false]],
-      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true]],
-      ["system", systemCaller(), [true, true, true]],
+      ["projects token", serviceCaller({ grants: ["projects"] }), [true, false, false, true]],
+      ["projects + deploy token", serviceCaller({ grants: ["deploy", "projects"] }), [true, false, true, true]],
+      ["read token", serviceCaller(), [true, false, false, false]],
+      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
+      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
+      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false, false]],
+      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true, true]],
+      ["system", systemCaller(), [true, true, true, true]],
     ];
     for (const [row, caller, allowed] of rows) {
-      for (const [index, name] of ["read", "admin", "deploy"].entries()) {
+      for (const [index, name] of ["read", "admin", "deploy", "projects"].entries()) {
         const before = authorizationExecutions;
         const result = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", name, { caller, args: {} });
         if (allowed[index]) {
@@ -367,7 +371,31 @@ describe("orchestratorTools (Restate)", () => {
     // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
     for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["deploy"] }), args,
+        caller: serviceCaller({ grants: ["deploy"] }), args: name === "set_project_agent_mode" ? { teamKey: "BDS", mode: "legacy" } : args,
+      });
+      expect(result.isError, name).toBe(true);
+      expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("projects grants cannot reach any other registered admin tool (%s)", async (label) => {
+    const env = environments.get(label)!;
+    // Bootstrap discovery with a harmless read, then select from the actual registry.
+    await callService(env.baseUrl(), "orchestratorTools", "get_runner_mode", { caller: SYSTEM, args: {} });
+    const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
+    expect(response.ok).toBe(true);
+    const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
+    const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
+    expect(admins.length).toBeGreaterThan(0);
+    // A superset of schema-valid fields covers every current admin handler. Unknown
+    // fields are stripped by its schema; missing/new required fields fail ingress.
+    const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
+      backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
+      paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
+    // Only the project mode tool is reachable with the projects grant.
+    for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
+        caller: serviceCaller({ grants: ["projects"] }), args: name === "start_deploy" ? { branch: "testing", requestedBy: "test" } : args,
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -396,6 +424,35 @@ describe("orchestratorTools (Restate)", () => {
       expect(health).toHaveProperty("kgRefreshPreflight");
     },
   );
+
+  it.each(VARIANTS.map(([label]) => label))("changes project agent modes through ingress (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const change = (mode: string, caller: Caller = systemCaller()) => callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", { caller, args: { teamKey: "BDS", mode } });
+    try {
+      setProjectConfigured("BDS", false);
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
+        saveAccountProfileRevision(makeStageAgentProfile());
+      }
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      for (const mode of ["configured", "legacy"]) {
+        const result = await change(mode, serviceCaller({ grants: ["projects"] }));
+        expect(result.isError).toBeFalsy();
+        expect(JSON.parse(result.content[0].text)).toEqual({ teamKey: "BDS", agentMode: mode });
+        const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });
+        expect(JSON.parse(health.content[0].text).stageAgents.projects).toContainEqual({ teamKey: "BDS", agentMode: mode });
+      }
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+      expect(await change("configured")).toEqual({ isError: true, content: [{ type: "text", text: "resolution-failed" }] });
+      const refused = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "set_project_agent_mode", {
+        caller: { kind: "human", email: "user@example.com", role: "user" }, args: { teamKey: "BDS", mode: "legacy" },
+      });
+      expect(refused).toEqual({ isError: true, content: [{ type: "text", text: "forbidden: set_project_agent_mode requires the admin role" }] });
+    } finally {
+      setProjectConfigured("BDS", false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
+
 
   it.each(VARIANTS.map(([label]) => label))(
     "get_tenant_health reads the stored setup-check run from the SetupChecks object, without its detail or fix (%s)",
@@ -933,6 +990,49 @@ describe("orchestratorTools (Restate)", () => {
       expect(result.body.syncJobId).toBeDefined();
     },
   );
+
+  it.each(VARIANTS.map(([label]) => label))("add_project starts configured with defaults on (%s)", async (label) => {
+    const env = environments.get(label)!;
+    const teamKey = `CONFIGURED-${label}`;
+    try {
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) saveAccountProfileRevision(makeStageAgentProfile());
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "add_project", {
+        caller: SYSTEM, args: { teamKey, owner: "BuildDownAI", repo: "configured-fixture", defaultBranch: "main" },
+      });
+      expect(JSON.parse(result.content![0].text).status).toBe(202);
+      const health = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", { caller: SYSTEM, args: {} });
+      expect(JSON.parse(health.content[0].text).stageAgents.projects).toContainEqual({ teamKey, agentMode: "configured" });
+    } finally {
+      setProjectConfigured(teamKey, false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    }
+  });
+
+  it.each(VARIANTS.map(([label]) => label))("reports configured and legacy stage agents through ingress (%s)", async (label) => {
+    const env = environments.get(label)!;
+    try {
+      if (!dedup.getDb().prepare("SELECT 1 FROM model_account_profiles WHERE profile_id = 'health-test'").get()) {
+        saveAccountProfileRevision(makeStageAgentProfile());
+      }
+      setOrchestratorDefaults(makeStageAgentDefaults());
+      dedup.getDb().prepare("INSERT OR IGNORE INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES ('AII', 'acme', 'widgets', 'claude.yml', 'main')").run();
+      setProjectConfigured("AII", true);
+      setProjectConfigured("BDS", false);
+      const result = await callService<ToolResponse>(env.baseUrl(), "orchestratorTools", "get_tenant_health", {
+        caller: { kind: "human", email: "user@example.com", role: "user", grants: [] }, args: {},
+      });
+      expect(result.isError).toBeFalsy();
+      const stageAgents = JSON.parse(result.content[0].text).stageAgents;
+      expect(stageAgents.defaultsMode).toBe("configured");
+      expect(stageAgents.projects.filter((project: { teamKey: string }) => ["AII", "BDS"].includes(project.teamKey))).toEqual([{ teamKey: "AII", agentMode: "configured" }, { teamKey: "BDS", agentMode: "legacy" }]);
+    } finally {
+      setProjectConfigured("AII", false);
+      setProjectConfigured("BDS", false);
+      setOrchestratorDefaults({ version: 1, mode: "legacy" });
+      dedup.getDb().prepare("DELETE FROM mappings WHERE team_key = 'AII'").run();
+    }
+  });
 
   it.each(VARIANTS.map(([label]) => label))(
     "a user caller is refused a write tool over the real ingress and never runs the action (%s)",

@@ -118,6 +118,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
 | Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
+| Stored key destination bindings and redaction | `src/restate/key-binding.ts`, `src/model-credentials.ts` | [docs/key-safety.md](docs/key-safety.md) |
 | Admin SPA | `src/admin-ui/` | |
 | Restate engine: sidecar, endpoint, workflows, test job | `src/restate/endpoint.ts`, `src/restate/planning-run-workflow.ts`, `src/restate/` | [docs/restate.md](docs/restate.md), [docs/restate-testing.md](docs/restate-testing.md) |
 | Unit test suite: setup files, the environment allowlist, shared fixture builders and harnesses, type checking, CI jobs | `src/__tests__/setup/`, `src/__tests__/helpers/`, `vitest.config.ts` | [docs/unit-tests.md](docs/unit-tests.md) |
@@ -185,6 +186,10 @@ The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_T
 
 ## Running tests
 
+Follow the [Rules for a reliable test](docs/unit-tests.md#rules-for-a-reliable-test) when writing or repairing tests.
+
+A test never proves a result with a wall-clock limit or a fixed sleep; see [Timing rules](docs/restate-testing.md#timing-rules).
+
 ```bash
 npm test          # vitest run
 npm run typecheck # tsc --noEmit, then tsc --noEmit -p tsconfig.tests.json (test files included)
@@ -199,7 +204,7 @@ Fixing a bug: write the failing test first, then the fix, in one pull request �
 
 ## Data layer
 
-One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 26 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 58 tables (including tables initialized on first use). `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
 
 Schema changes run at boot and a trigger can block a column change — read [docs/sqlite-schema.md](docs/sqlite-schema.md) before changing a table or column.
 
@@ -228,7 +233,9 @@ A change that adds or alters an architectural feature must update the matching `
 
 1. Add the mapping at `/admin` via the **New project** stepper. On the Source step, **Check installation** probes whether the App is installed and can see the repo, linking straight to the fix — install the App, or add the repo to an existing install. The check is advisory; you can save regardless.
 2. **Save.** The mapping persists immediately and sync runs in the background, polling to a terminal state. The mapping is saved however the sync resolves.
-3. Merge the sync PR in the target repo.
+3. Merge the sync PR in the target repo. Add the pickup label to the first issue only after the sync pull request merges.
+
+A new project starts configured when the orchestrator stage defaults are on (unless a stored project row already exists or configuration fails to resolve); existing projects keep their mode.
 
 The GitHub App needs **Workflows** permission alongside **Contents** — GitHub rejects writes under `.github/workflows/` without it, and the sync fails with "permission denied" before opening its PR. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a stale window.
 

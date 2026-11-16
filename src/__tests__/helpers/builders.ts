@@ -296,6 +296,7 @@ export function makeProvider(overrides: Partial<TicketingProvider> = {}): Ticket
     clearWorkingState: vi.fn<TicketingProvider["clearWorkingState"]>(async () => true),
     parkForHuman: vi.fn<TicketingProvider["parkForHuman"]>(async () => true),
     markMerged: vi.fn<TicketingProvider["markMerged"]>(async () => {}),
+    createChildIssue: vi.fn<TicketingProvider["createChildIssue"]>(async () => ({ id: "child-id", identifier: "TEST-2" })),
     postComment: vi.fn<TicketingProvider["postComment"]>(async () => {}),
     fetchPlanningContext: vi.fn<TicketingProvider["fetchPlanningContext"]>(async () => ""),
     issueUrl: vi.fn<TicketingProvider["issueUrl"]>((issue) => `https://linear.app/issue/${issue.identifier}`),
@@ -415,4 +416,14 @@ export function makeAccessEntry(overrides: Partial<AccessEntry> = {}): AccessEnt
     addedBy: "admin@example.com",
     ...overrides,
   };
+}
+
+/** A complete configured defaults row backed by one compatible account profile. */
+export function makeStageAgentDefaults(): import("../../agent-config.js").StageAgentConfigurationV1 {
+  const stage = { agent: "claude", provider: "anthropic", model: "test-model", accountProfileId: "health-test", invocationTimeoutMs: 60_000 } as const;
+  return { version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } };
+}
+
+export function makeStageAgentProfile(): import("../../agent-config-store.js").SaveAccountProfileRevisionInput {
+  return { profileId: "health-test", identity: "Health Test", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
 }

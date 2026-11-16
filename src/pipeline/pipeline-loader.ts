@@ -121,7 +121,7 @@ export function dependenciesMissing(ctx: PipelineContext): boolean {
 export function shouldSkipPostPushReview(ctx: PipelineContext): boolean {
   // Gap-fill runs update an existing PR and retain their established
   // review flow; do not start a second post-push review cycle here.
-  if (ctx.data.prNumber) return true;
+  if (ctx.data.reviewOnly || ctx.data.prNumber) return true;
   // Never run further review/force-push cycles against an unapproved
   // draft — the review budget is already exhausted.
   if (ctx.getOutputs("feedback-loop").approved !== true) return true;
@@ -137,6 +137,15 @@ export function shouldSkipPostPushReview(ctx: PipelineContext): boolean {
  * so the YAML only needs to declare IDs, types, and optional moduleIds.
  */
 function applyWiring(step: YamlStep, options?: LoadPipelineOptions): StepDefinition {
+  const wired = applyNormalWiring(step, options);
+  const normalSkip = wired.skip;
+  return { ...wired, skip: (ctx) => {
+    if (ctx.data.reviewOnly && !["clone", "feedback-loop"].includes(step.id)) return "review-only";
+    return normalSkip ? normalSkip(ctx) : false;
+  } };
+}
+
+function applyNormalWiring(step: YamlStep, options?: LoadPipelineOptions): StepDefinition {
   switch (step.id) {
     case "clone":
       return {

@@ -8,6 +8,8 @@ import { GetFleetReportArgsSchema, GetTenantHealthArgsSchema } from "../restate/
 import { testDb } from "./helpers/test-db.js";
 import { checkExchange, recordExchange, type Exchange } from "./contract-recorder.js";
 
+import { makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
+
 const NOW = 1_700_000_000_000;
 const DAY = 86_400_000;
 let dedup: typeof DedupModule;
@@ -37,8 +39,16 @@ function payload(recorded: Exchange) {
 }
 
 describe("recorded get_tenant_health exchanges", () => {
-  it.each(["healthy", "degraded"])("%s", async (scenario) => {
+  it.each(["healthy", "degraded", "stage-agents"])("%s", async (scenario) => {
     vi.stubEnv("KG_EMBEDDINGS_DEGRADED", scenario === "degraded" ? "1" : "");
+    if (scenario === "stage-agents") {
+      const store = await import("../agent-config-store.js");
+      store.saveAccountProfileRevision(makeStageAgentProfile());
+      store.setOrchestratorDefaults(makeStageAgentDefaults());
+      store.setProjectConfigured("AII", true);
+      dedup.getDb().prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, 'acme', 'widgets', 'claude.yml', 'main')").run("BDS");
+      dedup.getDb().prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, 'acme', 'widgets', 'claude.yml', 'main')").run("AII");
+    }
     const { SetupChecks, SETUP_CHECKS_KEY } = await import("../restate/setup-checks.js");
     const get = vi.fn(async () => null);
     const recorded = await recordExchange("get_tenant_health", { args: {} }, {

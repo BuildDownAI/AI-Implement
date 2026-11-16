@@ -123,6 +123,7 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/^# ai-implement-capability: private-run-config-v1$/m);
       expect(yaml).toMatch(/^# ai-implement-capability: stage-agent-config-v1$/m);
       expect(yaml).toMatch(/^# ai-implement-capability: stage-agent-launch-context-v1$/m);
+      expect(yaml).toMatch(/^# ai-implement-capability: openrouter-accounts-v1$/m);
       const doc = parse(yaml) as any;
       for (const name of Object.keys(doc.on.workflow_dispatch.inputs)) {
         expect(name).not.toMatch(/private|capab|marker/i);

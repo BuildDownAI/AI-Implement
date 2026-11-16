@@ -144,7 +144,7 @@ beforeEach(async () => {
   });
   const stage = { agent: "codex", provider: "openai", model: "m", accountProfileId: "cdx", invocationTimeoutMs: 60_000 } as const;
   store.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  store.setProjectOptIn("AII", true);
+  store.setProjectConfigured("AII", true);
 
   const credentials = { sessionStore: sessions, resolveProtectedSecret: () => null };
   holder.runtime = {
@@ -244,13 +244,13 @@ describe("opted-in local Docker implementation", () => {
 
 describe("opted-out local Docker implementation", () => {
   it("still refuses without an Anthropic credential", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     await dispatchLocal();
     expect(dockerCalls).toHaveLength(0);
   });
 
   it("keeps the legacy shape: raw credential and run config in argv", async () => {
-    store.setProjectOptIn("AII", false);
+    store.setProjectConfigured("AII", false);
     await dispatchLocal(mapping, { ...config, anthropicApiKey: "sk-ant-synthetic" });
     const { args, envFile } = dockerCalls[0]!;
     expect(envFile).toContain("ANTHROPIC_API_KEY=sk-ant-synthetic");

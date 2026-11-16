@@ -5,6 +5,7 @@ import { removeScratchFromIndex } from "../scratch-exclude.js";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { DEFAULT_REVIEWER_SELECTION, type ReviewerSelection } from "../../config.js";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { LLMResult, PipelineContext, RunTelemetry, StepModule, StepReporter } from "../types.js";
@@ -44,7 +45,7 @@ import { REVIEWER_VERDICT_SCHEMA, resolveTrustedReviewer, type ReviewerDefinitio
 import { isChecksPermissionError } from "../../checks-permission.js";
 import { inferTestResults, sumUsage, toolTraceLines, writeCycleSummary, type CycleDisposition } from "../cycle-summary.js";
 import { DEFAULT_MODEL } from "../default-model.js";
-import { safeLimitLabel } from "../stage-executor.js";
+import { ACCOUNT_FALLBACK_CODES, safeLimitLabel } from "../stage-executor.js";
 import { reasonCodeTag, terminationReasonSentence } from "../../run-autopsy.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
@@ -209,13 +210,13 @@ interface FixSummary {
   notes: string;
 }
 
-function makeDefaultGhSpawn(cwd: string) {
+function makeDefaultGhSpawn(cwd: string, maxBuffer?: number) {
   return (args: string[]) => {
-    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const r = spawnSync("gh", args, { cwd, stdio: ["ignore", "pipe", "pipe"], ...(maxBuffer === undefined ? {} : { maxBuffer }) });
     return {
       stdout: r.stdout?.toString() ?? "",
-      stderr: r.stderr?.toString() ?? "",
-      exitCode: r.status ?? 1,
+      stderr: r.error ? `${r.error.message}\n${r.stderr?.toString() ?? ""}` : r.stderr?.toString() ?? "",
+      exitCode: r.error ? 1 : r.status ?? 1,
     };
   };
 }
@@ -338,6 +339,9 @@ function reviewerSummaryBlock(feedback: string, issues: ReviewIssue[]): string {
 function fixPassLabel(iteration: number, maxIterations: number): string {
   return `${iteration}/${Math.max(1, maxIterations - 1)}`;
 }
+
+const CI_CHECK_FAILING_TITLE = "CI check failing";
+const CI_CHECK_UNVERIFIED_TITLE = "CI check status could not be verified";
 
 function formatReviewHistory(history: ReviewFinding[]): string {
   if (history.length === 0) {
@@ -1735,7 +1739,7 @@ async function runSelectedInternalReviewers(params: {
         status: "failed",
         started_at: startedAt,
         ended_at: endedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { approved: false, complete: false, feedback, issues: [], blockingIssues: [], maxTurns, ...extraOutputs, ...(telemetry ? { telemetry } : {}) },
         logs_url: null,
@@ -1743,7 +1747,7 @@ async function runSelectedInternalReviewers(params: {
     };
     let prompt: string;
     try {
-      prompt = definition.buildPrompt({
+      prompt = `The pipeline reads the CI checks on the current commit; do not report CI status as an issue.\n\n` + definition.buildPrompt({
         issueIdentifier: params.context.data.issueIdentifier,
         issueTitle: params.context.data.issueTitle,
         issueDescription: params.context.data.issueDescription,
@@ -1790,15 +1794,14 @@ async function runSelectedInternalReviewers(params: {
     let transientRetries = 0;
     let reviewStageClassified: FailureRecord | undefined;
     let invocationThrew = false;
-    while (reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
+    while (!params.context.data.reviewOnly && reviewResult.telemetry?.outcome !== "max_turns" && reviewFailureMessage(reviewResult) !== null) {
       reviewStageClassified = reviewResult.failure ?? classifyLlmResult(reviewResult, {
         stage,
         attempt: reviewResult.attempts ?? 1,
         expectsStructuredOutput: true,
         elapsedMs: reviewResult.telemetry?.durationMs ?? undefined,
       });
-      const accountSwitched = reviewStageClassified.code === "ACCOUNT_USAGE_LIMIT"
-        && reviewStageClassified.accountFallback?.stage === "review";
+      const accountSwitched = reviewStageClassified.accountFallback?.stage === "review";
       if (!accountSwitched && (reviewStageClassified.category !== "transient" || transientRetries >= params.retryPolicy.stageRetries)) break;
       await params.reporter.report({
         id: `${reportId}.retry${reviewStageAttempt}`,
@@ -1806,7 +1809,7 @@ async function runSelectedInternalReviewers(params: {
         status: "failed",
         started_at: reviewStartedAt,
         ended_at: reviewEndedAt,
-        parent_step_id: "post-push-review",
+        parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
         inputs: reportInputs,
         outputs: { failure: reviewStageClassified, maxTurns, telemetry: reviewResult.telemetry },
         logs_url: null,
@@ -1924,7 +1927,7 @@ async function runSelectedInternalReviewers(params: {
       status: "passed",
       started_at: reviewStartedAt,
       ended_at: reviewEndedAt,
-      parent_step_id: "post-push-review",
+      parent_step_id: params.context.data.reviewOnly ? "feedback-loop" : "post-push-review",
       inputs: reportInputs,
       outputs: { approved: verdict.approved, findings: reviewerFindings, summary: verdict.summary, checks: verdict.checks, maxTurns, telemetry: reviewResult.telemetry },
       logs_url: null,
@@ -2180,7 +2183,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
 
-      const previousFindings = formatReviewHistory(reviewHistory);
+      const previousFindings = formatReviewHistory(reviewHistory.map(finding => ({
+        ...finding,
+        issues: finding.issues.filter(issue =>
+          issue.title !== CI_CHECK_FAILING_TITLE && issue.title !== CI_CHECK_UNVERIFIED_TITLE),
+      })));
       const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.branchDefinitions, selectedInternalReviewers);
       const activeInternalReviewers: SelectedReviewer[] = [
         ...selectedInternalReviewers,
@@ -2328,14 +2335,14 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         // issue so it flows through the same ledger/gating path "CI check failing" already uses,
         // rather than silently approving on missing evidence.
         internalIssues.push({
-          title: "CI check status could not be verified",
+          title: CI_CHECK_UNVERIFIED_TITLE,
           problem: `Could not read check runs at ${externalReviewResult.headSha} to determine whether CI checks passed.`,
           requiredFix: "Investigate the check-runs read failure (transient API error or credential issue), then re-run review once check runs can be read.",
         });
       }
       for (const checkName of ciChecksResult.failingChecks) {
         internalIssues.push({
-          title: "CI check failing",
+          title: CI_CHECK_FAILING_TITLE,
           problem: `CI check '${checkName}' is failing on the current head`,
           requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
         });
@@ -2752,8 +2759,8 @@ ${externalFindingsFixBlock}
       });
       let fixResult = await invokeFix();
       let fixAttempt = 1;
-      while (isLlmResultFailure(fixResult, false) && fixResult.failure?.code === "ACCOUNT_USAGE_LIMIT"
-        && fixResult.failure.accountFallback?.stage === "implementation") {
+      while (isLlmResultFailure(fixResult, false)
+        && fixResult.failure?.accountFallback?.stage === "implementation") {
         await reporter.report({
           id: `post-push-review.fix-${iteration}.retry${fixAttempt++}`,
           type: "custom",
@@ -2772,9 +2779,9 @@ ${externalFindingsFixBlock}
       const fixFailure = fixResult.failure ?? (isLlmResultFailure(fixResult, false) ? classifyLlmResult(fixResult, {
         stage: `post-push-review/fix-${iteration}`, attempt: fixResult.attempts ?? 1, expectsStructuredOutput: false,
       }) : null);
-      // Preserve partial work from exit-0 errors, except when usage-limit retries are exhausted.
-      if (fixResult.exitCode !== 0 || fixFailure?.code === "ACCOUNT_USAGE_LIMIT") {
-        if (fixFailure?.code === "ACCOUNT_USAGE_LIMIT") reviewerFailure = fixFailure;
+      // Preserve partial work from capped passes and exit-0 errors, except when account fallbacks are exhausted.
+      if ((fixResult.exitCode !== 0 && fixResult.telemetry?.outcome !== "max_turns") || (fixFailure && ACCOUNT_FALLBACK_CODES.has(fixFailure.code))) {
+        if (fixFailure && ACCOUNT_FALLBACK_CODES.has(fixFailure.code)) reviewerFailure = fixFailure;
         priorLlmFailure = true;
         terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
@@ -3037,3 +3044,87 @@ ${externalFindingsFixBlock}
 };
 
 export default postPushReviewStep;
+
+// Keep one comment below GitHub's 65,536-character limit. Allocate finding
+// space before summaries, and make any omitted detail explicit.
+function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLedgerFinding[]): string {
+  const limit = 65_000;
+  const clip = (value: string, size: number) => {
+    if (value.length <= size) return value;
+    let end = Math.max(0, size - 15);
+    // Avoid cutting a Unicode surrogate pair when shortening reviewer text.
+    if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
+    return `${value.slice(0, end)}… [truncated]`;
+  };
+  const header = `<!-- ai-implement rollup-review -->\n\n## Roll-up review: ${verdict}\n\nAdvisory only.`;
+  const shown = findings.slice(0, 100);
+  const findingBudget = 50_000;
+  const perFinding = Math.floor(findingBudget / Math.max(1, shown.length));
+  const details = shown.map(f => {
+    const location = `${clip(f.path ?? "(general)", Math.floor(perFinding / 3))}:${f.line ?? "?"}`;
+    const prefix = `- **${f.severity}** ${location} — `;
+    return prefix + clip(f.body, Math.max(30, perFinding - prefix.length - 2));
+  }).join("\n\n");
+  const omitted = findings.length > shown.length ? `\n\n${findings.length - shown.length} additional findings omitted from this comment.` : "";
+  const body = [header, details + omitted].filter(Boolean).join("\n\n");
+  return `${body}\n\n${clip(feedback, limit - body.length - 2)}`;
+}
+
+/** Single advisory pass. No native review, external polling, fix, commit or push. */
+export async function runReviewOnly(context: PipelineContext, workspaceDir: string, reporter: StepReporter, ghSpawn?: (args: string[]) => SpawnResult) {
+  // Bound memory explicitly; overflow is an incomplete review, never a partial diff review.
+  const gh = ghSpawn ?? makeDefaultGhSpawn(workspaceDir, 64 * 1024 * 1024);
+  const prNumber = context.data.prNumber!;
+  let reviewedHead = "";
+  let findings: ReviewLedgerFinding[] = [];
+  let feedback = "";
+  let failed = false;
+  let approved = false;
+  let costUsd: number | null = null;
+  try {
+    const headArgs = ["pr", "view", prNumber, "--json", "headRefOid", "--jq", ".headRefOid"];
+    const head = gh(headArgs);
+    if (head.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("Cannot read reviewed roll-up head");
+    reviewedHead = head.stdout.trim();
+    // gh returns the entire base-to-head PR diff, including earlier commits and lockfiles.
+    const diff = gh(["pr", "diff", prNumber]);
+    if (diff.exitCode !== 0) throw new Error(`Cannot read PR diff: ${resultMessage(diff)}`);
+    const afterDiff = gh(headArgs);
+    if (afterDiff.exitCode !== 0 || afterDiff.stdout.trim() !== reviewedHead) throw new Error("Roll-up head changed while reading the diff; review incomplete");
+    const { fetchTrustedConfigReviewers } = await import("./install.js");
+    const trustedConfig = await fetchTrustedConfigReviewers({
+      owner: context.data.githubOwner, repo: context.data.githubRepo, token: context.data.githubToken,
+      reviewers: context.data.reviewOnly!.reviewers, trustedReviewerDefinitions: context.data.trustedReviewerDefinitions,
+    });
+    const definitions = await resolveConfigReviewerDefinitions([], context.data.trustedReviewerDefinitions, trustedConfig);
+    const resolved = await resolveSelectedInternalReviewers(context.data.reviewOnly!.reviewers, context.data.trustedReviewerDefinitions,
+      definitions.trustedDefinitions, definitions.branchDefinitions);
+    if (resolved.unresolvedIds.length) throw new Error(selectionFailureMessage("unresolved", resolved.unresolvedIds));
+    const result = await runSelectedInternalReviewers({ context, reporter, reviewers: resolved.reviewers,
+      retryPolicy: normalizeRetryPolicy(context.data.retryPolicy), prNumber, iteration: 1, diff: diff.stdout,
+      previousFindings: "", model: context.data.model ?? DEFAULT_MODEL, sleep: async () => {} });
+    findings = result.findings;
+    feedback = result.feedback;
+    failed = result.incompleteReviews.length > 0;
+    approved = result.approved;
+    costUsd = result.costUsd;
+  } catch (error) {
+    failed = true;
+    feedback = error instanceof Error ? error.message : String(error);
+  }
+  const verdict = failed ? "Review incomplete" : approved ? "Approved" : "Changes recommended";
+  const body = rollupReviewBody(verdict, feedback, findings);
+  let verdictUrl = "";
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rollup-review-"));
+  try {
+    const bodyFile = path.join(tempDir, "verdict.md");
+    fs.writeFileSync(bodyFile, body, { mode: 0o600 });
+    const posted = gh(["pr", "comment", prNumber, "--body-file", bodyFile]);
+    if (posted.exitCode !== 0) throw new Error(`Cannot post roll-up review: ${resultMessage(posted)}`);
+    verdictUrl = posted.stdout.trim();
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
+    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl } };
+}

@@ -57,6 +57,7 @@ const AUTH_MODE_LIST = [
   "claude-subscription",
   "openai-api-key",
   "codex-subscription",
+  "openrouter-api-key",
 ] as const satisfies readonly AccountAuthMode[];
 // Compile-time exhaustiveness: fails if AccountAuthMode gains a member not listed above.
 type MissingAuthModes = Exclude<AccountAuthMode, (typeof AUTH_MODE_LIST)[number]>;

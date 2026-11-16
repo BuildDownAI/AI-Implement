@@ -11,9 +11,10 @@ import type { Job, JobStatus } from "../log.js";
 import type { ImplementationFinishOutcome, ImplementationFinishResult } from "./implementation-run-workflow.js";
 
 /** Conclusions a callback writes that a deadline must not overwrite (`TTL_STALE_CONCLUSIONS` in `src/index.ts`). */
-const CALLBACK_OWNED_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending"]);
+const CALLBACK_OWNED_CONCLUSIONS = new Set(["operator_cancelled", "runner_approved", "external_review_pending", "rollup_review"]);
 
 export interface ImplementationFinishDependencies {
+  neverStarted?(job: Job): Promise<boolean>;
   getJob(dispatchId: string): Job | null;
   /** `updateJobStatus`: owned terminal writes always defer admission release to the workflow. */
   closeRow(job: Job, status: JobStatus, conclusion: string, opts?: { backendTerminated?: boolean; skipAdmissionRelease?: boolean }): void;
@@ -33,10 +34,14 @@ function callbackFacts(job: Job) {
   // A `noWork` success writes only the tracker (`markMerged`), never the row: a grouping parent that ended
   // clean with no PR and no failure is that case, as the Legacy monitors read it (D7).
   const noWork = job.groupingParent && job.prUrl === null && job.failure === null && job.status !== "failed";
-  const reported = job.approved || job.failure !== null || job.failureCommentedAt !== null || job.status === "failed" || noWork
+  // Owned gap-fill failures close the row in the callback, even without structured failure.
+  // Status alone is sufficient; arbitrary conclusions must not hide a missing callback.
+  const reported = job.approved || job.failure !== null || job.failureCommentedAt !== null || job.status === "failed"
     || (job.conclusion !== null && CALLBACK_OWNED_CONCLUSIONS.has(job.conclusion));
   return {
-    reported,
+    reported: reported || noWork,
+    inferredNoWork: noWork && !reported,
+    reviewOnly: job.conclusion === "rollup_review",
     operatorCancelled: job.conclusion === "operator_cancelled",
     // The callback's ticket move for an approved run, or one pending its external review.
     madeTransition: job.approved || job.conclusion === "external_review_pending",
@@ -52,6 +57,10 @@ export async function finishImplementationJob(
   const job = deps.getJob(dispatchId);
   if (!job) return {};
   const facts = callbackFacts(job);
+
+  // Advisory callbacks already recorded their terminal result. The owner only cleans up
+  // and releases admission; implementation finalization must never move their tracker issue.
+  if (facts.reviewOnly) return {};
 
   if (facts.operatorCancelled) {
     // The callback wrote `failed` / `operator_cancelled` and cleared the working state; clearing again is safe.
@@ -76,10 +85,14 @@ export async function finishImplementationJob(
 
   const closeOpts = { skipAdmissionRelease: true };
 
-  if (!facts.reported) {
+  // Inferred no-work is not callback evidence: a grouping parent's machine may never have started.
+  // Explicit callback outcomes remain authoritative, including on retries of this failure.
+  const neverStarted = (!facts.reported || facts.inferredNoWork) && await deps.neverStarted?.(job);
+  if (!facts.reported || neverStarted) {
     // The backend ended and no callback came: the failure fix-up.
-    deps.closeRow(job, "failed", "ended_without_callback", closeOpts);
-    await deps.finalize({ kind: "failed", conclusion: "ended_without_callback" }, job);
+    const conclusion = neverStarted ? "fly_machine_never_started" : "ended_without_callback";
+    deps.closeRow(job, "failed", conclusion, closeOpts);
+    await deps.finalize({ kind: "failed", conclusion }, job);
     return {};
   }
 

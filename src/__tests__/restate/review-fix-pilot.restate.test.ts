@@ -151,6 +151,8 @@ interface GithubFixture {
   /** Incomplete-feedback outcomes the production-shaped `load()` resolved as pending:null. */
   incompleteLoads: Array<{ category: string; reason: string }>;
   windowMs: number;
+  unknownLaunchGraceMs: number;
+  postDeadlineReconcileIntervalMs: number;
   jobTimeoutMinutes: number;
   reviewProcess: string | null;
   blockAdmission: "paused" | "occupied" | "at_capacity" | "budget_exhausted" | null;
@@ -246,6 +248,8 @@ function freshScenario(prefix: string, opts: { cap?: number; budget?: number; pa
     headSha: sha(`${owner}-initial`),
     checks: [], statusState: "success", statusCount: 0, reviews: [], comments: [], commentPosts: 0,
     pending: null, useProductionPending: false, incompleteLoads: [], windowMs: 200, jobTimeoutMinutes: LONG_DEADLINE_JOB_TIMEOUT_MINUTES,
+    unknownLaunchGraceMs: SHORT_UNKNOWN_LAUNCH_GRACE_MS,
+    postDeadlineReconcileIntervalMs: SHORT_POST_DEADLINE_RECONCILE_MS,
     reviewProcess: null, blockAdmission: null, admitOverride: null, recordResultOverride: null, applyApprovalEffectOverride: null,
     dispatchImpl: () => { throw new Error("unset"); },
     dispatchCalls: 0, lookupTimes: [], listRunsVisible: true, runId: null, runAttempt: 1, runDetail: null,
@@ -490,8 +494,8 @@ const pr = createReviewFixPR({
 const attemptWorkflow = createReviewFixAttempt({
   store: attemptStore, worker, finalizer, notifyPrOnCompletion: true,
   unknownLaunchAlertMs: SHORT_UNKNOWN_LAUNCH_ALERT_MS,
-  unknownLaunchGraceMs: SHORT_UNKNOWN_LAUNCH_GRACE_MS,
-  postDeadlineReconcileIntervalMs: SHORT_POST_DEADLINE_RECONCILE_MS,
+  unknownLaunchGraceMs: (scope) => findFixture(scope.repository).unknownLaunchGraceMs,
+  postDeadlineReconcileIntervalMs: (scope) => findFixture(scope.repository).postDeadlineReconcileIntervalMs,
   alert: async (attemptId, reason) => { alerts.push({ attemptId, reason }); },
   loadApprovalEvidence: async (attempt, _result) => {
     const currentPrHeadSha = (await github.getPrHeadSha(attempt.scope)) ?? "";
@@ -1109,12 +1113,25 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
   it.each(VARIANTS.flatMap(([label]) => (["cancel", "closed", "merged"] as const).map((event) => ({ label, event }))))("$event ends an unknown launch during its backed-off wait ($label)", async ({ label, event }) => {
     const env = envFor(label);
     const fixture = freshScenario(`unknown-${event}`);
+    fixture.unknownLaunchGraceMs = 10 * 60_000;
+    fixture.postDeadlineReconcileIntervalMs = 10 * 60_000;
     fixture.jobTimeoutMinutes = SHORT_DEADLINE_JOB_TIMEOUT_MINUTES;
     fixture.dispatchImpl = async () => { fixture.dispatchCalls++; throw new Error("lost launch response"); };
     await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
     const attemptId = fixture.attemptId!;
     await eventually(() => sqliteStore.hasCurrentAuthority(attemptId), (authority) => !authority,
       { timeoutMs: 6_000, label: "deadline revokes unknown launch" });
+    const prepared = (await sqliteStore.getPreparedAttempt(attemptId))!;
+    const runRows = await eventually(() => queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`),
+      (found) => found.length === 1, { label: "unknown launch run invocation" });
+    // Authority can expire before the workflow starts its backed-off sleep.
+    // Wait for that durable command so cancellation exercises the intended wait.
+    await eventually(() => journalEntries(env.adminAPIBaseUrl(), runRows[0].id as string),
+      (entries) => entries.some((entry) => entry.entry_type === "Command: Sleep"
+        && (JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } })
+          .Command.Sleep.wake_up_time > prepared.deadlineAt),
+      { label: "unknown launch backed-off sleep" });
     if (event === "cancel") {
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
     } else {
@@ -1124,7 +1141,25 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
         createReviewFixIngressClient(env.baseUrl()))).toBe(true);
     }
     await eventually(async () => (await sqliteStore.getRecordedOutcome(attemptId))?.terminal.status,
-      (status) => status === "launch_unresolved", { timeoutMs: 1_500, label: "cancel interrupts backoff" });
+      (status) => status === "launch_unresolved", { label: "cancel interrupts backoff" });
+    const rows = await queryInvocations(env.adminAPIBaseUrl(),
+      `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+    expect(rows).toHaveLength(1);
+    const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
+    const sleeps = entries.filter((entry) => entry.entry_type === "Command: Sleep")
+      .sort((a, b) => Number(a.index) - Number(b.index));
+    expect(sleeps.length).toBeGreaterThan(0);
+    for (const sleep of sleeps) expect(Number.isFinite(Number(sleep.index))).toBe(true);
+    const command = JSON.parse(String(sleeps.at(-1)!.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+    const completedAt = (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(attemptId) as { completed_at: number | null }).completed_at;
+    expect(typeof completedAt).toBe("number");
+    expect(Number.isFinite(command.Command.Sleep.wake_up_time)).toBe(true);
+    // Timer completion would put checkedAt at or after wake_up_time. The durable
+    // outcome preceding it proves cancellation interrupted this attempt's wait,
+    // regardless of when polling observes the outcome.
+    expect(command.Command.Sleep.wake_up_time).toBeGreaterThanOrEqual(prepared.deadlineAt + 5 * 60_000);
+    expect(completedAt).toBeLessThan(command.Command.Sleep.wake_up_time);
     expect(fixture.dispatchCalls).toBe(1);
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
   }, 15_000);

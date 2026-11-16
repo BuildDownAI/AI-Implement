@@ -343,6 +343,10 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     inputs: FeedbackLoopInputs,
     reporter: StepReporter,
   ): Promise<FeedbackLoopOutputs> {
+    if (context.data.reviewOnly) {
+      const { runReviewOnly } = await import("./post-push-review.js");
+      return runReviewOnly(context, inputs.workspaceDir, reporter);
+    }
     const parentStepId =
       typeof inputs.parentStepId === "string" ? inputs.parentStepId : "feedback-loop";
     const effectiveMaxIterations =

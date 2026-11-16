@@ -21,7 +21,7 @@ export interface Caller {
   kind: IdentityKind;
   email: string | null;
   role: AccessRole | null;
-  grants: readonly "deploy"[];
+  grants: readonly ("deploy" | "projects")[];
 }
 
 /** The identity in-process/system code acts under: unrestricted, unattributed to a person. */
@@ -30,7 +30,7 @@ export function systemCaller(): Caller {
 }
 
 /** The identity a trusted machine (the BuildDown control plane) acts under: user role with explicit grants, never `admin`. */
-export function serviceCaller(options: { grants?: readonly "deploy"[] } = {}): Caller {
+export function serviceCaller(options: { grants?: readonly ("deploy" | "projects")[] } = {}): Caller {
   return { kind: "service", email: null, role: "user", grants: options.grants ?? [] };
 }
 

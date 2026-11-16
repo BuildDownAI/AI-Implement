@@ -7,7 +7,7 @@
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"runnerMode\": {\n    \"mode\": \"default\",\n    \"source\": \"env\"\n  },\n  \"inFlightJobCount\": 0,\n  \"awaitingDecisionCount\": 0,\n  \"pendingGapfillCount\": 0,\n  \"projectCount\": 0,\n  \"kgDegraded\": true,\n  \"kgUnavailable\": false,\n  \"sidecar\": {\n    \"reachable\": true,\n    \"toolsListed\": true,\n    \"lastError\": null,\n    \"checkedAt\": 1700000000000\n  },\n  \"restate\": {\n    \"sidecar\": {\n      \"state\": \"ready\"\n    },\n    \"registration\": {\n      \"state\": \"registered\"\n    }\n  },\n  \"restateRetentionDays\": 14,\n  \"volumeSnapshotRetentionDays\": 14,\n  \"kgRefreshPreflight\": null,\n  \"setupChecks\": null\n}"
+        "text": "{\n  \"runnerMode\": {\n    \"mode\": \"default\",\n    \"source\": \"env\"\n  },\n  \"inFlightJobCount\": 0,\n  \"awaitingDecisionCount\": 0,\n  \"pendingGapfillCount\": 0,\n  \"projectCount\": 0,\n  \"stageAgents\": {\n    \"defaultsMode\": \"legacy\",\n    \"projects\": []\n  },\n  \"kgDegraded\": true,\n  \"kgUnavailable\": false,\n  \"sidecar\": {\n    \"reachable\": true,\n    \"toolsListed\": true,\n    \"lastError\": null,\n    \"checkedAt\": 1700000000000\n  },\n  \"restate\": {\n    \"sidecar\": {\n      \"state\": \"ready\"\n    },\n    \"registration\": {\n      \"state\": \"registered\"\n    }\n  },\n  \"restateRetentionDays\": 14,\n  \"volumeSnapshotRetentionDays\": 14,\n  \"kgRefreshPreflight\": null,\n  \"setupChecks\": null\n}"
       }
     ]
   }

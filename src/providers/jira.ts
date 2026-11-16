@@ -427,7 +427,7 @@ export class JiraProvider implements TicketingProvider {
    * issue whose embedded list is shorter than `total` costs an extra `listComments` call
    * (newest first, so the 100 kept are the newest). The embedded list is sorted newest first too.
    */
-  async listIssuesPage(mapping: RepoMapping, cursor: string | null): Promise<TrackerIssuePage> {
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
     const cfg = mapping.ticketingConfig;
     if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
     const scopeKey = mapping.teamKey;
@@ -435,7 +435,7 @@ export class JiraProvider implements TicketingProvider {
 
     const fieldIds = await this.fields(scopeKey);
     const res = await this.client.searchJqlPage(
-      `(${cfg.jql})`,
+      `(${cfg.jql})${filter ? ' AND summary ~ ' + JSON.stringify(filter.titlePrefix.replace(/[\[\]]/g, "")) : ""}`,
       [
         "summary", "description", "status", "labels", "project", "parent", "issuelinks", "comment",
         fieldIds.repoFieldId,
@@ -1031,6 +1031,42 @@ export class JiraProvider implements TicketingProvider {
 
   issueUrl(issue: TicketIssue): string {
     return `${this.siteUrl}/browse/${issue.identifier}`;
+  }
+
+  async createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    const ids = await this.fields(scopeKey);
+    const parent = await this.client.getIssue(parentId, ["project", "issuetype", ids.repoFieldId]);
+    const project = parent.fields.project as { id?: string } | undefined;
+    const parentType = parent.fields.issuetype as { subtask?: boolean; hierarchyLevel?: number } | undefined;
+    if (!project?.id || parentType?.subtask) throw new Error("Jira parent does not support native children");
+    const repo = parent.fields[ids.repoFieldId];
+    const mapping = this.getMappings()[scopeKey];
+    if (mapping.ticketingConfig.kind !== "jira" || !readRepoFieldValue(repo) ||
+        readRepoFieldValue(repo) !== mapping.ticketingConfig.repoFieldValue) {
+      throw new Error("Jira parent Repo does not match the mapping");
+    }
+    const types = await this.client.listCreateIssueTypes(project.id);
+    const level = parentType?.hierarchyLevel ?? 0;
+    const projectTypes = level > 0 ? await this.client.listProjectIssueTypes(project.id) : [];
+    const childType = types.find((t) => level === 0 ? t.subtask :
+      projectTypes.some((pt) => pt.id === t.id && pt.hierarchyLevel === level - 1));
+    if (!childType) throw new Error("Jira project has no compatible native child issue type");
+    const repoValue = typeof repo === "string" ? repo : { value: readRepoFieldValue(repo) };
+    const classicEpic = level === 1 && !(await this.client.getProject(project.id)).simplified;
+    // Fully overridden mappings skip field discovery, so resolve Epic Link here too.
+    const epicLinkFieldId = classicEpic
+      ? ids.epicLinkFieldId ?? (await this.client.listFields()).find((f) => f.name === "Epic Link")?.id
+      : undefined;
+    const relationship = epicLinkFieldId
+      ? { [epicLinkFieldId]: parent.key }
+      : { parent: { id: parent.id } };
+    const child = await this.client.createIssue({
+      project: { id: project.id }, ...relationship, issuetype: { id: childType.id },
+      summary: content.title, description: markdownToAdf(content.body),
+      [ids.statusFieldId]: { value: STATUS_VALUES.READY }, [ids.repoFieldId]: repoValue,
+    });
+    if (!child.id || !child.key) throw new Error("Jira child issue creation returned no identity");
+    return { id: child.id, identifier: child.key };
   }
 
   async findByKey(key: string, scopeKey?: string): Promise<TicketIssue | null> {

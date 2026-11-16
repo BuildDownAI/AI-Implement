@@ -523,6 +523,18 @@ describe("kg-refresh production wiring (AII-901)", () => {
     expect(ingress.enqueueDryRun).not.toHaveBeenCalled();
   });
 
+  it.each([null, "operator@example.com"])("forwards the admin caller to the refresh tool (%s)", async (email) => {
+    const callAsSystem = vi.fn();
+    const callAsCaller = vi.fn().mockResolvedValue({
+      status: "ok", content: [{ type: "text", text: JSON.stringify({ status: 202, body: { refreshing: true, triggerId: "manual-1" } }) }],
+    });
+    const caller = { kind: "human", email, role: "admin", grants: [] } as const;
+    const deps = idx.makeKgRefreshAdminDeps("Org/kg", {} as never, callAsSystem, held(false), callAsCaller);
+    expect(await deps.trigger(undefined, caller)).toEqual({ status: 202, body: { refreshing: true, triggerId: "manual-1" } });
+    expect(callAsCaller).toHaveBeenCalledWith("trigger_kg_refresh", {}, caller);
+    expect(callAsSystem).not.toHaveBeenCalled();
+  });
+
   it("cancel cancels the clicked row's dispatchId and reads no marker", async () => {
     const client = { repoStatus: vi.fn(), cancel: vi.fn().mockResolvedValue({ status: "accepted" }) };
     const deps = idx.makeKgRefreshAdminDeps("Org/kg", client as never, vi.fn() as never, held(false));
