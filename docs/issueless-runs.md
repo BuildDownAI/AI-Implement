@@ -46,6 +46,8 @@ flowchart TD
 
 ---
 
+KG dispatch rows record `trigger` as `manual` when the trigger input carries `actorEmail`, otherwise `schedule` (the system schedule supplies no email). Only the trigger category is stored in the row. Jobs and the KG dispatch log show `KG refresh` with a `manual` or `scheduled` badge; legacy rows without a trigger have no badge. Their dispatch count reads `run #N` without re-dispatch styling. Issue-backed runs retain re-dispatch styling.
+
 ## 3. Envelope and dispatch
 
 The orchestrator builds a `RunConfigV1` (defined in `src/run-config.ts`) with the following fields for a kg-refresh run:

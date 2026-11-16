@@ -179,9 +179,15 @@ export interface KgDispatchInput {
   machineNonce: string | null;
 }
 
-/** The `dispatch_log` row's values, journaled by the `resolve` step and projected by `reserve`. */
+/** Email presence distinguishes manual requests from the system schedule. */
+export function kgRefreshTrigger(options: { actorEmail?: string }): "schedule" | "manual" {
+  return options.actorEmail !== undefined ? "manual" : "schedule";
+}
+
+/** The dispatch row journaled by resolve and projected by reserve; older records omit trigger. */
 export interface KgDispatchRecord {
   dispatchId: string;
+  trigger?: "schedule" | "manual";
   issueId: "kg-refresh";
   phase: "kg-refresh";
   repo: string;
@@ -654,7 +660,7 @@ export function createKgRefreshWorkflow(deps: KgRefreshWorkflowDependencies) {
       // it ends in are function declarations below, hoisted to the top of this block.
       if (resume) return await resumeFromHold(resume);
 
-      const record = await ctx.run("resolve", () => deps.resolveDispatchRecord(dispatchId));
+      const record = await ctx.run("resolve", () => ({ ...deps.resolveDispatchRecord(dispatchId), trigger: kgRefreshTrigger(input) }));
       await ctx.run("reserve", () => deps.recordDispatchRow(record));
       const { executionMode } = record;
 
