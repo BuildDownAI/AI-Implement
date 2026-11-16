@@ -340,6 +340,9 @@ function fixPassLabel(iteration: number, maxIterations: number): string {
   return `${iteration}/${Math.max(1, maxIterations - 1)}`;
 }
 
+const CI_CHECK_FAILING_TITLE = "CI check failing";
+const CI_CHECK_UNVERIFIED_TITLE = "CI check status could not be verified";
+
 function formatReviewHistory(history: ReviewFinding[]): string {
   if (history.length === 0) {
     return "No previous post-push review findings.";
@@ -1744,7 +1747,7 @@ async function runSelectedInternalReviewers(params: {
     };
     let prompt: string;
     try {
-      prompt = definition.buildPrompt({
+      prompt = `The pipeline reads the CI checks on the current commit; do not report CI status as an issue.\n\n` + definition.buildPrompt({
         issueIdentifier: params.context.data.issueIdentifier,
         issueTitle: params.context.data.issueTitle,
         issueDescription: params.context.data.issueDescription,
@@ -2180,7 +2183,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
 
-      const previousFindings = formatReviewHistory(reviewHistory);
+      const previousFindings = formatReviewHistory(reviewHistory.map(finding => ({
+        ...finding,
+        issues: finding.issues.filter(issue =>
+          issue.title !== CI_CHECK_FAILING_TITLE && issue.title !== CI_CHECK_UNVERIFIED_TITLE),
+      })));
       const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.branchDefinitions, selectedInternalReviewers);
       const activeInternalReviewers: SelectedReviewer[] = [
         ...selectedInternalReviewers,
@@ -2328,14 +2335,14 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         // issue so it flows through the same ledger/gating path "CI check failing" already uses,
         // rather than silently approving on missing evidence.
         internalIssues.push({
-          title: "CI check status could not be verified",
+          title: CI_CHECK_UNVERIFIED_TITLE,
           problem: `Could not read check runs at ${externalReviewResult.headSha} to determine whether CI checks passed.`,
           requiredFix: "Investigate the check-runs read failure (transient API error or credential issue), then re-run review once check runs can be read.",
         });
       }
       for (const checkName of ciChecksResult.failingChecks) {
         internalIssues.push({
-          title: "CI check failing",
+          title: CI_CHECK_FAILING_TITLE,
           problem: `CI check '${checkName}' is failing on the current head`,
           requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
         });
