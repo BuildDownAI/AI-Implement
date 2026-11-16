@@ -12,7 +12,7 @@ const job = {
   runnerMode: "local", machineId: "a".repeat(64), status: "running", dispatchedAt: Date.now(),
 };
 
-async function setup(entries: Array<typeof job & { trigger?: string | null }> = [job], logsStatus = 200) {
+async function setup(entries: Array<typeof job & { trigger?: string | null; prUrl?: string }> = [job], logsStatus = 200) {
   const dom = new JSDOM(pipelinesHtml + localJobLogsHtml, { runScripts: "outside-only" });
   const { window } = dom;
   window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
@@ -22,7 +22,12 @@ async function setup(entries: Array<typeof job & { trigger?: string | null }> = 
     json: async () => url.startsWith("/api/log?") ? entries : { logs: "saved runner output", source: "saved" },
   }));
   window.api = api;
-  window.esc = window.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+  window.esc = (value: unknown) => {
+    const el = window.document.createElement("span");
+    el.textContent = String(value ?? "");
+    return el.innerHTML;
+  };
+  window.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
   window.safeUrl = (value: string) => value;
   window.isAdmin = () => true;
   window.registerPage = vi.fn();
@@ -71,6 +76,28 @@ describe("pipeline list log actions", () => {
       expect(button).not.toBeNull();
       button.click();
       await vi.waitFor(() => expect(api).toHaveBeenCalledWith("/api/jobs/396/logs"));
+    } finally { dom.window.close(); }
+  });
+});
+
+describe("dispatch PR link escaping", () => {
+  it.each([false, true])("keeps an attacker-controlled URL inside href (grouped: %s)", async grouped => {
+    const prUrl = 'https://github.com/org/repo/pull/1?x=\" onmouseover=\"alert(1)&other=\'value\'';
+    const implementation = { ...job, machineId: "", prUrl, dispatchNumber: grouped ? 2 : 1 };
+    const entries = grouped
+      ? [implementation, { ...job, id: 395, phase: "planning", dispatchNumber: 1 }]
+      : [implementation];
+    const { dom, document } = await setup(entries);
+    try {
+      expect(document.querySelectorAll("#log-body tr")).toHaveLength(1);
+      const cell = document.querySelector("#log-body tr")!.children[9];
+      const link = cell.querySelector("a")!;
+      expect(link.textContent).toBe("View");
+      expect(link.getAttribute("href")).toBe(prUrl);
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttributeNames().sort()).toEqual(["href", "target"]);
+      expect(cell.querySelectorAll("a")).toHaveLength(1);
+      expect(document.querySelector("#log-body [onmouseover]")).toBeNull();
     } finally { dom.window.close(); }
   });
 });
