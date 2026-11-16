@@ -472,14 +472,18 @@ describe("row projections (real log.ts, scratch database)", () => {
     });
   });
 
-  it.each([undefined, "operator@example.com"])("persists the derived trigger without the actor email (%s)", async actorEmail => {
+  it.each([
+    { options: {}, expected: "schedule" },
+    { options: { actorEmail: "operator@example.com" }, expected: "manual" },
+    { options: { trigger: "manual" as const }, expected: "manual" },
+    { options: { trigger: "schedule" as const }, expected: "schedule" },
+  ])("persists the derived trigger without the actor email ($expected, $options)", async ({ options, expected }) => {
     const { kgRefreshTrigger } = await import("../restate/kg-refresh-workflow.js");
     await withScratchDb((log, prod, db) => {
-      const trigger = kgRefreshTrigger({ actorEmail });
+      const trigger = kgRefreshTrigger(options);
       const record = { dispatchId: "d-trigger", issueId: "kg-refresh", phase: "kg-refresh", repo: "acme/kg", executionMode: "github-actions", trigger } as const;
       prod.recordKgDispatchRow(record);
       prod.recordKgDispatchRow(record);
-      const expected = actorEmail === undefined ? "schedule" : "manual";
       expect(db.prepare("SELECT trigger FROM dispatch_log").all()).toEqual([{ trigger: expected }]);
       expect(log.listLog()[0].trigger).toBe(expected);
     });

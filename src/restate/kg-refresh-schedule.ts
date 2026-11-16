@@ -3,7 +3,7 @@
  * `KgRepo` lease and whether it holds a snapshot at the decision gate (AII-1489: a hold is `KgRepo` state, not a
  * running workflow); `replace` cancels a hold this schedule started through `KgRepo.decide`, the one decision door,
  * so it never touches a run a person accepted (that run has no hold); `fire` is the same door `POST /api/kg/refresh`
- * uses (`trigger_kg_refresh` as the system caller), so the credential preflight is not copied.
+ * uses (`trigger_kg_refresh`, with the schedule acting as the system caller), so the credential preflight is not copied.
  *
  * `busy` does not read the deploy hold: the tool answers 409 `deploy-in-progress`, which maps to a
  * `busy` fire answer and leaves the occurrence due. `KgRepo` and `orchestratorTools` are

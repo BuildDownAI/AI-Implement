@@ -501,7 +501,7 @@ export interface AdminDeps {
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(opts?: { ref?: string; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
+    trigger(opts?: { ref?: string; actorEmail?: string }, caller?: Caller): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<{ status: number; body: unknown }>;
     /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
     cancel(opts: { jobId: number; dispatchId?: string | null; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
@@ -867,7 +867,7 @@ export function handleAdminRequest(
               }
             }
           }
-          return kgRefresh.trigger().then(
+          return kgRefresh.trigger(undefined, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }).then(
             (r) => json(res, r.status, r.body),
             (err) => json(res, 500, { error: String(err) }),
           );

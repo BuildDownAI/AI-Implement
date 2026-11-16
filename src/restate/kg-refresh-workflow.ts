@@ -82,6 +82,7 @@ export const kgRefreshOptionsSchema = z.object({
   kgSourceRef: z.string().optional(),
   acceptNewBaseline: z.boolean().optional(), // tolerated for in-flight inputs; remove after 2026-11-13
   actorEmail: z.string().optional(),
+  trigger: z.enum(["schedule", "manual"]).optional(),
 }).strict();
 
 /** The `decide` actor: who decided, as it appears on the PR note and in the log. */
@@ -179,9 +180,9 @@ export interface KgDispatchInput {
   machineNonce: string | null;
 }
 
-/** Email presence distinguishes manual requests from the system schedule. */
-export function kgRefreshTrigger(options: { actorEmail?: string }): "schedule" | "manual" {
-  return options.actorEmail !== undefined ? "manual" : "schedule";
+/** Explicit caller category covers admin sessions without email; older inputs use actorEmail. */
+export function kgRefreshTrigger(options: { actorEmail?: string; trigger?: "schedule" | "manual" }): "schedule" | "manual" {
+  return options.trigger ?? (options.actorEmail !== undefined ? "manual" : "schedule");
 }
 
 /** The dispatch row journaled by resolve and projected by reserve; older records omit trigger. */

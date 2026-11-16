@@ -2272,12 +2272,12 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
-  it("POST /api/kg/refresh with no body reaches the trigger with no option — the unchanged real refresh", async () => {
+  it("POST /api/kg/refresh with no body forwards the authenticated human caller", async () => {
     const token = await login("secret");
     const res = await kgRequest("/api/kg/refresh", "POST", token);
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith(undefined, { kind: "human", email: null, role: "admin", grants: [] });
     expect(JSON.parse(res.body)).toMatchObject({ refreshing: true });
   });
 
@@ -2285,7 +2285,7 @@ describe("admin kg refresh options removed (AII-1263)", () => {
     const token = await login("secret");
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith(undefined, { kind: "human", email: null, role: "admin", grants: [] });
     expect(JSON.parse(res.body)).toEqual({ refreshing: true, triggerId: "t-0" });
   });
 

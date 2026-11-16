@@ -1419,7 +1419,7 @@ describe("KgRefresh durable workflow", () => {
       await done;
       expect(claimCalls).not.toContain(triggerId);
       expect(attachCalls).not.toContain(triggerId);
-      expect(appendJobLogCalls.filter((c) => c.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "github-actions" }]);
+      expect(appendJobLogCalls.filter((c) => c.dispatchId === triggerId)).toEqual([{ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "github-actions", trigger: "schedule" }]);
     }, 30_000);
 
     it.each(VARIANTS.map(([label]) => label))("AII-1246: attach receives the dispatch result's app, and no app key when there is none (%s)", async (label) => {
@@ -1583,21 +1583,21 @@ describe("KgRefresh durable workflow", () => {
       expect(dispatchedNonces.at(-1)).toBeNull();
     }, 30_000);
 
-    it.each(VARIANTS.map(([label]) => label))("the projections receive exactly the journaled values, and the nonce is in no journal entry (%s)", async (label) => {
+    it.each(VARIANTS.flatMap(([label]) => (["schedule", "manual"] as const).map((trigger) => [label, trigger] as const)))("the projections receive exactly the journaled values, and the nonce is in no journal entry (%s, %s)", async (label, trigger) => {
       const env = envFor(label);
       const triggerId = newTriggerId();
       const runId = runIdCounter++;
       makeScenario(triggerId, { dispatchOutcome: "accepted", runId, executionMode: "fly-machines" });
       const rowsBefore = appendJobLogCalls.length;
       const resultsBefore = dispatchResults.length;
-      const done = runWorkflow(env.baseUrl(), triggerId);
+      const done = runWorkflow(env.baseUrl(), triggerId, { trigger });
       await eventually(() => scenarios.get(triggerId)!.dispatchCalls >= 1, (ok) => ok, { label: "dispatch" });
       await callWorkflow(env.baseUrl(), "KgRefresh", triggerId, "report", SUCCESS_REPORT);
       await done;
 
       // `recordDispatchRow` receives the journaled `resolve` record.
       const record = appendJobLogCalls.slice(rowsBefore).find((r) => r.dispatchId === triggerId);
-      expect(record).toEqual({ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "fly-machines" });
+      expect(record).toEqual({ dispatchId: triggerId, issueId: "kg-refresh", phase: "kg-refresh", repo: KG_SOURCE_REPO, executionMode: "fly-machines", trigger });
 
       // `recordDispatchDetails` receives the journaled dispatch result's machine id, URL and run id, and nothing else.
       const result = dispatchResults.slice(resultsBefore).at(-1)!;

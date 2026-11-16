@@ -4125,9 +4125,12 @@ export function makeKgRefreshAdminDeps(
   client: KgRefreshIngressClient,
   callAsSystem: typeof callToolAsSystem = callToolAsSystem,
   deployHeld: () => boolean = isDeployHeld,
+  callAsCaller: typeof callTool = callTool,
 ): NonNullable<AdminDeps["kgRefresh"]> {
   return {
-    trigger: async (opts) => kgToolAnswer(await callAsSystem("trigger_kg_refresh", { ...opts }), deployHeld),
+    trigger: async (opts, caller) => kgToolAnswer(await (caller
+      ? callAsCaller("trigger_kg_refresh", { ...opts }, caller)
+      : callAsSystem("trigger_kg_refresh", { ...opts })), deployHeld),
     status: async () => {
       const r = await callAsSystem("get_kg_status", {});
       if (r.status === "unavailable" || r.status === "deploy-held") {
