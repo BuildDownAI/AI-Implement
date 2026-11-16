@@ -1,3 +1,10 @@
+import { checkModelAccountKey } from "../model-account-key-check.js";
+import { resolveModelCredential } from "../model-credentials.js";
+import { readKeyBinding } from "../key-bindings.js";
+import { createModelSessionStore } from "../model-session-store.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { sessionOwnerVerifier } from "../model-session-ownership.js";
+import { getAccountProfile, lookupCredentialReference } from "../agent-config-store.js";
 import { importEnvironmentCredential } from "../model-account-cli.js";
 import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { modelPrices } from "./model-prices.js";
@@ -1418,6 +1425,34 @@ export const getPipelineScheduleTool = tool(
   },
 );
 
+export const checkModelAccountKeyTool = tool(
+  {
+    description: "Check one stored OpenRouter account key against OpenRouter; returns states only (admin role).",
+    input: z.object({ profileId: z.string().min(1).max(128) }),
+    role: "admin",
+    operation: "read",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("check-model-account-key", () => checkModelAccountKey(input.args.profileId, {
+      readProfile: getAccountProfile,
+      readBinding(profileId, revision) {
+        const ref = lookupCredentialReference(profileId, revision);
+        return ref ? readKeyBinding(ref) : undefined;
+      },
+      resolveCredential: request => resolveModelCredential(request, {
+        sessionStore: createModelSessionStore({
+          keys: createModelSessionKeyProvider(process.env), verifyOwner: sessionOwnerVerifier,
+          authorizeOperator: () => false, db: () => getDb(),
+        }),
+        resolveProtectedSecret: createModelProtectedSecrets({ env: process.env }).resolve,
+      }),
+      fetch,
+    }), { maxRetryAttempts: 1 });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
 export const importEnvironmentCredentialTool = tool(
   {
     description: "Import the orchestrator environment credential into an account profile without changing stage defaults (admin role).",
@@ -1706,6 +1741,7 @@ export const orchestratorTools = restate.service({
     get_runner_backend: getRunnerBackendTool,
     set_pipeline_schedule: setPipelineScheduleTool,
     get_pipeline_schedule: getPipelineScheduleTool,
+    check_model_account_key: checkModelAccountKeyTool,
     import_environment_credential: importEnvironmentCredentialTool,
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,

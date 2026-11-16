@@ -1,3 +1,4 @@
+import { fakeFetch } from "../helpers/fake-fetch.js";
 import { getReviewerScorecard } from "../../report-card.js";
 import { createModelProtectedSecrets } from "../../model-protected-secrets.js";
 import { makeStageAgentDefaults, makeStageAgentProfile } from "../helpers/builders.js";
@@ -367,7 +368,7 @@ describe("orchestratorTools (Restate)", () => {
     // fields are stripped by its schema; missing/new required fields fail ingress.
     const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
       backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
-      paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
+      paused: true, issueId: "test-issue", dispatchId: "test-dispatch", profileId: "key-check-test" };
     // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
     for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
@@ -391,7 +392,7 @@ describe("orchestratorTools (Restate)", () => {
     // fields are stripped by its schema; missing/new required fields fail ingress.
     const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
       backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
-      paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
+      paused: true, issueId: "test-issue", dispatchId: "test-dispatch", profileId: "key-check-test" };
     // Only the project mode tool is reachable with the projects grant.
     for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
@@ -1064,6 +1065,47 @@ describe("orchestratorTools (Restate)", () => {
     // had just written).
     expect(replayInsideCounter).toBe(1);
     expect(replayOutsideCounter).toBeGreaterThan(1);
+  });
+
+  it("checks a stored OpenRouter key in a secret-free journal step", async () => {
+    const env = environments.get("alwaysReplay")!;
+    const previous = process.env.RUNNER_TOKEN_SECRET;
+    const token = "SENTINEL-RESTATE-KEY-CHECK";
+    const ref = "model-account:key-check-test";
+    const profileId = "key-check-test";
+    try {
+      process.env.RUNNER_TOKEN_SECRET = "key-check-encryption-secret";
+      saveAccountProfileRevision({ ...makeStageAgentProfile(), profileId, provider: "openrouter", authMode: "openrouter-api-key", metadata: { credentialRef: ref } });
+      expect(createModelProtectedSecrets({ env: process.env }).write(ref, token).ok).toBe(true);
+      dedup.getDb().prepare("INSERT INTO key_bindings (key_ref, destination, bound_at) VALUES (?, ?, ?)").run(ref, "openrouter/openrouter-api-key", Date.now());
+      // Keep Restate's local HTTP traffic real, fake only the provider request.
+      const realFetch = globalThis.fetch;
+      const fake = fakeFetch({ "GET /api/v1/key": () => { throw new Error(token); } });
+      globalThis.fetch = (input, init) => String(input).startsWith("https://openrouter.ai/") ? fake.fetch(input, init) : realFetch(input, init);
+      try {
+        const invoke = (caller = SYSTEM as Caller) => callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", "check_model_account_key", { caller, args: { profileId } });
+        const result = await invoke();
+        expect(JSON.parse(result.content![0]!.text)).toEqual({ profileId, profile: "ok", binding: "ok", credential: "set", provider: "fail (no answer)" });
+        expect(fake.calls).toHaveLength(1);
+        expect((await invoke({ kind: "human", email: "user@example.com", role: "user", grants: [] })).isError).toBe(true);
+        expect(fake.calls).toHaveLength(1);
+        const invocations = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'orchestratorTools' AND target_handler_name = 'check_model_account_key'");
+        expect(invocations.length).toBeGreaterThanOrEqual(2);
+        const journals: string[] = [];
+        for (const invocation of invocations) {
+          journals.push(journalText(await journalEntries(env.adminAPIBaseUrl(), String(invocation.id))));
+        }
+        const journal = journals.join("\n");
+        expect(journal).toContain("check-model-account-key");
+        expect(journal).toContain("fail (no answer)");
+        expect(journal).not.toContain(token);
+        expect(journal).not.toContain(ref);
+        const metadata = await realFetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools/handlers/check_model_account_key`).then(r => r.json());
+        expect(metadata).toMatchObject({ retry_policy: { max_attempts: 1, on_max_attempts: "Kill" } });
+      } finally { globalThis.fetch = realFetch; }
+    } finally {
+      if (previous === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = previous;
+    }
   });
 
   it("imports an environment account through one secret-free journal step", async () => {

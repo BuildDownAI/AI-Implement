@@ -127,6 +127,19 @@ Import and remove API-key and Bedrock credentials with `secret-import` and `secr
 
 ### OpenRouter API credentials
 
+After storing a key on Models & providers, an admin can call
+`check_model_account_key` through MCP or `POST /api/tools/check_model_account_key`
+with `{ "args": { "profileId": "your-account-id" } }`. This read-only tool checks
+that account's current revision and binding, resolves its stored key inside the
+orchestrator, and calls OpenRouter's key endpoint with a 20-second limit. It
+returns only `{ profileId, profile, credential, binding, provider }` states; it
+never returns the key or a provider response body. A working account reports
+`profile: "ok"`, `binding: "ok"`, `credential: "set"`, `provider: "pass"`.
+Legacy keys without a binding report `binding: "missing"` and are still checked;
+a mismatched binding stops the check. A refused key reports
+`provider: "fail (key refused, status 401)"` (or status 403). The check changes no
+account and consumes no model tokens.
+
 `OPENROUTER_API_KEY` is a reserved name; do not use it in a project's Extra Env or as a forwarded secret name.
 
 For an `openrouter-api-key` profile, the selected model environment contains these four values:

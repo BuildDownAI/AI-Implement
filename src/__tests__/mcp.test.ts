@@ -43,6 +43,7 @@ import {
   setRunProfileTool,
   pauseProjectTool,
   importEnvironmentCredentialTool,
+  checkModelAccountKeyTool,
   addProjectTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
@@ -118,6 +119,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   set_run_profile: setRunProfileTool,
   pause_project: pauseProjectTool,
   import_environment_credential: importEnvironmentCredentialTool,
+  check_model_account_key: checkModelAccountKeyTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
   clear_dispatch_dedup: clearDispatchDedupTool,
@@ -138,7 +140,7 @@ const WRITE_TOOL_NAMES = new Set([
   "clear_dispatch_dedup",
   "release_dispatch_reservation",
 ]);
-const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity"]);
+const ADMIN_READ_TOOL_NAMES = new Set(["check_model_account_key", "get_review_fix_attempt", "get_review_fix_activity"]);
 
 const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   name,

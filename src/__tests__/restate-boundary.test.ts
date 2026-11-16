@@ -239,9 +239,16 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     },
   );
 
-  it("the two review-fix admin reads are explicitly marked read-only and declare no retryPolicy", () => {
-    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_review_fix_activity", "get_review_fix_attempt"]);
-    for (const { identifier } of adminReadEntries) {
+  it("admin reads declare read semantics; the provider check journals one attempt", () => {
+    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["check_model_account_key", "get_review_fix_activity", "get_review_fix_attempt"]);
+    for (const { identifier, toolName } of adminReadEntries) {
+      if (toolName === "check_model_account_key") {
+        const block = definitionBlockFor(identifier, TOOLS_SOURCE);
+        expect(block).toContain("ctx.run(");
+        expect(block).toContain("maxRetryAttempts: 1");
+        expect(block).toContain("maxAttempts: 1");
+        continue;
+      }
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
       expect(block).toContain('operation: "read"');
       expect(block).not.toContain("ctx.run(");
@@ -249,8 +256,8 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     }
   });
 
-  it("no read handler declares a retryPolicy", () => {
-    const readEntries = handlerEntries.filter((e) => !writeEntries.some((w) => w.identifier === e.identifier));
+  it("ordinary reads declare no retryPolicy", () => {
+    const readEntries = handlerEntries.filter((e) => e.toolName !== "check_model_account_key" && !writeEntries.some((w) => w.identifier === e.identifier));
     for (const { identifier } of readEntries) {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
       expect(block, `${identifier} is a read handler but declares retryPolicy`).not.toMatch(/retryPolicy\s*:/);
