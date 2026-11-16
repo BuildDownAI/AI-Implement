@@ -2,6 +2,8 @@ import { JSDOM } from "jsdom";
 import { describe, expect, it, vi } from "vitest";
 import { pipelinesHtml, pipelinesScript } from "../pages/pipelines.js";
 import { kgPipelinesHtml } from "../pages/kg-pipelines.js";
+import { drawerHtml, drawerScript } from "../drawer.js";
+import { componentsCss } from "../components.js";
 import { localJobLogsHtml, localJobLogsScript } from "../local-job-logs.js";
 
 const job = {
@@ -138,5 +140,124 @@ describe("dispatch log instances", () => {
       await window.createDispatchLog("kglog").load();
       expect(api.mock.calls[0][0]).toMatch(/^\/api\/log\?since=\d+$/);
     } finally { dom.window.close(); }
+  });
+});
+
+describe("dispatch table accessibility", () => {
+  it("wraps Jobs and KG tables with the shared horizontal scroller", () => {
+    const dom = new JSDOM(pipelinesHtml + kgPipelinesHtml);
+    for (const prefix of ["log", "kglog"]) {
+      const body = dom.window.document.getElementById(prefix + "-body");
+      expect(body?.closest("table")?.parentElement?.className).toBe("tbl-scroll");
+    }
+    expect(componentsCss).toContain(".tbl-scroll { max-width: 100%; overflow-x: auto; }");
+    expect(componentsCss).toContain(".tbl-scroll .tbl th, .tbl-scroll .tbl td { white-space: nowrap; }");
+    dom.window.close();
+  });
+
+  it("opens the implementation with the planning id and inferred status", async () => {
+    const { dom, document, window } = await setup([
+      { ...job, dispatchNumber: 2 },
+      { ...job, id: 395, phase: "planning", status: "unknown" },
+    ]);
+    try {
+      (document.querySelector("#log-body td") as HTMLElement).click();
+      expect(window.openJobDrawer).toHaveBeenCalledWith(396, 395, "completed");
+    } finally { dom.window.close(); }
+  });
+});
+
+
+describe("grouped row drawer integration", () => {
+  const implementation = {
+    ...job, dispatchNumber: 2, dispatchedAt: Date.UTC(2026, 10, 15, 14),
+    issueTitle: "Implement the issue", teamKey: "SAN2", repo: "org/repo",
+    issueState: "In progress", sessionImage: "registry.example/impl:latest",
+    restate: null,
+  };
+  const planning = {
+    ...implementation, id: 395, phase: "planning", dispatchNumber: 1,
+    dispatchedAt: Date.UTC(2026, 10, 14, 9), status: "completed",
+    executionMode: "github-actions", runnerMode: "gha", machineId: "",
+    issueTitle: "Plan the issue",
+  };
+
+  async function mount(admin = true) {
+    const dom = new JSDOM(pipelinesHtml + drawerHtml, { runScripts: "outside-only" });
+    const { window } = dom;
+    const api = vi.fn(async (url: string) => {
+      let body: unknown;
+      if (url.startsWith("/api/log?")) body = [implementation, planning];
+      else if (url === "/api/mappings") body = {};
+      else if (url === "/api/jobs/396/steps") body = { job: implementation, steps: [] };
+      else if (url === "/api/jobs/395/steps") body = { job: planning, steps: [] };
+      else throw new Error("Unexpected request: " + url);
+      return { ok: true, status: 200, json: async () => body };
+    });
+    window.api = api;
+    window.esc = window.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+    window.safeUrl = (value: string) => value;
+    window.isAdmin = () => admin;
+    window.registerPage = vi.fn();
+    window.setLastUpdated = vi.fn();
+    window.eval(pipelinesScript);
+    window.eval(drawerScript);
+    await window.loadLog();
+    return { window, document: window.document, api };
+  }
+
+  it("opens implementation, preserves its planning association on refresh, and opens distinct planning metadata", async () => {
+    const { window, document, api } = await mount();
+    const field = (label: string) => Array.from(document.querySelectorAll("#drawer-context .field"))
+      .find(el => el.querySelector(".field-label")?.textContent === label)?.lastElementChild?.textContent;
+    const assertImplementation = () => {
+      expect(document.getElementById("drawer-title")?.textContent).toBe(implementation.issueTitle);
+      expect(document.getElementById("drawer-meta")?.textContent).toContain(new Date(implementation.dispatchedAt).toLocaleString());
+      expect(field("Dispatch #")).toBe("2");
+      expect(field("Phase")).toBe("implementation");
+      expect(field("Runner")).toBe("local-docker (local)");
+      expect(document.getElementById("drawer-planning-job")?.textContent).toContain("completed");
+    };
+    try {
+      expect(document.querySelectorAll("#log-body tr")).toHaveLength(1);
+      (document.querySelector("#log-body td") as HTMLElement).click();
+      await vi.waitFor(assertImplementation);
+      expect(api).toHaveBeenCalledWith("/api/jobs/396/steps");
+      expect(api).not.toHaveBeenCalledWith("/api/jobs/395/steps");
+      expect(document.getElementById("drawer-issue-row")?.textContent).toContain("running");
+      await window.refreshJobDrawer(396, { background: true });
+      assertImplementation();
+
+      document.getElementById("drawer-planning-job")!.click();
+      await vi.waitFor(() => expect(document.getElementById("drawer-title")?.textContent).toBe(planning.issueTitle));
+      expect(api).toHaveBeenCalledWith("/api/jobs/395/steps");
+      expect(document.getElementById("drawer-meta")?.textContent).toContain(new Date(planning.dispatchedAt).toLocaleString());
+      expect(document.getElementById("drawer-meta")?.textContent).not.toContain(new Date(implementation.dispatchedAt).toLocaleString());
+      expect(field("Dispatch #")).toBe("1");
+      expect(field("Phase")).toBe("planning");
+      expect(field("Runner")).toBe("github-actions (gha)");
+      expect(document.getElementById("drawer-planning-job")).toBeNull();
+      await window.refreshJobDrawer(395, { background: true });
+      expect(field("Dispatch #")).toBe("1");
+      expect(document.getElementById("drawer-planning-job")).toBeNull();
+
+      // Returning via the row restores the association; opening an ungrouped job clears it.
+      (document.querySelector("#log-body td") as HTMLElement).click();
+      await vi.waitFor(assertImplementation);
+      await window.openJobDrawer(396);
+      expect(field("Phase")).toBe("implementation");
+      expect(document.getElementById("drawer-planning-job")).toBeNull();
+    } finally { window.closeJobDrawer(); window.close(); }
+  });
+
+  it("does not open a drawer or request admin endpoints when a user clicks the grouped row", async () => {
+    const { window, document, api } = await mount(false);
+    try {
+      const open = vi.spyOn(window, "openJobDrawer");
+      (document.querySelector("#log-body td") as HTMLElement).click();
+      expect(open).not.toHaveBeenCalled();
+      expect(document.getElementById("job-drawer-wrap")?.hasAttribute("hidden")).toBe(true);
+      expect(api.mock.calls.every(([url]) => url.startsWith("/api/log?"))).toBe(true);
+    } finally { window.close(); }
   });
 });

@@ -34,10 +34,12 @@ function dispatchLogCardHtml(prefix: string, opts: { title: string; emptyText: s
         <div class="card-subtitle"><span id="${prefix}-count">&mdash;</span> &middot; <span id="lu-${prefix}" class="text-tertiary"></span></div>
       </div>
       <div class="card-body tight">
+        <div class="tbl-scroll">
         <table class="tbl">
           <thead><tr><th>Time</th><th>#</th><th>Issue</th><th>State</th><th>Team</th><th>Repo</th><th>Runner</th><th>Image</th><th>Status</th><th>PR</th></tr></thead>
           <tbody id="${prefix}-body"></tbody>
         </table>
+        </div>
         <div id="${prefix}-empty" class="hidden text-tertiary" style="padding:12px">${opts.emptyText}</div>
       </div>
     </div>
@@ -274,15 +276,16 @@ export const pipelinesScript = `
           tr.setAttribute('data-job-id', String(item.type === 'group' ? item.impl.id : item.entry.id));
           if (item.type === 'group') {
             const plan = item.plan;
+            tr.setAttribute('data-planning-job-id', String(plan.id));
             const impl = item.impl;
             const dt = new Date(plan.dispatchedAt).toLocaleString();
-            const issueLabel = (impl.issueIdentifier || impl.issueId) + (impl.issueTitle ? ': ' + window.esc(impl.issueTitle) : '');
+            const issueLabel = window.esc(impl.issueIdentifier || impl.issueId) + (impl.issueTitle ? ': ' + window.esc(impl.issueTitle) : '');
             const dn2 = plan.dispatchNumber || 1;
             const isRedispatch = dn2 > 1;
             if (isRedispatch) tr.classList.add('redispatch-row');
             const dnBadge = isRedispatch
-              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn2 + '</span>'
-              : '' + dn2;
+              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + window.esc(dn2) + '</span>'
+              : window.esc(dn2);
             const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
             const imageCell = impl.sessionImage
               ? '<td class="mono" title="' + window.escAttr(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
@@ -292,10 +295,11 @@ export const pipelinesScript = `
             // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
             const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
               ? 'completed' : plan.status;
+            tr.setAttribute('data-planning-status', planStatus || 'dispatched');
             const combinedStatus = statusBadge(planStatus, plan.conclusion, plan.failure) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion, impl.failure, impl.phase);
-            const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
+            const prLink = impl.prUrl ? '<a href="' + window.escAttr(window.safeUrl(impl.prUrl)) + '" target="_blank">View</a>' : '—';
             const logs = logsButton(impl);
-            tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
+            tr.innerHTML = '<td style="white-space:nowrap">' + window.esc(dt) + '</td>'
               + '<td style="text-align:center">' + dnBadge + '</td>'
               + '<td class="mono">' + issueLabel + '</td>'
               + '<td class="mono">' + window.esc(impl.issueState || '—') + '</td>'
@@ -308,13 +312,13 @@ export const pipelinesScript = `
           } else {
             const entry = item.entry;
             const dt = new Date(entry.dispatchedAt).toLocaleString();
-            const issueLabel = (entry.issueIdentifier || entry.issueId) + (entry.issueTitle ? ': ' + window.esc(entry.issueTitle) : '');
+            const issueLabel = window.esc(entry.issueIdentifier || entry.issueId) + (entry.issueTitle ? ': ' + window.esc(entry.issueTitle) : '');
             const dn3 = entry.dispatchNumber || 1;
             const isRedispatch = dn3 > 1;
             if (isRedispatch) tr.classList.add('redispatch-row');
             const dnBadge = isRedispatch
-              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn3 + '</span>'
-              : '' + dn3;
+              ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + window.esc(dn3) + '</span>'
+              : window.esc(dn3);
             const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
             const imageCell = entry.sessionImage
               ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
@@ -323,7 +327,7 @@ export const pipelinesScript = `
             if (entry.machineId) {
               logCell = logsButton(entry);
             } else if (entry.prUrl) {
-              logCell = '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>';
+              logCell = '<a href="' + window.escAttr(window.safeUrl(entry.prUrl)) + '" target="_blank">View</a>';
             } else {
               logCell = '—';
             }
@@ -333,7 +337,7 @@ export const pipelinesScript = `
             const cancelCell = (isKgRefresh && isInflight && cancelId)
               ? '<button data-cancel-id="' + window.escAttr(cancelId) + '" title="Cancel this run" style="background:none;border:none;cursor:pointer;padding:0 0 0 8px;color:var(--fail-fg,#dc2626);font:inherit">\u23f9 Stop</button>'
               : '';
-            tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
+            tr.innerHTML = '<td style="white-space:nowrap">' + window.esc(dt) + '</td>'
               + '<td style="text-align:center">' + dnBadge + '</td>'
               + '<td class="mono">' + issueLabel + '</td>'
               + '<td class="mono">' + window.esc(entry.issueState || '—') + '</td>'
@@ -390,7 +394,13 @@ export const pipelinesScript = `
         }
         const tr = target.closest('tr');
         const id = tr && tr.getAttribute('data-job-id');
-        if (id && window.openJobDrawer) window.openJobDrawer(Number(id));
+        if (id && window.openJobDrawer) {
+          if (tr.hasAttribute('data-planning-job-id')) {
+            window.openJobDrawer(Number(id), Number(tr.getAttribute('data-planning-job-id')), tr.getAttribute('data-planning-status'));
+          } else {
+            window.openJobDrawer(Number(id));
+          }
+        }
       });
       tbody.dataset.drawerWired = '1';
     }
