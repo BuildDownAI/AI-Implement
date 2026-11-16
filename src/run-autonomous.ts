@@ -1,3 +1,4 @@
+import { commentInstructionReviewRubric } from "./pipeline/feedback-loop-core.js";
 import type { RunModelPrices } from "./run-config.js";
 import { sanitizeAttribution, type InvocationAttributionV1 } from "./pipeline/types.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
@@ -1364,6 +1365,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       workspaceDir,
       planningContext,
       implementationPrompt,
+      reviewRubric: commentInstructionReviewRubric(commentInstruction),
       prNumber,
       githubOwner,
       githubRepo,

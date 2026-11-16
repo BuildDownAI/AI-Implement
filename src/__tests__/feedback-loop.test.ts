@@ -1,3 +1,4 @@
+import { commentInstructionReviewRubric } from "../pipeline/feedback-loop-core.js";
 import { createStageExecutor } from "../pipeline/stage-executor.js";
 import { ModelAuthClientError, type ModelInvocation } from "../model-auth-client.js";
 import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
@@ -241,17 +242,18 @@ describe("feedbackLoopStep — planning context routing", () => {
 
   it("sends acceptanceBar to review on every pass with new-format context", async () => {
     const ctx = makeContext();
+    const reviewRubric = commentInstructionReviewRubric("Fix the documentation only");
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
       .mockResolvedValueOnce(REVIEW_APPROVED);
     await feedbackLoopStep.run(
       ctx,
-      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, maxIterations: 2 },
+      { workspaceDir, issueTitle: "T", issueDescription: "D", planningContext: NEW_FORMAT_CONTEXT, reviewRubric, maxIterations: 2 },
       { report: vi.fn(async () => undefined) },
     );
     const expectedBar = "## ✅ AI Planning: Acceptance Bar\n\n1. Foo.\n2. Bar.";
-    expect(mockReviewRun.mock.calls[0][1]).toMatchObject({ acceptanceBar: expectedBar });
-    expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar });
+    expect(mockReviewRun.mock.calls[0][1]).toMatchObject({ acceptanceBar: expectedBar, reviewRubric });
+    expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar, reviewRubric });
   });
 
   it("sends wrapped mapSection (with security guard) to implement on pass 2 with new-format context", async () => {
