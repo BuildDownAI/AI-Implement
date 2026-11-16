@@ -227,15 +227,29 @@ export const TRACKER_CONFIG_CHECKS: readonly SetupCheck[] = [
     onAdminPath: false,
     run: (ctx) => judgeLinear(ctx, (facts, projects) => perVisibleTeam(facts, projects, (team) => {
       const lifecycle = Object.values(LINEAR_LABELS).map((label) => label.name);
-      const wrongCase = lifecycle.flatMap((name) => {
+      const missing: string[] = [];
+      const wrongCase: string[] = [];
+      for (const name of lifecycle) {
         const reused = reusableLabel(facts.labels[name], (label) => label.teamKey, team);
-        return reused && reused.name !== name ? [`${reused.name} is used for ${name}`] : [];
-      });
-      if (wrongCase.length === 0) return { state: "pass", detail: "Each lifecycle label has its exact name, or is created at first use" };
+        if (!reused) missing.push(name);
+        else if (reused.name !== name) wrongCase.push(`${reused.name} is used for ${name}`);
+      }
+      if (wrongCase.length === 0 && missing.length === 0) return { state: "pass", detail: "Each lifecycle label exists" };
+      const details: string[] = [];
+      const fixes: string[] = [];
+      if (wrongCase.length > 0) {
+        details.push(`${wrongCase.join(". ")}. The orchestrator applies a label in a different case, but the poll and the label removal look for the exact name.`);
+        fixes.push("Rename each label to the exact name shown.");
+      }
+      if (missing.length > 0) {
+        const names = missing.join(", ");
+        details.push(`${names} do not exist. The orchestrator creates them at the team's first dispatch, which needs the app to be allowed to create team labels.`);
+        fixes.push(`Create ${names} in team ${team}, or check that the app can create labels in the team.`);
+      }
       return {
-        state: "warn",
-        detail: `${wrongCase.join(". ")}. The orchestrator applies a label in a different case, but the poll and the label removal look for the exact name.`,
-        fix: "Rename each label to the exact name shown.",
+        state: wrongCase.length > 0 ? "warn" : "cannot-verify",
+        detail: details.join(" "),
+        fix: fixes.join(" "),
       };
     })),
   },
