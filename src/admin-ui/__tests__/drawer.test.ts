@@ -1241,6 +1241,18 @@ describe("job drawer Open in Restate UI link", () => {
 });
 
 describe("job drawer row parity", () => {
+  it("shows the table's issue ID fallback when the identifier is unavailable", async () => {
+    const issueId = 'issue-<img src=x>"quoted"';
+    const { win, doc } = mountDrawer({ ...BASE_JOB, issueIdentifier: "", issueId }, []);
+    try {
+      await win.openJobDrawer(1);
+      const issue = Array.from(doc.querySelectorAll("#drawer-context .field"))
+        .find(field => field.querySelector(".field-label")?.textContent === "Issue");
+      expect(issue?.lastElementChild?.textContent).toBe(issueId);
+      expect(issue?.querySelector("img")).toBeNull();
+    } finally { win.closeJobDrawer(); win.close(); }
+  });
+
   it.each(["planning", "implementation", "kg-refresh"])("shows exact dispatch metadata for %s", async phase => {
     const job = {
       ...BASE_JOB, phase, issueState: 'Ready <img src=x> "quoted"',

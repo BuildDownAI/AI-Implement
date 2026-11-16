@@ -499,12 +499,13 @@ export const drawerScript = `
     const mapping = mappings && job.teamKey ? mappings[job.teamKey] : null;
     const repoParts = repoPartsForJob(job, mapping);
 
-    if (job.issueIdentifier) {
+    const issueLabel = job.issueIdentifier || job.issueId;
+    if (issueLabel) {
       // The server resolves issueUrl through the mapping's ticketing provider, so the
       // drawer never has to know which tracker (or which Jira site) a project uses.
       const valueHtml = job.issueUrl
-        ? '<a class="text-accent" href="' + window.escAttr(window.safeUrl(job.issueUrl)) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>'
-        : window.esc(job.issueIdentifier);
+        ? '<a class="text-accent" href="' + window.escAttr(window.safeUrl(job.issueUrl)) + '" target="_blank">' + window.esc(issueLabel) + ' &#8599;</a>'
+        : window.esc(issueLabel);
       fields.push({ label: 'Issue', value: valueHtml });
     }
 
