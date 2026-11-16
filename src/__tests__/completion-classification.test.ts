@@ -295,9 +295,9 @@ describe("monitorFailureCommentPrefix", () => {
     expect(monitorFailureCommentPrefix("kg-refresh")).toBe("⚠️ KG refresh failed: ");
   });
 
-  it("uses the implementation phrase for a gap-analysis job — gap-analysis is implementation's retry path and has no comment shape of its own, and it's the only phase where the monitor is ever the sole commenter (BAC-27112 follow-up)", () => {
+  it("names a failed gap-fill in the monitor comment", () => {
     const prefix = monitorFailureCommentPrefix("gap-analysis");
-    expect(prefix.startsWith("⚠️ Implementation failed: ")).toBe(true);
+    expect(prefix.startsWith("⚠️ Gap-fill failed: ")).toBe(true);
   });
 });
 

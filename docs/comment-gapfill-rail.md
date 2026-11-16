@@ -102,3 +102,18 @@ are advisory and cannot authorize merging. The owning workflow preserves success
 and failed `rollup_review` results, including when a deadline follows the callback,
 and releases the reservation without implementation tracker transitions or stuck
 remediation. Ordinary comment gap-fills are unchanged.
+
+## Failed rounds
+
+A Restate-owned gap-fill reporting `outcome: "failure"` posts its existing run autopsy
+on the job's PR, as well as the unchanged ticket delivery. The autopsy says the PR
+is unchanged and includes final reviewer feedback, or run notes when review did not
+run. The PR comment adds guidance to post a new `/ai-implement` comment with a
+changed instruction. Unapproved changes remain discarded; no diff is published.
+
+Callback lifecycle effects are serialized per dispatch before checking the persisted
+completion guard, suppressing repeat PR and ticket posts for overlapping deliveries
+and retries after report forwarding fails. Report forwarding
+still runs on those retries. A GitHub failure (or missing autopsy/target/credentials)
+is a callback warning and does not prevent the failed row write or report delivery.
+The monitor's separate failure classification names the phase as “Gap-fill failed”.
