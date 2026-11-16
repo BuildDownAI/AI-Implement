@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
@@ -78,7 +78,10 @@ describe("OpenRouter live check", () => {
         return new Response(scenario.key, { status: scenario.status });
       };
     `);
-    const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` };
+    const bin = testDir("openrouter-bin");
+    writeFileSync(join(bin, "npx"), "#!/bin/sh\nexit 1\n");
+    chmodSync(join(bin, "npx"), 0o755);
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${bin}:${process.env.PATH}`, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` };
     delete env.OPENROUTER_TEST_API_KEY;
     if (scenario.key !== undefined) env.OPENROUTER_TEST_API_KEY = scenario.key;
     const stdoutPath = join(testDir("openrouter-output"), "stdout");
@@ -87,7 +90,7 @@ describe("OpenRouter live check", () => {
     const stderrFd = openSync(stderrPath, "w");
     let child;
     try {
-      child = spawnSync("sh", [resolve("scripts/ci/ai-verify.sh")], {
+      child = spawnSync("bash", ["-euo", "pipefail", resolve("scripts/ci/ai-verify.sh")], {
         env, stdio: ["ignore", stdoutFd, stderrFd],
       });
     } finally {
@@ -98,7 +101,7 @@ describe("OpenRouter live check", () => {
     const stderr = readFileSync(stderrPath, "utf8");
     expect(child.error).toBeUndefined();
     expect(child.status).toBe(0);
-    expect(stdout).toBe(prefix + scenario.result + "\n");
+    expect(stdout).toBe(prefix + scenario.result + "\nopenrouter-account-live-check: skipped (tsx not found)\n");
     expect(stderr).toBe("");
     expect(stdout + stderr).not.toContain(key);
   });
@@ -109,4 +112,60 @@ describe("OpenRouter live check", () => {
     expect(frontMatter).not.toBeNull();
     expect(parse(frontMatter![1]).verify).toBe("scripts/ci/ai-verify.sh");
   });
+});
+
+it("runs the account check after the key check and exits zero when tsx throws", () => {
+  const dir = testDir("openrouter-throwing-tsx");
+  const npx = join(dir, "npx");
+  const calls = join(dir, "calls");
+  writeFileSync(npx, `#!/bin/sh
+if [ "$3" = "--version" ]; then exit 0; fi
+printf '%s\\n' "$*" > "$CHECK_CALLS"
+echo 'account invoked'
+"$CHECK_NODE" -e 'throw new Error("synthetic sensitive exception")'
+`);
+  chmodSync(npx, 0o755);
+  writeFileSync(join(dir, "node"), "#!/bin/sh\necho 'openrouter-live-check: skipped (no key)'\n");
+  chmodSync(join(dir, "node"), 0o755);
+  const child = spawnSync("bash", ["-euo", "pipefail", resolve("scripts/ci/ai-verify.sh")], {
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, OPENROUTER_TEST_API_KEY: "", CHECK_CALLS: calls, CHECK_NODE: process.execPath, NODE_OPTIONS: "" }, encoding: "utf8",
+  });
+  expect(child.status).toBe(0);
+  expect(child.stdout).toBe("openrouter-live-check: skipped (no key)\naccount invoked\n");
+  expect(child.stderr).toBe("");
+  expect(readFileSync(calls, "utf8")).toContain("--no-install tsx");
+  expect(readFileSync(calls, "utf8")).toContain("openrouter-account-live-check.ts");
+});
+
+it.each(["cat", "sed", "awk"])("continues the strict-mode hook without a run identity when %s fails", (command) => {
+  const dir = testDir("openrouter-identity-failure");
+  for (const [name, script] of Object.entries({
+    [command]: "exit 1",
+    node: "echo 'openrouter-live-check: skipped (no key)'",
+    npx: `if [ "$3" = "--version" ]; then exit 0; fi
+if [ -n "$OPENROUTER_ACCOUNT_CHECK_RUN_ID" ]; then exit 1; fi
+echo 'account invoked without run identity'`,
+  })) {
+    const path = join(dir, name);
+    writeFileSync(path, `#!/bin/sh\n${script}\n`);
+    chmodSync(path, 0o755);
+  }
+  const stdoutPath = join(dir, "stdout");
+  const stderrPath = join(dir, "stderr");
+  const stdoutFd = openSync(stdoutPath, "w");
+  const stderrFd = openSync(stderrPath, "w");
+  let child;
+  try {
+    child = spawnSync("bash", ["-euo", "pipefail", resolve("scripts/ci/ai-verify.sh")], {
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, OPENROUTER_ACCOUNT_CHECK_RUN_ID: "stale-identity", NODE_OPTIONS: "" },
+      stdio: ["ignore", stdoutFd, stderrFd],
+    });
+  } finally {
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+  }
+  expect(child.error).toBeUndefined();
+  expect(child.status).toBe(0);
+  expect(readFileSync(stdoutPath, "utf8")).toBe("openrouter-live-check: skipped (no key)\naccount invoked without run identity\n");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
 });
