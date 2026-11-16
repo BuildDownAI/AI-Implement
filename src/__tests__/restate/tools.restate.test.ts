@@ -132,6 +132,7 @@ const authorizationTools = restate.service({
     read: tool({ description: "test read", input: z.object({}), role: "user" }, authorizationHandler),
     admin: tool({ description: "test admin", input: z.object({}), role: "admin" }, authorizationHandler),
     projects: tool({ description: "test projects", input: z.object({}), role: "admin", grant: "projects" }, authorizationHandler),
+    secrets: tool({ description: "test secrets", input: z.object({}), role: "admin", grant: "secrets" }, authorizationHandler),
     deploy: tool({ description: "test deploy", input: z.object({}), role: "admin", grant: "deploy" }, authorizationHandler),
   },
 });
@@ -243,17 +244,19 @@ describe("orchestratorTools (Restate)", () => {
   it.each(VARIANTS.map(([label]) => label))("enforces every authorization state-table cell (%s)", async (label) => {
     const env = environments.get(label)!;
     const rows: Array<[string, Caller, boolean[]]> = [
-      ["projects token", serviceCaller({ grants: ["projects"] }), [true, false, false, true]],
-      ["projects + deploy token", serviceCaller({ grants: ["deploy", "projects"] }), [true, false, true, true]],
-      ["read token", serviceCaller(), [true, false, false, false]],
-      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
-      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
-      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false, false]],
-      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true, true]],
-      ["system", systemCaller(), [true, true, true, true]],
+      ["projects token", serviceCaller({ grants: ["projects"] }), [true, false, false, true, false]],
+      ["projects + deploy token", serviceCaller({ grants: ["deploy", "projects"] }), [true, false, true, true, false]],
+      ["read token", serviceCaller(), [true, false, false, false, false]],
+      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false, false]],
+      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false, false]],
+      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false, false, false]],
+      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true, true, true]],
+      ["system", systemCaller(), [true, true, true, true, true]],
+      ["secrets token", serviceCaller({ grants: ["secrets"] }), [true, false, false, false, true]],
+      ["all grants token", serviceCaller({ grants: ["deploy", "projects", "secrets"] }), [true, false, true, true, true]],
     ];
     for (const [row, caller, allowed] of rows) {
-      for (const [index, name] of ["read", "admin", "deploy", "projects"].entries()) {
+      for (const [index, name] of ["read", "admin", "deploy", "projects", "secrets"].entries()) {
         const before = authorizationExecutions;
         const result = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", name, { caller, args: {} });
         if (allowed[index]) {
