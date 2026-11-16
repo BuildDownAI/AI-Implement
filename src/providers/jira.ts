@@ -8,6 +8,7 @@ import type {
   FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
+  IssueStatusRecord,
   ProviderConfig,
   TicketIssue,
   TicketingProvider,
@@ -461,6 +462,54 @@ export class JiraProvider implements TicketingProvider {
       issues,
       pageInfo: { hasNextPage: !!res.nextPageToken, endCursor: res.nextPageToken ?? null },
     };
+  }
+
+  async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
+    const cfg = mapping.ticketingConfig;
+    if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
+    const scopeKey = mapping.teamKey;
+    if (!scopeKey) throw new TrackerUnavailableError("mapping carries no team key");
+
+    const fieldIds = await this.fields(scopeKey);
+    const status = jqlFieldRef(fieldIds.statusFieldId);
+    const terminal = [STATUS_VALUES.MERGED, STATUS_VALUES.PLANNING_FAILED, STATUS_VALUES.IMPLEMENTATION_FAILED]
+      .map((value) => JSON.stringify(value)).join(",");
+    const jql = `(${cfg.jql}) AND ${status} is not EMPTY AND (${status} not in (${terminal}) OR updated >= -7d)`;
+    const states = new Map<string, Pick<IssueStatusRecord, "state" | "phase">>([
+      [STATUS_VALUES.READY, { state: "ready", phase: null }],
+      [STATUS_VALUES.PLANNING, { state: "planning", phase: null }],
+      [STATUS_VALUES.AWAITING_APPROVAL, { state: "awaiting-approval", phase: null }],
+      [STATUS_VALUES.APPROVED, { state: "plan-approved", phase: null }],
+      [STATUS_VALUES.IMPLEMENTING, { state: "implementing", phase: null }],
+      [STATUS_VALUES.PR_READY, { state: "pr-ready", phase: null }],
+      [STATUS_VALUES.MERGED, { state: "merged", phase: null }],
+      [STATUS_VALUES.PLANNING_FAILED, { state: "failed", phase: "planning" }],
+      [STATUS_VALUES.IMPLEMENTATION_FAILED, { state: "failed", phase: "implementation" }],
+    ]);
+    const issues: IssueStatusRecord[] = [];
+    let nextPageToken: string | undefined;
+    for (let page = 0; page < 20; page++) {
+      const result = await this.client.searchJqlPage(
+        jql, ["summary", "updated", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
+      );
+      for (const raw of result.issues) {
+        if (readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) !== cfg.repoFieldValue) continue;
+        const workflowState = readStatusValue(raw.fields, fieldIds.statusFieldId);
+        issues.push({
+          id: raw.id,
+          identifier: raw.key,
+          title: (raw.fields.summary as string | null) ?? null,
+          url: this.issueUrl({ identifier: raw.key } as TicketIssue),
+          ...(states.get(workflowState) ?? { state: "unknown", phase: null }),
+          labels: [],
+          workflowState,
+          updatedAt: Date.parse(raw.fields.updated as string),
+        });
+      }
+      nextPageToken = result.nextPageToken;
+      if (!nextPageToken) return issues;
+    }
+    throw new TrackerUnavailableError("Jira issue status search exceeded 20 pages");
   }
 
   private async toTrackerRecord(raw: JiraIssue, fieldIds: ResolvedFieldIds): Promise<TrackerIssueRecord> {
