@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
@@ -78,7 +78,10 @@ describe("OpenRouter live check", () => {
         return new Response(scenario.key, { status: scenario.status });
       };
     `);
-    const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` };
+    const bin = testDir("openrouter-bin");
+    writeFileSync(join(bin, "npx"), "#!/bin/sh\nexit 1\n");
+    chmodSync(join(bin, "npx"), 0o755);
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${bin}:${process.env.PATH}`, NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` };
     delete env.OPENROUTER_TEST_API_KEY;
     if (scenario.key !== undefined) env.OPENROUTER_TEST_API_KEY = scenario.key;
     const stdoutPath = join(testDir("openrouter-output"), "stdout");
@@ -98,9 +101,22 @@ describe("OpenRouter live check", () => {
     const stderr = readFileSync(stderrPath, "utf8");
     expect(child.error).toBeUndefined();
     expect(child.status).toBe(0);
-    expect(stdout).toBe(prefix + scenario.result + "\n");
+    expect(stdout).toBe(prefix + scenario.result + "\nopenrouter-agent-live-check: skipped (tsx not found)\n");
     expect(stderr).toBe("");
     expect(stdout + stderr).not.toContain(key);
+  });
+
+  it("runs the key check first and remains report-only when the agent launcher throws", () => {
+    const bin = testDir("throwing-agent-launcher");
+    const trace = join(bin, "trace");
+    writeFileSync(join(bin, "node"), `#!/bin/sh\necho key >> '${trace}'\n`);
+    writeFileSync(join(bin, "npx"), `#!/bin/sh\nif [ "$3" = "--version" ]; then exit 0; fi\necho agent >> '${trace}'\nexit 1\n`);
+    for (const name of ["node", "npx"]) chmodSync(join(bin, name), 0o755);
+    const result = spawnSync("/bin/sh", [resolve("scripts/ci/ai-verify.sh")], {
+      env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: "utf8",
+    });
+    expect(result.status).toBe(0);
+    expect(readFileSync(trace, "utf8")).toBe("key\nagent\n");
   });
 
   it("configures the repository verify hook", () => {

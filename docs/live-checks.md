@@ -37,3 +37,49 @@ execution mode), its Fly project secret does not reach the run and the check
 skips. The GitHub Actions forwarding rail is the repository Actions secret
 `AI_IMPLEMENT_FORWARDED_ENV`, containing a `OPENROUTER_TEST_API_KEY=VALUE` line.
 Set the value there through GitHub's secret UI, never in a repository file.
+
+## Agent route check
+
+After the key check, the hook uses `npx --no-install tsx` to run
+`scripts/openrouter-agent-live-check.ts`. Once per pipeline run it makes four
+small requests: `claude`, `codex`, `claude wrong-key`, and `codex wrong-key`.
+The first two use the test secret; the last two use `sk-or-v1-invalid` and should
+be refused. Cost is four small requests per run, two of them refused.
+
+Each invocation starts in its own empty system temporary directory and receives
+only `Reply with the one word OK.` on stdin. No source code or issue text is
+sent. Claude uses the shared invocation environment and print mode; Codex uses
+the shared environment and provider arguments with a read-only sandbox.
+The default models are `anthropic/claude-haiku-5.5` and
+`openai/gpt-5.1-codex-mini`. Optional hook inputs
+`OPENROUTER_TEST_CLAUDE_MODEL` and `OPENROUTER_TEST_CODEX_MODEL` replace them.
+
+Each call prints `openrouter-agent-live-check: <call> <result>` in the runner log:
+
+| Outcome | Result |
+| --- | --- |
+| Binary absent | `skipped (binary not found)` |
+| Good key, exit 0 and answer contains OK | `pass` |
+| Good key, exit 0 without OK | `fail (no OK in the answer)` |
+| Good key, other exit | `fail (exit <code>): <evidence>` |
+| Wrong key, nonzero exit or error answer | `refused as expected (exit <code>): <evidence>` |
+| Wrong key answers OK | `fail (wrong key was accepted)` |
+| No end in 120 seconds (process stopped) | `fail (no answer)` |
+
+A wrong key with no error and no OK is also `fail (no OK in the answer)`.
+Evidence is the last nonempty error line, redacted before being limited to 300
+characters; structured stdout errors supply evidence when stderr is empty.
+Keys and authentication headers are never printed.
+
+Without a key there is just `openrouter-agent-live-check: skipped (no key)`.
+A temporary marker makes later passes print only
+`openrouter-agent-live-check: skipped (ran before in this run)`.
+The marker hashes the per-run session token (or runner token, GitHub run/attempt,
+or dispatch envelope when available);
+local invocations fall back to the hook's parent process identity. Markers are
+outside the workspace and persist for the runner's temporary-directory lifetime.
+Without the local tsx launcher the hook prints
+`openrouter-agent-live-check: skipped (tsx not found)`.
+The check is **report-only**, including unexpected script errors: the hook exits
+0. A live failure is evidence for a follow-up issue under AII-1949. Unit tests
+use fake processes; the first real result is from an AII run after merge.
