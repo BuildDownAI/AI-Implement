@@ -8,7 +8,7 @@ import { testDir } from "../helpers/test-dir.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, access: vi.fn(actual.access), link: vi.fn(actual.link), writeFile: vi.fn(actual.writeFile) };
+  return { ...actual, access: vi.fn(actual.access), readdir: vi.fn(actual.readdir), link: vi.fn(actual.link), writeFile: vi.fn(actual.writeFile) };
 });
 
 afterEach(() => {
@@ -721,4 +721,111 @@ it("does not overwrite a task that appears before child publication", async () =
   expect(await readFile(destination, "utf8")).toBe("Existing task");
   expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
   expect((await readdir(directory)).some((f) => f.endsWith(".tmp"))).toBe(false);
+});
+
+describe("listIssueStatuses", () => {
+  async function fixture() {
+    const directory = testDir("fs-statuses");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    const p = provider({ TEAM: config });
+    await mkdir(join(directory, ".state", "TEAM"), { recursive: true });
+    return { directory, config, p };
+  }
+
+  async function task(directory: string, status: string, options: {
+    location?: "completed" | "failed"; age?: number; failurePhase?: string;
+  } = {}) {
+    const target = options.location ? join(directory, options.location) : directory;
+    await mkdir(target, { recursive: true });
+    await writeTask(target, "TEST-1.md", "---\ntitle: Status task\n---\nBody");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+      version: 1, status, comments: [], prUrls: [], failurePhase: options.failurePhase,
+      updatedAt: new Date(Date.now() - (options.age ?? 0) * 86400000).toISOString(),
+    }));
+  }
+
+  it.each([
+    ["ready", "ready", null], ["planning", "planning", null],
+    ["plan-approved", "plan-approved", null], ["implementing", "implementing", null],
+    ["pr-ready", "pr-ready", null], ["failed", "failed", "planning"],
+    ["failed", "failed", "implementation"], ["failed", "failed", null],
+    ["completed", "merged", null], ["cancelled", null, null],
+    ["unfamiliar", "unknown", null],
+  ])("normalizes %s to %s with phase %s", async (status, state, phase) => {
+    const { directory, config, p } = await fixture();
+    await task(directory, status, { failurePhase: phase ?? undefined });
+    const result = await p.listIssueStatuses(config);
+    if (state === null) expect(result).toEqual([]);
+    else expect(result).toEqual([{
+      id: "filesystem:TEAM:TEST-1", identifier: "TEST-1", title: "Status task",
+      url: "/admin?filesystemIssue=filesystem%3ATEAM%3ATEST-1",
+      state, phase, labels: [], workflowState: status, updatedAt: expect.any(Number),
+    }]);
+    expect(await readFile(join(directory, "TEST-1.md"), "utf8")).toContain("Status task");
+  });
+
+  it.each(["completed", "failed"] as const)("filters %s archives by timestamp", async (location) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-16T12:00:00Z"));
+    try {
+      const { directory, config, p } = await fixture();
+      for (const age of [6, 7, 8]) {
+        await task(directory, location, { location, age });
+        const result = await p.listIssueStatuses(config);
+        expect(result).toHaveLength(age <= 7 ? 1 : 0);
+        if (age <= 7) expect(result[0]).toMatchObject({
+          state: location === "completed" ? "merged" : "failed",
+          updatedAt: Date.now() - age * 86400000,
+        });
+      }
+      await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+        version: 1, status: location, comments: [], prUrls: [], updatedAt: "invalid",
+      }));
+      expect(await p.listIssueStatuses(config)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps old active tasks", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "completed", { age: 8 });
+    expect(await p.listIssueStatuses(config)).toMatchObject([{ state: "merged" }]);
+  });
+
+  it.each([true, false])("defaults missing state with planning=%s without writing", async (planningEnabled) => {
+    const { directory, config, p } = await fixture();
+    config.planningEnabled = planningEnabled;
+    await writeTask(directory, "TEST-1.md", "---\ntitle: No state\n---\nBody");
+    await mkdir(join(directory, "completed"));
+    await writeTask(join(directory, "completed"), "TEST-2.md", "---\ntitle: Archived\n---\nBody");
+    expect(await p.listIssueStatuses(config)).toMatchObject([{
+      state: planningEnabled ? "ready" : "plan-approved", phase: null, updatedAt: null,
+      workflowState: planningEnabled ? "ready" : "plan-approved",
+    }]);
+    expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
+  });
+
+  it("rejects invalid state JSON alongside a valid task", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "ready");
+    await writeTask(directory, "TEST-2.md", "---\ntitle: Broken\n---\nBody");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-2.json"), "{invalid");
+    await expect(p.listIssueStatuses(config)).rejects.toThrow(/Invalid state/);
+  });
+
+  it("rejects directory read errors", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "ready");
+    vi.mocked(readdir).mockRejectedValueOnce(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+    await expect(p.listIssueStatuses(config)).rejects.toThrow("permission denied");
+  });
+
+  it("only scans the requested mapping", async () => {
+    const { directory, config } = await fixture();
+    await task(directory, "ready");
+    const other = mapping({ directory: testDir("fs-other"), teamKey: "OTHER" });
+    await writeTask(other.ticketingConfig.kind === "filesystem" ? other.ticketingConfig.directory : "", "TEST-2.md", "invalid");
+    expect(await provider({ TEAM: config, OTHER: other }).listIssueStatuses(config)).toHaveLength(1);
+  });
 });
