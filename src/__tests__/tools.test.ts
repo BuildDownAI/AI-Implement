@@ -2237,7 +2237,7 @@ describe("list_open_pulls (AII-1964)", () => {
     const calls: RunCall[] = [];
     const ctx = fakeContext("list_open_pulls", calls);
     const run = ctx.run;
-    ctx.run = ((name: string, action: () => unknown, options?: { maxRetryAttempts: number }) => {
+    ctx.run = ((name: string, action: () => unknown, options: Parameters<typeof run>[2]) => {
       insideStep = true;
       return run(name, action, options);
     }) as typeof ctx.run;
@@ -2318,7 +2318,7 @@ describe("list_issue_statuses (AII-1966)", () => {
     const calls: RunCall[] = [];
     const ctx = fakeContext("list_issue_statuses", calls);
     const run = ctx.run;
-    ctx.run = ((name: string, action: () => unknown, options?: { maxRetryAttempts: number }) => {
+    ctx.run = ((name: string, action: () => unknown, options: Parameters<typeof run>[2]) => {
       insideStep = true;
       return run(name, action, options);
     }) as typeof ctx.run;
