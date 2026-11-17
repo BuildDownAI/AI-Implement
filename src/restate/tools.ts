@@ -30,6 +30,7 @@ import {
 import { getDb } from "../dedup.js";
 import { getOrchestratorDefaults, isProjectConfigured } from "../agent-config-store.js";
 import { summarizeSetupChecks } from "../setup-checks/index.js";
+import { listOpenPulls } from "../open-pulls.js";
 import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
@@ -1037,6 +1038,22 @@ export const getReviewFixActivityTool = tool(
   },
 );
 
+export const LIST_OPEN_PULLS_DESCRIPTION =
+  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; any unreadable repository fails the whole call. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
+
+export const listOpenPullsTool = tool(
+  {
+    description: LIST_OPEN_PULLS_DESCRIPTION,
+    input: z.object({}),
+    role: "user",
+    operation: "read",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    const entries = await ctx.run("list-open-pulls", () => listOpenPulls());
+    return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+  },
+);
+
 export const LIST_JOB_ACCOUNTING_DESCRIPTION =
   "Returns one page of finished-job accounting records, oldest change first: dispatch id, phase, status, conclusion, lifecycle owner, times, changedAt, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). A job that changes after it was served (a second terminal write, a late review conclusion, a late invocation row) is served again with a newer changedAt: the newest copy of a job replaces older ones. usage is reported only when the runner's invocation list arrived whole, partial when some invocation rows exist without that, unknown when none exist. Args: optional cursor { changedAt, dispatchId }, optional pageSize 1..200 (default 100), optional includeUnsettled (boolean; also serves jobs that changed in the last 10 minutes — only for a caller about to lose the orchestrator; such records may still change and are replaced by changedAt). Returns records, nextCursor, oldestRetainedCompletedAt (information only) and prunedThrough ({ changedAt, dispatchId } of the newest finished job pruned, or null). Without includeUnsettled a record is returned 10 minutes after its last change. Read.";
 
@@ -1690,6 +1707,7 @@ export const orchestratorTools = restate.service({
     get_review_fix_attempt: getReviewFixAttemptTool,
     get_review_fix_activity: getReviewFixActivityTool,
     list_job_accounting: listJobAccountingTool,
+    list_open_pulls: listOpenPullsTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,
