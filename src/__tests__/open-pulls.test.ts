@@ -45,6 +45,18 @@ it("projects tracked identity, newest completed work and workflow without secret
   expect((await api.listOpenPulls({ listRepoPulls, now }))[0].workflow?.reason).toBe("job-running");
   expect(listRepoPulls).toHaveBeenCalledTimes(1);
 });
+it("reports an approved child as settled while paused and active after resuming", async () => {
+  config.upsertMapping("APP", makeMapping({ owner: "acme", repo: "app", autoMerge: true, paused: true }));
+  const pr = { ...pull(), base: "ai-implement/feature/AII-10" };
+  job({ pr_url: pr.url, completed_at: 90, phase: "implementation", conclusion: "runner_approved" });
+  const listRepoPulls = vi.fn(async () => [pr]);
+  expect((await api.listOpenPulls({ listRepoPulls, now }))[0].workflow)
+    .toEqual({ state: "settled", reason: "completed" });
+  config.setMappingPaused("APP", false);
+  expect((await api.listOpenPulls({ listRepoPulls, now }))[0].workflow)
+    .toEqual({ state: "active", reason: "auto-merge-pending" });
+  expect(listRepoPulls).toHaveBeenCalledTimes(1);
+});
 it("recovers roll-ups case insensitively, preferring a direct row", async () => {
   job({ pr_url: pull(12).url, completed_at: 90, phase: "implementation", conclusion: "runner_approved" });
   const listRepoPulls = async () => [pull(42, "ai-implement/feature/aii-12")];

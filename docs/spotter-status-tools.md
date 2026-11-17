@@ -35,7 +35,7 @@ Tracking first uses the newest dispatch by dispatch time for the repository and 
 | 4 | Pending review-fix queue row for repository and PR number | `active` | `review-fix-queued` |
 | 5 | Pending or dispatched comment gap-fill row for owner, repository and PR number | `active` | `gap-fill-queued` |
 | 6 | Late-review row for the PR URL created at or after now minus the 30-minute deadline | `active` | `awaiting-late-review` |
-| 7 | Mapping enables auto-merge; PR is not draft; base is a grouping branch different from the mapping's default branch; identifier exists; run-record merge verdict is `approved` | `active` | `auto-merge-pending` |
+| 7 | Mapping enables auto-merge and is not paused; PR is not draft; base is a grouping branch different from the mapping's default branch; identifier exists; run-record merge verdict is `approved` | `active` | `auto-merge-pending` |
 | 8 | Internal issue ID is parked in planning, gap-analysis or implementation | `settled` | `parked` |
 | 9 | Mapping exists and PR's gap-analysis dispatch count in the inclusive last 24 hours reaches its resolved PR dispatch budget | `settled` | `budget-exhausted` |
 | 10 | Roll-up | `settled` | `awaiting-review` |

@@ -68,7 +68,7 @@ export async function listOpenPulls(deps: Partial<OpenPullsDeps> = {}): Promise<
       const workflow = resolveOpenPullWorkflow({
         repo, prNumber: pr.number, prUrl: pr.url, baseRef: pr.base, draft: pr.draft,
         issueId: job?.issueId ?? null, issueIdentifier: job?.issueIdentifier ?? null, isRollUp,
-        mapping: mapping ? { autoMerge: mapping.autoMerge, defaultBranch: mapping.defaultBranch,
+        mapping: mapping ? { paused: mapping.paused, autoMerge: mapping.autoMerge, defaultBranch: mapping.defaultBranch,
           prDispatchBudget: resolvePrDispatchBudget(mapping) } : null,
         now,
       });

@@ -141,10 +141,11 @@ it("row 7: approved child awaits auto-merge", () => {
   approved();
   check({ state: "active", reason: "auto-merge-pending" });
 });
-it.each(["disabled", "draft", "ordinary-base", "default-base", "no-mapping", "no-identifier", "unapproved"])(
+it.each(["disabled", "paused", "draft", "ordinary-base", "default-base", "no-mapping", "no-identifier", "unapproved"])(
   "auto-merge guard: %s", (guard) => {
     approved();
     if (guard === "disabled") input.mapping!.autoMerge = false;
+    if (guard === "paused") input.mapping!.paused = true;
     if (guard === "draft") input.draft = true;
     if (guard === "ordinary-base") input.baseRef = "main";
     if (guard === "default-base") input.mapping!.defaultBranch = input.baseRef;
