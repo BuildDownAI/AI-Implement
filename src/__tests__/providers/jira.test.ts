@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
 import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira.js";
 import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
-import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
 import { validateTicketingConfig } from "../../providers/ticketing-config.js";
 import { validateIssueBaseBranch } from "../../base-branch.js";
@@ -2145,7 +2145,7 @@ describe("JiraProvider.listIssueStatuses", () => {
     const fake = fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/ }) }).install();
     await provider().listIssueStatuses(mapping());
     expect(searchBodies(fake)[0]).toEqual({
-      jql: '(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -7d)',
+      jql: `(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`,
       fields: ["summary", "updated", "customfield_10100", "customfield_10101"],
       maxResults: 100,
     });

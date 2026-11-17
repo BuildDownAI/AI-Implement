@@ -258,7 +258,7 @@ export class LinearProvider implements TicketingProvider {
     const label = AI_IMPLEMENT_LABEL;
     const since = new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString();
     type StatusNode = {
-      id: string; identifier: string; title: string; url: string; updatedAt: string;
+      id: string; identifier: string; title: string; updatedAt: string;
       state: { name: string; type: string };
       labels: { nodes: Array<{ name: string }> };
     };
@@ -274,7 +274,7 @@ export class LinearProvider implements TicketingProvider {
           labels: { name: { eq: $label } }
           ${recent ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }'}
         }) {
-          nodes { id identifier title url updatedAt state { name type } labels { nodes { name } } }
+          nodes { id identifier title updatedAt state { name type } labels { nodes { name } } }
           pageInfo { hasNextPage endCursor }
         }
       }`;

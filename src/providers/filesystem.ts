@@ -148,7 +148,8 @@ export class FilesystemProvider implements TicketingProvider {
     const records: IssueStatusRecord[] = [];
     for (const { issue, state, location } of tasks.values()) {
       const status = state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved");
-      const updatedAt = state ? Date.parse(state.updatedAt) : null;
+      const parsedUpdatedAt = state ? Date.parse(state.updatedAt) : NaN;
+      const updatedAt = Number.isFinite(parsedUpdatedAt) ? parsedUpdatedAt : null;
       if (status === "cancelled") continue;
       if (location !== "active" && (updatedAt === null || !(updatedAt >= cutoff))) continue;
       const normalized = status === "completed" ? "merged"

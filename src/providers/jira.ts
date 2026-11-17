@@ -15,7 +15,7 @@ import type {
   TrackerIssuePage,
   TrackerIssueRecord,
 } from "./types.js";
-import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
 import { JiraApiError, JiraFieldNotSelectError, JiraClient, type JiraComment, type JiraIssue } from "./jira-client.js";
 import {
   BASE_BRANCH_FIELD_NAME,
@@ -485,7 +485,7 @@ export class JiraProvider implements TicketingProvider {
     const status = jqlFieldRef(fieldIds.statusFieldId);
     const terminal = [STATUS_VALUES.MERGED, STATUS_VALUES.PLANNING_FAILED, STATUS_VALUES.IMPLEMENTATION_FAILED]
       .map((value) => JSON.stringify(value)).join(",");
-    const jql = `(${cfg.jql}) AND ${status} is not EMPTY AND (${status} not in (${terminal}) OR updated >= -7d)`;
+    const jql = `(${cfg.jql}) AND ${status} is not EMPTY AND (${status} not in (${terminal}) OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`;
     const states = new Map<string, Pick<IssueStatusRecord, "state" | "phase">>([
       [STATUS_VALUES.READY, { state: "ready", phase: null }],
       [STATUS_VALUES.PLANNING, { state: "planning", phase: null }],
