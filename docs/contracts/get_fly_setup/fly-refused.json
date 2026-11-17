@@ -1,0 +1,14 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"usedBy\": [],\n  \"appSource\": \"restate\",\n  \"configured\": true,\n  \"app\": \"sessions\",\n  \"processLevelSecrets\": {\n    \"enabled\": true,\n    \"source\": \"default\"\n  },\n  \"reachable\": false,\n  \"reachError\": \"http-401\",\n  \"names\": []\n}"
+      }
+    ]
+  }
+}

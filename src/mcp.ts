@@ -91,6 +91,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "list_in_flight_jobs",
   "get_session_machine",
   "list_session_machines",
+  "get_fly_setup",
   "get_issue_dispatch_status",
   "get_issue_report_card",
   "get_fleet_report",

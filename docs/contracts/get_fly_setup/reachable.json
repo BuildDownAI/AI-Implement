@@ -1,0 +1,14 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"usedBy\": [],\n  \"appSource\": \"restate\",\n  \"configured\": true,\n  \"app\": \"sessions\",\n  \"processLevelSecrets\": {\n    \"enabled\": true,\n    \"source\": \"default\"\n  },\n  \"reachable\": true,\n  \"reachError\": null,\n  \"names\": [\n    {\n      \"name\": \"GLOBAL_TOKEN\",\n      \"group\": \"global\",\n      \"projects\": [],\n      \"createdAt\": \"2026-11-16T00:00:00Z\"\n    }\n  ]\n}"
+      }
+    ]
+  }
+}
