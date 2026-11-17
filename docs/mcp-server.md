@@ -156,8 +156,8 @@ A token with `orchestrator:projects` receives the `projects` grant and keeps the
 start a deploy. A deploy-only or read-only token cannot change project modes.
 
 A token with `orchestrator:secrets` receives the `secrets` grant and keeps the
-`service` identity's `user` role. This grant authorizes only a tool that declares
-`grant: "secrets"`; no production tool declares it yet. It cannot authorize
+`service` identity's `user` role. This grant authorizes `get_fly_setup`, which
+declares `grant: "secrets"`. It cannot authorize
 deploy or project-mode changes and never grants the `admin` role.
 
 All four recognized scopes allow read tools; a token with none is refused (401).
