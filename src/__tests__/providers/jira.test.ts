@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
-import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira.js";
+import { JiraProvider, adfToPlainText, createJiraProviderFromConfig } from "../../providers/jira.js";
 import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
 import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
@@ -8,6 +8,7 @@ import { validateIssueBaseBranch } from "../../base-branch.js";
 import type { RepoMapping } from "../../config.js";
 import { makeIssue, makeMapping } from "../helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type ReplyInit, type Routes } from "../helpers/fake-fetch.js";
+import { runChildIssueContract } from "./contract.js";
 
 // The client reaches Jira through the OAuth gateway for cloud id "c", so every request path starts here.
 const API = "/ex/jira/c/rest/api/3";
@@ -2036,9 +2037,6 @@ describe("JiraProvider.fetchSetupFacts", () => {
     expect(facts.credentials === "accepted" && Object.keys(facts.projects)).toEqual(["X"]);
   });
 });
-
-import { runChildIssueContract } from "./contract.js";
-import { adfToPlainText } from "../../providers/jira.js";
 
 for (const repo of ["acme/x", { id: "option", value: "acme/x" }]) {
   runChildIssueContract(`JiraProvider Repo=${typeof repo}`, async () => {
