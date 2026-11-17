@@ -101,6 +101,7 @@ const RESTATE_TOOL_NAMES = new Set([
   "get_review_fix_activity",
   "list_job_accounting",
   "list_open_pulls",
+  "list_issue_statuses",
   "kg_hybrid_search",
   "kg_search",
   "kg_semantic_search",

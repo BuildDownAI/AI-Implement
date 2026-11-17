@@ -66,7 +66,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as InFlightModule from "../in-flight-work.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
-import { makeAppendLogEntry, makeMapping, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeMapping, makeProvider, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -2268,5 +2268,78 @@ describe("list_open_pulls (AII-1964)", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("list_open_pulls");
     expect(result.content[0].text).toContain("GitHub unavailable");
+  });
+});
+
+
+describe("list_issue_statuses (AII-1966)", () => {
+  let tools: typeof ToolsModule;
+  let api: typeof import("../issue-statuses.js");
+
+  beforeEach(async () => {
+    ({ modules: { tools, api } } = await testDb({
+      modules: {
+        tools: () => import("../restate/tools.js"),
+        api: () => import("../issue-statuses.js"),
+      },
+    }));
+    api.clearIssueStatusesCache();
+  });
+
+  afterEach(() => {
+    tools.setProviderRegistry(null);
+    api.clearIssueStatusesCache();
+    vi.restoreAllMocks();
+  });
+
+  it("returns a populated top-level array through the shared registry inside the named step", async () => {
+    const mapping = makeMapping();
+    vi.mocked(getMappings).mockReturnValue({ APP: mapping });
+    let insideStep = false;
+    const reader = vi.fn(async () => {
+      expect(insideStep).toBe(true);
+      return [{
+        id: "internal", identifier: "APP-1", title: "Issue", url: null,
+        state: "ready" as const, phase: null, labels: [], workflowState: null, updatedAt: 123,
+      }];
+    });
+    const registry = makeRegistry({ provider: makeProvider({ listIssueStatuses: reader }) });
+    const providerFor = vi.spyOn(registry, "forMapping");
+    tools.setProviderRegistry(registry);
+    const calls: RunCall[] = [];
+    const ctx = fakeContext("list_issue_statuses", calls);
+    const run = ctx.run;
+    ctx.run = ((name: string, action: () => unknown) => {
+      insideStep = true;
+      return run(name, action);
+    }) as typeof ctx.run;
+    const result = await tools.listIssueStatusesTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([{
+      teamKey: "APP", tracker: mapping.ticketingConfig.kind,
+      issue: { identifier: "APP-1", title: "Issue", url: null },
+      state: "ready", phase: null, raw: { labels: [], workflowState: null }, changedAt: 123,
+    }]);
+    expect(providerFor).toHaveBeenCalledWith(mapping);
+    expect(reader).toHaveBeenCalledWith(mapping);
+    expect(calls.map(call => call.name)).toEqual(["list-issue-statuses"]);
+  });
+
+  it("returns an empty array successfully when there are no mappings", async () => {
+    vi.mocked(getMappings).mockReturnValue({});
+    const result = await tools.listIssueStatusesTool(fakeContext("list_issue_statuses"), { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+  });
+
+  it("surfaces a provider failure as a named tool error", async () => {
+    vi.mocked(getMappings).mockReturnValue({ APP: makeMapping() });
+    tools.setProviderRegistry(makeRegistry({ provider: makeProvider({
+      listIssueStatuses: vi.fn().mockRejectedValue(new Error("tracker unavailable")),
+    }) }));
+    const result = await tools.listIssueStatusesTool(fakeContext("list_issue_statuses"), { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("list_issue_statuses");
+    expect(result.content[0].text).toContain("tracker unavailable");
   });
 });
