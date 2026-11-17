@@ -300,8 +300,8 @@ export interface TicketingProvider {
   /** One page of the mapping's issues for export or review-child discovery. When supplied, filter must narrow results server-side (a title-prefix superset is allowed). Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
   listIssuesPage?(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage>;
   /** Every in-scope issue for this mapping with a normalized state: open issues the pickup query
-   *  matches, in any state, plus `merged` and `failed` issues updated in the last 7 days. Cancelled
-   *  issues are left out. Throws `TrackerUnavailableError` when the credential is missing, and
+   *  matches, in any state, plus `merged` and `failed` issues updated in the last 7 days.
+   *  Throws `TrackerUnavailableError` when the credential is missing, and
    *  throws on any read it cannot complete: never returns a partial list. Optional so a fork's
    *  custom provider still compiles. */
   listIssueStatuses?(mapping: RepoMapping): Promise<IssueStatusRecord[]>;
