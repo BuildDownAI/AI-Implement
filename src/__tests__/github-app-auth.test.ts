@@ -361,7 +361,7 @@ describe("getAppInstallation", () => {
 describe("readAppIdentity", () => {
   const GITHUB_DATE = "Tue, 10 Nov 2026 02:42:14 GMT";
 
-  it("returns the slug and GitHub's clock beside this host's, read when the response arrived", async () => {
+  it("returns the slug, the subscribed events and GitHub's clock beside this host's, read when the response arrived", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.parse("2026-11-10T02:40:00Z"));
     try {
@@ -369,13 +369,14 @@ describe("readAppIdentity", () => {
       fakeFetch({
         "GET /app": () => {
           vi.setSystemTime(responseArrives);
-          return { json: { slug: "ai-implement" }, headers: { Date: GITHUB_DATE } };
+          return { json: { slug: "ai-implement", events: ["issue_comment", "pull_request"] }, headers: { Date: GITHUB_DATE } };
         },
       }).install();
 
-      await expect(readAppIdentity(APP_ID, privateKey)).resolves.toEqual({
+      await expect(readAppIdentity(APP_ID, privateKey)).resolves.toStrictEqual({
         status: 200,
         slug: "ai-implement",
+        events: ["issue_comment", "pull_request"],
         errorBody: "",
         githubTime: Date.parse(GITHUB_DATE),
         localTime: responseArrives,
@@ -389,7 +390,7 @@ describe("readAppIdentity", () => {
     fakeFetch({ "GET /app": { ...githubError(401, "'Expiration time' claim ('exp') is too far in the future"), headers: { Date: GITHUB_DATE } } }).install();
 
     const read = await readAppIdentity(APP_ID, privateKey);
-    expect(read).toMatchObject({ status: 401, slug: null, githubTime: Date.parse(GITHUB_DATE) });
+    expect(read).toMatchObject({ status: 401, slug: null, events: null, githubTime: Date.parse(GITHUB_DATE) });
     expect(read.errorBody).toContain("too far in the future");
   });
 

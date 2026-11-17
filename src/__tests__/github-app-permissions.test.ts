@@ -2,7 +2,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { GITHUB_APP_PERMISSIONS, permissionLevelCovers, type GitHubPermissionLevel } from "../github-app-permissions.js";
+import { GITHUB_APP_EVENTS, GITHUB_APP_PERMISSIONS, permissionLevelCovers, type GitHubPermissionLevel } from "../github-app-permissions.js";
 
 const declared = new Map<string, GitHubPermissionLevel>(GITHUB_APP_PERMISSIONS.map((p) => [p.name, p.level]));
 
@@ -86,5 +86,21 @@ describe("GITHUB_APP_PERMISSIONS", () => {
     const expected = GITHUB_APP_PERMISSIONS.map(({ title, level }) => ({ title, level }));
     const byTitle = (a: { title: string }, b: { title: string }) => a.title.localeCompare(b.title);
     expect(rows.sort(byTitle)).toEqual([...expected].sort(byTitle));
+  });
+});
+
+/** The event names `handleGitHubWebhook` compares a delivery's `x-github-event` header with. */
+function routedEvents(): string[] {
+  const text = readFileSync("src/webhook.ts", "utf8");
+  return [...new Set([...text.matchAll(/\bevent [!=]== "([a-z_]+)"/g)].map(([, name]) => name))].sort();
+}
+
+describe("GITHUB_APP_EVENTS", () => {
+  it("reads the events the webhook routes", () => {
+    expect(routedEvents()).toEqual(expect.arrayContaining(["pull_request", "push"]));
+  });
+
+  it("declares exactly the events the webhook acts on", () => {
+    expect(GITHUB_APP_EVENTS.map((event) => event.name).sort()).toEqual(routedEvents());
   });
 });

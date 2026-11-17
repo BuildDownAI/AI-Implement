@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { parse } from "smol-toml";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
+import { GITHUB_APP_EVENTS } from "../github-app-permissions.js";
 import { HEALTH_WAIT_MS, probeHealth, PROVISION_ENV_CHECKS, makeIo, provisionPreflight, runProvisionClient, type CommandResult, type ProvisionDependencies } from "../provision-client.js";
 
 describe("probeHealth", () => {
@@ -427,7 +428,7 @@ describe("runProvisionClient", () => {
       expect(f.stdout()).toContain("gh secret set AI_IMPLEMENT_APP_ID --repo owner/repo --body 987654321");
       expect(f.stdout()).toContain(`gh secret set AI_IMPLEMENT_PRIVATE_KEY --repo owner/repo < ${f.pemPath}`);
       expect(onItsOwnLine(f.stdout(), "https://ai-implement-client.fly.dev/api/github/webhook")).toBe(true);
-      for (const event of ["Issue comment", "Pull request", "Pull request review", "Pull request review comment"]) expect(f.stdout()).toContain(event);
+      for (const event of GITHUB_APP_EVENTS) expect(f.stdout()).toContain(event.title);
       expect(f.stdout()).toContain("printenv GITHUB_WEBHOOK_SECRET");
       // Adding a project, and opting it in to a model account, are the guide's to explain.
       expect(onItsOwnLine(f.stdout(), "https://docs.builddown.ai/latest/setup/target-repo")).toBe(true);

@@ -40,7 +40,13 @@ change:
 
 The App is created once per orchestrator (`GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` secrets);
 its webhook must point at the orchestrator's `/api/github/webhook` with the
-`GITHUB_WEBHOOK_SECRET`.
+`GITHUB_WEBHOOK_SECRET`, and the App must subscribe to the events the orchestrator handles,
+declared beside the permissions as `GITHUB_APP_EVENTS`: `pull_request_review`,
+`pull_request_review_comment` and `issue_comment`, without which review findings and
+`/ai-implement` comments start nothing, and `pull_request` and `push`, whose absence leaves merges
+and self-deploy's new commits to the poll. A scan test pins the declaration to the events
+`handleGitHubWebhook` (`src/webhook.ts`) routes, and the `github.webhook-events` setup check
+compares the App's own subscriptions with it.
 
 ## Deploy paths
 

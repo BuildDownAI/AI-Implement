@@ -15,6 +15,7 @@ export const SECRET_SENTINELS = {
   MICROSOFT_OAUTH_CLIENT_SECRET: "sentinel-microsoft-secret",
   BUILDDOWN_OIDC_CLIENT_SECRET: "sentinel-builddown-secret",
   LINEAR_CLIENT_SECRET: "sentinel-linear-secret",
+  GITHUB_WEBHOOK_SECRET: "sentinel-webhook-secret",
 } as const;
 
 /**

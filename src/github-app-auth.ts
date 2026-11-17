@@ -371,6 +371,8 @@ export interface AppIdentityRead {
   status: number;
   /** Null when GitHub answered anything but 200: a refusal (`appCredentialsRefused`) or no judgment at all. */
   slug: string | null;
+  /** The webhook events the App subscribes to, null when `slug` is. */
+  events: string[] | null;
   /** The response body when GitHub refused, else "". */
   errorBody: string;
   /** GitHub's time from the response's `Date` header, in epoch milliseconds, or null when absent. */
@@ -386,9 +388,9 @@ export async function readAppIdentity(appId: string, privateKey: string): Promis
   const localTime = Date.now();
   const date = Date.parse(res.headers.get("date") ?? "");
   const githubTime = Number.isFinite(date) ? date : null;
-  if (!res.ok) return { status: res.status, slug: null, errorBody: await res.text(), githubTime, localTime };
-  const data = (await res.json()) as { slug: string };
-  return { status: res.status, slug: data.slug, errorBody: "", githubTime, localTime };
+  if (!res.ok) return { status: res.status, slug: null, events: null, errorBody: await res.text(), githubTime, localTime };
+  const data = (await res.json()) as { slug: string; events: string[] };
+  return { status: res.status, slug: data.slug, events: data.events, errorBody: "", githubTime, localTime };
 }
 
 /** Whether GitHub refused the App's credentials: 401 for a bad key or a skewed clock, 404 for an App ID it does not know. Any other status is GitHub not answering normally. */

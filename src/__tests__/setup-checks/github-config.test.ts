@@ -16,10 +16,13 @@ const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, publicK
 const APP_ENV = { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey };
 const NOW = Date.parse("2026-11-10T02:42:14Z");
 
-/** GitHub's answer to the App's JWT: accepted as `slug`, or refused when `slug` is null, with the host `skewSeconds` ahead. */
-const appRead = ({ slug = "ai-implement" as string | null, status = 200, skewSeconds = 0 } = {}): AppIdentityRead => ({
+const ALL_EVENTS = ["issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment", "push"];
+
+/** GitHub's answer to the App's JWT: accepted as `slug`, subscribed to `events`, or refused when `slug` is null, with the host `skewSeconds` ahead. */
+const appRead = ({ slug = "ai-implement" as string | null, status = 200, skewSeconds = 0, events = ALL_EVENTS } = {}): AppIdentityRead => ({
   status: slug === null && status === 200 ? 401 : status,
   slug,
+  events: slug === null ? null : events,
   errorBody: slug === null ? '{"message":"A JSON web token could not be decoded"}' : "",
   githubTime: NOW,
   localTime: NOW + skewSeconds * 1000,
@@ -339,6 +342,69 @@ describe("github.webhook-signature", () => {
   it("waits on github.app-identity when GitHub refuses to list deliveries", async () => {
     const rows = await run("github.webhook-signature", withSecret({ deliveries: async () => { throw new GitHubApiError({ status: 401 }); } }));
     expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the github.app-identity check first." })]);
+  });
+});
+
+describe("github.webhook-events", () => {
+  const WITH_SECRET = { ...APP_ENV, GITHUB_WEBHOOK_SECRET: "s" };
+  const subscribedTo = (events: string[]) => context({ app: async () => appRead({ events }) }, { env: WITH_SECRET });
+  const SETTINGS_FIX = "An organization owner or a GitHub App manager subscribes the App to these in the settings of the account that owns the App: Developer settings -> GitHub Apps -> Edit -> Permissions & events -> Subscribe to events.";
+
+  it("answers nothing without GITHUB_WEBHOOK_SECRET, which github.webhook-signature reports", async () => {
+    const ctx = context({ app: async () => { throw new Error("no GitHub read expected"); } });
+    expect(await run("github.webhook-events", ctx)).toEqual([]);
+  });
+
+  it("passes when the App subscribes to every event the orchestrator acts on", async () => {
+    expect(await run("github.webhook-events", subscribedTo(ALL_EVENTS))).toEqual([{ state: "pass", detail: "The App subscribes to every webhook event the orchestrator uses" }]);
+  });
+
+  it("fails naming every missing event and what each stops, when one turns a feature off", async () => {
+    expect(await run("github.webhook-events", subscribedTo(["pull_request", "push"]))).toEqual([{
+      state: "fail",
+      detail: "The App does not subscribe to pull_request_review, pull_request_review_comment, issue_comment. A review that requests changes never starts a fix run. A review bot's inline finding never starts a fix run. /ai-implement comments are ignored, and review summary comments never start a fix run.",
+      fix: SETTINGS_FIX,
+    }]);
+  });
+
+  it("warns when only events the poll covers later are missing", async () => {
+    expect(await run("github.webhook-events", subscribedTo(["issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment"]))).toEqual([{
+      state: "warn",
+      detail: "The App does not subscribe to push. Self-deploy notices a new commit only at its next poll.",
+      fix: SETTINGS_FIX,
+    }]);
+  });
+
+  it("waits on github.app-identity when GitHub refuses the App's credentials", async () => {
+    const ctx = context({ app: async () => appRead({ slug: null }) }, { env: WITH_SECRET });
+    expect(await run("github.webhook-events", ctx)).toEqual([{
+      state: "cannot-verify",
+      detail: "GitHub refused the App's credentials, so its webhook events cannot be read",
+      fix: "More information is needed. Address the github.app-identity check first.",
+      waitsOn: "github.app-identity",
+    }]);
+  });
+
+  it("asks for another run when GitHub neither accepts nor refuses the credentials", async () => {
+    const ctx = context({ app: async () => appRead({ slug: null, status: 502 }) }, { env: WITH_SECRET });
+    expect(await run("github.webhook-events", ctx)).toEqual([{
+      state: "cannot-verify",
+      detail: "GitHub answered HTTP 502 rather than accepting or refusing the App's credentials, so the App's webhook events cannot be read",
+      fix: "Run the checks again once GitHub answers normally.",
+    }]);
+  });
+
+  it("waits on env.github-app without the App's credentials, reading nothing from GitHub", async () => {
+    const ctx = context({ app: async () => { throw new Error("no GitHub read expected"); } }, { env: { GITHUB_WEBHOOK_SECRET: "s" } });
+    expect(await run("github.webhook-events", ctx)).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the env.github-app check first." })]);
+  });
+
+  it("answers one row for the orchestrator, however many projects there are", async () => {
+    const ctx = context({ app: async () => appRead({ events: ["push"] }) }, {
+      env: WITH_SECRET,
+      mappings: () => ({ ENG: makeMapping({ owner: "acme", repo: "app" }), OPS: makeMapping({ owner: "other", repo: "ops" }) }),
+    });
+    expect((await run("github.webhook-events", ctx)).map((row) => [row.state, row.project])).toEqual([["fail", undefined]]);
   });
 });
 

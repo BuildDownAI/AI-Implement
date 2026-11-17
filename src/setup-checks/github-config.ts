@@ -2,7 +2,7 @@
 
 import type { RepoMapping } from "../config.js";
 import { appCredentialsProblem, appCredentialsRefused, appInstallUrl, CLOCK_SKEW_TOLERANCE_S, type AppIdentityRead } from "../github-app-auth.js";
-import { GITHUB_APP_PERMISSIONS, permissionLevelCovers } from "../github-app-permissions.js";
+import { GITHUB_APP_EVENTS, GITHUB_APP_PERMISSIONS, permissionLevelCovers } from "../github-app-permissions.js";
 import { GitHubApiError } from "../github-errors.js";
 import type { RepositoryFacts, RepositoryFactsRequest } from "../github.js";
 import { githubRepoParts } from "../reference-repos.js";
@@ -339,6 +339,36 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
         }];
       }
       return [{ state: "pass", detail: `None of the App's ${total} webhook deliveries in the last day failed the GITHUB_WEBHOOK_SECRET check${partly}` }];
+    },
+  },
+  {
+    id: "github.webhook-events",
+    title: "Webhook events",
+    group: "github",
+    tier: "feature",
+    onAdminPath: false,
+    perProject: false,
+    verifiable: true,
+    // An installation whose owner has not accepted the permission an event needs shows on github.permissions, per project.
+    run: async (ctx) => {
+      // Without the secret every delivery is refused, which github.webhook-signature reports, so no event is received to judge.
+      if (!ctx.env.GITHUB_WEBHOOK_SECRET) return [];
+      const read = await readApp(ctx);
+      if ("outcome" in read) return [read.outcome];
+      const { app } = read;
+      const subscribed = app.events;
+      if (subscribed === null) {
+        if (!appCredentialsRefused(app)) return [{ state: "cannot-verify", detail: `${unjudged(app)}, so the App's webhook events cannot be read`, fix: RETRY_FIX }];
+        return [{ state: "cannot-verify", detail: "GitHub refused the App's credentials, so its webhook events cannot be read", ...waitOn("github.app-identity") }];
+      }
+      const gaps = GITHUB_APP_EVENTS.filter((event) => !subscribed.includes(event.name));
+      if (gaps.length === 0) return [{ state: "pass", detail: "The App subscribes to every webhook event the orchestrator uses" }];
+      // Every gap at once, so one visit to the App's settings covers them all.
+      return [{
+        state: gaps.some((event) => event.required) ? "fail" : "warn",
+        detail: `The App does not subscribe to ${gaps.map((event) => event.name).join(", ")}. ${gaps.map((event) => event.whenMissing).join(" ")}`,
+        fix: `An organization owner or a GitHub App manager subscribes the App to these in the settings of the account that owns the App: Developer settings -> GitHub Apps -> Edit -> Permissions & events -> Subscribe to events.`,
+      }];
     },
   },
   {

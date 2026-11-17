@@ -210,13 +210,13 @@ describe("SETUP_CHECKS", () => {
   });
 
   it("declares perProject on exactly the checks that answer a row for a project", async () => {
-    // GitHub accepts the App but it is installed nowhere, so each GitHub per-project check reaches its projects.
+    // GitHub accepts the App but it is installed nowhere, so each GitHub per-project check reaches its projects. The webhook secret lets the webhook checks run.
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
     const githubAccepting = makeSetupCheckContext({
-      env: { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey },
+      env: { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey, GITHUB_WEBHOOK_SECRET: "secret" },
       mappings: () => ({ ENG: makeMapping() }),
       githubSetupFacts: () => makeGitHubSetupFacts({
-        app: async () => ({ status: 200, slug: "ai-implement", errorBody: "", githubTime: null, localTime: 0 }),
+        app: async () => ({ status: 200, slug: "ai-implement", events: [], errorBody: "", githubTime: null, localTime: 0 }),
         installation: async () => null,
         publicRepository: async () => ({ status: 404, refExists: null }),
       }),

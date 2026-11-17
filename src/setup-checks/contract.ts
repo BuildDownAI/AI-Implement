@@ -68,6 +68,7 @@ export const SETUP_CHECK_IDS = [
   "github.permissions",
   "github.target-secrets",
   "github.webhook-signature",
+  "github.webhook-events",
   "github.kg-grants",
   "github.workflow-default-branch",
   "github.workflow-mapping-branch",
