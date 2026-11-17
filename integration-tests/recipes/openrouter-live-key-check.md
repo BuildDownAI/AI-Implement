@@ -63,7 +63,7 @@ Run B (AII-1969) independently confirmed the same four outcomes on machine
 `48ee5d7b202218`, 2026-11-17 01:29–01:30 UTC. Its wrong-key authentication
 refusal had cf-ray `a5baf8bcba5329b5-IAD`. Exact per-result timestamps,
 revision, installed-version output, and model metadata for Run B were not
-supplied; Run A is the primary evidence record.
+supplied; Runs A and B are historical evidence only.
 
 The earlier trusted-directory failure and false wrong-key “refused as expected”
 were addressed by [AII-1969](https://linear.app/eudoxus/issue/AII-1969)
@@ -72,23 +72,51 @@ were addressed by [AII-1969](https://linear.app/eudoxus/issue/AII-1969)
 `--skip-git-repo-check`. An unrelated CLI refusal does not establish authentication
 refusal.
 
-**Current revision: live verification pending.** Run A predates commits
-`97daf4f8` and `656f0bf0`, which added the good-key terminal-status gate.
-Neither Run A nor Run B establishes that a real successful Codex/OpenRouter
-stream passes that gate. The AII-1949 live-evidence requirement remains unmet
-for the revision under review; unit tests with synthetic streams cannot close
-this gap.
+**Current revision: live-evidence requirement met by Run C.** Runs A and B
+remain historical; Run C verifies the final code with the successful-terminal-event
+gate in `CodexStreamParser.terminalStatus`.
 
-A fresh AII verify-hook run must exercise the final combined revision with the
-project's real `OPENROUTER_TEST_API_KEY`, pinned Codex, and the specified open
-model. Retain its tested SHA, actual `codex --version`, selected model, run and
-machine identifiers, UTC timestamps, and sanitized result lines for the key,
-account, good-key agent, and wrong-key agent checks. The good-key line must be
-`openrouter-agent-live-check: codex pass` from the script containing the
-terminal-status gate; the wrong-key line must include authentication-refusal
-evidence. Record failures and their fix issues rather than treating skips or
-historical results as current success. The existing per-run markers suppress
-repeat calls, so another verify pass in an already checked run cannot supply
-this evidence. Publication and roll-up review remain pipeline-owned.
+Run C (project AII): the review-fix run on
+[PR #1677](https://github.com/BuildDownAI/AI-Implement/pull/1677)
+([run review](https://linear.app/eudoxus/review/ai-implement-feature-branch-ready-for-review-0edd771067da)),
+Fly app `ai-implement-testing-sessions`, machine `8111939a510158`, region `iad`.
+Tested revision: `ceaf3986b787923981d4078be87e6db7e3829753`, the
+feature-branch head after [PR #1678](https://github.com/BuildDownAI/AI-Implement/pull/1678)
+merged, including the terminal-status gate. Pinned Codex: `0.159.2`
+(`CODEX_CLI_VERSION` in `Dockerfile.session`); selected model:
+`deepseek/deepseek-v4.1-flash-1017`.
+
+The operator supplied these sanitized results on 2026-11-17 after reading the
+Fly runner log; this is live runner evidence using the configured project key,
+not a sandbox run. The supplied version is the runner's pinned version; a
+literal `codex --version` output line and a separate pipeline run ID were not
+supplied. The review link, app, machine, and UTC timestamps identify Run C.
+
+```text
+2026-11-17T07:02:32Z openrouter-live-check: pass
+2026-11-17T07:02:45Z openrouter-account-live-check: pass
+2026-11-17T07:03:04Z openrouter-agent-live-check: codex pass
+2026-11-17T07:03:16Z openrouter-agent-live-check: codex wrong-key refused as expected (exit 1): Reconnecting... 1/5 (unexpected status 401 Unauthorized: User not found., url: https://openrouter.ai/api/v1/responses, cf-ray: a5bcdfb0ea679d25-IAD)
+```
+
+The good-key `codex pass` proves that a real Codex/OpenRouter stream passed the
+successful-terminal-event gate. The wrong-key result includes HTTP 401
+Unauthorized authentication refusal. All four checks passed; no failure was
+seen and no new fix issue is needed. The stored-account check still covers a
+temporary database and substituted binding writer, not the deployed account
+database or live Restate.
+
+The operator reports that only these four documentation files changed between
+Run C's tested revision and `eaf5a25a`; no script or test changed. The requested
+`git diff --stat ceaf3986 eaf5a25a` comparison could not be independently
+repeated in this shallow checkout because `ceaf3986` is absent and `.git` is
+read-only. Run C is the operator-attested evidence for the final runtime code.
+
+This run's pipeline also executes the verify hook on its own head. Any differing
+results must be recorded alongside Run C; no results from that later hook are
+available in this evidence update. Skips and repeated verify passes are not
+replacement live evidence because per-run markers suppress repeat account and
+agent calls. Publication, merge into the parent's feature branch, and renewed
+roll-up review remain pipeline-owned.
 
 See the shared [evidence record](../../docs/live-checks.md#live-observation-evidence-aii-1949).
