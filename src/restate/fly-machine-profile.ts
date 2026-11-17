@@ -37,7 +37,7 @@ export const FLY_MACHINE_PROFILE_DEFAULTS: Record<string, FlyMachineProfileConfi
   "kg-refresh": { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: SEVEN_DAYS_MS },
 };
 
-const VALID_CPUS = [1, 2, 4, 8, 16];
+export const VALID_CPUS = [1, 2, 4, 8, 16];
 const MIN_MEMORY_MB = 256;
 const MAX_MEMORY_MB = 65536;
 const MIN_IDLE_TIMEOUT_MS = 60_000;

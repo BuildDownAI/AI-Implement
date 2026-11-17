@@ -30,6 +30,7 @@ export function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxInProgressAiIssues: 3,
     executionMode: "github-actions",
     sessionMode: "autonomous",
+    machineCpuKind: "shared",
     machineCpus: 2,
     machineMemoryMb: 4096,
     planningEnabled: false,

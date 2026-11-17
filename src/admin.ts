@@ -1,3 +1,4 @@
+import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "./restate/fly-machine-profile.js";
 import { readKeyBinding } from "./key-bindings.js";
 import type { KeyBindOutcome } from "./restate/key-binding.js";
 import { MODEL_AUTH_ENV, hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
@@ -3340,6 +3341,7 @@ export interface UpsertMappingBody {
   maxInProgressAiIssues?: number;
   executionMode?: string;
   sessionMode?: string;
+  machineCpuKind?: "shared" | "performance";
   machineCpus?: number;
   machineMemoryMb?: number;
   planningEnabled?: boolean;
@@ -3413,6 +3415,19 @@ export async function upsertMappingAction(
   const machineMemoryMb = body.machineMemoryMb ?? DEFAULT_MACHINE_MEMORY_MB;
   if (!Number.isInteger(machineMemoryMb) || machineMemoryMb < 256) {
     return { status: 400, body: { error: "machineMemoryMb must be an integer >= 256" } };
+  }
+
+  const machineCpuKind = body.machineCpuKind === undefined
+    ? existingMapping?.machineCpuKind ?? "shared"
+    : body.machineCpuKind;
+  if (machineCpuKind !== "shared" && machineCpuKind !== "performance") {
+    return { status: 400, body: { error: "machineCpuKind must be 'shared' or 'performance'" } };
+  }
+  if (machineCpuKind === "performance" && !VALID_CPUS.includes(machineCpus)) {
+    return { status: 400, body: { error: `machineCpus must be one of ${VALID_CPUS.join(", ")} for performance CPUs` } };
+  }
+  if (machineCpuKind === "performance" && machineMemoryMb < PERFORMANCE_MIN_MB_PER_CPU * machineCpus) {
+    return { status: 400, body: { error: `machineMemoryMb must be at least ${PERFORMANCE_MIN_MB_PER_CPU} MB per CPU for performance CPUs` } };
   }
 
   const workflowFile = body.workflowFile || existingMapping?.workflowFile || "claude-implement.yml";
@@ -3632,6 +3647,7 @@ export async function upsertMappingAction(
     maxInProgressAiIssues,
     executionMode,
     sessionMode,
+    machineCpuKind,
     machineCpus,
     machineMemoryMb,
     planningEnabled,
