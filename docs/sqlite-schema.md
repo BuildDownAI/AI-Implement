@@ -239,17 +239,13 @@ with a primary key on dispatch and finding. Ingestion writes it atomically with
 the finding so callback retries reuse the original revision, while a new dispatch
 can reopen a resolved finding and clear stale fixed credit.
 
+`comment_gapfill_queue` admission refusal tracking uses additive, boot-time
+`PRAGMA table_info` guarded migrations (existing rows are preserved):
 
-## Comment gap-fill refusal tracking (AII-1981)
+| Column | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `refusal_count` | INTEGER NOT NULL | 0 | Admission refusals for this queue row |
+| `last_refusal_reason` | TEXT nullable | NULL | Last admission refusal, retained when skipped |
+| `last_refusal_dispatch_id` | TEXT nullable | NULL | Deduplicates reservation step retries |
 
-`getDb()` checks `PRAGMA table_info(comment_gapfill_queue)` and adds missing
-columns with `ALTER TABLE ... ADD COLUMN`. Repeated boots preserve existing rows.
-
-| Column | Definition | Purpose |
-| --- | --- | --- |
-| `refusal_count` | `INTEGER NOT NULL DEFAULT 0` | Admission refusals; the third skips the row |
-| `last_refusal_reason` | `TEXT`, nullable | Latest admission refusal, retained when skipped |
-| `last_refusal_dispatch_id` | `TEXT`, nullable | Prevent counting a retried reservation step twice |
-
-Old rows start with zero refusals and null reason/dispatch identity. Rollback
-leaves these additive columns in place.
+`comment_gapfill_refusals` stores durable reservation decisions with `queue_item_id INTEGER NOT NULL`, `dispatch_id TEXT NOT NULL`, and `reason TEXT NOT NULL`; the composite primary key is `(queue_item_id, dispatch_id)`. Boot uses additive `CREATE TABLE IF NOT EXISTS` and seeds the previously recorded last refusal with `INSERT OR IGNORE`. Decisions remain available after terminal queue transitions.

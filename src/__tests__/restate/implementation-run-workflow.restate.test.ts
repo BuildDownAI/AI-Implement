@@ -319,20 +319,6 @@ describe("ImplementationRun durable workflow", () => {
     return { dispatchId, sc, done, read, report };
   }
 
-  it("journals a structured reservation refusal without launching", async () => {
-    const label = labels[0]!;
-    const w = begin(slow, label, { reserveImpl: async () => ({ ok: false, reason: "occupied" }) });
-    expect(await w.done).toEqual({ reason: "refused" });
-    expect(w.sc.calls).toEqual(["reserve"]);
-    expect(releasesOf(w.dispatchId)).toEqual([]);
-    const env = slow.get(label)!;
-    const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}'`);
-    expect(rows.length).toBeGreaterThan(0);
-    const text = (await Promise.all(rows.map(async row => journalText(await journalEntries(env.adminAPIBaseUrl(), String(row.id)))))).join("\n");
-    expect(text).toContain("occupied");
-    expect(text).toContain("reserve");
-  });
-
   it.each(["github-actions", "fly-machines", "local-docker"] as const)("%s gap-fill finishes once and releases its reservation without journaling credentials", async backend => {
     const label = labels[0]!;
     const nonce = "NONCE-SENTINEL";

@@ -1,4 +1,3 @@
-export type ReservationResult = boolean | { ok: false; reason: import("../dispatch-admission.js").DispatchAdmissionDeferReason };
 import { copyModelPrices, type RunModelPrices } from "../run-config.js";
 /**
  * `ImplementationRun` — the workflow that owns one implementation attempt (AII-1553): one dispatch
@@ -90,12 +89,15 @@ export interface ImplementationRunResult {
   reason: DispatchAdmissionReleaseReason | "refused" | "termination_unconfirmed";
 }
 
-/** Plain functions, every one called inside `ctx.run` — none of them may call `ctx` themselves. */
+/** Boolean results remain compatible with previously journaled reservations. */
+export type ImplementationReservation = boolean | { ok: false; reason: import("../dispatch-admission.js").DispatchAdmissionDeferReason };
+
+/** Plain functions called inside ctx.run; dependencies must not call ctx. */
 export interface ImplementationRunDependencies {
   /** Test seam; production leaves it unset and reads `restate_retention_days` at build time. */
   retentionMs?: number;
-  /** Takes the reservation for this dispatch id: `true` when held, `false` when refused. Idempotent per dispatch id. */
-  reserve(input: ImplementationRunInput): ReservationResult | Promise<ReservationResult>;
+  /** Takes the reservation for this dispatch id: `true` when held, a reason when refused (legacy booleans supported). Idempotent per dispatch id. */
+  reserve(input: ImplementationRunInput): ImplementationReservation | Promise<ImplementationReservation>;
   /** The run or machine id of a launch that already happened for this dispatch, or `null`.
    *  `dispatchedAt` is the journaled dispatch time (epoch ms): a run created before it is not this launch. */
   findExistingRun(input: ImplementationRunInput, dispatchedAt: number): Promise<string | null>;
@@ -180,14 +182,14 @@ export function createImplementationRunWorkflow(deps: ImplementationRunDependenc
     // The first step. A refusal returns before the `try`, so no `finally` releases a row this dispatch does not hold.
     // A cancel or a failed step after a possible commit releases the row of this dispatch id: the function may have
     // committed the reservation without the result being journaled, and a release with nothing held is safe.
-    let held: ReservationResult;
+    let held: ImplementationReservation;
     try {
       held = await ctx.run("reserve", async () => deps.reserve(input), { maxRetryAttempts: 3 });
     } catch (err) {
       if (!restate.internal.isSuspendedError(err)) await release("cancelled");
       throw err;
     }
-    if (held === false || typeof held === "object") {
+    if (held === false || (typeof held === "object" && !held.ok)) {
       ctx.console.log(`[implementation-run] reservation refused dispatch=${dispatchId} issue=${input.issueIdentifier} reason=${typeof held === "object" ? held.reason : "unknown"}`);
       ctx.set("step", "refused");
       return { reason: "refused" };

@@ -1,21 +1,5 @@
-/**
- * Atomic admission storage for the Restate review-fix pilot (AII-775), backed by the
- * additive `dispatch_admissions` / `dispatch_budget_entries` schema `dedup.ts` created
- * for AII-771. This module is the single authority for team capacity and scoped
- * issue/PR occupancy going forward — it does not read `dispatch_log` or `dispatched`
- * (the old predicate `dispatch-gate.ts#canDispatch` still uses), and nothing here calls
- * it or is called by it. Comment gap-fill previews share this admission policy
- * before ingress; acquire remains the atomic reservation authority.
- *
- * Two occupancy sources exist during the pilot: this table, and the legacy
- * `dispatch_log`-derived predicate in `dispatch-gate.ts`. They are only consistent
- * while one is empty — cutover drains the legacy path first rather than backfilling
- * history into this one (see the issue's "no active-run backfill" note).
- *
- * Every mutation is one synchronous `better-sqlite3` transaction on the single shared
- * connection (`getDb()`), so "check policy, reserve capacity/occupancy, record the
- * dispatch identity" is atomic and race-free without needing real concurrency in tests.
- */
+/** Atomic dispatch admission and read-only policy preview, backed by the
+ * admission and budget ledgers. Acquire revalidates policy transactionally. */
 import type Database from "better-sqlite3";
 import { getDb } from "./dedup.js";
 import type { DispatchKind } from "./dispatch-gate.js";
@@ -221,15 +205,11 @@ function isUniqueConstraintError(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/.test(error.message);
 }
 
-export type DispatchAdmissionCheck = Exclude<DispatchAdmissionDecision, { ok: true }> |
-  { readonly ok: true; readonly count: number; readonly cap: number; readonly record?: DispatchAdmissionRecord };
-
-/** Read-only preview; acquire repeats this exact policy inside its write transaction. */
-export function checkAdmission(request: DispatchAdmissionRequest): DispatchAdmissionCheck {
-  return evaluateAdmission(getDb(), request);
-}
-
-function evaluateAdmission(db: Database.Database, request: DispatchAdmissionRequest): DispatchAdmissionCheck {
+/** Read-only preview; acquire re-evaluates this policy inside its transaction. */
+export function checkAdmission(request: DispatchAdmissionRequest):
+  | { ok: true; record?: DispatchAdmissionRecord; count: number; cap: number }
+  | Extract<DispatchAdmissionDecision, { ok: false }> {
+  const db = getDb();
   const existing = db
     .prepare("SELECT * FROM dispatch_admissions WHERE dispatch_id = ?")
     .get(request.dispatchId) as Row | undefined;
@@ -297,10 +277,10 @@ export function acquire(
 ): DispatchAdmissionDecision {
   const db = getDb();
   return db.transaction((): DispatchAdmissionDecision => {
-    const decision = evaluateAdmission(db, request);
+    const decision = checkAdmission(request);
     if (!decision.ok) return decision;
     if (decision.record) return { ...decision, record: decision.record };
-    const cap = decision.cap;
+    const cap = request.cap;
     const capCount = decision.count;
 
     let executionId: string | undefined;

@@ -65,7 +65,7 @@ Each finding is rendered whole under its `finding_key`, the same shape a review-
 
 ## In-flight deferral
 
-When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left `pending` with no reply, and the next drain retries it. Once the run sets `pr_url`, step 1 finds it and the item dispatches. There is no age cap: the job timeout, stuck watchdog and reaper end the run. Other `canDispatch` or admission refusals (`pr_budget`, capacity) defer the same way.
+When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left `pending` with no reply, and the next drain retries it. Once the run sets `pr_url`, step 1 finds it and the item dispatches. There is no age cap: the job timeout, stuck watchdog and reaper end the run. Policy refusals (`pr_budget`, parked state, capacity) instead count toward the three-refusal limit described below.
 
 ## Drain replies
 
@@ -128,20 +128,23 @@ still runs on those retries. A GitHub failure (or missing autopsy/target/credent
 is a callback warning and does not prevent the failed row write or report delivery.
 The monitor's separate failure classification names the phase as “Gap-fill failed”.
 
+Before submitting an ImplementationRun, the drain previews the same read-only
+admission policy that `acquire` rechecks inside its atomic transaction: PR occupancy,
+PR budget, parked state, and team capacity, including human overrides. Existing
+legacy safeguards still defer in-flight work without counting it as a policy refusal.
+Parked rows always reach the shared preview, including rows parked by an earlier
+budget refusal. Historical dispatch-log budget and capacity safeguards run after
+the preview and count toward the same limit, using `budget_exhausted` and
+`at_capacity` respectively. Preview refusals do not create
+admissions or spend budget. Reservation refusals caused by a race carry their
+reason through the workflow's journaled reservation result and log.
 
-## Admission refusals
+Each admission refusal increments the queue row's `refusal_count` and replaces
+`last_refusal_reason`. The named `MAX_COMMENT_GAPFILL_REFUSALS` limit is three:
+the third refusal sets the row to `skipped`, retains the reason, and logs the
+reason, count, and terminal status. Subsequent drains do not submit it. Late
+reservation refusals count too; the durable `comment_gapfill_refusals` ledger prevents a retried
+reservation step from counting the same dispatch twice. Both preview and late
+`budget_exhausted` refusals use the existing PR budget park and notice mechanism.
 
-Before submitting ImplementationRun, the drain runs the read-only
-`checkAdmission` policy shared with `acquire`: PR occupancy, the admission budget
-ledger, parked state, and team capacity, with the same precedence and human
-overrides. Existing legacy gate deferrals remain waits. The preview writes no
-admission or budget entries; acquire rechecks atomically to handle races.
-
-Admission refusals from either preview or reservation increment the queue row's
-`refusal_count` and replace `last_refusal_reason`. After
-`MAX_COMMENT_GAPFILL_REFUSALS` (3), the row becomes `skipped` and is no longer
-submitted. Logs include the reason, count, and status; the workflow also logs the
-reservation refusal reason. Retried reservation steps count once per dispatch.
-Ingress acceptance cannot overwrite a refusal transition. A
-`budget_exhausted` refusal uses the same PR budget park and deduplicated notices
-as the legacy `pr_budget` gate.
+Reservation retries reuse the original per-dispatch refusal before checking capacity, including after the queue row is skipped. Interleaved retries never count twice. Human requests reaching the limit receive a PR reply with the last reason and instructions to request another run; posting failures are logged.
