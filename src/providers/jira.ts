@@ -501,11 +501,10 @@ export class JiraProvider implements TicketingProvider {
     let nextPageToken: string | undefined;
     for (let page = 0; page < 20; page++) {
       const result = await this.client.searchJqlPage(
-        jql, ["summary", "updated", "status", "resolution", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
+        jql, ["summary", "updated", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
       );
       for (const raw of result.issues) {
         if (readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) !== cfg.repoFieldValue) continue;
-        if (nativeLifecycleState(raw.fields) === "cancelled") continue;
         const workflowState = readStatusValue(raw.fields, fieldIds.statusFieldId);
         issues.push({
           id: raw.id,

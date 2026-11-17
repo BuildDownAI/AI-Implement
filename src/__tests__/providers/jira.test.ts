@@ -2146,7 +2146,7 @@ describe("JiraProvider.listIssueStatuses", () => {
     await provider().listIssueStatuses(mapping());
     expect(searchBodies(fake)[0]).toEqual({
       jql: '(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -7d)',
-      fields: ["summary", "updated", "status", "resolution", "customfield_10100", "customfield_10101"],
+      fields: ["summary", "updated", "customfield_10100", "customfield_10101"],
       maxResults: 100,
     });
   });
@@ -2158,7 +2158,7 @@ describe("JiraProvider.listIssueStatuses", () => {
     expect(await provider().listIssueStatuses(mapping())).toHaveLength(2);
   });
 
-  it.each(["Won't Do", "Cancelled", "CANCELED", "Duplicate"])("excludes native cancellation %s independently of the custom status", async (resolution) => {
+  it.each(["Won't Do", "Cancelled", "CANCELED", "Duplicate"])("keeps custom-status state and phase for native resolution %s", async (resolution) => {
     const nativeIssue = (category: string, name: string | null, customStatus = "Ready"): JiraIssue => {
       const raw = issue(customStatus);
       return { ...raw, fields: { ...raw.fields,
@@ -2170,12 +2170,21 @@ describe("JiraProvider.listIssueStatuses", () => {
       nativeIssue("done", resolution),
       nativeIssue("done", resolution, "Merged"),
       nativeIssue("done", resolution, "Planning Failed"),
+      nativeIssue("done", resolution, "Implementation Failed"),
       nativeIssue("done", "Done", "Merged"),
       nativeIssue("indeterminate", resolution),
       nativeIssue("done", null),
     ] }) }).install();
-    expect((await provider().listIssueStatuses(mapping())).map((record) => record.state))
-      .toEqual(["merged", "ready", "ready"]);
+    expect((await provider().listIssueStatuses(mapping())).map(({ workflowState, state, phase }) => ({ workflowState, state, phase })))
+      .toEqual([
+        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Merged", state: "merged", phase: null },
+        { workflowState: "Planning Failed", state: "failed", phase: "planning" },
+        { workflowState: "Implementation Failed", state: "failed", phase: "implementation" },
+        { workflowState: "Merged", state: "merged", phase: null },
+        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Ready", state: "ready", phase: null },
+      ]);
   });
 
   it("accumulates pages and forwards tokens through an empty page", async () => {
