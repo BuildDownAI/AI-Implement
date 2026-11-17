@@ -133,7 +133,7 @@ A tool that the BuildDown control plane calls with its `service` token (for exam
 
 ### `get_fly_setup`
 
-Call with `{ "args": {} }`; arguments belong only inside `args`. Requires an admin or a token with `orchestrator:secrets` alone. No paging. During a deploy hold the route answers 409 `deploy-in-progress`; when Restate cannot serve it answers 503 `restate-unavailable`.
+Call with `{ "args": {} }`; arguments belong only inside `args`. Requires an admin, or a control-plane token whose scope includes `orchestrator:secrets`. No paging. During a deploy hold the route answers 409 `deploy-in-progress`; when Restate cannot serve it answers 503 `restate-unavailable`.
 
 The JSON text reply contains:
 
