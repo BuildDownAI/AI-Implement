@@ -57,7 +57,7 @@ export async function runOpenRouterAgentLiveCheck({ env = process.env, spawn = n
           };
           let child: ChildProcessWithoutNullStreams;
           try {
-            child = spawn("codex", ["exec", "--json", "--ignore-user-config", "--ignore-rules", "--model",
+            child = spawn("codex", ["exec", "--json", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--model",
               env.OPENROUTER_TEST_MODEL || DEFAULT_MODEL, ...openrouterProviderArgs(), "--sandbox", "read-only", "-"], {
               cwd: directory, env: buildModelInvocationEnv({ authMode: "openrouter-api-key",
                 secret: { kind: "api-key", apiKey: selectedKey }, inheritedEnv: env }).env,

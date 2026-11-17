@@ -78,7 +78,7 @@ describe("OpenRouter agent live check", () => {
     expect(f.spawn).toHaveBeenCalledTimes(2);
     for (const [i, [cmd, args, options]] of f.spawn.mock.calls.entries()) {
       expect(cmd).toBe("codex");
-      expect(args).toEqual(["exec", "--json", "--ignore-user-config", "--ignore-rules", "--model", model ?? DEFAULT_MODEL,
+      expect(args).toEqual(["exec", "--json", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--model", model ?? DEFAULT_MODEL,
         ...openrouterProviderArgs(), "--sandbox", "read-only", "-"]);
       expect(options.env).toEqual(buildModelInvocationEnv({ inheritedEnv: env, authMode: "openrouter-api-key", secret: { kind: "api-key", apiKey: i === 0 ? key : "sk-or-v1-invalid" } }).env);
       expect(existsSync(options.cwd)).toBe(false);
