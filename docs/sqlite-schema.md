@@ -41,6 +41,13 @@ Every step is idempotent, so a second boot changes nothing:
 - One trigger is the exception. `trg_dispatch_log_changed_at` is dropped and created at every
   boot, so an older form of it is replaced by the current form.
 
+### Project CPU kind
+
+`initMappingsTable()` creates `mappings.machine_cpu_kind TEXT NOT NULL DEFAULT 'shared'`.
+For an older database it checks `PRAGMA table_info(mappings)` and adds the missing
+column with the same default. Existing projects read as `shared`; repeated boots
+leave it unchanged. Older orchestrators ignore the column on rollback.
+
 ### OpenRouter CHECK constraint rebuilds (AII-1883)
 
 `getDb()` creates `model_account_profile_revisions` and `model_invocation_attribution`

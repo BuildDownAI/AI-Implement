@@ -786,7 +786,7 @@ describe("migrated read handlers (AII-711)", () => {
   it("list_projects selects its fields explicitly — extraEnv never leaves the handler", async () => {
     vi.mocked(getMappings).mockReturnValue({
       BDS: makeMapping({
-        owner: "BuildDownAI", repo: "skills", extraEnv: { SUPER_SECRET: "leak-me" },
+        owner: "BuildDownAI", repo: "skills", machineCpuKind: "performance", extraEnv: { SUPER_SECRET: "leak-me" },
         trustedReviewAuthors: ["codex-reviewer[bot]"], reviewProcess: "claude-code-review",
       }),
     });
@@ -794,6 +794,7 @@ describe("migrated read handlers (AII-711)", () => {
     expect(result.isError).toBeUndefined();
     const rows = JSON.parse(result.content[0].text) as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(1);
+    expect(rows[0].machineCpuKind).toBe("performance");
     expect(rows[0].teamKey).toBe("BDS");
     expect(rows[0].repo).toBe("BuildDownAI/skills");
     expect(rows[0].trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
@@ -2358,4 +2359,14 @@ describe("list_issue_statuses (AII-1966)", () => {
     expect(result.content[0].text).toContain("list_issue_statuses");
     expect(result.content[0].text).toContain(failure === "resolution" ? "provider unavailable" : failure === "unsupported" ? "cannot list issue statuses" : "tracker unavailable");
   });
+});
+
+
+it("add_project accepts CPU kinds without defaulting omitted input", () => {
+  const base = { teamKey: "AII", owner: "org", repo: "repo" };
+  for (const machineCpuKind of ["shared", "performance"]) {
+    expect(addProjectArgsSchema.safeParse({ ...base, machineCpuKind }).success).toBe(true);
+  }
+  expect(addProjectArgsSchema.safeParse({ ...base, machineCpuKind: "invalid" }).success).toBe(false);
+  expect(addProjectArgsSchema.parse(base)).not.toHaveProperty("machineCpuKind");
 });
