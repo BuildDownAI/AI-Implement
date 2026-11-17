@@ -20,6 +20,7 @@ import {
   listInFlightJobs,
   getSessionMachine,
   listSessionMachines,
+  getFlySetup,
   getIssueDispatchStatus,
   getIssueReportCardTool,
   getFleetReportTool,
@@ -98,6 +99,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   list_in_flight_jobs: listInFlightJobs,
   get_session_machine: getSessionMachine,
   list_session_machines: listSessionMachines,
+  get_fly_setup: getFlySetup,
   get_issue_dispatch_status: getIssueDispatchStatus,
   get_issue_report_card: getIssueReportCardTool,
   get_fleet_report: getFleetReportTool,
@@ -142,7 +144,7 @@ const WRITE_TOOL_NAMES = new Set([
   "clear_dispatch_dedup",
   "release_dispatch_reservation",
 ]);
-const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity"]);
+const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]);
 
 const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   name,
@@ -1704,7 +1706,7 @@ describe("handleMcpRequest", () => {
       }
     });
 
-    it("lists review-fix read tools for admins only", async () => {
+    it("lists privileged read tools for admins only", async () => {
       mockRole("admin");
       const adminResult = await callMcp(
         { authorization: "Bearer tok" },
@@ -1727,15 +1729,27 @@ describe("handleMcpRequest", () => {
       );
       const userNames = JSON.parse(userResult.body).result.tools.map((t: { name: string }) => t.name);
 
-      expect(adminNames).toEqual(expect.arrayContaining(["get_review_fix_attempt", "get_review_fix_activity"]));
+      expect(adminNames).toEqual(expect.arrayContaining(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]));
       expect(userNames).not.toContain("get_review_fix_attempt");
       expect(userNames).not.toContain("get_review_fix_activity");
+      expect(userNames).not.toContain("get_fly_setup");
     });
   });
 
   describe("tools/call — review-fix read tools", () => {
     afterEach(() => {
       setReviewFixAttemptsFacade(null);
+    });
+
+    it("routes get_fly_setup for an admin", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_fly_setup", arguments: {} } }),
+      );
+      const reply = JSON.parse(result.body).result;
+      expect(reply.isError).toBeFalsy();
+      expect(JSON.parse(reply.content[0].text)).toHaveProperty("reachable", null);
     });
 
     it("as admin, calls get_review_fix_attempt and returns the status envelope", async () => {

@@ -436,18 +436,34 @@ export interface FlySecret {
   created_at: string;
 }
 
+export function classifyFlySecretNames(names: readonly string[], teamKeys: readonly string[]): Array<{
+  name: string; group: "protection-key" | "project" | "global"; projects: string[];
+}> {
+  return names.map((name) => {
+    if (name === MODEL_AUTH_ENV.protectionKey) return { name, group: "protection-key", projects: [] };
+    const projects = teamKeys.filter((key) => name.startsWith(`${key.toUpperCase()}_`));
+    return { name, group: projects.length ? "project" : "global", projects };
+  });
+}
+
 export async function listAppSecrets(
   token: string,
   appName: string,
+  timeoutMs?: number,
 ): Promise<FlySecret[]> {
-  const res = await fetch(`${FLY_API_BASE}/apps/${appName}/secrets`, {
-    headers: flyHeaders(token),
-  });
-  if (!res.ok) throw new Error(`Fly app secrets list failed (${res.status})`);
-  // Fly answers an object that holds the list (`{ secrets: [...] }`), not a bare list.
-  const body = await res.json() as { secrets?: unknown } | null;
-  if (!Array.isArray(body?.secrets)) throw new Error("Fly app secrets list returned no secrets list");
-  return body.secrets as FlySecret[];
+  const ac = timeoutMs === undefined ? undefined : new AbortController();
+  const timer = ac ? setTimeout(() => ac.abort(), timeoutMs) : undefined;
+  try {
+    const res = await fetch(`${FLY_API_BASE}/apps/${appName}/secrets`, {
+      headers: flyHeaders(token), ...(ac ? { signal: ac.signal } : {}),
+    });
+    if (!res.ok) throw new FlyApiError(`Fly app secrets list failed (${res.status})`, res);
+    const body = await res.json() as { secrets?: unknown } | null;
+    if (!Array.isArray(body?.secrets)) throw new Error("Fly app secrets list returned no secrets list");
+    return body.secrets as FlySecret[];
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function setAppSecrets(

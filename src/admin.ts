@@ -95,7 +95,7 @@ import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getJobByMachineId, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { destroyMachineRecorded } from "./backend-run.js";
-import { listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
+import { classifyFlySecretNames, listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, fetchProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -3229,9 +3229,10 @@ async function handleListGlobalSecrets(
   }
   try {
     const allSecrets = await listAppSecrets(config.flySessionsToken, config.flySessionsApp);
-    const teamPrefixes = Object.keys(getMappings()).map((k) => `${k.toUpperCase()}_`);
+    const globalNames = new Set(classifyFlySecretNames(allSecrets.map((s) => s.name), Object.keys(getMappings()))
+      .filter((s) => s.group === "global").map((s) => s.name));
     const globalSecrets = allSecrets
-      .filter((s) => s.name !== MODEL_AUTH_ENV.protectionKey && !teamPrefixes.some((prefix) => s.name.startsWith(prefix)))
+      .filter((s) => globalNames.has(s.name))
       .map((s) => ({ name: s.name, createdAt: s.created_at }));
     json(res, 200, globalSecrets);
   } catch (err) {
