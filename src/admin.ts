@@ -118,7 +118,6 @@ import {
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
 import { listRepoBranchesAndTags, getRepoDefaultBranch, fetchRepoTarball } from "./github.js";
-import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport, restateRefForJob } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
@@ -422,15 +421,31 @@ interface ValidatedTicketing {
   ticketingConfig: TicketingMappingConfig;
 }
 
+/** A save's refusal, naming the body field it concerns so a form can show it beside that field. */
+class MappingFieldError extends Error {
+  constructor(readonly field: keyof UpsertMappingBody, message: string) {
+    super(message);
+  }
+}
+
+function refuse(field: keyof UpsertMappingBody, error: string): { status: 400; body: { error: string; field: keyof UpsertMappingBody } } {
+  return { status: 400, body: { error, field } };
+}
+
 function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketingConfig?: unknown }): ValidatedTicketing {
   const provider = body.ticketingProvider ?? "linear";
   if (provider !== "linear" && provider !== "jira" && provider !== "filesystem") {
-    throw new Error(`Invalid ticketingProvider: expected "linear", "jira", or "filesystem", got ${JSON.stringify(provider)}`);
+    throw new MappingFieldError("ticketingProvider", `Invalid ticketingProvider: expected "linear", "jira", or "filesystem", got ${JSON.stringify(provider)}`);
   }
   if (provider === "filesystem" && getRunnerMode().mode !== "local") {
-    throw new Error("Filesystem tickets require local runner mode (RUNNER_MODE=local)");
+    throw new MappingFieldError("ticketingProvider", "Filesystem tickets require local runner mode (RUNNER_MODE=local)");
   }
-  const config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
+  let config: TicketingMappingConfig;
+  try {
+    config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
+  } catch (err) {
+    throw new MappingFieldError("ticketingConfig", err instanceof Error ? err.message : String(err));
+  }
   if (config.kind === "jira") {
     // A field-id override is interpolated into JQL and into the fields list of a REST
     // query, so reject anything that is not a bare identifier here rather than letting
@@ -445,7 +460,7 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
     for (const key of overrideKeys) {
       const value = config[key];
       if (value != null && !/^[A-Za-z0-9_]+$/.test(value)) {
-        throw new Error(`Invalid ${key} "${value}" — Jira field ids may only contain letters, digits, and underscores`);
+        throw new MappingFieldError("ticketingConfig", `Invalid ${key} "${value}". Jira field ids may only contain letters, digits, and underscores`);
       }
     }
   }
@@ -532,6 +547,10 @@ export interface AdminDeps {
   startSetupChecks?: () => Promise<SetupChecksStart>;
   /** The setup-check run in progress in this process, or null. Absent in tests, where no run is ever in progress. */
   setupCheckProgress?: () => SetupCheckProgress | null;
+  /** Runs an unsaved project's checks in this process and stores nothing (AII-1543). Bound in src/index.ts, which holds the Restate status reader the context needs. */
+  runCandidateChecks?: (key: string, mapping: RepoMapping) => Promise<SetupCheckRun>;
+  /** Runs one saved project's checks through `SetupChecks.runProject` and answers the stored run they merged into. Same injection as `readSetupChecks`. */
+  runProjectSetupChecks?: (project: string) => Promise<SetupChecksIngressResult<SetupCheckRun | null>>;
 }
 
 export interface AgentConfigAdminDeps {
@@ -810,6 +829,11 @@ export function handleAdminRequest(
 
     if (url === "/api/mappings" && method === "POST") {
       handleUpsertMapping(req, res, config, registry, deps);
+      return true;
+    }
+
+    if (url === "/api/mappings/validate" && method === "POST") {
+      runAsync(res, handleValidateMapping(req, res));
       return true;
     }
 
@@ -1269,6 +1293,16 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/setup-checks/candidate" && method === "POST") {
+      runAsync(res, handleCandidateSetupChecks(req, res, deps));
+      return true;
+    }
+
+    if (url === "/api/setup-checks/project" && method === "POST") {
+      handleProjectSetupChecks(req, res, deps);
+      return true;
+    }
+
     if (url === "/api/sessions" && method === "GET") {
       handleListSessions(req, res, config, registry);
       return true;
@@ -1389,11 +1423,6 @@ export function handleAdminRequest(
       return true;
     }
 
-    if (url.startsWith("/api/admin/github-install-state") && method === "GET") {
-      handleGithubInstallState(req, res, config);
-      return true;
-    }
-
     if (url === "/api/admin/template-status" && method === "GET") {
       // Scan each target repo's in-repo PLANNING.md and WORKFLOW.md for the
       // legacy "curl Linear directly" pattern. Flag repos that still have it —
@@ -1471,6 +1500,54 @@ async function handleStartSetupChecks(res: http.ServerResponse, deps: AdminDeps)
     return;
   }
   json(res, 202, { invocationId: started.value.invocationId });
+}
+
+/**
+ * A project not saved yet, checked as its save would store it: the save's 400 when the save would refuse it, else its rows
+ * and the orchestrator-wide rows they depend on. Runs in this process and stores nothing, so it answers while Restate cannot.
+ */
+async function handleCandidateSetupChecks(req: http.IncomingMessage, res: http.ServerResponse, deps: AdminDeps): Promise<void> {
+  const built = await buildMappingFromRequest(req);
+  if ("status" in built) {
+    json(res, built.status, built.body);
+    return;
+  }
+  if (!deps.runCandidateChecks) {
+    json(res, 503, { error: "setup-checks-unavailable" });
+    return;
+  }
+  try {
+    const run = await deps.runCandidateChecks(built.key, built.mapping);
+    json(res, 200, { results: run.results, groups: SETUP_CHECK_GROUP_LABELS });
+  } catch (err) {
+    console.error(`[admin] setup checks for the unsaved project ${built.key} failed:`, err);
+    json(res, 500, { error: "setup-checks-failed" });
+  }
+}
+
+/** Runs one saved project's checks and answers the stored run they merged into: 404 for no such project, 503 when Restate cannot take the run. */
+async function handleProjectSetupChecks(req: http.IncomingMessage, res: http.ServerResponse, deps: AdminDeps): Promise<void> {
+  let project: unknown;
+  try {
+    ({ project } = JSON.parse(await readBody(req)) as { project?: unknown });
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+  if (typeof project !== "string" || !project) {
+    json(res, 400, { error: "project is required" });
+    return;
+  }
+  const result = deps.runProjectSetupChecks ? await deps.runProjectSetupChecks(project) : { status: "unavailable" as const };
+  if (result.status !== "ok") {
+    json(res, 503, { error: "restate-unavailable", setupCommand: setupCommandFor(process.env) });
+    return;
+  }
+  if (result.value === null) {
+    json(res, 404, { error: "no-such-project" });
+    return;
+  }
+  json(res, 200, { run: result.value, groups: SETUP_CHECK_GROUP_LABELS });
 }
 
 async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -3355,14 +3432,15 @@ export interface UpsertMappingBody {
   reviewProcess?: unknown;
 }
 
-export async function upsertMappingAction(
+/**
+ * The mapping a save would store for `body`, with its warnings, or the 400 the save would answer, naming the field it refuses.
+ * Reads the stored mapping it would replace and writes nothing, so a candidate's checks see exactly what a save stores.
+ */
+export function buildMappingFromBody(
   body: UpsertMappingBody,
-  config: AdminConfig,
-  registry: ProviderRegistry,
-  _deps: AdminDeps = {},
-): Promise<{ status: number; body: Record<string, unknown> }> {
+): { key: string; mapping: RepoMapping; warnings: string[] } | { status: number; body: Record<string, unknown> } {
   if (!body.teamKey || !body.owner || !body.repo) {
-    return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
+    return refuse(!body.teamKey ? "teamKey" : !body.owner ? "owner" : "repo", "teamKey, owner, and repo are required");
   }
 
   const existingMapping = getMappings()[body.teamKey];
@@ -3370,35 +3448,35 @@ export async function upsertMappingAction(
     ? body.defaultBranch.trim()
     : (existingMapping?.defaultBranch ?? "");
   if (!defaultBranch) {
-    return { status: 400, body: { error: "defaultBranch is required" } };
+    return refuse("defaultBranch", "defaultBranch is required");
   }
 
   const maxInProgressAiIssues =
     body.maxInProgressAiIssues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES;
   if (!Number.isInteger(maxInProgressAiIssues) || maxInProgressAiIssues < 1) {
-    return { status: 400, body: { error: "maxInProgressAiIssues must be a positive integer" } };
+    return refuse("maxInProgressAiIssues", "maxInProgressAiIssues must be a positive integer");
   }
 
   const validExecutionModes: ExecutionMode[] = ["github-actions", "fly-machines"];
   const executionMode = (body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
   if (!validExecutionModes.includes(executionMode)) {
-    return { status: 400, body: { error: "executionMode must be 'github-actions' or 'fly-machines'" } };
+    return refuse("executionMode", "executionMode must be 'github-actions' or 'fly-machines'");
   }
 
   const validSessionModes: SessionMode[] = ["autonomous", "interactive", "hybrid"];
   const sessionMode = (body.sessionMode ?? DEFAULT_SESSION_MODE) as SessionMode;
   if (!validSessionModes.includes(sessionMode)) {
-    return { status: 400, body: { error: "sessionMode must be 'autonomous', 'interactive', or 'hybrid'" } };
+    return refuse("sessionMode", "sessionMode must be 'autonomous', 'interactive', or 'hybrid'");
   }
 
   const machineCpus = body.machineCpus ?? DEFAULT_MACHINE_CPUS;
   if (!Number.isInteger(machineCpus) || machineCpus < 1) {
-    return { status: 400, body: { error: "machineCpus must be a positive integer" } };
+    return refuse("machineCpus", "machineCpus must be a positive integer");
   }
 
   const machineMemoryMb = body.machineMemoryMb ?? DEFAULT_MACHINE_MEMORY_MB;
   if (!Number.isInteger(machineMemoryMb) || machineMemoryMb < 256) {
-    return { status: 400, body: { error: "machineMemoryMb must be an integer >= 256" } };
+    return refuse("machineMemoryMb", "machineMemoryMb must be an integer >= 256");
   }
 
   const workflowFile = body.workflowFile || existingMapping?.workflowFile || "claude-implement.yml";
@@ -3408,7 +3486,7 @@ export async function upsertMappingAction(
   const autoMerge = body.autoMerge ?? DEFAULT_AUTO_MERGE;
 
   if (planningEnabled && !planningWorkflowFile) {
-    return { status: 400, body: { error: "planningWorkflowFile is required when planningEnabled is true" } };
+    return refuse("planningWorkflowFile", "planningWorkflowFile is required when planningEnabled is true");
   }
 
   for (const [field, value] of [
@@ -3416,90 +3494,81 @@ export async function upsertMappingAction(
     ["planningWorkflowFile", planningWorkflowFile],
   ] as const) {
     if (!isBareWorkflowFileName(value)) {
-      return {
-        status: 400,
-        body: { error: `${field} must be a bare file name ending in .yml or .yaml` },
-      };
+      return refuse(field, `${field} must be a bare file name ending in .yml or .yaml`);
     }
   }
   if (workflowFileNamesCollide(workflowFile, planningWorkflowFile)) {
-    return {
-      status: 400,
-      body: { error: "workflowFile and planningWorkflowFile must not be the same file name" },
-    };
+    return refuse("planningWorkflowFile", "workflowFile and planningWorkflowFile must not be the same file name");
   }
 
   let extraEnv: Record<string, string> = {};
   if (body.extraEnv !== undefined) {
     if (typeof body.extraEnv !== "object" || Array.isArray(body.extraEnv) || body.extraEnv === null) {
-      return { status: 400, body: { error: "extraEnv must be a plain object" } };
+      return refuse("extraEnv", "extraEnv must be a plain object");
     }
     if (!Object.values(body.extraEnv).every((v) => typeof v === "string")) {
-      return { status: 400, body: { error: "extraEnv values must all be strings" } };
+      return refuse("extraEnv", "extraEnv values must all be strings");
     }
     extraEnv = body.extraEnv as Record<string, string>;
     if (Object.keys(extraEnv).some((k) => k.toUpperCase() === EXECUTION_POLICY_ENV)) {
-      return { status: 400, body: { error: `extraEnv name ${EXECUTION_POLICY_ENV} is reserved` } };
+      return refuse("extraEnv", `extraEnv name ${EXECUTION_POLICY_ENV} is reserved`);
     }
     if (Object.keys(extraEnv).some((k) => isEphemeralPolicyEnvName(k) && k !== EPHEMERAL_FULL_ACCESS_EXTRA_ENV)) {
-      return { status: 400, body: { error: `extraEnv name ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must be spelled exactly` } };
+      return refuse("extraEnv", `extraEnv name ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must be spelled exactly`);
     }
     if (EPHEMERAL_FULL_ACCESS_EXTRA_ENV in extraEnv) {
       if (extraEnv[EPHEMERAL_FULL_ACCESS_EXTRA_ENV] !== EPHEMERAL_FULL_ACCESS_ASSERTION) {
-        return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must equal ${EPHEMERAL_FULL_ACCESS_ASSERTION}` } };
+        return refuse("extraEnv", `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must equal ${EPHEMERAL_FULL_ACCESS_ASSERTION}`);
       }
       const modeForOptIn = body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE;
       if (modeForOptIn !== "github-actions") {
-        return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"` } };
+        return refuse("extraEnv", `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"`);
       }
     }
   }
 
   // AII-1437: a mode change without extraEnv in the body keeps the stored opt-in, so check the effective value.
   if (body.extraEnv === undefined && executionMode !== "github-actions" && hasEphemeralFullAccessOptIn(existingMapping?.extraEnv)) {
-    return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"` } };
+    return refuse("executionMode", `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"`);
   }
 
   const validProviders: ClaudeProvider[] = ["anthropic", "bedrock"];
   const provider = (body.provider ?? DEFAULT_PROVIDER) as ClaudeProvider;
   if (!validProviders.includes(provider)) {
-    return { status: 400, body: { error: "provider must be 'anthropic' or 'bedrock'" } };
+    return refuse("provider", "provider must be 'anthropic' or 'bedrock'");
   }
 
   const awsRegionRaw = typeof body.awsRegion === "string" ? body.awsRegion.trim() : "";
   const awsRegion = awsRegionRaw.length > 0 ? awsRegionRaw : null;
   if (provider === "bedrock" && !awsRegion) {
-    return { status: 400, body: { error: "awsRegion is required when provider is 'bedrock'" } };
+    return refuse("awsRegion", "awsRegion is required when provider is 'bedrock'");
   }
   if (provider === "bedrock" && executionMode === "fly-machines") {
-    return {
-      status: 400,
-      body: { error: "provider 'bedrock' is not supported with executionMode 'fly-machines'" },
-    };
+    return refuse("provider", "provider 'bedrock' is not supported with executionMode 'fly-machines'");
   }
 
   let ticketing: ValidatedTicketing;
   try {
     ticketing = validateTicketingMapping(body);
   } catch (err) {
-    return { status: 400, body: { error: err instanceof Error ? err.message : String(err) } };
+    return refuse(err instanceof MappingFieldError ? err.field : "ticketingConfig", err instanceof Error ? err.message : String(err));
   }
 
   if (ticketing.ticketingProvider === "filesystem" && provider !== "anthropic") {
-    return { status: 400, body: { error: "Filesystem tickets use local Docker, which requires provider 'anthropic'" } };
+    return refuse("provider", "Filesystem tickets use local Docker, which requires provider 'anthropic'");
   }
   if (ticketing.ticketingProvider === "filesystem" &&
       (!/^[A-Za-z0-9_.-]+$/.test(body.teamKey) || body.teamKey === "." || body.teamKey === "..")) {
-    return { status: 400, body: { error: "Filesystem project key must contain only letters, digits, underscores, dots, or hyphens" } };
+    return refuse("teamKey", "Filesystem project key must contain only letters, digits, underscores, dots, or hyphens");
   }
 
   const resolveCap = (
-    name: string,
+    name: "maxTurns" | "maxIterations" | "maxJobMinutes" | "prDispatchBudget",
     value: number | null | undefined,
   ): number | null => {
     if (value === undefined || value === null) return null;
     if (!Number.isInteger(value) || value < 1) {
-      throw new Error(`${name} must be a positive integer or null`);
+      throw new MappingFieldError(name, `${name} must be a positive integer or null`);
     }
     return value;
   };
@@ -3514,42 +3583,42 @@ export async function upsertMappingAction(
     maxJobMinutes = resolveCap("maxJobMinutes", body.maxJobMinutes);
     prDispatchBudget = resolveCap("prDispatchBudget", body.prDispatchBudget);
   } catch (err) {
-    return { status: 400, body: { error: err instanceof Error ? err.message : String(err) } };
+    return refuse(err instanceof MappingFieldError ? err.field : "maxTurns", err instanceof Error ? err.message : String(err));
   }
 
   let branchPrefix: string | null;
   try {
     branchPrefix = normalizeBranchPrefix(body.branchPrefix);
   } catch (err) {
-    return { status: 400, body: { error: `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    return refuse("branchPrefix", `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   let skillsRepo: string | null;
   try {
     skillsRepo = normalizeSkillsRepo(body.skillsRepo);
   } catch (err) {
-    return { status: 400, body: { error: `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    return refuse("skillsRepo", `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   let referenceRepos: ReferenceRepo[] | null;
   try {
     referenceRepos = normalizeReferenceRepos(body.referenceRepos);
   } catch (err) {
-    return { status: 400, body: { error: `referenceRepos invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    return refuse("referenceRepos", `referenceRepos invalid: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   let sensitiveAddPatterns: string[] | null;
   try {
     sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns);
   } catch (err) {
-    return { status: 400, body: { error: `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    return refuse("sensitiveAddPatterns", `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   let sensitiveAllowPatterns: string[] | null;
   try {
     sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns);
   } catch (err) {
-    return { status: 400, body: { error: `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    return refuse("sensitiveAllowPatterns", `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   let dependencyTokenScope: "installation" | null;
@@ -3562,7 +3631,7 @@ export async function upsertMappingAction(
   } else if (rawScope === "installation") {
     dependencyTokenScope = "installation";
   } else {
-    return { status: 400, body: { error: `dependencyTokenScope invalid: must be null or "installation"` } };
+    return refuse("dependencyTokenScope", `dependencyTokenScope invalid: must be null or "installation"`);
   }
 
   // Retired API input is ignored. Preserve history for a reviewed deploy revert;
@@ -3580,7 +3649,7 @@ export async function upsertMappingAction(
     try {
       reviewers = normalizeReviewers(body.reviewers);
     } catch (err) {
-      return { status: 400, body: { error: `reviewers invalid: ${err instanceof Error ? err.message : String(err)}` } };
+      return refuse("reviewers", `reviewers invalid: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -3595,7 +3664,7 @@ export async function upsertMappingAction(
     try {
       trustedReviewAuthors = normalizeTrustedReviewAuthors(body.trustedReviewAuthors);
     } catch (err) {
-      return { status: 400, body: { error: `trustedReviewAuthors invalid: ${err instanceof Error ? err.message : String(err)}` } };
+      return refuse("trustedReviewAuthors", `trustedReviewAuthors invalid: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -3608,7 +3677,7 @@ export async function upsertMappingAction(
   } else if (isReviewProcessId(body.reviewProcess)) {
     reviewProcess = body.reviewProcess;
   } else {
-    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"` } };
+    return refuse("reviewProcess", `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"`);
   }
   const mapping: RepoMapping = {
     owner: body.owner,
@@ -3661,18 +3730,43 @@ export async function upsertMappingAction(
     );
   }
 
-  upsertMapping(body.teamKey, mapping);
+  return { key: body.teamKey, mapping, warnings };
+}
+
+/** `buildMappingFromBody` for a request's body, answering the save's 400 for a body the save cannot read: not JSON, or JSON `null`. */
+async function buildMappingFromRequest(req: http.IncomingMessage): Promise<ReturnType<typeof buildMappingFromBody>> {
+  let body: UpsertMappingBody | null;
+  try {
+    body = JSON.parse(await readBody(req)) as UpsertMappingBody | null;
+  } catch {
+    body = null;
+  }
+  if (body === null) return { status: 400, body: { error: "Invalid request body" } };
+  return buildMappingFromBody(body);
+}
+
+export async function upsertMappingAction(
+  body: UpsertMappingBody,
+  config: AdminConfig,
+  registry: ProviderRegistry,
+  _deps: AdminDeps = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const built = buildMappingFromBody(body);
+  if ("status" in built) return built;
+  const { key, mapping, warnings } = built;
+
+  upsertMapping(key, mapping);
   registry.invalidate();
 
   // Kick the workflow sync off in the background and return immediately
   // - the client polls GET /api/mappings/:teamKey/sync-status/:id for the outcome
   // - the mapping is already persisted above, so the save itself succeeds regardless of how the sync resolves
-  const { id } = enqueueWorkflowSync(body.teamKey);
+  const { id } = enqueueWorkflowSync(key);
   void runWorkflowSync(id, config).catch((err) =>
-    console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
+    console.error(`[admin] workflow sync failed for ${key}:`, err),
   );
 
-  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id, ...(warnings.length ? { warnings } : {}) } };
+  return { status: 202, body: { teamKey: key, ...mapping, syncJobId: id, ...(warnings.length ? { warnings } : {}) } };
 }
 
 async function handleUpsertMapping(
@@ -3689,6 +3783,13 @@ async function handleUpsertMapping(
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
+}
+
+/** Whether a save would accept `body`: its 400, naming the refused field, or 200. Reads only the database and writes nothing. */
+async function handleValidateMapping(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const built = await buildMappingFromRequest(req);
+  if ("status" in built) json(res, built.status, built.body);
+  else json(res, 200, { valid: true });
 }
 
 async function handleValidateJql(
@@ -3773,31 +3874,6 @@ async function handleListJiraFieldOptions(
   }
 }
 
-async function handleGithubInstallState(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  config: AdminConfig,
-): Promise<void> {
-  const query = new URL(req.url ?? "", "http://localhost").searchParams;
-  const owner = query.get("owner");
-  const repo = query.get("repo");
-  if (!owner || !repo) {
-    json(res, 400, { error: "owner and repo query params are required" });
-    return;
-  }
-  try {
-    const result = await probeInstallState({
-      appId: config.githubAppId,
-      privateKey: config.githubAppPrivateKey,
-      owner,
-      repo,
-    });
-    json(res, 200, result);
-  } catch (err) {
-    console.error(`[admin] install-state probe failed for ${owner}/${repo}:`, err);
-    json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-  }
-}
 
 interface TemplateStatusEntry {
   teamKey: string;

@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { readFileSync } from "node:fs";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { FilesystemSetupFacts, JiraSetupFacts } from "../../providers/types.js";
 import type { SetupCheck, SetupCheckContext, SetupCheckResult } from "../../setup-checks/index.js";
+import { waitOn } from "../../setup-checks/contract.js";
 import { makeAccessEntry, makeMapping, makeProvider } from "../helpers/builders.js";
-import { makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
+import { makeGitHubSetupFacts, makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
 import { fakeFetch } from "../helpers/fake-fetch.js";
 import { githubError } from "../helpers/replies/github.js";
@@ -27,6 +27,8 @@ function fakeCheck(overrides: Partial<SetupCheck> = {}): SetupCheck {
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: () => [{ state: "pass" }],
     ...overrides,
   };
@@ -201,18 +203,61 @@ describe("SETUP_CHECKS", () => {
 
   it("never shows a secret's value in any field", async () => {
     const results = await resultsFor(makeSentinelSetupCheckContext());
-    // Every check answers but the Jira checks that depend on a Jira project, which the context's one Linear project leaves out.
-    const answering = checks.SETUP_CHECK_IDS.filter((id) => !id.startsWith("tracker.jira.") || id === "tracker.jira.credentials");
+    // Every check answers but those that depend on a Jira or Filesystem project, which the context's one Linear project leaves out.
+    const answering = checks.SETUP_CHECK_IDS.filter((id) => (!id.startsWith("tracker.jira.") || id === "tracker.jira.credentials") && id !== "tracker.filesystem.directory");
     expect(new Set(results.map((r) => r.id))).toEqual(new Set(answering));
     expect(JSON.stringify(results)).not.toContain("sentinel-");
   });
 
-  it("points a fix at another check only by an id that exists", () => {
-    const sources = ["orchestrator-config", "tracker-config", "github-config"]
-      .map((file) => readFileSync(new URL(`../../setup-checks/${file}.ts`, import.meta.url), "utf8")).join("\n");
-    const pointers = [...sources.matchAll(/Address the(.*?) check first\./g)].map((match) => match[1]);
-    expect(pointers.length).toBeGreaterThan(0);
-    for (const pointer of pointers) expect(checks.SETUP_CHECK_IDS.map((id) => ` ${id}`), pointer).toContain(pointer);
+  it("declares perProject on exactly the checks that answer a row for a project", async () => {
+    // GitHub accepts the App but it is installed nowhere, so each GitHub per-project check reaches its projects. The webhook secret lets the webhook checks run.
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
+    const githubAccepting = makeSetupCheckContext({
+      env: { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey, GITHUB_WEBHOOK_SECRET: "secret" },
+      mappings: () => ({ ENG: makeMapping() }),
+      githubSetupFacts: () => makeGitHubSetupFacts({
+        app: async () => ({ status: 200, slug: "ai-implement", events: [], errorBody: "", githubTime: null, localTime: 0 }),
+        installation: async () => null,
+        publicRepository: async () => ({ status: 404, refExists: null }),
+      }),
+    });
+    const answeredForAProject = new Set<string>();
+    for (const ctx of [githubAccepting, CONTEXTS["Linear set up with faults"], CONTEXTS["Jira and Filesystem set up with faults"]]) {
+      for (const row of await resultsFor(ctx)) if (row.project !== undefined) answeredForAProject.add(row.id);
+    }
+    expect([...answeredForAProject].sort()).toEqual(checks.SETUP_CHECKS.filter((check) => check.perProject).map((check) => check.id).sort());
+  });
+
+  it("declares a check unverifiable only when it never passes, fails or warns", async () => {
+    const reviewedOutside = makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping({ reviewProcess: "claude-code-review" }) }) });
+    const unverifiable = checks.SETUP_CHECKS.filter((check) => !check.verifiable).map((check) => check.id);
+    expect(unverifiable.length).toBeGreaterThan(0);
+    const seen = new Set<string>();
+    for (const ctx of [...Object.values(CONTEXTS), reviewedOutside]) {
+      for (const row of await resultsFor(ctx)) {
+        if (!unverifiable.includes(row.id)) continue;
+        seen.add(row.id);
+        expect(["cannot-verify", "not-applicable"], `${row.id} answered ${row.state}`).toContain(row.state);
+      }
+    }
+    expect([...seen].sort()).toEqual([...unverifiable].sort());
+  });
+
+  // A surface groups a project's rows by the check they wait on, so a fix that names a check without saying so would be shown alone.
+  it("gives every row whose fix waits on another check that check as its waitsOn, and only those rows", async () => {
+    let waiting = 0;
+    for (const ctx of Object.values(CONTEXTS)) {
+      for (const row of await resultsFor(ctx)) {
+        const named = row.fix?.match(/^More information is needed\. Address the (.+) check first\.$/)?.[1];
+        expect(row.waitsOn, `${row.id}: ${row.fix}`).toBe(named);
+        if (named) waiting++;
+      }
+    }
+    expect(waiting).toBeGreaterThan(0);
+  });
+
+  it("words a waiting row's fix from the check it waits on", () => {
+    expect(waitOn("tracker.provider")).toEqual({ fix: "More information is needed. Address the tracker.provider check first.", waitsOn: "tracker.provider" });
   });
 });
 
@@ -225,6 +270,13 @@ describe("runSetupChecks", () => {
       checkedAt: 1234,
       results: [{ id: "admin.path", title: "Admin sign-in", group: "orchestrator", tier: "mode", onAdminPath: true, state: "warn", detail: "d", fix: "f" }],
     });
+  });
+
+  it("marks every row of an unverifiable check as such, a thrown one included, so a reader can leave them out of a verdict", async () => {
+    const answers = fakeCheck({ id: "env.github-app", verifiable: false, run: () => [{ state: "cannot-verify", project: "ENG" }] });
+    const throws = fakeCheck({ id: "restate", verifiable: false, run: () => { throw new Error("reader broke"); } });
+    const { results } = await checks.runSetupChecks(makeSetupCheckContext(), [answers, throws]);
+    expect(results.map((r) => [r.id, r.verifiable])).toEqual([["env.github-app", false], ["restate", false]]);
   });
 
   it("reports one result per outcome, in check order, for a per-project check", async () => {
@@ -274,6 +326,155 @@ describe("runSetupChecks", () => {
     const { results } = await run;
     expect(heard[2]).toEqual(["env.github-app", ["pass"]]);
     expect(results.map((row) => row.id)).toEqual(["env.github-app", "restate", "admin.path"]);
+  });
+});
+
+describe("a run for one project", () => {
+  const JIRA_CONFIG = { kind: "jira" as const, jql: "project = OPS", repoFieldValue: "acme/ops", ...NO_FIELD_OVERRIDES };
+  const FILESYSTEM_CONFIG = { kind: "filesystem" as const, directory: "/tickets" };
+  // Linear accepts the app and every per-project read is answerable; GitHub has no App credentials, so its per-project checks fold.
+  const linearProject = (key = "ENG") => makeSetupCheckContext({
+    mappings: () => ({ [key]: makeMapping() }),
+    trackerProvider: async () => makeProvider({ fetchSetupFacts: async () => makeLinearSetupFacts({ teams: { [key]: ["started", "completed"] } }) }),
+    trackerSetupFacts: async () => makeLinearSetupFacts({ teams: { [key]: ["started", "completed"] } }),
+  });
+  const idsOf = (run: { results: SetupCheckResult[] }) => new Set(run.results.map((row) => row.id));
+
+  it("refuses a context holding other projects, or holding none but another", async () => {
+    const both = makeSetupCheckContext({ mappings: () => ({ ENG: makeMapping(), OPS: makeMapping() }) });
+    await expect(checks.runProjectSetupChecks(both, "ENG")).rejects.toThrow("A run for ENG needs a context holding that project alone");
+    await expect(checks.runProjectSetupChecks(linearProject("OPS"), "ENG")).rejects.toThrow("A run for ENG needs a context holding that project alone");
+  });
+
+  it("runs every per-project check and the rows they depend on, and no other orchestrator-wide check", async () => {
+    const ids = idsOf(await checks.runProjectSetupChecks(linearProject(), "ENG"));
+    for (const id of ["tracker.provider", "tracker.linear.credentials", "github.app-identity", "github.clock", "tracker.linear.team-access", "github.installation", "github.target-secrets"]) {
+      expect(ids).toContain(id);
+    }
+    for (const id of ["tracker.jira.credentials", "restate", "env.github-app", "admin.path", "github.webhook-signature", "github.kg-grants", "model.credentials-adopted"]) {
+      expect(ids).not.toContain(id);
+    }
+  });
+
+  it("runs the credentials check of the project's own ticketing system alone", async () => {
+    const jira = await checks.runProjectSetupChecks(makeSetupCheckContext({ mappings: () => ({ OPS: makeMapping({ ticketingProvider: "jira", ticketingConfig: JIRA_CONFIG }) }) }), "OPS");
+    expect(idsOf(jira)).toContain("tracker.jira.credentials");
+    expect(idsOf(jira)).not.toContain("tracker.linear.credentials");
+    const filesystem = await checks.runProjectSetupChecks(makeSetupCheckContext({ mappings: () => ({ LOCAL: makeMapping({ ticketingProvider: "filesystem", ticketingConfig: FILESYSTEM_CONFIG }) }) }), "LOCAL");
+    expect(idsOf(filesystem)).not.toContain("tracker.linear.credentials");
+    expect(idsOf(filesystem)).not.toContain("tracker.jira.credentials");
+  });
+
+  it("gives the project's key to the row of a per-project check that threw, and none to an orchestrator-wide row", async () => {
+    // github.target-secrets reads the runner mode, so an unreadable one makes it throw, and the run answers its one row.
+    const ctx = makeSetupCheckContext({ ...linearProject(), runnerMode: () => { throw new Error("runner mode unreadable"); } });
+    const { results } = await checks.runProjectSetupChecks(ctx, "ENG");
+    expect(results.filter((row) => row.id === "github.target-secrets")).toEqual([expect.objectContaining({ state: "cannot-verify", detail: "runner mode unreadable", project: "ENG" })]);
+    expect(results.find((row) => row.id === "github.app-identity")?.project).toBeUndefined();
+    expect(results.find((row) => row.id === "tracker.provider")?.project).toBeUndefined();
+  });
+
+  it("leaves out the checks it is told to", async () => {
+    const ids = idsOf(await checks.runProjectSetupChecks(linearProject(), "ENG", ["github.workflow-default-branch", "github.workflow-mapping-branch"]));
+    expect(ids).not.toContain("github.workflow-default-branch");
+    expect(ids).not.toContain("github.workflow-mapping-branch");
+    expect(ids).toContain("github.installation");
+  });
+
+  it("stamps the run with when it began and finished, as a full run is", async () => {
+    const ticks = [100, 200];
+    const run = await checks.runProjectSetupChecks(linearProject(), "ENG", [], () => ticks.shift()!);
+    expect([run.startedAt, run.checkedAt]).toEqual([100, 200]);
+  });
+});
+
+describe("a fault every project on a dependency shares", () => {
+  const JIRA_CONFIG = { kind: "jira" as const, jql: "project = OPS", repoFieldValue: "acme/ops", ...NO_FIELD_OVERRIDES };
+  const broken = makeSetupCheckContext({
+    mappings: () => ({ ENG: makeMapping(), APP: makeMapping(), OPS: makeMapping({ ticketingProvider: "jira", ticketingConfig: JIRA_CONFIG }) }),
+    trackerProvider: async (id) => { if (id === "linear") throw new Error("LINEAR_CLIENT_ID is not set"); return makeProvider(); },
+  });
+
+  // A project's marker counts only its own rows, so a full run gives each project on the broken provider its rows.
+  it("is in the rows of each project that depends on it, in a full run, and in no other project's", async () => {
+    const { results } = await checks.runSetupChecks(broken, checks.SETUP_CHECKS);
+    const linearRows = results.filter((row) => row.id.startsWith("tracker.linear.") && row.id !== "tracker.linear.credentials");
+    expect(new Set(linearRows.map((row) => row.project))).toEqual(new Set(["ENG", "APP"]));
+    expect(linearRows.every((row) => row.state === "cannot-verify")).toBe(true);
+    expect(results.find((row) => row.id === "tracker.provider" && row.state === "fail")?.project).toBeUndefined();
+  });
+
+  it("makes a project run answer with a full run, while a fault of the project's own does not", () => {
+    const run = (results: SetupCheckResult[]) => ({ checkedAt: 1, results });
+    const shared = (state: SetupCheckResult["state"]) => ({ id: "tracker.provider" as const, title: "", group: "tracker" as const, tier: "core" as const, onAdminPath: false, state, detail: "" });
+    expect(checks.projectRunNeedsFullRun(run([shared("fail")]))).toBe(true);
+    expect(checks.projectRunNeedsFullRun(run([shared("cannot-verify")]))).toBe(true);
+    expect(checks.projectRunNeedsFullRun(run([shared("pass"), shared("warn"), shared("not-applicable")]))).toBe(false);
+    expect(checks.projectRunNeedsFullRun(run([{ ...shared("fail"), id: "tracker.linear.team-access", project: "ENG" }]))).toBe(false);
+  });
+});
+
+describe("merging a project run into the stored run", () => {
+  const row = (overrides: Partial<SetupCheckResult>): SetupCheckResult => ({
+    id: "tracker.linear.team-access", title: "Linear team access", group: "tracker", tier: "core", onAdminPath: false, state: "pass", ...overrides,
+  });
+  // Built per test, so a merge that changed its input could not hide behind an earlier test's change.
+  const storedRun = () => ({
+    startedAt: 10,
+    checkedAt: 20,
+    results: [
+      row({ id: "restate", group: "orchestrator", onAdminPath: true }),
+      row({ id: "tracker.provider", detail: "The linear provider is ready for ENG, OPS" }),
+      row({ id: "github.app-identity", group: "github" }),
+      row({ project: "ENG", state: "fail" }),
+      row({ id: "github.reference-repos", group: "github", project: "ENG", state: "warn" }),
+      row({ project: "OPS", state: "fail" }),
+    ],
+  });
+  const projectRun = () => ({
+    startedAt: 90,
+    checkedAt: 99,
+    results: [
+      row({ id: "tracker.provider", detail: "The linear provider is ready for ENG" }),
+      row({ id: "github.app-identity", group: "github", state: "fail" }),
+      row({ project: "ENG" }),
+    ],
+  });
+
+  it("replaces the project's rows and the orchestrator-wide rows the run read, each dated by the run, and leaves every other row as it was", () => {
+    const stored = storedRun();
+    expect(checks.mergeProjectRun(stored, "ENG", projectRun())).toEqual({
+      startedAt: 10,
+      checkedAt: 20,
+      results: [
+        stored.results[0],
+        stored.results[1],
+        stored.results[5],
+        row({ id: "github.app-identity", group: "github", state: "fail", checkedAt: 99 }),
+        row({ project: "ENG", checkedAt: 99 }),
+      ],
+    });
+  });
+
+  // Its row names every project on the provider, and a project run's names only the one project.
+  it("keeps the stored tracker.provider row, which a project run reads for one project only", () => {
+    const merged = checks.mergeProjectRun(storedRun(), "ENG", projectRun());
+    expect(merged.results.filter((r) => r.id === "tracker.provider")).toEqual([storedRun().results[1]]);
+  });
+
+  // With no stored provider row to keep, the run's own is the only one saying whether the provider can be built.
+  it("starts the stored run from the whole project run when none is stored, its tracker.provider row included", () => {
+    expect(checks.mergeProjectRun(null, "ENG", projectRun())).toStrictEqual({
+      checkedAt: 99,
+      results: projectRun().results.map((r) => ({ ...r, checkedAt: 99 })),
+    });
+  });
+
+  it("changes neither run it is given", () => {
+    const stored = storedRun();
+    const run = projectRun();
+    checks.mergeProjectRun(stored, "ENG", run);
+    expect({ stored, run }).toEqual({ stored: storedRun(), run: projectRun() });
   });
 });
 
@@ -616,7 +817,7 @@ describe("the summary every allowlisted identity sees", () => {
       checkedAt: 99,
       results: [
         row({ state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines", fixUrl: "/admin#settings" }),
-        row({ id: "tracker.linear.team-access", title: "Linear team access", group: "tracker", onAdminPath: false, project: "ENG", detail: "The app can see team ENG" }),
+        row({ id: "tracker.linear.team-access", title: "Linear team access", group: "tracker", onAdminPath: false, project: "ENG", detail: "The app can see team ENG", checkedAt: 5 }),
       ],
     };
     expect(checks.summarizeSetupChecks(run)).toStrictEqual({

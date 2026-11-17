@@ -1,16 +1,16 @@
 /** Checks of the GitHub App and the repositories each project's runs read: the `github` group. */
 
 import type { RepoMapping } from "../config.js";
-import { appCredentialsProblem, appCredentialsRefused, CLOCK_SKEW_TOLERANCE_S, type AppIdentityRead } from "../github-app-auth.js";
-import { GITHUB_APP_PERMISSIONS, permissionLevelCovers } from "../github-app-permissions.js";
+import { appCredentialsProblem, appCredentialsRefused, appInstallUrl, CLOCK_SKEW_TOLERANCE_S, type AppIdentityRead } from "../github-app-auth.js";
+import { GITHUB_APP_EVENTS, GITHUB_APP_PERMISSIONS, permissionLevelCovers } from "../github-app-permissions.js";
 import { GitHubApiError } from "../github-errors.js";
-import { appInstallUrl } from "../github-install-state.js";
 import type { RepositoryFacts, RepositoryFactsRequest } from "../github.js";
 import { githubRepoParts } from "../reference-repos.js";
+import { resolveReviewProcess } from "../review-process.js";
 import { resolveExecutionPath } from "../runner-mode.js";
 import { isWorkflowSyncInProgress } from "../workflow-sync-queue.js";
 import { buildSyncBranchName } from "../workflow-sync.js";
-import type { SetupCheck, SetupCheckContext, SetupCheckOutcome } from "./index.js";
+import { waitOn, type SetupCheck, type SetupCheckContext, type SetupCheckOutcome } from "./contract.js";
 
 /** The expression naming a workflow file on `branch`, or on GitHub's default branch when `branch` is null. */
 export function workflowFileExpression(branch: string | null, file: string): string {
@@ -59,7 +59,7 @@ const unreachable = (err: unknown): SetupCheckOutcome => ({
 /** Why GitHub cannot be asked as the App, in env.github-app's own words, or null when it can. */
 function credentialsGate(ctx: SetupCheckContext): SetupCheckOutcome | null {
   const problem = appCredentialsProblem(ctx.env);
-  return problem ? { state: "cannot-verify", detail: `${problem}, so GitHub cannot be asked as the App`, fix: "More information is needed. Address the env.github-app check first." } : null;
+  return problem ? { state: "cannot-verify", detail: `${problem}, so GitHub cannot be asked as the App`, ...waitOn("env.github-app") } : null;
 }
 
 /** GitHub's answer to the App's credentials, or the outcome that says why it could not be asked. */
@@ -91,30 +91,38 @@ const RETRY_FIX = "Run the checks again once GitHub answers normally.";
 
 type AcceptedApp = AppIdentityRead & { slug: string };
 
+/** The App once GitHub accepts its credentials, or the outcome saying why no project can be asked about. `subject` names what the check reads. */
+async function readAppFor(ctx: SetupCheckContext, subject: string): Promise<{ app: AcceptedApp } | { outcome: SetupCheckOutcome }> {
+  const read = await readApp(ctx);
+  if ("outcome" in read) return read;
+  const { app } = read;
+  if (app.slug !== null) return { app: { ...app, slug: app.slug } };
+  if (!appCredentialsRefused(app)) return { outcome: { state: "cannot-verify", detail: `${unjudged(app)}, so ${subject} cannot be read`, fix: RETRY_FIX } };
+  return { outcome: { state: "cannot-verify", detail: `GitHub refused the App's credentials, so ${subject} cannot be read`, ...waitOn("github.app-identity") } };
+}
+
 /**
- * Judges every project once GitHub accepts the App's credentials, or says in one row why it cannot.
- * `subject` names what the check reads, for that row.
+ * Judges every project once GitHub accepts the App's credentials, or says for each project why it cannot, so a fault every project
+ * shares shows on each of them. `notNeeded` answers, from a project's configuration alone, why the check does not apply to it,
+ * which holds whatever GitHub answers. `subject` names what the check reads, for the rows that cannot be read.
  * With no project it answers nothing, since tracker.provider already says no project is configured.
  */
 async function judgeProjects(
   ctx: SetupCheckContext,
   subject: string,
   judge: (app: AcceptedApp, mapping: RepoMapping, key: string) => Promise<SetupCheckOutcome>,
+  notNeeded: (mapping: RepoMapping) => SetupCheckOutcome | null = () => null,
 ): Promise<SetupCheckOutcome[]> {
   const projects = Object.entries(ctx.mappings());
   if (projects.length === 0) return [];
-  const read = await readApp(ctx);
-  if ("outcome" in read) return [read.outcome];
-  const { app } = read;
-  if (app.slug === null) {
-    if (!appCredentialsRefused(app)) return [{ state: "cannot-verify", detail: `${unjudged(app)}, so ${subject} cannot be read`, fix: RETRY_FIX }];
-    return [{ state: "cannot-verify", detail: `GitHub refused the App's credentials, so ${subject} cannot be read`, fix: "More information is needed. Address the github.app-identity check first." }];
-  }
-  const accepted = { ...app, slug: app.slug };
-  return Promise.all(projects.map(async ([key, mapping]): Promise<SetupCheckOutcome> => ({
-    ...(await judge(accepted, mapping, key).catch(unreachable)),
-    project: key,
-  })));
+  // The App is read once per run however many projects ask (githubSetupFacts), and not at all when none needs it.
+  return Promise.all(projects.map(async ([key, mapping]): Promise<SetupCheckOutcome> => {
+    const off = notNeeded(mapping);
+    if (off) return { ...off, project: key };
+    const read = await readAppFor(ctx, subject);
+    if ("outcome" in read) return { ...read.outcome, project: key };
+    return { ...(await judge(read.app, mapping, key).catch(unreachable)), project: key };
+  }));
 }
 
 const levelLabel = (level: string) => (level === "write" ? "read and write" : "read-only");
@@ -130,16 +138,16 @@ function notOnGitHubActions(ctx: SetupCheckContext, { owner, repo, executionMode
 async function projectRepository(ctx: SetupCheckContext, { owner, repo }: RepoMapping): Promise<{ facts: RepositoryFacts } | { outcome: SetupCheckOutcome }> {
   const github = ctx.githubSetupFacts();
   if (!(await github.installation(owner))) {
-    return { outcome: { state: "cannot-verify", detail: `The App is not installed on ${owner}, so ${owner}/${repo} cannot be read`, fix: "More information is needed. Address the github.installation check first." } };
+    return { outcome: { state: "cannot-verify", detail: `The App is not installed on ${owner}, so ${owner}/${repo} cannot be read`, ...waitOn("github.installation") } };
   }
   let facts;
   try {
     facts = (await github.repositories(owner)).get(repo.toLowerCase());
   } catch (err) {
-    if (err instanceof GitHubApiError) return { outcome: { state: "cannot-verify", detail: `GitHub refused to read ${owner}'s repositories for the App (HTTP ${err.status})`, fix: "More information is needed. Address the github.permissions check first." } };
+    if (err instanceof GitHubApiError) return { outcome: { state: "cannot-verify", detail: `GitHub refused to read ${owner}'s repositories for the App (HTTP ${err.status})`, ...waitOn("github.permissions") } };
     throw err;
   }
-  if (!facts?.visible) return { outcome: { state: "cannot-verify", detail: `The App's installation on ${owner} cannot see ${repo}`, fix: "More information is needed. Address the github.installation check first." } };
+  if (!facts?.visible) return { outcome: { state: "cannot-verify", detail: `The App's installation on ${owner} cannot see ${repo}`, ...waitOn("github.installation") } };
   return { facts };
 }
 
@@ -179,6 +187,8 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async (ctx) => {
       const read = await readApp(ctx);
       if ("outcome" in read) return [read.outcome];
@@ -202,6 +212,8 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async (ctx) => {
       const read = await readApp(ctx);
       if ("outcome" in read) return [read.outcome];
@@ -223,6 +235,8 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeProjects(ctx, "the App's installations", async (app, { owner, repo }) => {
       const facts = ctx.githubSetupFacts();
       const installation = await facts.installation(owner);
@@ -253,10 +267,12 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "core",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     // No fixUrl: GitHub documents the App's permissions page only as navigation, and only an owner or App manager can open it.
     run: (ctx) => judgeProjects(ctx, "the App's permissions", async (_app, { owner }) => {
       const installation = await ctx.githubSetupFacts().installation(owner);
-      if (!installation) return { state: "cannot-verify", detail: `The App is not installed on ${owner}, so its permissions there cannot be read`, fix: "More information is needed. Address the github.installation check first." };
+      if (!installation) return { state: "cannot-verify", detail: `The App is not installed on ${owner}, so its permissions there cannot be read`, ...waitOn("github.installation") };
       const gaps = GITHUB_APP_PERMISSIONS.filter((p) => !permissionLevelCovers(installation.permissions[p.name], p.level));
       if (gaps.length === 0) return { state: "pass", detail: `The App's installation on ${owner} has every permission the orchestrator uses` };
       // Every gap at once, so one round of grants and one approval on the installation covers them all.
@@ -273,6 +289,8 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "mode",
     onAdminPath: false,
+    perProject: true,
+    verifiable: false,
     run: (ctx) => {
       // With no project there is nothing to answer, as in judgeProjects.
       return Object.entries(ctx.mappings()).map(([key, mapping]): SetupCheckOutcome => {
@@ -294,6 +312,8 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "feature",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async (ctx) => {
       if (!ctx.env.GITHUB_WEBHOOK_SECRET) return [{ state: "not-applicable", detail: "GITHUB_WEBHOOK_SECRET is not set, so there is no webhook signature to check" }];
       const gate = credentialsGate(ctx);
@@ -303,7 +323,7 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
         listed = await ctx.githubSetupFacts().deliveries();
       } catch (err) {
         if (err instanceof GitHubApiError) {
-          return [{ state: "cannot-verify", detail: `GitHub refused to list the App's webhook deliveries (HTTP ${err.status}), so their signatures cannot be read`, fix: "More information is needed. Address the github.app-identity check first." }];
+          return [{ state: "cannot-verify", detail: `GitHub refused to list the App's webhook deliveries (HTTP ${err.status}), so their signatures cannot be read`, ...waitOn("github.app-identity") }];
         }
         return [unreachable(err)];
       }
@@ -322,11 +342,43 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     },
   },
   {
+    id: "github.webhook-events",
+    title: "Webhook events",
+    group: "github",
+    tier: "feature",
+    onAdminPath: false,
+    perProject: false,
+    verifiable: true,
+    // An installation whose owner has not accepted the permission an event needs shows on github.permissions, per project.
+    run: async (ctx) => {
+      // Without the secret every delivery is refused, which github.webhook-signature reports, so no event is received to judge.
+      if (!ctx.env.GITHUB_WEBHOOK_SECRET) return [];
+      const read = await readApp(ctx);
+      if ("outcome" in read) return [read.outcome];
+      const { app } = read;
+      const subscribed = app.events;
+      if (subscribed === null) {
+        if (!appCredentialsRefused(app)) return [{ state: "cannot-verify", detail: `${unjudged(app)}, so the App's webhook events cannot be read`, fix: RETRY_FIX }];
+        return [{ state: "cannot-verify", detail: "GitHub refused the App's credentials, so its webhook events cannot be read", ...waitOn("github.app-identity") }];
+      }
+      const gaps = GITHUB_APP_EVENTS.filter((event) => !subscribed.includes(event.name));
+      if (gaps.length === 0) return [{ state: "pass", detail: "The App subscribes to every webhook event the orchestrator uses" }];
+      // Every gap at once, so one visit to the App's settings covers them all.
+      return [{
+        state: gaps.some((event) => event.required) ? "fail" : "warn",
+        detail: `The App does not subscribe to ${gaps.map((event) => event.name).join(", ")}. ${gaps.map((event) => event.whenMissing).join(" ")}`,
+        fix: `An organization owner or a GitHub App manager subscribes the App to these in the settings of the account that owns the App: Developer settings -> GitHub Apps -> Edit -> Permissions & events -> Subscribe to events.`,
+      }];
+    },
+  },
+  {
     id: "github.kg-grants",
     title: "Knowledge graph refresh access",
     group: "github",
     tier: "feature",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async (ctx) => {
       if (!ctx.env.KG_SOURCE_REPO?.trim()) return [{ state: "not-applicable", detail: "KG_SOURCE_REPO is not set, so the App needs no knowledge graph access" }];
       if (!ctx.githubSetupFacts().kgSourceRepo()) {
@@ -359,10 +411,10 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "mode",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeProjects(ctx, "the projects' workflow files", async (_app, mapping, key) => {
       const { owner, repo } = mapping;
-      const off = notOnGitHubActions(ctx, mapping, "workflow files");
-      if (off) return off;
       const read = await projectRepository(ctx, mapping);
       if ("outcome" in read) return read.outcome;
       const { facts } = read;
@@ -398,7 +450,7 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
       }
       if (pr) return { state: "fail", detail: `${lead}. Workflow sync pull request #${pr.number} carries them`, fix: `Merge pull request #${pr.number}.`, fixUrl: pr.url };
       return { state: "fail", detail: `${lead}, and no workflow sync pull request is open`, fix: "Click Sync workflows on the project's row at /admin#projects, then merge the pull request it opens." };
-    }),
+    }, (mapping) => notOnGitHubActions(ctx, mapping, "workflow files")),
   },
   {
     id: "github.workflow-mapping-branch",
@@ -406,10 +458,10 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "mode",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeProjects(ctx, "the projects' branches", async (_app, mapping) => {
       const { owner, repo, defaultBranch: branch } = mapping;
-      const off = notOnGitHubActions(ctx, mapping, "workflow files");
-      if (off) return off;
       const read = await projectRepository(ctx, mapping);
       if ("outcome" in read) return read.outcome;
       const { facts } = read;
@@ -430,7 +482,7 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
         detail: `${owner}/${repo}'s project branch ${branch} differs from its default branch ${facts.defaultBranch} and lacks ${fileList(missing)}, so dispatches to it fail`,
         fix: `Merge the workflow files into ${branch}, or set the project's Default Branch at /admin#projects to ${facts.defaultBranch}.`,
       };
-    }),
+    }, (mapping) => notOnGitHubActions(ctx, mapping, "workflow files")),
   },
   {
     id: "github.reference-repos",
@@ -438,9 +490,10 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "feature",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeProjects(ctx, "the projects' reference repositories", async (_app, { owner, repo, referenceRepos }) => {
       const entries = (referenceRepos ?? []).map((entry) => ({ entry, parts: githubRepoParts(entry.repo) }));
-      if (entries.length === 0) return { state: "not-applicable", detail: `${owner}/${repo} reads no reference repositories` };
       const results = await Promise.all(entries.map(({ entry, parts }) =>
         parts ? cloneable(ctx, parts.owner, parts.repo, entry.ref).catch((err) => ({ unread: `${entry.repo} could not be read: ${err instanceof Error ? err.message : String(err)}` }))
           : Promise.resolve({ problem: `${entry.repo} is not a GitHub repository` })));
@@ -455,7 +508,7 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
       }
       if (unread.length > 0) return { state: "cannot-verify", detail: `Some of ${owner}/${repo}'s reference repositories could not be read: ${unread.join(", ")}`, fix: "Check that the orchestrator can reach api.github.com." };
       return { state: "pass", detail: `Runs of ${owner}/${repo} can clone all ${entries.length} of its reference repositories` };
-    }),
+    }, ({ owner, repo, referenceRepos }) => ((referenceRepos ?? []).length === 0 ? { state: "not-applicable", detail: `${owner}/${repo} reads no reference repositories` } : null)),
   },
   {
     id: "github.skills-repo",
@@ -463,9 +516,11 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "github",
     tier: "feature",
     onAdminPath: false,
+    perProject: true,
+    verifiable: true,
     run: (ctx) => judgeProjects(ctx, "the projects' skills repositories", async (_app, { owner, repo, skillsRepo }) => {
-      if (!skillsRepo) return { state: "not-applicable", detail: `${owner}/${repo} has no skills repository` };
-      const parts = githubRepoParts(skillsRepo);
+      // Judged only for a project that has one, as notNeeded below says.
+      const parts = githubRepoParts(skillsRepo!);
       if (!parts) return { state: "fail", detail: `${skillsRepo} is not a GitHub repository, so no skills install`, fix: "Correct the project's Skills Repo at /admin#projects." };
       const name = `${parts.owner}/${parts.repo}`;
       if (name.toLowerCase() === `${owner}/${repo}`.toLowerCase()) return { state: "pass", detail: `${owner}/${repo}'s skills come from its own repository, which every run can clone` };
@@ -489,6 +544,29 @@ export const GITHUB_CONFIG_CHECKS: readonly SetupCheck[] = [
       }
       if (visibility === "missing") return { state: "fail", detail: `The skills repository ${name} does not exist, or is private, so its skills never install`, fix: "Correct the project's Skills Repo at /admin#projects, or make the repository public." };
       return { state: "cannot-verify", detail: `The skills repository ${name} could not be read (HTTP ${visibility.unread})`, fix: "Check that the orchestrator can reach api.github.com." };
+    }, ({ owner, repo, skillsRepo }) => (skillsRepo ? null : { state: "not-applicable", detail: `${owner}/${repo} has no skills repository` })),
+  },
+  {
+    id: "github.review-process",
+    title: "Review process reviewer",
+    group: "github",
+    tier: "feature",
+    onAdminPath: false,
+    perProject: true,
+    verifiable: false,
+    // No App credential can read another App's installation on a repository, so an outside reviewer is named, never judged.
+    run: (ctx) => Object.entries(ctx.mappings()).map(([key, { owner, repo, reviewProcess }]): SetupCheckOutcome => {
+      const process = resolveReviewProcess(reviewProcess);
+      if (process.id === "ai-implement") {
+        return { project: key, state: "not-applicable", detail: `${owner}/${repo} uses the AI-Implement review, so no outside reviewer needs setting up` };
+      }
+      const reviewer = process.trustedAuthors.find((login) => login.endsWith("[bot]"));
+      return {
+        project: key,
+        state: "cannot-verify",
+        detail: `${owner}/${repo} uses ${process.label}, whose reviews come from ${reviewer}. The orchestrator cannot see whether that reviewer is set up on the repository.`,
+        fix: `If running into issues, install that reviewer's GitHub App on ${owner}/${repo} and turn its reviews on, or choose another Review process for the project at /admin#projects.`,
+      };
     }),
   },
 ];

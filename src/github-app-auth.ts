@@ -330,18 +330,6 @@ async function* installationRepositoryPages(token: string): AsyncGenerator<strin
   }
 }
 
-/**
- * Whether the installation can see a given repo. Only meaningful when repositorySelection === "selected"
- * (an "all" install sees everything, so the caller skips this). Stops reading pages as soon as the repo is found.
- */
-export async function installationIncludesRepo(token: string, repoName: string): Promise<boolean> {
-  const target = repoName.toLowerCase();
-  for await (const names of installationRepositoryPages(token)) {
-    if (names.includes(target)) return true;
-  }
-  return false;
-}
-
 /** Every repository name a selected-repositories installation includes, lowercased, read with that installation's token. */
 export async function listInstallationRepositoryNames(token: string): Promise<Set<string>> {
   const names = new Set<string>();
@@ -373,11 +361,18 @@ export async function getAppSlug(appId: string, privateKey: string): Promise<str
   return cachedAppSlug;
 }
 
+/** The page GitHub serves for installing the App on an account, or for adding repositories to an installation. */
+export function appInstallUrl(slug: string): string {
+  return `https://github.com/apps/${slug}/installations/new`;
+}
+
 /** What `GET /app` answered for the App's JWT, with GitHub's clock beside this host's. */
 export interface AppIdentityRead {
   status: number;
   /** Null when GitHub answered anything but 200: a refusal (`appCredentialsRefused`) or no judgment at all. */
   slug: string | null;
+  /** The webhook events the App subscribes to, null when `slug` is. */
+  events: string[] | null;
   /** The response body when GitHub refused, else "". */
   errorBody: string;
   /** GitHub's time from the response's `Date` header, in epoch milliseconds, or null when absent. */
@@ -393,9 +388,9 @@ export async function readAppIdentity(appId: string, privateKey: string): Promis
   const localTime = Date.now();
   const date = Date.parse(res.headers.get("date") ?? "");
   const githubTime = Number.isFinite(date) ? date : null;
-  if (!res.ok) return { status: res.status, slug: null, errorBody: await res.text(), githubTime, localTime };
-  const data = (await res.json()) as { slug: string };
-  return { status: res.status, slug: data.slug, errorBody: "", githubTime, localTime };
+  if (!res.ok) return { status: res.status, slug: null, events: null, errorBody: await res.text(), githubTime, localTime };
+  const data = (await res.json()) as { slug: string; events: string[] };
+  return { status: res.status, slug: data.slug, events: data.events, errorBody: "", githubTime, localTime };
 }
 
 /** Whether GitHub refused the App's credentials: 401 for a bad key or a skewed clock, 404 for an App ID it does not know. Any other status is GitHub not answering normally. */

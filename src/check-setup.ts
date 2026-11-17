@@ -69,8 +69,11 @@ async function readOwnHealth(deps: CheckSetupDependencies): Promise<{ restate: S
   return { restate: read.restate as SetupCheckRestateStatus, instanceId: read.instanceId as string };
 }
 
+/** A row as printed: a check's, or several checks' joined, whose `id` then lists theirs. */
+type PrintedRow = Pick<SetupCheckResult, "state" | "project" | "title" | "detail" | "fix"> & { id: string };
+
 /** One check's lines: its state, id and title, then its detail and fix beneath. The provisioning command prints its own checks this way too. */
-export function formatCheckRow(r: Pick<SetupCheckResult, "state" | "id" | "project" | "title" | "detail" | "fix">): string[] {
+export function formatCheckRow(r: PrintedRow): string[] {
   const indent = " ".repeat(LABEL_WIDTH + 4);
   const lines = [`  ${STATE_LABELS[r.state].padEnd(LABEL_WIDTH)}  ${r.id}${r.project ? ` (${r.project})` : ""}: ${r.title}`];
   if (r.detail) lines.push(`${indent}${r.detail}`);
@@ -78,11 +81,38 @@ export function formatCheckRow(r: Pick<SetupCheckResult, "state" | "id" | "proje
   return lines;
 }
 
+/**
+ * The rows to print: two or more of one project's rows that wait on the same check say only that it comes first, so they print as one,
+ * in the place of the first of them. The admin UI's groupWaitingRows shows them the same way.
+ */
+export function joinWaitingRows(rows: SetupCheckResult[]): PrintedRow[] {
+  const waiting = new Map<string, SetupCheckResult[]>();
+  const keyOf = (r: SetupCheckResult) => (r.waitsOn ? `${r.project ?? ""}\n${r.waitsOn}` : null);
+  for (const r of rows) {
+    const key = keyOf(r);
+    if (key) waiting.set(key, [...(waiting.get(key) ?? []), r]);
+  }
+  return rows.flatMap((r): PrintedRow[] => {
+    const group = waiting.get(keyOf(r) ?? "");
+    if (!group || group.length < 2) return [r];
+    if (group[0] !== r) return [];
+    const sameDetail = group.every((each) => each.detail === r.detail);
+    return [{
+      state: r.state,
+      id: group.map((each) => each.id).join(", "),
+      project: r.project,
+      title: `${group.length} checks wait on ${r.waitsOn}`,
+      detail: sameDetail ? r.detail : `None of them can be read until ${r.waitsOn} passes.`,
+      fix: r.fix,
+    }];
+  });
+}
+
 function formatRun(run: SetupCheckRun, failingCore: number): string {
   const lines: string[] = [];
   for (const group of new Set(run.results.map((r) => r.group))) {
     lines.push(SETUP_CHECK_GROUP_LABELS[group]);
-    for (const r of run.results.filter((result) => result.group === group)) lines.push(...formatCheckRow(r));
+    for (const r of joinWaitingRows(run.results.filter((result) => result.group === group))) lines.push(...formatCheckRow(r));
     lines.push("");
   }
   lines.push(failingCore === 0 ? "No core check fails." : `${failingCore} core ${failingCore === 1 ? "check fails" : "checks fail"}.`);

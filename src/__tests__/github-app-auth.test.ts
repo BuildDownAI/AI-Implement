@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { getInstallationToken, getInstallationId, refreshInstallationToken, getInstallation, getAppInstallation, getAppSlug, readAppIdentity, appCredentialsRefused, installationIncludesRepo, listInstallationRepositoryNames, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
+import { getInstallationToken, getInstallationId, refreshInstallationToken, getInstallation, getAppInstallation, getAppSlug, readAppIdentity, appCredentialsRefused, listInstallationRepositoryNames, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
 import { GitHubApiError } from "../github-errors.js";
 import { fakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
 import { githubError } from "./helpers/replies/github.js";
@@ -361,7 +361,7 @@ describe("getAppInstallation", () => {
 describe("readAppIdentity", () => {
   const GITHUB_DATE = "Tue, 10 Nov 2026 02:42:14 GMT";
 
-  it("returns the slug and GitHub's clock beside this host's, read when the response arrived", async () => {
+  it("returns the slug, the subscribed events and GitHub's clock beside this host's, read when the response arrived", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.parse("2026-11-10T02:40:00Z"));
     try {
@@ -369,13 +369,14 @@ describe("readAppIdentity", () => {
       fakeFetch({
         "GET /app": () => {
           vi.setSystemTime(responseArrives);
-          return { json: { slug: "ai-implement" }, headers: { Date: GITHUB_DATE } };
+          return { json: { slug: "ai-implement", events: ["issue_comment", "pull_request"] }, headers: { Date: GITHUB_DATE } };
         },
       }).install();
 
-      await expect(readAppIdentity(APP_ID, privateKey)).resolves.toEqual({
+      await expect(readAppIdentity(APP_ID, privateKey)).resolves.toStrictEqual({
         status: 200,
         slug: "ai-implement",
+        events: ["issue_comment", "pull_request"],
         errorBody: "",
         githubTime: Date.parse(GITHUB_DATE),
         localTime: responseArrives,
@@ -389,7 +390,7 @@ describe("readAppIdentity", () => {
     fakeFetch({ "GET /app": { ...githubError(401, "'Expiration time' claim ('exp') is too far in the future"), headers: { Date: GITHUB_DATE } } }).install();
 
     const read = await readAppIdentity(APP_ID, privateKey);
-    expect(read).toMatchObject({ status: 401, slug: null, githubTime: Date.parse(GITHUB_DATE) });
+    expect(read).toMatchObject({ status: 401, slug: null, events: null, githubTime: Date.parse(GITHUB_DATE) });
     expect(read.errorBody).toContain("too far in the future");
   });
 
@@ -416,62 +417,6 @@ describe("appCredentialsRefused", () => {
       expect(appCredentialsRefused({ status })).toBe(refused);
     },
   );
-});
-
-describe("installationIncludesRepo", () => {
-  const REPOS = "GET /installation/repositories";
-
-  it("returns true when the repo is on the first page (single request)", async () => {
-    const api = fakeFetch({
-      [REPOS]: [{ json: { total_count: 2, repositories: [{ name: "frontend" }, { name: "backend" }] } }],
-    }).install();
-
-    expect(await installationIncludesRepo("ghs_x", "backend")).toBe(true);
-    expect(api.calls).toHaveLength(1);
-  });
-
-  it("matches case-insensitively", async () => {
-    fakeFetch({ [REPOS]: [{ json: { total_count: 1, repositories: [{ name: "Backend" }] } }] }).install();
-
-    expect(await installationIncludesRepo("ghs_x", "backend")).toBe(true);
-  });
-
-  it("returns false without paginating when total_count <= 100", async () => {
-    const api = fakeFetch({
-      [REPOS]: [{ json: { total_count: 2, repositories: [{ name: "frontend" }, { name: "api" }] } }],
-    }).install();
-
-    expect(await installationIncludesRepo("ghs_x", "backend")).toBe(false);
-    expect(api.calls).toHaveLength(1); // no needless page 2
-  });
-
-  it("paginates when total_count > 100 and finds the repo on a later page", async () => {
-    const fullPage = Array.from({ length: 100 }, (_, i) => ({ name: "repo" + i }));
-    const api = fakeFetch({
-      [REPOS]: [
-        { json: { total_count: 101, repositories: fullPage } },
-        { json: { total_count: 101, repositories: [{ name: "backend" }] } },
-      ],
-    }).install();
-
-    expect(await installationIncludesRepo("ghs_x", "backend")).toBe(true);
-    expect(api.calls).toHaveLength(2);
-  });
-
-  it("stops reading pages once it finds the repo, though more remain", async () => {
-    const fullPage = [{ name: "backend" }, ...Array.from({ length: 99 }, (_, i) => ({ name: "repo" + i }))];
-    const api = fakeFetch({ [REPOS]: [{ json: { total_count: 101, repositories: fullPage } }] }).install();
-
-    expect(await installationIncludesRepo("ghs_x", "backend")).toBe(true);
-    expect(api.calls).toHaveLength(1);
-  });
-
-  it("throws a GitHubApiError on a non-ok response", async () => {
-    fakeFetch({ [REPOS]: githubError(403, "Resource not accessible by integration") }).install();
-
-    await expect(installationIncludesRepo("ghs_x", "backend"))
-      .rejects.toThrow("Failed to list installation repositories");
-  });
 });
 
 describe("listInstallationRepositoryNames", () => {

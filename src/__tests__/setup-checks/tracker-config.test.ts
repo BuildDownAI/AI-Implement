@@ -39,17 +39,40 @@ describe("every Linear check", () => {
     expect(outcomes).toEqual(id === "tracker.linear.credentials" ? [{ state: "not-applicable", detail: "No project uses Linear" }] : []);
   });
 
+  // A fault every Linear project shares is each project's own row, so each project's marker shows it.
   it.each(LINEAR_IDS.filter((id) => id !== "tracker.linear.credentials"))(
-    "cannot verify, and points at the credentials check, when Linear gives the app no token (%s)",
+    "cannot verify for each project, and points at the credentials check, when Linear gives the app no token (%s)",
     async (id) => {
-      expect(await run(id, onLinear(REFUSED))).toEqual([
-        { state: "cannot-verify", detail: "Linear gave the app no token, so this cannot be read", fix: "More information is needed. Address the tracker.linear.credentials check first." },
-      ]);
+      const refused = { state: "cannot-verify", detail: "Linear gave the app no token, so the team's setup cannot be read", fix: "More information is needed. Address the tracker.linear.credentials check first.", waitsOn: "tracker.linear.credentials" };
+      expect(await run(id, onLinear(REFUSED, "ENG", "OPS"))).toEqual([{ ...refused, project: "ENG" }, { ...refused, project: "OPS" }]);
+    },
+  );
+
+  it.each(LINEAR_IDS.filter((id) => id !== "tracker.linear.credentials"))(
+    "cannot verify for each project, and points at tracker.provider, when the facts cannot be read (%s)",
+    async (id) => {
+      const rows = await run(id, { ...onLinear(null, "ENG", "OPS"), trackerSetupFacts: async () => { throw new Error("LINEAR_CLIENT_ID is not set"); } });
+      expect(rows).toEqual(["ENG", "OPS"].map((project) => ({
+        project,
+        state: "cannot-verify",
+        detail: "The linear setup facts could not be read: LINEAR_CLIENT_ID is not set",
+        fix: "More information is needed. Address the tracker.provider check first.",
+        waitsOn: "tracker.provider",
+      })));
     },
   );
 
   it.each(LINEAR_IDS)("cannot verify when the Linear provider reads no setup facts (%s)", async (id) => {
-    expect(await run(id, onLinear(null))).toMatchObject([{ state: "cannot-verify", detail: "The Linear provider reads no setup facts" }]);
+    const rows = await run(id, onLinear(null, "ENG", "OPS"));
+    expect(rows).toMatchObject(id === "tracker.linear.credentials" ? [{ state: "cannot-verify", detail: "The Linear provider reads no setup facts" }] : ["ENG", "OPS"].map((project) => ({ project, state: "cannot-verify", detail: "The Linear provider reads no setup facts" })));
+  });
+
+  it("leaves a Jira project's rows out when Linear's facts cannot be read", async () => {
+    const rows = await run("tracker.linear.team-access", {
+      mappings: () => ({ ENG: makeMapping(), OPS: makeMapping({ ticketingProvider: "jira" }) }),
+      trackerSetupFacts: async () => { throw new Error("LINEAR_CLIENT_ID is not set"); },
+    });
+    expect(rows.map((row) => row.project)).toEqual(["ENG"]);
   });
 });
 
@@ -131,7 +154,7 @@ describe("the per-team Linear checks", () => {
     "cannot verify a project whose team the app cannot see (%s)",
     async (id) => {
       expect(await run(id, onLinear(makeLinearSetupFacts(), "ENGG"))).toEqual([
-        { project: "ENGG", state: "cannot-verify", detail: "The app cannot see team ENGG, so this cannot be read", fix: "More information is needed. Address the tracker.linear.team-access check first." },
+        { project: "ENGG", state: "cannot-verify", detail: "The app cannot see team ENGG, so its setup cannot be read", fix: "More information is needed. Address the tracker.linear.team-access check first.", waitsOn: "tracker.linear.team-access" },
       ]);
     },
   );
@@ -297,21 +320,38 @@ describe("every Jira check", () => {
     expect(trackerSetupFacts).not.toHaveBeenCalled();
   });
 
+  const TWO_JIRA = { OPS: jiraProject(), SUP: jiraProject() };
+
   it.each(JIRA_IDS.filter((id) => id !== "tracker.jira.credentials"))(
-    "cannot verify, and points at the credentials check, when Jira does not accept the credentials (%s)",
+    "cannot verify for each project, and points at the credentials check, when Jira does not accept the credentials (%s)",
     async (id) => {
-      expect(await run(id, onJira(REFUSED_JIRA))).toEqual([
-        { state: "cannot-verify", detail: "Jira did not accept the credentials, so this cannot be read", fix: "More information is needed. Address the tracker.jira.credentials check first." },
-      ]);
+      const refused = { state: "cannot-verify", detail: "Jira did not accept the credentials, so the project's setup cannot be read", fix: "More information is needed. Address the tracker.jira.credentials check first.", waitsOn: "tracker.jira.credentials" };
+      expect(await run(id, onJira(REFUSED_JIRA, TWO_JIRA))).toEqual([{ ...refused, project: "OPS" }, { ...refused, project: "SUP" }]);
+    },
+  );
+
+  it.each(JIRA_IDS.filter((id) => id !== "tracker.jira.credentials"))(
+    "cannot verify for each project, and points at tracker.provider, when the facts cannot be read (%s)",
+    async (id) => {
+      const rows = await run(id, { ...onJira(null, TWO_JIRA), trackerSetupFacts: async () => { throw new Error("JIRA_SITE_URL is not set"); } });
+      expect(rows).toEqual(["OPS", "SUP"].map((project) => ({
+        project,
+        state: "cannot-verify",
+        detail: "The jira setup facts could not be read: JIRA_SITE_URL is not set",
+        fix: "More information is needed. Address the tracker.provider check first.",
+        waitsOn: "tracker.provider",
+      })));
     },
   );
 
   it.each(JIRA_IDS)("cannot verify when the Jira provider reads no setup facts (%s)", async (id) => {
-    expect(await run(id, onJira(null))).toMatchObject([{ state: "cannot-verify", detail: "The Jira provider reads no setup facts" }]);
+    const rows = await run(id, onJira(null, TWO_JIRA));
+    expect(rows).toMatchObject(id === "tracker.jira.credentials" ? [{ state: "cannot-verify", detail: "The Jira provider reads no setup facts" }] : ["OPS", "SUP"].map((project) => ({ project, state: "cannot-verify", detail: "The Jira provider reads no setup facts" })));
   });
 
-  it.each(JIRA_IDS)("lets a failed read reach the check runner, which reports its error (%s)", async (id) => {
-    await expect(run(id, { mappings: () => ({ OPS: jiraProject() }), trackerSetupFacts: async () => { throw new Error("Jira read failed"); } }))
+  // The credentials check is orchestrator-wide, so its one row is the check runner's; the per-project checks answer for each project.
+  it("lets a failed read reach the check runner from the credentials check, which reports its error", async () => {
+    await expect(run("tracker.jira.credentials", { mappings: () => ({ OPS: jiraProject() }), trackerSetupFacts: async () => { throw new Error("Jira read failed"); } }))
       .rejects.toThrow("Jira read failed");
   });
 
@@ -321,7 +361,7 @@ describe("every Jira check", () => {
       const facts = acceptedJira({ OPS: { fields: "unresolved", field: "AI-Implement Status", fault: "missing" }, WEB: resolvedProject() });
       const outcomes = await run(id, onJira(facts, { OPS: jiraProject(), WEB: jiraProject() }));
       expect(outcomes).toEqual([
-        { project: "OPS", state: "cannot-verify", detail: "This project's Jira fields cannot be found, so this cannot be read", fix: "More information is needed. Address the tracker.jira.fields check first." },
+        { project: "OPS", state: "cannot-verify", detail: "This project's Jira fields cannot be found, so the rest of its setup cannot be read", fix: "More information is needed. Address the tracker.jira.fields check first.", waitsOn: "tracker.jira.fields" },
         expect.objectContaining({ project: "WEB", state: "pass" }),
       ]);
     },
@@ -547,11 +587,10 @@ describe("tracker.filesystem.directory", () => {
     trackerSetupFacts: async () => ({ kind: "filesystem", directories: { LOCAL: { directory: "/tickets", fault } } }),
   });
 
-  it("does not apply, and reads nothing, when no project uses Filesystem", async () => {
+  // A Linear or Jira project's own run would otherwise carry a row about Filesystem, stamped as that project's.
+  it("answers nothing, and reads nothing, when no project uses Filesystem", async () => {
     const trackerSetupFacts = vi.fn(async () => null);
-    expect(await run("tracker.filesystem.directory", { mappings: () => ({ ENG: makeMapping() }), trackerSetupFacts })).toEqual([
-      { state: "not-applicable", detail: "No project uses Filesystem" },
-    ]);
+    expect(await run("tracker.filesystem.directory", { mappings: () => ({ ENG: makeMapping() }), trackerSetupFacts })).toEqual([]);
     expect(trackerSetupFacts).not.toHaveBeenCalled();
   });
 
@@ -583,9 +622,14 @@ describe("tracker.filesystem.directory", () => {
     ]);
   });
 
-  it("cannot verify when the Filesystem provider reads no setup facts", async () => {
+  it("cannot verify, as the project's own row, when the Filesystem provider reads no setup facts", async () => {
     expect(await run("tracker.filesystem.directory", { ...onFilesystem(null), trackerSetupFacts: async () => null })).toMatchObject([
-      { state: "cannot-verify", detail: "The Filesystem provider reads no setup facts" },
+      { project: "LOCAL", state: "cannot-verify", detail: "The Filesystem provider reads no setup facts" },
     ]);
+  });
+
+  it("cannot verify, as the project's own row pointing at tracker.provider, when the facts cannot be read", async () => {
+    const rows = await run("tracker.filesystem.directory", { ...onFilesystem(null), trackerSetupFacts: async () => { throw new Error("the provider broke"); } });
+    expect(rows).toEqual([{ project: "LOCAL", state: "cannot-verify", detail: "The filesystem setup facts could not be read: the provider broke", fix: "More information is needed. Address the tracker.provider check first.", waitsOn: "tracker.provider" }]);
   });
 });

@@ -1,4 +1,4 @@
-/** Every repository permission the GitHub App needs, declared once for the setup checks and the install guide. */
+/** Every repository permission and webhook event the GitHub App needs, declared once for the setup checks and the install guide. */
 
 /** A permission's level on an installation; `write` includes `read`. */
 export type GitHubPermissionLevel = "read" | "write";
@@ -34,3 +34,23 @@ export type GitHubAppPermissionName = (typeof GITHUB_APP_PERMISSIONS)[number]["n
 export function permissionLevelCovers(held: string | undefined, needed: GitHubPermissionLevel): boolean {
   return held === "write" || (held === "read" && needed === "read");
 }
+
+export interface GitHubAppEvent {
+  /** Its name in the App's and an installation's `events` list. */
+  name: string;
+  /** Its label among the App's "Subscribe to events" checkboxes. */
+  title: string;
+  /** A feature never runs without it. Otherwise the poll covers it, later. */
+  required: boolean;
+  /** What stops or waits without it, as an operator reads it. */
+  whenMissing: string;
+}
+
+/** Every event `handleGitHubWebhook` acts on. Each needs a permission above, which GitHub requires before an App can subscribe to it. */
+export const GITHUB_APP_EVENTS = [
+  { name: "pull_request_review", title: "Pull request review", required: true, whenMissing: "A review that requests changes never starts a fix run." },
+  { name: "pull_request_review_comment", title: "Pull request review comment", required: true, whenMissing: "A review bot's inline finding never starts a fix run." },
+  { name: "issue_comment", title: "Issue comment", required: true, whenMissing: "/ai-implement comments are ignored, and review summary comments never start a fix run." },
+  { name: "pull_request", title: "Pull request", required: false, whenMissing: "A merged or closed pull request is handled only at the next poll, and the knowledge graph's pull request check never runs." },
+  { name: "push", title: "Push", required: false, whenMissing: "Self-deploy notices a new commit only at its next poll." },
+] as const satisfies readonly GitHubAppEvent[];

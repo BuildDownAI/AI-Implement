@@ -21,10 +21,6 @@ vi.mock("../workflow-sync.js", () => ({
   }),
 }));
 
-vi.mock("../github-install-state.js", () => ({
-  probeInstallState: vi.fn(),
-}));
-
 class MockRequest extends EventEmitter {
   url?: string;
   method?: string;

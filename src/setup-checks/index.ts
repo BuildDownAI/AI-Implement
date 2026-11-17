@@ -1,100 +1,34 @@
 /**
  * Orchestrator setup checks: read-only checks of an orchestrator's setup, each naming its fix.
  *
- * This module holds the result contract, the check ids, the context a check reads, the list and
- * the runner. The checks sit beside it, one module per group, each named `<group>-config.ts`:
+ * This module holds the list, the context every caller starts from and the runner, with a project's own run and the stored
+ * run's merge. The contract a check is written against (the check ids, a result, the context a check reads) is contract.ts,
+ * re-exported here. The checks sit beside it, one module per group, each named `<group>-config.ts`:
  * `orchestrator-config.ts` holds the orchestrator's own environment and settings checks.
  */
 
 import { getOrchestratorDefaults, getProjectStageConfig } from "../agent-config-store.js";
 import { statSync } from "node:fs";
-import { isAllowlistReadAvailable, getEffectiveAllowlist, listAccessEntries, type AccessEntry, type EffectiveAllowlist } from "../access-entries.js";
+import { isAllowlistReadAvailable, getEffectiveAllowlist, listAccessEntries } from "../access-entries.js";
 import { getMappings, type RepoMapping } from "../config.js";
-import { getDatabasePath, getDb, type DatabasePath } from "../dedup.js";
+import { getDatabasePath, getDb } from "../dedup.js";
 import { readKgSourceRepo } from "../deploy.js";
-import { getAppInstallation, getScopedInstallationToken, listInstallationRepositoryNames, readAppIdentity, type AppIdentityRead, type AppInstallation } from "../github-app-auth.js";
-import { readPublicRepository, readRepositoryFacts, type PublicRepositoryRead, type RepositoryFacts } from "../github.js";
-import { ORCHESTRATOR_INSTANCE_ID, readOrchestratorHealth, type HealthSetupChecks, type OrchestratorHealthRead } from "../health-body.js";
-import { runKgRefreshPreflight, type PreflightCheckResult } from "../kg-refresh.js";
-import { getRunnerBackendSource, getFlySessionsConfig, getOrchestratorSettings, type FlySessionsConfig } from "../orchestrator-settings.js";
+import { getAppInstallation, getScopedInstallationToken, listInstallationRepositoryNames, readAppIdentity } from "../github-app-auth.js";
+import { readPublicRepository, readRepositoryFacts } from "../github.js";
+import { ORCHESTRATOR_INSTANCE_ID, readOrchestratorHealth, type HealthSetupChecks } from "../health-body.js";
+import { runKgRefreshPreflight } from "../kg-refresh.js";
+import { getRunnerBackendSource, getFlySessionsConfig, getOrchestratorSettings } from "../orchestrator-settings.js";
 import { providerConfigFromEnv, ProviderRegistry } from "../providers/index.js";
-import type { TicketingProvider, TrackerSetupFacts } from "../providers/types.js";
-import { getRunnerMode, type RunnerModeStatus } from "../runner-mode.js";
-import { listRecentAppDeliveries, type RecentAppDeliveries } from "../webhook-redelivery.js";
-import { getWorkflowSyncByTeam, type WorkflowSyncJob } from "../workflow-sync-queue.js";
+import type { TrackerSetupFacts } from "../providers/types.js";
+import { getRunnerMode } from "../runner-mode.js";
+import { listRecentAppDeliveries } from "../webhook-redelivery.js";
+import { getWorkflowSyncByTeam } from "../workflow-sync-queue.js";
+import type { GitHubSetupFacts, SetupCheck, SetupCheckContext, SetupCheckId, SetupCheckResult } from "./contract.js";
 import { GITHUB_CONFIG_CHECKS, ownerRepositoryRequests } from "./github-config.js";
 import { isAdminPathConfigured, ORCHESTRATOR_CONFIG_CHECKS } from "./orchestrator-config.js";
 import { TRACKER_CONFIG_CHECKS } from "./tracker-config.js";
 
-export type SetupCheckState = "pass" | "warn" | "fail" | "cannot-verify" | "not-applicable";
-export type SetupCheckTier = "core" | "mode" | "feature";
-
-/**
- * Every check's id, declared once. Stored runs, runtime failures and self-heal actions name checks
- * by id, so an id is never renamed; a check module adds its ids here when it registers its checks.
- */
-export const SETUP_CHECK_IDS = [
-  // orchestrator-config.ts
-  "env.github-app",
-  "env.admin-access-code",
-  "env.runner-mode",
-  "env.poll-interval",
-  "env.breaker-threshold",
-  "model.credentials-adopted",
-  "settings.seeded",
-  "settings.env-override",
-  "settings.allowlist-env",
-  "volume.database",
-  "restate",
-  "callback.config",
-  "callback.reachable",
-  "runner.fly-sessions",
-  "admin.path",
-  "admin.providers",
-  "admin.redirect-url",
-  "admin.allowlist",
-  // tracker-config.ts
-  "tracker.provider",
-  "tracker.linear.credentials",
-  "tracker.linear.team-access",
-  "tracker.linear.pickup-label",
-  "tracker.linear.lifecycle-labels",
-  "tracker.linear.workflow-states",
-  "tracker.jira.credentials",
-  "tracker.jira.fields",
-  "tracker.jira.field-cache",
-  "tracker.jira.status-options",
-  "tracker.jira.repo-option",
-  "tracker.jira.jql",
-  "tracker.filesystem.directory",
-  // github-config.ts
-  "github.app-identity",
-  "github.clock",
-  "github.installation",
-  "github.permissions",
-  "github.target-secrets",
-  "github.webhook-signature",
-  "github.kg-grants",
-  "github.workflow-default-branch",
-  "github.workflow-mapping-branch",
-  "github.reference-repos",
-  "github.skills-repo",
-] as const;
-
-export type SetupCheckId = (typeof SETUP_CHECK_IDS)[number];
-
-export interface SetupCheckResult {
-  id: SetupCheckId;        // stable, e.g. "admin.allowlist"; runtime failures and self-heal actions name checks by id
-  title: string;           // a human name for the check
-  group: "orchestrator" | "tracker" | "github" | "model";
-  tier: SetupCheckTier;    // core: every deployment; mode: one execution mode; feature: optional
-  onAdminPath: boolean;    // named on GET / while no admin path is configured
-  project?: string;        // the mapping key, for a per-project check; absent for orchestrator-wide checks
-  state: SetupCheckState;
-  detail?: string;         // what was read; only on the Setup page and its route, never in a summary (ADR 047)
-  fix?: string;            // set when state is warn, fail or cannot-verify; shown where detail is
-  fixUrl?: string;         // a page that applies the fix; shown where detail is
-}
+export * from "./contract.js";
 
 /** How each group is named to an operator. The keys stay as they are, since stored runs and their readers use them. */
 export const SETUP_CHECK_GROUP_LABELS: Record<SetupCheckResult["group"], string> = {
@@ -120,68 +54,6 @@ export interface SetupCheckSummary {
   checkedAt: number;
   failingCore: number;
   rows: Array<Pick<SetupCheckResult, "id" | "title" | "state" | "project">>;
-}
-
-/**
- * The part of `RestateStatus` (`src/restate/status.ts`) the `restate` check reads. Declared here
- * because only door adapters may import from `src/restate/` (`restate-boundary.test.ts`).
- */
-export interface SetupCheckRestateStatus {
-  sidecar: { state: string };
-  registration: { state: string };
-}
-
-/** Everything a check reads, as functions, so a reader that throws fails only the checks that call it. */
-export interface SetupCheckContext {
-  env: Readonly<Record<string, string | undefined>>;
-  /** A raw `settings` row, or null when none exists. */
-  readSetting(key: string): string | null;
-  orchestratorDefaults(): ReturnType<typeof getOrchestratorDefaults>;
-  projectStageConfig(key: string): ReturnType<typeof getProjectStageConfig>;
-  runnerMode(): RunnerModeStatus;
-  flySessions(): FlySessionsConfig;
-  runnerBackendSource(): "restate" | "not-loaded";
-  mappings(): Record<string, RepoMapping>;
-  storedAccessEntries(): AccessEntry[];
-  effectiveAllowlist(): EffectiveAllowlist | null;
-  /** Availability of the latest read, even when effectiveAllowlist serves cached entries. */
-  allowlistReadAvailable(): boolean;
-  restateStatus(): SetupCheckRestateStatus;
-  databasePath(): DatabasePath;
-  /** True when `dir` is on a different filesystem from `/`, which on Fly means a mounted volume. */
-  onSeparateFilesystem(dir: string): boolean;
-  /** The provider for a ticketing provider id, built as the poll builds it. Throws when it cannot be built. */
-  trackerProvider(providerId: string): Promise<TicketingProvider>;
-  /** One provider's setup facts for its projects' teams, read once per context, or null when it reads none. */
-  trackerSetupFacts(providerId: string): Promise<TrackerSetupFacts | null>;
-  /** The GitHub reads the `github` checks share, one set per context. */
-  githubSetupFacts(): GitHubSetupFacts;
-  /** The orchestrator's health endpoint at a base URL, read from this host the way a run reaches the orchestrator. */
-  orchestratorHealthAt(baseUrl: string): Promise<OrchestratorHealthRead>;
-  /** The identifier this orchestrator's own health body carries. */
-  orchestratorInstanceId(): string;
-}
-
-/** GitHub's side of the setup, read lazily: each read runs at its first call and is shared for the rest of the run. */
-export interface GitHubSetupFacts {
-  /** `GET /app` with the App's JWT. Throws when the App's ID or key is missing or cannot sign one. */
-  app(): Promise<AppIdentityRead>;
-  /** The App's installation on an owner, or null when it has none. */
-  installation(owner: string): Promise<AppInstallation | null>;
-  /** The lowercased names a selected-repositories installation includes, or null when it includes them all. Throws when the owner has no installation. */
-  installationRepositories(owner: string): Promise<Set<string> | null>;
-  /** What the installation's token sees of every repository projects read on an owner, keyed by lowercased name. */
-  repositories(owner: string): Promise<Map<string, RepositoryFacts>>;
-  /** An unauthenticated read of a repository, and of `ref` in it, for an owner the App is not installed on. */
-  publicRepository(owner: string, repo: string, ref?: string): Promise<PublicRepositoryRead>;
-  /** The App's webhook deliveries from the last day. */
-  deliveries(): Promise<RecentAppDeliveries>;
-  /** `KG_SOURCE_REPO` as self-deploy and the refresh read it, or null when it is unset or not an owner/repo name. */
-  kgSourceRepo(): string | null;
-  /** The knowledge-graph refresh preflight, or null when `kgSourceRepo()` is. */
-  kgPreflight(): Promise<PreflightCheckResult | null>;
-  /** A project's workflow sync row, or null when none was ever queued. */
-  workflowSync(teamKey: string): WorkflowSyncJob | null;
 }
 
 /** The production reads behind `githubSetupFacts`, each memoized by its arguments. */
@@ -293,19 +165,6 @@ export function createSetupCheckContext(
   return ctx;
 }
 
-/** What a check reports; the runner adds the check's own identity fields. */
-export type SetupCheckOutcome = Pick<SetupCheckResult, "state" | "detail" | "fix" | "fixUrl" | "project">;
-
-export interface SetupCheck {
-  id: SetupCheckId;
-  title: string;
-  group: SetupCheckResult["group"];
-  tier: SetupCheckTier;
-  onAdminPath: boolean;
-  /** One outcome for an orchestrator-wide check, one per project for a per-project check. */
-  run(ctx: SetupCheckContext): SetupCheckOutcome[] | Promise<SetupCheckOutcome[]>;
-}
-
 export const SETUP_CHECKS: readonly SetupCheck[] = [...ORCHESTRATOR_CONFIG_CHECKS, ...TRACKER_CONFIG_CHECKS, ...GITHUB_CONFIG_CHECKS];
 
 /**
@@ -320,7 +179,14 @@ export async function runSetupChecks(
 ): Promise<SetupCheckRun> {
   const startedAt = now();
   const rows = await Promise.all(checks.map(async (check) => {
-    const identity = { id: check.id, title: check.title, group: check.group, tier: check.tier, onAdminPath: check.onAdminPath };
+    const identity = {
+      id: check.id,
+      title: check.title,
+      group: check.group,
+      tier: check.tier,
+      onAdminPath: check.onAdminPath,
+      ...(check.verifiable ? {} : { verifiable: false as const }),
+    };
     let settled: SetupCheckResult[];
     try {
       settled = (await check.run(ctx)).map((outcome) => ({ ...identity, ...outcome }));
@@ -336,6 +202,54 @@ export async function runSetupChecks(
     return settled;
   }));
   return { startedAt, checkedAt: now(), results: rows.flat() };
+}
+
+/** The orchestrator-wide checks every project's rows depend on, run beside them. */
+const PROJECT_RUN_DEPENDENCIES: readonly SetupCheckId[] = ["tracker.provider", "github.app-identity", "github.clock"];
+/** The checks no project passes before its first workflow sync, which a run before the save leaves out. */
+export const BEFORE_FIRST_SYNC: readonly SetupCheckId[] = ["github.workflow-default-branch", "github.workflow-mapping-branch"];
+/** The credentials check of each ticketing system that has one. */
+const CREDENTIALS_CHECK: Partial<Record<string, SetupCheckId>> = { linear: "tracker.linear.credentials", jira: "tracker.jira.credentials" };
+
+/**
+ * Runs one project's checks and the orchestrator-wide checks they depend on. `ctx.mappings()` must answer that project alone,
+ * so every read is that project's. A per-project check that threw answers one row with no project, which here is the project's.
+ */
+export async function runProjectSetupChecks(
+  ctx: SetupCheckContext,
+  key: string,
+  exclude: readonly SetupCheckId[] = [],
+  now: () => number = Date.now,
+): Promise<SetupCheckRun> {
+  const projects = Object.keys(ctx.mappings());
+  if (projects.length !== 1 || projects[0] !== key) throw new Error(`A run for ${key} needs a context holding that project alone`);
+  const credentials = CREDENTIALS_CHECK[ctx.mappings()[key].ticketingProvider];
+  const checks = SETUP_CHECKS.filter((check) => !exclude.includes(check.id)
+    && (check.perProject || check.id === credentials || PROJECT_RUN_DEPENDENCIES.includes(check.id)));
+  const run = await runSetupChecks(ctx, checks, now);
+  return { ...run, results: run.results.map((row) => (row.project === undefined && checks.some((check) => check.id === row.id && check.perProject) ? { ...row, project: key } : row)) };
+}
+
+/**
+ * Whether a project run found an orchestrator-wide check its rows depend on failing or unread. Such a fault reaches every project
+ * that shares the check, whose stored rows a project run cannot correct, so the run is answered by a full run instead.
+ */
+export function projectRunNeedsFullRun(run: SetupCheckRun): boolean {
+  return run.results.some((row) => row.project === undefined && (row.state === "fail" || row.state === "cannot-verify"));
+}
+
+/**
+ * The stored run with one project's rows, and the orchestrator-wide rows the project run read afresh, replaced by the project run's,
+ * each dated by that run. So a project row that points at a failed dependency points at that dependency's current row.
+ * tracker.provider keeps its stored row: it names every project on a provider, and a project run's names one. With no stored run, the whole project run starts one.
+ */
+export function mergeProjectRun(stored: SetupCheckRun | null, key: string, run: SetupCheckRun): SetupCheckRun {
+  const dated = (row: SetupCheckResult): SetupCheckResult => ({ ...row, checkedAt: run.checkedAt });
+  if (stored === null) return { checkedAt: run.checkedAt, results: run.results.map(dated) };
+  const rows = run.results.filter((row) => row.project === key || (row.project === undefined && row.id !== "tracker.provider")).map(dated);
+  const refreshed = new Set(rows.filter((row) => row.project === undefined).map((row) => row.id));
+  const kept = stored.results.filter((row) => row.project !== key && !(row.project === undefined && refreshed.has(row.id)));
+  return { ...stored, results: [...kept, ...rows] };
 }
 
 /** The run in progress in this process, as the admin Setup page shows it while it runs. */

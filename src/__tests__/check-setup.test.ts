@@ -28,6 +28,8 @@ function check(overrides: Partial<SetupCheck> = {}): SetupCheck {
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: () => [{ state: "pass" }],
     ...overrides,
   };
@@ -202,6 +204,35 @@ describe("the Fly sessions cache", () => {
     await runCheckSetup([], d.deps);
 
     expect(d.deps.refreshRunnerBackend).not.toHaveBeenCalled();
+  });
+});
+
+describe("output of rows waiting on another check", () => {
+  const waiting = { state: "cannot-verify" as const, detail: "The linear setup facts could not be read", fix: "More information is needed. Address the tracker.provider check first.", waitsOn: "tracker.provider" as const };
+  const CHECKS: SetupCheck[] = [
+    check({ id: "tracker.linear.team-access", group: "tracker", run: () => [{ ...waiting, project: "ENG" }, { ...waiting, project: "OPS" }] }),
+    check({ id: "tracker.linear.pickup-label", group: "tracker", run: () => [{ ...waiting, project: "ENG" }, { ...waiting, project: "OPS" }] }),
+    check({ id: "tracker.linear.workflow-states", group: "tracker", run: () => [{ ...waiting, project: "SAN" }] }),
+  ];
+  const linesFor = (out: string, project: string) => out.split("\n").filter((line) => line.includes(`(${project})`));
+
+  it("prints one line for each project's rows waiting on the same check, naming every check, and a lone waiting row as it is", async () => {
+    const d = deps({ checks: CHECKS });
+    await runCheckSetup([], d.deps);
+    for (const project of ["ENG", "OPS"]) {
+      const lines = linesFor(d.stdout(), project);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("tracker.linear.team-access, tracker.linear.pickup-label");
+      expect(lines[0]).toContain("tracker.provider");
+    }
+    expect(linesFor(d.stdout(), "SAN")).toEqual([expect.stringContaining("tracker.linear.workflow-states (SAN)")]);
+    expect(d.stdout().split("\n").filter((line) => line.includes("Fix: More information is needed. Address the tracker.provider check first."))).toHaveLength(3);
+  });
+
+  it("keeps every row in --json", async () => {
+    const d = deps({ checks: CHECKS });
+    await runCheckSetup(["--json"], d.deps);
+    expect(JSON.parse(d.stdout()).results).toHaveLength(5);
   });
 });
 
