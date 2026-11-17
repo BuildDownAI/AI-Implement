@@ -366,15 +366,15 @@ describe("orchestratorTools (Restate)", () => {
     const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
     const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
     expect(admins.length).toBeGreaterThan(0);
-    // A superset of schema-valid fields covers every current admin handler. Unknown
-    // fields are stripped by its schema; missing/new required fields fail ingress.
+    // Shared fields cover permissive admin schemas; strict schemas get their own
+    // arguments below so ingress validation reaches the authorization check.
     const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
       backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
       paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
     // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
     for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["deploy"] }), args: name === "set_project_agent_mode" ? { teamKey: "BDS", mode: "legacy" } : args,
+        caller: serviceCaller({ grants: ["deploy"] }), args: name === "get_fly_setup" ? {} : name === "set_project_agent_mode" ? { teamKey: "BDS", mode: "legacy" } : args,
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -390,15 +390,15 @@ describe("orchestratorTools (Restate)", () => {
     const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
     const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
     expect(admins.length).toBeGreaterThan(0);
-    // A superset of schema-valid fields covers every current admin handler. Unknown
-    // fields are stripped by its schema; missing/new required fields fail ingress.
+    // Shared fields cover permissive admin schemas; strict schemas get their own
+    // arguments below so ingress validation reaches the authorization check.
     const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
       backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
       paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
     // Only the project mode tool is reachable with the projects grant.
     for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["projects"] }), args: name === "start_deploy" ? { branch: "testing", requestedBy: "test" } : args,
+        caller: serviceCaller({ grants: ["projects"] }), args: name === "get_fly_setup" ? {} : name === "start_deploy" ? { branch: "testing", requestedBy: "test" } : args,
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
