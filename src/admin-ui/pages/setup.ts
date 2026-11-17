@@ -56,14 +56,7 @@ export const setupScript = `
   var RUNNING_NAMED = 3;
 
   // The states listed open in each table, worst first; the rest fold away.
-  var ACTIONABLE = ['fail', 'cannot-verify', 'warn'];
-  var STATE_BADGE = {
-    'fail': ['fail', 'Fail'],
-    'cannot-verify': ['info', 'Cannot verify'],
-    'warn': ['warn', 'Warning'],
-    'pass': ['success', 'Pass'],
-    'not-applicable': ['neutral', 'Not applicable']
-  };
+  var ACTIONABLE = window.SETUP_ACTIONABLE;
 
   // What each card covers, under its name. Only this page says it, so it lives here rather than coming from the route.
   var GROUP_CONTEXT = {
@@ -75,7 +68,8 @@ export const setupScript = `
   var PROJECT_CONTEXT = "This project's ticketing system setup and its GitHub repository";
 
   // pendingStart is set by a started run until the run shows up: the stored run it must replace, and when it began.
-  var state = { data: null, unreadable: false, setupCommand: null, pendingStart: null };
+  // checkingProject is the project whose own checks are running from its card, so its button shows it across a redraw.
+  var state = { data: null, unreadable: false, setupCommand: null, pendingStart: null, checkingProject: null };
   // Which tables' passing rows are unfolded, by table key, so a refresh keeps them open.
   var unfolded = {};
   var pollTimer = null;
@@ -149,28 +143,6 @@ export const setupScript = `
     });
   }
 
-  function cell(content, className) {
-    return '<td' + (className ? ' class="' + className + '"' : '') + '>' + content + '</td>';
-  }
-
-  // The id under the title is what fixes and the setup command name a check by.
-  function checkCell(title, id) {
-    return cell('<div>' + window.esc(title) + '</div><div class="mono text-secondary" style="font-size:11px;margin-top:2px;overflow-wrap:anywhere">' + window.esc(id) + '</div>');
-  }
-
-  function fixCell(row) {
-    if (!row.fix) return cell('');
-    return cell(window.esc(row.fix)
-      + (row.fixUrl ? ' <a class="text-accent" href="' + window.escAttr(window.safeUrl(row.fixUrl)) + '" target="_blank" rel="noopener">Open ↗</a>' : ''));
-  }
-
-  function rowHtml(row, hidden) {
-    var badge = STATE_BADGE[row.state] || ['neutral', row.state];
-    return '<tr' + (hidden ? ' hidden' : '') + '>' + checkCell(row.title, row.id)
-      + cell(window.statusBadge(badge[0], badge[1]))
-      + cell(window.esc(row.detail || ''), 'text-secondary') + fixCell(row) + '</tr>';
-  }
-
   // The checks still running, in one line so a run in progress does not lengthen the page.
   // The first few are named, in the list's own order, and the rest counted.
   function runningLine(running) {
@@ -188,14 +160,6 @@ export const setupScript = `
     return parts.join(', ');
   }
 
-  // Fixed widths, the same in every card, so opening a fold never moves a column and the cards line up.
-  // Below its minimum width the table scrolls sideways inside its card rather than squeezing its text.
-  function table(body) {
-    return '<table class="tbl" style="table-layout:fixed;min-width:900px">'
-      + '<colgroup><col style="width:24%"><col style="width:11%"><col style="width:35%"><col style="width:30%"></colgroup>'
-      + '<thead><tr><th>Check</th><th>State</th><th>What was found</th><th>Fix</th></tr></thead><tbody>' + body + '</tbody></table>';
-  }
-
   // One card's checks: the open rows, the line of running checks, then a fold over the rest.
   // Folded rows stay in the same table as the open rows, so their columns line up.
   // With nothing open, the running line and the fold sit above the table, so opening the fold adds the table below and the fold stays put.
@@ -208,22 +172,32 @@ export const setupScript = `
       ? '<button type="button" class="btn btn-ghost btn-sm text-accent setup-fold">'
         + '<span style="display:inline-block;transform:rotate(' + (unfold ? 90 : 0) + 'deg)">›</span> ' + window.esc(foldLabel(countBy(rows))) + '</button>'
       : '';
-    var foldedRows = folded.map(function (row) { return rowHtml(row, !unfold); }).join('');
+    var foldedRows = folded.map(function (row) { return window.setupCheckRow(row, !unfold); }).join('');
     var runningNow = runningLine(running);
     if (!open.length) {
       return (runningNow ? '<div class="setup-running-row" style="padding:10px 14px">' + runningNow + '</div>' : '')
         + (fold ? '<div class="setup-fold-row" style="padding:10px 14px">' + fold + '</div>' : '')
-        + (unfold ? table(foldedRows) : '');
+        + (unfold ? window.setupCheckTable(foldedRows) : '');
     }
-    return table(open.map(function (row) { return rowHtml(row, false); }).join('')
+    return window.setupCheckTable(window.groupWaitingRows(open).map(function (row) { return window.setupCheckRow(row, false); }).join('')
       + (runningNow ? '<tr class="setup-running-row"><td colspan="4">' + runningNow + '</td></tr>' : '')
       + (fold ? '<tr class="setup-fold-row"><td colspan="4">' + fold + '</td></tr>' + foldedRows : ''));
   }
 
-  function card(title, subtitle, body) {
+  function card(title, subtitle, body, action) {
     return '<div class="card"><div class="card-header"><div><h2 class="card-title">' + window.esc(title) + '</h2>'
-      + (subtitle ? '<div class="card-subtitle">' + window.esc(subtitle) + '</div>' : '') + '</div></div>'
+      + (subtitle ? '<div class="card-subtitle">' + window.esc(subtitle) + '</div>' : '') + '</div>' + (action || '') + '</div>'
       + '<div class="card-body tight">' + body + '</div></div>';
+  }
+
+  // A project's own checks run again from its card, for an admin, while no full run is going (a project run would wait behind it).
+  function projectCheckButton(project) {
+    if (!window.isAdmin()) return '';
+    var checking = state.checkingProject === project;
+    var disabled = checking || state.checkingProject !== null || view() === 'running';
+    // Named for its reach, since the header's Run checks is the full run.
+    return '<button type="button" class="btn btn-accent btn-sm setup-project-check" title="Runs only this project\\'s checks, not a full run"'
+      + (disabled ? ' disabled' : '') + '>' + (checking ? 'Checking…' : 'Check this project') + '</button>';
   }
 
   // A card per group for the checks that run once for the orchestrator, then a card per project for the rest.
@@ -241,19 +215,42 @@ export const setupScript = `
       }).join('');
     var projects = [];
     perProject.forEach(function (row) { if (projects.indexOf(row.project) === -1) projects.push(row.project); });
-    html += projects.sort().map(function (project) {
+    projects.sort();
+    html += projects.map(function (project) {
       var own = perProject.filter(function (row) { return row.project === project; });
-      return card(project, PROJECT_CONTEXT, checksBody('project:' + project, own, [], folds));
+      return card(project, PROJECT_CONTEXT, checksBody('project:' + project, own, [], folds), projectCheckButton(project));
     }).join('');
     var el = document.getElementById('setup-groups');
     el.innerHTML = html;
-    // Each fold's key is captured here rather than written into the markup (ADR 002).
+    // Each fold's key and each project's key are captured here rather than written into the markup (ADR 002).
     el.querySelectorAll('.setup-fold').forEach(function (button, i) {
       button.addEventListener('click', function () {
         unfolded[folds[i]] = !unfolded[folds[i]];
         renderGroups(shownRows());
       });
     });
+    el.querySelectorAll('.setup-project-check').forEach(function (button, i) {
+      button.addEventListener('click', function () { checkProject(projects[i]); });
+    });
+  }
+
+  // Runs one project's checks, which merge into the stored run, then loads the page again to show it.
+  async function checkProject(project) {
+    showError('');
+    state.checkingProject = project;
+    render();
+    var failure = '';
+    try {
+      var res = await window.api('/api/setup-checks/project', { method: 'POST', body: JSON.stringify({ project: project }) });
+      if (res.status === 503) failure = 'The checks for ' + project + ' cannot run right now, because the Restate engine is not serving.';
+      else if (res.status === 404) failure = 'No project ' + project + ' is configured any more.';
+      else if (!res.ok) failure = 'The checks for ' + project + ' could not run (HTTP ' + res.status + ').';
+    } catch (e) {
+      failure = 'The checks for ' + project + ' could not run.';
+    }
+    state.checkingProject = null;
+    await loadSetup();
+    showError(failure);
   }
 
   function render() {

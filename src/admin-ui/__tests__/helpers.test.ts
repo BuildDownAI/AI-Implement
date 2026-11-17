@@ -8,6 +8,8 @@ import { issuesScript } from "../pages/issues.js";
 import { kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { overviewScript } from "../pages/overview.js";
 import { reaperScript } from "../pages/reaper.js";
+import { setupScript } from "../pages/setup.js";
+import { stepperScript } from "../stepper.js";
 
 /** Runs helpers.ts in a page of its own, as the admin page runs it ahead of every other script. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -328,6 +330,189 @@ describe("fmtDuration", () => {
   it("clamps a negative length to zero rather than counting down", () => {
     const win = mountHelpers();
     expect(win.fmtDuration(-3 * S)).toBe("0s");
+  });
+});
+
+// The Setup page's tests cover escaping, the fix link and the column widths through these helpers.
+// What the New project stepper relies on besides is pinned here.
+describe("setupCheckRow and setupCheckTable", () => {
+  const row = (overrides: Record<string, unknown> = {}) => ({
+    id: "github.installation",
+    title: "App installed on the repository",
+    state: "fail",
+    detail: "The App is not installed on acme.",
+    fix: "Install the App.",
+    ...overrides,
+  });
+
+  function cells(markup: string): HTMLTableCellElement[] {
+    const win = mountHelpers();
+    const body = win.document.createElement("tbody");
+    body.innerHTML = markup;
+    return Array.from(body.querySelectorAll("td"));
+  }
+
+  it.each([
+    ["fail", "badge fail", "Fail"],
+    ["cannot-verify", "badge info", "Cannot verify"],
+    ["warn", "badge warn", "Warning"],
+    ["pass", "badge success", "Pass"],
+    ["not-applicable", "badge neutral", "Not applicable"],
+  ])("shows a %s row's state as a status badge", (state, className, label) => {
+    const win = mountHelpers();
+    const [, stateCell] = cells(win.setupCheckRow(row({ state }), false));
+    const badge = stateCell.querySelector(".badge")!;
+    expect(badge.className).toBe(className);
+    expect(badge.querySelector(".dot")).not.toBeNull();
+    expect(badge.textContent).toBe(label);
+  });
+
+  it("shows a state it does not know by its own name, as a neutral badge", () => {
+    const win = mountHelpers();
+    const [, stateCell] = cells(win.setupCheckRow(row({ state: "unheard-of" }), false));
+    expect(stateCell.querySelector(".badge")!.className).toBe("badge neutral");
+    expect(stateCell.textContent).toBe("unheard-of");
+  });
+
+  it("hides a row only when asked to", () => {
+    const win = mountHelpers();
+    expect(win.setupCheckRow(row(), true)).toMatch(/^<tr hidden>/);
+    expect(win.setupCheckRow(row(), false)).toMatch(/^<tr>/);
+  });
+
+  it("writes the check, its id, what was found and the fix in that order, and an empty fix cell for a row with none", () => {
+    const win = mountHelpers();
+    const [check, , detail, fix] = cells(win.setupCheckRow(row(), false));
+    expect(check.textContent).toBe("App installed on the repositorygithub.installation");
+    expect(detail.textContent).toBe("The App is not installed on acme.");
+    expect(fix.textContent).toBe("Install the App.");
+    const [, , , none] = cells(win.setupCheckRow(row({ fix: undefined, fixUrl: "https://github.com/apps/x" }), false));
+    expect(none.innerHTML).toBe("");
+  });
+
+  it("wraps the rows it is given in a table headed by the four columns", () => {
+    const win = mountHelpers();
+    const holder = win.document.createElement("div");
+    holder.innerHTML = win.setupCheckTable(win.setupCheckRow(row(), false));
+    const heads = Array.from(holder.querySelectorAll("thead th"), (th) => (th as HTMLElement).textContent);
+    expect(heads).toEqual(["Check", "State", "What was found", "Fix"]);
+    expect(holder.querySelectorAll("tbody tr")).toHaveLength(1);
+  });
+});
+
+// The stacked form the New project stepper's Review shows, for a container too narrow for the table.
+describe("setupCheckItem", () => {
+  const row = (overrides: Record<string, unknown> = {}) => ({
+    id: "github.installation",
+    title: "App installed on the repository",
+    state: "fail",
+    detail: "The App is not installed on acme.",
+    fix: "Install the App.",
+    ...overrides,
+  });
+
+  function item(markup: string): HTMLElement {
+    const holder = mountHelpers().document.createElement("div");
+    holder.innerHTML = markup;
+    return holder.firstElementChild as HTMLElement;
+  }
+
+  /** Each labeled line as [label, text]. */
+  const lines = (el: HTMLElement) =>
+    Array.from(el.querySelectorAll(".setup-check-line"), (line) => [line.querySelector(".setup-check-label")!.textContent, line.lastElementChild!.textContent]);
+
+  it("names the check and its id beside its state, then what was found and the fix, each labeled", () => {
+    const el = item(mountHelpers().setupCheckItem(row(), false, false));
+    expect(el.querySelector(".setup-check-title")!.textContent).toBe("App installed on the repository");
+    expect(el.querySelector(".setup-check-id")!.textContent).toBe("github.installation");
+    expect(el.querySelector(".badge")!.className).toBe("badge fail");
+    expect(lines(el)).toEqual([["Found", "The App is not installed on acme."], ["Fix", "Install the App."]]);
+  });
+
+  it("leaves out a line it has nothing for", () => {
+    const win = mountHelpers();
+    expect(lines(item(win.setupCheckItem(row({ detail: undefined }), false, false)))).toEqual([["Fix", "Install the App."]]);
+    expect(lines(item(win.setupCheckItem(row({ fix: undefined }), false, false)))).toEqual([["Found", "The App is not installed on acme."]]);
+  });
+
+  it("is hidden and shaded only when asked", () => {
+    const win = mountHelpers();
+    const plain = item(win.setupCheckItem(row(), false, false));
+    const both = item(win.setupCheckItem(row(), true, true));
+    expect([plain.hidden, plain.classList.contains("shaded")]).toEqual([false, false]);
+    expect([both.hidden, both.classList.contains("shaded")]).toEqual([true, true]);
+  });
+
+  it("writes every text from the row as text, and the fix's link through safeUrl", () => {
+    const win = mountHelpers();
+    const el = item(win.setupCheckItem(row({ title: "<b>t</b>", id: "<b>i</b>", detail: "<b>d</b>", fix: "<b>f</b>", fixUrl: "javascript:alert(1)" }), false, false));
+    expect(el.querySelector("b")).toBeNull();
+    expect(el.querySelector(".setup-check-title")!.textContent).toBe("<b>t</b>");
+    expect(el.querySelector("a")!.getAttribute("href")).toBe("#");
+  });
+});
+
+// The Setup page's cards and the stepper's Review show a project's rows waiting on one check as one row.
+describe("groupWaitingRows", () => {
+  const group = (...rows: Record<string, unknown>[]) => mountHelpers().groupWaitingRows(rows);
+  const waiting = (id: string, extra: Record<string, unknown> = {}) => ({ id, title: id, state: "cannot-verify", detail: "d", fix: "f", waitsOn: "tracker.provider", project: "ENG", ...extra });
+
+  it("shows two or more rows waiting on one check as one row, in the first one's place, naming every check", () => {
+    const shown = group({ id: "github.installation", state: "fail" }, waiting("a"), { id: "github.permissions", state: "warn" }, waiting("b"), waiting("c"));
+    expect(shown.map((row: { id: string }) => row.id)).toEqual(["github.installation", "a, b, c", "github.permissions"]);
+    expect(shown[1]).toMatchObject({ state: "cannot-verify", detail: "d", fix: "f" });
+    expect(shown[1].title).toContain("tracker.provider");
+  });
+
+  it("leaves a lone waiting row, and every other row, as it is", () => {
+    const lone = waiting("a");
+    expect(group(lone, { id: "x", state: "pass" })).toEqual([lone, { id: "x", state: "pass" }]);
+  });
+
+  it("joins only one project's rows waiting on the same check", () => {
+    const shown = group(waiting("a"), waiting("b", { project: "OPS" }), waiting("c", { waitsOn: "github.app-identity" }), waiting("d", { waitsOn: "github.app-identity" }));
+    expect(shown.map((row: { id: string }) => row.id)).toEqual(["a", "b", "c, d"]);
+  });
+
+  it("keeps a detail the rows share, and says what they wait on when their details differ", () => {
+    const [shown] = group(waiting("a", { detail: "one" }), waiting("b", { detail: "two" }));
+    expect(shown.detail).not.toBe("one");
+    expect(shown.detail).toContain("tracker.provider");
+  });
+});
+
+// Every setup surface orders and folds rows by the one list here, so a new state or a new order changes them together.
+describe("the setup states' order", () => {
+  it("is published worst first, the first three needing attention", () => {
+    const win = mountHelpers();
+    expect(win.SETUP_STATE_ORDER).toEqual(["fail", "cannot-verify", "warn", "pass", "not-applicable"]);
+    expect(win.SETUP_ACTIONABLE).toEqual(["fail", "cannot-verify", "warn"]);
+  });
+
+  it.each([["setup", setupScript], ["stepper", stepperScript]])("%s defines no order of its own", (_name, script) => {
+    expect(script).not.toMatch(/\[\s*'fail',\s*'cannot-verify'/);
+  });
+});
+
+// The marker rule the Projects page reads for each of a project's two setup cells.
+describe("setupVerdict", () => {
+  const verdict = (...rows: Record<string, unknown>[]) => mountHelpers().setupVerdict(rows);
+  const r = (state: string, extra: Record<string, unknown> = {}) => ({ state, ...extra });
+
+  it("takes the worst state among the rows, one row being enough", () => {
+    expect(verdict(r("pass"), r("warn"), r("cannot-verify"), r("fail"))).toEqual({ kind: "fail", label: "Fail", toLook: 3 });
+    expect(verdict(r("pass"), r("warn"), r("cannot-verify"))).toEqual({ kind: "info", label: "Cannot verify", toLook: 2 });
+    expect(verdict(r("pass"), r("warn"))).toEqual({ kind: "warn", label: "Warning", toLook: 1 });
+    expect(verdict(r("pass"), r("pass"))).toEqual({ kind: "success", label: "Pass", toLook: 0 });
+  });
+
+  it("judges neither a row that does not apply nor a check that can never be verified", () => {
+    expect(verdict(r("pass"), r("not-applicable"), r("cannot-verify", { verifiable: false }))).toEqual({ kind: "success", label: "Pass", toLook: 0 });
+  });
+
+  it("has no verdict when nothing is left to judge", () => {
+    expect(verdict()).toBeNull();
+    expect(verdict(r("not-applicable"), r("fail", { verifiable: false }))).toBeNull();
   });
 });
 

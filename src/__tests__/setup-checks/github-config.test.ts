@@ -185,18 +185,42 @@ describe("github.installation", () => {
     expect(await run("github.target-secrets", context({}, { mappings: () => ({}) }))).toEqual([]);
   });
 
-  it("waits on github.app-identity when GitHub refuses the credentials", async () => {
-    const rows = await run("github.installation", context({ app: async () => appRead({ slug: null }) }));
-    expect(rows).toEqual([expect.objectContaining({ state: "cannot-verify", fix: "More information is needed. Address the github.app-identity check first." })]);
+  // A fault every project shares is each project's own row, so each project's marker shows it.
+  const TWO = { mappings: () => ({ ENG: makeMapping({ owner: "acme", repo: "app" }), OPS: makeMapping({ owner: "acme", repo: "ops" }) }) };
+
+  it("waits on github.app-identity, for each project, when GitHub refuses the credentials", async () => {
+    const rows = await run("github.installation", context({ app: async () => appRead({ slug: null }) }, TWO));
+    expect(rows).toEqual(["ENG", "OPS"].map((project) => expect.objectContaining({ project, state: "cannot-verify", fix: "More information is needed. Address the github.app-identity check first." })));
   });
 
-  it("cannot verify, without blaming the credentials, when GitHub answers HTTP 503", async () => {
-    const rows = await run("github.installation", context({ app: async () => appRead({ slug: null, status: 503 }) }));
-    expect(rows).toEqual([{
+  it("cannot verify for each project, without blaming the credentials, when GitHub answers HTTP 503", async () => {
+    const rows = await run("github.installation", context({ app: async () => appRead({ slug: null, status: 503 }) }, TWO));
+    expect(rows).toEqual(["ENG", "OPS"].map((project) => ({
+      project,
       state: "cannot-verify",
       detail: "GitHub answered HTTP 503 rather than accepting or refusing the App's credentials, so the App's installations cannot be read",
       fix: "Run the checks again once GitHub answers normally.",
-    }]);
+    })));
+  });
+
+  // A project's optional marker would otherwise read Cannot verify for a feature it does not use.
+  it("leaves a check that does not apply to a project's configuration not applicable, whatever GitHub answers", async () => {
+    const mappings = () => ({ ENG: makeMapping({ owner: "acme", repo: "app" }), OPS: makeMapping({ owner: "acme", repo: "ops", skillsRepo: "acme/skills", referenceRepos: [{ repo: "acme/docs", path: "docs" }] }) });
+    const refused = context({ app: async () => appRead({ slug: null }) }, { mappings });
+    for (const id of ["github.skills-repo", "github.reference-repos"]) {
+      expect((await run(id, refused)).map((row) => [row.project, row.state])).toEqual([["ENG", "not-applicable"], ["OPS", "cannot-verify"]]);
+    }
+    const local = context({ app: async () => appRead({ slug: null }) }, { mappings, runnerMode: () => ({ mode: "local", source: "env" }) });
+    for (const id of ["github.workflow-default-branch", "github.workflow-mapping-branch"]) {
+      expect((await run(id, local)).every((row) => row.state === "not-applicable")).toBe(true);
+    }
+  });
+
+  it("cannot verify for each project when the App's credentials cannot be used or GitHub cannot be reached", async () => {
+    const unset = await run("github.installation", context({}, { ...TWO, env: {} }));
+    expect(unset.map((row) => [row.project, row.fix])).toEqual([["ENG", "More information is needed. Address the env.github-app check first."], ["OPS", "More information is needed. Address the env.github-app check first."]]);
+    const unreachable = await run("github.installation", context({ app: async () => { throw new Error("socket hang up"); } }, TWO));
+    expect(unreachable).toEqual(["ENG", "OPS"].map((project) => expect.objectContaining({ project, detail: "The orchestrator could not reach GitHub: socket hang up" })));
   });
 
   it("fails a project whose owner has no installation, linking the install page", async () => {
@@ -496,5 +520,39 @@ describe("github.skills-repo", () => {
     expect(missing).toEqual([expect.objectContaining({ state: "fail", detail: "The skills repository other/skills does not exist, or is private, so its skills never install" })]);
     const limited = await run("github.skills-repo", withSkills("https://github.com/other/skills", { installation: async () => null, publicRepository: async () => ({ status: 403, refExists: null }) }));
     expect(limited).toEqual([expect.objectContaining({ state: "cannot-verify" })]);
+  });
+});
+
+describe("github.review-process", () => {
+  const withProcess = (reviewProcess: RepoMapping["reviewProcess"]) =>
+    context({}, { mappings: () => ({ ENG: makeMapping({ owner: "acme", repo: "app", reviewProcess }) }) });
+
+  it.each([null, "ai-implement"] as const)("needs no outside reviewer under the AI-Implement review (stored as %s)", async (reviewProcess) => {
+    expect(await run("github.review-process", withProcess(reviewProcess))).toEqual([{
+      project: "ENG",
+      state: "not-applicable",
+      detail: "acme/app uses the AI-Implement review, so no outside reviewer needs setting up",
+    }]);
+  });
+
+  it.each([
+    ["claude-code-review", "Claude Code Review", "claude[bot]"],
+    ["claude-code-review-repository-fix", "Claude Code Review, repository auto-fix", "claude[bot]"],
+    ["codex-code-review", "Codex Code Review", "chatgpt-codex-connector[bot]"],
+  ] as const)("names the reviewer %s's reviews come from, and cannot judge it", async (reviewProcess, label, reviewer) => {
+    expect(await run("github.review-process", withProcess(reviewProcess))).toEqual([{
+      project: "ENG",
+      state: "cannot-verify",
+      detail: `acme/app uses ${label}, whose reviews come from ${reviewer}. The orchestrator cannot see whether that reviewer is set up on the repository.`,
+      fix: "If running into issues, install that reviewer's GitHub App on acme/app and turn its reviews on, or choose another Review process for the project at /admin#projects.",
+    }]);
+  });
+
+  it("answers a row for each project, reading nothing from GitHub", async () => {
+    const ctx = context({ app: async () => { throw new Error("no GitHub read expected"); } }, {
+      env: {},
+      mappings: () => ({ ENG: makeMapping({ owner: "acme", repo: "app" }), OPS: makeMapping({ owner: "acme", repo: "ops", reviewProcess: "codex-code-review" }) }),
+    });
+    expect((await run("github.review-process", ctx)).map((row) => [row.project, row.state])).toEqual([["ENG", "not-applicable"], ["OPS", "cannot-verify"]]);
   });
 });

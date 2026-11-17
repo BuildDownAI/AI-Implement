@@ -1,7 +1,7 @@
 // The admin routes' two ingress functions for the SetupChecks object (AII-1538, AII-1541): when they call, what they call,
 // and how a refusal, an error or a hung ingress comes back.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createSetupChecksHydration, readSetupChecksViaObject, startSetupChecksViaObject } from "../restate/setup-checks.js";
+import { createSetupChecksHydration, readSetupChecksViaObject, runProjectSetupChecksViaObject, startSetupChecksViaObject } from "../restate/setup-checks.js";
 import { resetRestateStatus, setRestateStatus } from "../restate/status.js";
 import { endSetupCheckProgress, getLastSetupCheckRun, getSetupCheckProgress, recordSetupCheckRun, type SetupCheckRun } from "../setup-checks/index.js";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
@@ -58,6 +58,33 @@ describe("readSetupChecksViaObject", () => {
     stubAbortTimeout(10_000);
     const fake = fakeFetch({ "POST /SetupChecks/orchestrator/get": hangUntilAborted });
     expect(await readSetupChecksViaObject({ baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "unavailable" });
+  });
+});
+
+describe("runProjectSetupChecksViaObject", () => {
+  it("answers unavailable without contacting the ingress while Restate cannot serve", async () => {
+    const fake = fakeFetch({});
+    expect(await runProjectSetupChecksViaObject("ENG", { baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => false })).toEqual({ status: "unavailable" });
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("calls SetupChecks/orchestrator/runProject with the project, and answers the stored run it merged into", async () => {
+    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/runProject": { json: RUN } });
+    expect(await runProjectSetupChecksViaObject("ENG", { baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "ok", value: RUN });
+    expect(fake.calls.map((call) => call.path)).toEqual(["/SetupChecks/orchestrator/runProject"]);
+    expect(JSON.parse(fake.calls[0].body)).toEqual({ project: "ENG" });
+  });
+
+  it("answers null for a project no mapping has", async () => {
+    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/runProject": { json: null } });
+    expect(await runProjectSetupChecksViaObject("GONE", { baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "ok", value: null });
+  });
+
+  it("bounds the run at 60 seconds, since it waits for the checks, so a hung ingress answers unavailable", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    stubAbortTimeout(60_000);
+    const fake = fakeFetch({ "POST /SetupChecks/orchestrator/runProject": hangUntilAborted });
+    expect(await runProjectSetupChecksViaObject("ENG", { baseUrl: BASE_URL, fetchImpl: fake.fetch, canServe: () => true })).toEqual({ status: "unavailable" });
   });
 });
 

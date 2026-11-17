@@ -226,7 +226,7 @@ A change that adds or alters an architectural feature must update the matching `
 
 ## Adding a new target repo
 
-1. Add the mapping at `/admin` via the **New project** stepper. On the Source step, **Check installation** probes whether the App is installed and can see the repo, linking straight to the fix — install the App, or add the repo to an existing install. The check is advisory; you can save regardless.
+1. Add the mapping at `/admin` via the **New project** stepper. Its Review step runs the project's setup checks before it is saved, each failing one with its fix. Only the project's own failing required checks hold Create; the rest are advisory, so a network blip or an orchestrator-wide fault never blocks a save. Full reference: [docs/admin-ui.md](docs/admin-ui.md) § What each page shows and changes.
 2. **Save.** The mapping persists immediately and sync runs in the background, polling to a terminal state. The mapping is saved however the sync resolves.
 3. Merge the sync PR in the target repo.
 

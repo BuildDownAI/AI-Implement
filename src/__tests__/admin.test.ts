@@ -51,10 +51,6 @@ vi.mock("../workflow-sync.js", async (importOriginal) => ({
   }),
 }));
 
-vi.mock("../github-install-state.js", () => ({
-  probeInstallState: vi.fn(),
-}));
-
 // getAvailability() is module state the poll loop populates. Mocking that one export
 // keeps the rest of the module real and lets the route's passthrough be exercised
 // without an App-token mint or a network call.
@@ -182,7 +178,6 @@ const loaders = {
   config: () => import("../config.js"),
   dedup: () => import("../dedup.js"),
   log: () => import("../log.js"),
-  installState: () => import("../github-install-state.js"),
   queue: () => import("../workflow-sync-queue.js"),
   dispatchBreaker: () => import("../dispatch-breaker.js"),
   dispatchAdmission: () => import("../dispatch-admission.js"),
@@ -205,7 +200,6 @@ let admin: Modules["admin"];
 let config: Modules["config"];
 let dedup: Modules["dedup"];
 let log: Modules["log"];
-let installState: Modules["installState"];
 let queue: Modules["queue"];
 let adminSession: Modules["adminSession"];
 let accessEntries: Modules["accessEntries"];
@@ -220,7 +214,7 @@ beforeEach(async () => {
   for (const mock of [getScopedInstallationTokenMock, getRepoDefaultBranchMock, fetchRepoTarballMock, extractSourceMock]) mock.mockReset();
   db = await testDb({ modules: loaders });
   modules = db.modules;
-  ({ admin, config, dedup, log, installState, queue, adminSession, accessEntries, accessAudit, accessGrants } = modules);
+  ({ admin, config, dedup, log, queue, adminSession, accessEntries, accessAudit, accessGrants } = modules);
   provider = new FakeProvider();
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
@@ -4059,33 +4053,11 @@ describe("sync-status endpoint", () => {
   });
 });
 
-describe("github-install-state endpoint", () => {
-  it("returns 401 without an auth token", async () => {
-    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret");
-    expect(res.statusCode).toBe(401);
-  });
-
-  it("returns 400 when owner or repo is missing", async () => {
+describe("the retired install-state route (AII-1543)", () => {
+  it("is gone, so an admin's request falls through to the unknown-route answer", async () => {
     const token = await login("secret");
-    const res = await request("/api/admin/github-install-state?owner=acme", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(400);
-  });
-
-  it("returns 200 with the probe result", async () => {
-    const token = await login("secret");
-    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready" });
-
     const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ state: "ready" });
-  });
-
-  it("returns 500 when the probe throws (e.g. a rethrown credential error)", async () => {
-    const token = await login("secret");
-    vi.mocked(installState.probeInstallState).mockRejectedValueOnce(new Error("bad jwt"));
-
-    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(500);
+    expect(res.statusCode).toBe(404);
   });
 });
 
@@ -5671,6 +5643,193 @@ describe("per-page grants", () => {
       } finally {
         vi.unstubAllEnvs();
       }
+    });
+
+    describe("an unsaved project's checks (AII-1543)", () => {
+      const CANDIDATE = { teamKey: "APP", owner: "org", repo: "app", defaultBranch: "main" };
+
+      it("checks the project as its save would store it, and writes no mapping and no sync", async () => {
+        const run = vi.fn(async () => RUN);
+        const res = await requestWithDeps("/api/setup-checks/candidate", "POST", adminSsoSession(), { runCandidateChecks: run }, CANDIDATE);
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body)).toEqual({ results: RUN.results, groups: SETUP_CHECK_GROUP_LABELS });
+        expect(run).toHaveBeenCalledWith("APP", expect.objectContaining({ owner: "org", repo: "app", defaultBranch: "main", workflowFile: "claude-implement.yml" }));
+        expect(config.getMappings()).not.toHaveProperty("APP");
+        expect(queue.getWorkflowSyncByTeam("APP")).toBeNull();
+      });
+
+      it("answers the 400 the save answers for the same body, before any check runs", async () => {
+        const refused = { ...CANDIDATE, maxInProgressAiIssues: 0 };
+        const run = vi.fn(async () => RUN);
+        const candidate = await requestWithDeps("/api/setup-checks/candidate", "POST", adminSsoSession(), { runCandidateChecks: run }, refused);
+        const save = await requestWithDeps("/api/mappings", "POST", adminSsoSession(), {}, refused);
+        expect(candidate.statusCode).toBe(400);
+        expect([candidate.statusCode, JSON.parse(candidate.body)]).toEqual([save.statusCode, JSON.parse(save.body)]);
+        expect(run).not.toHaveBeenCalled();
+      });
+
+      it("answers 400 for a body that is not JSON, and 503 when nothing is wired", async () => {
+        const req = new MockRequest("/api/setup-checks/candidate", "POST", { authorization: `Bearer ${adminSsoSession()}` }, "{not json");
+        const res = new MockResponse();
+        admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), { runCandidateChecks: vi.fn() });
+        await res.done;
+        expect(res.statusCode).toBe(400);
+        expect((await requestWithDeps("/api/setup-checks/candidate", "POST", adminSsoSession(), {}, CANDIDATE)).statusCode).toBe(503);
+      });
+
+      it("answers 500 with a fixed error when the run throws, never the error's own text", async () => {
+        const run = vi.fn(async () => { throw new Error("a secret-bearing detail"); });
+        const res = await requestWithDeps("/api/setup-checks/candidate", "POST", adminSsoSession(), { runCandidateChecks: run }, CANDIDATE);
+        expect(res.statusCode).toBe(500);
+        expect(JSON.parse(res.body)).toEqual({ error: "setup-checks-failed" });
+      });
+    });
+
+    describe("validating a project before its save (AII-1543)", () => {
+      const BODY = { teamKey: "APP", owner: "org", repo: "app", defaultBranch: "main" };
+      const JIRA = { kind: "jira", jql: "project = APP", repoFieldValue: "app" };
+
+      it("accepts what a save accepts, and writes no mapping and no sync", async () => {
+        const res = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, BODY);
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body)).toEqual({ valid: true });
+        expect(config.getMappings()).not.toHaveProperty("APP");
+        expect(queue.getWorkflowSyncByTeam("APP")).toBeNull();
+      });
+
+      it("answers exactly the 400 a save answers for the same body", async () => {
+        const refused = { ...BODY, branchPrefix: "bad prefix" };
+        const validate = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, refused);
+        const save = await requestWithDeps("/api/mappings", "POST", adminSsoSession(), {}, refused);
+        expect(validate.statusCode).toBe(400);
+        expect([validate.statusCode, JSON.parse(validate.body)]).toEqual([save.statusCode, JSON.parse(save.body)]);
+      });
+
+      // A form shows a refusal beside the field it names, so each refusal names the body field the operator changes to clear it.
+      it.each([
+        [{ teamKey: "" }, "teamKey"],
+        [{ owner: "" }, "owner"],
+        [{ repo: "" }, "repo"],
+        [{ defaultBranch: " " }, "defaultBranch"],
+        [{ maxInProgressAiIssues: 0 }, "maxInProgressAiIssues"],
+        [{ executionMode: "elsewhere" }, "executionMode"],
+        [{ sessionMode: "elsewhere" }, "sessionMode"],
+        [{ machineCpus: 0 }, "machineCpus"],
+        [{ machineMemoryMb: 128 }, "machineMemoryMb"],
+        [{ workflowFile: "dir/claude-implement.yml" }, "workflowFile"],
+        [{ planningWorkflowFile: "claude-implement.yml" }, "planningWorkflowFile"],
+        [{ extraEnv: [] }, "extraEnv"],
+        [{ provider: "elsewhere" }, "provider"],
+        [{ provider: "bedrock" }, "awsRegion"],
+        [{ provider: "bedrock", awsRegion: "us-east-1", executionMode: "fly-machines" }, "provider"],
+        [{ ticketingProvider: "elsewhere" }, "ticketingProvider"],
+        [{ ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/tickets" } }, "ticketingProvider"],
+        [{ ticketingProvider: "jira", ticketingConfig: { ...JIRA, jql: "" } }, "ticketingConfig"],
+        [{ ticketingProvider: "jira", ticketingConfig: { ...JIRA, statusFieldOverride: "customfield 1" } }, "ticketingConfig"],
+        [{ maxTurns: 0 }, "maxTurns"],
+        [{ maxIterations: 1.5 }, "maxIterations"],
+        [{ maxJobMinutes: -1 }, "maxJobMinutes"],
+        [{ prDispatchBudget: 0 }, "prDispatchBudget"],
+        [{ branchPrefix: "bad prefix" }, "branchPrefix"],
+        [{ sensitiveAddPatterns: "**" }, "sensitiveAddPatterns"],
+        [{ sensitiveAllowPatterns: "**" }, "sensitiveAllowPatterns"],
+        [{ extraEnv: { NAME: 1 } }, "extraEnv"],
+        [{ skillsRepo: "not a repository" }, "skillsRepo"],
+        [{ referenceRepos: "BuildDownAI/docs" }, "referenceRepos"],
+        [{ dependencyTokenScope: "everything" }, "dependencyTokenScope"],
+        [{ reviewers: "everyone" }, "reviewers"],
+        [{ trustedReviewAuthors: 7 }, "trustedReviewAuthors"],
+        [{ reviewProcess: "elsewhere" }, "reviewProcess"],
+      ] as [Record<string, unknown>, keyof AdminModule.UpsertMappingBody][])("names %j's refusal as %s", async (overrides, field) => {
+        const res = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, { ...BODY, ...overrides });
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body)).toMatchObject({ field, error: expect.any(String) });
+      });
+
+      it("names a Filesystem project's malformed key as teamKey, under the local runner mode Filesystem needs", async () => {
+        vi.stubEnv("RUNNER_MODE", "local");
+        try {
+          const body = { ...BODY, teamKey: "bad key", ticketingProvider: "filesystem", ticketingConfig: { kind: "filesystem", directory: "/tmp/tickets" } };
+          const res = await requestWithDeps("/api/mappings/validate", "POST", adminSsoSession(), {}, body);
+          expect(res.statusCode).toBe(400);
+          expect(JSON.parse(res.body)).toMatchObject({ field: "teamKey", error: expect.stringContaining("Filesystem project key") });
+        } finally {
+          vi.unstubAllEnvs();
+        }
+      });
+
+      it("refuses a user, and a body that is not JSON", async () => {
+        expect((await requestWithDeps("/api/mappings/validate", "POST", userSession(), {}, BODY)).statusCode).toBe(403);
+        const req = new MockRequest("/api/mappings/validate", "POST", { authorization: `Bearer ${adminSsoSession()}` }, "{not json");
+        const res = new MockResponse();
+        admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+        await res.done;
+        expect(res.statusCode).toBe(400);
+      });
+    });
+
+    describe("a saved project's checks (AII-1543)", () => {
+      it("runs the project's checks and answers the stored run they merged into", async () => {
+        const runProject = ok(RUN);
+        const res = await requestWithDeps("/api/setup-checks/project", "POST", adminSsoSession(), { runProjectSetupChecks: runProject }, { project: "ENG" });
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body)).toEqual({ run: RUN, groups: SETUP_CHECK_GROUP_LABELS });
+        expect(runProject).toHaveBeenCalledWith("ENG");
+      });
+
+      it("answers 404 when no project has the key", async () => {
+        const res = await requestWithDeps("/api/setup-checks/project", "POST", adminSsoSession(), { runProjectSetupChecks: ok(null) }, { project: "GONE" });
+        expect(res.statusCode).toBe(404);
+        expect(JSON.parse(res.body)).toEqual({ error: "no-such-project" });
+      });
+
+      it.each([undefined, {}, { project: "" }, { project: 7 }])("answers 400 for the body %j, and runs nothing", async (body) => {
+        const runProject = ok(RUN);
+        expect((await requestWithDeps("/api/setup-checks/project", "POST", adminSsoSession(), { runProjectSetupChecks: runProject }, body)).statusCode).toBe(400);
+        expect(runProject).not.toHaveBeenCalled();
+      });
+
+      it("answers 503 naming the setup command when Restate cannot take the run, or nothing is wired", async () => {
+        const refused = vi.fn(async () => ({ status: "unavailable" as const }));
+        const res = await requestWithDeps("/api/setup-checks/project", "POST", adminSsoSession(), { runProjectSetupChecks: refused }, { project: "ENG" });
+        expect(res.statusCode).toBe(503);
+        expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable", setupCommand: setupCommandFor(process.env) });
+        expect((await requestWithDeps("/api/setup-checks/project", "POST", adminSsoSession(), {}, { project: "ENG" })).statusCode).toBe(503);
+      });
+    });
+
+    it("refuses both project routes to a user granted every page, and runs nothing", async () => {
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      const candidate = vi.fn(async () => RUN);
+      const project = ok(RUN);
+      expect((await requestWithDeps("/api/setup-checks/candidate", "POST", userSession(), { runCandidateChecks: candidate }, { teamKey: "APP", owner: "org", repo: "app", defaultBranch: "main" })).statusCode).toBe(403);
+      expect((await requestWithDeps("/api/setup-checks/project", "POST", userSession(), { runProjectSetupChecks: project }, { project: "ENG" })).statusCode).toBe(403);
+      expect(candidate).not.toHaveBeenCalled();
+      expect(project).not.toHaveBeenCalled();
+    });
+
+    // Both routes run the save's builder before answering, so a body it cannot read or a database fault must still answer the request.
+    describe.each(["/api/mappings/validate", "/api/setup-checks/candidate"])("%s, when the save's builder cannot run", (url) => {
+      async function post(body: string, to = url): Promise<MockResponse> {
+        const req = new MockRequest(to, "POST", { authorization: `Bearer ${adminSsoSession()}` }, body);
+        const res = new MockResponse();
+        admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), { runCandidateChecks: vi.fn(async () => RUN) });
+        await res.done;
+        return res;
+      }
+
+      it.each(["null", "{not json"])("answers the body %s as the save does", async (body) => {
+        const res = await post(body);
+        const save = await post(body, "/api/mappings");
+        expect(res.statusCode).toBe(400);
+        expect([res.statusCode, JSON.parse(res.body)]).toEqual([save.statusCode, JSON.parse(save.body)]);
+      });
+
+      it("answers 500 when the stored mappings cannot be read", async () => {
+        dedup.getDb().exec("ALTER TABLE mappings RENAME TO mappings_gone");
+        const res = await post(JSON.stringify({ teamKey: "APP", owner: "org", repo: "app", defaultBranch: "main" }));
+        expect(res.statusCode).toBe(500);
+      });
     });
   });
 

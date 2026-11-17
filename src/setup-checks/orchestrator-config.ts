@@ -11,7 +11,7 @@ import { parseBreakerThreshold } from "../dispatch-breaker.js";
 import { FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, isRunnerMode, resolveExecutionPath, resolveFlyProcessLevelSecrets, resolveRunnerCallbackBaseUrl, resolveRunnerMode, RUNNER_MODE_SETTING_KEY, VALID_RUNNER_MODES } from "../runner-mode.js";
 import { missingRunnerCallbackConfig } from "../runner-callback.js";
 import { ORCHESTRATOR_HEALTH_TIMEOUT_MS } from "../health-body.js";
-import type { SetupCheck, SetupCheckContext } from "./index.js";
+import { waitOn, type SetupCheck, type SetupCheckContext } from "./contract.js";
 
 /** A URL's host name, or null when it does not parse, so the fetch reports the malformed address. */
 function hostnameOf(url: string): string | null {
@@ -43,6 +43,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env, orchestratorDefaults, projectStageConfig, mappings }) => {
       const hasEnv = Boolean(env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN);
       const configured = orchestratorDefaults()?.config.mode === "configured";
@@ -72,6 +74,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       const problem = appCredentialsProblem(env);
       if (problem) return [{ state: "fail", detail: problem, fix: "Set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY. The private key is the PEM file from the GitHub App's settings page." }];
@@ -84,6 +88,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       if (!env.ADMIN_ACCESS_CODE) return [{ state: "not-applicable", detail: "ADMIN_ACCESS_CODE not set" }];
       if (effectiveAccessCode(env.ADMIN_ACCESS_CODE) === null) {
@@ -102,6 +108,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       if (!env.RUNNER_MODE) return [{ state: "pass", detail: "RUNNER_MODE not set, so the stored runner mode applies" }];
       if (isRunnerMode(env.RUNNER_MODE)) return [{ state: "pass", detail: `RUNNER_MODE=${env.RUNNER_MODE}` }];
@@ -118,6 +126,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       const raw = env.POLL_INTERVAL_MS;
       const ms = parsePollIntervalMs(raw);
@@ -137,6 +147,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       const raw = env.DISPATCH_BREAKER_THRESHOLD;
       const value = parseBreakerThreshold(raw);
@@ -157,6 +169,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env, readSetting }) => {
       const findings: string[] = [];
       for (const setting of SEED_ONCE_SETTINGS) {
@@ -181,6 +195,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env, readSetting }) => {
       const findings: string[] = [];
       const mode = resolveRunnerMode(env.RUNNER_MODE, null);
@@ -203,6 +219,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env, storedAccessEntries }) => {
       if (allowlistFromEnv(env).length === 0) {
         return [{ state: "pass", detail: "Neither OAUTH_ALLOWED_DOMAINS nor OAUTH_ALLOWED_EMAILS admits anyone" }];
@@ -223,6 +241,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ env, databasePath, onSeparateFilesystem }) => {
       const db = databasePath();
       if (db.fellBack) {
@@ -249,6 +269,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ restateStatus }) => {
       const { sidecar, registration } = restateStatus();
       const detail = `The sidecar is ${sidecar.state} and the endpoint registration is ${registration.state}`;
@@ -262,6 +284,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       const callback = resolveRunnerCallbackBaseUrl(env);
       const missing = missingRunnerCallbackConfig({
@@ -285,9 +309,11 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: async ({ env, runnerMode, orchestratorHealthAt, orchestratorInstanceId }) => {
       const { url } = resolveRunnerCallbackBaseUrl(env);
-      if (!url) return [{ state: "cannot-verify", detail: "No callback address is set, so there is none to reach", fix: "More information is needed. Address the callback.config check first." }];
+      if (!url) return [{ state: "cannot-verify", detail: "No callback address is set, so there is none to reach", ...waitOn("callback.config") }];
       // A local runner reaches the orchestrator through host.docker.internal, which resolves inside its container only.
       if (runnerMode().mode === "local") return [{ state: "not-applicable", detail: "The runner mode is local, so runs reach the orchestrator from containers on this host" }];
       if (hostnameOf(url) === "host.docker.internal") return [{ state: "not-applicable", detail: `${url} resolves only inside a local runner's container` }];
@@ -318,6 +344,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "mode",
     onAdminPath: false,
+    perProject: false,
+    verifiable: true,
     run: ({ runnerMode, mappings, flySessions, runnerBackendSource }) => {
       const mode = runnerMode().mode;
       const onFly = Object.entries(mappings())
@@ -347,6 +375,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       const providers = resolveProviders(env).providers.map((p) => p.id);
       const codeSet = effectiveAccessCode(env.ADMIN_ACCESS_CODE) !== null;
@@ -367,6 +397,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       const { dropped } = resolveProviders(env);
       if (dropped.length === 0) return [{ state: "pass", detail: "No sign-in provider is partly configured" }];
@@ -383,6 +415,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ env }) => {
       if (resolveProviders(env).providers.length === 0) return [{ state: "not-applicable", detail: "No sign-in provider is configured" }];
       if (env.OAUTH_REDIRECT_BASE_URL) return [{ state: "pass", detail: `Sign-in returns to ${env.OAUTH_REDIRECT_BASE_URL}` }];
@@ -399,6 +433,8 @@ export const ORCHESTRATOR_CONFIG_CHECKS: readonly SetupCheck[] = [
     group: "orchestrator",
     tier: "core",
     onAdminPath: true,
+    perProject: false,
+    verifiable: true,
     run: ({ env, effectiveAllowlist }) => {
       const providers = resolveProviders(env).providers.map((p) => p.id);
       if (providers.length === 0) return [{ state: "not-applicable", detail: "No sign-in provider is configured" }];

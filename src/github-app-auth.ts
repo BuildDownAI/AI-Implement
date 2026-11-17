@@ -330,18 +330,6 @@ async function* installationRepositoryPages(token: string): AsyncGenerator<strin
   }
 }
 
-/**
- * Whether the installation can see a given repo. Only meaningful when repositorySelection === "selected"
- * (an "all" install sees everything, so the caller skips this). Stops reading pages as soon as the repo is found.
- */
-export async function installationIncludesRepo(token: string, repoName: string): Promise<boolean> {
-  const target = repoName.toLowerCase();
-  for await (const names of installationRepositoryPages(token)) {
-    if (names.includes(target)) return true;
-  }
-  return false;
-}
-
 /** Every repository name a selected-repositories installation includes, lowercased, read with that installation's token. */
 export async function listInstallationRepositoryNames(token: string): Promise<Set<string>> {
   const names = new Set<string>();
@@ -371,6 +359,11 @@ export async function getAppSlug(appId: string, privateKey: string): Promise<str
   }
   cachedAppSlug = app.slug;
   return cachedAppSlug;
+}
+
+/** The page GitHub serves for installing the App on an account, or for adding repositories to an installation. */
+export function appInstallUrl(slug: string): string {
+  return `https://github.com/apps/${slug}/installations/new`;
 }
 
 /** What `GET /app` answered for the App's JWT, with GitHub's clock beside this host's. */

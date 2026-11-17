@@ -1,17 +1,20 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { setupHtml, setupScript } from "../pages/setup.js";
 import { mountAdminPage, type FakeApiResponse } from "../../__tests__/helpers/fixtures/admin-ui.js";
 import { SETUP_CHECK_GROUP_LABELS } from "../../setup-checks/index.js";
 import { componentsCss } from "../components.js";
 
-type Row = { id: string; title: string; group: string; tier: string; onAdminPath: boolean; state: string; project?: string; detail?: string; fix?: string; fixUrl?: string };
+type Row = { id: string; title: string; group: string; tier: string; onAdminPath: boolean; state: string; project?: string; detail?: string; fix?: string; fixUrl?: string; waitsOn?: string };
 
 const row = (over: Partial<Row>): Row => ({ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: false, state: "pass", ...over });
 const body = (over: Record<string, unknown>) => ({ run: null, progress: null, groups: SETUP_CHECK_GROUP_LABELS, ...over });
 const reply = (status: number, json: unknown): FakeApiResponse => ({ ok: status >= 200 && status < 300, status, json: async () => json });
 
 /** Mounts the page with replies in order for GET /api/setup-checks, records every timer delay, and fires none. */
-function mount(gets: Array<FakeApiResponse | Promise<FakeApiResponse>>, options: { admin?: boolean; post?: FakeApiResponse } = {}) {
+function mount(
+  gets: Array<FakeApiResponse | Promise<FakeApiResponse>>,
+  options: { admin?: boolean; post?: FakeApiResponse; project?: FakeApiResponse | Promise<FakeApiResponse> } = {},
+) {
   const delays: number[] = [];
   const posts: string[] = [];
   const queue = [...gets];
@@ -23,6 +26,10 @@ function mount(gets: Array<FakeApiResponse | Promise<FakeApiResponse>>, options:
       if (url === "/api/setup-checks/run" && init?.method === "POST") {
         posts.push(url);
         return options.post ?? reply(202, { invocationId: "inv_1" });
+      }
+      if (url === "/api/setup-checks/project" && init?.method === "POST") {
+        posts.push(`${url} ${init.body}`);
+        return options.project ?? reply(200, { run: null, groups: SETUP_CHECK_GROUP_LABELS });
       }
       return queue.length > 1 ? queue.shift()! : queue[0];
     },
@@ -57,6 +64,17 @@ describe("setup page", () => {
     expect(user.el("setup-run-first-btn").hidden).toBe(true);
     expect(user.el("setup-never-run-hint").textContent).toMatch(/admin/);
     expect(user.el("setup-run-btn").hidden).toBe(true);
+  });
+
+  it("shows a project's rows waiting on the same check as one row in its card", async () => {
+    const waiting = (id: string) => row({ id, title: id, group: "tracker", project: "ENG", state: "cannot-verify", detail: "d", fix: "f", waitsOn: "tracker.provider" });
+    const results = [waiting("tracker.linear.team-access"), waiting("tracker.linear.pickup-label"), row({ id: "github.installation", group: "github", project: "ENG", state: "fail" })];
+    const page = mount([reply(200, body({ run: { checkedAt: 1, results } }))]);
+    await page.win.loadSetup();
+    const card = page.cards().find((c) => c.querySelector(".card-title")?.textContent === "ENG")!;
+    const shown = [...card.querySelectorAll("tbody tr:not([hidden]):not(.setup-fold-row):not(.setup-running-row)")];
+    expect(shown).toHaveLength(2);
+    expect(shown.some((tr) => tr.textContent!.includes("tracker.linear.team-access, tracker.linear.pickup-label"))).toBe(true);
   });
 
   it("shows a user the last run without the Run button, since starting one is an admin's", async () => {
@@ -311,5 +329,67 @@ describe("setup page", () => {
     await busy.win.startSetupRun();
     expect(busy.el("setup-error").classList.contains("hidden")).toBe(true);
     expect(busy.el("setup-run-label").textContent).toBe("This run");
+  });
+});
+
+describe("setup page — a project's own checks, run again from its card", () => {
+  const RUN = { checkedAt: 1, results: [
+    row({ group: "orchestrator" }),
+    row({ id: "github.installation", group: "github", project: "AII", state: "fail" }),
+    row({ id: "github.installation", group: "github", project: "SAN", state: "pass" }),
+  ] };
+  const button = (card: HTMLElement) => card.querySelector(".card-header .setup-project-check") as HTMLButtonElement | null;
+  const projectCards = (m: ReturnType<typeof mount>) => m.cards().filter((c) => /^(AII|SAN)$/.test(c.querySelector(".card-title")!.textContent!));
+  const settle = () => new Promise((resolve) => queueMicrotask(() => resolve(undefined)));
+
+  it("gives an admin the button on each project's card and none on a group's, and a user none at all", async () => {
+    const admin = mount([reply(200, body({ run: RUN }))]);
+    await admin.win.loadSetup();
+    expect(projectCards(admin).every((c) => button(c) !== null && !button(c)!.disabled)).toBe(true);
+    expect(admin.cards().filter((c) => !projectCards(admin).includes(c)).every((c) => button(c) === null)).toBe(true);
+
+    const user = mount([reply(200, body({ run: RUN }))], { admin: false });
+    await user.win.loadSetup();
+    expect(user.doc.querySelectorAll(".setup-project-check")).toHaveLength(0);
+  });
+
+  it("runs that project's checks, holds every card's button meanwhile, then shows the stored run they merged into", async () => {
+    let answer!: (r: FakeApiResponse) => void;
+    const merged = { checkedAt: 1, results: [RUN.results[0], { ...RUN.results[1], state: "pass" }, RUN.results[2]] };
+    const m = mount([reply(200, body({ run: RUN })), reply(200, body({ run: merged }))], { project: new Promise((resolve) => { answer = resolve; }) });
+    await m.win.loadSetup();
+    button(projectCards(m)[1])!.click();
+    await settle();
+    expect(m.posts).toEqual(['/api/setup-checks/project {"project":"SAN"}']);
+    // Every card's button is held, and the running one reads differently from the rest.
+    const [idle, running] = projectCards(m).map((c) => button(c)!);
+    expect([idle.disabled, running.disabled]).toEqual([true, true]);
+    expect(running.textContent).not.toBe(idle.textContent);
+    answer(reply(200, { run: merged, groups: SETUP_CHECK_GROUP_LABELS }));
+    await vi.waitFor(() => expect(projectCards(m).every((c) => !button(c)!.disabled)).toBe(true));
+    expect(new Set(projectCards(m).map((c) => button(c)!.textContent)).size).toBe(1);
+    expect(m.el("setup-kpi-fail").textContent).toBe("0");
+  });
+
+  // Facts the message carries, not its wording: which project, and the cause the answer names.
+  it.each([
+    [503, "Restate"],
+    [404, "configured"],
+    [500, "500"],
+  ])("says why, naming the project, when its checks answer %i, and gives the button back", async (status, cause) => {
+    const m = mount([reply(200, body({ run: RUN }))], { project: reply(status, {}) });
+    await m.win.loadSetup();
+    button(projectCards(m)[0])!.click();
+    await vi.waitFor(() => expect(m.el("setup-error").classList.contains("hidden")).toBe(false));
+    expect(m.el("setup-error").textContent).toContain("AII");
+    expect(m.el("setup-error").textContent).toContain(cause);
+    expect(button(projectCards(m)[0])!.disabled).toBe(false);
+  });
+
+  it("holds the button while a full run is going, since a project run would wait behind it", async () => {
+    const progress = { startedAt: 1, total: 3, finished: RUN.results, running: [] };
+    const m = mount([reply(200, body({ run: RUN, progress }))]);
+    await m.win.loadSetup();
+    expect(projectCards(m).every((c) => button(c)!.disabled)).toBe(true);
   });
 });

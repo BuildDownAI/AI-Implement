@@ -110,5 +110,107 @@ export const helpersJs = `
     return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
   }
   window.fmtDuration = fmtDuration;
+
+  // Setup-check states, worst first, which every setup surface orders rows by. The first three need attention,
+  // so a page shows their rows open and folds the rest, and a marker takes the worst of them.
+  const SETUP_STATE_ORDER = ['fail', 'cannot-verify', 'warn', 'pass', 'not-applicable'];
+  const SETUP_ACTIONABLE = SETUP_STATE_ORDER.slice(0, 3);
+  window.SETUP_STATE_ORDER = SETUP_STATE_ORDER;
+  window.SETUP_ACTIONABLE = SETUP_ACTIONABLE;
+
+  // A setup check's row, as the Setup page and the New project stepper show it: the check and its id,
+  // its state, what was found, and its fix with any page that applies it.
+  const SETUP_STATE_BADGE = {
+    'fail': ['fail', 'Fail'],
+    'cannot-verify': ['info', 'Cannot verify'],
+    'warn': ['warn', 'Warning'],
+    'pass': ['success', 'Pass'],
+    'not-applicable': ['neutral', 'Not applicable']
+  };
+
+  function setupCell(content, className) {
+    return '<td' + (className ? ' class="' + className + '"' : '') + '>' + content + '</td>';
+  }
+
+  // The id under the title is what fixes and the setup command name a check by.
+  function setupCheckCell(title, id) {
+    return setupCell('<div>' + esc(title) + '</div><div class="mono text-secondary" style="font-size:11px;margin-top:2px;overflow-wrap:anywhere">' + esc(id) + '</div>');
+  }
+
+  function setupFixText(row) {
+    return esc(row.fix) + (row.fixUrl ? ' <a class="text-accent" href="' + escAttr(safeUrl(row.fixUrl)) + '" target="_blank" rel="noopener">Open ↗</a>' : '');
+  }
+
+  function setupFixCell(row) {
+    return setupCell(row.fix ? setupFixText(row) : '');
+  }
+
+  // The same row stacked for a narrow container, as the New project stepper shows it: the check and its state on one line,
+  // what was found and the fix beneath. Its spacing and colors are the .setup-check-item rules, so a container can restyle it.
+  // shaded marks every other item of a list, counted by the caller so rows a fold hides still keep the alternation.
+  function setupCheckItem(row, hidden, shaded) {
+    const badge = SETUP_STATE_BADGE[row.state] || ['neutral', row.state];
+    return '<div class="setup-check-item' + (shaded ? ' shaded' : '') + '"' + (hidden ? ' hidden' : '') + '>'
+      + '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'
+      + '<div style="min-width:0"><div class="setup-check-title">' + esc(row.title) + '</div><div class="mono setup-check-id">' + esc(row.id) + '</div></div>'
+      + '<div style="flex-shrink:0">' + statusBadge(badge[0], badge[1]) + '</div></div>'
+      + (row.detail ? '<div class="setup-check-line"><span class="setup-check-label">Found</span><span>' + esc(row.detail) + '</span></div>' : '')
+      + (row.fix ? '<div class="setup-check-line"><span class="setup-check-label">Fix</span><span>' + setupFixText(row) + '</span></div>' : '')
+      + '</div>';
+  }
+  window.setupCheckItem = setupCheckItem;
+
+  // Rows of one project that wait on the same check say only that it comes first, so two or more show as one row naming them all,
+  // in the place of the first of them. Every other row stays as it is and where it is. For showing only: counts and verdicts read the rows themselves.
+  // The setup command prints them the same way (joinWaitingRows).
+  function groupWaitingRows(rows) {
+    const keyOf = function (row) { return row.waitsOn ? (row.project || '') + '|' + row.waitsOn : null; };
+    const waiting = {};
+    rows.forEach(function (row) { const key = keyOf(row); if (key) (waiting[key] = waiting[key] || []).push(row); });
+    const shown = [];
+    rows.forEach(function (row) {
+      const group = keyOf(row) ? waiting[keyOf(row)] : null;
+      if (!group || group.length < 2) { shown.push(row); return; }
+      if (group[0] !== row) return;
+      const sameDetail = group.every(function (each) { return each.detail === row.detail; });
+      shown.push({
+        title: group.length + ' checks wait on ' + row.waitsOn,
+        id: group.map(function (each) { return each.id; }).join(', '),
+        state: row.state,
+        detail: sameDetail ? row.detail : 'None of them can be read until ' + row.waitsOn + ' passes.',
+        fix: row.fix,
+      });
+    });
+    return shown;
+  }
+  window.groupWaitingRows = groupWaitingRows;
+
+  // The verdict a marker shows for a set of setup-check rows: the worst state among those that can be judged, one row being enough to set it.
+  // Rows that do not apply, and checks that can never be verified, are left out. Null when none is left to judge.
+  function setupVerdict(rows) {
+    const judged = rows.filter(function (row) { return row.verifiable !== false && row.state !== 'not-applicable'; });
+    if (!judged.length) return null;
+    const worst = SETUP_STATE_ORDER.find(function (state) { return judged.some(function (row) { return row.state === state; }); });
+    const badge = SETUP_STATE_BADGE[worst] || SETUP_STATE_BADGE['pass'];
+    return { kind: badge[0], label: badge[1], toLook: judged.filter(function (row) { return row.state !== 'pass'; }).length };
+  }
+  window.setupVerdict = setupVerdict;
+
+  function setupCheckRow(row, hidden) {
+    const badge = SETUP_STATE_BADGE[row.state] || ['neutral', row.state];
+    return '<tr' + (hidden ? ' hidden' : '') + '>' + setupCheckCell(row.title, row.id)
+      + setupCell(statusBadge(badge[0], badge[1]))
+      + setupCell(esc(row.detail || ''), 'text-secondary') + setupFixCell(row) + '</tr>';
+  }
+  window.setupCheckRow = setupCheckRow;
+
+  // Fixed widths, the same in every table, so opening a fold never moves a column and tables line up.
+  // Below its minimum width the table scrolls sideways inside its container rather than squeezing its text.
+  function setupCheckTable(body) {
+    return '<table class="tbl" style="table-layout:fixed;min-width:900px">'
+      + '<colgroup><col style="width:24%"><col style="width:11%"><col style="width:35%"><col style="width:30%"></colgroup>'
+      + '<thead><tr><th>Check</th><th>State</th><th>What was found</th><th>Fix</th></tr></thead><tbody>' + body + '</tbody></table>';
+  }
+  window.setupCheckTable = setupCheckTable;
 })();
 `;
