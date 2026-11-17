@@ -93,15 +93,23 @@ id. An unset project selection uses the normal defaults; an empty selection stil
 runs `integration-review`. Open ledger findings are not appended as fix instructions.
 
 The runner reviews the full PR diff once and posts one verdict comment marked
-`<!-- ai-implement rollup-review -->`, containing severity, file:line and body for
-each finding. Reviewer failure produces an incomplete verdict. No implement or fix
+`<!-- ai-implement rollup-review -->`, showing the short reviewed head SHA and
+explaining that the verdict does not block the merge: blockers are filed as one `[roll-up-review]` child until the two-child
+limit is reached. Findings are deduplicated only by `stableReviewFindingKey`,
+with all reporting reviewer IDs, severity, file:line and body on each entry.
+Reviewer failure produces an incomplete verdict. No implement or fix
 pass, repository hook, commit, push, or external-review polling runs. The callback
 finishes the dispatch row with `rollup_review` and preserves the findings ledger,
 dispositions and approval marks; it does not submit `LateExternalReview`. Findings
 are advisory and cannot authorize merging. The owning workflow preserves successful
 and failed `rollup_review` results, including when a deadline follows the callback,
 and releases the reservation without implementation tracker transitions or stuck
-remediation. Ordinary comment gap-fills are unchanged.
+remediation. Every terminal result gets a follow-up notice: it names the filed
+child, says
+when no child is needed, or names failed reviewers for an incomplete review
+(with a fallback when review failed before a reviewer ran). At the two-child
+limit, including on incomplete reviews, it says a person must decide further fixes.
+Ordinary comment gap-fills are unchanged.
 
 ## Failed rounds
 
