@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as mappingConfig from "../../config.js";
 import { LinearGraphQLError, LinearLabelWriteError, LinearProvider } from "../../providers/linear.js";
-import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import {
   clearLinearTokenCache,
   configureLinearAuth,
@@ -1845,5 +1845,114 @@ describe("LinearProvider.createChildIssue", () => {
       data({ issueLabels: { nodes: [{ id: "label", name: "Pickup", team: null }] } }),
       data({ issueCreate: { success: false, issue: null } }));
     await expect(new LinearProvider({}).createChildIssue("p", "T", { title: "Title", body: "Body" })).rejects.toThrow(/creation failed/);
+  });
+});
+
+
+describe("LinearProvider.listIssueStatuses", () => {
+  beforeEach(() => {
+    vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("AI-Implement");
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+  const mapping = makeMapping({ teamKey: "ENG" });
+  const node = (type = "started", names = ["AI-Implement"], id = "uuid") => ({
+    id, identifier: "ENG-1", title: "Status", url: "https://api.example/issue",
+    updatedAt: "2026-01-01T12:00:00Z", state: { name: "Workflow", type },
+    labels: { nodes: names.map(name => ({ name })) },
+  });
+  const page = (nodes: ReturnType<typeof node>[] = [], hasNextPage = false, endCursor: string | null = null) =>
+    data({ issues: { nodes, pageInfo: { hasNextPage, endCursor } } });
+
+  it.each([
+    ["canceled", ["AI-Needs-Human"], undefined, undefined],
+    ["completed", ["Ready for Review", "AI-Needs-Human"], "merged", undefined],
+    ["started", ["AI-Working", "AI-Needs-Human", "Ready for Review"], "failed", "AI-Needs-Human"],
+    ["started", ["AI-Working", "Ready for Review"], "pr-ready", "Ready for Review"],
+    ["started", ["Plan-Complete", "AI-Working"], "implementing", "AI-Working"],
+    ["started", ["AI-Planning", "Plan-Complete"], "plan-approved", "Plan-Complete"],
+    ["started", ["AI-Planning"], "planning", "AI-Planning"],
+    ["started", ["AI-Implement"], "ready", "AI-Implement"],
+  ] as const)("normalizes %s with %j", async (type, names, state, first) => {
+    const labels = ["other", ...names, "last"];
+    linear(page([node(type, labels)]), page());
+    const result = await new LinearProvider({ linearWorkspaceUrl: "https://linear.app/acme" }).listIssueStatuses(mapping);
+    if (!state) {
+      expect(result).toEqual([]);
+      expect(result[0]?.state).toBeUndefined();
+      expect(result[0]?.labels[0]).toBeUndefined();
+      expect(result[0]?.phase).toBeUndefined();
+      return;
+    }
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ id: "uuid", identifier: "ENG-1", title: "Status",
+      url: "https://linear.app/acme/issue/ENG-1", state, phase: null,
+      workflowState: "Workflow", updatedAt: Date.parse("2026-01-01T12:00:00Z") });
+    expect(result[0].labels[0]).toBe(first);
+    expect(result[0].labels).toEqual(first ? [first, ...labels.filter(l => l !== first)] : []);
+  });
+
+  it("filters both reads by team and live pickup, with a seven-day completedAt window", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-01-10T00:00:00Z"));
+    const setting = vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("First");
+    const fake = linear(page(), page(), page(), page());
+    const provider = new LinearProvider({});
+    await provider.listIssueStatuses(mapping);
+    setting.mockReturnValue("Second");
+    await provider.listIssueStatuses(mapping);
+    fake.calls.forEach((call, i) => {
+      const { query, variables: vars } = JSON.parse(call.body);
+      expect(query).toContain("team: { key: { eq: $teamKey } }");
+      expect(query).toContain("labels: { name: { eq: $label } }");
+      expect(query).toContain("id identifier title url updatedAt state { name type } labels { nodes { name } }");
+      expect(vars).toEqual({ teamKey: "ENG", label: i < 2 ? "First" : "Second", first: 100, after: null,
+        ...(i % 2 ? { since: new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString() } : {}) });
+      expect(query).toContain(i % 2 ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }');
+    });
+  });
+
+  it.each([false, true])("omits duplicate issues from either query (recent=%s)", async recent => {
+    const duplicate = page([node("duplicate", ["AI-Implement", "AI-Planning"])]);
+    linear(...(recent ? [page(), duplicate] : [duplicate, page()]));
+    expect(await new LinearProvider({}).listIssueStatuses(mapping)).toEqual([]);
+  });
+
+  it("traverses both queries and deduplicates overlapping ids", async () => {
+    const fake = linear(page([node()], true, "a"), page([node("started", undefined, "second")]),
+      page([node()], true, "b"), page([node("completed", undefined, "third")]));
+    const result = await new LinearProvider({}).listIssueStatuses(mapping);
+    expect(result.map(r => r.id)).toEqual(["uuid", "second", "third"]);
+    expect(fake.calls.map((_, i) => variables(fake, i).after)).toEqual([null, "a", null, "b"]);
+  });
+
+  it.each([false, true])("accepts exactly 20 pages (recent=%s)", async recent => {
+    const pages = Array.from({ length: 20 }, (_, i) => page([node("started", undefined, String(i))], i < 19, String(i)));
+    linear(...(recent ? [page(), ...pages] : [...pages, page()]));
+    expect(await new LinearProvider({}).listIssueStatuses(mapping)).toHaveLength(20);
+  });
+
+  it.each([false, true])("rejects a 21-page result without returning partial data (recent=%s)", async recent => {
+    const pages = Array.from({ length: 21 }, (_, i) => page([node()], true, String(i)));
+    const fake = linear(...(recent ? [page(), ...pages] : pages));
+    await expect(new LinearProvider({}).listIssueStatuses(mapping)).rejects.toThrow(/exceeded 20 pages/);
+    expect(fake.calls).toHaveLength(recent ? 21 : 20);
+  });
+
+  it("rejects a GraphQL failure after a successful page", async () => {
+    linear(page([node()], true, "next"), { json: { errors: [{ message: "bad" }] } });
+    await expect(new LinearProvider({}).listIssueStatuses(mapping)).rejects.toThrow(/GraphQL error/);
+  });
+
+  it("rejects a next page with no cursor", async () => {
+    linear(page([node()], true));
+    await expect(new LinearProvider({}).listIssueStatuses(mapping)).rejects.toThrow(/cursor/);
+  });
+
+  it.each(["auth", "team"])("rejects missing %s before fetching", async missing => {
+    const fake = linear();
+    const provider = new LinearProvider({});
+    if (missing === "auth") __resetLinearAuthForTest();
+    await expect(provider.listIssueStatuses(missing === "team" ? makeMapping({ teamKey: "" }) : mapping))
+      .rejects.toBeInstanceOf(TrackerUnavailableError);
+    expect(fake.calls).toHaveLength(0);
   });
 });
