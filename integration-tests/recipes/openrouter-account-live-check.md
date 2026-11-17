@@ -17,6 +17,10 @@ and uses the project secret `OPENROUTER_TEST_API_KEY` already configured on AII.
 2. Read the **runner log**. While the session machine still exists, call
    `get_session_machine` for that run with `logLines` set to include the verify
    output. Capture the result before the machine is removed.
+   Retain a sanitized log link, run identifier, UTC timestamp, tested revision
+   (the final combined parent feature-branch SHA), actual `codex --version`,
+   selected model, and exact result lines in the shared evidence section and
+   this recipe. Record any observed failure with its actual fix-issue link.
 3. Find the exact result line below. No OpenRouter request should be run from
    the build-agent sandbox; the real evidence comes from this AII run.
 

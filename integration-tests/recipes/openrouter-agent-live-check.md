@@ -18,6 +18,11 @@ account and the pinned Codex with the open model
 2. Read the **runner log**. While the session machine exists, call
    `get_session_machine` for the run with `logLines` covering verify output.
    Capture the log before the machine is removed.
+   Retain a sanitized log link, run identifier, UTC timestamp, tested revision
+   (the final combined parent feature-branch SHA), actual `codex --version`,
+   selected model, and exact result lines for both calls in the shared evidence
+   section and this recipe. Record any observed failure with its actual
+   fix-issue link.
 3. Find both agent-check lines. Subsequent verify passes should report
    `openrouter-agent-live-check: skipped (ran before in this run)`.
 

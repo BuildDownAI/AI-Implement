@@ -180,9 +180,33 @@ not execution records.
 
 To close this evidence gap, retain a sanitized runner-log excerpt for each check
 and link it here and in its recipe. Include the run identifier, timestamp,
-pinned Codex version, selected model, and exact result lines. Record failures
+pinned Codex version, selected model, tested revision (the final combined parent
+feature-branch SHA), and exact result lines. Record failures
 with their actual fix-issue links under AII-1949; a skip or unrelated process
 failure cannot establish provider access or authentication refusal. No live
 provider defect or linked fix issue can be asserted from the evidence currently
 available. This evidence requirement remains unmet; merging code alone does not
 satisfy it.
+
+### AII-1970 local verification attempt (blocked)
+
+On 2026-11-17 at 04:44 UTC, `sh scripts/ci/ai-verify.sh` was executed in the
+implementation sandbox against revision
+`dceffd4a3177f71366850701cf14b74ea46a8768`, using Node `v24.22.3`.
+The locally installed binary reported `codex-cli 0.159.2`; no Codex model was
+invoked and no authorized AII runner identifier or runner-log link was available.
+The hook exited 0 with these exact results:
+
+```text
+openrouter-live-check: skipped (no key)
+openrouter-account-live-check: skipped (tsx not found)
+openrouter-agent-live-check: skipped (tsx not found)
+```
+
+`OPENROUTER_TEST_API_KEY` was absent. The hook's tsx probe also failed:
+`npx --no-install tsx --version` reported tsx `v4.23.12`, then an `EPERM`
+error when opening its IPC socket in this sandbox. Thus “tsx not found” here
+does not mean the dependency is absent. These skips establish neither provider
+acceptance nor authentication refusal. No live provider defect or fix issue
+was established. Completion still requires the authorized runner observations
+and sanitized log links above; this local attempt does not close AII-1970.
