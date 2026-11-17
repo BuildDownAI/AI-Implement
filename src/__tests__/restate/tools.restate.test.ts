@@ -584,10 +584,10 @@ describe("orchestratorTools (Restate)", () => {
       };
       setReviewFixAttemptsFacade(facade);
       try {
-        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]) {
           const denied = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
             caller: { kind: "human", email: "reader@example.com", role: "user" },
-            args: { attemptId: "exact-attempt" },
+            args: name === "get_fly_setup" ? {} : { attemptId: "exact-attempt" },
           });
           expect(denied.isError).toBe(true);
           expect(denied.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -629,7 +629,7 @@ describe("orchestratorTools (Restate)", () => {
         const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
         expect(response.ok).toBe(true);
         const catalog = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
-        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]) {
           expect(catalog.handlers.find((h) => h.name === name)?.metadata).toMatchObject({
             "mcp.type": "tool", "mcp.role": "admin",
           });
