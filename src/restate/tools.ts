@@ -1094,7 +1094,7 @@ export const listOpenPullsTool = tool(
     operation: "read",
   },
   async (ctx): Promise<ToolResponse> => {
-    const entries = await ctx.run("list-open-pulls", () => listOpenPulls());
+    const entries = await ctx.run("list-open-pulls", () => listOpenPulls(), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(entries) }] };
   },
 );
@@ -1113,7 +1113,7 @@ export const listIssueStatusesTool = tool(
     const entries = await ctx.run("list-issue-statuses", () => listIssueStatuses({
       providerFor: (m) => providerRegistryForTools().forMapping(m),
       now: Date.now,
-    }));
+    }), { maxRetryAttempts: 1 });
     return { content: [{ type: "text", text: JSON.stringify(entries) }] };
   },
 );
