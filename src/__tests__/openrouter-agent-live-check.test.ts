@@ -23,7 +23,7 @@ function fixture(outcomes: Array<{ code?: number; text?: string; stderr?: string
     queueMicrotask(() => {
       if (scenario.hang) return;
       if (scenario.missing) { child.emit("error", Object.assign(new Error(key), { code: "ENOENT" })); return; }
-      child.stdout.emit("data", Buffer.from(scenario.error ? JSON.stringify({ type: "error", message: "refused" }) + "\n" : answer(scenario.text ?? "")));
+      child.stdout.emit("data", Buffer.from(scenario.error ? JSON.stringify({ type: "error", message: scenario.stderr ?? "refused" }) + "\n" : answer(scenario.text ?? "")));
       child.stderr.emit("data", Buffer.from(scenario.stderr ?? ""));
       child.emit("close", scenario.code ?? 0);
     });
@@ -62,7 +62,11 @@ describe("OpenRouter agent live check", () => {
   });
   it.each([
     { scenario: { code: 1, stderr: "unauthorized" }, expected: "refused as expected (exit 1): unauthorized" },
-    { scenario: { error: true }, expected: "refused as expected (exit 0): refused" },
+    { scenario: { error: true, stderr: "Invalid API key" }, expected: "refused as expected (exit 0): Invalid API key" },
+    { scenario: { code: 1, stderr: "connection timed out" }, expected: "fail (no authentication refusal, exit 1): connection timed out" },
+    { scenario: { code: 2, stderr: "unexpected argument --ignore-rules" }, expected: "fail (no authentication refusal, exit 2): unexpected argument --ignore-rules" },
+    { scenario: { error: true }, expected: "fail (no authentication refusal, exit 0): refused" },
+    { scenario: { code: 1, stderr: "HTTP 401 Unauthorized" }, expected: "refused as expected (exit 1): HTTP 401 Unauthorized" },
     { scenario: { text: "OK" }, expected: "fail (wrong key was accepted)" },
     { scenario: { text: "" }, expected: "fail (no OK in the answer)" },
     { scenario: { missing: true }, expected: "skipped (binary not found)" },

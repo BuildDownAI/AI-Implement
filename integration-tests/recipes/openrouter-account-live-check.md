@@ -27,3 +27,13 @@ and uses the project secret `OPENROUTER_TEST_API_KEY` already configured on AII.
 - A fail line records a live finding for follow-up under AII-1949 and does not
   fail the pipeline. See [live checks](../../docs/live-checks.md) for all results.
 - Logs contain no key, key fragment, request header, response body, or exception text.
+
+## Recorded observations
+
+No actual stored-account live result or captured runner-log excerpt is
+available in this checkout. The pass assertion above is an expected outcome,
+not an observed provider response.
+
+Live verification remains incomplete. See the shared [evidence status](../../docs/live-checks.md#live-observation-evidence-aii-1949)
+for the available source and missing capture requirements. No live failure or
+linked fix issue has been established from the available evidence.

@@ -104,8 +104,8 @@ omitted so a previous unrelated run cannot suppress a check.
 This proves the account code with the real key in a **temporary database**.
 It does not create an account on the deployed orchestrator or call the
 `KeyBinding` Restate object; Restate tests cover that object. Fail lines are
-observations to investigate under AII-1949. The first live result is obtained
-from the next AII run after merge; build/unit tests use fake fetch only.
+observations to investigate under AII-1949. Build/unit tests use fake fetch only;
+see the evidence status below for live verification.
 
 ## OpenRouter agent check
 
@@ -143,16 +143,44 @@ or `codex wrong-key`.
 | Good key, exit 0, answer contains OK | `pass` |
 | Good key, exit 0, no OK | `fail (no OK in the answer)` |
 | Good key, nonzero exit | `fail (exit <code>): <evidence>` |
-| Wrong key, nonzero exit or JSON error answer | `refused as expected (exit <code>): <evidence>` |
+| Wrong key, nonzero exit or JSON error with authentication refusal | `refused as expected (exit <code>): <evidence>` |
+| Wrong key, nonzero exit or JSON error without authentication refusal | `fail (no authentication refusal, exit <code>): <evidence>` |
 | Wrong key answers OK | `fail (wrong key was accepted)` |
 | Wrong key exits 0 without OK or an error | `fail (no OK in the answer)` |
 | Call exceeds 120 seconds | `fail (no answer)` |
 | Unexpected spawn failure | `fail (could not start)` |
+
+Authentication evidence must contain HTTP 401/403, unauthorized, invalid API key,
+or an authentication failed/required/error message. A CLI or network failure alone
+does not prove that the provider refused the key.
 
 Evidence is the last nonempty error-output line (or the Codex JSON error when
 stderr is empty), with keys and authorization headers redacted before cutting
 to 300 characters. Answer text is read from completed agent-message events,
 not a search of raw JSON. This check is **report-only**: outcomes and script
 exceptions do not change the hook's exit code of 0. A fail is a live finding for
-follow-up under AII-1949. Unit tests use fake processes; the first live result
-comes from the next AII run after merge.
+follow-up under AII-1949. Unit tests use fake processes; they do not establish
+provider access. See the evidence status below.
+
+## Live observation evidence (AII-1949)
+
+Completion is **blocked on captured runner-log evidence**. The following records
+separate the historical observation supplied in the
+[AII-1949 issue](https://linear.app/eudoxus/issue/AII-1949) from results that have
+not been observed. Expected result lines in the tables above are specifications,
+not execution records.
+
+| Check | Observed result | Evidence available in this checkout |
+| --- | --- | --- |
+| Key (AII-1907) | The parent issue reports `openrouter-live-check: pass` on 2026-11-14. | Issue report only; no captured runner log or run identifier supplied. Not independently verified here. |
+| Stored account (AII-1952) | No live observation available. | No captured runner log supplied. Temporary-account unit tests do not prove provider acceptance. |
+| Codex (AII-1953) | No live observation available for either the real-key or wrong-key call. | No captured runner log supplied. Fake-process tests do not prove pinned Codex or model compatibility. |
+
+To close this evidence gap, retain a sanitized runner-log excerpt for each check
+and link it here and in its recipe. Include the run identifier, timestamp,
+pinned Codex version, selected model, and exact result lines. Record failures
+with their actual fix-issue links under AII-1949; a skip or unrelated process
+failure cannot establish provider access or authentication refusal. No live
+provider defect or linked fix issue can be asserted from the evidence currently
+available. This evidence requirement remains unmet; merging code alone does not
+satisfy it.

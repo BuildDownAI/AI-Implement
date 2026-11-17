@@ -81,7 +81,11 @@ export async function runOpenRouterAgentLiveCheck({ env = process.env, spawn = n
               finish(`fail (not sent): ${evidence}`); return;
             }
             if (name === "codex wrong-key") {
-              finish(code !== 0 || parser.terminalStatus?.isError ? `refused as expected (exit ${code}): ${evidence}`
+              // A process failure alone does not prove that OpenRouter rejected the key.
+              const authenticationRefusal = /\b(?:401|403|unauthorized)\b|\binvalid[ _-]+api[ _-]+key\b|\bauthentication\s+(?:failed|required|error)\b/i.test(errorOutput);
+              finish(code !== 0 || parser.terminalStatus?.isError ? authenticationRefusal
+                ? `refused as expected (exit ${code}): ${evidence}`
+                : `fail (no authentication refusal, exit ${code}): ${evidence}`
                 : ok ? "fail (wrong key was accepted)" : "fail (no OK in the answer)");
             } else finish(code !== 0 ? `fail (exit ${code}): ${evidence}` : ok ? "pass" : "fail (no OK in the answer)");
           });
