@@ -1475,7 +1475,7 @@ export const projectsScript = `
         status.style.color = 'var(--st-warn-fg, #c80)';
       } else {
         status.textContent = 'Valid';
-        status.style.color = 'var(--st-ok-fg, #2a8)';
+        status.style.color = 'var(--st-success-fg)';
       }
     } catch (err) {
       status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));

@@ -34,7 +34,7 @@ export const deploymentsHtml = `
       <div class="card-body" style="padding: 12px 16px">
         <div class="kpi-label" style="margin-bottom: 4px">Watching</div>
         <div id="deployments-watched-source-value" style="font-size: 14px; font-family: var(--font-mono)">—</div>
-        <div id="deployments-downgrade-warn" class="kpi-trend" style="color: var(--color-warn); margin-top: 4px" hidden>
+        <div id="deployments-downgrade-warn" class="kpi-trend" style="color: var(--st-warn-fg); margin-top: 4px" hidden>
           ⚠ This ref is behind the running commit — deploying it is a downgrade.
         </div>
         <div style="margin-top: 8px">
@@ -126,7 +126,7 @@ export const deploymentsHtml = `
         </div>
         <div class="kpi-trend text-secondary" id="deployments-retention-applies" style="margin-top: 8px"></div>
         <div class="kpi-trend text-secondary" id="deployments-retention-applied" style="margin-top: 4px"></div>
-        <div class="kpi-trend" id="deployments-retention-error" style="color: var(--color-warn); margin-top: 4px" hidden></div>
+        <div class="kpi-trend" id="deployments-retention-error" style="color: var(--st-warn-fg); margin-top: 4px" hidden></div>
         <div style="margin-top: 12px">
           <button class="btn btn-primary btn-sm" id="deployments-retention-save" onclick="window.saveRetention()" disabled>Save</button>
         </div>
@@ -356,7 +356,7 @@ export const deploymentsScript = `
   function setReservationMessage(text, isError) {
     const el = document.getElementById('reservations-message');
     el.textContent = text || '';
-    el.style.color = isError ? 'var(--color-warn)' : '';
+    el.style.color = isError ? 'var(--st-warn-fg)' : '';
     el.hidden = !text;
   }
 

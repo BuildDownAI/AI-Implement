@@ -7,6 +7,7 @@ import { deploymentsScript } from "../pages/deployments.js";
 import { issuesScript } from "../pages/issues.js";
 import { kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { overviewScript } from "../pages/overview.js";
+import { reaperScript } from "../pages/reaper.js";
 
 /** Runs helpers.ts in a page of its own, as the admin page runs it ahead of every other script. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -339,6 +340,7 @@ describe("pages on the shared helpers", () => {
     ["blockers", blockersScript],
     ["deployments", deploymentsScript],
     ["kg-pipelines", kgPipelinesScript],
+    ["reaper", reaperScript],
   ];
   const onSharedTime: [string, string][] = [
     ["overview", overviewScript],
