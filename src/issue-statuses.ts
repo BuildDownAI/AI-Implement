@@ -38,7 +38,8 @@ export async function listIssueStatuses(deps: IssueStatusesDeps): Promise<IssueS
   `);
   const entries: IssueStatusEntry[] = [];
   const teams = new Map<string, string>();
-  for (const [teamKey, mapping] of Object.entries(getMappings()).sort(([a], [b]) => a.localeCompare(b))) {
+  for (const [teamKey, storedMapping] of Object.entries(getMappings()).sort(([a], [b]) => a.localeCompare(b))) {
+    const mapping = { ...storedMapping, teamKey };
     const provider = await deps.providerFor(mapping);
     if (!provider.listIssueStatuses) {
       throw new Error(`tracker ${mapping.ticketingConfig.kind} for ${teamKey} cannot list issue statuses`);

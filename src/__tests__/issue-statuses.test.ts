@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { IssueStatusRecord, TicketingProvider } from "../providers/types.js";
 import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 import { FakeProvider } from "./providers/fake.js";
 
@@ -34,6 +35,46 @@ async function setup() {
 
 describe("listIssueStatuses", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("passes each stored team's key to provider resolution and status reads", async () => {
+    const s = await setup();
+    s.config.upsertMapping("B", makeMapping());
+    s.read.mockResolvedValue([]);
+    await s.list();
+    for (const [index, teamKey] of ["A", "B"].entries()) {
+      const mapping = { ...s.config.getMappings()[teamKey], teamKey };
+      expect(s.deps.providerFor).toHaveBeenNthCalledWith(index + 1, mapping);
+      expect(s.read).toHaveBeenNthCalledWith(index + 1, mapping);
+    }
+  });
+
+  it("reads persisted mappings through the real Linear provider with scoped GraphQL requests", async () => {
+    const { modules: s } = await testDb({ modules: {
+      config: () => import("../config.js"),
+      statuses: () => import("../issue-statuses.js"),
+      auth: () => import("../linear-app-auth.js"),
+      linear: () => import("../providers/linear.js"),
+    } });
+    s.config.upsertMapping("ENG", makeMapping());
+    expect(s.config.getMappings().ENG.teamKey).toBeUndefined();
+    s.auth.configureLinearAuth("client-id", "client-secret");
+    s.auth.__setLinearTokenForTest("test-token");
+    const node = { id: "internal", identifier: "ENG-1", title: "Issue", url: "https://linear.app/issue/ENG-1",
+      updatedAt: "2026-01-01T00:00:00Z", state: { name: "Todo", type: "unstarted" },
+      labels: { nodes: [{ name: "AI-Implement" }] } };
+    const fake = fakeFetch({ "POST /graphql": [
+      { json: { data: { issues: { nodes: [node], pageInfo: { hasNextPage: false, endCursor: null } } } } },
+      { json: { data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
+    ] }).install();
+    const provider = new s.linear.LinearProvider({});
+    expect(await s.statuses.listIssueStatuses({ providerFor: async () => provider, now: () => 0 })).toEqual([
+      { teamKey: "ENG", tracker: "linear", issue: { identifier: "ENG-1", title: "Issue", url: node.url },
+        state: "ready", phase: null, raw: { labels: ["AI-Implement"], workflowState: "Todo" },
+        changedAt: Date.parse(node.updatedAt) },
+    ]);
+    expect(fake.calls).toHaveLength(2);
+    for (const call of fake.calls) expect(JSON.parse(call.body).variables.teamKey).toBe("ENG");
+  });
 
   it.each([null, "planning", "implementation"] as const)("keeps merged state and phase %s despite parks, but still updates its time (row 1)", async (phase) => {
     const s = await setup();
