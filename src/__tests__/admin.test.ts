@@ -1,4 +1,4 @@
-import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "../restate/fly-machine-profile.js";
+import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "../fly-machine-sizing.js";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";

@@ -1,4 +1,4 @@
-import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "./restate/fly-machine-profile.js";
+import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-sizing.js";
 import { readKeyBinding } from "./key-bindings.js";
 import type { KeyBindOutcome } from "./restate/key-binding.js";
 import { MODEL_AUTH_ENV, hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
