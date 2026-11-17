@@ -814,6 +814,25 @@ describe("listIssueStatuses", () => {
     await expect(p.listIssueStatuses(config)).rejects.toThrow(/Invalid state/);
   });
 
+  it("rejects a missing configured task root", async () => {
+    const directory = join(testDir("fs-statuses-missing"), "missing");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a configured task root that is a regular file", async () => {
+    const directory = join(testDir("fs-statuses-file"), "file");
+    await writeFile(directory, "not a directory");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).rejects.toThrow("task root is not a directory");
+  });
+
+  it("allows an empty task root without optional archive directories", async () => {
+    const directory = testDir("fs-statuses-empty");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).resolves.toEqual([]);
+  });
+
   it("rejects directory read errors", async () => {
     const { directory, config, p } = await fixture();
     await task(directory, "ready");

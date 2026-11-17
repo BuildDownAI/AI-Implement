@@ -607,10 +607,13 @@ async function existingRealDirectory(path: string, strict = false): Promise<stri
   try {
     const resolved = resolve(path);
     const info = await stat(resolved);
-    if (!info.isDirectory()) return null;
+    if (!info.isDirectory()) {
+      if (strict) throw new Error(`Configured filesystem task root is not a directory: ${resolved}`);
+      return null;
+    }
     return await realpath(resolved);
   } catch (err) {
-    if (strict && !isMissing(err)) throw err;
+    if (strict) throw err;
     return null;
   }
 }
