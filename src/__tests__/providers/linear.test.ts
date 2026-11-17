@@ -1906,8 +1906,14 @@ describe("LinearProvider.listIssueStatuses", () => {
       expect(query).toContain("id identifier title url updatedAt state { name type } labels { nodes { name } }");
       expect(vars).toEqual({ teamKey: "ENG", label: i < 2 ? "First" : "Second", first: 100, after: null,
         ...(i % 2 ? { since: new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString() } : {}) });
-      expect(query).toContain(i % 2 ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled"] } }');
+      expect(query).toContain(i % 2 ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }');
     });
+  });
+
+  it.each([false, true])("omits duplicates retaining pickup and planning labels (recent=%s)", async recent => {
+    const duplicate = page([node("duplicate", ["AI-Implement", "AI-Planning"])]);
+    linear(...(recent ? [page(), duplicate] : [duplicate, page()]));
+    expect(await new LinearProvider({}).listIssueStatuses(mapping)).toEqual([]);
   });
 
   it("traverses both queries and deduplicates overlapping ids", async () => {
