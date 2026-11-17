@@ -2329,8 +2329,10 @@ describe("list_issue_statuses (AII-1966)", () => {
       issue: { identifier: "APP-1", title: "Issue", url: null },
       state: "ready", phase: null, raw: { labels: [], workflowState: null }, changedAt: 123,
     }]);
-    expect(providerFor).toHaveBeenCalledWith(mapping);
-    expect(reader).toHaveBeenCalledWith(mapping);
+    const providerMapping = { ...mapping, teamKey: "APP" };
+    expect(providerFor).toHaveBeenCalledWith(providerMapping);
+    expect(reader).toHaveBeenCalledWith(providerMapping);
+    expect(mapping.teamKey).toBeUndefined();
     expect(calls).toEqual([{ name: "list-issue-statuses", options: { maxRetryAttempts: 1 }, result: JSON.parse(result.content[0].text) }]);
   });
 
