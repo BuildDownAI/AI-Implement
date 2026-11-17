@@ -2237,9 +2237,9 @@ describe("list_open_pulls (AII-1964)", () => {
     const calls: RunCall[] = [];
     const ctx = fakeContext("list_open_pulls", calls);
     const run = ctx.run;
-    ctx.run = ((name: string, action: () => unknown) => {
+    ctx.run = ((name: string, action: () => unknown, options?: { maxRetryAttempts: number }) => {
       insideStep = true;
-      return run(name, action);
+      return run(name, action, options);
     }) as typeof ctx.run;
     const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
     expect(result.isError).toBeUndefined();
@@ -2248,7 +2248,7 @@ describe("list_open_pulls (AII-1964)", () => {
     expect(entries).toHaveLength(populated ? 1 : 0);
     if (populated) expect(entries[0]).toMatchObject({ repo: "acme/app", pr: { number: 42 } });
     expect(reader).toHaveBeenCalledTimes(1);
-    expect(calls.map(call => call.name)).toEqual(["list-open-pulls"]);
+    expect(calls).toEqual([{ name: "list-open-pulls", options: { maxRetryAttempts: 1 }, result: entries }]);
   });
 
   it("uses a recorded step result without reading the cache or GitHub again", async () => {
@@ -2258,16 +2258,25 @@ describe("list_open_pulls (AII-1964)", () => {
     const ctx = { ...fakeContext("list_open_pulls"), run } as unknown as restate.Context;
     const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
     expect(JSON.parse(result.content[0].text)).toEqual(recorded);
-    expect(run).toHaveBeenCalledWith("list-open-pulls", expect.any(Function));
+    expect(run).toHaveBeenCalledWith("list-open-pulls", expect.any(Function), { maxRetryAttempts: 1 });
     expect(reader).not.toHaveBeenCalled();
   });
 
-  it("surfaces a GitHub failure as a named tool error", async () => {
-    vi.spyOn(github, "listAllOpenPullRequests").mockRejectedValue(new Error("GitHub unavailable"));
-    const result = await tools.listOpenPullsTool(fakeContext("list_open_pulls"), { caller: HUMAN_USER, args: {} });
+  it.each(["credential", "GitHub"])("surfaces a %s failure as a named tool error with bounded retries", async (source) => {
+    const detail = `${source} unavailable`;
+    if (source === "credential") {
+      const auth = await import("../github-app-auth.js");
+      vi.mocked(auth.getInstallationToken).mockRejectedValue(new Error(detail));
+    } else {
+      vi.spyOn(github, "listAllOpenPullRequests").mockRejectedValue(new Error(detail));
+    }
+    const ctx = fakeContext("list_open_pulls");
+    const run = vi.spyOn(ctx, "run");
+    const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(run).toHaveBeenCalledWith("list-open-pulls", expect.any(Function), { maxRetryAttempts: 1 });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("list_open_pulls");
-    expect(result.content[0].text).toContain("GitHub unavailable");
+    expect(result.content[0].text).toContain(detail);
   });
 });
 
@@ -2309,9 +2318,9 @@ describe("list_issue_statuses (AII-1966)", () => {
     const calls: RunCall[] = [];
     const ctx = fakeContext("list_issue_statuses", calls);
     const run = ctx.run;
-    ctx.run = ((name: string, action: () => unknown) => {
+    ctx.run = ((name: string, action: () => unknown, options?: { maxRetryAttempts: number }) => {
       insideStep = true;
-      return run(name, action);
+      return run(name, action, options);
     }) as typeof ctx.run;
     const result = await tools.listIssueStatusesTool(ctx, { caller: HUMAN_USER, args: {} });
     expect(result.isError).toBeUndefined();
@@ -2322,7 +2331,7 @@ describe("list_issue_statuses (AII-1966)", () => {
     }]);
     expect(providerFor).toHaveBeenCalledWith(mapping);
     expect(reader).toHaveBeenCalledWith(mapping);
-    expect(calls.map(call => call.name)).toEqual(["list-issue-statuses"]);
+    expect(calls).toEqual([{ name: "list-issue-statuses", options: { maxRetryAttempts: 1 }, result: JSON.parse(result.content[0].text) }]);
   });
 
   it("returns an empty array successfully when there are no mappings", async () => {
@@ -2332,14 +2341,19 @@ describe("list_issue_statuses (AII-1966)", () => {
     expect(JSON.parse(result.content[0].text)).toEqual([]);
   });
 
-  it("surfaces a provider failure as a named tool error", async () => {
+  it.each(["resolution", "unsupported", "read"])("surfaces a provider %s failure as a named tool error with bounded retries", async (failure) => {
     vi.mocked(getMappings).mockReturnValue({ APP: makeMapping() });
-    tools.setProviderRegistry(makeRegistry({ provider: makeProvider({
-      listIssueStatuses: vi.fn().mockRejectedValue(new Error("tracker unavailable")),
-    }) }));
-    const result = await tools.listIssueStatusesTool(fakeContext("list_issue_statuses"), { caller: HUMAN_USER, args: {} });
+    const registry = makeRegistry({ provider: makeProvider({
+      listIssueStatuses: failure === "unsupported" ? undefined : vi.fn().mockRejectedValue(new Error("tracker unavailable")),
+    }) });
+    if (failure === "resolution") vi.spyOn(registry, "forMapping").mockImplementation(() => { throw new Error("provider unavailable"); });
+    tools.setProviderRegistry(registry);
+    const ctx = fakeContext("list_issue_statuses");
+    const run = vi.spyOn(ctx, "run");
+    const result = await tools.listIssueStatusesTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(run).toHaveBeenCalledWith("list-issue-statuses", expect.any(Function), { maxRetryAttempts: 1 });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("list_issue_statuses");
-    expect(result.content[0].text).toContain("tracker unavailable");
+    expect(result.content[0].text).toContain(failure === "resolution" ? "provider unavailable" : failure === "unsupported" ? "cannot list issue statuses" : "tracker unavailable");
   });
 });
