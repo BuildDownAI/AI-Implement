@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { DispatchAdmissionDeferReason } from "./dispatch-admission.js";
 import { getDb } from "./dedup.js";
 
 export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed" | "completed";
@@ -14,6 +15,8 @@ export interface CommentGapfillQueueItem {
   status: CommentGapfillStatus;
   createdAt: number;
   processedAt: number | null;
+  refusalCount: number;
+  lastRefusalReason: string | null;
 }
 
 export interface EnqueueCommentGapfillInput {
@@ -36,6 +39,8 @@ interface CommentGapfillQueueRow {
   status: CommentGapfillStatus;
   created_at: number;
   processed_at: number | null;
+  refusal_count: number;
+  last_refusal_reason: string | null;
 }
 
 function insertCommentGapfill(input: EnqueueCommentGapfillInput): boolean {
@@ -108,6 +113,8 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
     status: row.status,
     createdAt: row.created_at,
     processedAt: row.processed_at,
+    refusalCount: row.refusal_count,
+    lastRefusalReason: row.last_refusal_reason,
   };
 }
 
@@ -288,4 +295,29 @@ export function confirmCommentGapfillLaunch(dispatchId: string): void {
 export function rejectCommentGapfillLaunch(dispatchId: string, status: number): void {
   const launch = getCommentGapfillLaunch(dispatchId);
   if (launch && !launch.accepted && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, rejected: { status } }), dispatchId);
+}
+
+export const MAX_COMMENT_GAPFILL_REFUSALS = 3;
+
+/** Every dispatch keeps its original refusal across interleaved step retries. */
+export function getCommentGapfillRefusal(id: number, dispatchId: string): DispatchAdmissionDeferReason | null {
+  const row = getDb().prepare("SELECT reason FROM comment_gapfill_refusals WHERE queue_item_id = ? AND dispatch_id = ?")
+    .get(id, dispatchId) as { reason: DispatchAdmissionDeferReason } | undefined;
+  return row?.reason ?? null;
+}
+
+export function recordCommentGapfillRefusal(id: number, reason: string, dispatchId: string): void {
+  const db = getDb();
+  db.transaction(() => {
+    const inserted = db.prepare("INSERT OR IGNORE INTO comment_gapfill_refusals VALUES (?, ?, ?)").run(id, dispatchId, reason);
+    if (!inserted.changes) return;
+    db.prepare(`UPDATE comment_gapfill_queue SET
+      refusal_count = refusal_count + 1, last_refusal_reason = ?, last_refusal_dispatch_id = ?,
+      status = CASE WHEN refusal_count + 1 >= ? THEN 'skipped' ELSE 'pending' END,
+      processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+      WHERE id = ? AND status IN ('pending', 'dispatched')
+    `).run(reason, dispatchId, MAX_COMMENT_GAPFILL_REFUSALS, Date.now(), id);
+  })();
+  const item = getCommentGapfillItem(id);
+  console.log(`[comment-gapfill] Admission refused item #${id}: ${reason} (${item?.refusalCount}/${MAX_COMMENT_GAPFILL_REFUSALS}, ${item?.status})`);
 }
