@@ -154,9 +154,11 @@ Authentication evidence must contain HTTP 401/403, unauthorized, invalid API key
 or an authentication failed/required/error message. A CLI or network failure alone
 does not prove that the provider refused the key.
 
-Evidence is the last nonempty error-output line (or the Codex JSON error when
-stderr is empty), with keys and authorization headers redacted before cutting
-to 300 characters. Answer text is read from completed agent-message events,
+Authentication refusal checks inspect both stderr and the Codex JSON error,
+and use a matching authentication-error line as evidence for the wrong-key call.
+Otherwise evidence is the last nonempty stderr line (or the Codex JSON error
+when stderr is empty). Keys and authorization headers are redacted before
+cutting to 300 characters. Answer text is read from completed agent-message events,
 not a search of raw JSON. This check is **report-only**: outcomes and script
 exceptions do not change the hook's exit code of 0. A fail is a live finding for
 follow-up under AII-1949. Unit tests use fake processes; they do not establish

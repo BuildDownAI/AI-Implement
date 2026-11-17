@@ -73,8 +73,13 @@ export async function runOpenRouterAgentLiveCheck({ env = process.env, spawn = n
           child.on("close", (code) => {
             parser.end();
             const ok = /\bOK\b/.test(parser.finalMessage ?? "");
-            const errorOutput = errors || parser.toResult({ exitCode: code ?? 1 }).errorMessage || "";
-            const evidence = redactEvidence(errorOutput, [key, credential, selectedKey])
+            const structuredError = parser.toResult({ exitCode: code ?? 1 }).errorMessage || "";
+            const errorOutput = [errors, structuredError].filter(Boolean).join("\n");
+            const authenticationEvidence = errorOutput.split(/\r?\n/).find((line) =>
+              /\b(?:401|403|unauthorized)\b|\binvalid[ _-]+api[ _-]+key\b|\bauthentication\s+(?:failed|required|error)\b/i.test(line));
+            const evidenceOutput = name === "codex wrong-key" && authenticationEvidence
+              ? authenticationEvidence : errors || structuredError;
+            const evidence = redactEvidence(evidenceOutput, [key, credential, selectedKey])
               .replace(/(?:authorization|proxy-authorization)\s*:[^\r\n]*/gi, "***")
               .split(/\r?\n/).filter((line) => line.trim()).at(-1)?.slice(0, 300) ?? "";
             if (errorOutput.includes("--skip-git-repo-check") || errorOutput.includes("Not inside a trusted directory")) {
@@ -82,7 +87,7 @@ export async function runOpenRouterAgentLiveCheck({ env = process.env, spawn = n
             }
             if (name === "codex wrong-key") {
               // A process failure alone does not prove that OpenRouter rejected the key.
-              const authenticationRefusal = /\b(?:401|403|unauthorized)\b|\binvalid[ _-]+api[ _-]+key\b|\bauthentication\s+(?:failed|required|error)\b/i.test(errorOutput);
+              const authenticationRefusal = authenticationEvidence !== undefined;
               finish(code !== 0 || parser.terminalStatus?.isError ? authenticationRefusal
                 ? `refused as expected (exit ${code}): ${evidence}`
                 : `fail (no authentication refusal, exit ${code}): ${evidence}`
