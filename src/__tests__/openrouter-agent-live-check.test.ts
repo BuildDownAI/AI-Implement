@@ -71,6 +71,20 @@ describe("OpenRouter agent live check", () => {
     await f.run();
     expect(f.log.mock.calls[1]).toEqual([`openrouter-agent-live-check: codex wrong-key ${expected}`]);
   });
+  it.each([
+    "Not inside a trusted directory and --skip-git-repo-check was not specified.",
+    "Not inside a trusted directory\nlast error line",
+    "--skip-git-repo-check was not specified.\nlast error line",
+  ])("reports both calls as not sent for %s", async (stderr) => {
+    const f = fixture([{ code: 1, stderr }, { code: 1, stderr }]);
+    expect(await f.run()).toBe(0);
+    const evidence = stderr.split("\n").at(-1);
+    expect(f.log.mock.calls).toEqual([
+      [`openrouter-agent-live-check: codex fail (not sent): ${evidence}`],
+      [`openrouter-agent-live-check: codex wrong-key fail (not sent): ${evidence}`],
+    ]);
+    expect(f.log.mock.calls.flat().join("\n")).not.toContain("refused as expected");
+  });
   it.each([undefined, "override/model"])('uses shared arguments and environments with model %s', async (model) => {
     const f = fixture();
     const env = { ...f.env, OPENROUTER_TEST_MODEL: model };
