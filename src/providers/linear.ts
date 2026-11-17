@@ -272,7 +272,7 @@ export class LinearProvider implements TicketingProvider {
         issues(first: $first, after: $after, filter: {
           team: { key: { eq: $teamKey } }
           labels: { name: { eq: $label } }
-          ${recent ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }'}
+          ${recent ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled"] } }'}
         }) {
           nodes { id identifier title url updatedAt state { name type } labels { nodes { name } } }
           pageInfo { hasNextPage endCursor }
@@ -302,7 +302,7 @@ export class LinearProvider implements TicketingProvider {
     ];
     const records: IssueStatusRecord[] = [];
     for (const node of nodes.values()) {
-      if (isTerminalStateType(node.state.type) && node.state.type !== "completed") continue;
+      if (node.state.type === "canceled") continue;
       const labels = node.labels.nodes.map((l) => l.name);
       const deciding = precedence.find(([name]) => labels.includes(name)) ?? [label, "ready"];
       const completed = node.state.type === "completed";
