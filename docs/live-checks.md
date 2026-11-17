@@ -119,6 +119,7 @@ shared model environment and OpenRouter provider arguments, a read-only sandbox,
 and only `Reply with the one word OK.` on stdin. Each has a 120-second limit;
 timeout kills its process group. Temporary working directories are removed.
 No source code or issue text is sent and no workspace file is written.
+Codex starts outside a git repository on purpose, using `--skip-git-repo-check`.
 
 The default model is `deepseek/deepseek-v4.1-flash-1017`; the optional hook input
 `OPENROUTER_TEST_MODEL` overrides it. This is not an orchestrator setting.
@@ -138,6 +139,7 @@ or `codex wrong-key`.
 | Account helper failed | `openrouter-agent-live-check: skipped (no test account)` |
 | tsx unavailable in hook | `openrouter-agent-live-check: skipped (tsx not found)` |
 | Binary missing for a call | `skipped (binary not found)` |
+| Either call's error output contains `--skip-git-repo-check` or `Not inside a trusted directory` | `fail (not sent): <evidence>` |
 | Good key, exit 0, answer contains OK | `pass` |
 | Good key, exit 0, no OK | `fail (no OK in the answer)` |
 | Good key, nonzero exit | `fail (exit <code>): <evidence>` |

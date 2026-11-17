@@ -73,9 +73,13 @@ export async function runOpenRouterAgentLiveCheck({ env = process.env, spawn = n
           child.on("close", (code) => {
             parser.end();
             const ok = /\bOK\b/.test(parser.finalMessage ?? "");
-            const evidence = redactEvidence(errors || parser.toResult({ exitCode: code ?? 1 }).errorMessage || "", [key, credential, selectedKey])
+            const errorOutput = errors || parser.toResult({ exitCode: code ?? 1 }).errorMessage || "";
+            const evidence = redactEvidence(errorOutput, [key, credential, selectedKey])
               .replace(/(?:authorization|proxy-authorization)\s*:[^\r\n]*/gi, "***")
               .split(/\r?\n/).filter((line) => line.trim()).at(-1)?.slice(0, 300) ?? "";
+            if (errorOutput.includes("--skip-git-repo-check") || errorOutput.includes("Not inside a trusted directory")) {
+              finish(`fail (not sent): ${evidence}`); return;
+            }
             if (name === "codex wrong-key") {
               finish(code !== 0 || parser.terminalStatus?.isError ? `refused as expected (exit ${code}): ${evidence}`
                 : ok ? "fail (wrong key was accepted)" : "fail (no OK in the answer)");
