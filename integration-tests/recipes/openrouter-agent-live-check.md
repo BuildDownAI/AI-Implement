@@ -88,9 +88,19 @@ were addressed by [AII-1969](https://linear.app/eudoxus/issue/AII-1969)
 `--skip-git-repo-check`. An unrelated CLI refusal does not establish authentication
 refusal.
 
-**Current revision: live-evidence requirement met by Run C.** Runs A and B
-remain historical; Run C verifies the final code with the successful-terminal-event
-gate in `CodexStreamParser.terminalStatus`.
+**Current revision: live-evidence requirement met by Run C under the operator's
+explicit acceptance in AII-1971.** Runs A and B remain historical; Run C records
+operator-attested final-code execution with the successful-terminal-event gate
+in `CodexStreamParser.terminalStatus`.
+
+This is an issue-specific acceptance of the supplied evidence, not a claim that
+Run C satisfies every recipe metadata requirement. The actual `codex --version`
+output and separate pipeline run ID remain unavailable; the pinned version is
+not a substitute for observed version output. Future runs must still capture
+all metadata required by the recipes. Run B has no tested revision or model
+metadata and cannot be tied to the terminal-status gate; Run C supplies that
+revision and model, plus the operator's explicit final-code attestation. Its
+acceptance does not make Run B evidence for the current gate.
 
 Run C (project AII): the review-fix run on
 [PR #1677](https://github.com/BuildDownAI/AI-Implement/pull/1677)
