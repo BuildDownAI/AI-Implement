@@ -12,6 +12,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 |----------|--------|
 | [standing-rules.md](standing-rules.md) | The operator's rules for all design and analysis work: verify every claim in code before presenting it, do not expand the rights a deployment needs, re-evaluate ADR rules as Restate use grows |
 | [pipeline-architecture.md](pipeline-architecture.md) | The step contract, the built-in steps, how `applyWiring` supplies inputs, and how a fork overrides steps or the pipeline |
+| [spotter-status-tools.md](spotter-status-tools.md) | Spotter open PR and issue status tools, workflow rules, tracker mappings, local overlays, caches and failure semantics |
 | [review-fix-rail.md](review-fix-rail.md) | The finding ledger, the four `review_*` tables, the webhook events that feed the fix queue, and the drain loop |
 | [restate-review-fix-pilot.md](restate-review-fix-pilot.md) | Pilot setup, attempt recovery, drain and rollback procedures, automated evidence and remaining SAN checks |
 | [feature-branch-grouping.md](feature-branch-grouping.md) | Parent/child issue grouping, cascade branch creation, and automatic roll-up |

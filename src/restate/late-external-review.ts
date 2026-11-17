@@ -8,6 +8,7 @@
  * Shape follows `PlanningRun` (`planning-run-workflow.ts`, `planning-run-client.ts`): injected
  * dependencies, every external read and write inside a named `ctx.run`, waits with `ctx.sleep`.
  */
+import { LATE_EXTERNAL_REVIEW_DEADLINE_MS } from "../late-review-policy.js";
 import * as restate from "@restatedev/restate-sdk";
 import type { WorkflowContext } from "@restatedev/restate-sdk";
 import * as restateClients from "@restatedev/restate-sdk-clients";
@@ -27,12 +28,12 @@ import type { RestateService } from "./endpoint.js";
 import { restateRetentionMs } from "./retention.js";
 import { RESTATE_INGRESS_BASE_URL } from "./server.js";
 
+export { LATE_EXTERNAL_REVIEW_DEADLINE_MS } from "../late-review-policy.js";
+
 /** How often the PR is read. */
 export const LATE_EXTERNAL_REVIEW_INTERVAL_MS = 60 * 1000;
 /** A gap-fill that names its pushed head waits up to this long for the PR to show that head before it ends `superseded`. At least one tick interval. */
 export const LATE_EXTERNAL_REVIEW_HEAD_GRACE_MS = 2 * 60 * 1000;
-/** How long the workflow keeps looking before it ends `timed-out`. */
-export const LATE_EXTERNAL_REVIEW_DEADLINE_MS = 30 * 60 * 1000;
 /** A gap-fill head with no review check run at all, older than this, has no reviewer; the check counts as passed. Applies only when no earlier commit of the PR had a review run (AII-1302). */
 export const LATE_EXTERNAL_REVIEW_ABSENT_GRACE_MS = 5 * 60 * 1000;
 /** Marker of the PR comment the approve step posts; also the once-only check. */

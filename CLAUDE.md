@@ -91,6 +91,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Subsystem | Start at | Reference |
 |---|---|---|
 | Pipeline, steps, custom overrides | `src/pipeline/` | [docs/pipeline-architecture.md](docs/pipeline-architecture.md) |
+| Spotter PR and issue status read tools | `src/open-pulls.ts`, `src/issue-statuses.ts` | [docs/spotter-status-tools.md](docs/spotter-status-tools.md) |
 | Review findings → fix dispatches | `src/review-fix-queue.ts` | [docs/review-fix-rail.md](docs/review-fix-rail.md) |
 | Restate review-fix pilot setup, recovery, drain, rollback | `src/restate/review-fix-attempt.ts`, `src/restate/review-fix-pr.ts` | [docs/restate-review-fix-pilot.md](docs/restate-review-fix-pilot.md) |
 | Per-review-cycle evidence (input/output commit, dispositions, tests, verdict, usage) | `src/pipeline/cycle-summary.ts` | [docs/cycle-summary-evidence.md](docs/cycle-summary-evidence.md) |
