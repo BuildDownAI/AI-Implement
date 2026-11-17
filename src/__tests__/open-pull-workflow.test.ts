@@ -97,9 +97,9 @@ it("row 3: unfinished review-fix attempt", () => {
   attempt();
   check({ state: "active", reason: "review-fix-running" });
 });
-it("row 3: bare gap-fill admission represents active work without claiming a review fix", () => {
+it("row 3: bare gap-fill admission represents running review-fix work", () => {
   admission();
-  check({ state: "active", reason: "job-running" });
+  check({ state: "active", reason: "review-fix-running" });
 });
 it("review-fix attempt identifies the work when an admission also exists", () => {
   admission();
@@ -109,9 +109,9 @@ it("review-fix attempt identifies the work when an admission also exists", () =>
 it("admitted gap-fill takes precedence over parked", () => {
   admission();
   parked();
-  check({ state: "active", reason: "job-running" });
+  check({ state: "active", reason: "review-fix-running" });
 });
-it.each([
+it.each<Record<string, string | number | null>>([
   { released_at: 2 }, { repository: "other/repo" }, { pr_number: 43 },
 ])("released or unrelated admission has no verdict: %j", (values) => {
   admission(values);
