@@ -106,3 +106,51 @@ It does not create an account on the deployed orchestrator or call the
 `KeyBinding` Restate object; Restate tests cover that object. Fail lines are
 observations to investigate under AII-1949. The first live result is obtained
 from the next AII run after merge; build/unit tests use fake fetch only.
+
+## OpenRouter agent check
+
+After the account check, the hook runs `npx --no-install tsx
+scripts/openrouter-agent-live-check.ts` once per pipeline run, using a separate
+system temporary marker with the same run identity described above. It resolves
+the test credential with the account helper, then starts two pinned Codex calls:
+`codex` uses that credential; `codex wrong-key` uses the fixed invalid key
+`sk-or-v1-invalid`. Each starts in a fresh empty temporary directory, with the
+shared model environment and OpenRouter provider arguments, a read-only sandbox,
+and only `Reply with the one word OK.` on stdin. Each has a 120-second limit;
+timeout kills its process group. Temporary working directories are removed.
+No source code or issue text is sent and no workspace file is written.
+
+The default model is `deepseek/deepseek-v4.1-flash-1017`; the optional hook input
+`OPENROUTER_TEST_MODEL` overrides it. This is not an orchestrator setting.
+OpenRouter selects the model host; the host is **not pinned**. The test key and
+fixed prompt go to OpenRouter and its selected host. Cost per run is one small
+request and one refused request. No per-run operator step is needed.
+
+The runner log contains the following results. The first three skips produce
+one line only, with no Codex call. Otherwise each call prints its own line with
+`openrouter-agent-live-check: <call> ` as the prefix, where `<call>` is `codex`
+or `codex wrong-key`.
+
+| Outcome | Result |
+| --- | --- |
+| Missing/empty secret | `openrouter-agent-live-check: skipped (no key)` |
+| Already attempted this run | `openrouter-agent-live-check: skipped (ran before in this run)` |
+| Account helper failed | `openrouter-agent-live-check: skipped (no test account)` |
+| tsx unavailable in hook | `openrouter-agent-live-check: skipped (tsx not found)` |
+| Binary missing for a call | `skipped (binary not found)` |
+| Good key, exit 0, answer contains OK | `pass` |
+| Good key, exit 0, no OK | `fail (no OK in the answer)` |
+| Good key, nonzero exit | `fail (exit <code>): <evidence>` |
+| Wrong key, nonzero exit or JSON error answer | `refused as expected (exit <code>): <evidence>` |
+| Wrong key answers OK | `fail (wrong key was accepted)` |
+| Wrong key exits 0 without OK or an error | `fail (no OK in the answer)` |
+| Call exceeds 120 seconds | `fail (no answer)` |
+| Unexpected spawn failure | `fail (could not start)` |
+
+Evidence is the last nonempty error-output line (or the Codex JSON error when
+stderr is empty), with keys and authorization headers redacted before cutting
+to 300 characters. Answer text is read from completed agent-message events,
+not a search of raw JSON. This check is **report-only**: outcomes and script
+exceptions do not change the hook's exit code of 0. A fail is a live finding for
+follow-up under AII-1949. Unit tests use fake processes; the first live result
+comes from the next AII run after merge.
