@@ -540,6 +540,25 @@ async function checkNoSubmit(opts: DrainInput, id: number, status: string): Prom
 }
 
 describe("ImplementationRun gap-fill ingress", () => {
+  it("bounds repeated admission refusals even when the legacy gate passes", async () => {
+    seedOrigin();
+    const id = seedItem();
+    const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+    admission.acquire({ dispatchId: "held", mappingKey: "AII",
+      scope: { kind: "issue", issueScope: "AII", issueId: "other" },
+      kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
+    const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
+    submit.mockImplementation(async (_key, input) => {
+      await deps.reserve(input);
+      return { status: "accepted" };
+    });
+    for (let tick = 0; tick < 4; tick++) await drain.drainCommentGapfillQueue(optsFor(mapping));
+    expect(submit).not.toHaveBeenCalled();
+    expect(queue.getCommentGapfillItem(id)).toMatchObject({
+      status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity",
+    });
+  });
+
   for (const lifecycle of [null, "legacy", "restate"] as const) {
     it.each([
       ["default", "github-actions", "github-actions"],
@@ -586,6 +605,45 @@ describe("ImplementationRun gap-fill ingress", () => {
     if (status === "unavailable") expect(lines).toHaveBeenCalledWith("[comment-gapfill] Gap-fill for PR #42 skipped: Restate unavailable");
     if (status === "not-found") expect(lines).toHaveBeenCalledWith("[comment-gapfill] Gap-fill for PR #42 skipped: the ImplementationRun service is not registered");
     if (status === "conflict") expect(lines).toHaveBeenCalledWith(`[comment-gapfill] Existing ImplementationRun owns dispatch=${submit.mock.calls[0]![0]}`);
+  });
+
+
+  it("previews budget exhaustion without spending admission and parks the PR", async () => {
+    seedOrigin();
+    const id = seedItem({ commentId: -999 });
+    const held = admission.acquire({ dispatchId: "spent", mappingKey: "AII",
+      scope: { kind: "pr", issueId: "issue-1", installationId: "778899", repository: "acme/billing", prNumber: 42 },
+      kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 2 });
+    if (!held.ok) throw new Error("fixture refused");
+    admission.release("spent", held.record.lifecycleOwner, held.record.generation, "finalized");
+    const opts = optsFor(makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 1 }));
+    await drain.drainCommentGapfillQueue(opts);
+    expect(submit).not.toHaveBeenCalled();
+    expect(queue.getCommentGapfillItem(id)).toMatchObject({ refusalCount: 1, lastRefusalReason: "budget_exhausted" });
+    expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
+    expect(opts.postComment).toHaveBeenCalledTimes(1);
+    expect(admission.read("spent")?.releasedAt).not.toBeNull();
+    expect(admission.count("AII")).toBe(0);
+  });
+
+  it("stops after three post-submit race refusals and preserves skipped on acceptance", async () => {
+    seedOrigin();
+    const id = seedItem();
+    const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+    const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
+    submit.mockImplementation(async (_key, input) => {
+      const held = admission.acquire({ dispatchId: "competitor", mappingKey: "AII",
+        scope: { kind: "issue", issueScope: "AII", issueId: "other" },
+        kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
+      if (!held.ok) throw new Error("fixture refused");
+      expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
+      expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
+      admission.release("competitor", held.record.lifecycleOwner, held.record.generation, "finalized");
+      return { status: "accepted" };
+    });
+    for (let tick = 0; tick < 4; tick++) await drain.drainCommentGapfillQueue(optsFor(mapping));
+    expect(submit).toHaveBeenCalledTimes(3);
+    expect(queue.getCommentGapfillItem(id)).toMatchObject({ status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity" });
   });
 
   it("Restate unavailable leaves pending with no reservation or installation lookup", async () => {
@@ -687,7 +745,7 @@ describe("ImplementationRun gap-fill ingress", () => {
       expect(admission.acquire({ dispatchId: "competing-run", mappingKey: "AII",
         scope: { kind: "issue", issueScope: "AII", issueId: "other" },
         kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 }).ok).toBe(true);
-      expect(await deps.reserve(input)).toBe(false);
+      expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
       return { status: "accepted" };
     });
     await drain.drainCommentGapfillQueue(optsFor(mapping));
@@ -720,7 +778,7 @@ describe("ImplementationRun gap-fill ingress", () => {
       kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
     expect(held.ok).toBe(true);
     const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
-    expect(await deps.reserve(submit.mock.calls[0]![1])).toBe(false);
+    expect(await deps.reserve(submit.mock.calls[0]![1])).toEqual({ ok: false, reason: "at_capacity" });
     expect(queue.getCommentGapfillItem(id)?.status).toBe("pending");
   });
 });
@@ -735,4 +793,49 @@ it("selects integration-review plus deduplicated effective gating reviewers only
   expect(drain.rollupReviewMode(queue.ROLLUP_REVIEW_COMMENTER, makeMapping({ reviewers: [
     { id: "integration-review", gates: true }, { id: "code-review", gates: true }, { id: "optional", gates: false },
   ] }))?.reviewers).toEqual([{ id: "integration-review", gates: true }, { id: "code-review", gates: true }]);
+});
+
+
+describe("shared admission preview policy", () => {
+  function request(overrides: Partial<import("../dispatch-admission.js").DispatchAdmissionRequest> = {}): import("../dispatch-admission.js").DispatchAdmissionRequest {
+    return { dispatchId: "preview", mappingKey: "AII", kind: "gap-fill", backend: "github-actions",
+      lifecycleOwner: { kind: "restate", attemptId: "preview" }, cap: 1, prDispatchBudget: 1,
+      scope: { kind: "pr", issueId: "issue", installationId: "123", repository: "acme/billing", prNumber: 42 }, ...overrides };
+  }
+
+  it.each([
+    { name: "occupied precedes budget, park and capacity", occupied: true, budget: true, parked: true, cap: 0, humanRequested: false, reason: "occupied" },
+    { name: "budget precedes park and capacity", occupied: false, budget: true, parked: true, cap: 0, humanRequested: false, reason: "budget_exhausted" },
+    { name: "park precedes capacity", occupied: false, budget: false, parked: true, cap: 0, humanRequested: false, reason: "parked" },
+    { name: "human bypasses budget and park", occupied: false, budget: true, parked: true, cap: 1, humanRequested: true, reason: null },
+    { name: "human cannot bypass occupancy", occupied: true, budget: true, parked: true, cap: 1, humanRequested: true, reason: "occupied" },
+    { name: "human cannot bypass capacity", occupied: false, budget: true, parked: true, cap: 0, humanRequested: true, reason: "at_capacity" },
+  ])("$name without changing admission or budget rows", async ({ occupied, budget, parked, cap, humanRequested, reason }) => {
+    const { getDb } = await import("../dedup.js");
+    if (occupied || budget) {
+      expect(admission.acquire(request({ dispatchId: "seed" })).ok).toBe(true);
+      if (!occupied) admission.releaseByDispatchId("seed", "finalized");
+    }
+    const snapshot = () => ["dispatch_admissions", "dispatch_budget_entries"].map(table => getDb().prepare(`SELECT * FROM ${table} ORDER BY dispatch_id`).all());
+    const before = snapshot();
+    const req = request({ parked, cap, humanRequested });
+    const preview = admission.checkAdmission(req);
+    expect(preview).toMatchObject(reason ? { ok: false, reason } : { ok: true });
+    expect(snapshot()).toEqual(before);
+    const acquired = admission.acquire(req);
+    expect(acquired.ok).toBe(preview.ok);
+    if (!acquired.ok) expect(acquired).toEqual(preview);
+  });
+
+  it("previews an existing dispatch idempotently before all refusal checks", async () => {
+    const { getDb } = await import("../dedup.js");
+    const acquired = admission.acquire(request());
+    expect(acquired.ok).toBe(true);
+    const snapshot = () => ["dispatch_admissions", "dispatch_budget_entries"].map(table => getDb().prepare(`SELECT * FROM ${table}`).all());
+    const before = snapshot();
+    const req = request({ cap: 0, parked: true, prDispatchBudget: 0 });
+    expect(admission.checkAdmission(req)).toEqual(admission.acquire(req));
+    expect(admission.checkAdmission(req)).toMatchObject({ ok: true, record: acquired.ok ? acquired.record : undefined });
+    expect(snapshot()).toEqual(before);
+  });
 });

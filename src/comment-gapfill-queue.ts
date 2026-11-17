@@ -14,6 +14,8 @@ export interface CommentGapfillQueueItem {
   status: CommentGapfillStatus;
   createdAt: number;
   processedAt: number | null;
+  refusalCount: number;
+  lastRefusalReason: string | null;
 }
 
 export interface EnqueueCommentGapfillInput {
@@ -36,6 +38,8 @@ interface CommentGapfillQueueRow {
   status: CommentGapfillStatus;
   created_at: number;
   processed_at: number | null;
+  refusal_count: number;
+  last_refusal_reason: string | null;
 }
 
 function insertCommentGapfill(input: EnqueueCommentGapfillInput): boolean {
@@ -108,6 +112,8 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
     status: row.status,
     createdAt: row.created_at,
     processedAt: row.processed_at,
+    refusalCount: row.refusal_count,
+    lastRefusalReason: row.last_refusal_reason,
   };
 }
 
@@ -288,4 +294,21 @@ export function confirmCommentGapfillLaunch(dispatchId: string): void {
 export function rejectCommentGapfillLaunch(dispatchId: string, status: number): void {
   const launch = getCommentGapfillLaunch(dispatchId);
   if (launch && !launch.accepted && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, rejected: { status } }), dispatchId);
+}
+
+export const MAX_COMMENT_GAPFILL_REFUSALS = 3;
+
+/** A late Restate step retry counts once per dispatch. Advance the ingress CAS token. */
+export function recordCommentGapfillRefusal(id: number, reason: string, dispatchId: string): void {
+  getDb().prepare(`
+    UPDATE comment_gapfill_queue SET
+      refusal_count = refusal_count + 1, last_refusal_reason = ?,
+      last_refusal_dispatch_id = ?,
+      status = CASE WHEN refusal_count + 1 >= ? THEN 'skipped' ELSE 'pending' END,
+      processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+    WHERE id = ? AND status IN ('pending', 'dispatched')
+      AND last_refusal_dispatch_id IS NOT ?
+  `).run(reason, dispatchId, MAX_COMMENT_GAPFILL_REFUSALS, Date.now(), id, dispatchId);
+  const item = getCommentGapfillItem(id);
+  console.log(`[comment-gapfill] Admission refused item #${id}: ${reason} refusals=${item?.refusalCount} status=${item?.status}`);
 }

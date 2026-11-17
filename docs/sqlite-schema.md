@@ -238,3 +238,18 @@ the scorecard counts historical resolved rows without evidence as ignored.
 with a primary key on dispatch and finding. Ingestion writes it atomically with
 the finding so callback retries reuse the original revision, while a new dispatch
 can reopen a resolved finding and clear stale fixed credit.
+
+
+## Comment gap-fill refusal tracking (AII-1981)
+
+`getDb()` checks `PRAGMA table_info(comment_gapfill_queue)` and adds missing
+columns with `ALTER TABLE ... ADD COLUMN`. Repeated boots preserve existing rows.
+
+| Column | Definition | Purpose |
+| --- | --- | --- |
+| `refusal_count` | `INTEGER NOT NULL DEFAULT 0` | Admission refusals; the third skips the row |
+| `last_refusal_reason` | `TEXT`, nullable | Latest admission refusal, retained when skipped |
+| `last_refusal_dispatch_id` | `TEXT`, nullable | Prevent counting a retried reservation step twice |
+
+Old rows start with zero refusals and null reason/dispatch identity. Rollback
+leaves these additive columns in place.

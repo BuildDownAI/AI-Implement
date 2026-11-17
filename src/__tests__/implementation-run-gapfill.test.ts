@@ -21,7 +21,7 @@ vi.mock("../restate/implementation-launch-intent.js", () => ({ implementationInt
 }) }));
 // Composition tests isolate ownership; the SQLite integration cases below restore the real port.
 vi.mock("../restate/implementation-run-owner.js", () => ({
-  requireImplementationRunOwner: (input: ImplementationRunInput) => ({ input, generation: 3, createdAt: 1000, jobId: null, state: "launching" }),
+  requireImplementationRunOwner: vi.fn((input: ImplementationRunInput) => ({ input, generation: 3, createdAt: 1000, jobId: null, state: "launching" })),
   updateImplementationRunOwner: vi.fn(),
   readImplementationRunOwner: (id: string) => ordinaryIntents.get(`owner:${id}`)?.snapshot ?? null,
   releaseImplementationRunOwner: vi.fn(),
@@ -31,8 +31,8 @@ vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...awa
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), ROLLUP_REVIEW_COMMENTER: "ai-implement-rollup-review", CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
-vi.mock("../comment-gapfill-drain.js", async original => ({ ...await original<typeof import("../comment-gapfill-drain.js")>(), buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), ROLLUP_REVIEW_COMMENTER: "ai-implement-rollup-review", CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), recordCommentGapfillRefusal: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-drain.js", async original => ({ ...await original<typeof import("../comment-gapfill-drain.js")>(), firePrBudgetPark: vi.fn(), buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), setJobMachineId: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn(async () => ({ token: "TOKEN-SENTINEL" })) }));
 vi.mock("../github.js", async original => ({ ...await original<object>(), dispatchWorkflow: vi.fn(), getWorkflowRunStatus: vi.fn(async () => null), cancelWorkflowRun: vi.fn(async () => true) }));
@@ -46,10 +46,11 @@ vi.mock("../runner-tokens.js", () => ({ mintLaunchTokens: vi.fn(() => ({ runToke
 vi.mock("../base-branch.js", async original => ({ ...await original<object>(), postBranchComment: vi.fn() }));
 vi.mock("../dedup.js", () => ({ markDispatched: vi.fn() }));
 import { createProductionImplementationRunServices, createImplementationFindExistingRun } from "../restate/implementation-run-production.js";
+import { requireImplementationRunOwner } from "../restate/implementation-run-owner.js";
 import { acquire, read } from "../dispatch-admission.js";
 import { acquireDispatch } from "../dispatch-gate.js";
-import { getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
-import { resolveManagedDecision, buildCommentGapfillInstruction } from "../comment-gapfill-drain.js";
+import { getCommentGapfillItem, markCommentGapfillProcessed, recordCommentGapfillRefusal } from "../comment-gapfill-queue.js";
+import { firePrBudgetPark, resolveManagedDecision, buildCommentGapfillInstruction } from "../comment-gapfill-drain.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill } from "../gapfill-launch.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, updateJobPrUrl, attachJobRunIdIfMissing, suppressStaleNotifications } from "../log.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
@@ -143,10 +144,36 @@ it("first launch accepts GitHub repository casing differences", async () => {
   expect(await d.findExistingRun(run, 1999)).toBeNull();
   expect(await d.launch(run)).toEqual({ outcome: "accepted", jobId: "88" });
 });
-it.each(["parked", "budget_exhausted", "occupied", "at_capacity"])("reserve refusal %s restores pending", async reason => {
+it.each(["parked", "budget_exhausted", "occupied", "at_capacity"])("production reserve returns %s without requiring an owner", async reason => {
   vi.mocked(acquire).mockReturnValue({ ok: false, reason } as never);
-  expect(await d.reserve(run)).toBe(false);
-  expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "pending");
+  expect(await d.reserve(run)).toEqual({ ok: false, reason });
+  expect(requireImplementationRunOwner).not.toHaveBeenCalled();
+  expect(recordCommentGapfillRefusal).toHaveBeenCalledWith(1, reason, run.dispatchId);
+  if (reason === "budget_exhausted") expect(firePrBudgetPark).toHaveBeenCalled();
+  else expect(firePrBudgetPark).not.toHaveBeenCalled();
+});
+it("the workflow journals the production refusal and logs its reason", async () => {
+  vi.mocked(acquire).mockReturnValueOnce({ ok: false, reason: "occupied", count: 1, cap: 1 });
+  const { createImplementationRunWorkflow } = await vi.importActual<typeof import("../restate/implementation-run-workflow.js")>("../restate/implementation-run-workflow.js");
+  const journal = new Map<string, unknown>();
+  const log = vi.fn();
+  const ctx = {
+    key: run.dispatchId, set: vi.fn(), console: { log },
+    run: async (name: string, effect: () => unknown) => {
+      const result = await effect();
+      journal.set(name, structuredClone(result));
+      return result;
+    },
+  } as unknown as import("@restatedev/restate-sdk").WorkflowContext;
+  const workflow = createImplementationRunWorkflow({ ...d, retentionMs: 1000 }) as unknown as {
+    workflow: { run(ctx: import("@restatedev/restate-sdk").WorkflowContext, input: ImplementationRunInput): Promise<unknown> };
+  };
+  expect(await workflow.workflow.run(ctx, run)).toEqual({ reason: "refused" });
+  expect(journal.get("reserve")).toEqual({ ok: false, reason: "occupied" });
+  expect(log).toHaveBeenCalledWith("[implementation-run] reservation refused dispatch=dispatch issue=ENG-1 reason=occupied");
+  expect(requireImplementationRunOwner).not.toHaveBeenCalled();
+  expect(prepareGhaGapfillLaunch).not.toHaveBeenCalled();
+  expect(journal.has("release")).toBe(false);
 });
 it.each(["probe", "token", "managed"])("prep %s failure fails the queue and settles rejected", async source => {
   if (source === "probe") vi.mocked(prepareGhaGapfillLaunch).mockRejectedValueOnce(new Error("probe"));

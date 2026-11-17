@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
@@ -383,4 +384,45 @@ describe("roll-up reviews", () => {
     expect(rows).toHaveLength(5);
     expect(queue.countConflictAttempts("org", "repo", 42)).toBe(0);
   });
+});
+
+it("counts distinct refusals, retains the latest reason, and protects terminal skips", () => {
+  const id = queue.enqueueCommentGapfill({ owner: "org", repo: "repo", prNumber: 42,
+    commentId: 7654, commenter: "alice", instruction: "" });
+  const snapshot = queue.getCommentGapfillItem(id)!;
+  for (const [index, reason] of ["occupied", "parked", "at_capacity"].entries()) {
+    queue.recordCommentGapfillRefusal(id, reason, String(index));
+    queue.recordCommentGapfillRefusal(id, reason, String(index));
+    expect(queue.getCommentGapfillItem(id)).toMatchObject({
+      refusalCount: index + 1, lastRefusalReason: reason,
+      status: index === 2 ? "skipped" : "pending",
+    });
+  }
+  queue.markCommentGapfillSubmitted(snapshot);
+  queue.recordCommentGapfillRefusal(id, "occupied", "fourth");
+  expect(queue.getCommentGapfillItem(id)).toMatchObject({
+    status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity",
+  });
+});
+
+it("upgrades an old queue schema twice without losing rows", async () => {
+  const db = await testDb({ tables: "none", modules: {
+    dedup: () => import("../dedup.js"), queue: () => import("../comment-gapfill-queue.js"),
+  } });
+  const old = new Database(db.path);
+  old.exec(`CREATE TABLE comment_gapfill_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL, comment_id INTEGER NOT NULL UNIQUE,
+    commenter TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, processed_at INTEGER
+  );
+  INSERT INTO comment_gapfill_queue(owner, repo, pr_number, comment_id, commenter, created_at)
+    VALUES ('org', 'repo', 42, 99, 'alice', 100)`);
+  old.close();
+  for (let boot = 0; boot < 2; boot++) {
+    const modules = await db.reopen();
+    expect(modules.queue.getCommentGapfillItem(1)).toMatchObject({
+      commentId: 99, status: "pending", refusalCount: 0, lastRefusalReason: null,
+    });
+  }
 });

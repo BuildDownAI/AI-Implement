@@ -127,3 +127,21 @@ and retries after report forwarding fails. Report forwarding
 still runs on those retries. A GitHub failure (or missing autopsy/target/credentials)
 is a callback warning and does not prevent the failed row write or report delivery.
 The monitor's separate failure classification names the phase as “Gap-fill failed”.
+
+
+## Admission refusals
+
+Before submitting ImplementationRun, the drain runs the read-only
+`checkAdmission` policy shared with `acquire`: PR occupancy, the admission budget
+ledger, parked state, and team capacity, with the same precedence and human
+overrides. Existing legacy gate deferrals remain waits. The preview writes no
+admission or budget entries; acquire rechecks atomically to handle races.
+
+Admission refusals from either preview or reservation increment the queue row's
+`refusal_count` and replace `last_refusal_reason`. After
+`MAX_COMMENT_GAPFILL_REFUSALS` (3), the row becomes `skipped` and is no longer
+submitted. Logs include the reason, count, and status; the workflow also logs the
+reservation refusal reason. Retried reservation steps count once per dispatch.
+Ingress acceptance cannot overwrite a refusal transition. A
+`budget_exhausted` refusal uses the same PR budget park and deduplicated notices
+as the legacy `pr_budget` gate.

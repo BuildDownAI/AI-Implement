@@ -731,6 +731,14 @@ export function getDb(): Database.Database {
         processed_at INTEGER
       )
     `);
+    const gapfillColumns = new Set((db.prepare("PRAGMA table_info(comment_gapfill_queue)").all() as Array<{ name: string }>).map(c => c.name));
+    for (const [name, definition] of [
+      ["refusal_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["last_refusal_reason", "TEXT"],
+      ["last_refusal_dispatch_id", "TEXT"],
+    ]) {
+      if (!gapfillColumns.has(name)) db.exec(`ALTER TABLE comment_gapfill_queue ADD COLUMN ${name} ${definition}`);
+    }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_status ON comment_gapfill_queue(status, created_at)`);
     // PR #202 review (minor): countConflictAttempts / hasPendingConflictResolution /
     // markCommentGapfillRunTerminal all filter by repo+PR — give them an index.

@@ -4,8 +4,8 @@
  * for AII-771. This module is the single authority for team capacity and scoped
  * issue/PR occupancy going forward — it does not read `dispatch_log` or `dispatched`
  * (the old predicate `dispatch-gate.ts#canDispatch` still uses), and nothing here calls
- * it or is called by it. No production call site exists yet; a later issue wires a
- * caller (e.g. the review-fix admission port) on top of `acquire`/`release`.
+ * it or is called by it. Comment gap-fill previews share this admission policy
+ * before ingress; acquire remains the atomic reservation authority.
  *
  * Two occupancy sources exist during the pilot: this table, and the legacy
  * `dispatch_log`-derived predicate in `dispatch-gate.ts`. They are only consistent
@@ -221,6 +221,59 @@ function isUniqueConstraintError(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/.test(error.message);
 }
 
+export type DispatchAdmissionCheck = Exclude<DispatchAdmissionDecision, { ok: true }> |
+  { readonly ok: true; readonly count: number; readonly cap: number; readonly record?: DispatchAdmissionRecord };
+
+/** Read-only preview; acquire repeats this exact policy inside its write transaction. */
+export function checkAdmission(request: DispatchAdmissionRequest): DispatchAdmissionCheck {
+  return evaluateAdmission(getDb(), request);
+}
+
+function evaluateAdmission(db: Database.Database, request: DispatchAdmissionRequest): DispatchAdmissionCheck {
+  const existing = db
+    .prepare("SELECT * FROM dispatch_admissions WHERE dispatch_id = ?")
+    .get(request.dispatchId) as Row | undefined;
+  if (existing && existing.released_at === null) {
+    return {
+      ok: true,
+      record: toRecord(existing),
+      count: countActive(db, request.mappingKey),
+      cap: request.cap,
+    };
+  }
+
+  const cap = request.cap;
+  const capCount = countActive(db, request.mappingKey);
+
+  if (isOccupied(db, request.scope)) {
+    return { ok: false, reason: "occupied", count: capCount, cap };
+  }
+
+  if (!request.humanRequested && request.scope.kind === "pr" && request.prDispatchBudget !== undefined) {
+    const since = Date.now() - PR_BUDGET_WINDOW_MS;
+    const budgetRow = db
+      .prepare(
+        "SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ? AND created_at >= ?",
+      )
+      .get(request.scope.repository, request.scope.prNumber, since) as { n: number };
+    if (budgetRow.n >= request.prDispatchBudget) {
+      return { ok: false, reason: "budget_exhausted", count: capCount, cap };
+    }
+  }
+
+  // Budget refusal takes precedence over an issue park so callers can retry
+  // an owed budget notice (including a breaker-first park) without admitting.
+  if (!request.humanRequested && request.parked) {
+    return { ok: false, reason: "parked", count: capCount, cap };
+  }
+
+  if (request.kind !== "kg-refresh" && capCount >= cap) {
+    return { ok: false, reason: "at_capacity", count: capCount, cap };
+  }
+
+  return { ok: true, count: capCount, cap };
+}
+
 /**
  * Atomically evaluates policy (parked, PR budget, team capacity) and scoped occupancy,
  * then reserves a slot and records the dispatch identity — all before any external
@@ -244,46 +297,11 @@ export function acquire(
 ): DispatchAdmissionDecision {
   const db = getDb();
   return db.transaction((): DispatchAdmissionDecision => {
-    const existing = db
-      .prepare("SELECT * FROM dispatch_admissions WHERE dispatch_id = ?")
-      .get(request.dispatchId) as Row | undefined;
-    if (existing && existing.released_at === null) {
-      return {
-        ok: true,
-        record: toRecord(existing),
-        count: countActive(db, request.mappingKey),
-        cap: request.cap,
-      };
-    }
-
-    const cap = request.cap;
-    const capCount = countActive(db, request.mappingKey);
-
-    if (isOccupied(db, request.scope)) {
-      return { ok: false, reason: "occupied", count: capCount, cap };
-    }
-
-    if (!request.humanRequested && request.scope.kind === "pr" && request.prDispatchBudget !== undefined) {
-      const since = Date.now() - PR_BUDGET_WINDOW_MS;
-      const budgetRow = db
-        .prepare(
-          "SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ? AND created_at >= ?",
-        )
-        .get(request.scope.repository, request.scope.prNumber, since) as { n: number };
-      if (budgetRow.n >= request.prDispatchBudget) {
-        return { ok: false, reason: "budget_exhausted", count: capCount, cap };
-      }
-    }
-
-    // Budget refusal takes precedence over an issue park so callers can retry
-    // an owed budget notice (including a breaker-first park) without admitting.
-    if (!request.humanRequested && request.parked) {
-      return { ok: false, reason: "parked", count: capCount, cap };
-    }
-
-    if (request.kind !== "kg-refresh" && capCount >= cap) {
-      return { ok: false, reason: "at_capacity", count: capCount, cap };
-    }
+    const decision = evaluateAdmission(db, request);
+    if (!decision.ok) return decision;
+    if (decision.record) return { ...decision, record: decision.record };
+    const cap = decision.cap;
+    const capCount = decision.count;
 
     let executionId: string | undefined;
     if (prepare) {

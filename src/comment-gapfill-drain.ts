@@ -1,3 +1,6 @@
+import { checkAdmission } from "./dispatch-admission.js";
+import { isParked } from "./dispatch-breaker.js";
+import { recordCommentGapfillRefusal } from "./comment-gapfill-queue.js";
 import { ROLLUP_REVIEW_COMMENTER } from "./comment-gapfill-queue.js";
 import { resolveReviewerSelection } from "./config.js";
 import { createImplementationRunIngressClient, type ImplementationRunIngressClient } from "./restate/implementation-run-client.js";
@@ -234,8 +237,8 @@ function resolveInFlightDispatch(owner: string, repo: string, headRef: string | 
  * first) and a tracker comment unless the breaker's trip comment already reached
  * the tracker, both best-effort. Never throws.
  */
-async function firePrBudgetPark(
-  opts: DrainCommentGapfillsInput,
+export async function firePrBudgetPark(
+  opts: Pick<DrainCommentGapfillsInput, "getInstallationToken" | "listPrComments" | "postComment" | "postTrackerComment">,
   mapping: RepoMapping,
   issueId: string,
   owner: string,
@@ -409,6 +412,20 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       const installationId = String(await opts.getInstallationId(item.owner));
       const dispatchId = crypto.randomUUID();
       const backend = execPath === "both" ? "github-actions" : execPath;
+      const preview = checkAdmission({
+        dispatchId, mappingKey: scopeKey,
+        scope: { kind: "pr", issueId: prLog.issueId, installationId, repository: fullRepo, prNumber: item.prNumber },
+        kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+        cap: mapping.maxInProgressAiIssues, prDispatchBudget: prBudget, humanRequested,
+        parked: isParked(prLog.issueId, "gap-analysis"),
+      });
+      if (!preview.ok) {
+        recordCommentGapfillRefusal(item.id, preview.reason, dispatchId);
+        if (preview.reason === "budget_exhausted") {
+          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+        }
+        continue;
+      }
       const submitted = await (opts.implementationRun ?? createImplementationRunIngressClient()).submit(dispatchId, {
         dispatchId,
         teamKey: scopeKey,
