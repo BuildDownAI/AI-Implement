@@ -9,7 +9,9 @@ if [ -r "/proc/$PPID/stat" ] && [ -r /proc/sys/kernel/random/boot_id ]; then
 fi
 if npx --no-install tsx --version >/dev/null 2>&1; then
   npx --no-install tsx "$(dirname "$0")/../openrouter-account-live-check.ts" 2>/dev/null || true
+  npx --no-install tsx "$(dirname "$0")/../openrouter-agent-live-check.ts" 2>/dev/null || true
 else
   echo 'openrouter-account-live-check: skipped (tsx not found)'
+  echo 'openrouter-agent-live-check: skipped (tsx not found)'
 fi
 exit 0

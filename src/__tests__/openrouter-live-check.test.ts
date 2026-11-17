@@ -101,7 +101,7 @@ describe("OpenRouter live check", () => {
     const stderr = readFileSync(stderrPath, "utf8");
     expect(child.error).toBeUndefined();
     expect(child.status).toBe(0);
-    expect(stdout).toBe(prefix + scenario.result + "\nopenrouter-account-live-check: skipped (tsx not found)\n");
+    expect(stdout).toBe(prefix + scenario.result + "\nopenrouter-account-live-check: skipped (tsx not found)\nopenrouter-agent-live-check: skipped (tsx not found)\n");
     expect(stderr).toBe("");
     expect(stdout + stderr).not.toContain(key);
   });
@@ -120,7 +120,7 @@ it("runs the account check after the key check and exits zero when tsx throws", 
   const calls = join(dir, "calls");
   writeFileSync(npx, `#!/bin/sh
 if [ "$3" = "--version" ]; then exit 0; fi
-printf '%s\\n' "$*" > "$CHECK_CALLS"
+printf '%s\\n' "$*" >> "$CHECK_CALLS"
 echo 'account invoked'
 "$CHECK_NODE" -e 'throw new Error("synthetic sensitive exception")'
 `);
@@ -131,10 +131,13 @@ echo 'account invoked'
     env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, OPENROUTER_TEST_API_KEY: "", CHECK_CALLS: calls, CHECK_NODE: process.execPath, NODE_OPTIONS: "" }, encoding: "utf8",
   });
   expect(child.status).toBe(0);
-  expect(child.stdout).toBe("openrouter-live-check: skipped (no key)\naccount invoked\n");
+  expect(child.stdout).toBe("openrouter-live-check: skipped (no key)\naccount invoked\naccount invoked\n");
   expect(child.stderr).toBe("");
   expect(readFileSync(calls, "utf8")).toContain("--no-install tsx");
-  expect(readFileSync(calls, "utf8")).toContain("openrouter-account-live-check.ts");
+  expect(readFileSync(calls, "utf8").trim().split("\n")).toEqual([
+    expect.stringContaining("openrouter-account-live-check.ts"),
+    expect.stringContaining("openrouter-agent-live-check.ts"),
+  ]);
 });
 
 it.each(["cat", "sed", "awk"])("continues the strict-mode hook without a run identity when %s fails", (command) => {
@@ -166,6 +169,6 @@ echo 'account invoked without run identity'`,
   }
   expect(child.error).toBeUndefined();
   expect(child.status).toBe(0);
-  expect(readFileSync(stdoutPath, "utf8")).toBe("openrouter-live-check: skipped (no key)\naccount invoked without run identity\n");
+  expect(readFileSync(stdoutPath, "utf8")).toBe("openrouter-live-check: skipped (no key)\naccount invoked without run identity\naccount invoked without run identity\n");
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 });

@@ -9,6 +9,6 @@
     "rootDir": ".",
     "declaration": false
   },
-  "include": ["src/**/*.ts", "scripts/openrouter-account-live-check.ts"],
+  "include": ["src/**/*.ts", "scripts/openrouter-account-live-check.ts", "scripts/openrouter-agent-live-check.ts"],
   "exclude": []
 }
