@@ -92,7 +92,10 @@ export async function runOpenRouterAgentLiveCheck({ env = process.env, spawn = n
                 ? `refused as expected (exit ${code}): ${evidence}`
                 : `fail (no authentication refusal, exit ${code}): ${evidence}`
                 : ok ? "fail (wrong key was accepted)" : "fail (no OK in the answer)");
-            } else finish(code !== 0 ? `fail (exit ${code}): ${evidence}` : ok ? "pass" : "fail (no OK in the answer)");
+            } else finish(code !== 0 ? `fail (exit ${code}): ${evidence}`
+              : parser.terminalStatus?.isError ? `fail (terminal error): ${evidence}`
+              : parser.terminalStatus === undefined ? "fail (no successful terminal event)"
+              : ok ? "pass" : "fail (no OK in the answer)");
           });
           timer = setTimer(() => {
             // Kill the whole isolated process group, including any descendants.

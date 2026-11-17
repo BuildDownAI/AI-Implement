@@ -10,7 +10,7 @@ import { testTempRoot } from "./helpers/test-dir.js";
 
 const key = "synthetic-agent-secret-value";
 const answer = (text: string) => JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }) + "\n";
-function fixture(outcomes: Array<{ code?: number; text?: string; stderr?: string; error?: boolean; errorMessage?: string; missing?: boolean; hang?: boolean }> = [{ text: "OK" }, { code: 1 }]) {
+function fixture(outcomes: Array<{ code?: number; text?: string; stderr?: string; error?: boolean; errorMessage?: string; terminal?: "turn.completed" | "turn.failed" | "error" | "none"; missing?: boolean; hang?: boolean }> = [{ text: "OK" }, { code: 1 }]) {
   testTempRoot("agent-check");
   const children: ChildProcessWithoutNullStreams[] = [];
   const prompts: string[] = [];
@@ -24,6 +24,9 @@ function fixture(outcomes: Array<{ code?: number; text?: string; stderr?: string
       if (scenario.hang) return;
       if (scenario.missing) { child.emit("error", Object.assign(new Error(key), { code: "ENOENT" })); return; }
       child.stdout.emit("data", Buffer.from(scenario.error ? JSON.stringify({ type: "error", message: scenario.errorMessage ?? "refused" }) + "\n" : answer(scenario.text ?? "")));
+      if (!scenario.error && scenario.terminal !== "none") {
+        child.stdout.emit("data", Buffer.from(JSON.stringify({ type: scenario.terminal ?? "turn.completed", error: { message: "terminal failure" }, message: "terminal failure" }) + "\n"));
+      }
       child.stderr.emit("data", Buffer.from(scenario.stderr ?? ""));
       child.emit("close", scenario.code ?? 0);
     });
@@ -59,6 +62,11 @@ describe("OpenRouter agent live check", () => {
     const f = fixture([scenario, { code: 1 }]);
     await f.run();
     expect(f.log.mock.calls[0]).toEqual([`openrouter-agent-live-check: codex ${expected}`]);
+  });
+  it.each(["turn.failed", "error", "none"] as const)("rejects OK with exit 0 and terminal %s", async (terminal) => {
+    const f = fixture([{ text: "OK", terminal }, { code: 1 }]);
+    await f.run();
+    expect(f.log.mock.calls[0][0]).toMatch(/^openrouter-agent-live-check: codex fail/);
   });
   it.each([
     { scenario: { code: 1, stderr: "unauthorized" }, expected: "refused as expected (exit 1): unauthorized" },
@@ -132,7 +140,7 @@ describe("OpenRouter agent live check", () => {
   it("does not mistake an echoed prompt in an error for an answer", async () => {
     const f = fixture([{ error: true }]);
     await f.run();
-    expect(f.log.mock.calls[0][0]).toContain("fail (no OK in the answer)");
+    expect(f.log.mock.calls[0][0]).toContain("fail (terminal error)");
   });
   it("stops both timed-out agents at 120 seconds and cleans their directories", async () => {
     const f = fixture([{ hang: true }, { hang: true }]);
