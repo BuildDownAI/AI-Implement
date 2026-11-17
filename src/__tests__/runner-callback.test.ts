@@ -6771,7 +6771,8 @@ describe("roll-up review follow-up children", () => {
       { source: "ai-implement-internal", severity: "blocking", path: "two.ts", line: 9, body: "When retried, work is duplicated." },
       { source: "ai-implement-internal", severity: "minor", body: "minor nit" },
     ];
-    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success") {
+    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success",
+      failedReviewers = outcome === "failure" ? ["code-review", "integration-review"] : []) {
       const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
       const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
@@ -6779,7 +6780,7 @@ describe("roll-up review follow-up children", () => {
         resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
         body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
-          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99" } } });
+          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers } } });
       return { deliver, dispatchId };
     }
     async function run(head: string, internalFindings = findings) {
@@ -6806,6 +6807,8 @@ describe("roll-up review follow-up children", () => {
     expect(content.title).toMatch(/^\[roll-up-review\] org\/repo#12 /);
     expect(content.body).not.toContain("minor nit");
     expect(update.mock.calls[0][4]).toContain("minor nit");
+    expect(update.mock.calls[0][4]).toContain("Blocking findings filed as");
+    expect(update.mock.calls[0][4]).toContain((await create.mock.results[0].value).identifier);
   });
 
   it("does not file partial blockers from an incomplete review or consume the child budget", async () => {
@@ -6814,20 +6817,33 @@ describe("roll-up review follow-up children", () => {
     expect((await deliver()).status).toBe(200);
     expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", approved: false, conclusion: "rollup_review" });
     expect(create).not.toHaveBeenCalled();
-    expect(update).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("code-review, integration-review");
     await run("a");
     await run("b");
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  it("notifies on a failure before the reviewed head or reviewers are available", async () => {
+    const { prepare, create, update } = await setup();
+    const { deliver } = await prepare("", [], "failure", []);
+    expect((await deliver()).status).toBe(200);
+    expect(create).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("No failed reviewer was identified");
+    expect(dedup.getDb().prepare("SELECT value FROM settings WHERE key = ?")
+      .get("roll-up-review:children:org/repo#12")).toBeUndefined();
+  });
+
   it("ignores minor-only results", async () => {
-    const { run, create, findings } = await setup();
+    const { run, create, findings, update } = await setup();
     await run("a", [findings[2]]);
     expect(create).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("No blocking findings");
   });
 
   it("serializes concurrent same-head creates and caps at two including terminal children", async () => {
-    const { run, create, update, children, provider } = await setup();
+    const { run, create, update, children, provider, prepare, findings } = await setup();
     await Promise.all([run("a"), run("a")]);
     expect(create).toHaveBeenCalledOnce();
     provider.setLifecycle(children[0].id, "completed");
@@ -6835,11 +6851,16 @@ describe("roll-up review follow-up children", () => {
     await run("a");
     expect(create).toHaveBeenCalledOnce();
     await run("b");
-    expect(update.mock.calls.at(-1)?.[4]).toContain("a person decides");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("a person must decide");
     dedup.getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:children:%");
     await run("c");
     expect(create).toHaveBeenCalledTimes(2);
     expect(update.mock.calls.at(-1)?.[4]).toContain("limit");
+    const incomplete = await prepare("d", findings, "failure");
+    expect((await incomplete.deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("a person must decide");
   });
 
   it("fails closed on tracker reads and ambiguous creates", async () => {
@@ -6867,6 +6888,7 @@ describe("roll-up review follow-up children", () => {
     const next = await prepare("b");
     expect((await next.deliver()).status).toBe(200);
     expect(create).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledTimes(2);
   });
 
   it("parks a child if the PR closes during creation", async () => {

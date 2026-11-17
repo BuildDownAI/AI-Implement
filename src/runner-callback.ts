@@ -183,7 +183,7 @@ export interface RunnerResultBody {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Internal findings collected across review iterations, validated before storage. */
   reviewOnly?: boolean;
-  rollupReview?: { headSha: string; verdictUrl: string };
+  rollupReview?: { headSha: string; verdictUrl: string; failedReviewers?: string[] };
   internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
@@ -2127,20 +2127,23 @@ export async function resubmitPendingGapFillReviews(opts: {
   return submitted;
 }
 
+const ROLLUP_REVIEW_CHILD_LIMIT = 2;
+
 /** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
 async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
   scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
   // Partial findings remain advisory evidence; only a complete review can request a fix.
-  if (input.body.outcome !== "success") return;
+  const complete = input.body.outcome === "success";
   const review = input.body.rollupReview;
-  if (!review || typeof review.headSha !== "string" || !/^[a-f0-9]{40,64}$/.test(review.headSha) ||
+  if (!review || typeof review.headSha !== "string" ||
+      (!/^[a-f0-9]{40,64}$/.test(review.headSha) && (complete || review.headSha !== "")) ||
       typeof review.verdictUrl !== "string" || !job?.prUrl || !input.watchdogConfig) return;
   const target = parsePrUrlTarget(job.prUrl);
   if (!target || job.repo !== `${target.owner}/${target.repo}`) return;
   const { owner, repo, prNumber } = target;
-  if (!provider.listIssuesPage) {
-    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up`);
-    return;
+  const canEnumerate = !!provider.listIssuesPage;
+  if (!canEnumerate) {
+    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up child`);
   }
   const reservationKey = `roll-up-review:children:${owner}/${repo}#${prNumber}`;
   const reserved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
@@ -2157,15 +2160,12 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   if (!branch || branch[1].toLowerCase() !== job.issueIdentifier?.toLowerCase()) return;
   const parent = await provider.findByKey(job.issueIdentifier!, scopeKey);
   if (!parent || parent.id !== parentId) return;
-  if (pr.merged || pr.state === "closed") {
-    await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
-    return;
-  }
+  const closed = pr.merged || pr.state === "closed";
+  if (closed) await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
   const blockers = (input.body.internalFindings ?? []).filter(f => f && f.severity === "blocking" &&
     typeof f.body === "string" && f.body.trim() && (f.path === undefined || typeof f.path === "string") &&
     (f.line === undefined || (Number.isInteger(f.line) && f.line > 0)));
-  if (!blockers.length) return;
-  const children = (await listRollupReviewChildren(provider, mapping)).filter(c =>
+  const children = (canEnumerate ? await listRollupReviewChildren(provider, mapping) : []).filter(c =>
     c.parent?.identifier === parent.identifier && c.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} `));
   const existingHeads = children.map(c => c.title.split(" ")[2]);
   if (existingHeads.includes(review.headSha)) onTrackerWriteReserved();
@@ -2174,8 +2174,8 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   const reservation = getDb().transaction(() => {
     const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
     const heads = new Set<string>([...existingHeads, ...(row ? JSON.parse(row.value) as string[] : [])]);
-    if (heads.has(review.headSha)) return { create: false, count: heads.size };
-    if (heads.size >= 2) return { create: false, count: heads.size };
+    if (!complete || !blockers.length || !canEnumerate || closed || heads.has(review.headSha)) return { create: false, count: heads.size };
+    if (heads.size >= ROLLUP_REVIEW_CHILD_LIMIT) return { create: false, count: heads.size };
     heads.add(review.headSha);
     getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(reservationKey, JSON.stringify([...heads]));
     return { create: true, count: heads.size };
@@ -2198,7 +2198,14 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   const verdict = comments.find(c => c.id === Number(verdictMatch[4]));
   if (!verdict) throw new Error("Cannot find roll-up verdict comment");
   const marker = "<!-- roll-up-review follow-up -->";
-  const notice = `${marker}\n\n${childIdentifier ? `Blocking findings filed as ${childIdentifier}.` : "No additional child filed."}` +
-    (reservation.count >= 2 ? " The automatic follow-up limit (two children per roll-up PR) is reached; a person decides any further fixes." : "");
+  const failedReviewers = Array.isArray(review.failedReviewers)
+    ? review.failedReviewers.filter((id): id is string => typeof id === "string" && !!id.trim()) : [];
+  const resultNotice = !complete
+    ? `The review did not finish. ${failedReviewers.length ? `Failed reviewers: ${failedReviewers.join(", ")}.` : "No failed reviewer was identified; the review could not complete."}`
+    : childIdentifier ? `Blocking findings filed as ${childIdentifier}.`
+    : blockers.length ? "No additional child filed." : "No blocking findings; no child filed.";
+  const notice = `${marker}\n\n${resultNotice}` +
+    (reservation.count >= ROLLUP_REVIEW_CHILD_LIMIT
+      ? ` The automatic follow-up limit (${ROLLUP_REVIEW_CHILD_LIMIT} children per roll-up PR) is reached; a person must decide any further fixes.` : "");
   await updatePrComment(token, owner, repo, verdict.id, verdict.body.split(marker)[0].trimEnd() + "\n\n" + notice);
 }
