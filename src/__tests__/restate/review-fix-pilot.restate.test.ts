@@ -1127,10 +1127,13 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       (found) => found.length === 1, { label: "unknown launch run invocation" });
     // Authority can expire before the workflow starts its backed-off sleep.
     // Wait for that durable command so cancellation exercises the intended wait.
-    await eventually(() => journalEntries(env.adminAPIBaseUrl(), runRows[0].id as string),
-      (entries) => entries.some((entry) => entry.entry_type === "Command: Sleep"
-        && (JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } })
-          .Command.Sleep.wake_up_time > prepared.deadlineAt),
+    const minimumWakeAt = prepared.deadlineAt + 5 * 60_000;
+    const backedOffSleep = await eventually(async () =>
+      (await journalEntries(env.adminAPIBaseUrl(), runRows[0].id as string))
+        .find((entry) => entry.entry_type === "Command: Sleep"
+          && (JSON.parse(String(entry.entry_json)) as { Command: { Sleep: { wake_up_time: number } } })
+            .Command.Sleep.wake_up_time >= minimumWakeAt),
+      (entry) => entry !== undefined,
       { label: "unknown launch backed-off sleep" });
     if (event === "cancel") {
       await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel", { attemptId });
@@ -1145,12 +1148,8 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     const rows = await queryInvocations(env.adminAPIBaseUrl(),
       `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
     expect(rows).toHaveLength(1);
-    const entries = await journalEntries(env.adminAPIBaseUrl(), rows[0].id as string);
-    const sleeps = entries.filter((entry) => entry.entry_type === "Command: Sleep")
-      .sort((a, b) => Number(a.index) - Number(b.index));
-    expect(sleeps.length).toBeGreaterThan(0);
-    for (const sleep of sleeps) expect(Number.isFinite(Number(sleep.index))).toBe(true);
-    const command = JSON.parse(String(sleeps.at(-1)!.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
+    expect(Number.isFinite(Number(backedOffSleep!.index))).toBe(true);
+    const command = JSON.parse(String(backedOffSleep!.entry_json)) as { Command: { Sleep: { wake_up_time: number } } };
     const completedAt = (getDb().prepare("SELECT completed_at FROM review_fix_attempts WHERE attempt_id = ?")
       .get(attemptId) as { completed_at: number | null }).completed_at;
     expect(typeof completedAt).toBe("number");
@@ -1158,7 +1157,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
     // Timer completion would put checkedAt at or after wake_up_time. The durable
     // outcome preceding it proves cancellation interrupted this attempt's wait,
     // regardless of when polling observes the outcome.
-    expect(command.Command.Sleep.wake_up_time).toBeGreaterThanOrEqual(prepared.deadlineAt + 5 * 60_000);
+    expect(command.Command.Sleep.wake_up_time).toBeGreaterThanOrEqual(minimumWakeAt);
     expect(completedAt).toBeLessThan(command.Command.Sleep.wake_up_time);
     expect(fixture.dispatchCalls).toBe(1);
     expect((await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId)).status).toBe("launch_unresolved");
