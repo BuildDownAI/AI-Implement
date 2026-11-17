@@ -3,6 +3,7 @@ import type {
   FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
+  IssueStatusRecord,
   LinearSetupFacts,
   LifecycleLabelsResult,
   TicketIssue,
@@ -11,7 +12,7 @@ import type {
   TrackerIssuePage,
 } from "./types.js";
 import { getMappings, type RepoMapping } from "../config.js";
-import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 import { getLinearToken, isLinearAuthConfigured, LinearApiError, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
@@ -248,6 +249,72 @@ export class LinearProvider implements TicketingProvider {
       issues: data.issues?.nodes ?? [],
       pageInfo: data.issues?.pageInfo ?? { hasNextPage: false, endCursor: null },
     };
+  }
+
+  async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
+    refreshPickupLabel();
+    if (!isLinearAuthConfigured()) throw new TrackerUnavailableError("Linear credential not configured");
+    if (!mapping.teamKey) throw new TrackerUnavailableError("mapping carries no team key");
+    const label = AI_IMPLEMENT_LABEL;
+    const since = new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString();
+    type StatusNode = {
+      id: string; identifier: string; title: string; url: string; updatedAt: string;
+      state: { name: string; type: string };
+      labels: { nodes: Array<{ name: string }> };
+    };
+    type StatusPage = { issues: {
+      nodes: StatusNode[];
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    } };
+    const nodes = new Map<string, StatusNode>();
+    for (const recent of [false, true]) {
+      const query = `query($teamKey: String!, $label: String!, $first: Int!, $after: String${recent ? ", $since: DateTimeOrDuration!" : ""}) {
+        issues(first: $first, after: $after, filter: {
+          team: { key: { eq: $teamKey } }
+          labels: { name: { eq: $label } }
+          ${recent ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }'}
+        }) {
+          nodes { id identifier title url updatedAt state { name type } labels { nodes { name } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`;
+      let after: string | null = null;
+      for (let page = 1; ; page++) {
+        const data: StatusPage = await this.linearMutation<StatusPage>(query, {
+          teamKey: mapping.teamKey, label, first: 100, after, ...(recent ? { since } : {}),
+        });
+        for (const node of data.issues.nodes) nodes.set(node.id, node);
+        const { hasNextPage, endCursor } = data.issues.pageInfo;
+        if (!hasNextPage) break;
+        if (page >= 20) throw new Error("Linear listIssueStatuses exceeded 20 pages");
+        if (!endCursor || endCursor === after) throw new Error("Linear listIssueStatuses missing advancing cursor");
+        after = endCursor;
+      }
+    }
+
+    const precedence: Array<[string, IssueStatusRecord["state"]]> = [
+      [LINEAR_LABELS.needsHuman.name, "failed"],
+      [LINEAR_LABELS.readyForReview.name, "pr-ready"],
+      [LINEAR_LABELS.working.name, "implementing"],
+      [LINEAR_LABELS.planComplete.name, "plan-approved"],
+      [LINEAR_LABELS.planning.name, "planning"],
+      [label, "ready"],
+    ];
+    const records: IssueStatusRecord[] = [];
+    for (const node of nodes.values()) {
+      if (node.state.type === "canceled" || node.state.type === "duplicate") continue;
+      const labels = node.labels.nodes.map((l) => l.name);
+      const deciding = precedence.find(([name]) => labels.includes(name)) ?? [label, "ready"];
+      const completed = node.state.type === "completed";
+      records.push({
+        id: node.id, identifier: node.identifier, title: node.title,
+        url: this.issueUrl({ id: node.id, identifier: node.identifier, title: node.title, description: null, scopeKey: mapping.teamKey, nativeStatus: node.state.name }),
+        state: completed ? "merged" : deciding[1], phase: null,
+        labels: completed ? [] : [deciding[0], ...labels.filter((name) => name !== deciding[0])],
+        workflowState: node.state.name, updatedAt: Date.parse(node.updatedAt),
+      });
+    }
+    return records;
   }
 
   async fetchSetupFacts(teamKeys: string[]): Promise<LinearSetupFacts> {

@@ -229,3 +229,11 @@ remain invisible to polling, and failed writes remove temporary files and state.
 Parent metadata is stored in provider-owned state
 and survives restart; pickup follows the mapping's planning setting. The fake
 provider records the parent association and puts children in planning pickup.
+
+## Aggregated issue statuses
+
+`src/issue-statuses.ts` exposes `listIssueStatuses`, called by `listIssueStatusesTool` in `src/restate/tools.ts` and registered as the user-role `list_issue_statuses` read tool. See [Spotter status tools](spotter-status-tools.md) for the tool contract. It reads every mapping, including paused mappings, and caches only successful provider status reads for 60 seconds per mapping key. Missing provider support or any provider failure rejects the whole call.
+
+Each call refreshes dispatch-breaker and job-log overlays. Merged issues retain their state and phase; otherwise a park makes an issue failed with the park's phase (gap-analysis maps to implementation). A failed issue with no tracker phase uses the newest job's phase. The newest job is ordered by `dispatched_at`, then row ID; its `completed_at`, falling back to `dispatched_at`, can advance the tracker change time. If multiple phases are parked, the newest park wins.
+
+Output contains only named public fields. Identifier collisions retain the first mapping in key order and warn with both team keys. Entries sort by team key and descending change time, with null times last.
