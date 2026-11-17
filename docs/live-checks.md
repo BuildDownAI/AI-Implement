@@ -140,7 +140,9 @@ or `codex wrong-key`.
 | tsx unavailable in hook | `openrouter-agent-live-check: skipped (tsx not found)` |
 | Binary missing for a call | `skipped (binary not found)` |
 | Either call's error output contains `--skip-git-repo-check` or `Not inside a trusted directory` | `fail (not sent): <evidence>` |
-| Good key, exit 0, answer contains OK | `pass` |
+| Good key, exit 0, successful terminal event, answer contains OK | `pass` |
+| Good key, exit 0, terminal error | `fail (terminal error): <evidence>` |
+| Good key, exit 0, no terminal event | `fail (no successful terminal event)` |
 | Good key, exit 0, no OK | `fail (no OK in the answer)` |
 | Good key, nonzero exit | `fail (exit <code>): <evidence>` |
 | Wrong key, nonzero exit or JSON error with authentication refusal | `refused as expected (exit <code>): <evidence>` |
@@ -166,47 +168,49 @@ provider access. See the evidence status below.
 
 ## Live observation evidence (AII-1949)
 
-Completion is **blocked on captured runner-log evidence**. The following records
-separate the historical observation supplied in the
-[AII-1949 issue](https://linear.app/eudoxus/issue/AII-1949) from results that have
-not been observed. Expected result lines in the tables above are specifications,
-not execution records.
+Run A (AII-1970, project AII): Fly app `ai-implement-testing-sessions`,
+machine `84eee57cd13318`, region `iad`, on 2026-11-17. Tested revision:
+`dceffd4a3177f71366850701cf14b74ea46a8768` (AII-1949 feature-branch head
+under roll-up review in PR #1677). Pinned Codex: `0.159.2`
+(`CODEX_CLI_VERSION` in `Dockerfile.session`); model:
+`deepseek/deepseek-v4.1-flash-1017`.
 
-| Check | Observed result | Evidence available in this checkout |
+| Check | Run A observed result (UTC, 2026-11-17) | Evidence identity |
 | --- | --- | --- |
-| Key (AII-1907) | The parent issue reports `openrouter-live-check: pass` on 2026-11-14. | Issue report only; no captured runner log or run identifier supplied. Not independently verified here. |
-| Stored account (AII-1952) | No live observation available. | No captured runner log supplied. Temporary-account unit tests do not prove provider acceptance. |
-| Codex (AII-1953) | No live observation available for either the real-key or wrong-key call. | No captured runner log supplied. Fake-process tests do not prove pinned Codex or model compatibility. |
+| Key (AII-1907) | 04:43:41 — `openrouter-live-check: pass` | `ai-implement-testing-sessions` / `84eee57cd13318` |
+| Stored account (AII-1952) | 04:43:44 — `openrouter-account-live-check: pass` | Same Run A; temporary database |
+| Codex, good key (AII-1953) | 04:43:46 — `openrouter-agent-live-check: codex pass` | Same Run A; pinned Codex and model above |
+| Codex, wrong key (AII-1953) | 04:43:53 — `refused as expected (exit 1)` with HTTP 401 | Same Run A; exact authentication evidence below |
+| Second verify pass | 04:53:17 account and 04:53:26 agent — `skipped (ran before in this run)` | Same Run A; deduplication evidence |
 
-To close this evidence gap, retain a sanitized runner-log excerpt for each check
-and link it here and in its recipe. Include the run identifier, timestamp,
-pinned Codex version, selected model, tested revision (the final combined parent
-feature-branch SHA), and exact result lines. Record failures
-with their actual fix-issue links under AII-1949; a skip or unrelated process
-failure cannot establish provider access or authentication refusal. No live
-provider defect or linked fix issue can be asserted from the evidence currently
-available. This evidence requirement remains unmet; merging code alone does not
-satisfy it.
-
-### AII-1970 local verification attempt (blocked)
-
-On 2026-11-17 at 04:44 UTC, `sh scripts/ci/ai-verify.sh` was executed in the
-implementation sandbox against revision
-`dceffd4a3177f71366850701cf14b74ea46a8768`, using Node `v24.22.3`.
-The locally installed binary reported `codex-cli 0.159.2`; no Codex model was
-invoked and no authorized AII runner identifier or runner-log link was available.
-The hook exited 0 with these exact results:
+The operator read these results from the Fly runner logs. Fly logs are not
+retained, so there is no runner-log link; the app, machine ID, and UTC timestamps
+identify the run. This is operator-supplied live evidence, not a sandbox run.
 
 ```text
-openrouter-live-check: skipped (no key)
-openrouter-account-live-check: skipped (tsx not found)
-openrouter-agent-live-check: skipped (tsx not found)
+2026-11-17T04:43:41Z openrouter-live-check: pass
+2026-11-17T04:43:44Z openrouter-account-live-check: pass
+2026-11-17T04:43:46Z openrouter-agent-live-check: codex pass
+2026-11-17T04:43:53Z openrouter-agent-live-check: codex wrong-key refused as expected (exit 1): Reconnecting... 1/5 (unexpected status 401 Unauthorized: User not found., url: https://openrouter.ai/api/v1/responses, cf-ray: a5bc13925a41ee37-IAD)
+2026-11-17T04:53:17Z openrouter-account-live-check: skipped (ran before in this run)
+2026-11-17T04:53:26Z openrouter-agent-live-check: skipped (ran before in this run)
 ```
 
-`OPENROUTER_TEST_API_KEY` was absent. The hook's tsx probe also failed:
-`npx --no-install tsx --version` reported tsx `v4.23.12`, then an `EPERM`
-error when opening its IPC socket in this sandbox. Thus “tsx not found” here
-does not mean the dependency is absent. These skips establish neither provider
-acceptance nor authentication refusal. No live provider defect or fix issue
-was established. Completion still requires the authorized runner observations
-and sanitized log links above; this local attempt does not close AII-1970.
+The two second-pass skips demonstrate the one-time-per-run rule; the first-pass
+pass/refusal lines establish provider access and authentication refusal.
+The stored-account result covers a temporary database and a substituted binding
+write, not the deployed account database or live Restate.
+
+Run B (AII-1969) independently confirmed the same four outcomes on machine
+`48ee5d7b202218`, 2026-11-17 01:29–01:30 UTC. Its wrong-key authentication
+refusal had cf-ray `a5baf8bcba5329b5-IAD`. Exact per-result timestamps,
+revision, installed-version output, and model metadata for Run B were not
+supplied; Run A is the primary evidence record.
+
+The earlier trusted-directory failure and false wrong-key “refused as expected”
+were addressed by [AII-1969](https://linear.app/eudoxus/issue/AII-1969)
+([PR #1674](https://github.com/BuildDownAI/AI-Implement/pull/1674));
+[PR #1672](https://github.com/BuildDownAI/AI-Implement/pull/1672) added
+`--skip-git-repo-check`. An unrelated CLI refusal does not establish authentication
+refusal. The live evidence requirement is now met for the tested revision;
+publication and the subsequent roll-up review remain pipeline-owned.
