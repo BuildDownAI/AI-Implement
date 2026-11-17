@@ -232,7 +232,7 @@ provider records the parent association and puts children in planning pickup.
 
 ## Aggregated issue statuses
 
-`src/issue-statuses.ts` exposes `listIssueStatuses` as a standalone module; no handler calls it yet. It reads every mapping, including paused mappings, and caches only successful provider status reads for 60 seconds per mapping key. Missing provider support or any provider failure rejects the whole call.
+`src/issue-statuses.ts` exposes `listIssueStatuses`, called by the `list_issue_statuses` tool (see [Spotter status tools](spotter-status-tools.md)). It reads every mapping, including paused mappings, and caches only successful provider status reads for 60 seconds per mapping key. Missing provider support or any provider failure rejects the whole call.
 
 Each call refreshes dispatch-breaker and job-log overlays. Merged issues retain their state and phase; otherwise a park makes an issue failed with the park's phase (gap-analysis maps to implementation). A failed issue with no tracker phase uses the newest job's phase. The newest job is ordered by `dispatched_at`, then row ID; its `completed_at`, falling back to `dispatched_at`, can advance the tracker change time. If multiple phases are parked, the newest park wins.
 

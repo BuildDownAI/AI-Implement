@@ -14,7 +14,7 @@ export interface WorkflowInput {
   issueId: string | null;
   issueIdentifier: string | null;
   isRollUp: boolean;
-  mapping: { autoMerge: boolean; defaultBranch: string; prDispatchBudget: number } | null;
+  mapping: { autoMerge: boolean; paused: boolean; defaultBranch: string; prDispatchBudget: number } | null;
   now: number;
 }
 
@@ -55,7 +55,7 @@ export function resolveOpenPullWorkflow(input: WorkflowInput): WorkflowVerdict |
     .get(prUrl, now - LATE_EXTERNAL_REVIEW_DEADLINE_MS)) {
     return { state: "active", reason: "awaiting-late-review" };
   }
-  if (mapping?.autoMerge && !input.draft && isGroupingBranch(input.baseRef)
+  if (mapping?.autoMerge && !mapping.paused && !input.draft && isGroupingBranch(input.baseRef)
     && input.baseRef !== mapping.defaultBranch && issueIdentifier !== null
     && getRunRecordMergeVerdict(issueIdentifier, prUrl) === "approved") {
     // Red checks hold the merge, but remain active: auto-merge reads checks again on each tick.
