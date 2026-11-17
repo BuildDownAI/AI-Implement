@@ -48,8 +48,9 @@ account and the pinned Codex with the open model
 
 Run A (AII-1970, project AII): Fly app `ai-implement-testing-sessions`,
 machine `84eee57cd13318`, region `iad`, on 2026-11-17. Tested revision:
-`dceffd4a3177f71366850701cf14b74ea46a8768` (AII-1949 feature-branch head
-under roll-up review in PR #1677). Pinned Codex: `0.159.2`
+`dceffd4a3177f71366850701cf14b74ea46a8768` (historical AII-1949
+feature-branch revision, before the terminal-status fixes in PR #1677).
+Pinned Codex: `0.159.2`
 (`CODEX_CLI_VERSION` in `Dockerfile.session`); model:
 `deepseek/deepseek-v4.1-flash-1017`.
 
@@ -66,8 +67,11 @@ identify the run. This is operator-supplied live evidence, not a sandbox run.
 2026-11-17T04:53:26Z openrouter-agent-live-check: skipped (ran before in this run)
 ```
 
-The two second-pass skips demonstrate the one-time-per-run rule; the first-pass
-pass/refusal lines establish provider access and authentication refusal.
+The two second-pass skips demonstrate the one-time-per-run rule at that
+revision; the first-pass pass/refusal lines establish historical provider access
+and authentication refusal. The good-key pass used exit code and OK text only;
+it did not inspect `CodexStreamParser.terminalStatus`. It therefore does not
+verify the current successful-terminal-event requirement.
 The stored-account result covers a temporary database and a substituted binding
 write, not the deployed account database or live Restate.
 
@@ -82,7 +86,25 @@ were addressed by [AII-1969](https://linear.app/eudoxus/issue/AII-1969)
 ([PR #1674](https://github.com/BuildDownAI/AI-Implement/pull/1674));
 [PR #1672](https://github.com/BuildDownAI/AI-Implement/pull/1672) added
 `--skip-git-repo-check`. An unrelated CLI refusal does not establish authentication
-refusal. The live evidence requirement is now met for the tested revision;
-publication and the subsequent roll-up review remain pipeline-owned.
+refusal.
+
+**Current revision: live verification pending.** Run A predates commits
+`97daf4f8` and `656f0bf0`, which added the good-key terminal-status gate.
+Neither Run A nor Run B establishes that a real successful Codex/OpenRouter
+stream passes that gate. The AII-1949 live-evidence requirement remains unmet
+for the revision under review; unit tests with synthetic streams cannot close
+this gap.
+
+A fresh AII verify-hook run must exercise the final combined revision with the
+project's real `OPENROUTER_TEST_API_KEY`, pinned Codex, and the specified open
+model. Retain its tested SHA, actual `codex --version`, selected model, run and
+machine identifiers, UTC timestamps, and sanitized result lines for the key,
+account, good-key agent, and wrong-key agent checks. The good-key line must be
+`openrouter-agent-live-check: codex pass` from the script containing the
+terminal-status gate; the wrong-key line must include authentication-refusal
+evidence. Record failures and their fix issues rather than treating skips or
+historical results as current success. The existing per-run markers suppress
+repeat calls, so another verify pass in an already checked run cannot supply
+this evidence. Publication and roll-up review remain pipeline-owned.
 
 See the shared [evidence record](../../docs/live-checks.md#live-observation-evidence-aii-1949).
