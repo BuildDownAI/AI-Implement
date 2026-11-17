@@ -25,7 +25,9 @@ account and the pinned Codex with the open model
 
 - Pass: `openrouter-agent-live-check: codex pass` and
   `openrouter-agent-live-check: codex wrong-key refused as expected (exit <code>): <evidence>`.
-  Evidence should explain the key refusal; an exit-0 JSON error is also a refusal.
+  Evidence must show authentication refusal (401/403, unauthorized, invalid API
+  key, or authentication failed/required/error). An exit-0 JSON error counts only
+  with that evidence; CLI and network failures do not prove key refusal.
 - Skips are not evidence of successful model access. Fail lines are report-only
   findings for follow-up under AII-1949; they do not fail the run.
 - Logs contain no key, key fragment, or request header.
@@ -34,5 +36,14 @@ account and the pinned Codex with the open model
   request plus one refused request per run. `OPENROUTER_TEST_MODEL` can override
   the model. See [live checks](../../docs/live-checks.md) for every result line.
 
-Do not run the live check from the build-agent sandbox; obtain live evidence
-from the next AII run after merge.
+
+
+## Recorded observations
+
+No actual Codex live result or captured runner-log excerpt is available in
+this checkout for either key. The pass and refusal assertions above are expected
+outcomes, not observed provider responses.
+
+Live verification remains incomplete. See the shared [evidence status](../../docs/live-checks.md#live-observation-evidence-aii-1949)
+for the available source and missing capture requirements. No live failure or
+linked fix issue has been established from the available evidence.

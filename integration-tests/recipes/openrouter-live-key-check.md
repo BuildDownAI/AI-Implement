@@ -27,3 +27,13 @@ and uses the project secret `OPENROUTER_TEST_API_KEY` already configured on AII.
 - A fail line records a live finding for follow-up under AII-1949 and does not
   fail the pipeline. See [live checks](../../docs/live-checks.md) for all results.
 - Logs contain no key, key fragment, request header, response body, or exception text.
+
+## Recorded observations
+
+The parent issue reports `openrouter-live-check: pass` on 2026-11-14.
+No captured runner-log excerpt or run identifier is available in this checkout,
+so that report has not been independently verified here.
+
+Live verification remains incomplete. See the shared [evidence status](../../docs/live-checks.md#live-observation-evidence-aii-1949)
+for the available source and missing capture requirements. No live failure or
+linked fix issue has been established from the available evidence.
