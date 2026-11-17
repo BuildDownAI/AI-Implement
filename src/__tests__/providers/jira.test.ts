@@ -2146,7 +2146,7 @@ describe("JiraProvider.listIssueStatuses", () => {
     await provider().listIssueStatuses(mapping());
     expect(searchBodies(fake)[0]).toEqual({
       jql: '(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -7d)',
-      fields: ["summary", "updated", "customfield_10100", "customfield_10101"],
+      fields: ["summary", "updated", "status", "resolution", "customfield_10100", "customfield_10101"],
       maxResults: 100,
     });
   });
@@ -2156,6 +2156,26 @@ describe("JiraProvider.listIssueStatuses", () => {
       issue("Ready", " acme/x "), issue("Ready"), issue("Ready", { value: "acme/other" }),
     ] }) }).install();
     expect(await provider().listIssueStatuses(mapping())).toHaveLength(2);
+  });
+
+  it.each(["Won't Do", "Cancelled", "CANCELED", "Duplicate"])("excludes native cancellation %s independently of the custom status", async (resolution) => {
+    const nativeIssue = (category: string, name: string | null, customStatus = "Ready"): JiraIssue => {
+      const raw = issue(customStatus);
+      return { ...raw, fields: { ...raw.fields,
+        status: { statusCategory: { key: category } },
+        resolution: name === null ? null : { name },
+      } };
+    };
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [
+      nativeIssue("done", resolution),
+      nativeIssue("done", resolution, "Merged"),
+      nativeIssue("done", resolution, "Planning Failed"),
+      nativeIssue("done", "Done", "Merged"),
+      nativeIssue("indeterminate", resolution),
+      nativeIssue("done", null),
+    ] }) }).install();
+    expect((await provider().listIssueStatuses(mapping())).map((record) => record.state))
+      .toEqual(["merged", "ready", "ready"]);
   });
 
   it("accumulates pages and forwards tokens through an empty page", async () => {

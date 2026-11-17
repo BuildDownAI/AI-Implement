@@ -85,6 +85,17 @@ function descriptionText(fields: Record<string, unknown>): string | null {
   return typeof d === "string" ? d : d ? adfToPlainText(d) : null;
 }
 
+/** Native cancellation is independent of the AI-Implement custom status. */
+function nativeLifecycleState(fields: JiraIssue["fields"]): IssueLifecycleState {
+  const status = fields.status as { statusCategory?: { key?: string } } | null;
+  const resolution = fields.resolution as { name?: string } | null;
+  if (!resolution || status?.statusCategory?.key !== "done") return "active";
+  const resName = (resolution.name ?? "").toLowerCase();
+  return resName.includes("won't") || resName.includes("cancel") || resName === "duplicate"
+    ? "cancelled"
+    : "completed";
+}
+
 type JiraTicketingConfig = Extract<RepoMapping["ticketingConfig"], { kind: "jira" }>;
 
 /** The field-ID overrides a project sets, which key the poll's field cache. */
@@ -490,10 +501,11 @@ export class JiraProvider implements TicketingProvider {
     let nextPageToken: string | undefined;
     for (let page = 0; page < 20; page++) {
       const result = await this.client.searchJqlPage(
-        jql, ["summary", "updated", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
+        jql, ["summary", "updated", "status", "resolution", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
       );
       for (const raw of result.issues) {
         if (readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) !== cfg.repoFieldValue) continue;
+        if (nativeLifecycleState(raw.fields) === "cancelled") continue;
         const workflowState = readStatusValue(raw.fields, fieldIds.statusFieldId);
         issues.push({
           id: raw.id,
@@ -989,20 +1001,7 @@ export class JiraProvider implements TicketingProvider {
     const issues = await this.client.searchJql(jql, ["resolution", "status"]);
     const result = new Map<string, IssueLifecycleState>();
     for (const issue of issues) {
-      const status = issue.fields.status as { statusCategory?: { key?: string } } | null;
-      const resolution = issue.fields.resolution as { name?: string } | null;
-      let lifecycle: IssueLifecycleState;
-      if (resolution && status?.statusCategory?.key === "done") {
-        const resName = (resolution.name ?? "").toLowerCase();
-        if (resName.includes("won't") || resName.includes("cancel") || resName === "duplicate") {
-          lifecycle = "cancelled";
-        } else {
-          lifecycle = "completed";
-        }
-      } else {
-        lifecycle = "active";
-      }
-      result.set(issue.id, lifecycle);
+      result.set(issue.id, nativeLifecycleState(issue.fields));
     }
     return result;
   }
