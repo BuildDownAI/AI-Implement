@@ -17,6 +17,7 @@ import {
   generateMachineNonce,
   buildSessionMachineConfig,
   listAppSecrets,
+  classifyFlySecretNames,
   setAppSecrets,
   putAppSecretsVersioned,
   unsetAppSecret,
@@ -1554,5 +1555,50 @@ describe("machineNeverStarted", () => {
     [undefined, false],
   ] as const)("reads start evidence from %j", (types, expected) => {
     expect(machineNeverStarted({ ...mockMachine, events: types?.map(type => ({ type })) })).toBe(expected);
+  });
+});
+
+
+describe("Fly secret name classification", () => {
+  it("preserves protection precedence, all matching projects and unknown-prefix globals", () => {
+    const names = ["MQ_KEY", "GLOBAL", MODEL_AUTH_ENV.protectionKey, "OLD_KEY", "MQ_ADM_TOKEN"];
+    const rows = classifyFlySecretNames(names, ["mq", "MQ_ADM"]);
+    expect(rows).toEqual([
+      { name: "MQ_KEY", group: "project", projects: ["mq"] },
+      { name: "GLOBAL", group: "global", projects: [] },
+      { name: MODEL_AUTH_ENV.protectionKey, group: "protection-key", projects: [] },
+      { name: "OLD_KEY", group: "global", projects: [] },
+      { name: "MQ_ADM_TOKEN", group: "project", projects: ["mq", "MQ_ADM"] },
+    ]);
+    for (const teamKey of ["mq", "MQ_ADM"]) {
+      const config = buildSessionMachineConfig({ ...baseInput, teamKey, allTeamKeys: ["mq", "MQ_ADM"], teamSecretNames: names, flyProcessLevelSecrets: true });
+      const globals = config.config.processes![0].secrets!.filter((s) => !("name" in s)).map((s) => s.env_var).sort();
+      expect(globals).toEqual(rows.filter((r) => r.group === "global").map((r) => r.name).sort());
+    }
+  });
+});
+
+describe("listAppSecrets time limit", () => {
+  it("bounds the response body and clears the timer", async () => {
+    vi.useFakeTimers();
+    try {
+      fakeFetch({ [`GET /v1/apps/${APP}/secrets`]: ({ signal }) => new Response(new ReadableStream({
+        start(controller) { signal!.addEventListener("abort", () => controller.error(signal!.reason), { once: true }); },
+      })) }).install();
+      const pending = expect(listAppSecrets(TOKEN, APP, 100)).rejects.toMatchObject({ name: "AbortError" });
+      await vi.advanceTimersByTimeAsync(100);
+      await pending;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it("clears the timer on success and HTTP failure", async () => {
+    vi.useFakeTimers();
+    try {
+      fakeFetch({ [`GET /v1/apps/${APP}/secrets`]: [{ json: { secrets: [] } }, { status: 401 }] }).install();
+      expect(await listAppSecrets(TOKEN, APP, 100)).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+      await expect(listAppSecrets(TOKEN, APP, 100)).rejects.toMatchObject({ status: 401, message: "Fly app secrets list failed (401)" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 });

@@ -20,11 +20,11 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
 import { effectiveAccessCode } from "../admin-session.js";
-import { getRunnerMode, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
+import { getRunnerMode, resolveExecutionPath, getFlyProcessLevelSecrets, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
 import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
 import {
-  getMachine, listMachines, fetchMachineLogs, readMachineExit,
+  classifyFlySecretNames, listAppSecrets, FlyApiError, getMachine, listMachines, fetchMachineLogs, readMachineExit,
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
@@ -51,7 +51,7 @@ import { RunnerBackend } from "./runner-backend.js";
 import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
-import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getRunnerBackendSource, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
@@ -72,7 +72,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
-  grants: z.array(z.enum(["deploy", "projects"])).readonly().default([]),
+  grants: z.array(z.enum(["deploy", "projects", "secrets"])).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -93,7 +93,7 @@ interface ToolOptions<I extends z.ZodType> {
   input: I;
   role: AccessRole;
   /** Alternate authority, accepted only by tools that explicitly request it. */
-  grant?: "deploy" | "projects";
+  grant?: "deploy" | "projects" | "secrets";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -509,6 +509,50 @@ export const getSessionMachine = tool(
         result.logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, logLines);
       } catch (err) {
         result.logsError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const GetFlySetupArgsSchema = z.object({}).strict();
+
+export const getFlySetup = tool(
+  {
+    description: "Reports live Fly sessions connectivity and secret names by group, never values.",
+    input: GetFlySetupArgsSchema,
+    role: "admin",
+    grant: "secrets",
+    operation: "read",
+  },
+  async (): Promise<ToolResponse> => {
+    const config = mcpAdminConfig();
+    const mappings = getMappings();
+    const appSource = getRunnerBackendSource();
+    const configured = appSource !== "not-loaded" && !!config.flySessionsToken && !!config.flySessionsApp;
+    const result = {
+      usedBy: Object.keys(mappings).filter((key) => {
+        const path = resolveExecutionPath(getRunnerMode().mode, mappings[key].executionMode);
+        return path === "fly-machines" || path === "both";
+      }).sort(),
+      appSource, configured, app: config.flySessionsApp || null,
+      processLevelSecrets: getFlyProcessLevelSecrets(),
+      reachable: null as boolean | null,
+      reachError: null as string | null,
+      names: [] as Array<{ name: string; group: string; projects: string[]; createdAt: string }>,
+    };
+    if (configured) {
+      try {
+        const secrets = await listAppSecrets(config.flySessionsToken!, config.flySessionsApp!, 10_000);
+        result.names = secrets.map((secret) => {
+          const { group, projects } = classifyFlySecretNames([secret.name], Object.keys(mappings))[0];
+          return { name: secret.name, group, projects, createdAt: secret.created_at };
+        }).sort((a, b) => a.name.localeCompare(b.name));
+        result.reachable = true;
+      } catch (err) {
+        result.reachable = false;
+        result.reachError = err instanceof FlyApiError ? `http-${err.status}`
+          : err instanceof Error && err.name === "AbortError" ? "timeout" : "error";
       }
     }
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -1681,6 +1725,7 @@ export const orchestratorTools = restate.service({
     list_in_flight_jobs: listInFlightJobs,
     get_session_machine: getSessionMachine,
     list_session_machines: listSessionMachines,
+    get_fly_setup: getFlySetup,
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,

@@ -1,0 +1,15 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "forbidden: get_fly_setup requires the admin role"
+      }
+    ],
+    "isError": true
+  }
+}

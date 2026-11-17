@@ -239,8 +239,8 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     },
   );
 
-  it("the two review-fix admin reads are explicitly marked read-only and declare no retryPolicy", () => {
-    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_review_fix_activity", "get_review_fix_attempt"]);
+  it("the admin reads are explicitly marked read-only and declare no retryPolicy", () => {
+    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_fly_setup", "get_review_fix_activity", "get_review_fix_attempt"]);
     for (const { identifier } of adminReadEntries) {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
       expect(block).toContain('operation: "read"');
