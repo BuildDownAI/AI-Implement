@@ -1811,7 +1811,7 @@ describe("LinearProvider.fetchSetupFacts", () => {
   });
 });
 
-import { runChildIssueContract } from "./contract.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 import * as settings from "../../orchestrator-settings.js";
 
 runChildIssueContract("LinearProvider", async () => {
@@ -1973,5 +1973,45 @@ describe("LinearProvider.listIssueStatuses", () => {
     await expect(provider.listIssueStatuses(missing === "team" ? makeMapping({ teamKey: "" }) : mapping))
       .rejects.toBeInstanceOf(TrackerUnavailableError);
     expect(fake.calls).toHaveLength(0);
+  });
+});
+
+runPrClosedUnmergedContract("LinearProvider", async (terminal) => {
+  const fake = linear(
+    data({ issue: { state: { type: terminal ? "completed" : "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "review", name: "Ready for Review" }, { id: "plan", name: "Plan-Complete" }, { id: "bug", name: "bug" }] } } }),
+    ...(terminal ? [] : [data({ teams: { nodes: [{ id: "team", key: "ENG" }] } }),
+      data({ workflowStates: { nodes: [{ id: "other", name: "Rejected", type: "canceled" }, { id: "cancel", name: "cAnCeLlEd", type: "canceled" }] } }),
+      data({ issueUpdate: { success: true } }), data({ commentCreate: { success: true } })]),
+  );
+  return { provider: new LinearProvider({}), issueId: "i", scopeKey: "ENG", restartSentence: "To run it again, move the issue back to Todo.",
+    verify: async (terminal, comment) => {
+      expect(fake.calls).toHaveLength(terminal ? 1 : 5);
+      if (!terminal) {
+        expect(variables(fake, 3)).toEqual({ issueId: "i", stateId: "cancel", labelIds: ["plan", "bug"] });
+        expect(variables(fake, 4)).toEqual({ issueId: "i", body: comment });
+      }
+    } };
+});
+describe("LinearProvider unmerged close state lookup", () => {
+  it.each(["canceled", "completed", "duplicate"])("does not write to %s issues", async (type) => {
+    const fake = linear(data({ issue: { state: { type }, team: { key: "ENG" }, labels: { nodes: [{ id: "r", name: "Ready for Review" }] } } }));
+    expect(await new LinearProvider({}).markPrClosedUnmerged("i", "ENG", "url")).toBe(false);
+    expect(fake.calls).toHaveLength(1);
+  });
+  it.each(["Canceled", "CANCELED", "Rejected", ""])("selects canceled state %s or rejects missing state", async (name) => {
+    const fake = linear(data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [] } } }),
+      data({ teams: { nodes: [{ id: "team", key: "ENG" }] } }),
+      data({ workflowStates: { nodes: name ? [
+        ...(name.toLowerCase() === "canceled" ? [{ id: "other", name: "Rejected", type: "canceled" }] : []),
+        { id: "cancel", name, type: "canceled" },
+        { id: "last", name: "Archived", type: "canceled" },
+      ] : [] } }),
+      data({ issueUpdate: { success: true } }), data({ commentCreate: { success: true } }));
+    const result = new LinearProvider({}).markPrClosedUnmerged("i", "ENG", "url");
+    if (!name) {
+      await expect(result).rejects.toThrow('No "canceled" workflow state');
+      expect(fake.calls).toHaveLength(3);
+    }
+    else { expect(await result).toBe(true); expect(variables(fake, 3).stateId).toBe("cancel"); }
   });
 });

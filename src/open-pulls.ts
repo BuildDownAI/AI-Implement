@@ -8,7 +8,7 @@ import { resolveOpenPullWorkflow } from "./open-pull-workflow.js";
 export interface OpenPullEntry {
   teamKey: string | null;
   repo: string;
-  pr: { number: number; url: string; headRef: string; baseRef: string; openedAt: number; draft: boolean };
+  pr: { number: number; url: string; headRef: string; baseRef: string; openedAt: number; draft: boolean; role?: "implementation" | "roll-up" };
   issue: { identifier: string; title: string | null; url: string | null } | null;
   lastJob: { phase: string | null; status: string; conclusion: string | null; finishedAt: number } | null;
   workflow?: { state: "active" | "settled"; reason: string };
@@ -68,7 +68,7 @@ export async function listOpenPulls(deps: Partial<OpenPullsDeps> = {}): Promise<
         teamKey: link ? link.issue.mappingKey : mappings.length === 1 ? mappings[0][0] : null,
         repo,
         pr: { number: pr.number, url: pr.url, headRef: pr.head, baseRef: pr.base,
-          openedAt: pr.createdAt, draft: pr.draft },
+          openedAt: pr.createdAt, draft: pr.draft, ...(link ? { role: link.role } : {}) },
         issue: link?.issue.identifier != null
           ? { identifier: link.issue.identifier, title: link.issue.title, url: link.issue.url } : null,
         lastJob: lastJob ?? null,

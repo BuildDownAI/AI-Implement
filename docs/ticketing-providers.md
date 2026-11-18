@@ -237,3 +237,15 @@ provider records the parent association and puts children in planning pickup.
 Each call refreshes dispatch-breaker and job-log overlays. Merged issues retain their state and phase; otherwise a park makes an issue failed with the park's phase (gap-analysis maps to implementation). A failed issue with no tracker phase uses the newest job's phase. The newest job is ordered by `dispatched_at`, then row ID; its `completed_at`, falling back to `dispatched_at`, can advance the tracker change time. If multiple phases are parked, the newest park wins.
 
 Output contains only named public fields. Identifier collisions retain the first mapping in key order and warn with both team keys. Entries sort by team key and descending change time, with null times last.
+
+## Pull request closed without a merge
+
+`markPrClosedUnmerged(issueId, scopeKey, prUrl)` returns `true` after cancelling the issue and posting one comment naming the PR URL. It returns `false` without a write for an already terminal issue. This provider write is available for future merge-poll integration; it has no production caller yet.
+
+| Provider | Write | Terminal guard | Restart |
+|---|---|---|---|
+| Linear | One issue update sets the team's canceled state and removes `Ready for Review`, retaining `Plan-Complete` so a restart reuses the plan; then posts the comment | Completed, canceled, or duplicate state type | Move the issue back to Todo |
+| Jira | Sets AI-Implement status to `Implementation Failed`, then posts the comment; the field has no cancelled value | Field is `Merged` or native status is in the Done category | Set AI-Implement status to its pickup value |
+| Filesystem | Sets status `cancelled` and appends the comment in one locked task update | `completed` or `cancelled`, or a task that is not active | Set task status to its pickup value |
+
+The comment reads: “The pull request &lt;prUrl&gt; was closed without a merge. AI-Implement cancelled this issue.” It appends the provider's restart instruction. A person must restart the issue. Linear prefers a canceled workflow state named `Canceled` or `Cancelled` ignoring case, falling back to the first canceled state, and throws if none exists. Jira requires a successful terminal-state read before writing. Linear and Jira update state before commenting; a comment failure does not roll back the state write.
