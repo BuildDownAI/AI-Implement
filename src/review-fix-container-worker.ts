@@ -1,3 +1,5 @@
+import { decideImplementationSandbox } from "./implementation-launch.js";
+import { getFlyProcessLevelSecrets } from "./runner-mode.js";
 /** Fresh, attempt-owned containers using the established gap-fill transports (ADR 037). */
 import { redactAndCap } from "./pipeline/failure-classification.js";
 import { createHash } from "node:crypto";
@@ -109,7 +111,7 @@ export class ContainerReviewFixWorker implements ReviewFixWorkerPort {
       };
       let id: string;
       if (backend === "fly-machines") {
-        const result = await dispatchFlyGapfill({ ...this.deps.fly, ...common, issue: { issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title }, owner: mapping.owner, repo: mapping.repo, issueIdentifier: issue.identifier, scopeKey: teamKey, allTeamKeys: Object.keys(getMappings()), decision,
+        const result = await dispatchFlyGapfill({ implementationSandbox: decideImplementationSandbox({ protectedLaunch: decision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }), ...this.deps.fly, ...common, issue: { issueId: issue.id, issueIdentifier: issue.identifier, issueTitle: issue.title }, owner: mapping.owner, repo: mapping.repo, issueIdentifier: issue.identifier, scopeKey: teamKey, allTeamKeys: Object.keys(getMappings()), decision,
           runnerCallbackUrl: tokens.runner_callback_url ?? "", runToken: tokens.run_token ?? "", runProgressToken: tokens.run_progress_token ?? "", onBeforeLaunch: (size, n) => beforeLaunch(n, size) });
         id = result.machine.id;
       } else {

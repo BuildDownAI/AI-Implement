@@ -133,3 +133,20 @@ An unbound `launch_unresolved` outcome records the unresolved launch without
 cleanup, even if the dispatch row already has a machine or container ID. There is
 no terminal confirmation: the resource, nonce and occupancy remain for operator
 recovery.
+
+### Implementation sandbox decision
+
+Inside the existing Restate `dispatch` and `launch-once` steps, first implementations,
+gap-fills and review-fix attempts select `runner-isolated` only for a protected launch
+with process-level secrets enabled. Otherwise they select `agent-default`, with reason
+`unprotected` (which takes precedence) or `process-secrets-off`. Legacy launches default
+to `agent-default` and receive no execution policy. There is no new setting or journal step.
+
+The Fly full-access execution policy travels only in protected run config credentials
+and applies to every implementation agent (Claude's mapping is a no-op). The machine
+builder independently rejects policies without process-level secrets or for a purpose
+other than `session`. These machines remain one-shot, with no mounts and restart policy
+`no`. Machine metadata `implementation_sandbox` records `runner-isolated` or
+`agent-default:<reason>`, also included in the dispatch log. Metadata survives adoption
+after a lost launch response; tokens, nonces and policies stay outside step results.
+Changes to this security boundary require explicit operator review before merge.

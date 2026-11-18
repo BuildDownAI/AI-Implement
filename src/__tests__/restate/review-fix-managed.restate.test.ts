@@ -70,6 +70,7 @@ vi.mock("../../github.js", async (importOriginal) => ({
 // Synthetic container boundaries retain the real production worker, preparation and durable intent.
 vi.mock("../../gapfill-launch.js", async original => ({ ...await original<typeof import("../../gapfill-launch.js")>(),
   dispatchFlyGapfill: async (input: import("../../gapfill-launch.js").DispatchFlyGapfillInput) => {
+    expect(input.implementationSandbox).toEqual({ sandbox: "runner-isolated" });
     if (input.decision.kind !== "launch") throw new Error("expected managed Fly launch");
     state.containers.push({ snapshot: input.decision.snapshot, bearer: input.decision.takeBootstrap()!.bearer, backend: "fly-machines", name: input.runName! });
     input.onBeforeLaunch?.({ cpus: 2, memoryMb: 4096, cpuKind: "shared" }, "synthetic-container-nonce", "runner");
@@ -601,7 +602,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
         expect(state.containers).toHaveLength(before + 1);
         expect(grants(attemptId)).toBe(1);
         const text = await journalsOf(attemptId, pr);
-        for (const secret of [launch.bearer, ACCESS, SECRET, "SYNTHETIC-container-api-key"]) expect(JSON.stringify([text, logs.mock.calls, errors.mock.calls])).not.toContain(secret);
+        for (const secret of [launch.bearer, ACCESS, SECRET, "SYNTHETIC-container-api-key", "executionPolicy", "ephemeral-full-access"]) expect(JSON.stringify([text, logs.mock.calls, errors.mock.calls])).not.toContain(secret);
         await store.releaseOwner(attemptId, "cancelled");
         pr++;
       }
@@ -651,7 +652,7 @@ describe("Restate managed Codex review-fix on GHA: production composition", () =
           expect(revoked()).toEqual(fault === "lost acknowledgement" ? expect.any(Number) : null);
           // journalText decodes journal payloads, including ctx.run step outputs.
           const journal = await journalsOf(attemptId, pr);
-          for (const secret of [launch.bearer, ACCESS, SECRET, "SYNTHETIC-container-api-key"])
+          for (const secret of [launch.bearer, ACCESS, SECRET, "SYNTHETIC-container-api-key", "executionPolicy", "ephemeral-full-access"])
             expect(JSON.stringify([journal, ...logs.map(l => l.mock.calls)])).not.toContain(secret);
           await store.releaseOwner(attemptId, "cancelled");
         } finally {

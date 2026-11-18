@@ -507,6 +507,7 @@ const LEGACY_FLY_BODY = {
     },
     "metadata": {
       "purpose": "session",
+      "implementation_sandbox": "agent-default:unprotected",
       "issue_id": "issue-1389",
       "issue_identifier": "AII-1389",
       "repo": "acme/app",
@@ -547,7 +548,7 @@ function normalize(v: Record<string, unknown>): Record<string, unknown> {
 describe("opted-out dispatch is unchanged", () => {
   beforeEach(() => store.setProjectConfigured("AII", false));
 
-  it("Fly createMachine body deep-equals the pre-change fixture", async () => {
+  it("Fly createMachine body preserves the legacy fixture with sandbox metadata", async () => {
     await dispatchFly({ ...mapping, extraEnv: { FOO: "bar" } } as RepoMapping);
     expect(normalize(machineBody() as never)).toEqual(LEGACY_FLY_BODY);
   });

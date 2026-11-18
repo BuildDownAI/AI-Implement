@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { decodeRunConfig } from "../run-config.js";
+import { makeSnapshot, makeGrant } from "./helpers/fixtures/configured-run.js";
+import { decodeTrustedRunConfig, decodeRunConfig } from "../run-config.js";
 import { testDb } from "./helpers/test-db.js";
 import { makeMapping, makeScopedPrIdentity, makeChatGptPlanRecord } from "./helpers/builders.js";
 import type { ContainerReviewFixWorkerDeps } from "../review-fix-container-worker.js";
@@ -548,4 +549,26 @@ for (const backend of backends) describe(`managed ${backend}`, () => {
     expect(getDb().prepare("SELECT revoked_at FROM model_credential_grants WHERE dispatch_id = ?").get(s.plan.attemptId)).toEqual({ revoked_at: expect.any(Number) });
   });
 
+});
+
+describe("Fly review-fix sandbox", () => {
+  it.each([true, false].flatMap(protectedLaunch => [true, false].map(secrets => ({ protectedLaunch, secrets }))))("protected=$protectedLaunch secrets=$secrets", async ({ protectedLaunch, secrets }) => {
+    const s = await setup("fly-machines");
+    const mode = await import("../runner-mode.js");
+    mode.initSettingsTable();
+    mode.setFlyProcessLevelSecrets(secrets);
+    vi.spyOn(s.managed, "isManagedProject").mockReturnValue(protectedLaunch);
+    if (protectedLaunch) {
+      const snapshot = makeSnapshot();
+      const grant = makeGrant(snapshot, { dispatchId: s.plan.attemptId, projectKey: "AII" });
+      vi.spyOn(s.managed, "prepareManagedDispatch").mockResolvedValue({ kind: "launch", dispatchId: s.plan.attemptId, projectKey: "AII", backend: "fly-machines", snapshot, fallbackModels: {}, grant: {} as never, takeBootstrap: () => grant });
+      vi.spyOn(s.managed, "settleLaunch").mockImplementation(() => ({ revoked: false }));
+    }
+    const worker = new s.worker.ContainerReviewFixWorker({ ...s.deps, modelAuthRuntime: {} as never });
+    expect(await worker.launch(s.plan)).toMatchObject({ status: "accepted" });
+    const config = vi.mocked(s.fly.createMachine).mock.calls.at(-1)![2].config;
+    const isolated = protectedLaunch && secrets;
+    expect(config.metadata?.implementation_sandbox).toBe(isolated ? "runner-isolated" : `agent-default:${protectedLaunch ? "process-secrets-off" : "unprotected"}`);
+    expect(decodeTrustedRunConfig(config.env!.AI_IMPLEMENT_RUN_CONFIG).credentials?.executionPolicy?.backend).toBe(isolated ? "fly" : undefined);
+  });
 });
