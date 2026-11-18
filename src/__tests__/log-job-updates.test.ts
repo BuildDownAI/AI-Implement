@@ -505,6 +505,7 @@ describe("job pull request links", () => {
   ];
 
   it.each(setters)("links the job issue from each setter", (set) => {
+    links.listLinksByOutcome("open");
     const id = job("ENG", "jira");
     set(id);
     expect(links.findLinkByPr("o/r", 42)).toMatchObject({
@@ -534,6 +535,7 @@ describe("job pull request links", () => {
   });
 
   it("does not link a stored URL when the status caller supplies none", () => {
+    links.listLinksByOutcome("open");
     const id = job();
     dedup.getDb().prepare("UPDATE dispatch_log SET pr_url = ? WHERE id = ?").run(url, id);
     log.updateJobStatus(id, "completed", "success");
