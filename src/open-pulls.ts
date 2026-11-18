@@ -2,8 +2,7 @@ import { getMappings, resolvePrDispatchBudget, type RepoMapping } from "./config
 import { getDb } from "./dedup.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { listAllOpenPullRequests, type OpenPullRequest } from "./github.js";
-import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier } from "./log.js";
-import { parseGroupingBranchIdentifier } from "./comment-gapfill-drain.js";
+import { findLinkByPr } from "./pr-links.js";
 import { resolveOpenPullWorkflow } from "./open-pull-workflow.js";
 
 export interface OpenPullEntry {
@@ -51,35 +50,29 @@ export async function listOpenPulls(deps: Partial<OpenPullsDeps> = {}): Promise<
       cache.set(repo, cached);
     }
     for (const pr of cached.pulls) {
-      let job = getLatestDispatchForPr(owner, name, pr.number);
-      let isRollUp = false;
-      if (!job) {
-        const slug = parseGroupingBranchIdentifier(pr.head);
-        if (slug) job = getLatestDispatchForIssueIdentifier(owner, name, slug);
-        isRollUp = job !== null;
-      }
-      const issueUrl = job ? (getDb().prepare("SELECT issue_url FROM dispatch_log WHERE id = ?")
-        .get(job.id) as { issue_url: string | null }).issue_url : null;
+      const link = findLinkByPr(repo, pr.number);
       const lastJob = getDb().prepare(`SELECT phase, status, conclusion, completed_at AS finishedAt
         FROM dispatch_log WHERE pr_url = ? AND completed_at IS NOT NULL ORDER BY id DESC LIMIT 1`)
         .get(pr.url) as OpenPullEntry["lastJob"] | undefined;
-      const mapping = mappings.find(([key]) => key === job?.teamKey)?.[1]
-        ?? (mappings.length === 1 ? mappings[0][1] : null);
+      const mapping = link ? mappings.find(([key]) => key === link.issue.mappingKey)?.[1] ?? null
+        : mappings.length === 1 ? mappings[0][1] : null;
       const workflow = resolveOpenPullWorkflow({
         repo, prNumber: pr.number, prUrl: pr.url, baseRef: pr.base, draft: pr.draft,
-        issueId: job?.issueId ?? null, issueIdentifier: job?.issueIdentifier ?? null, isRollUp,
+        issueId: link?.issue.trackerIssueId ?? null, issueIdentifier: link?.issue.identifier ?? null,
+        isRollUp: link?.role === "roll-up",
         mapping: mapping ? { paused: mapping.paused, autoMerge: mapping.autoMerge, defaultBranch: mapping.defaultBranch,
           prDispatchBudget: resolvePrDispatchBudget(mapping) } : null,
         now,
       });
       const entry: OpenPullEntry = {
-        teamKey: job ? job.teamKey : mappings.length === 1 ? mappings[0][0] : null,
+        teamKey: link ? link.issue.mappingKey : mappings.length === 1 ? mappings[0][0] : null,
         repo,
         pr: { number: pr.number, url: pr.url, headRef: pr.head, baseRef: pr.base,
           openedAt: pr.createdAt, draft: pr.draft },
-        issue: job?.issueIdentifier != null ? { identifier: job.issueIdentifier, title: job.issueTitle, url: issueUrl } : null,
+        issue: link?.issue.identifier != null
+          ? { identifier: link.issue.identifier, title: link.issue.title, url: link.issue.url } : null,
         lastJob: lastJob ?? null,
-        tracked: job !== null,
+        tracked: link !== null,
       };
       if (workflow) entry.workflow = { state: workflow.state, reason: workflow.reason };
       entries.push(entry);

@@ -10,12 +10,16 @@ let db: ReturnType<typeof import("../dedup.js").getDb>;
 let api: typeof import("../open-pulls.js");
 let config: typeof import("../config.js");
 let time: number;
+let links: typeof import("../pr-links.js");
+let workflow: typeof import("../open-pull-workflow.js");
 const pull = (number = 42, head = "work"): OpenPullRequest => ({ number,
   url: `https://github.com/acme/app/pull/${number}`, head, base: "main", headSha: "sha",
   draft: false, title: "Title", createdAt: 123 });
 beforeEach(async () => {
   const { modules } = await testDb({ modules: { db: () => import("../dedup.js"),
-    api: () => import("../open-pulls.js"), config: () => import("../config.js") } });
+    api: () => import("../open-pulls.js"), config: () => import("../config.js"), links: () => import("../pr-links.js"),
+    workflow: () => import("../open-pull-workflow.js") } });
+  links = modules.links; workflow = modules.workflow;
   db = modules.db.getDb(); api = modules.api; config = modules.config;
   db.prepare("DELETE FROM mappings").run();
   config.upsertMapping("APP", makeMapping({ owner: "acme", repo: "app", paused: true, extraEnv: { SECRET: "x" } }));
@@ -27,9 +31,16 @@ function job(values: Record<string, string | number | null> = {}) {
   db.prepare(`INSERT INTO dispatch_log (${Object.keys(fields).join(",")}) VALUES (${Object.keys(fields).map(() => "?").join(",")})`)
     .run(...Object.values(fields));
 }
+function link(number = 42, role: "implementation" | "roll-up" = "implementation",
+  issue: Partial<import("../pr-links.js").IssueInput> = {}) {
+  return links.linkPullRequest({ repository: "acme/app", number, url: pull(number).url, role, source: "backfill",
+    issue: { trackerKind: "linear", mappingKey: "APP", trackerIssueId: "issue", identifier: "AII-12",
+      title: "Parent", url: "https://tracker/12", ...issue } });
+}
 const now = () => time;
 it("projects tracked identity, newest completed work and workflow without secrets", async () => {
   const pr = pull();
+  link();
   job({ pr_url: pr.url, completed_at: 90, phase: "implementation", status: "failed" });
   job({ pr_url: pr.url, completed_at: 80, phase: "gap-analysis", conclusion: "runner_approved", dispatched_at: time + 1 });
   job({ pr_url: pr.url, dispatched_at: time + 2 });
@@ -47,6 +58,7 @@ it("projects tracked identity, newest completed work and workflow without secret
 });
 it("reports an approved child as settled while paused and active after resuming", async () => {
   config.upsertMapping("APP", makeMapping({ owner: "acme", repo: "app", autoMerge: true, paused: true }));
+  link();
   const pr = { ...pull(), base: "ai-implement/feature/AII-10" };
   job({ pr_url: pr.url, completed_at: 90, phase: "implementation", conclusion: "runner_approved" });
   const listRepoPulls = vi.fn(async () => [pr]);
@@ -57,17 +69,48 @@ it("reports an approved child as settled while paused and active after resuming"
     .toEqual({ state: "active", reason: "auto-merge-pending" });
   expect(listRepoPulls).toHaveBeenCalledTimes(1);
 });
-it("recovers roll-ups case insensitively, preferring a direct row", async () => {
-  job({ pr_url: pull(12).url, completed_at: 90, phase: "implementation", conclusion: "runner_approved" });
-  const listRepoPulls = async () => [pull(42, "ai-implement/feature/aii-12")];
-  expect((await api.listOpenPulls({ listRepoPulls, now }))[0]).toMatchObject({ tracked: true,
-    teamKey: "APP",
-    issue: { identifier: "AII-12", title: "Parent", url: "https://tracker/12" },
-    lastJob: null, workflow: { reason: "awaiting-review" } });
-  job({ pr_url: pull().url, issue_identifier: "OTHER-1", dispatched_at: time + 1 });
-  const entry = (await api.listOpenPulls({ listRepoPulls, now }))[0];
-  expect(entry.issue?.identifier).toBe("OTHER-1");
+it("projects linked identity without any jobs", async () => {
+  link();
+  expect((await api.listOpenPulls({ listRepoPulls: async () => [pull()], now }))[0])
+    .toMatchObject({ tracked: true, teamKey: "APP", lastJob: null,
+      issue: { identifier: "AII-12", title: "Parent", url: "https://tracker/12" } });
+});
+it("keeps a link with a null identifier tracked", async () => {
+  link(42, "implementation", { identifier: null });
+  expect((await api.listOpenPulls({ listRepoPulls: async () => [pull()], now }))[0])
+    .toMatchObject({ tracked: true, teamKey: "APP", issue: null, lastJob: null });
+});
+it("does not recover identity from surviving jobs or grouping branches", async () => {
+  job({ pr_url: pull().url, completed_at: 90 });
+  job({ pr_url: pull(12).url, completed_at: 91 });
+  const entry = (await api.listOpenPulls({
+    listRepoPulls: async () => [pull(42, "ai-implement/feature/AII-12")], now }))[0];
+  expect(entry).toMatchObject({ tracked: false, issue: null, teamKey: "APP", lastJob: { finishedAt: 90 } });
   expect(entry).not.toHaveProperty("workflow");
+});
+it.each(["implementation", "roll-up"] as const)("uses the %s link role and linked identity for workflow", async role => {
+  config.upsertMapping("SECOND", makeMapping({ owner: "acme", repo: "app", paused: false, autoMerge: true }));
+  link(42, role, { mappingKey: "SECOND", trackerIssueId: "linked-id" });
+  job({ pr_url: pull().url, issue_identifier: "OTHER-1", team_key: "APP", completed_at: 90 });
+  const spy = vi.spyOn(workflow, "resolveOpenPullWorkflow");
+  try {
+    const entry = (await api.listOpenPulls({ listRepoPulls: async () =>
+      [pull(42, role === "roll-up" ? "arbitrary" : "ai-implement/feature/AII-12")], now }))[0];
+    expect(entry).toMatchObject({ tracked: true, teamKey: "SECOND", issue: { identifier: "AII-12" },
+      lastJob: { finishedAt: 90 } });
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ issueId: "linked-id", issueIdentifier: "AII-12",
+      isRollUp: role === "roll-up", mapping: expect.objectContaining({ paused: false, autoMerge: true }) }));
+    expect(entry.workflow?.reason).toBe(role === "roll-up" ? "awaiting-review" : "completed");
+  } finally { spy.mockRestore(); }
+});
+it("does not fall back to the sole mapping when the linked key is missing", async () => {
+  link(42, "roll-up", { mappingKey: "MISSING" });
+  const spy = vi.spyOn(workflow, "resolveOpenPullWorkflow");
+  try {
+    const entry = (await api.listOpenPulls({ listRepoPulls: async () => [pull()], now }))[0];
+    expect(entry.teamKey).toBe("MISSING");
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ mapping: null }));
+  } finally { spy.mockRestore(); }
 });
 it("orders repositories before descending PR numbers regardless of input order", async () => {
   db.prepare("DELETE FROM mappings").run();
