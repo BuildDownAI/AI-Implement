@@ -148,9 +148,9 @@ On a running orchestrator, configure model accounts under **Models & providers**
 Projects drawer. Operator procedures, including the protected CLI steps, are in
 [docs/model-account-operations.md](docs/model-account-operations.md). Never paste raw browser
 credentials anywhere. Existing Codex local-login users re-sign in through `chatgpt-plan-login`; the
-orchestrator does not read or copy an `auth.json`. Support is provisional: see
-[docs/codex-parity-validation.md](docs/codex-parity-validation.md) for what is verified and what is
-still pending.
+orchestrator does not read or copy an `auth.json`. Codex runs in production under Restate on Fly Machines; see
+[docs/codex-parity-validation.md](docs/codex-parity-validation.md) for what is verified and what that
+evidence does not cover.
 
 ### Exercise planning and implementation separately
 
