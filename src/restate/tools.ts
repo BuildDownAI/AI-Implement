@@ -1,3 +1,6 @@
+import { resolveDefaultRunnerImage } from "../repo-image.js";
+import { STAGE_NAMES } from "../agent-config.js";
+import { createAgentConfigAdminDeps } from "../model-auth-runtime.js";
 import { importEnvironmentCredential } from "../model-account-cli.js";
 import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { modelPrices } from "./model-prices.js";
@@ -58,6 +61,8 @@ import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../rep
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
+  createModelAccountAction,
+  putProjectAgentConfigAction,
   setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
@@ -1085,7 +1090,7 @@ export const getReviewFixActivityTool = tool(
 );
 
 export const LIST_OPEN_PULLS_DESCRIPTION =
-  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; any unreadable repository fails the whole call. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
+  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; a failed refresh serves the last good repository copy only while it is less than 5 minutes old, otherwise the whole call fails. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
 
 export const listOpenPullsTool = tool(
   {
@@ -1101,7 +1106,7 @@ export const listOpenPullsTool = tool(
 );
 
 export const LIST_ISSUE_STATUSES_DESCRIPTION =
-  "Returns a JSON array with one entry per in-scope issue: open issues matching the pickup query in any state, plus merged and failed issues from the last 7 days. States: ready, planning, awaiting-approval, plan-approved, implementing, pr-ready, merged, failed, unknown. changedAt is the tracker's last-updated time, or a newer job time when there is one (epoch ms). Breaker parks mark nonmerged issues failed; jobs supply missing failure phase and newer changedAt. Tracker reads are cached for 60 s; one unreadable tracker fails the whole call. Linear and filesystem never report awaiting-approval. Read.";
+  "Returns a JSON array with one entry per in-scope issue: open issues matching the pickup query in any state, plus merged and failed issues from the last 7 days. States: ready, planning, awaiting-approval, plan-approved, implementing, pr-ready, merged, failed, unknown. changedAt is the tracker's last-updated time, or a newer job time when there is one (epoch ms). Breaker parks mark nonmerged issues failed; jobs supply missing failure phase and newer changedAt. Tracker reads are cached for 60 s; a failed refresh serves the last good team copy only while it is less than 5 minutes old, otherwise the whole call fails. Linear and filesystem never report awaiting-approval. Read.";
 
 export const listIssueStatusesTool = tool(
   {
@@ -1607,6 +1612,64 @@ export const addProjectArgsSchema = z.object({
   ),
 });
 
+function modelAdminDeps() {
+  return { agentConfig: createAgentConfigAdminDeps({
+    ...mcpAdminConfig(), sessionImage: resolveDefaultRunnerImage(process.env).image,
+  }) };
+}
+
+export const AddModelAccountArgsSchema = z.object({
+  profileId: z.string(), identity: z.string(), agent: z.string(),
+  provider: z.string(), authMode: z.string(),
+}).strict();
+
+export const SetProjectStageArgsSchema = z.object({
+  teamKey: z.string(),
+  stage: z.enum(STAGE_NAMES),
+  agent: z.string().nullable().optional(),
+  provider: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  fallbackModel: z.string().nullable().optional(),
+  accountProfileId: z.string().nullable().optional(),
+  invocationTimeoutMs: z.number().int().positive().nullable().optional(),
+  preferOpenModel: z.boolean().optional(),
+}).strict();
+
+export const addModelAccountTool = tool(
+  {
+    description: "Create an active model account profile. No credential values are accepted; use Set key on /admin#models.",
+    input: AddModelAccountArgsSchema,
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("add-model-account", () =>
+      createModelAccountAction(input.args, modelAdminDeps()), { maxRetryAttempts: 1 });
+    if (result.status >= 400) return toolError(JSON.stringify(result));
+    return { content: [{ type: "text", text: JSON.stringify(result.body) }] };
+  },
+);
+
+export const setProjectStageTool = tool(
+  {
+    description: "Overlay one project agent stage, preserving other stages and mode, with the admin UI readiness checks.",
+    input: SetProjectStageArgsSchema,
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { teamKey, stage, ...patch } = input.args;
+    const result = await ctx.run("set-project-stage", () =>
+      putProjectAgentConfigAction(teamKey, modelAdminDeps(), auditActor(input.caller, "system"), {
+        stages: { [stage]: patch },
+      }), { maxRetryAttempts: 1 });
+    if (result.status >= 400) return toolError(JSON.stringify(result));
+    return { content: [{ type: "text", text: JSON.stringify(result.body) }] };
+  },
+);
+
 export const SetProjectAgentModeArgsSchema = z.object({
   teamKey: z.string(),
   mode: z.enum(["configured", "legacy"]),
@@ -1796,6 +1859,8 @@ export const orchestratorTools = restate.service({
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,
     add_project: addProjectTool,
+    add_model_account: addModelAccountTool,
+    set_project_stage: setProjectStageTool,
     set_project_agent_mode: setProjectAgentModeTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,

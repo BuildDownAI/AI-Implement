@@ -12,6 +12,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 |----------|--------|
 | [standing-rules.md](standing-rules.md) | The operator's rules for all design and analysis work: verify every claim in code before presenting it, do not expand the rights a deployment needs, re-evaluate ADR rules as Restate use grows |
 | [pipeline-architecture.md](pipeline-architecture.md) | The step contract, the built-in steps, how `applyWiring` supplies inputs, and how a fork overrides steps or the pipeline |
+| [pull-request-links.md](pull-request-links.md) | Stored issue and PR schema, publication writers and recovery, merge readers, guarded cancellation and retention |
 | [spotter-status-tools.md](spotter-status-tools.md) | Spotter open PR and issue status tools, workflow rules, tracker mappings, local overlays, caches and failure semantics |
 | [review-fix-rail.md](review-fix-rail.md) | The finding ledger, the four `review_*` tables, the webhook events that feed the fix queue, and the drain loop |
 | [restate-review-fix-pilot.md](restate-review-fix-pilot.md) | Pilot setup, attempt recovery, drain and rollback procedures, automated evidence and remaining SAN checks |
@@ -21,6 +22,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [kg-sidecar.md](kg-sidecar.md) | The knowledge-graph sidecar, the `/mcp` proxy and its OAuth flow, and the image build |
 | [mcp-server.md](mcp-server.md) | The `/mcp` door, the identity contract (kind, role, the caller object, the refresh path), which client holds which token, what ends a session, the tools service and discovery, the three entry points, every tool with its role, run identities, failure behaviour |
 | [deployment.md](deployment.md) | Deploy paths, client instances, and the AWS Bedrock setup |
+| [fly-secrets-migration.md](fly-secrets-migration.md) | Move an existing Fly deployment from GraphQL secret reads to Machines API secret reads: compare, remove stale names, upgrade, verify and roll back |
 | [orchestrator-configuration.md](orchestrator-configuration.md) | How an orchestrator decides each setting's effective value: what boot requires and warns about, where a setting lives (environment, a seed-once settings row, an environment override, a Restate object) and which source wins, how the numeric values parse, the database path fallback, the image build stamps, and the setup checks that report each fault |
 | [setup-checks.md](setup-checks.md) | The setup checks: running the command locally and on Fly, what it reads, how to read its output and exit code, where a running orchestrator shows the results and to whom, and every check, by group, each linked to the reference that explains it |
 | [access-model.md](access-model.md) | Who may sign in and what they may see: the allowlist and its env-to-database handover, the Admin/User split and per-page grants, provider binding, the per-request re-check, the audit trail, and host recovery from lockout |

@@ -6719,7 +6719,7 @@ describe("owned result accounting boundary", () => {
   });
 });
 
-it.each(["success", "failure"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
+it.each(["success", "failure", "skipped"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
   const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
     ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET });
   const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
@@ -6732,7 +6732,8 @@ it.each(["success", "failure"] as const)("review-only %s preserves findings and 
   const provider = new FakeProvider({ recordCalls: true });
   const res = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
     resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
-    body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [],
+    body: { phase: "gap-analysis", outcome: outcome === "skipped" ? "success" : outcome, reviewOnly: true, comments: [],
+      ...(outcome === "skipped" ? { rollupReview: { headSha: "a".repeat(40), verdictUrl: "", skipReason: "PR head moved" } } : {}),
       internalFindings: [...findings, { source: "ai-implement-internal", severity: "blocking", body: "new" }],
       findingDispositions: findings.map((f, i) => ({ findingKey: reviewStore.stableReviewFindingKey(f),
         disposition: (["fixed", "invalid", "follow-up"] as const)[i], reason: "test" })),
@@ -6740,7 +6741,7 @@ it.each(["success", "failure"] as const)("review-only %s preserves findings and 
   });
   expect(res.status).toBe(200);
   expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual(before);
-  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome === "success" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
+  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome !== "failure" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
   expect(submit).not.toHaveBeenCalled();
   expect(provider.recordedCalls()).toHaveLength(0);
 });
@@ -6771,15 +6772,18 @@ describe("roll-up review follow-up children", () => {
       { source: "ai-implement-internal", severity: "blocking", path: "two.ts", line: 9, body: "When retried, work is duplicated." },
       { source: "ai-implement-internal", severity: "minor", body: "minor nit" },
     ];
-    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success") {
+    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success",
+      failedReviewers = outcome === "failure" ? ["code-review", "integration-review"] : [],
+      incompleteReviews?: Array<{ reviewerId: string; failure?: { category: import("../pipeline/failure-classification.js").FailureCategory; code: string } }>, skipReason?: string) {
       const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
       const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
       const deliver = () => runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
         resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
+        checkImplementationAdmissionTermination: async () => ({ status: "accepted" }),
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
         body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
-          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99" } } });
+          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers, incompleteReviews, skipReason } } });
       return { deliver, dispatchId };
     }
     async function run(head: string, internalFindings = findings) {
@@ -6794,6 +6798,71 @@ describe("roll-up review follow-up children", () => {
     return { provider, children, listing, create, update, run, prepare, findings };
   }
 
+  it("acknowledges a stale-head skip without child, tracker verdict, or retry", async () => {
+    const { prepare, provider, create, listing, update, findings } = await setup();
+    const { deliver, dispatchId } = await prepare("a", findings, "success", [], [], "PR head moved from A to B");
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "completed", conclusion: "rollup_review", approved: false });
+    expect(create).not.toHaveBeenCalled();
+    expect(listing).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(provider.recordedCalls()).toEqual([]);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(0);
+  });
+
+  it("queues one retry for PROVIDER_OVERLOADED incomplete reviewers", async () => {
+    const { prepare, update } = await setup();
+    const first = await prepare("a", [], "failure", ["code-review"], [
+      { reviewerId: "code-review", failure: { category: "transient", code: "PROVIDER_OVERLOADED" } },
+    ]);
+    expect((await first.deliver()).status).toBe(200);
+    const rows = dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ owner: "org", repo: "repo", pr_number: 12, commenter: "ai-implement-rollup-review" });
+    expect(update.mock.calls.at(-1)?.[4]).toContain("one retry is queued");
+  });
+
+  it("does not retry a second incomplete result, including after terminal queue states", async () => {
+    const { prepare, update } = await setup();
+    const failures = ["code-review", "integration-review"].map(reviewerId => ({ reviewerId,
+      failure: { category: "transient" as const, code: "PROVIDER_OVERLOADED" } }));
+    const first = await prepare("a", [], "failure", failures.map(r => r.reviewerId), failures);
+    await first.deliver();
+    dedup.getDb().prepare("UPDATE comment_gapfill_queue SET status = 'completed'").run();
+    const second = await prepare("a", [], "failure", failures.map(r => r.reviewerId), failures);
+    expect((await second.deliver()).status).toBe(200);
+    // A replay of the same callback token is refused and queues nothing.
+    expect((await second.deliver()).status).toBe(409);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("no retry is left; a person decides");
+  });
+
+  it.each(["auth", "missing", "empty", "complete"])("does not retry %s failures", async kind => {
+    const { prepare, update } = await setup();
+    const failures = kind === "empty" ? [] : [
+      { reviewerId: "code-review", failure: { category: "transient" as const, code: "PROVIDER_OVERLOADED" } },
+      { reviewerId: "integration-review", ...(kind === "missing" ? {} : {
+        failure: { category: "auth" as const, code: "AUTH_FAILED" } }) },
+    ];
+    const result = await prepare("a", [], kind === "complete" ? "success" : "failure",
+      ["code-review", "integration-review"], failures);
+    expect((await result.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(0);
+    if (kind !== "complete") expect(update.mock.calls.at(-1)?.[4]).toContain("no retry is left; a person decides");
+  });
+
+  it("keeps a queued retry notice when the comment write needs redelivery", async () => {
+    const { prepare, update } = await setup();
+    update.mockRejectedValueOnce(new Error("comment unavailable"));
+    const first = await prepare("a", [], "failure", ["code-review"], [
+      { reviewerId: "code-review", failure: { category: "transient", code: "PROVIDER_OVERLOADED" } },
+    ]);
+    expect((await first.deliver()).status).toBe(503);
+    expect((await first.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("one retry is queued");
+  });
+
   it("files both blockers in one templated child and keeps minors in the verdict", async () => {
     const { create, run, update } = await setup();
     await run("a");
@@ -6806,6 +6875,8 @@ describe("roll-up review follow-up children", () => {
     expect(content.title).toMatch(/^\[roll-up-review\] org\/repo#12 /);
     expect(content.body).not.toContain("minor nit");
     expect(update.mock.calls[0][4]).toContain("minor nit");
+    expect(update.mock.calls[0][4]).toContain("Blocking findings filed as");
+    expect(update.mock.calls[0][4]).toContain((await create.mock.results[0].value).identifier);
   });
 
   it("does not file partial blockers from an incomplete review or consume the child budget", async () => {
@@ -6814,20 +6885,33 @@ describe("roll-up review follow-up children", () => {
     expect((await deliver()).status).toBe(200);
     expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", approved: false, conclusion: "rollup_review" });
     expect(create).not.toHaveBeenCalled();
-    expect(update).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("code-review, integration-review");
     await run("a");
     await run("b");
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  it("notifies on a failure before the reviewed head or reviewers are available", async () => {
+    const { prepare, create, update } = await setup();
+    const { deliver } = await prepare("", [], "failure", []);
+    expect((await deliver()).status).toBe(200);
+    expect(create).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("No failed reviewer was identified");
+    expect(dedup.getDb().prepare("SELECT value FROM settings WHERE key = ?")
+      .get("roll-up-review:children:org/repo#12")).toBeUndefined();
+  });
+
   it("ignores minor-only results", async () => {
-    const { run, create, findings } = await setup();
+    const { run, create, findings, update } = await setup();
     await run("a", [findings[2]]);
     expect(create).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("No blocking findings");
   });
 
   it("serializes concurrent same-head creates and caps at two including terminal children", async () => {
-    const { run, create, update, children, provider } = await setup();
+    const { run, create, update, children, provider, prepare, findings } = await setup();
     await Promise.all([run("a"), run("a")]);
     expect(create).toHaveBeenCalledOnce();
     provider.setLifecycle(children[0].id, "completed");
@@ -6835,11 +6919,16 @@ describe("roll-up review follow-up children", () => {
     await run("a");
     expect(create).toHaveBeenCalledOnce();
     await run("b");
-    expect(update.mock.calls.at(-1)?.[4]).toContain("a person decides");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("a person must decide");
     dedup.getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:children:%");
     await run("c");
     expect(create).toHaveBeenCalledTimes(2);
     expect(update.mock.calls.at(-1)?.[4]).toContain("limit");
+    const incomplete = await prepare("d", findings, "failure");
+    expect((await incomplete.deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("a person must decide");
   });
 
   it("fails closed on tracker reads and ambiguous creates", async () => {
@@ -6857,16 +6946,106 @@ describe("roll-up review follow-up children", () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
-  it("acknowledges failures after creation and unsupported child discovery", async () => {
-    const { prepare, create, update, provider } = await setup();
-    update.mockRejectedValueOnce(new Error("comment unavailable"));
-    const { deliver } = await prepare("a");
-    expect((await deliver()).status).toBe(200);
+  it.each(["creation", "edit", "failed edit", "pending retry"])("serializes shared notices during overlapping %s callbacks", async stage => {
+    const { prepare, create, update } = await setup();
+    const first = await prepare("a");
+    const second = await prepare("a"); // Separate legacy dispatches share the same notice receipt.
+    if (stage === "pending retry") {
+      update.mockRejectedValueOnce(new Error("comment unavailable"));
+      expect((await first.deliver()).status).toBe(503);
+      update.mockClear();
+    }
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    if (stage === "creation") {
+      const actual = create.getMockImplementation()!;
+      create.mockImplementationOnce(async (...args) => {
+        entered();
+        await gate;
+        return actual(...args);
+      });
+    } else {
+      update.mockImplementationOnce(async () => {
+        entered();
+        await gate;
+        if (stage === "failed edit") throw new Error("comment unavailable");
+      });
+    }
+    const delivery = first.deliver();
+    await started;
+    const overlapping = second.deliver();
+    // Drain the mocked I/O in the second callback while the first remains suspended.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release();
+    const results = await Promise.all([delivery, overlapping]);
+    expect(results.map(result => result.status)).toEqual(stage === "failed edit" ? [503, 200] : [200, 200]);
     expect(create).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledTimes(stage === "failed edit" ? 2 : 1);
+    const child = await create.mock.results[0].value;
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toEqual({
+      headSha: "a".repeat(40), commentId: 99,
+      text: `<!-- roll-up-review follow-up -->\n\nBlocking findings filed as ${child.identifier}.`,
+      delivered: true,
+    });
+    expect(update.mock.calls[0][4]).toContain(JSON.parse(row.value).text);
+    if (stage === "failed edit") expect(update.mock.calls[1][4]).toBe(update.mock.calls[0][4]);
+  });
+
+  it("retries a durable notice after child creation without filing or posting twice", async () => {
+    const { prepare, create, update, listing } = await setup();
+    update.mockRejectedValueOnce(new Error("comment unavailable"));
+    const { deliver, dispatchId } = await prepare("a");
+    expect((await deliver()).status).toBe(503);
+    expect(create).toHaveBeenCalledOnce();
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toMatchObject({ headSha: "a".repeat(40), commentId: 99, delivered: false });
+    const originalText = update.mock.calls[0][4];
+    listing.mockRejectedValue(new Error("tracker discovery unavailable"));
+    expect((await deliver()).status).toBe(200);
+    expect(update.mock.calls[1][4]).toBe(originalText);
+    expect(create).toHaveBeenCalledOnce();
+    const second = await prepare("a");
+    expect((await second.deliver()).status).toBe(200);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it.each(["read", "missing", "lost-response"])("retains and retries a notice after %s with Restate ownership", async failure => {
+    const { prepare, create, update } = await setup();
+    const gh = await import("../github.js");
+    const { deliver, dispatchId } = await prepare("a");
+    expect(dispatchAdmission.acquire({ dispatchId, mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" }, kind: "implementation",
+      backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 1 }).ok).toBe(true);
+    const comments = vi.mocked(gh.listPrComments);
+    if (failure === "read") comments.mockRejectedValueOnce(new Error("comments unavailable"));
+    if (failure === "missing") comments.mockResolvedValueOnce([]);
+    if (failure === "lost-response") update.mockImplementationOnce(async (_token, _owner, _repo, id, body) => {
+      comments.mockResolvedValue([{ id, body }]);
+      throw new Error("response lost after edit");
+    });
+    expect((await deliver()).status).toBe(503);
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
+    expect(create).toHaveBeenCalledOnce();
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)?.status).toBe("completed");
+    expect((await deliver()).status).toBe(200);
+    expect(update).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toMatchObject({ delivered: true });
+  });
+
+  it("keeps unsupported child discovery advisory", async () => {
+    const { prepare, create, provider } = await setup();
     Object.assign(provider, { listIssuesPage: undefined });
     const next = await prepare("b");
     expect((await next.deliver()).status).toBe(200);
-    expect(create).toHaveBeenCalledOnce();
+    expect(create).not.toHaveBeenCalled();
   });
 
   it("parks a child if the PR closes during creation", async () => {

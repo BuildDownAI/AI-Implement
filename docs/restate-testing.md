@@ -402,9 +402,10 @@ did not test). Scenarios follow five rules, and
    that the engine or the code under test recorded (a journal `wake_up_time`, a stored outcome time), or hold the
    workflow at a gate (§ [Driving the race](#driving-the-race)). For example, "$event ends an unknown launch during
    its backed-off wait ($label)" in `review-fix-pilot.restate.test.ts` compares the durable `completed_at` with the
-   last sleep's `wake_up_time` in that attempt's journal. This case sets the timer ten minutes beyond the deadline:
+   selected backed-off sleep's `wake_up_time` in that attempt's journal. This case sets the timer ten minutes beyond the deadline:
    when proving that an event came before a timer, place the timer so far away that it cannot end during the test.
    A longer limit is not a fix for a test that fails on a busy worker.
+   A test waiting for a durable command must use the same condition as its assertion on that command, so an earlier command cannot match.
 
 `settle(ms)` is the only permitted wait, and only before a **negative** assertion ("nothing more happens"). A raw
 `setTimeout(` is allowed only inside a fake dependency that simulates a slow call, carrying a

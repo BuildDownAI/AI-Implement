@@ -273,6 +273,10 @@ export interface TicketingProvider {
    *  filesystem: a terminal task). Not the dispatch-breaker park (`src/dispatch-breaker.ts`),
    *  which holds re-dispatch per phase. */
   parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
+  /** The issue's pull request closed without a merge. Moves the issue to the tracker's
+   * cancelled state and posts one comment. Returns false, with no write, when the issue
+   * is already terminal. */
+  markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;

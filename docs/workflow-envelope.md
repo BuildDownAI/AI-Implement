@@ -475,10 +475,17 @@ the unchanged GitHub shape; machine launches remain a later slice.
 
 ### Advisory review-only gap-fills
 
-`reviewOnly: { reviewers: ReviewerSelection[] }` selects a single internal review pass
+`reviewOnly: { reviewers: ReviewerSelection[]; expectedHeadSha?: string }` selects a single internal review pass
 for an existing `prNumber` with `runnerPhase: "gap-analysis"`. The selection must be
 nonempty. Absent mode preserves the normal implement/fix gap-fill flow. Malformed
 mode fails decoding; it cannot be combined with `reviewFix`.
+
+`expectedHeadSha` is optional and must be a 40–64 character hexadecimal SHA.
+The runner compares it with the current PR head before reading the diff or calling
+reviewers. A mismatch returns a successful skip with `rollupReview.skipReason`
+explaining both heads: no reviewer runs, no PR verdict is posted, and the callback
+files no child or retry. Omitting the field preserves review of the current head.
+The head is still checked again after reading the diff to catch concurrent moves.
 
 GHA envelope dispatch, Fly and local Docker retain this payload. Legacy per-input
 GHA workflows reject the mode before launch. Roll-up reviews on GHA and Fly launch

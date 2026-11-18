@@ -1,3 +1,12 @@
+export interface RollupReviewResult {
+  /** Stale queued head: no reviewer or verdict was produced. */
+  skipReason?: string;
+  headSha: string;
+  verdictUrl: string;
+  failedReviewers?: string[];
+  incompleteReviews?: Array<{ reviewerId: string; failure?: Pick<import("./pipeline/failure-classification.js").FailureRecord, "category" | "code"> }>;
+}
+
 import type { ReviewLedgerFinding } from "./pipeline/review-ledger.js";
 import type { SourceResult } from "./kg-source-results.js";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
@@ -162,7 +171,7 @@ export async function postRunnerResult(params: {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid), present only when non-empty. */
   reviewOnly?: boolean;
-  rollupReview?: { headSha: string; verdictUrl: string };
+  rollupReview?: RollupReviewResult;
   internalFindings?: ReviewLedgerFinding[];
   findingDispositions?: FindingDisposition[];
   /**

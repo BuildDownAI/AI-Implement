@@ -8,7 +8,10 @@ flowchart TD
   W -->|pass| Q[(comment_gapfill_queue)]
   W -->|fail| R1[drop or reason reply]
   Q --> D[drain]
-  D --> L{PR lookup}
+  D --> S{Read PR state once}
+  S -->|merged or closed| T[item skipped with reason]
+  S -->|read failed| P
+  S -->|open| L{PR lookup}
   L -->|row found| G{canDispatch}
   L -->|no row| R2[reply, item failed]
   G -->|ok| RUN[gap-fill run]
@@ -37,14 +40,16 @@ The probe and the permission check each retry once with no sleep (GitHub's deliv
 
 ## Queue
 
-`comment_gapfill_queue` holds one row per comment (`owner`, `repo`, `prNumber`, `commentId`, `commenter`, `instruction`, `status`). `claimPendingCommentGapfills` hands rows to the drain; a row leaves `pending` only through `markCommentGapfillProcessed` (`dispatched`, `failed`, `skipped`).
+`comment_gapfill_queue` holds one row per comment (`owner`, `repo`, `prNumber`, `commentId`, `commenter`, `instruction`, `status`). `claimPendingCommentGapfills` hands rows to the drain; terminal PR checks and processing updates move rows out of `pending` (`dispatched`, `failed`, `skipped`).
 
 ## Drain and PR lookup
 
-For each claimed item the drain resolves the PR's dispatch row, in this order:
+For each claimed item with a repository mapping, the drain reads `getPullRequestState` before admission gates. Merged PRs immediately become `skipped` with `last_refusal_reason = pr_merged`; closed, unmerged PRs use `pr_closed`. This emits one terminal log line, consumes no refusal count, and posts no reply or budget notice. Subsequent ticks do not read the skipped row. A null or thrown PR read does not change the flow that existed before this check. An item with a dispatch log goes on to the admission gates. An item with no dispatch log gets the reply "AI-Implement could not read this PR from GitHub just now … repost" and ends `failed`, so the drain does not read it again on each tick. A failure to get the installation token affects every row, so it leaves the row `pending` for the next tick.
+
+For an open PR, the drain resolves its dispatch row in this order:
 
 1. `getLatestDispatchForPr`: a row whose `pr_url` is the PR.
-2. On a miss, read the PR once (`getPullRequestState`), then:
+2. On a miss, reuse the same PR read for its head branch, then:
    1. Roll-up parent: head `ai-implement/<feature|multi-issue>/<key>` resolves to the parent issue's latest dispatch.
    2. In-flight run: the newest `dispatched`/`running` row in the same repo whose issue identifier matches the head branch (`branchMatchesIssueIdentifier`). The PR's own run has the branch identifier but no `pr_url` until it completes. Ended runs already have `pr_url` and are not matched.
 3. No match: "no record" reply.
@@ -65,13 +70,14 @@ Each finding is rendered whole under its `finding_key`, the same shape a review-
 
 ## In-flight deferral
 
-When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left `pending` with no reply, and the next drain retries it. Once the run sets `pr_url`, step 1 finds it and the item dispatches. There is no age cap: the job timeout, stuck watchdog and reaper end the run. Other `canDispatch` or admission refusals (`pr_budget`, capacity) defer the same way.
+When step 2.2 matches, `canDispatch` refuses with `in_flight`, the item is left `pending` with no reply, and the next drain retries it. Once the run sets `pr_url`, step 1 finds it and the item dispatches. There is no age cap: the job timeout, stuck watchdog and reaper end the run. Policy refusals (`pr_budget`, parked state, capacity) instead count toward the three-refusal limit described below.
 
 ## Drain replies
 
 | Condition | Reply | Item |
 |---|---|---|
-| PR cannot be read (null or throw) | "could not read this PR from GitHub just now … repost" | `failed` |
+| PR merged or closed | no reply (one log line) | `skipped`, reason `pr_merged` or `pr_closed` |
+| PR token acquisition fails or PR cannot be read (null or throw) | no reply; retry next tick | unchanged |
 | No dispatch row, no roll-up parent, no in-flight match; comment from a person | "AI-Implement has no record of this PR. Please trigger a new implementation run from the issue tracker first." | `failed` |
 | Same, but the commenter is `ROLLUP_REVIEW_COMMENTER` | no reply (one log line) | `skipped` |
 | PR dispatch budget reached | budget park message (once per park, also when the dispatch breaker parked the PR first) | `pending` |
@@ -90,18 +96,42 @@ the same way and launches no run; see the [paired-image rule](workflow-envelope.
 Restate launch preparation sets the envelope's `reviewOnly` payload to
 `integration-review` plus the project's effective gating reviewers, deduplicated by
 id. An unset project selection uses the normal defaults; an empty selection still
-runs `integration-review`. Open ledger findings are not appended as fix instructions.
+runs `integration-review`. The payload's optional `expectedHeadSha` is recovered
+from the queue row's exact generated instruction, including retry rows and rows
+queued before this field existed; it is never replaced with the live PR head.
+Malformed synthetic instructions fail launch preparation. If the PR head has moved,
+the runner reports a skip with both heads before reading the diff or invoking a
+reviewer. It posts no verdict, and the callback files no child or retry while still
+finalizing the dispatch. Envelopes from older orchestrators that omit the field
+continue reviewing the current head. Open ledger findings are not appended as fix instructions.
+
+An incomplete roll-up review with a nonempty list of failed reviewers, all classified
+`transient` (for example `PROVIDER_OVERLOADED`), queues one retry for the same head.
+`ROLLUP_REVIEW_RETRY_LIMIT = 1` caps retries per repository/PR/head across every queue
+state. Non-transient or unclassified failures and a second incomplete result get no
+retry. The initial queue key is unchanged; attempt 1 has a distinct hashed negative
+ID and retains `ROLLUP_REVIEW_COMMENTER`. The retry uses the normal drain and budget
+checks with `humanRequested=false`. The verdict follow-up says “one retry is queued”
+or “no retry is left; a person decides”. Partial findings remain advisory.
 
 The runner reviews the full PR diff once and posts one verdict comment marked
-`<!-- ai-implement rollup-review -->`, containing severity, file:line and body for
-each finding. Reviewer failure produces an incomplete verdict. No implement or fix
+`<!-- ai-implement rollup-review -->`, showing the short reviewed head SHA and
+explaining that the verdict does not block the merge: blockers are filed as one `[roll-up-review]` child until the two-child
+limit is reached. Findings are deduplicated only by `stableReviewFindingKey`,
+with all reporting reviewer IDs, severity, file:line and body on each entry.
+Reviewer failure produces an incomplete verdict. No implement or fix
 pass, repository hook, commit, push, or external-review polling runs. The callback
 finishes the dispatch row with `rollup_review` and preserves the findings ledger,
 dispositions and approval marks; it does not submit `LateExternalReview`. Findings
 are advisory and cannot authorize merging. The owning workflow preserves successful
 and failed `rollup_review` results, including when a deadline follows the callback,
 and releases the reservation without implementation tracker transitions or stuck
-remediation. Ordinary comment gap-fills are unchanged.
+remediation. Each terminal result is given a follow-up notice: it names the filed
+child, says
+when no child is needed, or names failed reviewers for an incomplete review
+(with a fallback when review failed before a reviewer ran). At the two-child
+limit, including on incomplete reviews, it says a person must decide further fixes. When the verdict comment update fails, the callback keeps the saved notice pending and answers 503, so the runner's bounded result-delivery retries post it without filing another child (see `docs/feature-branch-grouping.md` § 6).
+Ordinary comment gap-fills are unchanged.
 
 ## Failed rounds
 
@@ -119,3 +149,24 @@ and retries after report forwarding fails. Report forwarding
 still runs on those retries. A GitHub failure (or missing autopsy/target/credentials)
 is a callback warning and does not prevent the failed row write or report delivery.
 The monitor's separate failure classification names the phase as “Gap-fill failed”.
+
+Before submitting an ImplementationRun, the drain previews the same read-only
+admission policy that `acquire` rechecks inside its atomic transaction: PR occupancy,
+PR budget, parked state, and team capacity, including human overrides. Existing
+legacy safeguards still defer in-flight work without counting it as a policy refusal.
+Parked rows always reach the shared preview, including rows parked by an earlier
+budget refusal. Historical dispatch-log budget and capacity safeguards run after
+the preview and count toward the same limit, using `budget_exhausted` and
+`at_capacity` respectively. Preview refusals do not create
+admissions or spend budget. Reservation refusals caused by a race carry their
+reason through the workflow's journaled reservation result and log.
+
+Each admission refusal increments the queue row's `refusal_count` and replaces
+`last_refusal_reason`. The named `MAX_COMMENT_GAPFILL_REFUSALS` limit is three:
+the third refusal sets the row to `skipped`, retains the reason, and logs the
+reason, count, and terminal status. Subsequent drains do not submit it. Late
+reservation refusals count too; the durable `comment_gapfill_refusals` ledger prevents a retried
+reservation step from counting the same dispatch twice. Both preview and late
+`budget_exhausted` refusals use the existing PR budget park and notice mechanism.
+
+Reservation retries reuse the original per-dispatch refusal before checking capacity, including after the queue row is skipped. Interleaved retries never count twice. Human requests reaching the limit receive a PR reply with the last reason and instructions to request another run; posting failures are logged.
