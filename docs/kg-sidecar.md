@@ -97,6 +97,28 @@ KG repo is needed. These values are environment-only for now;
 | `KG_STARDOG_RUN_CONSOLE` | Endpoint console URL. |
 | `KG_NAMESPACE` | Graph IRI namespace; a nonempty value takes precedence over `sources.yml`, including for the boot probe. |
 
+`src/kg-graph-source.ts` provides the database storage for the forthcoming KG
+page. It has no runtime callers yet, so the environment behavior above still
+applies. `kg_graph_source` defaults to `sidecar`; the non-secret rows are
+`kg_stardog_db`, `kg_stardog_run_endpoint`, `kg_stardog_run_console`, and
+`kg_stardog_run_platform`. The import platform defaults to
+`https://app.stardog.run`, distinct from the console host. Namespace and graph
+name use the shared `kg_namespace` and `kg_graph_name` rows. Names accept letters,
+digits, underscores and hyphens, beginning with a letter or digit; namespaces and
+endpoint/console/platform values must be absolute HTTP(S) URLs without userinfo.
+Empty fields clear their rows, and partial updates preserve omitted fields.
+
+The token is encrypted in `model_protected_secrets` at
+`kg-store:stardog-run-token`, with reference-bound authentication. The public
+getter exposes only `tokenSet`; missing or rotated `RUNNER_TOKEN_SECRET` makes
+it false. Token updates fail explicitly when encryption or storage fails, and
+roll back accompanying field changes. An empty token clears it. The child-env
+builder exposes the decrypted token and must never be logged or returned to a
+client. Only the dataset falls back to the environment: a stored graph name
+produces `tag:stardog:kit:alias:<name>` with hyphens replaced by underscores;
+otherwise `KG_STARDOG_DATASET` is preserved. There is no dataset settings row.
+Seeding, sidecar wiring and the admin page follow in separate changes.
+
 | `KG_BACKEND` in the orchestrator environment | Staged overlay with `parts/` | Child `KG_BACKEND` | Overlay variables | `KG_EMBEDDINGS_DEGRADED` |
 | -- | -- | -- | -- | -- |
 | not set | no | not set (as today) | none | as today |
