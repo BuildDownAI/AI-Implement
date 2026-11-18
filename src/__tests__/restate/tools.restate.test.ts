@@ -37,6 +37,7 @@ import { VARIANTS, journalEntries, journalText, callObject, callService, gate, q
 function adminToolArgs(name: string, fallback: Record<string, unknown>): Record<string, unknown> {
   switch (name) {
     case "get_fly_setup": return {};
+    case "unpark_issue": return { identifier: "CON-146" };
     case "set_project_agent_mode": return { teamKey: "BDS", mode: "legacy" };
     case "start_deploy": return { branch: "testing", requestedBy: "test" };
     case "add_model_account": return {

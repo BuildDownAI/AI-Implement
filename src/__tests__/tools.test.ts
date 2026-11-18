@@ -2660,7 +2660,7 @@ describe("unpark_issue (AII-2018)", () => {
   let db: ReturnType<typeof import("../dedup.js").getDb>;
   const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
   const rows = () => db.prepare("SELECT * FROM dispatch_breaker ORDER BY issue_id, phase").all();
-  const call = (args: { identifier: string; phase?: string }, caller = SYSTEM_ADMIN, calls: RunCall[] = []) =>
+  const call = (args: { identifier: string; phase?: string; issueId?: string }, caller = SYSTEM_ADMIN, calls: RunCall[] = []) =>
     tools.unparkIssueTool(fakeContext("unpark_issue", calls), { caller, args });
 
   beforeEach(async () => {
@@ -2733,6 +2733,29 @@ describe("unpark_issue (AII-2018)", () => {
     const nonparked = rows();
     expect(parse(await call({ identifier: "CON-146" })).unparked).toBe(false);
     expect(rows()).toEqual(nonparked);
+  });
+
+  it("unparks with a tracker ID fallback after dispatch history is pruned", async () => {
+    park();
+    park("tracker-id", "planning");
+    db.prepare("DELETE FROM dispatch_log").run();
+    const audit = vi.spyOn(console, "log").mockImplementation(() => {});
+    const calls: RunCall[] = [];
+    const result = await call({ identifier: "CON-146", issueId: "tracker-id", phase: "planning" }, SYSTEM_ADMIN, calls);
+    expect(parse(result)).toEqual({ identifier: "CON-146", issueId: "tracker-id", unparked: true });
+    expect(calls).toHaveLength(1);
+    expect(breaker.isParked("tracker-id", "planning")).toBe(false);
+    expect(breaker.isParked("tracker-id", "implementation")).toBe(true);
+    expect(audit.mock.calls.some(c => String(c[0]).includes("identifier=CON-146 issue=tracker-id phase=planning"))).toBe(true);
+    expect(parse(await call({ identifier: "CON-146", issueId: "tracker-id", phase: "planning" })).unparked).toBe(false);
+  });
+
+  it("prefers the newest dispatch identity over a fallback", async () => {
+    park();
+    park("other-id");
+    expect(parse(await call({ identifier: "CON-146", issueId: "other-id" })).issueId).toBe("tracker-id");
+    expect(breaker.isParked("tracker-id", "implementation")).toBe(false);
+    expect(breaker.isParked("other-id", "implementation")).toBe(true);
   });
 
   it("refuses callers without the admin role before running the mutation", async () => {
