@@ -30,9 +30,10 @@ detail (`get_review_fix_attempt`), read on 2026-11-18. The project is `BuildDown
 | Implementation | dispatch `fc8f0439-acac-4424-96dc-ef58eae131c2` | AII-1942 / #1657 | completed, `success` | `0e13a8908a320c3e296f3667e2db08ad99b9b5cb` |
 | Implementation | dispatch `77f486ed-7de7-4009-83b1-1dfed688e207` | AII-1943 / #1656 | completed, `runner_approved` | `7fb85759b0ec3ad82b532bef860c0814db79c3cd` |
 | Later review-fix | attempt `reviewfix-8f2743aa42908b05c6c4f53230914ed998ac6e93e089239741793082c34728fc` | #1657 | completed, `success` | `4ca967351c8622abcdc65e4544003381437a39cc` |
-| Later review-fix | attempt `reviewfix-004f9fe46ac036600c784dd93d1b43a689480a059041e6bd02b86490e3f68443` | AII-2004 / #1712 | `succeeded` | `11e674094b7ae23932ab1b34675732ca424c26c6` |
+| Later review-fix | attempt `reviewfix-004f9fe46ac036600c784dd93d1b43a689480a059041e6bd02b86490e3f68443` | AII-2004 / #1712 | attempt `succeeded`; the external review then requested changes (see below) | `11e674094b7ae23932ab1b34675732ca424c26c6` |
 
 PRs #1656 and #1712 merged. The planning stage and both review-fix attempts started after the initial runner had ended.
+The external review approved #1657's review-fix push `4ca96735` (orchestrator `late-external-approval` comment on that head).
 
 ### Detail of review-fix attempt `reviewfix-004f9fe4…` (#1712)
 
@@ -48,7 +49,13 @@ PRs #1656 and #1712 merged. The planning stage and both review-fix attempts star
 | Usage | complete: 1206518 tokens in / 3985 out; cost unavailable |
 | Input / output commit | `85b5a685b04ff8bbcd861371c372de01c318c726` / `11e674094b7ae23932ab1b34675732ca424c26c6` |
 | Findings | 2 findings (`13ed6eeb…`, `9de96252…`), both `addressed` in publication cycle 50001 |
-| Result | `succeeded`, `evidenceComplete: true`, `terminationConfirmed: true`, verdict approved |
+| Result | `succeeded`, `evidenceComplete: true`, `terminationConfirmed: true`, in-loop verdict approved |
+
+The approved verdict is the attempt's own in-loop review. The external Claude review then requested changes on
+`11e67409`, so AI-Implement withheld the approval mark for that head (orchestrator `late-external-held` comment keyed to this
+attempt). A later review-fix push, `fb48bdd5f48d27931d2193f1ecd678f04b325fd0`, passed the external review, and #1712 merged
+after it. This page does not record that later attempt's identifier. This attempt is evidence that Restate ran a Codex
+review-fix on Fly to a confirmed termination with complete evidence. It is not evidence of an externally approved head.
 
 Both cycles record `tests: missing`. The review-fix did not report that it ran the tests. CI on the PR is the test
 verdict.
