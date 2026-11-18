@@ -82,6 +82,24 @@ describe("pull request links", () => {
       expect.objectContaining({ name: "cancel_checked_at", type: "INTEGER", notnull: 0 }));
   });
 
+  it("clears the cancellation decision on reopen and reconsiders a later close", async () => {
+    const { modules: { links } } = await fixture();
+    links.linkPullRequest(input);
+    links.setLinkOutcome(input.repository, 1, "closed-unmerged", 150);
+    links.setCancelCheckedAt(input.repository, 1, 200);
+    links.setLinkOutcome(input.repository, 1, "closed-unmerged", 150);
+    expect(links.findLinkByPr(input.repository, 1)?.cancelCheckedAt).toBe(200);
+    links.setLinkOutcome(input.repository, 1, "open", 999);
+    expect(links.findLinkByPr(input.repository, 1)).toMatchObject({
+      outcome: "open", closedAt: null, cancelCheckedAt: null,
+    });
+    expect(links.listUncheckedClosedLinks()).toEqual([]);
+    links.setLinkOutcome(input.repository, 1, "closed-unmerged", 300);
+    expect(links.listUncheckedClosedLinks()).toEqual([
+      expect.objectContaining({ number: 1, closedAt: 300, cancelCheckedAt: null }),
+    ]);
+  });
+
   it("keeps the first issue and warns once with both identifiers", async () => {
     const { modules: { links } } = await fixture();
     const first = links.linkPullRequest(input);

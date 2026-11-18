@@ -187,8 +187,9 @@ export function listOpenLinksForIssue(trackerKind: TrackerKind, trackerIssueId: 
 }
 
 export function setLinkOutcome(repository: string, number: number, outcome: LinkOutcome, closedAt: number | null): boolean {
-  return database().prepare(`UPDATE pull_request_link SET outcome = ?, closed_at = ?
-    WHERE repository = ? AND number = ?`).run(outcome, outcome === "open" ? null : closedAt, repository, number).changes > 0;
+  return database().prepare(`UPDATE pull_request_link SET outcome = ?, closed_at = ?,
+    cancel_checked_at = CASE WHEN ? = 'open' THEN NULL ELSE cancel_checked_at END
+    WHERE repository = ? AND number = ?`).run(outcome, outcome === "open" ? null : closedAt, outcome, repository, number).changes > 0;
 }
 
 export function deleteLinksForMapping(mappingKey: string): void {

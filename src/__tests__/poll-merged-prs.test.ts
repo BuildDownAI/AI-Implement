@@ -227,6 +227,34 @@ describe("detectMergedPrs", () => {
       expect(d.cancelIssue).toHaveBeenCalledTimes(1);
       expect(d.tokenForOwner).toHaveBeenCalledTimes(1);
     });
+    it("cancels again after a checked PR reopens and closes unmerged again", async () => {
+      seedLink(5);
+      markDedup();
+      const d = deps();
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(1);
+      expect(hasDedup()).toBe(false);
+      expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
+
+      // The open-PR sweep restores the link through this same writer.
+      links.setLinkOutcome("o/r", 5, "open", null);
+      markDedup();
+      d.getPullRequestState.mockResolvedValueOnce({ merged: false, state: "open" });
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(1);
+      expect(hasDedup()).toBe(true);
+      expect(links.findLinkByPr("o/r", 5)?.cancelCheckedAt).toBeNull();
+
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(2);
+      expect(hasDedup()).toBe(false);
+      expect(links.findLinkByPr("o/r", 5)).toMatchObject({
+        outcome: "closed-unmerged", cancelCheckedAt: expect.any(Number),
+      });
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(2);
+      expect(d.getPullRequestState).toHaveBeenCalledTimes(3);
+    });
     it.each(["roll-up", "other-open"])("stamps final exclusion %s before the in-flight deferral", async (kind) => {
       log.appendLog({ issueId: "i1", repo: "o/r" });
       seedLink(5, "i1", "ENG-1", kind === "roll-up" ? "roll-up" : "implementation");
