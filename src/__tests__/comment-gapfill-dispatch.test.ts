@@ -37,6 +37,7 @@ beforeEach(async () => {
   ({ queue, log, breaker, drain, admission, config, gapfill } = (await testDb({ modules })).modules);
   submit.mockReset().mockResolvedValue({ status: "accepted" });
   acquireSpy = vi.spyOn(admission, "acquire");
+  fakeFetch({ "GET /repos/acme/billing/pulls/42": openPrWithHead("ai-implement/aii-1554-caller-switch") }).install();
 });
 afterEach(() => {
   expect(launchSpies.fly).not.toHaveBeenCalled();
@@ -564,7 +565,7 @@ describe("ImplementationRun gap-fill ingress", () => {
           prDispatchBudget: 7, humanRequested: true } });
       expect(queue.getCommentGapfillItem(id)?.status).toBe("dispatched");
       expect(opts.dispatch).not.toHaveBeenCalled();
-      expect(opts.getInstallationToken).not.toHaveBeenCalled();
+      expect(opts.getInstallationToken).toHaveBeenCalledTimes(1);
       expect(opts.getTargetRepoToken).not.toHaveBeenCalled();
       expect(acquireSpy).not.toHaveBeenCalled();
       // Acceptance transfers launch ownership; a second drain cannot launch or submit it again.
@@ -665,7 +666,7 @@ describe("ImplementationRun gap-fill ingress", () => {
   });
   it("in-flight branch fallback defers until pr_url is written", async () => {
     const jobId = log.appendLog(makeAppendLogEntry({ issueId: "issue-1", issueIdentifier: "AII-1554", teamKey: "AII", repo: "acme/billing", status: "running" }));
-    prLookup(42, openPrWithHead("ai-implement/aii-1554-caller-switch"));
+    fakeFetch({ "GET /repos/acme/billing/pulls/42": [openPrWithHead("ai-implement/aii-1554-caller-switch"), openPrWithHead("ai-implement/aii-1554-caller-switch")] }).install();
     const id = seedItem();
     await checkNoSubmit(optsFor(), id, "pending");
     log.updateJobPrUrl(jobId, "https://github.com/acme/billing/pull/42");
@@ -687,7 +688,7 @@ describe("ImplementationRun gap-fill ingress", () => {
       expect(admission.acquire({ dispatchId: "competing-run", mappingKey: "AII",
         scope: { kind: "issue", issueScope: "AII", issueId: "other" },
         kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 }).ok).toBe(true);
-      expect(await deps.reserve(input)).toBe(false);
+      expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
       return { status: "accepted" };
     });
     await drain.drainCommentGapfillQueue(optsFor(mapping));
@@ -720,7 +721,7 @@ describe("ImplementationRun gap-fill ingress", () => {
       kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
     expect(held.ok).toBe(true);
     const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
-    expect(await deps.reserve(submit.mock.calls[0]![1])).toBe(false);
+    expect(await deps.reserve(submit.mock.calls[0]![1])).toEqual({ ok: false, reason: "at_capacity" });
     expect(queue.getCommentGapfillItem(id)?.status).toBe("pending");
   });
 });
@@ -735,4 +736,167 @@ it("selects integration-review plus deduplicated effective gating reviewers only
   expect(drain.rollupReviewMode(queue.ROLLUP_REVIEW_COMMENTER, makeMapping({ reviewers: [
     { id: "integration-review", gates: true }, { id: "code-review", gates: true }, { id: "optional", gates: false },
   ] }))?.reviewers).toEqual([{ id: "integration-review", gates: true }, { id: "code-review", gates: true }]);
+});
+
+ it("bounds admission refusals across explicit drain ticks", async () => {
+  const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+  seedOrigin();
+  const id = seedItem();
+  const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+  admission.acquire({ dispatchId: "held", mappingKey: "AII", scope: { kind: "issue", issueScope: "AII", issueId: "other" }, kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
+  const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
+  submit.mockImplementation(async (_key, input) => { await deps.reserve(input); return { status: "accepted" }; });
+  const opts = optsFor(mapping);
+  for (let tick = 0; tick < 4; tick++) await drain.drainCommentGapfillQueue(opts);
+  expect(opts.postComment).toHaveBeenCalledTimes(1);
+  expect(opts.postComment).toHaveBeenCalledWith(expect.any(String), "acme", "billing", 42, expect.stringContaining("Last reason: at_capacity"));
+  expect(submit).not.toHaveBeenCalled();
+  expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity" }));
+  expect(lines).toHaveBeenCalledWith(expect.stringContaining("at_capacity (3/3, skipped)"));
+ });
+
+it("counts parked automatic rows through three refusals across explicit ticks", async () => {
+  const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+  seedOrigin();
+  const id = seedItem({ commenter: queue.ROLLUP_REVIEW_COMMENTER });
+  breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+  for (let tick = 1; tick <= 4; tick++) {
+    await drain.drainCommentGapfillQueue(optsFor());
+    expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({
+      refusalCount: Math.min(tick, 3), lastRefusalReason: "parked",
+      status: tick >= 3 ? "skipped" : "pending",
+    }));
+  }
+  expect(submit).not.toHaveBeenCalled();
+  expect(lines).toHaveBeenCalledWith(expect.stringContaining("parked (3/3, skipped)"));
+});
+
+it("previews budget exhaustion without admission writes and parks the PR", async () => {
+  seedOrigin();
+  const id = seedItem({ commenter: queue.ROLLUP_REVIEW_COMMENTER });
+  const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 1 });
+  const prior = admission.acquire({ dispatchId: "spent-budget", mappingKey: "AII", scope: { kind: "pr", issueId: "issue-1", installationId: "778899", repository: "acme/billing", prNumber: 42 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 10 });
+  if (!prior.ok) throw new Error("seed refused");
+  admission.release(prior.record.dispatchId, prior.record.lifecycleOwner, prior.record.generation, "finalized");
+  const opts = optsFor(mapping);
+  await drain.drainCommentGapfillQueue(opts);
+  expect(submit).not.toHaveBeenCalled();
+  expect(admission.count("AII")).toBe(0);
+  expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ refusalCount: 1, lastRefusalReason: "budget_exhausted" }));
+  expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
+  for (let tick = 2; tick <= 4; tick++) {
+    await drain.drainCommentGapfillQueue(opts);
+    expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({
+      refusalCount: Math.min(tick, 3), lastRefusalReason: "budget_exhausted",
+      status: tick >= 3 ? "skipped" : "pending",
+    }));
+  }
+  expect(submit).not.toHaveBeenCalled();
+  expect(opts.postComment).toHaveBeenCalledTimes(1);
+});
+
+it.each(["occupied", "budget_exhausted", "parked", "at_capacity"] as const)("admission preview shares acquire's %s decision without writing", reason => {
+  const request = { dispatchId: "preview", mappingKey: "AII", scope: { kind: "pr" as const, issueId: "issue-1", installationId: "778899", repository: "acme/billing", prNumber: 42 }, kind: "gap-fill" as const, backend: "github-actions" as const, lifecycleOwner: { kind: "legacy" as const }, cap: reason === "at_capacity" ? 0 : 10, parked: reason === "parked", prDispatchBudget: reason === "budget_exhausted" ? 0 : 10 };
+  if (reason === "occupied") expect(admission.acquire({ ...request, dispatchId: "occupant" }).ok).toBe(true);
+  const before = admission.count("AII");
+  const preview = admission.checkAdmission(request);
+  expect(preview).toEqual(expect.objectContaining({ ok: false, reason }));
+  expect(admission.read(request.dispatchId)).toBeNull();
+  expect(admission.count("AII")).toBe(before);
+  expect(admission.acquire(request)).toEqual(preview);
+});
+
+it("skips after three late reservation refusals and never submits a fourth", async () => {
+  seedOrigin();
+  const id = seedItem();
+  const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+  const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
+  submit.mockImplementation(async (dispatchId, input) => {
+    const competing = admission.acquire({ dispatchId: `race-${dispatchId}`, mappingKey: "AII", scope: { kind: "issue", issueScope: "AII", issueId: "other" }, kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
+    if (!competing.ok) throw new Error("race seed refused");
+    expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
+    // A retry of the same reservation must not burn another refusal.
+    expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
+    admission.release(competing.record.dispatchId, competing.record.lifecycleOwner, competing.record.generation, "finalized");
+    return { status: "accepted" };
+  });
+  for (let tick = 0; tick < 4; tick++) await drain.drainCommentGapfillQueue(optsFor(mapping));
+  expect(submit).toHaveBeenCalledTimes(3);
+  expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity" }));
+});
+
+
+describe("terminal PR check", () => {
+  it.each([[true, true], [false, true], [true, false], [false, false]])("skips a terminal parked PR (dispatch row: %s, merged: %s)", async (hasDispatch, merged) => {
+    if (hasDispatch) seedOrigin();
+    breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+    const id = queue.enqueueConflictResolution({ owner: "acme", repo: "billing", prNumber: 42, featureBranch: "ai-implement/feature/aii-1554" });
+    const http = prLookup(42, { json: { merged, state: "closed" } });
+    const opts = optsFor();
+    const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+    await checkNoSubmit(opts, id, "skipped");
+    expect(queue.getCommentGapfillItem(id)).toMatchObject({ lastRefusalReason: merged ? "pr_merged" : "pr_closed", refusalCount: 0 });
+    expect(opts.postComment).not.toHaveBeenCalled();
+    expect(opts.postTrackerComment).not.toHaveBeenCalled();
+    expect(lines.mock.calls.filter(([line]) => String(line).includes(merged ? "pr_merged" : "pr_closed"))).toHaveLength(1);
+    await drain.drainCommentGapfillQueue(opts);
+    expect(http.calls).toHaveLength(1);
+  });
+});
+
+it.each(["none", "parked", "running"] as const)("token refresh failure preserves the entire row (%s dispatch)", async dispatchState => {
+  if (dispatchState !== "none") seedOrigin(dispatchState === "running" ? "running" : "completed");
+  if (dispatchState === "parked") breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+  const id = seedItem();
+  const before = queue.getCommentGapfillItem(id);
+  const opts = optsFor();
+  vi.mocked(opts.getInstallationToken).mockRejectedValue(new Error("token refresh unavailable"));
+  const http = prLookup(42, openPrWithHead("ai-implement/aii-1554-caller-switch"));
+
+  await checkNoSubmit(opts, id, "pending");
+
+  expect(queue.getCommentGapfillItem(id)).toEqual(before);
+  expect(opts.getInstallationToken).toHaveBeenCalledTimes(1);
+  expect(http.calls).toHaveLength(0);
+  expect(opts.postComment).not.toHaveBeenCalled();
+  expect(opts.postTrackerComment).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["503", githubError(503, "Unavailable")],
+  ["throw", (() => { throw new Error("network failure"); })],
+] as Array<[string, Reply]>)("failed PR read with a dispatch log still reaches the gate (%s)", async (_label, reply) => {
+  seedOrigin();
+  seedItem();
+  const opts = optsFor();
+  const http = prLookup(42, reply);
+  await drain.drainCommentGapfillQueue(opts);
+  expect(http.calls).toHaveLength(1);
+  expect(acquireSpy.mock.calls.length + submit.mock.calls.length + vi.mocked(opts.dispatch).mock.calls.length).toBeGreaterThan(0);
+  expect(opts.postComment).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["503", githubError(503, "Unavailable")],
+  ["throw", (() => { throw new Error("network failure"); })],
+] as Array<[string, Reply]>)("failed PR read without a dispatch log replies once and ends failed (%s)", async (_label, reply) => {
+  const id = seedItem();
+  const opts = optsFor();
+  const http = prLookup(42, reply);
+  await checkNoSubmit(opts, id, "failed");
+  expect(http.calls).toHaveLength(1);
+  expect(opts.postComment).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(opts.postComment).mock.calls[0][4]).toContain("could not read this PR");
+  await checkNoSubmit(opts, id, "failed");
+  expect(http.calls).toHaveLength(1);
+});
+
+it("open in-flight PR preserves the entire row and reads once", async () => {
+  seedOrigin("running");
+  const id = seedItem();
+  const before = queue.getCommentGapfillItem(id);
+  const http = prLookup(42, openPrWithHead("ai-implement/aii-1554-caller-switch"));
+  await checkNoSubmit(optsFor(), id, "pending");
+  expect(queue.getCommentGapfillItem(id)).toEqual(before);
+  expect(http.calls).toHaveLength(1);
 });

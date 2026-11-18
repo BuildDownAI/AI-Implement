@@ -731,6 +731,18 @@ export function getDb(): Database.Database {
         processed_at INTEGER
       )
     `);
+    const gapfillColumns = new Set((db.prepare("PRAGMA table_info(comment_gapfill_queue)").all() as Array<{ name: string }>).map(c => c.name));
+    if (!gapfillColumns.has("refusal_count")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN refusal_count INTEGER NOT NULL DEFAULT 0");
+    if (!gapfillColumns.has("last_refusal_reason")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN last_refusal_reason TEXT");
+    if (!gapfillColumns.has("last_refusal_dispatch_id")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN last_refusal_dispatch_id TEXT");
+    db.exec(`CREATE TABLE IF NOT EXISTS comment_gapfill_refusals (
+      queue_item_id INTEGER NOT NULL, dispatch_id TEXT NOT NULL, reason TEXT NOT NULL,
+      PRIMARY KEY (queue_item_id, dispatch_id)
+    )`);
+    // Preserve the replay decision available from pre-ledger databases.
+    db.exec(`INSERT OR IGNORE INTO comment_gapfill_refusals
+      SELECT id, last_refusal_dispatch_id, last_refusal_reason FROM comment_gapfill_queue
+      WHERE last_refusal_dispatch_id IS NOT NULL AND last_refusal_reason IS NOT NULL`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_status ON comment_gapfill_queue(status, created_at)`);
     // PR #202 review (minor): countConflictAttempts / hasPendingConflictResolution /
     // markCommentGapfillRunTerminal all filter by repo+PR — give them an index.

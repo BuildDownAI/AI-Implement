@@ -79,7 +79,7 @@ interface Scenario {
   outcomeGate?: Gate;
   /** Parks the first `stop` call. */
   stopGate?: Gate;
-  reserveImpl?: (input: ImplementationRunInput) => Promise<boolean>;
+  reserveImpl?: ImplementationRunDependencies["reserve"];
   releaseImpl?: (dispatchId: string, reason: DispatchAdmissionReleaseReason) => void;
   launchImpl?: (input: ImplementationRunInput) => Promise<ImplementationLaunchResult>;
   /** Every effect call in order, one string per attempt (the shape the contract suite reads). */
