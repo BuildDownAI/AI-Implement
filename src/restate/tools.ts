@@ -1,3 +1,4 @@
+import { listParked, unpark } from "../dispatch-breaker.js";
 import { resolveDefaultRunnerImage } from "../repo-image.js";
 import { STAGE_NAMES } from "../agent-config.js";
 import { createAgentConfigAdminDeps } from "../model-auth-runtime.js";
@@ -25,7 +26,7 @@ import type { AccessRole } from "../access-entries.js";
 import { effectiveAccessCode } from "../admin-session.js";
 import { getRunnerMode, resolveExecutionPath, getFlyProcessLevelSecrets, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
 import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
+import { getLatestIssueIdForIdentifier, getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
 import {
   classifyFlySecretNames, listAppSecrets, FlyApiError, getMachine, listMachines, fetchMachineLogs, readMachineExit,
   type Machine,
@@ -112,7 +113,7 @@ interface ToolOptions<I extends z.ZodType> {
    */
   retryPolicy?: restate.RetryPolicy;
   /** Extra `key=value` text appended to this tool's write-audit line, for a write whose audit must name its target. */
-  auditDetail?: (input: WireInput<I>) => string;
+  auditDetail?: (input: WireInput<I>, response?: ToolResponse) => string;
 }
 
 function wireInputSchema<I extends z.ZodType>(input: I) {
@@ -170,12 +171,12 @@ export function tool<I extends z.ZodType>(
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
       const name = ctx.request().target.handler;
       const operation = opts.operation ?? (opts.role === "admin" ? "write" : "read");
-      const audit = (result: "forbidden" | "ok" | "error"): void => {
+      const audit = (result: "forbidden" | "ok" | "error", response?: ToolResponse): void => {
         if (operation !== "write") return;
         const actor = auditActor(input.caller, "system");
         let detail = "";
         try {
-          detail = opts.auditDetail ? ` ${opts.auditDetail(input)}` : "";
+          detail = opts.auditDetail ? ` ${opts.auditDetail(input, response)}` : "";
         } catch {
           detail = "";
         }
@@ -192,7 +193,7 @@ export function tool<I extends z.ZodType>(
       }
       try {
         const result = await handler(ctx, input);
-        audit(result.isError ? "error" : "ok");
+        audit(result.isError ? "error" : "ok", result);
         return result;
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) {
@@ -1817,6 +1818,36 @@ export const releaseDispatchReservationTool = tool(
   },
 );
 
+export const unparkIssueTool = tool(
+  {
+    description: "Unpark an issue by its tracker identifier, resolved case-insensitively from its newest dispatch across all repositories. Omit phase to clear all phases. Returns { identifier, issueId, unparked }; a nonparked issue is unchanged.",
+    input: z.object({
+      identifier: z.string().min(1),
+      phase: z.string().optional(),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input, response) => {
+      const issueId = response && !response.isError ? JSON.parse(response.content[0].text).issueId : "none";
+      return `identifier=${input.args.identifier} issue=${issueId} phase=${input.args.phase ?? "all"}`;
+    },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { identifier, phase } = input.args;
+    const result = await ctx.run("unpark-issue", () => {
+      const issueId = getLatestIssueIdForIdentifier(identifier);
+      if (issueId === null) return null;
+      // unpark also resets nonparked rows; call it only when a matching phase is parked.
+      const parked = listParked().some(row => row.issueId === issueId && (phase === undefined || row.phase === phase));
+      return { identifier, issueId, unparked: parked ? unpark(issueId, phase) : false };
+    }, { maxRetryAttempts: 1 });
+    if (result === null) {
+      return { isError: true, content: [{ type: "text", text: `no dispatch record for ${identifier}` }] };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+  },
+);
+
 export const orchestratorTools = restate.service({
   name: "orchestratorTools",
   handlers: {
@@ -1866,5 +1897,6 @@ export const orchestratorTools = restate.service({
     clear_dispatch_dedup: clearDispatchDedupTool,
     list_dispatch_reservations: listDispatchReservationsTool,
     release_dispatch_reservation: releaseDispatchReservationTool,
+    unpark_issue: unparkIssueTool,
   },
 });
