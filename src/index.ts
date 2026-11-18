@@ -31,7 +31,7 @@ import {
   type StaleAdmissionCandidate,
 } from "./dispatch-admission.js";
 import { reconcileFilesystemFailures } from "./filesystem-ticket-lifecycle.js";
-import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, type DispatchInputs } from "./github.js";
+import { dispatchWorkflow, postWorkflowDispatch, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, getPullRequestState, buildEnvelopeDispatchInputs, assertPrivateTransportForCredentials, assertExecutionPolicyCapability, postPrComment, listPrComments, defaultFetchSignal, fetchRepoTarball, getRefSha, mergePullRequest, closePullRequest, deleteBranch, postOrUpdateStickyComment, setCommitStatus, cancelWorkflowRun, listAllOpenPullRequests, type DispatchInputs } from "./github.js";
 import { resolveWorkflowCapabilities, type WorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -142,6 +142,7 @@ import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
+import { sweepUnlinkedPulls } from "./pr-link-sweep.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import {
   githubActionsWatchdogDecision,
@@ -955,6 +956,25 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
   const evidenceSweep = sweepExpiredReviewFixEvidence();
   if (evidenceSweep.purgedAttemptIds.length > 0) {
     console.log(`[review-fix-evidence] expired ${evidenceSweep.purgedAttemptIds.length} attempt(s): ${evidenceSweep.purgedAttemptIds.join(", ")}`);
+  }
+
+  try {
+    let appBotLogin: string | undefined;
+    try {
+      appBotLogin = `${await getAppSlug(config.githubAppId, config.githubAppPrivateKey)}[bot]`;
+    } catch {
+      // Unknown App identity prevents new branch-based links; existing links still reopen.
+    }
+    await sweepUnlinkedPulls({
+      mappings: getMappings(),
+      appBotLogin,
+      providerFor: (mapping) => registry.forMapping(mapping),
+      listRepoPulls: async (owner, repo) => listAllOpenPullRequests(
+        await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner), owner, repo,
+      ),
+    });
+  } catch (err) {
+    console.error("[poll] PR link sweep failed:", err);
   }
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
