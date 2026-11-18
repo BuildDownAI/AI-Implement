@@ -91,7 +91,7 @@ describe("recorded list_open_pulls exchanges", () => {
     await seedFinishedJob();
     const recorded = await recordExchange("list_open_pulls", { args: {} });
     expect(entriesOf(recorded)).toMatchObject([{
-      tracked: true, issue: { identifier: "AII-12" },
+      tracked: true, pr: { role: "implementation" }, issue: { identifier: "AII-12" },
       workflow: { state: "settled", reason: "completed" },
       lastJob: { phase: "implementation", status: "completed", conclusion: "success", finishedAt: T + 2000 },
     }]);
@@ -105,7 +105,7 @@ describe("recorded list_open_pulls exchanges", () => {
       VALUES (?, ?, ?, ?, ?, ?, ?)`).run("issue-12", "acme/app", 42, "review", "pending", T + 3000, T + 3000);
     const recorded = await recordExchange("list_open_pulls", { args: {} });
     expect(entriesOf(recorded)).toMatchObject([{
-      tracked: true, workflow: { state: "active", reason: "review-fix-queued" },
+      tracked: true, pr: { role: "implementation" }, workflow: { state: "active", reason: "review-fix-queued" },
     }]);
     check("tracked-active", recorded);
   });
@@ -115,6 +115,7 @@ describe("recorded list_open_pulls exchanges", () => {
     const entries = entriesOf(recorded);
     expect(entries).toMatchObject([{ issue: null, tracked: false, lastJob: null }]);
     expect(entries[0]).not.toHaveProperty("workflow");
+    expect(entries[0].pr).not.toHaveProperty("role");
     check("untracked", recorded);
   });
 

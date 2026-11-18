@@ -48,7 +48,7 @@ it("projects tracked identity, newest completed work and workflow without secret
   const result = await api.listOpenPulls({ listRepoPulls, now });
   expect(result).toEqual([{ teamKey: "APP", repo: "acme/app", tracked: true,
     issue: { identifier: "AII-12", title: "Parent", url: "https://tracker/12" },
-    pr: { number: 42, url: pr.url, headRef: "work", baseRef: "main", openedAt: 123, draft: false },
+    pr: { number: 42, url: pr.url, headRef: "work", baseRef: "main", openedAt: 123, draft: false, role: "implementation" },
     lastJob: { phase: "gap-analysis", status: "completed", conclusion: "runner_approved", finishedAt: 80 },
     workflow: { state: "settled", reason: "completed" } }]);
   expect(JSON.stringify(result)).not.toContain('"x"');
@@ -78,7 +78,7 @@ it("projects linked identity without any jobs", async () => {
 it("keeps a link with a null identifier tracked", async () => {
   link(42, "implementation", { identifier: null });
   expect((await api.listOpenPulls({ listRepoPulls: async () => [pull()], now }))[0])
-    .toMatchObject({ tracked: true, teamKey: "APP", issue: null, lastJob: null });
+    .toMatchObject({ tracked: true, teamKey: "APP", issue: null, lastJob: null, pr: { role: "implementation" } });
 });
 it("does not recover identity from surviving jobs or grouping branches", async () => {
   job({ pr_url: pull().url, completed_at: 90 });
@@ -87,6 +87,7 @@ it("does not recover identity from surviving jobs or grouping branches", async (
     listRepoPulls: async () => [pull(42, "ai-implement/feature/AII-12")], now }))[0];
   expect(entry).toMatchObject({ tracked: false, issue: null, teamKey: "APP", lastJob: { finishedAt: 90 } });
   expect(entry).not.toHaveProperty("workflow");
+  expect(entry.pr).not.toHaveProperty("role");
 });
 it.each(["implementation", "roll-up"] as const)("uses the %s link role and linked identity for workflow", async role => {
   config.upsertMapping("SECOND", makeMapping({ owner: "acme", repo: "app", paused: false, autoMerge: true }));
@@ -100,6 +101,7 @@ it.each(["implementation", "roll-up"] as const)("uses the %s link role and linke
       lastJob: { finishedAt: 90 } });
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ issueId: "linked-id", issueIdentifier: "AII-12",
       isRollUp: role === "roll-up", mapping: expect.objectContaining({ paused: false, autoMerge: true }) }));
+    expect(entry.pr.role).toBe(role);
     expect(entry.workflow?.reason).toBe(role === "roll-up" ? "awaiting-review" : "completed");
   } finally { spy.mockRestore(); }
 });
@@ -132,6 +134,7 @@ it("handles untracked PRs, shared mappings, deduplication and ordering", async (
   expect(first.map(p => p.pr.number)).toEqual([3, 1]);
   expect(first[0]).toMatchObject({ teamKey: "APP", issue: null, tracked: false, lastJob: null });
   expect(first[0]).not.toHaveProperty("workflow");
+  for (const entry of first) expect(entry.pr).not.toHaveProperty("role");
   config.upsertMapping("SECOND", makeMapping({ owner: "acme", repo: "app" }));
   config.upsertMapping("Z", makeMapping({ owner: "z", repo: "empty" }));
   const result = await api.listOpenPulls({ now, listRepoPulls: async (owner, repo) => {

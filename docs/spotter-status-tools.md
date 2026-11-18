@@ -15,6 +15,7 @@ The tool lists every open PR in every distinct mapped repository, including PRs 
 | `teamKey` | Linked issue's mapping key; without a link, the sole mapping key for the repository, or `null` when ambiguous |
 | `repo` | `owner/repo` |
 | `pr` | `number`, `url`, `headRef`, `baseRef`, `openedAt`, and boolean `draft` |
+| `pr.role` | Stored link role: `"implementation"` for an implementation link, `"roll-up"` for a roll-up link; key absent without a link (never `null`) |
 | `issue` | `{ identifier, title, url }`, or `null` without a link or when the linked issue identifier is `null`; title and URL can be `null` |
 | `lastJob` | `{ phase, status, conclusion, finishedAt }`, or `null`; phase and conclusion can be `null` |
 | `tracked` | Whether a pull request link exists |
@@ -150,6 +151,7 @@ An error tool response has `isError: true` and explanatory text; the recorded fa
 
 ## Known limits and Spotter handoff
 
+- Spotter does not decode `pr.role` yet.
 - The `ReviewFixPR` `wake` timer lives in Restate object state and is not readable by the workflow resolver. A PR can show `settled` for one poll after review feedback arrives, before visible queued or admitted work appears.
 - `auto-merge-pending` uses the stored run-record verdict and does not read check runs. It can remain active while checks hold the merge; it does not assert that checks passed.
 - Linear and filesystem never report `awaiting-approval`; Jira has a distinct value for it.
