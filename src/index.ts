@@ -980,6 +980,12 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
   // for merged PRs the webhook may have missed.
   await detectMergedPrs({
+    cancelIssue: async (link) => {
+      const mapping = getMappings()[link.issue.mappingKey];
+      if (!mapping) throw new Error(`No mapping for ${link.issue.mappingKey}`);
+      const provider = await registry.forMapping(mapping);
+      return provider.markPrClosedUnmerged(link.issue.trackerIssueId, link.issue.mappingKey, link.url);
+    },
     mappingForRepo: (repo) =>
       Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repo),
     tokenForOwner: (owner) =>

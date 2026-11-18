@@ -41,6 +41,7 @@ export interface PullRequestLink extends Omit<LinkPullRequestInput, "issue" | "h
   outcome: LinkOutcome;
   linkedAt: number;
   closedAt: number | null;
+  cancelCheckedAt: number | null;
 }
 
 const initializedDatabases = new WeakSet<ReturnType<typeof getDb>>();
@@ -74,9 +75,14 @@ function database() {
       source TEXT NOT NULL CHECK (source IN ('step-report', 'result', 'branch-match', 'backfill')),
       linked_at INTEGER NOT NULL,
       closed_at INTEGER,
+      cancel_checked_at INTEGER,
       UNIQUE (repository, number)
     );
   `);
+  const columns = db.prepare("PRAGMA table_info(pull_request_link)").all() as { name: string }[];
+  if (!columns.some((column) => column.name === "cancel_checked_at")) {
+    db.exec("ALTER TABLE pull_request_link ADD COLUMN cancel_checked_at INTEGER");
+  }
   // Set the guard before backfilling: linkPullRequest calls database() too.
   initializedDatabases.add(db);
   backfillLinksFromJobRows();
@@ -121,6 +127,7 @@ export function backfillLinksFromJobRows(): void {
 const selectLinks = `SELECT p.id, p.repository, p.number, p.url,
   p.head_ref AS headRef, p.base_ref AS baseRef, p.issue_id AS issueId,
   p.role, p.outcome, p.source, p.linked_at AS linkedAt, p.closed_at AS closedAt,
+  p.cancel_checked_at AS cancelCheckedAt,
   i.tracker_kind AS trackerKind, i.mapping_key AS mappingKey,
   i.tracker_issue_id AS trackerIssueId, i.identifier, i.title, i.url AS issueUrl,
   i.first_seen_at AS firstSeenAt, i.updated_at AS updatedAt
@@ -191,4 +198,15 @@ export function deleteLinksForMapping(mappingKey: string): void {
       (SELECT id FROM tracked_issue WHERE mapping_key = ?)`).run(mappingKey);
     db.prepare("DELETE FROM tracked_issue WHERE mapping_key = ?").run(mappingKey);
   })();
+}
+
+/** Closed links still awaiting a cancellation decision. */
+export function listUncheckedClosedLinks(): PullRequestLink[] {
+  return (database().prepare(`${selectLinks} WHERE p.outcome = 'closed-unmerged'
+    AND p.cancel_checked_at IS NULL ORDER BY p.id`).all() as LinkRow[]).map(toLink);
+}
+
+export function setCancelCheckedAt(repository: string, number: number, checkedAt: number): void {
+  database().prepare("UPDATE pull_request_link SET cancel_checked_at = ? WHERE repository = ? AND number = ?")
+    .run(checkedAt, repository, number);
 }

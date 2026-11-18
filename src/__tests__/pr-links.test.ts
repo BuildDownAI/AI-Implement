@@ -33,7 +33,7 @@ describe("pull request links", () => {
     }
     const db = dedup.getDb();
     expect(db.prepare("PRAGMA table_info(tracked_issue)").all()).toHaveLength(9);
-    expect(db.prepare("PRAGMA table_info(pull_request_link)").all()).toHaveLength(12);
+    expect(db.prepare("PRAGMA table_info(pull_request_link)").all()).toHaveLength(13);
     expect(db.prepare("PRAGMA foreign_key_list(pull_request_link)").all()).toEqual([
       expect.objectContaining({ table: "tracked_issue", from: "issue_id", to: "id" }),
     ]);
@@ -44,7 +44,7 @@ describe("pull request links", () => {
     }
     expect(() => db.exec("UPDATE tracked_issue SET mapping_key = NULL")).toThrow(/NOT NULL/);
     expect(() => db.exec("INSERT INTO tracked_issue SELECT NULL, tracker_kind, mapping_key, tracker_issue_id, identifier, title, url, first_seen_at, updated_at FROM tracked_issue")).toThrow(/UNIQUE/);
-    expect(() => db.exec("INSERT INTO pull_request_link SELECT NULL, repository, number, url, head_ref, base_ref, issue_id, role, outcome, source, linked_at, closed_at FROM pull_request_link")).toThrow(/UNIQUE/);
+    expect(() => db.exec("INSERT INTO pull_request_link SELECT NULL, repository, number, url, head_ref, base_ref, issue_id, role, outcome, source, linked_at, closed_at, cancel_checked_at FROM pull_request_link")).toThrow(/UNIQUE/);
   });
 
   it("refreshes metadata but preserves the first link and fills only missing refs across restarts", async () => {
@@ -62,6 +62,24 @@ describe("pull request links", () => {
     expect(links.listLinksByOutcome("merged")).toEqual([second]);
     const reopened = await f.reopen();
     expect(reopened.links.findLinkByPr(input.repository, 1)).toEqual(second);
+  });
+
+  it("migrates an old table idempotently and preserves cancellation markers on refresh", async () => {
+    const f = await fixture();
+    const { links, dedup } = f.modules;
+    links.linkPullRequest(input);
+    dedup.getDb().exec("ALTER TABLE pull_request_link DROP COLUMN cancel_checked_at");
+    const firstBoot = await f.reopen();
+    expect(firstBoot.links.findLinkByPr(input.repository, 1)).toMatchObject({ cancelCheckedAt: null });
+    firstBoot.links.setLinkOutcome(input.repository, 1, "closed-unmerged", 150);
+    expect(firstBoot.links.listUncheckedClosedLinks()).toHaveLength(1);
+    firstBoot.links.setCancelCheckedAt(input.repository, 1, 200);
+    firstBoot.links.linkPullRequest(input);
+    const secondBoot = await f.reopen();
+    expect(secondBoot.links.findLinkByPr(input.repository, 1)).toMatchObject({ cancelCheckedAt: 200, closedAt: 150 });
+    expect(secondBoot.links.listUncheckedClosedLinks()).toEqual([]);
+    expect(secondBoot.dedup.getDb().prepare("PRAGMA table_info(pull_request_link)").all()).toContainEqual(
+      expect.objectContaining({ name: "cancel_checked_at", type: "INTEGER", notnull: 0 }));
   });
 
   it("keeps the first issue and warns once with both identifiers", async () => {
