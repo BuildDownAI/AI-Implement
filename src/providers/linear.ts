@@ -159,6 +159,7 @@ export class LinearProvider implements TicketingProvider {
   private needsHumanLabelCache = new Map<string, string>();
   private teamIdByKey = new Map<string, string>();
   private inProgressStateByTeamKey = new Map<string, string>();
+  private canceledStateByTeamKey = new Map<string, string>();
   private completedStateByTeamKey = new Map<string, string>();
 
   constructor(config: ProviderConfig) {
@@ -908,6 +909,30 @@ export class LinearProvider implements TicketingProvider {
     return state.id;
   }
 
+  private async getCanceledStateId(teamKey: string): Promise<string> {
+    const cached = this.canceledStateByTeamKey.get(teamKey);
+    if (cached) return cached;
+    const teamId = await this.getTeamIdByKey(teamKey);
+    const data = await this.linearMutation<{
+      workflowStates: { nodes: Array<{ id: string; name: string; type: string }> };
+    }>(
+      `query($teamId: ID!) {
+        workflowStates(filter: { team: { id: { eq: $teamId } }, type: { eq: "canceled" } }) {
+          nodes { id name type }
+        }
+      }`,
+      { teamId },
+    );
+    const state =
+      data.workflowStates.nodes.find((s) => ["canceled", "cancelled"].includes(s.name.toLowerCase())) ??
+      data.workflowStates.nodes[0];
+    if (!state) {
+      throw new Error(`No "canceled" workflow state found for team ${teamId}`);
+    }
+    this.canceledStateByTeamKey.set(teamKey, state.id);
+    return state.id;
+  }
+
   private async updateIssueState(issueId: string, stateId: string): Promise<void> {
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
       `mutation($issueId: String!, $stateId: String!) {
@@ -1134,6 +1159,28 @@ export class LinearProvider implements TicketingProvider {
       { issueId, stateId, labelIds },
       "issueUpdate",
     );
+  }
+
+  async markPrClosedUnmerged(issueId: string, _scopeKey: string, prUrl: string): Promise<boolean> {
+    const data = await this.linearMutation<{
+      issue: { state: { type: string }; team: { key: string }; labels: { nodes: Array<{ id: string; name: string }> } } | null;
+    }>(
+      `query($id: String!) { issue(id: $id) { state { type } team { key } labels { nodes { id name } } } }`,
+      { id: issueId },
+    );
+    const issue = data.issue;
+    if (!issue || isTerminalStateType(issue.state.type)) return false;
+    const stateId = await this.getCanceledStateId(issue.team.key);
+    const labelIds = issue.labels.nodes.filter((l) => l.name !== LINEAR_LABELS.readyForReview.name).map((l) => l.id);
+    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
+      `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
+        issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) { success }
+      }`,
+      { issueId, stateId, labelIds },
+      "issueUpdate",
+    );
+    await this.postComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, move the issue back to Todo.`);
+    return true;
   }
 
   async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {

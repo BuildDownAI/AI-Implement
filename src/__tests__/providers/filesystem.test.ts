@@ -631,7 +631,7 @@ describe("FilesystemProvider.fetchSetupFacts", () => {
   });
 });
 
-import { runChildIssueContract } from "./contract.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 
 for (const planningEnabled of [true, false]) {
   runChildIssueContract(`FilesystemProvider planning=${planningEnabled}`, async () => {
@@ -847,4 +847,28 @@ describe("listIssueStatuses", () => {
     await writeTask(other.ticketingConfig.kind === "filesystem" ? other.ticketingConfig.directory : "", "TEST-2.md", "invalid");
     expect(await provider({ TEAM: config, OTHER: other }).listIssueStatuses(config)).toHaveLength(1);
   });
+});
+
+runPrClosedUnmergedContract("FilesystemProvider", async (terminal) => {
+  const dir = testDir("fs-close");
+  await writeTask(dir, "TASK-1.md", "---\ntitle: Task\n---\nWork");
+  const p = provider({ TEAM: mapping({ directory: dir }) });
+  const id = "filesystem:TEAM:TASK-1";
+  await p.markPrReady(id, "TEAM", "url");
+  if (terminal) await p.markMerged(id, "TEAM");
+  const path = join(dir, ".state", "TEAM", "TASK-1.json");
+  const before = await readFile(path, "utf8");
+  return { provider: p, issueId: id, scopeKey: "TEAM", restartSentence: "To run it again, set the task status to its pickup value.",
+    verify: async (terminal, comment) => {
+      const after = await readFile(path, "utf8");
+      if (terminal) expect(after).toBe(before);
+      else {
+        const state = JSON.parse(after);
+        expect(state.status).toBe("cancelled");
+        expect(state.comments).toHaveLength(JSON.parse(before).comments.length + 1);
+        expect(state.comments.at(-1).body).toBe(comment);
+        expect(await p.markPrClosedUnmerged(id, "TEAM", "url")).toBe(false);
+        expect(await readFile(path, "utf8")).toBe(after);
+      }
+    } };
 });
