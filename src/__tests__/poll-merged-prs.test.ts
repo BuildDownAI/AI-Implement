@@ -62,6 +62,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState: vi.fn(async () => ({ merged: true, state: "closed" as const })),
       tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
@@ -75,6 +76,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
@@ -88,6 +90,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
@@ -101,6 +104,7 @@ describe("detectMergedPrs", () => {
     const deps = {
       getPullRequestState,
       tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     };
@@ -118,6 +122,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
@@ -135,6 +140,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
@@ -147,6 +153,7 @@ describe("detectMergedPrs", () => {
     await mod.detectMergedPrs({
       getPullRequestState,
       tokenForOwner: async () => "tok",
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true,
       mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
     });
@@ -160,7 +167,8 @@ describe("detectMergedPrs", () => {
     links.setLinkOutcome("o/r", 5, outcome, 123);
     const getPullRequestState = vi.fn();
     await mod.detectMergedPrs({ getPullRequestState, tokenForOwner: async () => "tok",
-      mappingForRepo: () => makeMapping(), finalizeGroupingParent: async () => true });
+      mappingForRepo: () => makeMapping(), cancelIssue: async () => true,
+      finalizeGroupingParent: async () => true });
     expect(getPullRequestState).not.toHaveBeenCalled();
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
   });
@@ -169,7 +177,7 @@ describe("detectMergedPrs", () => {
     seedLink(5, "i1", null, "roll-up");
     const finalizeGroupingParent = vi.fn(async () => true);
     await mod.detectMergedPrs({ getPullRequestState: async () => ({ merged, state: "closed" }),
-      tokenForOwner: async () => "tok", mappingForRepo: () => makeMapping(), finalizeGroupingParent });
+      tokenForOwner: async () => "tok", mappingForRepo: () => makeMapping(), cancelIssue: async () => true, finalizeGroupingParent });
     expect(links.findLinkByPr("o/r", 5)?.outcome).toBe(merged ? "merged" : "closed-unmerged");
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
     expect(finalizeGroupingParent).not.toHaveBeenCalled();
@@ -180,10 +188,110 @@ describe("detectMergedPrs", () => {
     const getPullRequestState = vi.fn(async () => null);
     await mod.detectMergedPrs({ getPullRequestState, tokenForOwner: async () => "tok",
       mappingForRepo: () => kind === "unmapped" ? undefined : makeMapping(),
+      cancelIssue: async () => true,
       finalizeGroupingParent: async () => true });
     expect(links.findLinkByPr("o/r", 5)).toMatchObject({ outcome: "open", closedAt: null });
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
     expect(getPullRequestState).toHaveBeenCalledTimes(kind === "unmapped" ? 0 : 1);
+  });
+
+  describe("cancellation", () => {
+    function deps() {
+      return {
+        mappingForRepo: () => makeMapping(),
+        tokenForOwner: vi.fn(async () => "tok"),
+        getPullRequestState: vi.fn<DetectDeps["getPullRequestState"]>(async () => ({ merged: false, state: "closed" })),
+        finalizeGroupingParent: vi.fn(async () => true),
+        cancelIssue: vi.fn(async () => true),
+      };
+    }
+    function markDedup() {
+      db.prepare("INSERT INTO dispatched (issue_id, dispatched_at, team_key) VALUES ('i1', 1, 'm')").run();
+    }
+    function hasDedup() {
+      return !!db.prepare("SELECT 1 FROM dispatched WHERE issue_id = 'i1'").get();
+    }
+    it.each([true, false])("checks once and clears dedup on provider result %s", async (result) => {
+      seedLink(5);
+      markDedup();
+      const d = deps();
+      d.cancelIssue.mockResolvedValue(result);
+      const output = vi.spyOn(console, "log");
+      onTestFinished(() => output.mockRestore());
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(1);
+      expect(hasDedup()).toBe(false);
+      expect(links.findLinkByPr("o/r", 5)?.cancelCheckedAt).toEqual(expect.any(Number));
+      expect(output).toHaveBeenCalledWith(expect.stringContaining("ENG-1: PR #5 in o/r"));
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(1);
+      expect(d.tokenForOwner).toHaveBeenCalledTimes(1);
+    });
+    it("cancels again after a checked PR reopens and closes unmerged again", async () => {
+      seedLink(5);
+      markDedup();
+      const d = deps();
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(1);
+      expect(hasDedup()).toBe(false);
+      expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
+
+      // The open-PR sweep restores the link through this same writer.
+      links.setLinkOutcome("o/r", 5, "open", null);
+      markDedup();
+      d.getPullRequestState.mockResolvedValueOnce({ merged: false, state: "open" });
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(1);
+      expect(hasDedup()).toBe(true);
+      expect(links.findLinkByPr("o/r", 5)?.cancelCheckedAt).toBeNull();
+
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(2);
+      expect(hasDedup()).toBe(false);
+      expect(links.findLinkByPr("o/r", 5)).toMatchObject({
+        outcome: "closed-unmerged", cancelCheckedAt: expect.any(Number),
+      });
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(2);
+      expect(d.getPullRequestState).toHaveBeenCalledTimes(3);
+    });
+    it.each(["roll-up", "other-open"])("stamps final exclusion %s before the in-flight deferral", async (kind) => {
+      log.appendLog({ issueId: "i1", repo: "o/r" });
+      seedLink(5, "i1", "ENG-1", kind === "roll-up" ? "roll-up" : "implementation");
+      if (kind === "other-open") seedLink(6);
+      const d = deps();
+      d.getPullRequestState.mockImplementation(async (_token?: string, _owner?: string, _repo?: string, n?: number) =>
+        ({ merged: false, state: n === 6 ? "open" : "closed" }));
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 5)?.cancelCheckedAt).toEqual(expect.any(Number));
+    });
+    it.each(["in-flight", "error"])("retries %s without GitHub reads", async (kind) => {
+      seedLink(5);
+      markDedup();
+      const d = deps();
+      const job = kind === "in-flight" ? log.appendLog({ issueId: "i1", repo: "o/r" }) : null;
+      if (kind === "error") d.cancelIssue.mockRejectedValueOnce(new Error("provider down"));
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      onTestFinished(() => error.mockRestore());
+      await mod.detectMergedPrs(d);
+      expect(links.findLinkByPr("o/r", 5)?.cancelCheckedAt).toBeNull();
+      expect(hasDedup()).toBe(true);
+      if (job !== null) log.updateJobStatus(job, "completed", "success");
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(kind === "error" ? 2 : 1);
+      expect(hasDedup()).toBe(false);
+      expect(d.getPullRequestState).toHaveBeenCalledTimes(1);
+      expect(d.tokenForOwner).toHaveBeenCalledTimes(1);
+    });
+    it("ignores an already checked closed link", async () => {
+      seedLink(5);
+      links.setLinkOutcome("o/r", 5, "closed-unmerged", 1);
+      links.setCancelCheckedAt("o/r", 5, 2);
+      const d = deps();
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).not.toHaveBeenCalled();
+    });
   });
 
   describe("grouping parent whose own PR closed unmerged (AII-1294)", () => {
@@ -202,6 +310,7 @@ describe("detectMergedPrs", () => {
         getPullRequestState: vi.fn<DetectDeps["getPullRequestState"]>(async () => closed),
         tokenForOwner: async () => "tok",
         mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
+        cancelIssue: vi.fn(async () => true),
         finalizeGroupingParent: vi.fn(finalize),
       };
     }
@@ -212,6 +321,8 @@ describe("detectMergedPrs", () => {
       const deps = makeDeps(async () => { order.push(recon.hasReconciliationForPr("o/r", 7) ? "tombstone" : "finalize"); return true; });
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).toHaveBeenCalledTimes(1);
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)?.cancelCheckedAt).toEqual(expect.any(Number));
       expect(order).toEqual(["finalize"]);
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
     });
@@ -223,6 +334,8 @@ describe("detectMergedPrs", () => {
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).toHaveBeenCalledTimes(1);
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)?.cancelCheckedAt).toEqual(expect.any(Number));
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
     });
 
@@ -232,6 +345,8 @@ describe("detectMergedPrs", () => {
       const deps = makeDeps(async () => true);
       deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) => n === 7 ? closed : null);
       await mod.detectMergedPrs(deps);
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)?.cancelCheckedAt).toEqual(expect.any(Number));
       expect(deps.finalizeGroupingParent).toHaveBeenCalledWith(expect.objectContaining({
         repository: "o/r", number: 7, issue: expect.objectContaining({ trackerIssueId: "p1" }),
       }));
@@ -256,7 +371,7 @@ describe("detectMergedPrs", () => {
       expect(db.prepare("SELECT count(*) AS count FROM reconciliation_queue").get()).toEqual({ count: 1 });
     });
 
-    it("leaves a non-grouping issue at tombstone only", async () => {
+    it("cancels a non-grouping issue after tombstoning", async () => {
       seedParent(7, { groupingParent: false });
       const deps = makeDeps(async () => true);
       await mod.detectMergedPrs(deps);
@@ -298,7 +413,36 @@ describe("detectMergedPrs", () => {
       fail = false;
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).toHaveBeenCalledTimes(2);
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)?.cancelCheckedAt).toEqual(expect.any(Number));
       expect(recon.hasReconciliationForPr("o/r", 7)).toBe(true);
+    });
+
+    it("roll-up exclusion wins over grouping ownership and an in-flight run", async () => {
+      seedLink(7, "p1", "ENG-40", "roll-up");
+      seedParent(7);
+      log.appendLog({ issueId: "p1", repo: "o/r" });
+      const deps = makeDeps(async () => true);
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)).toMatchObject({
+        outcome: "closed-unmerged", cancelCheckedAt: expect.any(Number),
+      });
+      expect(recon.hasReconciliationForPr("o/r", 7)).toBe(false);
+    });
+
+    it("stamps a closed grouping exclusion even with another open link and an in-flight run", async () => {
+      seedParent(7);
+      links.setLinkOutcome("o/r", 7, "closed-unmerged", 1);
+      seedLink(8, "p1", "ENG-40");
+      log.appendLog({ issueId: "p1", repo: "o/r" });
+      const deps = makeDeps(async () => true);
+      deps.getPullRequestState.mockResolvedValue({ merged: false, state: "open" });
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(links.findLinkByPr("o/r", 7)?.cancelCheckedAt).toEqual(expect.any(Number));
     });
 
     it("writes no tombstone when no mapping resolves (finalize returns false)", async () => {

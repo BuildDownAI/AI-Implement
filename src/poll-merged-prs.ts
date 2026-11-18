@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import { getInFlightIssueIds, getLatestPrUrlForIssue } from "./log.js";
-import { getDb } from "./dedup.js";
-import { listLinksByOutcome, setLinkOutcome } from "./pr-links.js";
+import { deleteDispatched, getDb } from "./dedup.js";
+import { listLinksByOutcome, listOpenLinksForIssue, listUncheckedClosedLinks, setCancelCheckedAt, setLinkOutcome } from "./pr-links.js";
 import type { PullRequestLink } from "./pr-links.js";
 import {
   enqueueReconciliation,
@@ -10,6 +10,7 @@ import {
 } from "./reconciliation.js";
 
 export interface DetectDeps {
+  cancelIssue: (link: PullRequestLink) => Promise<boolean>;
   mappingForRepo: (repo: string) => RepoMapping | undefined;
   tokenForOwner: (owner: string) => Promise<string>;
   getPullRequestState: (
@@ -91,5 +92,28 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
       console.log(`[merge-poll] PR #${prNumber} in ${repo} closed unmerged; tombstoned`);
     }
     setLinkOutcome(repo, prNumber, outcome, Date.now());
+  }
+
+  // Outcome repair runs first; tombstones must not suppress cancellation retries.
+  for (const link of listUncheckedClosedLinks()) {
+    const { issue, repository, number } = link;
+    const groupingParent = getDb().prepare(
+      "SELECT 1 FROM dispatch_log WHERE pr_url = ? AND grouping_parent = 1 LIMIT 1",
+    ).get(link.url);
+    if (link.role === "roll-up" ||
+        (groupingParent && getLatestPrUrlForIssue(issue.trackerIssueId) === link.url) ||
+        listOpenLinksForIssue(issue.trackerKind, issue.trackerIssueId).length > 0) {
+      setCancelCheckedAt(repository, number, Date.now());
+      continue;
+    }
+    if (getInFlightIssueIds().has(issue.trackerIssueId)) continue;
+    try {
+      await deps.cancelIssue(link);
+      deleteDispatched(issue.trackerIssueId);
+      setCancelCheckedAt(repository, number, Date.now());
+      console.log(`[merge-poll] Cancel checked for ${issue.identifier ?? issue.trackerIssueId}: PR #${number} in ${repository} closed unmerged`);
+    } catch (err) {
+      console.error(`[merge-poll] failed to cancel ${issue.identifier ?? issue.trackerIssueId} for closed PR #${number} in ${repository}:`, err);
+    }
   }
 }
