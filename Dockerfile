@@ -6,6 +6,11 @@
 #
 # Keep the Node version aligned with the repo pins (.node-version / .nvmrc).
 # better-sqlite3 is a native addon whose lifecycle behavior can change across Node releases.
+# Select an artifact stage before the runtime stage. BuildKit skips the unused
+# base download entirely when a customer repository is configured.
+ARG KG_SOURCE_REPO
+ARG KG_ARTIFACT_KIND=${KG_SOURCE_REPO:+customer}
+
 FROM node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d AS builder
 
 WORKDIR /app
@@ -26,8 +31,19 @@ RUN npm run build
 # Prune to production deps in-place; native addon binaries stay (same glibc ABI).
 RUN npm prune --omit=dev
 
+FROM node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d AS kg-runtime
+
+FROM kg-runtime AS kg-artifact-base
+ARG KG_BASE_REPO=BuildDownAI/bd-knowledge-graph-base
+ADD https://codeload.github.com/${KG_BASE_REPO}/tar.gz/refs/heads/main /tmp/kg-base.tgz
+
+FROM kg-runtime AS kg-artifact-customer
+RUN mkdir -p /tmp
+
+FROM kg-artifact-${KG_ARTIFACT_KIND:-base} AS kg-artifact
+
 # ---------- Production ----------
-FROM node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
+FROM kg-runtime
 
 WORKDIR /app
 
@@ -69,8 +85,7 @@ COPY workflows/ ./workflows/
 # which exports KG_EMBEDDINGS_DEGRADED=1 and surfaces the fact via GET / and the
 # deploy notification. The || true copy guards below are exempt: they are part of
 # the deliberate sidecar-less mode, not unexpected failures.
-ARG KG_BASE_REPO=BuildDownAI/bd-knowledge-graph-base
-ADD https://codeload.github.com/${KG_BASE_REPO}/tar.gz/refs/heads/main /tmp/kg-base.tgz
+COPY --from=kg-artifact /tmp/ /tmp/
 ARG KG_SOURCE_REPO
 ENV KG_SOURCE_REPO=$KG_SOURCE_REPO
 COPY kg/ /app/kg/

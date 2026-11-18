@@ -75,7 +75,13 @@ export function seedSettingsFromEnv(env: Readonly<Record<string, string | undefi
   const db = getDb();
   if (env.KG_STARDOG_RUN_TOKEN &&
       !db.prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(STARDOG_RUN_TOKEN_REF)) {
-    setStardogValues({ token: env.KG_STARDOG_RUN_TOKEN });
+    try {
+      setStardogValues({ token: env.KG_STARDOG_RUN_TOKEN });
+    } catch {
+      // Keep boot available and leave the row absent so the next boot can retry.
+      // Never log the token or exception text from the secret-storage boundary.
+      console.warn("[settings] KG_STARDOG_RUN_TOKEN could not be stored; check RUNNER_TOKEN_SECRET and retry at next boot");
+    }
   }
   for (const setting of SEED_ONCE_SETTINGS) {
     const seed = setting.seedValue(env[setting.variable]);

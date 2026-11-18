@@ -127,3 +127,21 @@ it.each([undefined, "sidecar", "STARDOG_RUN", "stardog_run "])("does not seed so
   seed.seedSettingsFromEnv({ KG_BACKEND: backend });
   expect(dedup.getDb().prepare("SELECT 1 FROM settings WHERE key = 'kg_graph_source'").get()).toBeUndefined();
 });
+
+it.each([undefined, ""])("continues seeding without an encryption key (%s) and retries next boot", async (key) => {
+  const f = await fixture();
+  vi.stubEnv("RUNNER_TOKEN_SECRET", key);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const env = { KG_BACKEND: "stardog_run", KG_STARDOG_DB: "graph", KG_STARDOG_RUN_TOKEN: "SENTINEL-seed-token" };
+    expect(() => f.modules.seed.seedSettingsFromEnv(env)).not.toThrow();
+    expect(f.modules.kg.getStardogValues()).toMatchObject({ db: "graph", tokenSet: false });
+    expect(f.modules.dedup.getDb().prepare("SELECT * FROM model_protected_secrets").all()).toEqual([]);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(env.KG_STARDOG_RUN_TOKEN);
+    vi.stubEnv("RUNNER_TOKEN_SECRET", "configured-key");
+    const restarted = await f.reopen();
+    restarted.seed.seedSettingsFromEnv(env);
+    expect(restarted.kg.stardogChildEnv().KG_STARDOG_RUN_TOKEN).toBe(env.KG_STARDOG_RUN_TOKEN);
+  } finally { warn.mockRestore(); }
+});

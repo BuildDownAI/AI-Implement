@@ -35,7 +35,9 @@ a release.
 
 With no `KG_SOURCE_REPO`, the image downloads the public `KG_BASE_REPO` (default
 `BuildDownAI/bd-knowledge-graph-base`) main branch using a remote Dockerfile `ADD`.
-BuildKit checks the tar content on each build. Extraction strips the top directory
+The artifact stage is selected from `KG_SOURCE_REPO`, so customer builds skip the
+base download. BuildKit checks the tar content on each base build. Extraction
+strips the top directory
 and copies `kg_query`, `kg_ingest` (imported by query code), and `requirements.txt`;
 no snapshot, `sources.yml`, or Git checkout is included. The tar's pax comment
 records the commit in `/app/kg/.base-commit`, and `.base-only` marks this mode.
@@ -47,7 +49,9 @@ those values, no sidecar starts or gets probed, and `/mcp` has no KG tools.
 First boot seeds graph source (only exact `KG_BACKEND=stardog_run`), database,
 endpoint, console, namespace, and encrypted token from the environment. Stored
 values govern subsequent starts; the dataset remains an environment fallback
-when there is no stored graph name.
+when there is no stored graph name. Token encryption requires `RUNNER_TOKEN_SECRET`;
+if storage fails, boot continues with a warning and no token row, and the next boot
+retries the seed.
 
 ### A code deploy is a data refresh
 
