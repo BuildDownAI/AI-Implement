@@ -1,11 +1,67 @@
-# Codex parity validation (provisional)
+# Codex parity validation
 
-This page records the evidence for Codex support and what is still unproven. It does not claim complete Codex parity.
-AII-1289 owns the final Codex + Restate acceptance and stays open; closing it must replace each pending row below with
-accepted evidence. This page does not waive them.
+This page records the evidence for Codex support, and what that evidence does not cover.
+
+Since 2026-11-16, the AI-Implement project itself has run on Codex, with Restate owning every run, on Fly Machines.
+That production evidence is in [Production: Codex on Restate](#production-codex-on-restate-2026-11-16-to-2026-11-18).
+The operator accepted it as the closing evidence for AII-1289 on 2026-11-18. The rows under
+[Not covered by this evidence](#not-covered-by-this-evidence) stay unproven. They are not claimed here.
+
+The dated sections after the production section are history. They describe the source and settings of their own date.
+Some of their restrictions no longer apply: for example, AII-1770 (#1527) admits managed review-fix on Fly Machines and
+local Docker, and Restate is now a hard dependency.
 
 Operator procedures: [model-account-operations.md](model-account-operations.md). Template markers:
 [workflow-envelope.md](workflow-envelope.md). Planning isolation: [pipeline-architecture.md](pipeline-architecture.md).
+
+## Production: Codex on Restate (2026-11-16 to 2026-11-18)
+
+These records come from the testing orchestrator's own job accounting (`list_job_accounting`) and review-fix attempt
+detail (`get_review_fix_attempt`), read on 2026-11-18. The project is `BuildDownAI/AI-Implement`. Every record below has
+`lifecycleOwner: restate` and backend `fly-machines` (shared CPU, 2 CPUs, 4096 MB). Every invocation selected
+`codex` / `openai` / `gpt-6.1-sol`. Cost is `unavailable` in every record, not zero.
+
+### PlanningRun, implementation and review-fix
+
+| Stage | Record | Issue / PR | Outcome | Pushed head |
+|---|---|---|---|---|
+| Planning | dispatch `dc97e640-ca0b-4da5-8fe2-6a0c016a13aa` | AII-1942 | completed, `planning_callback` | none |
+| Planning | dispatch `7ff49aa6-7d29-4d69-b72f-749af80ef9da` | AII-1943 | completed, `planning_callback` | none |
+| Implementation | dispatch `fc8f0439-acac-4424-96dc-ef58eae131c2` | AII-1942 / #1657 | completed, `success` | `0e13a8908a320c3e296f3667e2db08ad99b9b5cb` |
+| Implementation | dispatch `77f486ed-7de7-4009-83b1-1dfed688e207` | AII-1943 / #1656 | completed, `runner_approved` | `7fb85759b0ec3ad82b532bef860c0814db79c3cd` |
+| Later review-fix | attempt `reviewfix-8f2743aa42908b05c6c4f53230914ed998ac6e93e089239741793082c34728fc` | #1657 | completed, `success` | `4ca967351c8622abcdc65e4544003381437a39cc` |
+| Later review-fix | attempt `reviewfix-004f9fe46ac036600c784dd93d1b43a689480a059041e6bd02b86490e3f68443` | AII-2004 / #1712 | `succeeded` | `11e674094b7ae23932ab1b34675732ca424c26c6` |
+
+PRs #1656 and #1712 merged. The planning stage and both review-fix attempts started after the initial runner had ended.
+
+### Detail of review-fix attempt `reviewfix-004f9fe4…` (#1712)
+
+| Field | Value |
+|---|---|
+| Owner | `restate`, attempt `reviewfix-004f9fe46ac036600c784dd93d1b43a689480a059041e6bd02b86490e3f68443` |
+| Execution | `fly-machines`, machine `857679ec04e168` |
+| Snapshot | `c85c8fd4-b4cd-494d-b9ee-de9a51914847` |
+| Invocation | `implementation-409e7f78-6398-4ffd-a04e-53a4a30e2933` |
+| Agent / provider / model | `codex` / `openai` / `gpt-6.1-sol` |
+| Profile / auth mode | `chatgpt-plan-test` / `codex-subscription` |
+| Limit | timeout 1800000 ms |
+| Usage | complete: 1206518 tokens in / 3985 out; cost unavailable |
+| Input / output commit | `85b5a685b04ff8bbcd861371c372de01c318c726` / `11e674094b7ae23932ab1b34675732ca424c26c6` |
+| Findings | 2 findings (`13ed6eeb…`, `9de96252…`), both `addressed` in publication cycle 50001 |
+| Result | `succeeded`, `evidenceComplete: true`, `terminationConfirmed: true`, verdict approved |
+
+Both cycles record `tests: missing`. The review-fix did not report that it ran the tests. CI on the PR is the test
+verdict.
+
+### Not covered by this evidence
+
+- **OpenAI API-key profile.** Every production record above uses the ChatGPT plan profile.
+- **Mixed Claude and Codex stages.** Every stage above is Codex.
+- **GHA and local Docker under Restate in production.** The production records above are Fly Machines only. The GHA
+  Restate review-fix proof is TEST-5, below. Local Docker has the synthetic and ordinary live runs below.
+- **Codex-specific fault injection.** No restart, lost launch acknowledgement, duplicate or stale callback, cancellation,
+  timeout or expired-token resume was injected into a Codex run. The generic Restate suites (`npm run test:restate`) cover
+  these paths with synthetic edges. They do not select Codex.
 
 ## Verified: code, synthetic and native-CLI evidence
 
@@ -136,7 +192,7 @@ The TEST mapping was restored to fly-machines/Legacy via the supported admin UI 
 ephemeral opt-in is absent, autoMerge false and capacity 2 CPU / 4096 MB retained, other mappings untouched. The smokes used
 temporary GHA, so this restoration is cleanup and not live Fly acceptance.
 
-AII-1289 remains open (Backlog) with the AII-1770/1338 gates. Managed review-fix admission on Fly and local Docker is implemented by AII-1770, subject to explicit operator review of its concrete PR before merge; no live proof is claimed, and the
+As of 2026-10-16, AII-1289 remained open (Backlog) with the AII-1770/1338 gates. Managed review-fix admission on Fly and local Docker is implemented by AII-1770, subject to explicit operator review of its concrete PR before merge; no live proof is claimed, and the
 sequence AII-1368 -> AII-1312 -> AII-1374 -> AII-1313 and D10 are not waived. No restart, cancel, retry or
 uncertain-launch proof is inferred from these normal successes.
 
