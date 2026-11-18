@@ -162,6 +162,11 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
       endSetupCheckProgress();
     }
 
+    // The stored run already shows the fault on every project, so another project's run finding it merges as it is.
+    nextProjectRun = async () => ({ checkedAt: 4650, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "OPS", state: "cannot-verify" })], scope: { checks: ["tracker.linear.team-access"], projects: ["OPS"] } });
+    expect((await runProject("shared", "OPS"))!.results).toContainEqual(row({ project: "OPS", state: "cannot-verify", checkedAt: 4650 }));
+    expect(quiet).toBe(1);
+
     nextProjectRun = async () => ({ checkedAt: 4700, results: [row({ id: "tracker.provider" }), row({ project: "ENG" })], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } });
     await runProject("shared", "ENG");
     expect(quiet).toBe(1);
@@ -221,6 +226,31 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     }
   });
 
+  // With nothing stored, a partial run would stand for every check, so every check runs instead and is stored whole.
+  it.each([
+    ["an orchestrator-wide run", "empty-wide", (key: string) => call<SetupCheckRun>(key, "runOrchestratorWide")],
+    ["a project run", "empty-project", (key: string) => runProject(key, "ENG")],
+  ] as const)("answers %s with a full run, stored whole, when nothing is stored", async (_case, key, start) => {
+    const full: SetupCheckRun = { startedAt: 7700, checkedAt: 7701, results: [row({ id: "restate", group: "orchestrator" }), row({ project: "ENG" }), row({ project: "OPS", state: "fail" })] };
+    let quiet = 0;
+    nextQuietRun = async () => { quiet++; return full; };
+    nextWideRun = async () => ({ checkedAt: 7650, results: [row({ id: "restate", group: "orchestrator" })], scope: { checks: ["restate"] } });
+    nextProjectRun = async () => ({ checkedAt: 7650, results: [row({ project: "ENG" })], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } });
+    expect(await start(key)).toEqual(full);
+    expect(quiet).toBe(1);
+    expect(await call(key, "get")).toEqual(full);
+  });
+
+  // The project run's own escalation is already a full run, which nothing stored needs no second one for.
+  it("runs every check once for a project run that finds a shared fault when nothing is stored", async () => {
+    const full: SetupCheckRun = { checkedAt: 7801, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "ENG", state: "cannot-verify" })] };
+    let quiet = 0;
+    nextQuietRun = async () => { quiet++; return full; };
+    nextProjectRun = async () => ({ checkedAt: 7750, results: [row({ id: "tracker.provider", state: "fail" }), row({ project: "ENG", state: "cannot-verify" })], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } });
+    expect(await runProject("empty-escalated", "ENG")).toEqual(full);
+    expect(quiet).toBe(1);
+  });
+
   describe("recheck", () => {
     const recheck = (key: string, request: { id: string; project?: string; cause?: string }) =>
       callObject<SetupCheckRun | null>(env().baseUrl(), "SetupChecks", key, "recheck", request);
@@ -262,6 +292,8 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
     });
 
     it("re-runs each check the rechecked rows wait on, so none waits on an older row", async () => {
+      nextRun = async () => ({ checkedAt: 8300, results: [row({ project: "ENG" })] });
+      await call<SetupCheckRun>("recheck-waits", "run");
       const waiting = row({ project: "ENG", state: "cannot-verify", waitsOn: "github.app-identity" });
       const asked = answering({
         "tracker.linear.team-access": { checkedAt: 8301, results: [waiting], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } },
@@ -303,6 +335,29 @@ describe.each(VARIANTS.map(([label]) => label))("SetupChecks (%s)", (label) => {
       expect(started).toBe(false);
       hold.release();
       expect(await merged).toEqual({ checkedAt: 8401, results: [row({ project: "OPS", state: "warn" }), row({ project: "ENG", state: "fail", checkedAt: 8501 })] });
+    });
+
+    it("answers a recheck with a full run, stored whole, when nothing is stored", async () => {
+      const full: SetupCheckRun = { checkedAt: 8601, results: [row({ project: "ENG" }), row({ project: "OPS", state: "fail" })] };
+      nextQuietRun = async () => full;
+      answering({ "tracker.linear.team-access": { checkedAt: 8600, results: [row({ project: "ENG", state: "fail" })], scope: { checks: ["tracker.linear.team-access"], projects: ["ENG"] } } });
+      expect(await recheck("recheck-empty", { id: "tracker.linear.team-access", project: "ENG" })).toEqual(full);
+      expect(await call("recheck-empty", "get")).toEqual(full);
+    });
+
+    // The hold is dated by the journaled clock, so a retry that resumes past the hour's edge takes the branch the first attempt took.
+    it("dates its hold by a journaled clock read", async () => {
+      answering({ "github.app-identity": { checkedAt: 8701, results: [row({ id: "github.app-identity", group: "github" })], scope: { checks: ["github.app-identity"] } } });
+      const before = Date.now();
+      await recheck("recheck-clock", { id: "github.app-identity" });
+      const rows = await invocations("recheck-clock", "recheck");
+      const entries = (await journalEntries(env().adminAPIBaseUrl(), String(rows[0].id))).map((e) => JSON.parse(String(e.entry_json ?? "null")) as Record<string, any> | null);
+      const unnamed = entries.find((e) => e?.Command?.Run && !e.Command.Run.name);
+      expect(unnamed).toBeDefined();
+      const done = entries.find((e) => e?.Notification?.Completion?.Run?.completion_id === unnamed!.Command.Run.completion_id);
+      const read = JSON.parse(Buffer.from(done!.Notification.Completion.Run.result.Success as number[]).toString("utf8")) as number;
+      expect(read).toBeGreaterThanOrEqual(before);
+      expect(read).toBeLessThanOrEqual(Date.now());
     });
 
     it("answers null for a check not on the list, and runs nothing", async () => {

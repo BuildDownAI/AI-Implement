@@ -59,10 +59,15 @@ const INGRESS_TIMEOUT_MS = 10_000;
 const WAITED_RUN_TIMEOUT_MS = 60_000;
 
 export function createSetupChecks(deps: SetupChecksDeps) {
-  /** Merges a partial run into the stored run and keeps the result, in this process and in the object. */
+  /**
+   * Merges a partial run into the stored run and keeps the result, in this process and in the object. With nothing stored, a partial run
+   * would stand for every check, so every check runs instead, in a step of its own, and that run is kept whole.
+   */
   async function storeMerged(ctx: ObjectContext, run: SetupCheckRun): Promise<SetupCheckRun> {
-    const mapped = await ctx.run("mapped projects", () => deps.mappedProjects());
-    const merged = mergeSetupCheckRun((await ctx.get<SetupCheckRun>(LAST_RUN)) ?? null, run, mapped);
+    const stored = (await ctx.get<SetupCheckRun>(LAST_RUN)) ?? null;
+    const merged = stored === null && run.scope !== undefined
+      ? await ctx.run("run checks", () => deps.runChecksQuietly())
+      : mergeSetupCheckRun(stored, run, await ctx.run("mapped projects", () => deps.mappedProjects()));
     cacheSetupCheckRun(merged);
     ctx.set<SetupCheckRun>(LAST_RUN, merged);
     return merged;
@@ -86,7 +91,7 @@ export function createSetupChecks(deps: SetupChecksDeps) {
         const run = await ctx.run("run project checks", () => deps.runProjectChecks(project));
         if (run === null) return null;
         // The full run leaves the progress record alone, which a start may hold for a run queued behind this one.
-        if (projectRunNeedsFullRun(run)) return storeMerged(ctx, await ctx.run("run checks", () => deps.runChecksQuietly()));
+        if (projectRunNeedsFullRun(run, (await ctx.get<SetupCheckRun>(LAST_RUN)) ?? null)) return storeMerged(ctx, await ctx.run("run checks", () => deps.runChecksQuietly()));
         return storeMerged(ctx, run);
       }),
       // Exclusive like the others, so it never merges into a run another handler is about to replace.

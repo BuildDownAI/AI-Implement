@@ -417,10 +417,20 @@ describe("a fault every project on a dependency shares", () => {
   it("makes a project run answer with a full run, while a fault of the project's own does not", () => {
     const run = (results: SetupCheckResult[]) => ({ checkedAt: 1, results });
     const shared = (state: SetupCheckResult["state"]) => ({ id: "tracker.provider" as const, title: "", group: "tracker" as const, tier: "core" as const, onAdminPath: false, state, detail: "" });
-    expect(checks.projectRunNeedsFullRun(run([shared("fail")]))).toBe(true);
-    expect(checks.projectRunNeedsFullRun(run([shared("cannot-verify")]))).toBe(true);
-    expect(checks.projectRunNeedsFullRun(run([shared("pass"), shared("warn"), shared("not-applicable")]))).toBe(false);
-    expect(checks.projectRunNeedsFullRun(run([{ ...shared("fail"), id: "tracker.linear.team-access", project: "ENG" }]))).toBe(false);
+    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), null)).toBe(true);
+    expect(checks.projectRunNeedsFullRun(run([shared("cannot-verify")]), null)).toBe(true);
+    expect(checks.projectRunNeedsFullRun(run([shared("pass"), shared("warn"), shared("not-applicable")]), null)).toBe(false);
+    expect(checks.projectRunNeedsFullRun(run([{ ...shared("fail"), id: "tracker.linear.team-access", project: "ENG" }]), null)).toBe(false);
+  });
+
+  // Once a full run has stored the fault on every project, another full run would only repeat its reads against the failing system.
+  it("lets a project run merge as it is once the stored run already shows the shared fault, and escalates for one it does not", () => {
+    const run = (results: SetupCheckResult[]) => ({ checkedAt: 1, results });
+    const shared = (state: SetupCheckResult["state"]) => ({ id: "tracker.provider" as const, title: "", group: "tracker" as const, tier: "core" as const, onAdminPath: false, state, detail: "" });
+    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([shared("fail")]))).toBe(false);
+    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([shared("pass")]))).toBe(true);
+    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([shared("cannot-verify")]))).toBe(true);
+    expect(checks.projectRunNeedsFullRun(run([shared("fail")]), run([{ ...shared("fail"), project: "ENG" }]))).toBe(true);
   });
 });
 
@@ -652,6 +662,9 @@ describe("the saved setup", () => {
     const synced = at({ githubSetupFacts: () => makeGitHubSetupFacts({ workflowSync: () => ({ id: 1, teamKey: "ENG", status: "completed", result: null, error: null, createdAt: 1, updatedAt: 1 }) }) });
     expect(synced.perProject.ENG.sync).not.toBe(base.perProject.ENG.sync);
     expect(synced.orchestratorWide).toBe(base.orchestratorWide);
+    // A sync queued again keeps its row's id, so only its error tells a retry that failed differently apart.
+    const failedWith = (message: string) => at({ githubSetupFacts: () => makeGitHubSetupFacts({ workflowSync: () => ({ id: 1, teamKey: "ENG", status: "failed", result: null, error: { category: "unknown", message }, createdAt: 1, updatedAt: 1 }) }) });
+    expect(failedWith("the App lacks workflows: write").perProject.ENG.sync).not.toBe(failedWith("the default branch is protected").perProject.ENG.sync);
     const adopted = at({ projectStageConfig: () => ({ configRevisionId: "rev-2", revision: 2, config: {} as never, createdAt: 1, createdBy: null, supersedesRevisionId: null }) });
     expect(adopted.orchestratorWide).not.toBe(base.orchestratorWide);
     expect(adopted.perProject).toEqual(base.perProject);
@@ -824,7 +837,7 @@ describe("the change detector", () => {
 
   describe("its record, which outlives the process", () => {
     // A detector over one shared record, standing in for the settings row a process writes and the next one reads.
-    type Store = { record: SetupChecksModule.ChangeDetectorRecord | null; writes: number };
+    type Store = { record: SetupChecksModule.ChangeDetectorRecord | null; reads: number; writes: number };
     function processOver(store: Store, read: () => Saved, accept = () => true) {
       const sent: SetupCheckRunKind[] = [];
       const lines: string[] = [];
@@ -832,12 +845,12 @@ describe("the change detector", () => {
         readSavedSetup: read,
         send: async (run) => { if (!accept()) return false; sent.push(run); return true; },
         log: (line) => { lines.push(line); },
-        readRecord: () => store.record,
+        readRecord: () => { store.reads++; return store.record; },
         writeRecord: (record) => { store.record = record; store.writes++; },
       });
       return { detector, sent, lines };
     }
-    const fresh = (): Store => ({ record: null, writes: 0 });
+    const fresh = (): Store => ({ record: null, reads: 0, writes: 0 });
 
     it("lets the next process send a run that was still waiting when this one stopped", async () => {
       const store = fresh();
@@ -868,12 +881,13 @@ describe("the change detector", () => {
       expect(next.sent).toEqual([]);
     });
 
-    it("writes the record only in a cycle that changes it", async () => {
+    // What the detector holds then mirrors the record, so reading it again would only cost a database read each cycle.
+    it("reads the record on its first cycle alone, and writes it only in a cycle that changes it", async () => {
       const store = fresh();
       const { detector } = processOver(store, () => at({ ENG: "m1" }));
       await detector.onPollCycle();
       await detector.onPollCycle();
-      expect(store.writes).toBe(1);
+      expect([store.reads, store.writes]).toEqual([1, 1]);
       await processOver(store, () => at({ ENG: "m1" })).detector.onPollCycle();
       expect(store.writes).toBe(1);
     });
@@ -887,19 +901,27 @@ describe("the change detector", () => {
       expect(store.record!.savedSetup).toEqual(checks.fingerprintSavedSetup(at({ ENG: "a-mapping-read-in-full" }, "the-orchestrator-wide-part")));
     });
 
-    it("only reads on its first cycle, and logs a line, when the record cannot be read", async () => {
+    // The record may hold a run still waiting, which writing a fresh record over it would lose.
+    it("looks for no change and writes nothing while the record cannot be read, then reads it on a later cycle", async () => {
       const sent: SetupCheckRunKind[] = [];
       const lines: string[] = [];
+      let writes = 0;
+      const reads: Array<SetupChecksModule.ChangeDetectorRecord | Error> = [
+        new Error("the database is locked"),
+        { savedSetup: checks.fingerprintSavedSetup(at({}, "o2")), waiting: [{ kind: "orchestrator-wide" }] },
+      ];
       const detector = checks.createSetupCheckChangeDetector({
         readSavedSetup: () => at({}, "o2"),
         send: async (run) => { sent.push(run); return true; },
         log: (line) => { lines.push(line); },
-        readRecord: () => { throw new Error("the database is locked"); },
-        writeRecord: () => {},
+        readRecord: () => { const next = reads.shift()!; if (next instanceof Error) throw next; return next; },
+        writeRecord: () => { writes++; },
       });
       await detector.onPollCycle();
-      expect(sent).toEqual([]);
-      expect(lines).toEqual(["[setup-checks] the last process's record could not be read, so this cycle only reads: the database is locked"]);
+      expect([sent, writes]).toEqual([[], 0]);
+      expect(lines).toEqual(["[setup-checks] the last process's record could not be read, so no change was looked for: the database is locked"]);
+      await detector.onPollCycle();
+      expect(sent).toEqual([{ kind: "orchestrator-wide" }]);
     });
 
     it("keeps the record in a settings row, and reads a row that is not one as none", () => {

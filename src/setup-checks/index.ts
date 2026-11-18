@@ -415,7 +415,8 @@ export function readSavedSetup(ctx: SetupCheckContext): SavedSetup {
   const sync = ctx.githubSetupFacts().workflowSync;
   const perProject = Object.fromEntries(Object.entries(mappings).map(([project, mapping]) => {
     const job = sync(project);
-    return [project, { mapping: JSON.stringify(mapping), sync: JSON.stringify(job && [job.id, job.status]) }];
+    // A sync queued again keeps its row's id, so a retry that fails differently shows only in the error the workflow check reads.
+    return [project, { mapping: JSON.stringify(mapping), sync: JSON.stringify(job && [job.id, job.status, job.error?.message ?? null]) }];
   }));
   const allowlist = ctx.effectiveAllowlist();
   const fly = ctx.flySessions();
@@ -528,16 +529,19 @@ export function createSetupCheckChangeDetector(deps: {
         return;
       }
       if (!recordRead) {
-        recordRead = true;
+        let record: ChangeDetectorRecord | null;
         try {
-          const record = readRecord();
-          if (record) {
-            last = record.savedSetup;
-            for (const run of record.waiting) waiting.set(runKey(run), run);
-            written = JSON.stringify(record);
-          }
+          record = readRecord();
         } catch (err) {
-          failed("the last process's record could not be read, so this cycle only reads", err);
+          // The record may hold runs still waiting, so it is read again next cycle rather than written over.
+          failed("the last process's record could not be read, so no change was looked for", err);
+          return;
+        }
+        recordRead = true;
+        if (record) {
+          last = record.savedSetup;
+          for (const run of record.waiting) waiting.set(runKey(run), run);
+          written = JSON.stringify(record);
         }
       }
       if (last !== null) for (const run of runsForSavedChange(last, current)) waiting.set(runKey(run), run);
@@ -565,11 +569,13 @@ export function createSetupCheckChangeDetector(deps: {
 }
 
 /**
- * Whether a project run found an orchestrator-wide check its rows depend on failing or unread. Such a fault reaches every project
- * that shares the check, whose stored rows a project run cannot correct, so the run is answered by a full run instead.
+ * Whether a project run found an orchestrator-wide check its rows depend on failing or unread, where the stored run does not show it so.
+ * Such a fault reaches every project that shares the check, whose stored rows a project run cannot correct, so the run is answered by
+ * a full run instead; once a full run has stored the fault on every project, later project runs merge as they are.
  */
-export function projectRunNeedsFullRun(run: SetupCheckRun): boolean {
-  return run.results.some((row) => row.project === undefined && (row.state === "fail" || row.state === "cannot-verify"));
+export function projectRunNeedsFullRun(run: SetupCheckRun, stored: SetupCheckRun | null): boolean {
+  return run.results.some((row) => row.project === undefined && (row.state === "fail" || row.state === "cannot-verify")
+    && !stored?.results.some((kept) => kept.id === row.id && kept.project === undefined && kept.state === row.state));
 }
 
 function inScope(row: SetupCheckResult, scope: SetupCheckScope): boolean {
