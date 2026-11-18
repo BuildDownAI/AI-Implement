@@ -2637,7 +2637,7 @@ describe("model administration acceptance through shared actions", () => {
     const source = readFileSync("src/mcp.ts", "utf8");
     const routing = source.slice(source.indexOf("const RESTATE_TOOL_NAMES"), source.indexOf("export const RESTATE_WRITE_TOOL_NAMES"));
     const docs = readFileSync("docs/mcp-server.md", "utf8");
-    for (const [name, handler] of [["add_model_account", tools.addModelAccountTool], ["set_project_stage", tools.setProjectStageTool]] as const) {
+    for (const [name, handler] of [["add_model_account", tools.addModelAccountTool], ["set_project_stage", tools.setProjectStageTool], ["unpark_issue", tools.unparkIssueTool]] as const) {
       expect((tools.orchestratorTools as unknown as { service: Record<string, unknown> }).service[name]).toBe(handler);
       expect(RESTATE_WRITE_TOOL_NAMES.has(name)).toBe(true);
       expect(routing).toContain(`"${name}"`);
@@ -2646,9 +2646,114 @@ describe("model administration acceptance through shared actions", () => {
     const declarations = readFileSync("src/restate/tools.ts", "utf8");
     const writes = [...declarations.matchAll(/= tool\(\s*\{([\s\S]*?)\n  async \(/g)]
       .filter(([, options]) => options.includes('role: "admin"') && !options.includes('operation: "read"')).length;
-    expect(writes).toBe(17);
-    expect(RESTATE_WRITE_TOOL_NAMES.size).toBe(16);
-    expect(docs).toContain("seventeen declared write handlers");
-    expect(docs).toContain("sixteen are in `RESTATE_WRITE_TOOL_NAMES`");
+    expect(writes).toBe(18);
+    expect(RESTATE_WRITE_TOOL_NAMES.size).toBe(17);
+    expect(docs).toContain("eighteen declared write handlers");
+    expect(docs).toContain("seventeen are in `RESTATE_WRITE_TOOL_NAMES`");
+  });
+});
+
+describe("unpark_issue (AII-2018)", () => {
+  let tools: typeof ToolsModule;
+  let log: typeof LogModule;
+  let breaker: typeof import("../dispatch-breaker.js");
+  let db: ReturnType<typeof import("../dedup.js").getDb>;
+  const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
+  const rows = () => db.prepare("SELECT * FROM dispatch_breaker ORDER BY issue_id, phase").all();
+  const call = (args: { identifier: string; phase?: string }, caller = SYSTEM_ADMIN, calls: RunCall[] = []) =>
+    tools.unparkIssueTool(fakeContext("unpark_issue", calls), { caller, args });
+
+  beforeEach(async () => {
+    const fixture = await testDb({ modules: {
+      tools: () => import("../restate/tools.js"),
+      log: () => import("../log.js"),
+      breaker: () => import("../dispatch-breaker.js"),
+      dedup: () => import("../dedup.js"),
+    } });
+    ({ tools, log, breaker } = fixture.modules);
+    db = fixture.modules.dedup.getDb();
+    log.appendLog(makeAppendLogEntry({ issueId: "tracker-id", issueIdentifier: "CON-146" }));
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  function park(issueId = "tracker-id", phase = "implementation") {
+    breaker.recordDispatchFailure(issueId, phase, "failure");
+    breaker.parkIssue(issueId, phase, "failure");
+    breaker.claimPrBudgetNotice(issueId, phase);
+    breaker.markTripNotified(issueId, phase);
+  }
+
+  it("clears all phases, counters and notices in one journaled step and audits the resolved identity", async () => {
+    park();
+    park("tracker-id", "planning");
+    const audit = vi.spyOn(console, "log").mockImplementation(() => {});
+    const calls: RunCall[] = [];
+    const result = await call({ identifier: "con-146" }, SYSTEM_ADMIN, calls);
+    expect(result.isError).toBeUndefined();
+    expect(parse(result)).toEqual({ identifier: "con-146", issueId: "tracker-id", unparked: true });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ name: "unpark-issue", options: { maxRetryAttempts: 1 } });
+    for (const phase of ["implementation", "planning"]) expect(breaker.isParked("tracker-id", phase)).toBe(false);
+    expect(rows()).toHaveLength(2);
+    for (const row of rows()) expect(row).toMatchObject({
+      parked_at: null, consecutive_failures: 0, trip_notified_at: null, pr_budget_notified_at: null,
+    });
+    expect(audit.mock.calls.some(c => String(c[0]).includes("identifier=con-146 issue=tracker-id phase=all"))).toBe(true);
+  });
+
+  it("clears only the specified phase", async () => {
+    park();
+    park("tracker-id", "planning");
+    const before = rows();
+    expect(parse(await call({ identifier: "CON-146", phase: "planning" })).unparked).toBe(true);
+    expect(breaker.isParked("tracker-id", "planning")).toBe(false);
+    expect(breaker.isParked("tracker-id", "implementation")).toBe(true);
+    expect(rows()[0]).toEqual(before[0]);
+  });
+
+  it("returns the exact unknown-identifier error without changing any row", async () => {
+    park();
+    const before = rows();
+    const result = await call({ identifier: "CON-999" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("no dispatch record for CON-999");
+    expect(rows()).toEqual(before);
+  });
+
+  it("leaves nonparked rows and missing breaker rows unchanged", async () => {
+    expect(parse(await call({ identifier: "CON-146" })).unparked).toBe(false);
+    expect(rows()).toEqual([]);
+    breaker.recordDispatchFailure("tracker-id", "planning", "failure");
+    park("tracker-id", "implementation");
+    const before = rows();
+    expect(parse(await call({ identifier: "CON-146", phase: "planning" })).unparked).toBe(false);
+    expect(rows()).toEqual(before);
+    breaker.unpark("tracker-id");
+    breaker.recordDispatchFailure("tracker-id", "planning", "failure");
+    const nonparked = rows();
+    expect(parse(await call({ identifier: "CON-146" })).unparked).toBe(false);
+    expect(rows()).toEqual(nonparked);
+  });
+
+  it("refuses callers without the admin role before running the mutation", async () => {
+    park();
+    const before = rows();
+    const calls: RunCall[] = [];
+    const result = await call({ identifier: "CON-146" }, HUMAN_USER, calls);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("forbidden: unpark_issue requires the admin role");
+    expect(calls).toEqual([]);
+    expect(rows()).toEqual(before);
+  });
+
+  it("resolves across repositories by timestamp, breaking ties by newest row id", async () => {
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 100").run();
+    const newest = log.appendLog(makeAppendLogEntry({ issueId: "newest", issueIdentifier: "con-146", repo: "another/repo" }));
+    const older = log.appendLog(makeAppendLogEntry({ issueId: "older", issueIdentifier: "CON-146" }));
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 200 WHERE id = ?").run(newest);
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 150 WHERE id = ?").run(older);
+    expect(parse(await call({ identifier: "Con-146" })).issueId).toBe("newest");
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 200 WHERE id = ?").run(older);
+    expect(parse(await call({ identifier: "Con-146" })).issueId).toBe("older");
   });
 });

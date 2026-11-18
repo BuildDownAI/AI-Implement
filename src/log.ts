@@ -990,6 +990,16 @@ export function getLatestDispatchForIssueIdentifier(owner: string, repo: string,
   return mapRows([row])[0];
 }
 
+/** Resolve a tracker issue ID from the newest dispatch across all repositories. */
+export function getLatestIssueIdForIdentifier(identifier: string): string | null {
+  const row = getDb()
+    .prepare(
+      "SELECT issue_id FROM dispatch_log WHERE issue_identifier = ? COLLATE NOCASE ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    )
+    .get(identifier) as { issue_id: string } | undefined;
+  return row?.issue_id ?? null;
+}
+
 /**
  * Returns the identifier, title, and repo for a parked issue, or null fields when
  * no record exists. dispatch_log is pruned, so the lookup falls back: newest row
