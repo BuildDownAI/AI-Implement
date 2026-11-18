@@ -20,7 +20,7 @@ vi.mock("../github.js", async (original) => ({
 
 const pull: OpenPullRequest = {
   number: 42, url: "https://github.com/acme/app/pull/42", head: "ai-implement/aii-12",
-  base: "main", headSha: "1".repeat(40), draft: false, title: "Implement a feature", createdAt: T,
+  base: "main", headSha: "1".repeat(40), author: null, draft: false, title: "Implement a feature", createdAt: T,
 };
 let db: ReturnType<typeof import("../dedup.js").getDb>;
 let github: typeof import("../github.js");

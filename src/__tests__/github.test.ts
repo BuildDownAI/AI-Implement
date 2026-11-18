@@ -1315,7 +1315,7 @@ describe("listAllOpenPullRequests", () => {
     expect(result).toEqual([1, 2, 3].map((number) => ({
       number, url: `https://github.com/owner/repo/pull/${number}`, base: "main",
       head: `feature-${number}`, headSha: `sha-${number}`, title: `Pull ${number}`,
-      draft: number === 1, createdAt: Date.parse("2026-10-10T19:10:30Z"),
+      author: null, draft: number === 1, createdAt: Date.parse("2026-10-10T19:10:30Z"),
     })));
     expect(fake.calls.map((c) => c.url.href)).toEqual([
       "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100", nextUrl,
@@ -1324,6 +1324,15 @@ describe("listAllOpenPullRequests", () => {
       expect(call.headers.get("authorization")).toBe("Bearer token");
       expect(call.signal).toBeInstanceOf(AbortSignal);
     }
+  });
+
+  it("maps author logins and absent users", async () => {
+    fakeFetch({ [PULLS]: { json: [
+      { ...pull(1), user: { login: "app[bot]" } },
+      { ...pull(2), user: null }, pull(3),
+    ] } }).install();
+    expect((await listAllOpenPullRequests("t", "owner", "repo")).map((p) => p.author))
+      .toEqual(["app[bot]", null, null]);
   });
 
   it("returns an empty list for a successful empty response", async () => {

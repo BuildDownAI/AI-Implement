@@ -12,7 +12,7 @@ let config: typeof import("../config.js");
 let time: number;
 const pull = (number = 42, head = "work"): OpenPullRequest => ({ number,
   url: `https://github.com/acme/app/pull/${number}`, head, base: "main", headSha: "sha",
-  draft: false, title: "Title", createdAt: 123 });
+  author: null, draft: false, title: "Title", createdAt: 123 });
 beforeEach(async () => {
   const { modules } = await testDb({ modules: { db: () => import("../dedup.js"),
     api: () => import("../open-pulls.js"), config: () => import("../config.js") } });
