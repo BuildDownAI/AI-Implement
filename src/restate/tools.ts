@@ -1820,10 +1820,9 @@ export const releaseDispatchReservationTool = tool(
 
 export const unparkIssueTool = tool(
   {
-    description: "Unpark an issue by its tracker identifier, resolved case-insensitively from its newest dispatch across all repositories. If dispatch history has been pruned, supply the tracker issueId as a fallback. Omit phase to clear all phases. Returns { identifier, issueId, unparked }; a nonparked issue is unchanged.",
+    description: "Unpark an issue by its tracker identifier, resolved case-insensitively from its newest dispatch across all repositories. Omit phase to clear all phases. Returns { identifier, issueId, unparked }; a nonparked issue is unchanged.",
     input: z.object({
       identifier: z.string().min(1),
-      issueId: z.string().min(1).optional().describe("Tracker issue ID fallback when no dispatch record remains for the identifier"),
       phase: z.string().optional(),
     }),
     role: "admin",
@@ -1836,7 +1835,7 @@ export const unparkIssueTool = tool(
   async (ctx, input): Promise<ToolResponse> => {
     const { identifier, phase } = input.args;
     const result = await ctx.run("unpark-issue", () => {
-      const issueId = getLatestIssueIdForIdentifier(identifier) ?? input.args.issueId ?? null;
+      const issueId = getLatestIssueIdForIdentifier(identifier);
       if (issueId === null) return null;
       // unpark also resets nonparked rows; call it only when a matching phase is parked.
       const parked = listParked().some(row => row.issueId === issueId && (phase === undefined || row.phase === phase));
