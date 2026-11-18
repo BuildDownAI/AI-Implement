@@ -471,10 +471,10 @@ until those are present.
 | Docker x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
 | Docker x ChatGPT plan | Verified ordinary local full loop and public attribution/new-file evidence on combined source e647e762; no Restate ownership | Run/snapshot/base head above; no local push by design |
 | Fly x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
-| Fly x ChatGPT plan | Verified ordinary Legacy planning, implementation, native review and comment gapfill; TEST-6/8 | TEST-6 machine/snapshot/head above; not full acceptance |
+| Fly x ChatGPT plan | Verified under Restate in production since 2026-11-16 (planning, implementation, later review-fix); earlier ordinary Legacy runs TEST-6/8 | Production section at the top of this page |
 | GHA x OpenAI API key | Pending | Run ID, snapshot ID, head SHA |
 | GHA x ChatGPT plan | Verified for TEST-3 ordinary runs and TEST-5 managed Restate review-fix; see the dated sections. API-key, mixed and Restate recovery cases remain pending | Run IDs, snapshot IDs and heads recorded above |
-| Real Codex PlanningRun and a later ReviewFixAttempt | Verified for the recorded GHA/ChatGPT PlanningRun (TEST-4) and later managed ReviewFixAttempt (TEST-5); other matrix cases remain pending | ReviewFixAttempt identifier, snapshot ID, head SHA |
+| Real Codex PlanningRun and a later ReviewFixAttempt | Verified on GHA (TEST-4, TEST-5) and on Fly in production | Production section; TEST-4 and TEST-5 sections |
 | Mixed-stage runs (Claude and Codex across planning/implementation/review) | Pending | Run ID, snapshot ID, head SHA per stage |
 | Codex on Restate: restart recovery | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate: cancel | Pending; ordinary local SIGINT truthfulness and used-session hold/manual recovery above are separate | Live run ID, snapshot ID, head SHA |
@@ -485,15 +485,17 @@ until those are present.
 | Codex on Restate: timeout | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate: unavailable auth | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate: expired-token resume | Pending | Live run ID, snapshot ID, head SHA |
-| Codex on Restate review-fix, live | Verified for TEST-5 GHA/ChatGPT normal completion | Exact attempt/run/snapshot/head and finalizer above |
+| Codex on Restate review-fix, live | Verified on GHA (TEST-5) and on Fly in production | Production section; TEST-5 section |
 
-Managed Restate review-fix admission on GitHub Actions (AII-1444) remains supported: Codex API/ChatGPT and supported mixed selections admit when the workflow capabilities and read-only readiness hold. AII-1770 adds managed Fly and local Docker admission with protected credentials, gated on explicit operator review of the concrete PR before merge. Claude subscription follows current Track D setup-token readiness. No live Fly/local proof exists yet. AII-1338 is generic Fly proof, not Codex-specific.
-AII-1289 owns the final Codex-specific evidence.
+Managed Restate review-fix admission on GitHub Actions (AII-1444) remains supported: Codex API/ChatGPT and supported mixed selections admit when the workflow capabilities and read-only readiness hold. AII-1770 adds managed Fly and local Docker admission with protected credentials, gated on explicit operator review of the concrete PR before merge. Claude subscription follows current Track D setup-token readiness. Live Fly proof is the production section at the top of this page; no live local Docker Restate proof exists. AII-1338 is generic Fly proof, not Codex-specific.
+AII-1289 closed on the production evidence (operator decision, 2026-11-18). The rows still marked Pending stay unproven; they are not scheduled by any open issue, and a new issue is needed to prove one.
 
-## Release order
+## Release order (history)
+
+This was the release order before AII-1289 closed. Steps 1 and 2 are complete, and Restate is now a hard dependency.
 
 1. Reviewed prerequisite integration to testing (credentials and GHA capability).
 2. The existing sequence AII-1368 → AII-1312 → AII-1374 → AII-1313, under D10/John.
-3. Final AII-1289 matrix completion afterward.
+3. Final AII-1289 matrix completion afterward. The operator closed AII-1289 on the production evidence instead.
 
-This order adds no scheduler, backend architecture or bypass.
+This order added no scheduler, backend architecture or bypass.
