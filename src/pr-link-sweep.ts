@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import type { OpenPullRequest } from "./github.js";
 import type { TicketingProvider } from "./providers/types.js";
-import { findLinkByPr, linkPullRequest, setLinkOutcome } from "./pr-links.js";
+import { recoverBranchLinkOwnership, findLinkByPr, linkPullRequest, setLinkOutcome } from "./pr-links.js";
 
 export interface SweepUnlinkedPullsDeps {
   mappings: Record<string, RepoMapping>;
@@ -67,4 +67,5 @@ export async function sweepUnlinkedPulls(deps: SweepUnlinkedPullsDeps): Promise<
       }
     }
   }
+  recoverBranchLinkOwnership();
 }

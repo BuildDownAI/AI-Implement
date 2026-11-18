@@ -21,3 +21,20 @@ Manual: use a disposable testing tracker and sandbox repository.
 - The prefixed implementation PR has a `branch-match` implementation link to its issue; `list_open_pulls` returns `tracked: true` and that issue.
 - Immediately after merge-up, the roll-up PR already has a `result` link with role `roll-up`, its grouping issue identity, and the correct head and base refs.
 - Merge detection records `closed-unmerged` or `merged` for the roll-up even though no sweep saw it open. It does not cancel the grouping issue or enqueue implementation reconciliation.
+
+
+## Cancellation regressions
+
+1. For one disposable implementation issue, open two implementation PRs. Merge
+   one and close the other unmerged before a single merge poll, repeating with
+   the opposite publication order.
+2. For a grouping parent's closing run, revoke the run before it reports a PR
+   URL, then let its App-authored implementation PR publish late. Sweep while
+   it is open, close it unmerged, and poll twice.
+3. Supply the exact run-to-PR URL association and poll again.
+
+Assert that the issue in step 1 is never cancelled and its merge reconciliation
+is queued once. In step 2 the grouping parent is never cancelled; the closed
+link retains a null cancellation decision and finalization waits for current-PR
+identity. Step 3 finalizes the current grouping parent once. An older late
+publication must not supersede a newer implementation PR.

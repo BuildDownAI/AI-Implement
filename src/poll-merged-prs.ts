@@ -1,11 +1,12 @@
 import type { RepoMapping } from "./config.js";
 import { getInFlightIssueIds } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
-import { isCurrentGroupingParent, listLinksByOutcome, listOpenLinksForIssue, listUncheckedClosedLinks, setCancelCheckedAt, setLinkOutcome } from "./pr-links.js";
+import { recoverBranchLinkOwnership, hasMergedImplementationForIssue, isCurrentGroupingParent, listLinksByOutcome, listOpenLinksForIssue, listUncheckedClosedLinks, setCancelCheckedAt, setLinkOutcome } from "./pr-links.js";
 import type { PullRequestLink } from "./pr-links.js";
 import {
   enqueueReconciliation,
   hasReconciliationForPr,
+  getPendingReconciliations,
   recordReconciliationTombstone,
 } from "./reconciliation.js";
 
@@ -36,6 +37,14 @@ export function prNumberFromUrl(url: string): number | null {
  * records terminal outcomes, and queues reconciliation independently of log retention.
  */
 export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
+  recoverBranchLinkOwnership();
+  // Exact ownership may arrive after an unresolved branch link became terminal.
+  for (const link of listUncheckedClosedLinks()) {
+    if (link.source === "branch-match" && link.groupingParent && isCurrentGroupingParent(link) &&
+        !hasReconciliationForPr(link.repository, link.number)) {
+      setLinkOutcome(link.repository, link.number, "open", null);
+    }
+  }
   for (const link of listLinksByOutcome("open")) {
     const { repository: repo, number: prNumber, issue } = link;
     const mapping = deps.mappingForRepo(repo);
@@ -68,6 +77,10 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
       });
       console.log(`[merge-poll] Detected merge of PR #${prNumber} in ${repo}; queued reconciliation`);
     } else if (state.state === "closed") {
+      if (link.role === "implementation" && link.source === "branch-match" && link.jobId === null) {
+        setLinkOutcome(repo, prNumber, outcome, Date.now());
+        continue;
+      }
       if (isCurrentGroupingParent(link)) {
         // A run in flight may still change the picture; the next poll re-checks.
         if (getInFlightIssueIds().has(issue.trackerIssueId)) continue;
@@ -93,11 +106,16 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
   // Outcome repair runs first; tombstones must not suppress cancellation retries.
   for (const link of listUncheckedClosedLinks()) {
     const { issue, repository, number } = link;
+    // Unknown branch ownership remains retryable, even after the PR closes.
+    if (link.role === "implementation" && link.source === "branch-match" && link.jobId === null) continue;
     // Superseded grouping PRs retain the parent's cancellation exemption even
     // when the current PR closes in this same poll. Only finalization needs
     // current-PR identity.
     if (link.role === "roll-up" ||
         link.groupingParent ||
+        hasMergedImplementationForIssue(issue) ||
+        getPendingReconciliations().some(job =>
+          job.issueId === issue.trackerIssueId) ||
         listOpenLinksForIssue(issue.trackerKind, issue.trackerIssueId).length > 0) {
       setCancelCheckedAt(repository, number, Date.now());
       continue;

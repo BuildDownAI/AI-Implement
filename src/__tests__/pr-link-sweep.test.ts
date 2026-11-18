@@ -8,8 +8,8 @@ const pull = (overrides: Partial<OpenPullRequest> = {}): OpenPullRequest => ({
   number: 1, url: "https://github.com/test-org/test-repo/pull/1", head: "ai-implement/aii-1981-some-slug",
   base: "main", headSha: "sha", title: "PR", createdAt: 1, draft: false, author: "app[bot]", ...overrides,
 });
-async function fixture() {
-  const { modules } = await testDb({ tables: "none", modules: {
+async function fixture(tables: "all" | "none" = "none") {
+  const { modules } = await testDb({ tables, modules: {
     sweep: () => import("../pr-link-sweep.js"), links: () => import("../pr-links.js"),
     github: () => import("../github.js"),
   } });
@@ -23,6 +23,54 @@ async function fixture() {
 afterEach(() => vi.restoreAllMocks());
 
 describe("sweepUnlinkedPulls", () => {
+  it("defers a late grouping publication until exact job ownership is recovered", async () => {
+    const { sweep, links, deps, issue } = await fixture("all");
+    const log = await import("../log.js");
+    const recon = await import("../reconciliation.js");
+    const poll = await import("../poll-merged-prs.js");
+    log.initLogTable();
+    recon.initReconciliationTable();
+    const config = await import("../config.js");
+    config.upsertMapping("AII", makeMapping());
+    const job = log.appendLog({ issueId: issue.id, repo: "test-org/test-repo", teamKey: "AII", groupingParent: true });
+    log.updateJobStatus(job, "failed", "pr_not_found");
+    await sweep.sweepUnlinkedPulls(deps);
+    const d = {
+      mappingForRepo: () => makeMapping(), tokenForOwner: async () => "token",
+      getPullRequestState: async () => ({ merged: false, state: "closed" as const }),
+      cancelIssue: vi.fn(async () => true), finalizeGroupingParent: vi.fn(async () => true),
+    };
+    await poll.detectMergedPrs(d);
+    expect(d.cancelIssue).not.toHaveBeenCalled();
+    expect(d.finalizeGroupingParent).not.toHaveBeenCalled();
+    expect(links.findLinkByPr("test-org/test-repo", 1)?.cancelCheckedAt).toBeNull();
+    // Exact publication evidence arrives later; recovery must retry the terminal link.
+    log.updateJobPrUrl(job, pull().url);
+    await poll.detectMergedPrs(d);
+    expect(d.finalizeGroupingParent).toHaveBeenCalledTimes(1);
+    expect(d.cancelIssue).not.toHaveBeenCalled();
+  });
+
+  it("keeps unknown terminal ownership retryable", async () => {
+    const { sweep, links, deps } = await fixture("all");
+    const log = await import("../log.js");
+    const recon = await import("../reconciliation.js");
+    const poll = await import("../poll-merged-prs.js");
+    log.initLogTable();
+    recon.initReconciliationTable();
+    await sweep.sweepUnlinkedPulls(deps);
+    const cancelIssue = vi.fn(async () => true);
+    const d = { mappingForRepo: () => makeMapping(), tokenForOwner: async () => "token",
+      getPullRequestState: async () => ({ merged: false, state: "closed" as const }),
+      cancelIssue, finalizeGroupingParent: async () => true };
+    await poll.detectMergedPrs(d);
+    await poll.detectMergedPrs(d);
+    expect(cancelIssue).not.toHaveBeenCalled();
+    expect(links.findLinkByPr("test-org/test-repo", 1)).toMatchObject({
+      outcome: "closed-unmerged", cancelCheckedAt: null,
+    });
+  });
+
   it.each([
     ["ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],
     ["custom/ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],

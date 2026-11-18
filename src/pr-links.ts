@@ -266,3 +266,22 @@ export function isCurrentGroupingParent(link: PullRequestLink): boolean {
     ORDER BY job_dispatched_at DESC, job_id DESC LIMIT 1`).get(link.issueId) as { id: number } | undefined;
   return latest?.id === link.id;
 }
+
+/** Branch matching proves the issue, but not which run published this PR.
+ * Retain grouping evidence without inventing a dispatch-to-PR association. */
+export function recoverBranchLinkOwnership(): void {
+  const db = database();
+  backfillLinksFromJobRows();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dispatch_log'").get()) return;
+  db.prepare(`UPDATE pull_request_link SET grouping_parent = 1
+    WHERE source = 'branch-match' AND EXISTS (
+      SELECT 1 FROM dispatch_log j JOIN tracked_issue i ON i.id = pull_request_link.issue_id
+      WHERE j.issue_id = i.tracker_issue_id AND j.repo = pull_request_link.repository
+        AND j.team_key = i.mapping_key AND COALESCE(j.tracker_kind, i.tracker_kind) = i.tracker_kind
+        AND j.grouping_parent = 1)`).run();
+}
+
+export function hasMergedImplementationForIssue(issue: TrackedIssue): boolean {
+  return database().prepare(`SELECT 1 FROM pull_request_link
+    WHERE issue_id = ? AND role = 'implementation' AND outcome = 'merged' LIMIT 1`).get(issue.id) !== undefined;
+}

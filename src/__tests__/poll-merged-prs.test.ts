@@ -236,6 +236,34 @@ describe("detectMergedPrs", () => {
     function hasDedup() {
       return !!db.prepare("SELECT 1 FROM dispatched WHERE issue_id = 'i1'").get();
     }
+    it.each([false, true])("preserves merged work in either insertion order (reverse=%s)", async (reverse) => {
+      for (const n of reverse ? [6, 5] : [5, 6]) seedLink(n);
+      markDedup();
+      const d = deps();
+      d.getPullRequestState.mockImplementation(async (_t, _o, _r, n) =>
+        ({ merged: n === 6, state: "closed" }));
+      await mod.detectMergedPrs(d);
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).not.toHaveBeenCalled();
+      expect(hasDedup()).toBe(true);
+      expect(recon.getPendingReconciliations()).toHaveLength(1);
+    });
+    it.each(["stored", "pending", "skipped"])("handles %s merge evidence", async (kind) => {
+      seedLink(5);
+      markDedup();
+      if (kind === "stored") {
+        seedLink(6);
+        links.setLinkOutcome("o/r", 6, "merged", 1);
+      } else {
+        const entry = { repo: "o/r", prNumber: 6, issueId: "i1", issueIdentifier: "ENG-1", mergeCommitSha: "" };
+        if (kind === "pending") recon.enqueueReconciliation(entry);
+        else recon.recordReconciliationTombstone(entry);
+      }
+      const d = deps();
+      await mod.detectMergedPrs(d);
+      expect(d.cancelIssue).toHaveBeenCalledTimes(kind === "skipped" ? 1 : 0);
+      expect(hasDedup()).toBe(kind !== "skipped");
+    });
     it.each([true, false])("checks once and clears dedup on provider result %s", async (result) => {
       seedLink(5);
       markDedup();

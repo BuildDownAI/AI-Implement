@@ -126,3 +126,19 @@ tombstone to pending in the same queue row, updating the merge SHA and resetting
 attempts. This handles a closed PR that reopens and later merges through either
 polling or webhook delivery. Pending, dispatched and failed rows remain deduplicated;
 roll-ups remain excluded.
+
+
+Cancellation also excludes issues with a stored merged implementation link or
+pending merge reconciliation. A skipped close tombstone alone is not merge
+evidence.
+
+Branch recovery refreshes surviving job evidence on every sweep and merge poll,
+including links already closed. A surviving grouping run for the same repository,
+mapping and tracker issue preserves the grouping exemption even without a reported
+PR URL. Only an exact PR URL association supplies dispatch ordering and current-PR
+identity; an issue's newest run alone cannot identify a late publisher. An
+implementation link recovered only by branch matching, with no exact job
+association, defers cancellation without stamping a cancellation decision.
+If exact evidence later establishes the current grouping PR, merge polling retries
+its finalization. Pruned evidence that was never recovered remains unknown and
+continues to defer cancellation.

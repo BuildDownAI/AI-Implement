@@ -145,6 +145,31 @@ describe("pull request links", () => {
     expect(dedup.getDb().prepare("SELECT id FROM tracked_issue").all()).toEqual([{ id: other.issueId }]);
   });
 
+  it("retains recovered grouping ownership after pruning without guessing current identity", async () => {
+    const { modules: { links, dedup } } = await testDb({ modules: {
+      links: () => import("../pr-links.js"), dedup: () => import("../dedup.js"),
+    } });
+    const log = await import("../log.js");
+    links.linkPullRequest({ ...input, source: "branch-match" });
+    log.appendLog({ issueId: "uuid", repo: "owner/repo", teamKey: "AII", groupingParent: true });
+    links.recoverBranchLinkOwnership();
+    dedup.getDb().exec("DELETE FROM dispatch_log");
+    links.recoverBranchLinkOwnership();
+    const recovered = links.findLinkByPr("owner/repo", 1)!;
+    expect(recovered).toMatchObject({ groupingParent: true, jobId: null, jobDispatchedAt: null });
+    expect(links.isCurrentGroupingParent(recovered)).toBe(false);
+  });
+
+  it("does not let older recovered publication supersede a newer PR after pruning", async () => {
+    const { modules: { links } } = await fixture();
+    const older = links.linkPullRequest({ ...input, source: "branch-match" });
+    const newer = links.linkPullRequest({ ...input, number: 2 });
+    links.recordLinkJob(newer, true, 200, 2);
+    links.recordLinkJob(older, true, 100, 1);
+    expect(links.isCurrentGroupingParent(links.findLinkByPr("owner/repo", 1)!)).toBe(false);
+    expect(links.isCurrentGroupingParent(links.findLinkByPr("owner/repo", 2)!)).toBe(true);
+  });
+
   it("rolls back the issue upsert when a link insert fails", async () => {
     const { modules: { links, dedup } } = await fixture();
     expect(() => links.linkPullRequest({ ...input, role: "invalid" as LinkPullRequestInput["role"] })).toThrow(/CHECK/);
