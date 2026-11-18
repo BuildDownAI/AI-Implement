@@ -1,5 +1,7 @@
 # How Restate simplifies the code and improves AI-Implement
 
+> Historical note (2026-10-10, AII-1195): the `@restatedev/restate-sdk-testcontainers` dependency listed below was removed; the tests run on the `restate-server` binary only.
+
 An assessment, not a decision. The decisions are ADR 017 (move the run lifecycle onto a durable-execution engine), ADR 018 (adopt one run kind at a time, gated on evidence), ADR 023 (run the server as a sidecar), ADR 025 (MCP tools are Restate handlers, the Operator object is the refresh authority), and ADR 015 (reads open, writes declared). This page synthesises what those decisions buy, what they cost, and where each cost has a path to becoming an advantage. It is written after the AII-687 tree landed the foundation — the harness, the sidecar, the tools service, and the `Operator` object — and before any run kind has migrated.
 
 ## The gains
@@ -24,7 +26,7 @@ Each row below names the cost, whether it can become an advantage, and where the
 
 Unmigrated run kinds consume single-use tokens; migrated kinds verify only and let a Restate idempotency key absorb a duplicate. Token handling is split while the migration runs (`docs/runner-callbacks.md` for the token flow).
 
-The split is temporary by construction. ADR 018 § Decision 7 defines an evaluation gate after the second migration: the main pipeline either migrates the same way and the run-ledger program (AII-611) is cancelled or narrowed, or AII-611 proceeds first. When the gate resolves, token handling converges to one model everywhere. The interim is not drift; it is a bounded state that a written decision closes. **Net: a positive, once the gate is reached** — the split forces the end-state decision to be made on evidence instead of assumed up front.
+The split is temporary by construction. ADR 018 § Decision 7 defines an evaluation gate after the second migration: the gate was closed on 2026-10-01: the main pipeline migrates the same way and the run-ledger program (AII-611) is narrowed. Token handling converges to one model everywhere as each run kind migrates. The interim is not drift; it is a bounded state that a written decision closes. **Net: a positive, once the gate is reached** — the split forces the end-state decision to be made on evidence instead of assumed up front.
 
 ### The journal is durable, readable storage — becomes a positive as enforced guardrails
 
@@ -71,7 +73,7 @@ The concern is that depending on a Business Source License 1.1 component pressur
 |---|---|---|
 | AI-Implement, BuildDownAI/skills | Apache-2.0 | our own source |
 | `@restatedev/restate-sdk` | MIT | imported into our code, shipped in our image |
-| `@restatedev/restate-sdk-testcontainers` | MIT | test-only dependency |
+| `@restatedev/restate-sdk-testcontainers` | MIT | removed 2026-10-10 (AII-1195); no longer a dependency |
 | `@restatedev/restate-server` (v1.7.10) | BSL 1.1 | run unmodified as a sidecar binary |
 
 The code we compile and distribute — the SDK — is MIT and imposes nothing. Only the server binary is BSL, and we run it unmodified as a separate process; we do not distribute a modified Restate server, which is what BSL's terms govern. A dependency's licence does not propagate to a project that merely runs it, and BSL 1.1 additionally converts to an open licence at its change date (Apache-2.0 for Restate; read the server's own `LICENSE` for the exact date and the additional-use grant). **Keep AI-Implement and the skills repo Apache-2.0.** There is no legal or practical reason to move our code to BSL, and doing so would give away the permissive terms our own users rely on for no benefit. The one thing worth doing is recording, in a dependency note, that the server binary is BSL and why that is acceptable — which is what ADR 017 already states.

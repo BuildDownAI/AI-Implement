@@ -1,3 +1,4 @@
+import { parseSourceResults } from "../kg-source-results.js";
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -6,15 +7,22 @@ import { postRunnerResult } from "../runner-result.js";
 import { DefaultPipelineContext } from "./context.js";
 import { PipelineRunner } from "./runner.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
-import { NoopStepReporter } from "./reporter.js";
+import { NoopStepReporter, TokenStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotFileTooLargeError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError, KgSnapshotHeldError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
 import { ClaudeCliExecutor } from "./executor.js";
-import { resolveLogLevel } from "../run-autonomous.js";
+import {
+  ConfiguredRunError,
+  hasConfiguredIntent,
+  prepareConfiguredRun,
+  resolveLogLevel,
+  type ConfiguredRunOptions,
+} from "../run-autonomous.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
 import type { LLMExecutor, PipelineContext, StepReporter, StepModule } from "./types.js";
 
 
@@ -132,6 +140,8 @@ export interface RunKgRefreshOptions {
   workspaceDir?: string;
   reporter?: StepReporter;
   llmExecutor?: LLMExecutor;
+  /** Seams for an opted-in (snapshot-carrying) run. Ignored for legacy runs. */
+  configured?: ConfiguredRunOptions;
   fetchImpl?: typeof fetch;
   stepsOverride?: {
     clone?: StepModule;
@@ -161,8 +171,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   maxTurns: number | undefined;
   dependencyTokenScope: "installation" | undefined;
   kgDryRun: boolean;
-  kgAcceptNewBaseline: boolean;
-  kgBaselineActor: string | undefined;
+  agentConfig: ResolvedAgentSnapshotV1 | undefined;
 } {
   const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
   let issueId = "";
@@ -173,8 +182,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let maxTurns: number | undefined;
   let dependencyTokenScope: "installation" | undefined;
   let kgDryRun = false;
-  let kgAcceptNewBaseline = false;
-  let kgBaselineActor: string | undefined;
+  let agentConfig: ResolvedAgentSnapshotV1 | undefined;
 
   if (rawConfig) {
     try {
@@ -189,9 +197,11 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
       }
       dependencyTokenScope = cfg.dependencyTokenScope;
       kgDryRun = cfg.kgDryRun === true;
-      kgAcceptNewBaseline = cfg.kgAcceptNewBaseline === true;
-      kgBaselineActor = cfg.kgBaselineActor;
+      agentConfig = cfg.agentConfig;
     } catch (err) {
+      // An opted-in envelope is authoritative: malformed configured input never degrades to the legacy
+      // environment fallbacks, and the diagnostic is fixed text (the decode error is not echoed).
+      if (hasConfiguredIntent(rawConfig)) throw new ConfiguredRunError("snapshot_incomplete");
       console.warn("[kg-refresh] Could not decode run_config envelope; using env fallbacks:", err);
     }
   }
@@ -219,8 +229,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
     maxTurns,
     dependencyTokenScope,
     kgDryRun,
-    kgAcceptNewBaseline,
-    kgBaselineActor,
+    agentConfig,
   };
 }
 
@@ -242,9 +251,17 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     maxTurns,
     dependencyTokenScope,
     kgDryRun: kgDryRunFromConfig,
-    kgAcceptNewBaseline,
-    kgBaselineActor,
+    agentConfig,
   } = resolveKgRefreshInputs(process.env);
+
+  // Validate an opted-in run before the clone, ingest or any model work. The deterministic kg-refresh
+  // pipeline has no agent step, so the selected executor serves only the context's model-driven repair.
+  const configured = await prepareConfiguredRun({
+    env: process.env,
+    snapshot: agentConfig,
+    workspaceDir,
+    options: opts.configured,
+  });
 
   // The env var stays as the dev-harness path (AII-586); the envelope field is the
   // real dispatch path (AII-632). Either one flips dry-run on.
@@ -268,15 +285,20 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       githubRepo,
       githubToken,
       branch: defaultBranch,
-      provider,
+      provider: configured ? configured.provider : provider,
+      agentConfig: configured?.snapshot,
       maxTurns,
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
       kgDryRun,
-      kgAcceptNewBaseline,
-      kgBaselineActor,
     },
-    opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
+    configured
+      ? configured.createExecutor({
+          workspaceDir,
+          legacy: opts.llmExecutor,
+          logLevel: resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL),
+        })
+      : opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
   );
 
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
@@ -304,49 +326,84 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
 
-  const reporter: StepReporter = opts.reporter ?? new NoopStepReporter();
+  // The token stays out of context.data: it is a live bearer secret. The local dev harness has none.
+  const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim();
+  const reporter: StepReporter =
+    opts.reporter ??
+    (callbackUrl && progressToken
+      ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
+      : new NoopStepReporter());
+
+  const untilStep = process.env.AI_IMPLEMENT_UNTIL_STEP?.trim() || undefined;
 
   try {
-    await runner.run(pipeline, context, reporter);
+    await runner.run(pipeline, context, reporter, { stopAfterStep: untilStep });
   } catch (err) {
     const isMissing = err instanceof KgSnapshotMissingError;
     const isStale = err instanceof KgSnapshotStaleError;
     const isTrackerDataError = err instanceof KgTrackerDataFetchError;
     const isTrackerRegression = err instanceof KgSnapshotTrackerRegressionError;
+    const held = err instanceof KgSnapshotHeldError ? err : undefined;
+    const isHeld = held !== undefined;
     const isIngestFailed = err instanceof KgIngestError;
+    const isTooLarge = err instanceof KgSnapshotFileTooLargeError;
     const failureCode = isMissing
       ? "KG_SNAPSHOT_MISSING"
-      : isStale
+      : isTooLarge
+        ? "KG_SNAPSHOT_FILE_TOO_LARGE"
+        : isStale
         ? "KG_SNAPSHOT_STALE"
         : isTrackerDataError
           ? "KG_TRACKER_DATA_FETCH_FAILED"
           : isTrackerRegression
             ? "KG_SNAPSHOT_TRACKER_REGRESSION"
-            : isIngestFailed
-              ? "KG_INGEST_FAILED"
-              : undefined;
+            : isHeld
+              ? "KG_SNAPSHOT_HELD"
+              : isIngestFailed
+                ? "KG_INGEST_FAILED"
+                : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
+    await configured?.finish("failed");
     // A guard refusal from kg-snapshot-push carries its per-part table on the error
     // itself (AII-632) so both dry-run and real refusals report the table via
     // get_kg_status (AII-638).
     const guardPartTable = isTrackerRegression
       ? (err as KgSnapshotTrackerRegressionError).partTable
-      : undefined;
+      : isHeld
+        ? held.partTable
+        : undefined;
     await postRunnerResult({
       phase: "kg-refresh",
       workspaceDir,
       outcome: "failure",
       failureReason: failureReason.slice(-4000),
       ...(failureCode ? { failureCode } : {}),
-      ...(guardPartTable ? { guardVerdict: "refused" as const, partTable: guardPartTable } : {}),
+      ...(guardPartTable ? { guardVerdict: isHeld ? ("held" as const) : ("refused" as const), partTable: guardPartTable } : {}),
+      // A held shrink already pushed its snapshot branch and opened the PR; report them so the orchestrator can act on it.
+      ...(held
+        ? {
+            ...(held.prNumber !== null ? { snapshotPr: held.prNumber } : {}),
+            ...(held.commitSha ? { snapshotCommit: held.commitSha } : {}),
+            snapshotBranch: held.branchName,
+            cause: held.cause,
+            failedTeams: held.failedTeams,
+            ...(held.acceptBlocked ? { acceptBlocked: true, lostTeams: held.lostTeams } : {}),
+            ...(held.sources.length > 0 ? { sources: held.sources } : {}),
+          }
+        : {}),
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
   }
 
+  await configured?.finish("completed");
   const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
+  const sources = parseSourceResults(snapshotPushOutputs.sources);
+  const warnings = Array.isArray(snapshotPushOutputs.warnings)
+    ? snapshotPushOutputs.warnings.filter((w): w is string => typeof w === "string")
+    : [];
   await postRunnerResult({
     phase: "kg-refresh",
     workspaceDir,
@@ -354,9 +411,11 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
     snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
     snapshotBranch: typeof snapshotPushOutputs.branchName === "string" ? snapshotPushOutputs.branchName : undefined,
-    ...(kgDryRun && snapshotPushOutputs.guardVerdict === "clean"
-      ? { guardVerdict: "clean" as const, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
+    ...(kgDryRun && (snapshotPushOutputs.guardVerdict === "clean" || snapshotPushOutputs.guardVerdict === "warnings")
+      ? { guardVerdict: snapshotPushOutputs.guardVerdict, partTable: snapshotPushOutputs.partTable as Array<{ part: string; prev: string; new: string }> | undefined }
       : {}),
+    ...(sources.length > 0 ? { sources } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });

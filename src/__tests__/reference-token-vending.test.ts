@@ -1,12 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RefTokenModule from "../reference-token-vending.js";
 import type { RepoMapping } from "../config.js";
 import type { ReferenceRepo } from "../reference-repos.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -15,31 +13,24 @@ vi.mock("../github-app-auth.js", () => ({
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 let refToken: typeof RefTokenModule;
 let mockGetScopedToken: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `ref-token-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerTokens = await import("../runner-tokens.js");
-  refToken = await import("../reference-token-vending.js");
-  const ghAuth = await import("../github-app-auth.js");
-  mockGetScopedToken = vi.mocked(ghAuth.getScopedInstallationToken);
+  const { modules } = await testDb({
+    modules: {
+      runnerTokens: () => import("../runner-tokens.js"),
+      refToken: () => import("../reference-token-vending.js"),
+      ghAuth: () => import("../github-app-auth.js"),
+    },
+  });
+  ({ runnerTokens, refToken } = modules);
+  mockGetScopedToken = vi.mocked(modules.ghAuth.getScopedInstallationToken);
   mockGetScopedToken.mockReset();
-  dedup.getDb();
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 
@@ -47,40 +38,7 @@ const REPO_A: ReferenceRepo = { repo: "https://github.com/acme/lib", path: "refs
 const REPO_B: ReferenceRepo = { repo: "https://github.com/other/util", path: "refs/util" };
 const REPO_SAME_OWNER: ReferenceRepo = { repo: "https://github.com/acme/helper", path: "refs/helper" };
 
-function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "acme/app",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: [REPO_A],
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    ...overrides,
-  };
-}
+const mapping = (overrides: Partial<RepoMapping> = {}) => makeMapping({ referenceRepos: [REPO_A], ...overrides });
 
 function mintProgressToken(mappingTeamKey = "ENG"): string {
   const { token } = runnerTokens.mintRunToken({
@@ -103,7 +61,7 @@ async function callHandler(opts: {
     secret: SECRET,
     githubAppId: "app-id",
     githubAppPrivateKey: "fake-key",
-    resolveMapping: opts.resolveMapping ?? (() => makeMapping()),
+    resolveMapping: opts.resolveMapping ?? (() => mapping()),
   });
 }
 
@@ -132,7 +90,7 @@ describe("handleReferenceTokenRequest", () => {
 
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ referenceRepos: [REPO_A, REPO_B] }),
+      resolveMapping: () => mapping({ referenceRepos: [REPO_A, REPO_B] }),
     });
 
     expect(result.status).toBe(200);
@@ -151,7 +109,7 @@ describe("handleReferenceTokenRequest", () => {
 
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ referenceRepos: [REPO_A, REPO_SAME_OWNER] }),
+      resolveMapping: () => mapping({ referenceRepos: [REPO_A, REPO_SAME_OWNER] }),
     });
 
     expect(result.status).toBe(200);
@@ -167,7 +125,7 @@ describe("handleReferenceTokenRequest", () => {
 
     await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ referenceRepos: [REPO_A, REPO_SAME_OWNER] }),
+      resolveMapping: () => mapping({ referenceRepos: [REPO_A, REPO_SAME_OWNER] }),
     });
 
     const callArgs = mockGetScopedToken.mock.calls[0];
@@ -204,7 +162,7 @@ describe("handleReferenceTokenRequest", () => {
 
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ referenceRepos: [REPO_A, REPO_B] }),
+      resolveMapping: () => mapping({ referenceRepos: [REPO_A, REPO_B] }),
     });
 
     expect(result.status).toBe(200);
@@ -306,7 +264,7 @@ describe("handleReferenceTokenRequest", () => {
 
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ referenceRepos: null }),
+      resolveMapping: () => mapping({ referenceRepos: null }),
     });
 
     expect(result.status).toBe(403);
@@ -318,7 +276,7 @@ describe("handleReferenceTokenRequest", () => {
 
     const result = await callHandler({
       authorization: `Bearer ${token}`,
-      resolveMapping: () => makeMapping({ referenceRepos: [] }),
+      resolveMapping: () => mapping({ referenceRepos: [] }),
     });
 
     expect(result.status).toBe(403);
@@ -343,8 +301,8 @@ describe("handleReferenceTokenRequest", () => {
       callHandler({ authorization: "Bearer bad.token" }),
       callHandler({ authorization: `Bearer ${resultToken}` }),
       callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => undefined }),
-      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => makeMapping({ referenceRepos: null }) }),
-      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => makeMapping({ referenceRepos: [] }) }),
+      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => mapping({ referenceRepos: null }) }),
+      callHandler({ authorization: `Bearer ${progressToken}`, resolveMapping: () => mapping({ referenceRepos: [] }) }),
     ]);
 
     for (const result of cases) {

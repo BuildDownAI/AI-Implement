@@ -1,5 +1,6 @@
+import { listAiImplementContainers, removeLocalContainer, selectSweepableContainers } from "./local-docker.js";
 import { listMachines, destroyMachine } from "./fly-machines.js";
-import { getJobByMachineId, updateJobStatus, invalidateNonce, getInFlightKgRefreshJobs } from "./log.js";
+import { getJobByMachineId, updateJobStatus, invalidateNonce } from "./log.js";
 import type { IssueLifecycleState } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import type { RepoMapping } from "./config.js";
@@ -7,22 +8,99 @@ import { recordReaperAction } from "./dedup.js";
 import { notifyReaperBurst } from "./notify.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import type { Job } from "./log.js";
+import {
+  DURABLE_RUNNER_PURPOSE_KEY,
+  DURABLE_RUNNER_PURPOSE_VALUE,
+  DURABLE_UNTIL_KEY,
+} from "./restate/fly-machine-profile.js";
 
 export const SWEEP_MACHINE_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
-const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 5 * 60 * 1000; // 5 minutes
 const TERMINAL_LIFECYCLE_STATES = new Set<IssueLifecycleState>(["completed", "cancelled"]);
 
 /**
- * AII-791: before any reaper outcome action (a destroy, a status write, a ticket reset),
- * read the row's immutable admission owner and skip entirely when it names a Restate
- * attempt — Restate's own workflow owns confirming that attempt's termination and
- * releasing its reservation, not the reaper. A job with no `dispatchId`, or no matching
+ * AII-791: Restate owns finalization and admission release. Read the admission
+ * owner before entering Legacy outcome handling; the only exception is resource
+ * removal after terminal status and an explicitly released matching admission. A job with no `dispatchId`, or no matching
  * admission row (historical/unreserved dispatch), is unaffected — it keeps the existing
  * Legacy handling this function guards.
  */
 function isRestateOwnedJob(job: Job): boolean {
   if (!job.dispatchId) return false;
   return readAdmission(job.dispatchId)?.lifecycleOwner.kind === "restate";
+}
+
+/** Cleanup permission is narrower than terminal status: the same admission generation
+ * must have been explicitly released. Never finalize or release a Restate job here. */
+export function canReapFinishedRestateJob(job: Job): boolean {
+  const admission = job.dispatchId ? readAdmission(job.dispatchId) : null;
+  return admission?.lifecycleOwner.kind === "restate"
+    && admission.releasedAt != null
+    && admission.generation === job.admissionGeneration
+    && admission.backend === job.executionMode
+    && ["completed", "review_failed", "failed", "timed_out", "dispatch-failed"].includes(job.status);
+}
+
+/** Returns true for every Restate-owned job, retaining the fence even if cleanup
+ * is ineligible. Boot and the periodic sweep share this resource-only path. */
+export async function reconcileRestateMachine(config: ReaperConfig, job: Job, machineId: string,
+  ageSeconds: number, reason = "stale-terminal-job", onCleanup?: () => void): Promise<boolean> {
+  if (!isRestateOwnedJob(job)) return false;
+  if (job.executionMode === "fly-machines" && canReapFinishedRestateJob(job)) {
+    recordReaperAction({ ruleMatched: reason, machineId, tenantId: job.teamKey,
+      issueIdentifier: job.issueIdentifier, ageSeconds, dryRun: config.reaperDryRun });
+    await safeDestroyMachine(config, machineId, reason, {
+      tenantId: job.teamKey, issueIdentifier: job.issueIdentifier, ageSeconds,
+    });
+    // Signal an eligible attempt, even when destruction failed, as Legacy does.
+    onCleanup?.();
+  }
+  return true;
+}
+
+/** Shared by boot and periodic reconciliation. Optional in-flight IDs enable the
+ * existing Legacy exited-container sweep against the same ownership snapshot. */
+export async function reconcileRestateLocalContainers(config: ReaperConfig, legacyInFlightIds?: string[]): Promise<string[] | null> {
+  let containers;
+  try {
+    containers = await listAiImplementContainers();
+  } catch {
+    // Do not let a failed ownership census authorize the Legacy Docker sweep.
+    return null;
+  }
+  const protectedIds: string[] = [];
+  for (const container of containers) {
+    const job = getJobByMachineId(container.id);
+    if (!job || !isRestateOwnedJob(job)) {
+      // Use the same snapshot for ownership and Legacy selection: a second Docker
+      // listing could introduce a newly exited, terminal-but-held Restate container.
+      if (legacyInFlightIds !== undefined
+        && /^Exited\b/i.test(container.status)
+        && selectSweepableContainers([container], legacyInFlightIds).length > 0) {
+        try {
+          await removeLocalContainer(container.id);
+          console.log(`[monitor] Swept exited local container ${container.name || container.id.slice(0, 12)}`);
+        } catch (err) {
+          console.error(`[monitor] Failed to sweep exited local container ${container.name}:`, err);
+        }
+      }
+      continue;
+    }
+    protectedIds.push(container.id);
+    if (job.executionMode !== "local-docker" || !canReapFinishedRestateJob(job)) continue;
+    const ageSeconds = Math.floor((Date.now() - job.dispatchedAt) / 1000);
+    recordReaperAction({ ruleMatched: "stale-terminal-job", machineId: container.id,
+      tenantId: job.teamKey, issueIdentifier: job.issueIdentifier, ageSeconds, dryRun: config.reaperDryRun });
+    console.log(`[reaper] rule=stale-terminal-job machine=${container.id} tenant=${job.teamKey ?? "-"} issue=${job.issueIdentifier ?? "-"} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`);
+    if (config.reaperDryRun) continue;
+    try {
+      await removeLocalContainer(container.id);
+    } catch (err) {
+      if (!/no such container/i.test(err instanceof Error ? err.message : String(err))) {
+        console.error(`[reaper] Failed to remove container=${container.id} rule=stale-terminal-job:`, err);
+      }
+    }
+  }
+  return protectedIds;
 }
 
 export interface ReaperConfig {
@@ -41,8 +119,6 @@ export interface ReaperHelpers {
   resetTicket: (job: Job) => Promise<void>;
   postSessionLogs: (job: Job, context: string) => Promise<void>;
   findPrForIssue: (repo: string | null, issueIdentifier: string | null) => Promise<string | null>;
-  /** Called for each kg-refresh job whose machine is absent from the Fly registry. */
-  failKgRefreshMachine?: (job: Job, opts?: { failureCode?: string; detail?: string }) => void;
 }
 
 export interface DestroyContext {
@@ -98,68 +174,27 @@ export async function safeDestroyMachine(
   }
 }
 
+/** Whether the machine is owned by a FlyMachineProfile object (purpose: durable-runner). */
+export function isDurableRunnerMachine(machine: { config?: { metadata?: Record<string, string> } }): boolean {
+  return machine.config?.metadata?.[DURABLE_RUNNER_PURPOSE_KEY] === DURABLE_RUNNER_PURPOSE_VALUE;
+}
+
 /**
- * Inverse sweep for issue-less kg-refresh job rows: finds rows in phase
- * "kg-refresh" and closes stale ones through the shared terminal path in
- * KgRefreshHandle. GHA rows are monitored by monitorGitHubActionsJob in the
- * poll cycle; only Fly and local-Docker rows are handled here.
- *
- * Called at the end of sweepOrphanedMachines with the already-fetched machine set.
+ * Whether a durable-runner machine's `durable_until` stamp (epoch seconds) is past.
+ * Absent keeps the machine; a present value that is not a finite number is a corrupt
+ * stamp, treated as past (with one warning) so it cannot keep a machine for ever.
  */
-async function sweepOrphanedKgRefreshJobs(
-  config: ReaperConfig,
-  helpers: ReaperHelpers,
-  activeMachineIds: Set<string>,
-): Promise<void> {
-  const jobs = getInFlightKgRefreshJobs();
-  for (const job of jobs) {
-    if (job.executionMode === "github-actions") continue; // handled by monitorGitHubActionsJob
-    if (isRestateOwnedJob(job)) continue; // Restate finalizes its own attempts (AII-791)
-
-    // Fly / local-Docker path below.
-
-    // Bootstrap-deadline: a row still in dispatched status (never received a callback)
-    // past the deadline is closed regardless of machineId or registry presence. This
-    // catches machines that booted and exited before recording their identity.
-    if (job.status === "dispatched" && Date.now() - job.dispatchedAt > KG_REFRESH_BOOTSTRAP_DEADLINE_MS) {
-      const ageSeconds = Math.floor((Date.now() - job.dispatchedAt) / 1000);
-      console.log(
-        `[reaper] rule=kg-refresh-bootstrap-timeout machine=${job.machineId ?? "-"} job=${job.id} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`,
-      );
-      recordReaperAction({
-        ruleMatched: "kg-refresh-bootstrap-timeout",
-        machineId: job.machineId ?? "", // "" is the sentinel for "no machine yet" in reaper_actions
-        tenantId: null,
-        issueIdentifier: null,
-        ageSeconds,
-        dryRun: config.reaperDryRun,
-      });
-      if (!config.reaperDryRun) {
-        helpers.failKgRefreshMachine?.(job, { failureCode: "bootstrap_timeout" });
-      }
-      continue;
-    }
-
-    if (!job.machineId) continue; // no-machine backend (local Docker) — skip
-    if (activeMachineIds.has(job.machineId)) continue; // machine alive — no action
-
-    const ageSeconds = Math.floor((Date.now() - job.dispatchedAt) / 1000);
-    console.log(
-      `[reaper] rule=kg-refresh-machine-absent machine=${job.machineId} job=${job.id} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`,
+function isDurableExpired(machineId: string, raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  const text = String(raw).trim();
+  const until = text === "" ? NaN : Number(text);
+  if (!Number.isFinite(until)) {
+    console.warn(
+      `[reaper] machine=${machineId} has a corrupt ${DURABLE_UNTIL_KEY}=${JSON.stringify(raw)}; treating as expired`,
     );
-    recordReaperAction({
-      ruleMatched: "kg-refresh-machine-absent",
-      machineId: job.machineId,
-      tenantId: null,
-      issueIdentifier: null,
-      ageSeconds,
-      dryRun: config.reaperDryRun,
-    });
-
-    if (!config.reaperDryRun) {
-      helpers.failKgRefreshMachine?.(job);
-    }
+    return true;
   }
+  return until < Date.now() / 1000;
 }
 
 /**
@@ -186,7 +221,6 @@ export async function sweepOrphanedMachines(
   }
 
   if (machines.length === 0) {
-    await sweepOrphanedKgRefreshJobs(config, helpers, new Set());
     lastSweepAt = Date.now();
     return;
   }
@@ -245,8 +279,28 @@ export async function sweepOrphanedMachines(
       continue;
     }
 
-    const job = getJobByMachineId(machine.id);
     const ageSeconds = Math.floor((Date.now() - new Date(machine.created_at).getTime()) / 1000);
+
+    // A durable-runner machine is owned by a FlyMachineProfile object, not a dispatch_log
+    // row: its job row is terminal (or absent) by design, so none of the four rules below
+    // may see it. The reaper is only the backstop for an owner lost with the Restate store.
+    const metadata = machine.config?.metadata;
+    if (isDurableRunnerMachine(machine)) {
+      if (!isDurableExpired(machine.id, metadata?.[DURABLE_UNTIL_KEY])) continue;
+      recordReaperAction({
+        ruleMatched: "durable-expired",
+        machineId: machine.id,
+        tenantId: null,
+        issueIdentifier: null,
+        ageSeconds,
+        dryRun: config.reaperDryRun,
+      });
+      await safeDestroyMachine(config, machine.id, "durable-expired", { ageSeconds });
+      if (!config.reaperDryRun) destroyedCount++;
+      continue;
+    }
+
+    const job = getJobByMachineId(machine.id);
 
     if (!job) {
       // No dispatch log entry — orphaned machine
@@ -263,9 +317,11 @@ export async function sweepOrphanedMachines(
       continue;
     }
 
-    // AII-791: the reaper never finalizes a Restate-owned attempt, even one that looks
-    // orphaned or stale from this row's own status.
-    if (isRestateOwnedJob(job)) continue;
+    // AII-791: Restate jobs never enter Legacy finalization; only released,
+    // terminal resources may be removed by the shared reconciliation path.
+    if (await reconcileRestateMachine(config, job, machine.id, ageSeconds, "stale-terminal-job", () => {
+      if (!config.reaperDryRun) destroyedCount++;
+    })) continue;
 
     const isTerminal =
       job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";
@@ -324,11 +380,8 @@ export async function sweepOrphanedMachines(
           updateJobStatus(job.id, "timed_out", "machine_max_age_sweep", undefined, { skipAdmissionRelease: true });
         }
         invalidateNonce(job.id);
-        if (job.phase === "kg-refresh") {
-          // Issue-less run: notify the handle so it closes the chain immediately
-          // rather than waiting for the in-process TTL watchdog on the next trigger().
-          helpers.failKgRefreshMachine?.(job);
-        } else {
+        // A gap-analysis (review-fix) run leaves the ticket and dispatched entry alone, as in the stuck watchdog.
+        if (job.phase !== "kg-refresh" && job.phase !== "gap-analysis") {
           await helpers.resetTicket(job);
         }
       }
@@ -363,21 +416,14 @@ export async function sweepOrphanedMachines(
           updateJobStatus(job.id, "timed_out", "issue_completed_sweep", undefined, { skipAdmissionRelease: true });
         }
         invalidateNonce(job.id);
-        await helpers.resetTicket(job);
+        // A gap-analysis (review-fix) run leaves the ticket alone: resetting a cancelled ticket
+        // would set Plan Approved and re-dispatch it.
+        if (job.phase !== "kg-refresh" && job.phase !== "gap-analysis") {
+          await helpers.resetTicket(job);
+        }
       }
     }
   }
-
-  // Inverse sweep: find kg-refresh job rows whose machine is gone from the registry.
-  // Machines in "started", "created", or "starting" are considered live (bootstrapping or
-  // running). "stopped" and "failed" machines are intentionally excluded so a machine that
-  // exited cleanly or crashed is treated as absent and triggers the close path.
-  const activeMachineIds = new Set(
-    machines
-      .filter((m) => m.state === "started" || m.state === "created" || m.state === "starting")
-      .map((m) => m.id),
-  );
-  await sweepOrphanedKgRefreshJobs(config, helpers, activeMachineIds);
 
   lastSweepAt = Date.now();
 

@@ -1,23 +1,24 @@
+import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "../fly-machine-sizing.js";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SignJWT, exportJWK, generateKeyPair } from "jose";
+import { createModelProtectedSecrets } from "../model-protected-secrets.js";
+import { createModelSessionKeyProvider } from "../model-session-keys.js";
+import { createModelSessionStore } from "../model-session-store.js";
 import type * as AdminModule from "../admin.js";
-import type * as AdminSessionModule from "../admin-session.js";
-import type * as AccessEntriesModule from "../access-entries.js";
-import type * as ConfigModule from "../config.js";
-import type * as DedupModule from "../dedup.js";
-import type * as RunnerModeModule from "../runner-mode.js";
-import type * as LogModule from "../log.js";
-import type * as StepLogModule from "../step-log.js";
-import type * as InstallStateModule from "../github-install-state.js";
-import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
+import type { SelfDeployClient } from "../restate/self-deploy.js";
+import type { SetupCheckRun } from "../setup-checks/index.js";
 import { FakeProvider } from "./providers/fake.js";
-import type { TicketIssue } from "../providers/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
+import type { AIImplementSnapshot } from "../providers/types.js";
+import { makeIssue, makeMapping, makeProvider, makeRegistry, makeScopedInstallationToken } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDb, type LoadedModules, type TestDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
-const notifyTextMock = vi.hoisted(() => vi.fn(async () => {}));
+const notifyTextMock = vi.hoisted(() => vi.fn(async (_webhookUrl: string, _message: string) => {}));
 vi.mock("../notify.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../notify.js")>()),
   notifyText: notifyTextMock,
@@ -26,10 +27,19 @@ vi.mock("../notify.js", async (importOriginal) => ({
 const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
 const destroyMachineMock = vi.hoisted(() => vi.fn(async () => {}));
 const listMachinesMock = vi.hoisted(() => vi.fn<() => Promise<import("../fly-machines.js").Machine[]>>(async () => []));
+// An issue run's session machine as Fly's API returns it, created a minute ago; its age is what a destroy records.
+const getMachineMock = vi.hoisted(() => vi.fn(async (_t: string, _a: string, id: string): Promise<import("../fly-machines.js").Machine> => {
+  const createdAt = new Date(Date.now() - 60_000).toISOString();
+  return {
+    id, name: `session-${id}`, state: "stopped", region: "iad", created_at: createdAt, updated_at: createdAt,
+    config: { image: "registry.fly.io/ai-implement-sessions:latest", metadata: {} },
+  };
+}));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
   destroyMachine: destroyMachineMock,
+  getMachine: getMachineMock,
   listMachines: listMachinesMock,
 }));
 
@@ -58,29 +68,35 @@ vi.mock("../deploy-availability.js", async (importOriginal) => ({
 }));
 
 const mintSourceTokenOrJwtMock = vi.hoisted(() => vi.fn());
-const getInstallationTokenMock = vi.hoisted(() => vi.fn().mockResolvedValue("gh-token-mock"));
+const getScopedInstallationTokenMock = vi.hoisted(() => vi.fn());
+const fetchRepoTarballMock = vi.hoisted(() => vi.fn());
+const extractSourceMock = vi.hoisted(() => vi.fn());
+vi.mock("../deploy.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../deploy.js")>();
+  return {
+    ...actual,
+    extractSource: extractSourceMock,
+  };
+});
+const getInstallationTokenMock = vi.hoisted(() =>
+  vi.fn<typeof import("../github-app-auth.js").getInstallationToken>(async () => "gh-token-mock"),
+);
 vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
   getInstallationToken: getInstallationTokenMock,
+  getScopedInstallationToken: getScopedInstallationTokenMock,
 }));
 
 const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
 const getRepoDefaultBranchMock = vi.hoisted(() => vi.fn());
-const cancelWorkflowRunMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const cancelWorkflowRunMock = vi.hoisted(() => vi.fn(async () => true));
 vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
   getRepoDefaultBranch: getRepoDefaultBranchMock,
+  fetchRepoTarball: fetchRepoTarballMock,
   cancelWorkflowRun: cancelWorkflowRunMock,
-}));
-
-const isLinearAuthConfiguredMock = vi.hoisted(() => vi.fn(() => false));
-const withLinearTokenMock = vi.hoisted(() => vi.fn());
-vi.mock("../linear-app-auth.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../linear-app-auth.js")>()),
-  isLinearAuthConfigured: isLinearAuthConfiguredMock,
-  withLinearToken: withLinearTokenMock,
 }));
 
 const readLocalJobLogsMock = vi.hoisted(() => vi.fn());
@@ -96,6 +112,14 @@ vi.mock("../workflow-probe.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../workflow-probe.js")>()),
   resolveWorkflowCapabilities: resolveWorkflowCapabilitiesMock,
 }));
+
+// Calls through by default; the status-route 500 test makes the factory throw once.
+const createModelSessionStoreMock = vi.hoisted(() => vi.fn());
+vi.mock("../model-session-store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../model-session-store.js")>();
+  createModelSessionStoreMock.mockImplementation(actual.createModelSessionStore);
+  return { ...actual, createModelSessionStore: createModelSessionStoreMock };
+});
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   // Mappings default to the linear tracker; snapshot merging matches on provider id.
@@ -117,10 +141,17 @@ class MockRequest extends EventEmitter {
     this.url = url;
     this.method = method;
     this.headers = headers;
-    process.nextTick(() => {
-      if (body) this.emit("data", Buffer.from(body));
-      this.emit("end");
-    });
+    // Like a paused real stream, hold the body until a reader attaches: an async gate (the
+    // control-plane token check) reads it several ticks after construction.
+    const release = (event: string | symbol): void => {
+      if (event !== "data" && event !== "end") return;
+      this.off("newListener", release);
+      process.nextTick(() => {
+        if (body) this.emit("data", Buffer.from(body));
+        this.emit("end");
+      });
+    };
+    this.on("newListener", release);
   }
 }
 
@@ -143,55 +174,60 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
-let admin: typeof AdminModule;
-let config: typeof ConfigModule;
-let dedup: typeof DedupModule;
-let runnerMode: typeof RunnerModeModule;
-let log: typeof LogModule;
-let stepLog: typeof StepLogModule;
-let installState: typeof InstallStateModule;
-let queue: typeof WorkflowSyncQueueModule;
-let adminSession: typeof AdminSessionModule;
-let accessEntries: typeof AccessEntriesModule;
-let accessAudit: typeof import("../access-audit.js");
-let accessGrants: typeof import("../access-page-grants.js");
+const loaders = {
+  admin: () => import("../admin.js"),
+  adminSession: () => import("../admin-session.js"),
+  accessEntries: () => import("../access-entries.js"),
+  accessAudit: () => import("../access-audit.js"),
+  accessGrants: () => import("../access-page-grants.js"),
+  config: () => import("../config.js"),
+  dedup: () => import("../dedup.js"),
+  log: () => import("../log.js"),
+  installState: () => import("../github-install-state.js"),
+  queue: () => import("../workflow-sync-queue.js"),
+  dispatchBreaker: () => import("../dispatch-breaker.js"),
+  dispatchAdmission: () => import("../dispatch-admission.js"),
+  orchestratorSettings: () => import("../orchestrator-settings.js"),
+  filesystemProvider: () => import("../providers/filesystem.js"),
+  deployHold: () => import("../deploy-hold.js"),
+  deployPolicy: () => import("../deploy-policy.js"),
+  deployNotify: () => import("../deploy-notify.js"),
+  retention: () => import("../restate/retention.js"),
+  githubErrors: () => import("../github-errors.js"),
+  toolsClient: () => import("../restate/tools-client.js"),
+  agentConfigStore: () => import("../agent-config-store.js"),
+};
+
+type Modules = LoadedModules<typeof loaders>;
+
+let db: TestDb<typeof loaders>;
+let modules: Modules;
+let admin: Modules["admin"];
+let config: Modules["config"];
+let dedup: Modules["dedup"];
+let log: Modules["log"];
+let installState: Modules["installState"];
+let queue: Modules["queue"];
+let adminSession: Modules["adminSession"];
+let accessEntries: Modules["accessEntries"];
+let accessAudit: Modules["accessAudit"];
+let accessGrants: Modules["accessGrants"];
 let provider: FakeProvider;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `admin-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
+  // Nothing here reaches the network: a test whose code does gets this empty table and fails.
+  fakeFetch({}).install();
+  // Armed per test by the KG-manifest tests; reset so one test's answers never reach the next.
+  for (const mock of [getScopedInstallationTokenMock, getRepoDefaultBranchMock, fetchRepoTarballMock, extractSourceMock]) mock.mockReset();
+  db = await testDb({ modules: loaders });
+  modules = db.modules;
+  ({ admin, config, dedup, log, installState, queue, adminSession, accessEntries, accessAudit, accessGrants } = modules);
   provider = new FakeProvider();
-  admin = await import("../admin.js");
-  adminSession = await import("../admin-session.js");
-  accessEntries = await import("../access-entries.js");
-  accessAudit = await import("../access-audit.js");
-  accessGrants = await import("../access-page-grants.js");
-  config = await import("../config.js");
-  dedup = await import("../dedup.js");
-  runnerMode = await import("../runner-mode.js");
-  log = await import("../log.js");
-  stepLog = await import("../step-log.js");
-  installState = await import("../github-install-state.js");
-  queue = await import("../workflow-sync-queue.js");
-  config.initMappingsTable();
-  log.initLogTable();
-  stepLog.initStepLogTable();
-  runnerMode.initSettingsTable();
-  accessEntries.initAccessEntriesTable();
-  accessAudit.initAccessAuditTable();
-  accessGrants.initAccessPageGrantsTable();
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
   process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
   process.env.OAUTH_ALLOWED_EMAILS = "ada@eudoxus.ai";
   accessEntries.refreshEffectiveAllowlist();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 function adminConfig(accessCode: string | null): Parameters<typeof admin.handleAdminRequest>[2] {
@@ -278,6 +314,8 @@ async function login(accessCode: string): Promise<string> {
   return JSON.parse(res.body).token as string;
 }
 
+const RETIRED_GRANT_FIELD = ["allowed", "Project", "Keys"].join("");
+
 describe("admin auth", () => {
   it("returns a token on correct access code", async () => {
     const res = await request("/api/auth", "POST", "secret", { code: "secret" });
@@ -321,15 +359,7 @@ describe("admin auth", () => {
   it("session token survives a module reload (simulates server restart)", async () => {
     const token = await login("secret");
 
-    // Simulate a restart by reloading modules while keeping the same DB file
-    vi.resetModules();
-    const admin2 = await import("../admin.js");
-    const config2 = await import("../config.js");
-    const log2 = await import("../log.js");
-    const runnerMode2 = await import("../runner-mode.js");
-    config2.initMappingsTable();
-    log2.initLogTable();
-    runnerMode2.initSettingsTable();
+    const { admin: admin2 } = await db.reopen();
 
     const req = new MockRequest("/api/mappings", "GET", { authorization: `Bearer ${token}` });
     const res = new MockResponse();
@@ -349,14 +379,13 @@ describe("admin auth", () => {
     const token = await login("secret");
 
     // Manually expire the session in the DB
-    const { getDb } = await import("../dedup.js");
-    getDb().prepare("UPDATE admin_sessions SET expires_at = ? WHERE token = ?").run(Date.now() - 1, token);
+    dedup.getDb().prepare("UPDATE admin_sessions SET expires_at = ? WHERE token = ?").run(Date.now() - 1, token);
 
     const res = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(401);
 
     // Row should be deleted from DB
-    const row = getDb().prepare("SELECT * FROM admin_sessions WHERE token = ?").get(token);
+    const row = dedup.getDb().prepare("SELECT * FROM admin_sessions WHERE token = ?").get(token);
     expect(row).toBeUndefined();
   });
 });
@@ -680,8 +709,58 @@ describe("admin mappings", () => {
     const data = JSON.parse(create.body);
     expect(data.executionMode).toBe("github-actions");
     expect(data.sessionMode).toBe("autonomous");
+    expect(data.machineCpuKind).toBe("shared");
     expect(data.machineCpus).toBe(2);
     expect(data.machineMemoryMb).toBe(4096);
+  });
+
+  it.each(VALID_CPUS)("saves performance with %s CPUs at the exact memory boundary", async (machineCpus) => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PERF", owner: "org", repo: "app", machineCpuKind: "performance",
+      machineCpus, machineMemoryMb: machineCpus * PERFORMANCE_MIN_MB_PER_CPU,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().PERF.machineCpuKind).toBe("performance");
+  });
+
+  it("keeps performance when the old drawer saves sizing without a kind", async () => {
+    config.upsertMapping("PERF", makeMapping({ machineCpuKind: "performance" }));
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PERF", owner: "org", repo: "app", machineCpus: 4,
+      machineMemoryMb: 4 * PERFORMANCE_MIN_MB_PER_CPU,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().PERF.machineCpuKind).toBe("performance");
+  });
+
+  it("keeps the existing shared sizing rules", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SHARED", owner: "org", repo: "app", machineCpuKind: "shared",
+      machineCpus: 3, machineMemoryMb: 256,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().SHARED).toMatchObject({ machineCpuKind: "shared", machineCpus: 3, machineMemoryMb: 256 });
+  });
+
+  it.each([
+    { machineCpuKind: "performance", machineCpus: 3, machineMemoryMb: 8192, field: "machineCpus" },
+    { machineCpuKind: "performance", machineCpus: 2, machineMemoryMb: 2 * PERFORMANCE_MIN_MB_PER_CPU - 1, field: "machineMemoryMb" },
+    { machineCpuKind: "unknown", machineCpus: 2, machineMemoryMb: 4096, field: "machineCpuKind" },
+    { machineCpuKind: null, machineCpus: 2, machineMemoryMb: 4096, field: "machineCpuKind" },
+    { machineCpus: 3, machineMemoryMb: 8192, field: "machineCpus" },
+  ])("rejects invalid kind/sizing without changing storage: %j", async ({ field, ...size }) => {
+    config.upsertMapping("PERF", makeMapping({ machineCpuKind: "performance" }));
+    const before = config.getMappings().PERF;
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PERF", owner: "org", repo: "app", ...size,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain(field);
+    expect(config.getMappings().PERF).toEqual(before);
   });
 
   it("rejects invalid executionMode", async () => {
@@ -850,6 +929,45 @@ describe("admin mappings", () => {
     }, token);
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/extraEnv must be a plain object/);
+  });
+
+  describe("ephemeral full-access opt-in (AII-1437)", () => {
+    const OPT_IN = "AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS";
+    const create = async (extraEnv: Record<string, string>, extra: Record<string, unknown> = {}) => {
+      const token = await login("secret");
+      return request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", extraEnv, ...extra }, token);
+    };
+
+    it("accepts the exact assertion on a GitHub Actions mapping", async () => {
+      const res = await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" });
+      expect(res.statusCode).toBe(202);
+      expect(JSON.parse(res.body).extraEnv).toEqual({ [OPT_IN]: "ephemeral-runner-asserted-v1" });
+    });
+
+    it.each([["true"], ["1"], [""], ["ephemeral-runner-asserted-v2"]])("rejects the value %j", async (value) => {
+      const res = await create({ [OPT_IN]: value });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain(OPT_IN);
+    });
+
+    it("rejects a case variant and the reserved launch variable", async () => {
+      expect((await create({ [OPT_IN.toLowerCase()]: "ephemeral-runner-asserted-v1" })).statusCode).toBe(400);
+      expect((await create({ AI_IMPLEMENT_EXECUTION_POLICY: "v1:ephemeral-full-access:gha:a:b" })).statusCode).toBe(400);
+    });
+
+    it("rejects the opt-in on a Fly mapping", async () => {
+      const res = await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" }, { executionMode: "fly-machines" });
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("github-actions");
+    });
+
+    it("rejects a mode change to Fly that omits extraEnv while the opt-in is stored", async () => {
+      expect((await create({ [OPT_IN]: "ephemeral-runner-asserted-v1" })).statusCode).toBe(202);
+      const token = await login("secret");
+      const res = await request("/api/mappings", "POST", "secret", { teamKey: "EPH", owner: "org", repo: "eph", executionMode: "fly-machines" }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("github-actions");
+    });
   });
 
   it("defaults provider to anthropic and awsRegion to null when omitted", async () => {
@@ -1581,215 +1699,44 @@ describe("admin mappings", () => {
     }
   });
 
-  it("treats absent reviewFixLifecycle as null on a new mapping", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL1", owner: "org", repo: "app",
-    }, token);
-    expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFL1.reviewFixLifecycle).toBeNull();
-  });
-
-  it("treats null and empty-string reviewFixLifecycle as null", async () => {
-    const token = await login("secret");
-    for (const [teamKey, value] of [["RFL2", null], ["RFL3", ""]] as const) {
-      const res = await request("/api/mappings", "POST", "secret", {
-        teamKey, owner: "org", repo: "app",
-        reviewFixLifecycle: value,
-      }, token);
-      expect(res.statusCode).toBe(202);
-      expect(JSON.parse(res.body).reviewFixLifecycle).toBeNull();
-    }
-  });
-
-  it("accepts an explicit reviewFixLifecycle='legacy'", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL4", owner: "org", repo: "app",
-      reviewFixLifecycle: "legacy",
-    }, token);
-    expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("legacy");
-  });
-
-  it("preserves existing reviewFixLifecycle when omitted from an unrelated update", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL5", owner: "org", repo: "app",
-      reviewFixLifecycle: "legacy",
-    }, token);
-
-    const update = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFL5", owner: "org", repo: "app-updated",
-    }, token);
-    expect(update.statusCode).toBe(202);
-    expect(JSON.parse(update.body).reviewFixLifecycle).toBe("legacy");
-  });
-
-  it("rejects invalid reviewFixLifecycle values with 400", async () => {
-    const token = await login("secret");
-    for (const invalid of ["bogus", "RESTATE", "true"]) {
-      const res = await request("/api/mappings", "POST", "secret", {
-        teamKey: "RFLBAD", owner: "org", repo: "app",
-        reviewFixLifecycle: invalid,
-      }, token);
-      expect(res.statusCode).toBe(400);
-      expect(JSON.parse(res.body).error).toContain("reviewFixLifecycle");
-    }
-  });
-
-  it("rejects reviewFixLifecycle='restate' with an actionable, fail-closed 400 naming the missing execution-mode prerequisite", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLFLY", owner: "org", repo: "app",
-      executionMode: "fly-machines",
-      reviewFixLifecycle: "restate",
-    }, token);
-    expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("github-actions");
-  });
-
-  it("rejects reviewFixLifecycle='restate' on github-actions with an actionable 400 when no Restate endpoint status is available (fail closed, deps.getRestateStatus unset)", async () => {
-    const token = await login("secret");
-    const res = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLGHA", owner: "org", repo: "app",
-      executionMode: "github-actions",
-      reviewFixLifecycle: "restate",
-    }, token);
-    expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("Restate endpoint");
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLGHA).toBeUndefined();
-  });
-
-  it("rejects reviewFixLifecycle='restate' with a registered, healthy Restate endpoint but a dispatch-ref workflow lacking the attempt-correlation capability", async () => {
-    const token = await login("secret");
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: false,
-    });
-    const res = await requestWithDeps("/api/mappings", "POST", token, {
-      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
-    }, {
-      teamKey: "RFLCAP", owner: "org", repo: "app", defaultBranch: "main",
-      executionMode: "github-actions",
-      reviewFixLifecycle: "restate",
-    });
-    expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("run_attempt_token");
-    expect(resolveWorkflowCapabilitiesMock).toHaveBeenCalledWith(expect.objectContaining({
-      owner: "org", repo: "app", workflowFile: "claude-implement.yml", ref: "main", token: "gh-token-mock",
-    }));
-  });
-
-  it("accepts reviewFixLifecycle='restate' when github-actions, the Restate endpoint is registered and healthy, and the dispatch-ref workflow supports attempt correlation", async () => {
-    const token = await login("secret");
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
-    });
-    const res = await requestWithDeps("/api/mappings", "POST", token, {
-      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
-    }, {
-      teamKey: "RFLOK", owner: "org", repo: "app", defaultBranch: "main",
-      executionMode: "github-actions",
-      reviewFixLifecycle: "restate",
-    });
-    expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).reviewFixLifecycle).toBe("restate");
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLOK.reviewFixLifecycle).toBe("restate");
-  });
-
-  it("rejects initial Restate activation while an unreserved Legacy runner is active", async () => {
+  it.each([undefined, null, "", "legacy", "restate", "bogus"])("ignores retired lifecycle input %s on a new mapping without probing readiness", async (reviewFixLifecycle) => {
     const token = await login("secret");
     resolveWorkflowCapabilitiesMock.mockClear();
-    dedup.getDb().prepare(`
-      INSERT INTO dispatch_log (issue_id, repo, dispatched_at, status, phase)
-      VALUES ('legacy-issue', 'org/app', ?, 'running', 'gap-analysis')
-    `).run(Date.now());
-    const res = await requestWithDeps("/api/mappings", "POST", token, {
-      getRestateStatus: () => ({ sidecar: { state: "ready" }, registration: { state: "registered" } }),
-    }, {
-      teamKey: "RFLDRAIN", owner: "org", repo: "app", defaultBranch: "main",
-      executionMode: "github-actions", reviewFixLifecycle: "restate",
-    });
-    expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toContain("unreserved Legacy workers to drain");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RETIRED", owner: "org", repo: "app", reviewFixLifecycle,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toMatchObject({ reviewFixLifecycle: null });
+    expect(JSON.parse(res.body).syncJobId).toBeDefined();
+    expect(config.getMappings().RETIRED.reviewFixLifecycle).toBeNull();
     expect(resolveWorkflowCapabilitiesMock).not.toHaveBeenCalled();
   });
 
-  it("preserves a selected Restate lifecycle during an unrelated edit and rejects an unsupported dispatch change", async () => {
+  it.each([null, "legacy", "restate"] as const)("preserves historical lifecycle %s and protected settings when an old client sends another value", async (stored) => {
+    config.upsertMapping("HIST", makeMapping({
+      owner: "org", repo: "app", reviewFixLifecycle: stored, paused: true,
+      dependencyTokenScope: "installation", sensitiveAddPatterns: ["secrets/**"],
+    }));
     const token = await login("secret");
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: true, supportsAttemptCorrelation: true,
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "HIST", owner: "org", repo: "app", reviewFixLifecycle: "legacy",
+      sensitiveAddPatterns: ["secrets/**"],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().HIST).toMatchObject({
+      reviewFixLifecycle: stored, paused: true, dependencyTokenScope: "installation",
+      sensitiveAddPatterns: ["secrets/**"],
     });
-    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
-    const original = await requestWithDeps("/api/mappings", "POST", token, healthy, {
-      teamKey: "RFLPRESERVE", owner: "org", repo: "app", defaultBranch: "pilot-ref",
-      workflowFile: "pilot.yml", executionMode: "github-actions", reviewFixLifecycle: "restate",
-    });
-    expect(original.statusCode).toBe(202);
-
-    const unrelated = await requestWithDeps("/api/mappings", "POST", token, {}, {
-      teamKey: "RFLPRESERVE", owner: "org", repo: "app", paused: true,
-      reviewFixLifecycle: "restate",
-    });
-    expect(unrelated.statusCode).toBe(202);
-    expect(JSON.parse(unrelated.body)).toMatchObject({
-      reviewFixLifecycle: "restate", workflowFile: "pilot.yml", executionMode: "github-actions", paused: true,
-    });
-
-    const changed = await requestWithDeps("/api/mappings", "POST", token, {}, {
-      teamKey: "RFLPRESERVE", owner: "org", repo: "app", executionMode: "fly-machines",
-    });
-    expect(changed.statusCode).toBe(400);
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLPRESERVE.executionMode).toBe("github-actions");
   });
 
-  it("rejects a workflow without publication support and does not expose probe errors", async () => {
+  it("still rejects an unsupported Bedrock/Fly backend pair", async () => {
     const token = await login("secret");
-    const healthy = { getRestateStatus: () => ({ sidecar: { state: "ready" as const }, registration: { state: "registered" as const } }) };
-    resolveWorkflowCapabilitiesMock.mockResolvedValueOnce({
-      contract: "envelope", supportsRunPublicationToken: false, supportsAttemptCorrelation: true,
-    });
-    const unsupported = await requestWithDeps("/api/mappings", "POST", token, healthy, {
-      teamKey: "RFLNO-PUB", owner: "org", repo: "app", defaultBranch: "main",
-      reviewFixLifecycle: "restate",
-    });
-    expect(unsupported.statusCode).toBe(400);
-    expect(JSON.parse(unsupported.body).error).toContain("run_publication_token");
-
-    resolveWorkflowCapabilitiesMock.mockRejectedValueOnce(new Error("secret probe detail"));
-    const failed = await requestWithDeps("/api/mappings", "POST", token, healthy, {
-      teamKey: "RFLPROBE", owner: "org", repo: "app", defaultBranch: "main",
-      reviewFixLifecycle: "restate",
-    });
-    expect(failed.statusCode).toBe(400);
-    expect(failed.body).not.toContain("secret probe detail");
-  });
-
-  it("does not write reviewFixLifecycle='restate' when a save is rejected — the mapping keeps its prior Legacy selection", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLKEEP", owner: "org", repo: "app",
-      reviewFixLifecycle: "legacy",
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BADBACKEND", owner: "org", repo: "app", executionMode: "fly-machines",
+      provider: "bedrock", awsRegion: "us-east-1",
     }, token);
-
-    const rejected = await request("/api/mappings", "POST", "secret", {
-      teamKey: "RFLKEEP", owner: "org", repo: "app",
-      executionMode: "fly-machines",
-      reviewFixLifecycle: "restate",
-    }, token);
-    expect(rejected.statusCode).toBe(400);
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).RFLKEEP.reviewFixLifecycle).toBe("legacy");
-    expect(JSON.parse(list.body).RFLKEEP.executionMode).toBe("github-actions");
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("bedrock");
   });
 
   it("round-trips a reviewers array, including an empty one", async () => {
@@ -1931,6 +1878,176 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("gap-analysis");
   });
+
+  it("round-trips trustedReviewAuthors, trimmed and lowercased", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA1", owner: "org", repo: "app",
+      trustedReviewAuthors: ["  Codex-Reviewer[bot]  "],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).TRA1.trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+  });
+
+  it("treats absent trustedReviewAuthors as null on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA2", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).trustedReviewAuthors).toBeNull();
+  });
+
+  it("preserves existing trustedReviewAuthors when omitted from update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA3", owner: "org", repo: "app",
+      trustedReviewAuthors: ["codex-reviewer[bot]"],
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA3", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
+  });
+
+  it("stores reviewProcess claude-code-review on a Legacy project, and ai-implement or null as null", async () => {
+    const token = await login("secret");
+    const post = (reviewProcess?: unknown) => request("/api/mappings", "POST", "secret", {
+      teamKey: "RP1", owner: "org", repo: "app",
+      ...(reviewProcess === undefined ? {} : { reviewProcess }),
+    }, token);
+
+    const created = await post("claude-code-review");
+    expect(created.statusCode).toBe(202);
+    expect(JSON.parse(created.body).reviewProcess).toBe("claude-code-review");
+
+    const kept = await post();
+    expect(JSON.parse(kept.body).reviewProcess).toBe("claude-code-review");
+
+    const defaulted = await post("ai-implement");
+    expect(JSON.parse(defaulted.body).reviewProcess).toBeNull();
+
+    await post("claude-code-review");
+    const reset = await post(null);
+    expect(JSON.parse(reset.body).reviewProcess).toBeNull();
+  });
+
+  it.each([null, "legacy", "restate"] as const)("allows Codex review with historical lifecycle %s without changing it", async (reviewFixLifecycle) => {
+    config.upsertMapping("CODEX", makeMapping({ owner: "org", repo: "app", reviewFixLifecycle }));
+    const result = await admin.upsertMappingAction({
+      teamKey: "CODEX", owner: "org", repo: "app", defaultBranch: "main",
+      reviewProcess: "codex-code-review",
+    }, adminConfig("secret"), makeFakeRegistry(provider));
+    expect(result.status).toBe(202);
+    expect(config.getMappings().CODEX).toMatchObject({ reviewProcess: "codex-code-review", reviewFixLifecycle });
+  });
+
+  it("creates a Codex mapping without an enablement dependency", async () => {
+    const result = await admin.upsertMappingAction({
+      teamKey: "NEWCODEX", owner: "org", repo: "app", defaultBranch: "main",
+      reviewProcess: "codex-code-review",
+    }, adminConfig("secret"), makeFakeRegistry(provider));
+    expect(result.status).toBe(202);
+    expect(result.body).toMatchObject({ reviewProcess: "codex-code-review", reviewFixLifecycle: null });
+    expect(result.body.syncJobId).toBeDefined();
+  });
+
+  it("stores reviewProcess claude-code-review-repository-fix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RP4", owner: "org", repo: "app", reviewProcess: "claude-code-review-repository-fix",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).reviewProcess).toBe("claude-code-review-repository-fix");
+  });
+
+  it("stores null reviewProcess when absent on a new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", { teamKey: "RP2", owner: "org", repo: "app" }, token);
+    expect(JSON.parse(res.body).reviewProcess).toBeNull();
+  });
+
+  it("rejects an unknown reviewProcess with the exact error", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RP3", owner: "org", repo: "app", reviewProcess: "github",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"');
+  });
+
+  it("resets trustedReviewAuthors to the null default via an explicit null", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA4", owner: "org", repo: "app",
+      trustedReviewAuthors: ["codex-reviewer[bot]"],
+    }, token);
+
+    const reset = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRA4", owner: "org", repo: "app",
+      trustedReviewAuthors: null,
+    }, token);
+    expect(reset.statusCode).toBe(202);
+    expect(JSON.parse(reset.body).trustedReviewAuthors).toBeNull();
+  });
+
+  it("rejects a non-array, non-null trustedReviewAuthors with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD1", owner: "org", repo: "app",
+      trustedReviewAuthors: "codex-reviewer[bot]",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: must be an array of strings or null");
+  });
+
+  it("rejects an empty-string entry (post-trim) with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD2", owner: "org", repo: "app",
+      trustedReviewAuthors: ["   "],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: [0] must not be empty");
+  });
+
+  it("rejects an entry that fails the login regex with the exact error prefix", async () => {
+    const token = await login("secret");
+    for (const bad of ["Codex Reviewer", "-bad", "bot]"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "TRABAD3", owner: "org", repo: "app",
+        trustedReviewAuthors: [bad],
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toBe(`trustedReviewAuthors invalid: [0] "${bad}" is not a valid GitHub login`);
+    }
+  });
+
+  it("rejects more than 20 entries with the exact error prefix", async () => {
+    const token = await login("secret");
+    const many = Array.from({ length: 21 }, (_, i) => `bot-${i}`);
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD4", owner: "org", repo: "app",
+      trustedReviewAuthors: many,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("trustedReviewAuthors invalid: too many entries (21); maximum is 20");
+  });
+
+  it("rejects a duplicate entry, including a duplicate created by lowercasing, with the exact error prefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "TRABAD5", owner: "org", repo: "app",
+      trustedReviewAuthors: ["Foo", "foo"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('trustedReviewAuthors invalid: duplicate entry "foo"');
+  });
 });
 
 describe("admin runner-mode", () => {
@@ -1998,7 +2115,7 @@ describe("admin runner-mode", () => {
     await res.done;
     expect(res.statusCode).toBe(200);
     expect(notifyTextMock).toHaveBeenCalledTimes(1);
-    const [url, message] = notifyTextMock.mock.calls[0] as unknown as [string, string];
+    const [url, message] = notifyTextMock.mock.calls[0];
     expect(url).toBe("https://hooks.example/x");
     expect(message).toMatch(/default/);
     expect(message).toMatch(/fly/);
@@ -2040,7 +2157,7 @@ describe("admin runner-mode", () => {
 });
 
 describe("admin kg materialize-mode", () => {
-  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() };
+  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn() };
 
   beforeEach(() => {
     delete process.env.KG_MATERIALIZE_DIRECT;
@@ -2115,23 +2232,44 @@ describe("admin kg materialize-mode", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("POST /api/kg/materialize-mode returns 409 when KG_MATERIALIZE_DIRECT env var is set", async () => {
+  it("POST /api/kg/materialize-mode answers 200 and persists even when KG_MATERIALIZE_DIRECT is set (AII-1109)", async () => {
     process.env.KG_MATERIALIZE_DIRECT = "true";
     const token = await login("secret");
     const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: false });
-    expect(res.statusCode).toBe(409);
-    const body = JSON.parse(res.body);
-    expect(body.error).toContain("KG_MATERIALIZE_DIRECT env var");
-    expect(body.persisted).toBe(false);
-    // Runtime value is still locked by the env var
-    expect(body.direct).toBe(true);
-    expect(body.source).toBe("env");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ direct: false, source: "db" });
 
-    // And the DB write actually happened — clearing the env var should
-    // surface the persisted value.
-    delete process.env.KG_MATERIALIZE_DIRECT;
     const get = await kgRequest("/api/kg/materialize-mode", "GET", token);
     expect(JSON.parse(get.body).direct).toBe(false);
+  });
+
+  it("GET /api/kg/execution-mode reports the default and its source, 501 without KG refresh", async () => {
+    const token = await login("secret");
+    expect((await kgRequest("/api/kg/execution-mode", "GET", token, undefined, false)).statusCode).toBe(501);
+    const res = await kgRequest("/api/kg/execution-mode", "GET", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ mode: "github-actions", source: "default" });
+  });
+
+  it("POST /api/kg/execution-mode persists for an admin, and a follow-up GET reports source db", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, { mode: "fly-machines" });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ mode: "fly-machines", source: "db" });
+    const get = await kgRequest("/api/kg/execution-mode", "GET", token);
+    expect(JSON.parse(get.body)).toEqual({ mode: "fly-machines", source: "db" });
+  });
+
+  it.each([{ mode: "both" }, { mode: "local-docker" }, { mode: 3 }, {}])("POST /api/kg/execution-mode rejects %j with 400", async (body) => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, body);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /api/kg/execution-mode refuses a non-admin session with 403", async () => {
+    const token = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const res = await kgRequest("/api/kg/execution-mode", "POST", token, { mode: "fly-machines" });
+    expect(res.statusCode).toBe(403);
   });
 
   it("rejects an unauthenticated request with 401", async () => {
@@ -2143,19 +2281,18 @@ describe("admin kg materialize-mode", () => {
   });
 });
 
-describe("admin kg refresh dry-run (AII-635)", () => {
+describe("admin kg refresh options removed (AII-1263)", () => {
+  // trigger_kg_refresh's answer to an accepted refresh (src/restate/tools.ts).
   const kgRefreshDeps = {
-    trigger: vi.fn(async (_opts?: { dryRun?: boolean }) => ({ status: 202, body: { accepted: true } })),
+    trigger: vi.fn(async (_opts?: { ref?: string; actorEmail?: string }) => ({ status: 202, body: { refreshing: true, triggerId: "t-0" } })),
     status: vi.fn(),
-    onMachineLost: vi.fn(),
+    cancel: vi.fn(),
   };
 
   beforeEach(() => {
     kgRefreshDeps.trigger.mockClear();
+    kgRefreshDeps.status.mockReset();
   });
-
-  // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
-  const ssoAdmin = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
 
   async function kgRequest(
     url: string,
@@ -2178,30 +2315,29 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     return { statusCode: res.statusCode, body: res.body };
   }
 
-  it("POST /api/kg/refresh with { dryRun: true } reaches the trigger with dryRun and echoes it", async () => {
+  it.each(["dryRun", "acceptNewBaseline"])("POST /api/kg/refresh with { %s: true } answers 400 option-removed and does not trigger", async (option) => {
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: true });
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { [option]: true });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: "option-removed", option });
+    expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
-  it("POST /api/kg/refresh with no body reaches the trigger with no option — the unchanged real refresh", async () => {
+  it("POST /api/kg/refresh with no body forwards the authenticated human caller", async () => {
     const token = await login("secret");
     const res = await kgRequest("/api/kg/refresh", "POST", token);
     expect(res.statusCode).toBe(202);
     expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false });
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith(undefined, { kind: "human", email: null, role: "admin", grants: [] });
+    expect(JSON.parse(res.body)).toMatchObject({ refreshing: true });
   });
 
   it("POST /api/kg/refresh with { dryRun: false } is the real refresh", async () => {
     const token = await login("secret");
     const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: false });
     expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger.mock.calls[0]).toHaveLength(0);
-    expect(JSON.parse(res.body).dryRun).toBe(false);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith(undefined, { kind: "human", email: null, role: "admin", grants: [] });
+    expect(JSON.parse(res.body)).toEqual({ refreshing: true, triggerId: "t-0" });
   });
 
   it("POST /api/kg/refresh with an invalid JSON body returns 400 and does not trigger", async () => {
@@ -2212,44 +2348,64 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
   });
 
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an SSO session reaches the trigger with the session's email as actor (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false, acceptNewBaseline: true });
-  });
-
-  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an access-code session names the actor 'access-code session' (AII-628)", async () => {
+  it.each([
+    [409, { error: "refresh-in-progress" }],
+    [501, { error: "kg-source-repo-not-configured" }],
+    [422, { error: "preflight-failed", precondition: "preflight-failed", detail: "acme/kg — contents: read — HTTP 404" }],
+    [507, { error: "insufficient-storage", detail: "less than 209715200 bytes free on the volume" }],
+  ])("POST /api/kg/refresh passes a %i tool answer through with its body (AII-901)", async (status, body) => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status, body } as never);
     const token = await login("secret");
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
-    expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "access-code session" });
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(status);
+    expect(JSON.parse(res.body)).toMatchObject(body);
   });
 
-  it("POST /api/kg/refresh with { dryRun: true, acceptNewBaseline: true } passes both through (AII-628)", async () => {
-    const token = adminSession.createSession(ssoAdmin);
-    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true, acceptNewBaseline: true });
+  it("POST /api/kg/refresh answers 202 { refreshing, triggerId } after a submit", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
     expect(res.statusCode).toBe(202);
-    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
-    expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
+    expect(JSON.parse(res.body)).toMatchObject({ refreshing: true, triggerId: "t-1" });
   });
 
-  it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {
-    const page = await import("../admin-ui/pages/deployments.js");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-btn"');
-    expect(page.deploymentsHtml).toContain("window.triggerKgRefresh(true)");
-    expect(page.deploymentsHtml).toContain('id="kg-dry-run-last"');
-    expect(page.deploymentsScript).toContain("JSON.stringify({ dryRun: true })");
-    expect(page.deploymentsScript).toContain("function renderKgDryRun(");
+  it("POST /api/kg/refresh answers 503 restate-unavailable with the body untouched", async () => {
+    kgRefreshDeps.trigger.mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } } as never);
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("a second quick POST /api/kg/refresh answers 409 refresh-in-progress (one workflow: KgRepo.trigger's live-refresh answer, pinned in tools.test.ts)", async () => {
+    kgRefreshDeps.trigger
+      .mockResolvedValueOnce({ status: 202, body: { refreshing: true, triggerId: "t-1" } } as never)
+      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } } as never);
+    const token = await login("secret");
+    const first = await kgRequest("/api/kg/refresh", "POST", token);
+    const second = await kgRequest("/api/kg/refresh", "POST", token);
+    expect(first.statusCode).toBe(202);
+    expect(second.statusCode).toBe(409);
+    expect(JSON.parse(second.body)).toMatchObject({ error: "refresh-in-progress" });
+  });
+
+  it("GET /api/kg/status keeps the status body shape, and answers 503 when unavailable", async () => {
+    kgRefreshDeps.status
+      .mockResolvedValueOnce({ status: 200, body: { stage: "idle", lastRefresh: null } })
+      .mockResolvedValueOnce({ status: 503, body: { error: "restate-unavailable" } });
+    const token = await login("secret");
+    const ok = await kgRequest("/api/kg/status", "GET", token);
+    expect(ok.statusCode).toBe(200);
+    expect(JSON.parse(ok.body)).toEqual({ stage: "idle", lastRefresh: null });
+    const down = await kgRequest("/api/kg/status", "GET", token);
+    expect(down.statusCode).toBe(503);
+    expect(JSON.parse(down.body)).toEqual({ error: "restate-unavailable" });
   });
 });
 
-describe("admin secrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
+const FLY_SECRETS = "/v1/apps/ai-implement-sessions/secrets";
 
+describe("admin secrets", () => {
   function secretsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
     return {
       adminAccessCode: "secret",
@@ -2268,6 +2424,22 @@ describe("admin secrets", () => {
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
+
+  describe.each(["constructor", "toString", "__proto__"])("secrets reject inherited mapping %s", (teamKey) => {
+    it.each([
+      ["GET", "", undefined],
+      ["POST", "", { name: "DATABASE_URL", value: "postgres://localhost/db" }],
+      ["DELETE", "/DATABASE_URL", undefined],
+    ] as const)("%s returns 404 without a secret call", async (method, suffix, body) => {
+      const token = await login("secret");
+      const fake = fakeFetch({}).install();
+      const res = await requestFly(`/api/mappings/${teamKey}/secrets${suffix}`, method, token, body);
+
+      expect.soft(res.statusCode).toBe(404);
+      expect.soft(JSON.parse(res.body)).toEqual({ error: "Team not found" });
+      expect(fake.calls).toHaveLength(0);
+    });
+  });
 
   it("returns 503 when Fly config is not set on GET secrets", async () => {
     const token = await login("secret");
@@ -2293,7 +2465,6 @@ describe("admin secrets", () => {
   });
 
   it("GET secrets returns 404 for unknown team", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true, json: async () => [] } as Response);
     const token = await login("secret");
     const res = await requestFly("/api/mappings/NOPE/secrets", "GET", token);
     expect(res.statusCode).toBe(404);
@@ -2301,14 +2472,11 @@ describe("admin secrets", () => {
 
   it("GET secrets lists only team-prefixed secrets with prefix stripped", async () => {
     const flySecrets = [
-      { name: "ENG_DATABASE_URL", digest: "abc", createdAt: "2026-01-01T00:00:00Z" },
-      { name: "ENG_STRIPE_KEY", digest: "def", createdAt: "2026-01-02T00:00:00Z" },
-      { name: "OTHER_SECRET", digest: "ghi", createdAt: "2026-01-03T00:00:00Z" },
+      { name: "ENG_DATABASE_URL", digest: "abc", created_at: "2026-01-01T00:00:00Z" },
+      { name: "ENG_STRIPE_KEY", digest: "def", created_at: "2026-01-02T00:00:00Z" },
+      { name: "OTHER_SECRET", digest: "ghi", created_at: "2026-01-03T00:00:00Z" },
     ];
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { app: { secrets: flySecrets } } }),
-    } as Response);
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: { secrets: flySecrets } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2321,11 +2489,8 @@ describe("admin secrets", () => {
     expect(data[1].name).toBe("STRIPE_KEY");
   });
 
-  it("POST secrets sets a secret with team prefix via GraphQL", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 101 } } } }),
-    } as Response);
+  it("POST secrets sets a secret with team prefix via Machines REST", async () => {
+    const fake = fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 101 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2334,16 +2499,38 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).name).toBe("DATABASE_URL");
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    const body = JSON.parse((opts as RequestInit).body as string);
-    expect(body.variables.input.secrets[0].key).toBe("ENG_DATABASE_URL");
-    expect(body.variables.input.secrets[0].value).toBe("postgres://localhost/db");
+    expect(fake.calls[0].url.origin).toBe("https://api.machines.dev");
+    expect(JSON.parse(fake.calls[0].body)).toEqual({ values: { ENG_DATABASE_URL: "postgres://localhost/db" } });
+  });
+
+  it("an admin-set secret appears in the launch reader", async () => {
+    const stored: Record<string, string> = {};
+    const fake = fakeFetch({
+      [`POST ${FLY_SECRETS}`]: (call) => {
+        Object.assign(stored, JSON.parse(call.body).values);
+        return { json: { version: 99, secrets: Object.entries(stored).map(([name, value]) => ({ name, value })) } };
+      },
+      [`GET ${FLY_SECRETS}`]: () => ({ json: { secrets: Object.keys(stored).map((name) => ({ name, digest: "digest", created_at: "2026-11-13" })) } }),
+    }).install();
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    const res = await requestFly("/api/mappings/ENG/secrets", "POST", token, { name: "DATABASE_URL", value: "secret" });
+    expect(res.statusCode).toBe(200);
+    const { listAppSecrets } = await import("../fly-machines.js");
+    expect((await listAppSecrets("fly-token", "ai-implement-sessions")).map((s) => s.name)).toEqual(["ENG_DATABASE_URL"]);
+    for (const call of fake.calls) expect(call.url.origin).toBe("https://api.machines.dev");
+  });
+
+  it("DELETE missing team secret succeeds", async () => {
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_MISSING`]: { json: { version: 100 } } }).install();
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+    const res = await requestFly("/api/mappings/ENG/secrets/MISSING", "DELETE", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ deleted: true });
   });
 
   it("POST secrets returns 400 when name is missing", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true } as Response);
-
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
 
@@ -2353,8 +2540,6 @@ describe("admin secrets", () => {
   });
 
   it("POST secrets returns 400 for invalid name characters", async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true } as Response);
-
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
 
@@ -2364,10 +2549,7 @@ describe("admin secrets", () => {
   });
 
   it("POST secrets normalizes lowercase names to uppercase", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 1 } } } }),
-    } as Response);
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 1 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2377,11 +2559,8 @@ describe("admin secrets", () => {
     expect(JSON.parse(res.body).name).toBe("DATABASE_URL");
   });
 
-  it("DELETE secret unsets the team-prefixed secret via GraphQL", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { unsetSecrets: { release: { version: 102 } } } }),
-    } as Response);
+  it("DELETE secret unsets the team-prefixed secret via Machines REST", async () => {
+    const fake = fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_DATABASE_URL`]: { json: { version: 102 } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2390,33 +2569,11 @@ describe("admin secrets", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).deleted).toBe(true);
 
-    const [url, opts] = vi.mocked(fetch).mock.calls[0];
-    expect(url).toBe("https://api.fly.io/graphql");
-    expect((opts as RequestInit).method).toBe("POST");
-    const body = JSON.parse((opts as RequestInit).body as string);
-    expect(body.variables.input.keys[0]).toBe("ENG_DATABASE_URL");
+    expect(fake.calls[0].url.href).toBe(`https://api.machines.dev${FLY_SECRETS}/ENG_DATABASE_URL`);
   });
 
   it("DELETE secret returns 404 when Fly returns HTTP 404 for unknown secret", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: false,
-      status: 404,
-      text: async () => "not found",
-    } as Response);
-
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
-
-    const res = await requestFly("/api/mappings/ENG/secrets/NONEXISTENT", "DELETE", token);
-    expect(res.statusCode).toBe(404);
-    expect(JSON.parse(res.body).error).toContain("not found");
-  });
-
-  it("DELETE secret returns 404 when Fly GraphQL reports the secret was not found", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ errors: [{ message: "Could not find secret ENG_NONEXISTENT" }] }),
-    } as Response);
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ENG_NONEXISTENT`]: { status: 404 } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2481,34 +2638,141 @@ describe("admin settings", () => {
     expect(body.flySessionsApp.dbValue).toBeNull();
   });
 
-  it("POST /api/settings saves flySessionsApp to DB", async () => {
-    const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "my-sessions-app" }, token);
-    expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.flySessionsApp.dbValue).toBe("my-sessions-app");
+  describe("runnerImageAllowedPrefixes (AII-1321)", () => {
+    const post = async (token: string, body: unknown) => request("/api/settings", "POST", "secret", body as never, token);
+    const get = async (token: string) => JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+
+    it("GET returns value, effective and builtIn with no row", async () => {
+      const token = await login("secret");
+      expect((await get(token)).runnerImageAllowedPrefixes).toEqual({
+        value: null,
+        effective: [],
+        builtIn: ["ghcr.io/builddownai/", "ghcr.io/<owner>/"],
+      });
+    });
+
+    it("POST stores a valid list joined with commas, and GET agrees", async () => {
+      const token = await login("secret");
+      const res = await post(token, { runnerImageAllowedPrefixes: " ghcr.io/a/ , ,registry.example.com:5000/team/b/ " });
+      expect(res.statusCode).toBe(200);
+      const expected = { value: "ghcr.io/a/,registry.example.com:5000/team/b/", effective: ["ghcr.io/a/", "registry.example.com:5000/team/b/"] };
+      expect(JSON.parse(res.body).runnerImageAllowedPrefixes).toMatchObject(expected);
+      expect((await get(token)).runnerImageAllowedPrefixes).toMatchObject(expected);
+    });
+
+    it.each([[null], ["   "]])("POST %j deletes the row", async (value) => {
+      const token = await login("secret");
+      await post(token, { runnerImageAllowedPrefixes: "ghcr.io/a/" });
+      const res = await post(token, { runnerImageAllowedPrefixes: value });
+      expect(res.statusCode).toBe(200);
+      expect((await get(token)).runnerImageAllowedPrefixes).toMatchObject({ value: null, effective: [] });
+    });
+
+    it.each([
+      ["a non-string", 5, "runnerImageAllowedPrefixes must be a string or null"],
+      ["over 1000 characters", "ghcr.io/" + "a".repeat(1000) + "/", undefined],
+      ["a space inside an entry", "ghcr.io/a b/", undefined],
+      ["a wildcard", "ghcr.io/a*/", undefined],
+      ["an entry without a trailing slash", "ghcr.io/acme", 'each prefix must end with "/"'],
+      ["a bare registry host", "ghcr.io/", undefined],
+      ["an empty path segment", "ghcr.io//", undefined],
+    ])("POST rejects %s with 400 and writes nothing", async (_label, value, message) => {
+      const token = await login("secret");
+      const res = await post(token, { runnerImageAllowedPrefixes: value, retryPolicy: { reviewMaxTurns: 60 } });
+      expect(res.statusCode).toBe(400);
+      if (message) expect(JSON.parse(res.body).error).toBe(message);
+      const after = await get(token);
+      expect(after.runnerImageAllowedPrefixes.value).toBeNull();
+      expect(after.retryPolicy).toEqual(after.retryPolicyDefaults);
+    });
+
+    it("POST refuses a user-role session with 403", async () => {
+      const token = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+      const res = await request("/api/settings", "POST", "secret", { runnerImageAllowedPrefixes: "ghcr.io/a/" } as never, token);
+      expect(res.statusCode).toBe(403);
+    });
   });
 
-  it("POST /api/settings sets restartRequired true when value differs from runtime", async () => {
+  /** A fake Restate: `set_runner_backend` merges into `state`, and the refresh reads it back through the real cache. */
+  function fakeRunnerBackend(opts: { down?: boolean } = {}) {
+    const state = { app: null as string | null, region: null as string | null };
+    const callTool = vi.fn(async (_name: string, args: Record<string, unknown>) => {
+      if (opts.down) return { status: "unavailable" as const };
+      Object.assign(state, args.patch);
+      return { status: "ok" as const, content: [{ type: "text", text: JSON.stringify(state) }] };
+    });
+    const refreshRunnerBackendCache = async () => {
+      await modules.orchestratorSettings.refreshRunnerBackendCache({ readFlyMachines: async () => ({ ...state }) });
+    };
+    return { deps: { callTool: callTool as never, refreshRunnerBackendCache }, callTool, state };
+  }
+
+  it("POST /api/settings writes flySessionsApp through set_runner_backend and the next GET reports source restate", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "new-app" }, token);
+    const fake = fakeRunnerBackend();
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "my-sessions-app" });
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).restartRequired).toBe(true);
+    expect(fake.callTool).toHaveBeenCalledWith(
+      "set_runner_backend",
+      { backend: "fly-machines", patch: { app: "my-sessions-app" } },
+      expect.objectContaining({ role: "admin" }),
+    );
+    expect(JSON.parse(res.body).flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.runnerBackendSource).toBe("restate");
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: "my-sessions-app", source: "restate" });
+    expect(get.flySessionsApp.dbValue).toBeNull();
   });
 
-  it("POST /api/settings sets restartRequired false when value matches runtime", async () => {
+  it("POST /api/settings stores null for a whitespace-only value", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: null }, token);
+    const fake = fakeRunnerBackend();
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "   " });
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).restartRequired).toBe(false);
+    expect(fake.callTool.mock.calls[0][1]).toEqual({ backend: "fly-machines", patch: { app: null } });
+    expect(JSON.parse(res.body).flySessionsApp.runtimeValue).toBeNull();
   });
 
-  it("POST /api/settings trims whitespace-only string to null", async () => {
+  it("POST /api/settings answers 503 and writes no row when Restate is down", async () => {
     const token = await login("secret");
-    const res = await request("/api/settings", "POST", "secret", { flySessionsApp: "   " }, token);
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).flySessionsApp.dbValue).toBeNull();
+    const fake = fakeRunnerBackend({ down: true });
+    const res = await requestWithDeps("/api/settings", "POST", token, fake.deps, { flySessionsApp: "x", flySessionsRegion: "iad" });
+    expect(res.statusCode).toBe(503);
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.flySessionsApp.dbValue).toBeNull();
+    expect(get.flySessionsRegion.dbValue).toBeNull();
+    expect(get.runnerBackendSource).toBe("not-loaded");
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
   });
+
+  it("POST /api/settings answers 503 when callTool throws", async () => {
+    const token = await login("secret");
+    const res = await requestWithDeps("/api/settings", "POST", token, { callTool: (async () => { throw new Error("boom"); }) as never }, { flySessionsRegion: "iad" });
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("GET /api/settings reports source not-loaded before any Restate read, with a null runtime value despite env", async () => {
+    process.env.FLY_SESSIONS_APP = "env-app";
+    const token = await login("secret");
+    const get = JSON.parse((await request("/api/settings", "GET", "secret", undefined, token)).body);
+    expect(get.runnerBackendSource).toBe("not-loaded");
+    for (const field of [get.flySessionsApp, get.flySessionsRegion]) {
+      expect(field).not.toHaveProperty("overriddenByEnv");
+      expect(field).toHaveProperty("dbValue");
+      expect(field).toHaveProperty("envValue");
+    }
+    expect(get.flySessionsApp).toMatchObject({ runtimeValue: null, source: "not-loaded", envValue: "env-app", dbValue: null });
+  });
+
 
   it("GET and POST /api/settings require auth", async () => {
     const get = await request("/api/settings", "GET", "secret");
@@ -2666,9 +2930,6 @@ describe("admin settings", () => {
 });
 
 describe("admin global secrets", () => {
-  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
-  afterEach(() => { vi.restoreAllMocks(); });
-
   function globalSecretsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
     return {
       adminAccessCode: "secret",
@@ -2695,20 +2956,12 @@ describe("admin global secrets", () => {
   });
 
   it("GET lists secrets that have no team prefix", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: {
-          app: {
-            secrets: [
-              { name: "ANTHROPIC_API_KEY", digest: "aaa", createdAt: "2026-01-01T00:00:00Z" },
-              { name: "ENG_DATABASE_URL",  digest: "bbb", createdAt: "2026-01-02T00:00:00Z" },
-              { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", createdAt: "2026-01-03T00:00:00Z" },
-            ],
-          },
-        },
-      }),
-    } as Response);
+    fakeFetch({ [`GET ${FLY_SECRETS}`]: { json: { secrets: [
+      { name: "ANTHROPIC_API_KEY", digest: "aaa", created_at: "2026-01-01" },
+      { name: "ENG_DATABASE_URL", digest: "bbb", created_at: "2026-01-02" },
+      { name: "CLAUDE_CODE_OAUTH_TOKEN", digest: "ccc", created_at: "2026-01-03" },
+      { name: "AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", digest: "ddd", created_at: "2026-01-04" },
+    ] } } }).install();
 
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2719,11 +2972,35 @@ describe("admin global secrets", () => {
     expect(body.map((s) => s.name)).toEqual(["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]);
   });
 
+  it.each(["AI_IMPLEMENT_MODEL_AUTH_PROTECTION_KEY", "ai_implement_model_auth_protection_key"])("protects reserved global key %s", async (name) => {
+    const fake = fakeFetch({}).install();
+    const token = await login("secret");
+    const set = await requestFlyGlobal("/api/global-secrets", "POST", token, { name, value: "evil" });
+    const unset = await requestFlyGlobal(`/api/global-secrets/${name}`, "DELETE", token);
+    expect(set.statusCode).toBe(400);
+    expect(unset.statusCode).toBe(400);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("DELETE missing global secret succeeds", async () => {
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/MISSING`]: { json: { version: 100 } } }).install();
+    const res = await requestFlyGlobal("/api/global-secrets/MISSING", "DELETE", await login("secret"));
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ deleted: true });
+  });
+
+  it.each([200, 422, 201])("never exposes set reply values (status %s)", async (status) => {
+    const marker = "SECRET_REPLY_MARKER";
+    const logs = [vi.spyOn(console, "error").mockImplementation(() => {}), vi.spyOn(console, "log").mockImplementation(() => {}), vi.spyOn(console, "warn").mockImplementation(() => {})];
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: status === 201 ? { status, text: marker } : { status, json: { version: 88, secrets: [{ value: marker }] } } }).install();
+    const res = await requestFlyGlobal("/api/global-secrets", "POST", await login("secret"), { name: "KEY", value: marker });
+    expect(res.statusCode).toBe(status === 200 ? 200 : 500);
+    expect(res.body).not.toContain(marker);
+    for (const log of logs) expect(log.mock.calls.map((args) => args.map(String).join(" ")).join("\n")).not.toContain(marker);
+  });
+
   it("POST sets a global secret", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { setSecrets: { release: { version: 5 } } } }),
-    } as Response);
+    fakeFetch({ [`POST ${FLY_SECRETS}`]: { json: { version: 5 } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets", "POST", token, {
@@ -2753,10 +3030,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE removes a global secret", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: { unsetSecrets: { release: { version: 6 } } } }),
-    } as Response);
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/ANTHROPIC_API_KEY`]: { json: { version: 6 } } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/ANTHROPIC_API_KEY", "DELETE", token);
@@ -2765,11 +3039,7 @@ describe("admin global secrets", () => {
   });
 
   it("DELETE returns 404 when Fly reports not found", async () => {
-    vi.mocked(fetch).mockResolvedValue({
-      ok: false,
-      text: async () => "could not find secret",
-      status: 422,
-    } as Response);
+    fakeFetch({ [`DELETE ${FLY_SECRETS}/NONEXISTENT`]: { status: 404 } }).install();
 
     const token = await login("secret");
     const res = await requestFlyGlobal("/api/global-secrets/NONEXISTENT", "DELETE", token);
@@ -2835,7 +3105,7 @@ describe("admin sessions", () => {
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
     log.appendLog({ issueId: "issue-s1", issueIdentifier: "ENG-7", issueTitle: "Mapped", teamKey: "ENG", repo: "org/repo", machineId: "machine-mapped" });
     log.appendLog({ issueId: "issue-s2", issueIdentifier: "ZZZ-1", issueTitle: "Unmapped", teamKey: "ZZZ", repo: "org/other", machineId: "machine-unmapped" });
-    const machine = (id: string) => ({ id, name: id, state: "started", region: "iad", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", config: {} as never });
+    const machine = (id: string) => ({ id, name: id, state: "started", region: "iad", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", config: { image: "registry.fly.io/test-sessions-app:latest" } });
     listMachinesMock.mockResolvedValueOnce([machine("machine-mapped"), machine("machine-unmapped"), machine("machine-orphan")]);
 
     const res = await requestWithConfig("/api/sessions", "GET", token, {
@@ -2915,6 +3185,16 @@ describe("admin machine logs", () => {
     expect(JSON.parse(res.body).error).toBe("Logs no longer available");
   });
 
+  it.each([401, 403])("returns a distinct 502 permission error when Fly returns %i", async (status) => {
+    fetchMachineLogsMock.mockRejectedValueOnce(new Error(`Failed to fetch logs for machine machine-abc (${status}): denied`));
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(502);
+    const error = JSON.parse(res.body).error as string;
+    expect(error).toMatch(/permission|credential/);
+    expect(error).not.toContain("no longer available");
+  });
+
   it("returns 500 on unexpected Fly API error", async () => {
     fetchMachineLogsMock.mockRejectedValueOnce(new Error("network timeout"));
     const token = await login("secret");
@@ -2949,7 +3229,7 @@ describe("admin job-detail endpoint", () => {
       issueId: "issue-detail",
       issueIdentifier: "ENG-99",
       issueTitle: "Detail test",
-      teamKey: "eng",
+      teamKey: "ENG",
       repo: "org/repo",
     });
     const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
@@ -2957,6 +3237,31 @@ describe("admin job-detail endpoint", () => {
     const body = JSON.parse(res.body);
     expect(body.job.id).toBe(id);
     expect(Array.isArray(body.steps)).toBe(true);
+  });
+
+  it.each(["restate", "legacy"] as const)("reports workflow ownership for a %s job", async (owner) => {
+    const token = await login("secret");
+    const dispatchId = `detail-${owner}`;
+    const admission = await import("../dispatch-admission.js");
+    expect(admission.acquire({
+      dispatchId,
+      mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "s", issueId: dispatchId },
+      kind: "implementation",
+      backend: "fly-machines",
+      lifecycleOwner: owner === "restate" ? { kind: owner, attemptId: "att-detail" } : { kind: owner },
+      cap: 5,
+    }).ok).toBe(true);
+    const id = log.appendLog({
+      issueId: dispatchId, issueIdentifier: "ENG-99", issueTitle: "Workflow",
+      teamKey: "ENG", repo: "org/repo", dispatchId, phase: "implementation",
+    });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.job.restate).toEqual(owner === "restate" ? { service: "ImplementationRun", key: dispatchId } : null);
+    expect(body.job.issueUrl).toBeNull();
+    expect(body.steps).toEqual([]);
   });
 
   it("resolves the job's issueUrl through the mapping's ticketing provider", async () => {
@@ -2983,7 +3288,7 @@ describe("admin filesystem issue detail endpoint", () => {
   ): Promise<T> {
     const previousMode = process.env.RUNNER_MODE;
     process.env.RUNNER_MODE = "local";
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "admin-fs-issue-"));
+    const dir = testDir("admin-fs-issue");
     try {
       const token = await login("secret");
       await request("/api/mappings", "POST", "secret", {
@@ -2993,18 +3298,10 @@ describe("admin filesystem issue detail endpoint", () => {
         ticketingProvider: "filesystem",
         ticketingConfig: { kind: "filesystem", directory: dir },
       }, token);
-      const { FilesystemProvider } = await import("../providers/filesystem.js");
-      const { initDispatchBreakerTable } = await import("../dispatch-breaker.js");
-      initDispatchBreakerTable();
-      const fsProvider = new FilesystemProvider(() => config.getMappings());
-      const registry = {
-        forMapping: async () => fsProvider,
-        forAllMappings: async () => [fsProvider],
-        invalidate: () => {},
-      } as unknown as ProviderRegistry;
+      const fsProvider = new modules.filesystemProvider.FilesystemProvider(() => config.getMappings());
+      const registry = makeRegistry({ provider: fsProvider });
       return await run({ dir, registry, token });
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
       if (previousMode === undefined) delete process.env.RUNNER_MODE;
       else process.env.RUNNER_MODE = previousMode;
     }
@@ -3018,6 +3315,38 @@ describe("admin filesystem issue detail endpoint", () => {
   it("requires auth to retry", async () => {
     const res = await request("/api/filesystem-issue/retry", "POST", "secret", { issueId: "filesystem:SAN2:SAN2-001" });
     expect(res.statusCode).toBe(401);
+  });
+
+  describe.each(["constructor", "toString", "__proto__"])("filesystem routes with inherited name %s", (scopeKey) => {
+    it.each(["details", "retry"])("keeps %s at 404 without inspecting the inherited mapping", async (route) => {
+      await withFilesystemProject(async ({ registry, token }) => {
+        // The old provider guard also returned 404 for Object.prototype values.
+        // Observe property access to prove inherited values are rejected before
+        // either route inspects them, rather than relying on that second guard.
+        const inspectInheritedMapping = vi.fn(() => undefined);
+        const inheritedMapping = Object.defineProperty({}, "ticketingProvider", {
+          get: inspectInheritedMapping,
+        });
+        const mappings = Object.assign(
+          Object.create({ [scopeKey]: inheritedMapping }),
+          config.getMappings(),
+        );
+        const getMappings = vi.spyOn(config, "getMappings").mockReturnValue(mappings);
+        try {
+          const issueId = `filesystem:${scopeKey}:SAN2-001`;
+          const result = route === "details"
+            ? await requestWithRegistry(`/api/filesystem-issue?issueId=${encodeURIComponent(issueId)}`, "GET", token, registry)
+            : await requestWithRegistry("/api/filesystem-issue/retry", "POST", token, registry, { issueId });
+          expect(result.statusCode).toBe(404);
+          expect(JSON.parse(result.body)).toEqual({
+            error: route === "details" ? "filesystem issue not found" : "Filesystem ticket not found",
+          });
+          expect(inspectInheritedMapping).not.toHaveBeenCalled();
+        } finally {
+          getMappings.mockRestore();
+        }
+      });
+    });
   });
 
   it("restores an archived failure once and retains the issue history", async () => {
@@ -3250,7 +3579,7 @@ describe("admin local job logs endpoint", () => {
 describe("admin dedup", () => {
   it("lists dedup entries", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-1", "TEAM", "T-1", "Test issue");
+    dedup.markDispatched("issue-1", "TEAM", "TEAM-1", "Test issue");
     const res = await request("/api/dedup", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     const entries = JSON.parse(res.body);
@@ -3260,16 +3589,48 @@ describe("admin dedup", () => {
 
   it("deletes a dedup entry", async () => {
     const token = await login("secret");
-    dedup.markDispatched("issue-del", "TEAM");
+    dedup.markDispatched("issue-del", "TEAM", "TEAM-2", "Dispatched issue");
     const del = await request("/api/dedup/issue-del", "DELETE", "secret", undefined, token);
     expect(del.statusCode).toBe(200);
     expect(dedup.isAlreadyDispatched("issue-del")).toBe(false);
   });
 });
 
+// A Linear team answering with `snapshot` beside a Jira team whose snapshot rejects (AII-1549).
+function oneTrackerFailing(snapshot: AIImplementSnapshot): ProviderRegistry {
+  config.upsertMapping("CORE", makeMapping({ owner: "org", repo: "core" }));
+  config.upsertMapping("ENG", makeMapping({
+    owner: "org",
+    repo: "eng",
+    ticketingProvider: "jira",
+    ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/eng" },
+  }));
+  const linear = makeProvider({ id: "linear", fetchAIImplementSnapshot: vi.fn(async () => snapshot) });
+  const jira = makeProvider({ id: "jira", fetchAIImplementSnapshot: vi.fn(async () => { throw new Error("Jira search failed (500)"); }) });
+  return makeRegistry({ providers: { linear, jira }, mappings: config.getMappings() });
+}
+
 describe("admin issues endpoint", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("answers 200 with the answering tracker's issues and names the tracker whose snapshot failed (AII-1549)", async () => {
+    const token = await login("secret");
+    const ready = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const registry = oneTrackerFailing({
+      readyForImplementation: [ready],
+      needsPlanning: [],
+      inProgressCountsByScope: { CORE: 1 },
+      parentsToFinalize: [],
+    });
+
+    const res = await requestWithRegistry("/api/issues", "GET", token, registry);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.issues.map((i: { identifier: string }) => i.identifier)).toEqual(["CORE-100"]);
+    expect(body.failedTrackers).toEqual([{ provider: "jira", error: "Jira search failed (500)" }]);
   });
 
   it("returns 401 without auth token", async () => {
@@ -3277,33 +3638,21 @@ describe("admin issues endpoint", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on provider failure", async () => {
+  it("answers 200 with no issues and names the tracker when the only provider fails (AII-1549)", async () => {
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("Linear API error: 401"),
     );
     const token = await login("secret");
     const res = await request("/api/issues", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(502);
-    expect(JSON.parse(res.body).error).toContain("Linear API error");
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.issues).toEqual([]);
+    expect(body.failedTrackers).toEqual([{ provider: "linear", error: "Linear API error: 401" }]);
   });
 
   it("returns 200 with shaped issues on success", async () => {
-    const ready: TicketIssue = {
-      id: "issue-1",
-      identifier: "CORE-100",
-      title: "Implement feature X",
-      description: null,
-      scopeKey: "CORE",
-      nativeStatus: "Todo (unstarted)",
-    };
-    const needsPlan: TicketIssue = {
-      id: "issue-2",
-      identifier: "CORE-50",
-      title: "Plan something",
-      description: null,
-      scopeKey: "CORE",
-      nativeStatus: "Backlog (backlog)",
-    };
+    const ready = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const needsPlan = makeIssue({ id: "issue-2", identifier: "CORE-50", scopeKey: "CORE" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [ready],
       needsPlanning: [needsPlan],
@@ -3329,8 +3678,8 @@ describe("admin issues endpoint", () => {
   it("resolves issueUrl through the team's ticketing provider, null for unmapped teams", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
-    const mapped: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Mapped", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
-    const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "Unmapped", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
+    const mapped = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const unmapped = makeIssue({ id: "issue-2", identifier: "ZZZ-1", scopeKey: "ZZZ" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [mapped],
       needsPlanning: [unmapped],
@@ -3414,30 +3763,44 @@ describe("admin blockers endpoint", () => {
     vi.restoreAllMocks();
   });
 
+  it("answers 200 with the answering tracker's blockers and names the tracker whose snapshot failed (AII-1549)", async () => {
+    const token = await login("secret");
+    // A team with no mapping is the simplest blocker to produce.
+    const unmapped = makeIssue({ identifier: "ZZZ-1", scopeKey: "ZZZ" });
+    const registry = oneTrackerFailing({
+      readyForImplementation: [unmapped],
+      needsPlanning: [],
+      inProgressCountsByScope: {},
+      parentsToFinalize: [],
+    });
+
+    const res = await requestWithRegistry("/api/blockers", "GET", token, registry);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers.map((b: { issueIdentifier: string; reason: string }) => [b.issueIdentifier, b.reason])).toEqual([["ZZZ-1", "no-mapping"]]);
+    expect(body.failedTrackers).toEqual([{ provider: "jira", error: "Jira search failed (500)" }]);
+  });
+
   it("returns 401 without auth token", async () => {
     const res = await request("/api/blockers", "GET", "secret");
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on provider failure", async () => {
+  it("answers 200 with no blockers and names the tracker when the only provider fails (AII-1549)", async () => {
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("boom"),
     );
     const token = await login("secret");
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
-    expect(res.statusCode).toBe(502);
-    expect(JSON.parse(res.body).error).toContain("boom");
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers).toEqual([]);
+    expect(body.failedTrackers).toEqual([{ provider: "linear", error: "boom" }]);
   });
 
   it("returns 200 with shape — no-mapping blocker when issue team has no mapping", async () => {
-    const issue: TicketIssue = {
-      id: "issue-1",
-      identifier: "CORE-100",
-      title: "Implement feature X",
-      description: null,
-      scopeKey: "CORE",
-      nativeStatus: "Todo (unstarted)",
-    };
+    const issue = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [issue],
       needsPlanning: [],
@@ -3456,6 +3819,36 @@ describe("admin blockers endpoint", () => {
     expect(body.totals.issues).toBe(1);
   });
 
+  it("lists a parked issue as parked for the phase it would run next, and no other phase", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
+    // Planning and implementation park only through the breaker: the third failed run in a row parks the phase.
+    const { recordDispatchFailure } = modules.dispatchBreaker;
+    const park = (issueId: string, phase: string) => {
+      for (let run = 0; run < 3; run++) recordDispatchFailure(issueId, phase, "failure");
+    };
+    const mk = (id: string, identifier: string) => makeIssue({ id, identifier, scopeKey: "CORE" });
+    park("impl-1", "implementation");
+    park("plan-1", "planning");
+    park("plan-2", "implementation"); // wrong phase for a needsPlanning issue
+    dedup.markDispatched("impl-1", "CORE", "CORE-1", "CORE-1"); // parked wins over dedup
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [mk("impl-1", "CORE-1")],
+      needsPlanning: [mk("plan-1", "CORE-2"), mk("plan-2", "CORE-3")],
+      inProgressCountsByScope: {},
+      parentsToFinalize: [],
+    });
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.blockers.map((b: { issueIdentifier: string; reason: string }) => [b.issueIdentifier, b.reason])).toEqual([
+      ["CORE-1", "parked"],
+      ["CORE-2", "parked"],
+    ]);
+    expect(body.blockers[0].detail).toContain("Parked after 3 failed runs");
+    expect(body.totals.byReason.parked).toBe(2);
+  });
+
   it("lists a Linear issue whose key belongs to a Jira mapping as no-mapping, and keeps it off /api/issues", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", {
@@ -3463,7 +3856,7 @@ describe("admin blockers endpoint", () => {
       ticketingProvider: "jira",
       ticketingConfig: { kind: "jira", jql: "project = ENG", repoFieldValue: "org/eng" },
     }, token);
-    const linearIssue: TicketIssue = { id: "lin-1", identifier: "ENG-7", title: "Linear issue", description: null, scopeKey: "ENG", nativeStatus: "Todo" };
+    const linearIssue = makeIssue({ identifier: "ENG-7" });
     const snapshot = { readyForImplementation: [linearIssue], needsPlanning: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValue(snapshot);
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
@@ -3484,9 +3877,9 @@ describe("admin blockers endpoint", () => {
   it("resolves issueUrl through the team's ticketing provider; a no-mapping blocker has none", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", planningWorkflowFile: "claude-plan.yml" }, token);
-    const dedupBlocked: TicketIssue = { id: "issue-1", identifier: "CORE-100", title: "Already dispatched", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
-    const unmapped: TicketIssue = { id: "issue-2", identifier: "ZZZ-1", title: "No mapping", description: null, scopeKey: "ZZZ", nativeStatus: "Todo" };
-    dedup.markDispatched("issue-1", "TEAM", "CORE-100", "Already dispatched");
+    const dedupBlocked = makeIssue({ identifier: "CORE-100", scopeKey: "CORE" });
+    const unmapped = makeIssue({ id: "issue-2", identifier: "ZZZ-1", scopeKey: "ZZZ" });
+    dedup.markDispatched("issue-1", "CORE", "CORE-100", "Already dispatched");
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [dedupBlocked, unmapped],
       needsPlanning: [],
@@ -3506,8 +3899,7 @@ describe("admin blockers endpoint", () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
 
-    const admission = await import("../dispatch-admission.js");
-    const acquired = admission.acquire({
+    const acquired = modules.dispatchAdmission.acquire({
       dispatchId: "res-core-1",
       mappingKey: "CORE",
       scope: { kind: "issue", issueScope: "CORE", issueId: "issue-held" },
@@ -3518,7 +3910,7 @@ describe("admin blockers endpoint", () => {
     });
     expect(acquired.ok).toBe(true);
 
-    const candidate: TicketIssue = { id: "issue-2", identifier: "CORE-2", title: "Needs a slot", description: null, scopeKey: "CORE", nativeStatus: "Todo" };
+    const candidate = makeIssue({ identifier: "CORE-2", scopeKey: "CORE" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [candidate],
       needsPlanning: [],
@@ -3541,8 +3933,7 @@ describe("admin blockers endpoint", () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "CORE", owner: "org", repo: "core", maxInProgressAiIssues: 1, planningWorkflowFile: "claude-plan.yml" }, token);
 
-    const admission = await import("../dispatch-admission.js");
-    const acquired = admission.acquire({
+    const acquired = modules.dispatchAdmission.acquire({
       dispatchId: "res-core-kg",
       mappingKey: "CORE",
       scope: { kind: "issue", issueScope: "CORE", issueId: "issue-kg" },
@@ -3664,7 +4055,7 @@ describe("admin log", () => {
 
 describe("classifyTemplate", () => {
   it("flags a body that curls api.linear.app/graphql with LINEAR_API_KEY as stale", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     const stale = `
       Post comments to Linear:
       curl -X POST https://api.linear.app/graphql \\
@@ -3675,21 +4066,21 @@ describe("classifyTemplate", () => {
   });
 
   it("flags a body with only api.linear.app/graphql but no LINEAR_API_KEY as current", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     // Mention of the URL alone (e.g. in a comment or doc) isn't enough.
     const body = "// Background: this used to call api.linear.app/graphql before runner-callback.";
     expect(classifyTemplate(body)).toBe("current");
   });
 
   it("flags a body with only LINEAR_API_KEY but no api.linear.app/graphql as current", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     // env var mentioned somewhere without a direct curl.
     const body = "LINEAR_API_KEY is set on the runner for other reasons.";
     expect(classifyTemplate(body)).toBe("current");
   });
 
   it("treats a body using the ai-output/comments convention as current", async () => {
-    const { classifyTemplate } = await import("../admin.js");
+    const { classifyTemplate } = admin;
     const body = `
       Write planning comments to ai-output/comments/01-analysis.md.
       Do NOT post to Linear directly.
@@ -3723,6 +4114,16 @@ describe("async sync on mapping upsert", () => {
     const res = await request("/api/mappings/MAN/sync-workflows", "POST", "secret", undefined, token);
     expect(res.statusCode).toBe(202);
     expect(typeof JSON.parse(res.body).syncJobId).toBe("number");
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("manual sync-workflows rejects inherited mapping %s without queuing work", async (teamKey) => {
+    const token = await login("secret");
+    const jobsBefore = dedup.getDb().prepare("SELECT * FROM workflow_sync_queue").all();
+    const res = await request(`/api/mappings/${teamKey}/sync-workflows`, "POST", "secret", undefined, token);
+
+    expect.soft(res.statusCode).toBe(404);
+    expect.soft(JSON.parse(res.body)).toEqual({ error: "Team not found" });
+    expect(dedup.getDb().prepare("SELECT * FROM workflow_sync_queue").all()).toEqual(jobsBefore);
   });
 
   it("manual sync-workflows returns 404 for an unknown team", async () => {
@@ -3823,27 +4224,40 @@ describe("github-install-state endpoint", () => {
   });
 });
 
+/** A fake `SelfDeploy` ingress client: each method is a spy a test can override. */
+function fakeSelfDeploy(over: Partial<SelfDeployClient> = {}): SelfDeployClient {
+  return {
+    releaseUnownedHold: vi.fn(async () => ({ released: true })),
+    start: vi.fn(async () => ({ deployId: "d1", commit: "abc1234", image: "registry.fly.io/app:testing-abc1234", alreadyActive: false })),
+    cancel: vi.fn(async () => ({ cancelled: true })),
+    status: vi.fn(async () => ({ deploy: null, options: { applyFlyToml: false } })),
+    setOptions: vi.fn(async (options) => ({ ok: true as const, options })),
+    ...over,
+  };
+}
+const DEPLOY_TARGET = { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" };
+
 describe("POST /api/deploy", () => {
   // The shared harness never passes deps, which is itself the 501 case; the rest need
-  // a stubbed starter, so the route is exercised without touching Fly or GitHub.
+  // a fake ingress client, so the route is exercised without touching Restate, Fly or GitHub.
   async function deployRequest(
     token: string,
     deps: AdminModule.AdminDeps,
+    url = "/api/deploy",
   ): Promise<{ statusCode: number; body: string }> {
-    const req = new MockRequest("/api/deploy", "POST", { authorization: `Bearer ${token}` }, undefined);
+    const req = new MockRequest(url, "POST", { authorization: `Bearer ${token}` }, undefined);
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
+  const adminToken = () => adminSession.createSession({ email: "ada@eudoxus.ai", sub: "google|ada", provider: "google", name: "Ada" });
 
-  it("rejects an unauthenticated request before consulting the starter", async () => {
-    let called = false;
-    const res = await deployRequest("not-a-session", {
-      startDeploy: async () => { called = true; return { started: true, commit: "abc1234" }; },
-    });
+  it("rejects an unauthenticated request before consulting SelfDeploy", async () => {
+    const selfDeploy = fakeSelfDeploy();
+    const res = await deployRequest("not-a-session", { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
     expect(res.statusCode).toBe(401);
-    expect(called).toBe(false);
+    expect(selfDeploy.start).not.toHaveBeenCalled();
   });
 
   it("answers 501 when the orchestrator is not configured to deploy itself", async () => {
@@ -3852,40 +4266,71 @@ describe("POST /api/deploy", () => {
     expect(res.statusCode).toBe(501);
   });
 
-  it("answers 202 with the commit when a deploy starts", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => ({ started: true, commit: "abc1234" }),
-    });
+  it("starts the watched branch as the admin's email and answers 202 with the deploy", async () => {
+    const selfDeploy = fakeSelfDeploy();
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
     expect(res.statusCode).toBe(202);
-    expect(JSON.parse(res.body).deploying).toBe("abc1234");
+    expect(JSON.parse(res.body)).toEqual({ deployId: "d1", commit: "abc1234", image: "registry.fly.io/app:testing-abc1234", alreadyActive: false });
+    expect(selfDeploy.start).toHaveBeenCalledWith({ branch: "testing", requestedBy: "ada@eudoxus.ai" });
   });
 
-  it("answers 409 when a deploy is already running", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => ({ started: false, reason: "deploy-in-progress" }),
-    });
-    expect(res.statusCode).toBe(409);
+  it("returns the same deployId with alreadyActive on a second call while active", async () => {
+    const active = { deployId: "d1", commit: "abc1234", image: "img", alreadyActive: true };
+    const selfDeploy = fakeSelfDeploy({ start: vi.fn(async () => active) });
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toMatchObject({ deployId: "d1", alreadyActive: true });
   });
 
-  it("answers 503 when HEAD cannot be resolved", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => ({ started: false, reason: "head-unknown" }),
-    });
-    expect(res.statusCode).toBe(503);
+  it.each([
+    ["head-unknown", 503, { error: "head-unknown" }],
+    ["image-not-published", 409, { error: "image-not-published" }],
+    ["not-configured", 501, { error: "not-configured" }],
+  ] as const)("maps %s to %i", async (reason, status, body) => {
+    const selfDeploy = fakeSelfDeploy({ start: vi.fn(async () => ({ reason })) });
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
+    expect(res.statusCode).toBe(status);
+    expect(JSON.parse(res.body)).toEqual(body);
+  });
+
+  it("refuses a watched ref with no published image channel instead of failing input validation", async () => {
+    const selfDeploy = fakeSelfDeploy();
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: { ...DEPLOY_TARGET, branch: "v1.2.3" } });
+    expect(res.statusCode).toBe(400);
+    expect(selfDeploy.start).not.toHaveBeenCalled();
   });
 
   it("answers 500 without echoing the error text", async () => {
-    const token = await login("secret");
-    const res = await deployRequest(token, {
-      startDeploy: async () => { throw new Error("kg_token=super-secret"); },
-    });
+    const selfDeploy = fakeSelfDeploy({ start: vi.fn(async () => { throw new Error("kg_token=super-secret"); }) });
+    const res = await deployRequest(adminToken(), { selfDeploy, selfDeployTarget: DEPLOY_TARGET });
     expect(res.statusCode).toBe(500);
     // Admin 5xx bodies leaking raw error text is a known defect elsewhere; this route
     // must not add to it, and the thrown message here would carry a build secret.
     expect(res.body).not.toContain("super-secret");
+  });
+
+  describe("POST /api/deploy-cancel", () => {
+    const cancel = (token: string, deps: AdminModule.AdminDeps) => deployRequest(token, deps, "/api/deploy-cancel");
+
+    it("answers 403 to a user-role session without calling SelfDeploy", async () => {
+      const selfDeploy = fakeSelfDeploy();
+      const user = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+      const res = await cancel(user, { selfDeploy });
+      expect(res.statusCode).toBe(403);
+      expect(selfDeploy.cancel).not.toHaveBeenCalled();
+    });
+
+    it("calls cancel with the admin's email and returns its answer unchanged", async () => {
+      const selfDeploy = fakeSelfDeploy({ cancel: vi.fn(async () => ({ cancelled: false, reason: "too-late" })) });
+      const res = await cancel(adminToken(), { selfDeploy });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ cancelled: false, reason: "too-late" });
+      expect(selfDeploy.cancel).toHaveBeenCalledWith({ requestedBy: "ada@eudoxus.ai" });
+    });
+
+    it("answers 501 when self-deploy is not configured", async () => {
+      expect((await cancel(adminToken(), {})).statusCode).toBe(501);
+    });
   });
 });
 
@@ -3920,6 +4365,46 @@ describe("POST /api/tools/<name>", () => {
       name: "Reader",
     });
   }
+
+  it("answers 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
+    const { setDeployHold, clearDeployHold } = modules.deployHold;
+    const { callTool } = modules.toolsClient;
+    const fake = fakeFetch({});
+    setDeployHold();
+    try {
+      const token = await login("secret");
+      const res = await toolRequest(token, { args: {} }, {
+        callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fake.fetch }),
+      });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: expect.any(Number) });
+      expect(fake.calls).toEqual([]);
+    } finally {
+      clearDeployHold();
+    }
+  });
+
+  it.each([
+    ["a refused connection", () => { throw new Error("ECONNREFUSED"); }],
+    ["a 5xx answer", () => new Response("boom", { status: 503 })],
+  ])("answers 503 restate-unavailable with no hold and %s", async (_label, reply) => {
+    const { callTool } = modules.toolsClient;
+    const fake = fakeFetch({ "POST /orchestratorTools/get_tenant_health": reply });
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, {
+      callTool: (name, args, caller) => callTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => true, restateReady: () => true }),
+    });
+    expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual(["POST /orchestratorTools/get_tenant_health"]);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
+
+  it("answers 503 restate-unavailable when callTool reports an outage", async () => {
+    const token = await login("secret");
+    const res = await toolRequest(token, { args: {} }, { callTool: async () => ({ status: "unavailable" }) });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+  });
 
   it("rejects an unauthenticated request with the route's existing 401, without calling the tool", async () => {
     const called = vi.fn();
@@ -4000,7 +4485,7 @@ describe("POST /api/tools/<name>", () => {
     expect(captured).toEqual({
       name: "get_tenant_health",
       args: { foo: "bar" },
-      caller: { kind: "human", email: null, role: "admin" },
+      caller: { kind: "human", email: null, role: "admin", grants: [] },
     });
   });
 
@@ -4026,7 +4511,7 @@ describe("POST /api/tools/<name>", () => {
       },
     }, "some_write_tool");
     expect(res.statusCode).toBe(200);
-    expect(capturedCaller).toEqual({ kind: "human", email: "reader@eudoxus.ai", role: "user" });
+    expect(capturedCaller).toEqual({ kind: "human", email: "reader@eudoxus.ai", role: "user", grants: [] });
     expect(JSON.parse(res.body)).toEqual({
       content: [{ type: "text", text: "forbidden: some_write_tool requires the admin role" }],
       isError: true,
@@ -4150,11 +4635,115 @@ describe("POST /api/tools/<name>", () => {
   });
 });
 
+describe("control-plane token on /api (AII-1514)", () => {
+  const ISSUER = "https://cp.builddown.test";
+  const BASE_URL = "https://orch-a.example.com";
+  let signingKey: CryptoKey;
+  let cpModule: typeof import("../control-plane-token.js");
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    cpModule = await import("../control-plane-token.js");
+    cpModule.resetControlPlaneTokenCache();
+    const pair = await generateKeyPair("ES256");
+    signingKey = pair.privateKey;
+    const jwk = { ...(await exportJWK(pair.publicKey)), kid: "k1", alg: "ES256", use: "sig" };
+    fakeFetch({
+      "GET /.well-known/openid-configuration": { json: { jwks_uri: `${ISSUER}/jwks` } },
+      "GET /jwks": { json: { keys: [jwk] } },
+    }).install();
+    saved = { i: process.env.BUILDDOWN_OIDC_ISSUER, b: process.env.OAUTH_REDIRECT_BASE_URL };
+    process.env.BUILDDOWN_OIDC_ISSUER = ISSUER;
+    process.env.OAUTH_REDIRECT_BASE_URL = BASE_URL;
+  });
+
+  afterEach(() => {
+    if (saved.i === undefined) delete process.env.BUILDDOWN_OIDC_ISSUER;
+    else process.env.BUILDDOWN_OIDC_ISSUER = saved.i;
+    if (saved.b === undefined) delete process.env.OAUTH_REDIRECT_BASE_URL;
+    else process.env.OAUTH_REDIRECT_BASE_URL = saved.b;
+  });
+
+  async function cpToken(aud = BASE_URL): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    return new SignJWT({ scope: "orchestrator:read" })
+      .setProtectedHeader({ alg: "ES256", kid: "k1" })
+      .setIssuer(ISSUER)
+      .setAudience(aud)
+      .setIssuedAt(now)
+      .setExpirationTime(now + 300)
+      .sign(signingKey);
+  }
+
+  async function call(url: string, method: string, tokenValue: string, deps: AdminModule.AdminDeps = {}) {
+    const req = new MockRequest(url, method, { authorization: `Bearer ${tokenValue}` }, method === "POST" ? JSON.stringify({ args: {} }) : undefined);
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("runs a tool as the read-only service caller", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", await cpToken(), { callTool });
+    expect(res.statusCode).toBe(200);
+    expect(callTool).toHaveBeenCalledWith("get_tenant_health", {}, { kind: "service", email: null, role: "user", grants: [] }, undefined);
+  });
+
+  it("hands a write tool the user-role service caller, which the tool() wrapper refuses", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    await call("/api/tools/set_runner_mode", "POST", await cpToken(), { callTool });
+    expect(callTool.mock.calls[0]?.[2]).toEqual({ kind: "service", email: null, role: "user", grants: [] });
+  });
+
+  it("answers 401 for a token for another orchestrator, without running the tool", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", await cpToken("https://orch-b.example.com"), { callTool });
+    expect(res.statusCode).toBe(401);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["/api/session-identity", "GET"],
+    ["/api/mappings", "GET"],
+    ["/api/mappings", "POST"],
+    ["/api/deploy", "POST"],
+    ["/api/deploy-cancel", "POST"],
+    ["/api/tools/get_tenant_health", "GET"],
+  ])("answers 401 to the token on %s %s", async (url, method) => {
+    const res = await call(url, method, await cpToken());
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("still accepts an admin session sent as a Bearer on the tools route", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", await login("secret"), { callTool });
+    expect(res.statusCode).toBe(200);
+    expect(callTool.mock.calls[0]?.[2]).toMatchObject({ kind: "human", role: "admin" });
+  });
+
+  it("answers 401, not 500, for a malformed percent-encoded tool name with a Bearer header", async () => {
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/%E0", "POST", "x", { callTool });
+    expect(res.statusCode).toBe(401);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("ignores the token when BUILDDOWN_OIDC_ISSUER is unset", async () => {
+    const t = await cpToken();
+    delete process.env.BUILDDOWN_OIDC_ISSUER;
+    const callTool = vi.fn<NonNullable<AdminModule.AdminDeps["callTool"]>>(async () => ({ status: "ok" as const, content: [] }));
+    const res = await call("/api/tools/get_tenant_health", "POST", t, { callTool });
+    expect(res.statusCode).toBe(401);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+});
+
 describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
   const ATTEMPT_DETAIL: AdminModule.ReviewFixAttemptDetail = {
     attemptId: "attempt-1",
     owner: { kind: "restate", attemptId: "attempt-1" },
-    execution: { githubRunId: "123", githubRunAttempt: 1 },
+    execution: { backend: "github-actions", githubRunId: "123", githubRunAttempt: 1 },
     deadlineAt: 1_700_000_000_000,
     pendingFeedback: false,
     snapshot: { taskText: "fix the thing", findings: [{ findingKey: "f1", version: 2 }] },
@@ -4232,28 +4821,38 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
 
   describe("GET /api/review-fix/attempts/:attemptId", () => {
     it("is reachable by a non-admin user session (reads are open, scope is enforced inside the facade)", async () => {
+      // The production facade answers not_found to any caller who is not an admin (createReviewFixAdminFacade).
+      const getAttempt = vi.fn(async (_attemptId: string, caller: { role: string }) =>
+        caller.role === "admin" ? { status: "ok" as const, attempt: ATTEMPT_DETAIL } : { status: "not_found" as const });
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1",
         "GET",
         userSession(),
-        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+        { reviewFixAttempts: fakeFacade({ getAttempt }) },
       );
-      expect(res.statusCode).toBe(200);
+      expect(getAttempt).toHaveBeenCalledWith("attempt-1", expect.objectContaining({ role: "user" }));
+      expect(res.statusCode).toBe(404);
     });
 
-    it("returns the attempt detail with explicit evidenceComplete/terminationConfirmed fields, never omitted", async () => {
+    it.each<AdminModule.ReviewFixAttemptExecutionRef | null>([
+      { backend: "github-actions", githubRunId: "9001", githubRunAttempt: 2 },
+      { backend: "fly-machines", runRef: "machine-123" },
+      { backend: "local-docker", runRef: "container-123" },
+      null,
+    ])("returns execution %j with explicit evidence fields", async (execution) => {
+      const detail = { ...ATTEMPT_DETAIL, execution };
       const token = await login("secret");
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1",
         "GET",
         token,
-        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: ATTEMPT_DETAIL }) }) },
+        { reviewFixAttempts: fakeFacade({ getAttempt: async () => ({ status: "ok", attempt: detail }) }) },
       );
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body).toHaveProperty("evidenceComplete", false);
       expect(body).toHaveProperty("terminationConfirmed", false);
-      expect(body).toEqual(ATTEMPT_DETAIL);
+      expect(body).toEqual(detail);
     });
 
     it("maps a facade \"unavailable\" result to 503 restate-unavailable", async () => {
@@ -4463,7 +5062,7 @@ describe("Review-fix attempt evidence + recovery actions (AII-806)", () => {
 
     it("passes the caller-supplied execution reference to the facade and answers 202 on a verified match", async () => {
       const token = await login("secret");
-      let capturedExecution: AdminModule.ReviewFixAttemptExecutionRef | undefined;
+      let capturedExecution: AdminModule.ReviewFixAttemptAdoptInput | undefined;
       const res = await requestWithDeps(
         "/api/review-fix/attempts/attempt-1/adopt",
         "POST",
@@ -4626,10 +5225,32 @@ describe("GET /api/deployment-status", () => {
 
   it("reports configured when a starter is injected", async () => {
     const token = await login("secret");
-    const res = await statusRequest(token, {
-      startDeploy: async () => ({ started: true, commit: "abc1234" }),
-    });
+    const res = await statusRequest(token, { selfDeploy: fakeSelfDeploy() });
     expect(res.body.configured).toBe(true);
+  });
+
+  it("includes SelfDeploy's status, and null when it is not configured", async () => {
+    const token = await login("secret");
+    const status = { deploy: null, options: { applyFlyToml: true } };
+    const res = await statusRequest(token, { selfDeploy: fakeSelfDeploy({ status: vi.fn(async () => status) }) });
+    expect(res.body.selfDeploy).toEqual(status);
+    expect((await statusRequest(token, {})).body.selfDeploy).toBeNull();
+  });
+
+  it("still answers when the SelfDeploy status call fails", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, { selfDeploy: fakeSelfDeploy({ status: vi.fn(async () => { throw new Error("down"); }) }) });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.selfDeploy).toBeNull();
+  });
+
+  it("reports applyFlyTomlAllowed only while FLY_IMAGE_APP is unset", async () => {
+    const token = await login("secret");
+    vi.stubEnv("FLY_IMAGE_APP", "");
+    expect((await statusRequest(token)).body.applyFlyTomlAllowed).toBe(true);
+    vi.stubEnv("FLY_IMAGE_APP", "owned-images");
+    expect((await statusRequest(token)).body.applyFlyTomlAllowed).toBe(false);
+    vi.unstubAllEnvs();
   });
 
   it("passes an unresolved availability through as null, never as false", async () => {
@@ -4700,8 +5321,7 @@ describe("GET /api/deployment-status", () => {
   it("reports the hold and what is still executing", async () => {
     // Held with work executing is the draining state the page names, and the counts
     // come from the same inventory the deploy itself waits on.
-    const { setDeployHold } = await import("../deploy-hold.js");
-    setDeployHold();
+    modules.deployHold.setDeployHold();
     const { id } = queue.enqueueWorkflowSync("ENG");
     queue.updateWorkflowSyncStatus(id, "running");
 
@@ -4720,9 +5340,8 @@ describe("GET /api/deployment-status", () => {
   it("reports when the current deploy started, so the page can show elapsed time", async () => {
     // An eight-minute build with no moving number is indistinguishable from a hang.
     // The clock belongs to the hold, so it arrives on the same read as `held`.
-    const { setDeployHold } = await import("../deploy-hold.js");
     const before = Date.now();
-    setDeployHold();
+    modules.deployHold.setDeployHold();
 
     const token = await login("secret");
     const res = await statusRequest(token);
@@ -4747,30 +5366,28 @@ describe("GET /api/deployment-status", () => {
   });
 
   it("reports the last acted commit, so the page knows what automatic deploying already handled", async () => {
-    const { setLastActedCommit } = await import("../deploy-policy.js");
     const token = await login("secret");
 
     expect((await statusRequest(token)).body.lastActedCommit).toBeNull();
-    setLastActedCommit("def5678");
+    modules.deployPolicy.setLastActedCommit("def5678");
     expect((await statusRequest(token)).body.lastActedCommit).toBe("def5678");
   });
 
   it("reports the last deploy outcome, so the page can render deployed-ok and build-failed cards", async () => {
-    const { recordDeployOutcome } = await import("../deploy-notify.js");
     const token = await login("secret");
 
     expect((await statusRequest(token)).body.lastDeployOutcome).toBeNull();
-    recordDeployOutcome({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
+    modules.deployNotify.recordDeployOutcome({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
     const body = (await statusRequest(token)).body;
     expect(body.lastDeployOutcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
   });
 });
 
 describe("POST /api/deploy-policy", () => {
-  async function policyRequest(token: string, body: unknown): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+  async function policyRequest(token: string, body: unknown, deps: AdminModule.AdminDeps = {}): Promise<{ statusCode: number; body: Record<string, unknown> }> {
     const req = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${token}` }, JSON.stringify(body));
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
     await res.done;
     return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
   }
@@ -4786,6 +5403,30 @@ describe("POST /api/deploy-policy", () => {
     const token = await login("secret");
     const res = await policyRequest(token, { autoDeploy: "false" });
     expect(res.statusCode).toBe(400);
+  });
+
+  it("stores applyFlyToml in SelfDeploy state, not in SQLite", async () => {
+    const token = await login("secret");
+    const selfDeploy = fakeSelfDeploy();
+    const res = await policyRequest(token, { applyFlyToml: true }, { selfDeploy });
+    expect(res.statusCode).toBe(200);
+    expect(selfDeploy.setOptions).toHaveBeenCalledWith({ applyFlyToml: true });
+  });
+
+  it("answers 409 apply-fly-toml-refused when SelfDeploy refuses, leaving the rest of the policy alone", async () => {
+    const token = await login("secret");
+    const selfDeploy = fakeSelfDeploy({ setOptions: vi.fn(async () => ({ ok: false as const, reason: "apply-fly-toml-refused" as const })) });
+    const res = await policyRequest(token, { applyFlyToml: true, autoDeploy: true }, { selfDeploy });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual({ error: "apply-fly-toml-refused" });
+    expect(modules.deployPolicy.getDeployPolicy().autoDeploy).toBe(false);
+  });
+
+  it("rejects a non-boolean applyFlyToml", async () => {
+    const token = await login("secret");
+    const selfDeploy = fakeSelfDeploy();
+    expect((await policyRequest(token, { applyFlyToml: "true" }, { selfDeploy })).statusCode).toBe(400);
+    expect(selfDeploy.setOptions).not.toHaveBeenCalled();
   });
 
   it("returns the full policy so the page renders the server's view", async () => {
@@ -4813,6 +5454,119 @@ describe("POST /api/deploy-policy", () => {
     admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
     await res.done;
     expect(JSON.parse(res.body)).toMatchObject({ autoDeploy: true, notifyAvailable: true });
+  });
+});
+
+describe("/api/retention", () => {
+  async function retentionRequest(
+    token: string,
+    method: "GET" | "POST",
+    body: unknown,
+    apply = vi.fn(async (_days: number) => ({ applied: ["vol_1"], skipped: "" })),
+  ): Promise<{ statusCode: number; body: Record<string, unknown>; apply: typeof apply }> {
+    const { retention } = modules;
+    const deps: Parameters<typeof admin.handleAdminRequest>[4] = {
+      retention: {
+        getRestateDays: retention.getRestateRetentionDays,
+        setRestateDays: retention.setRestateRetentionDays,
+        getVolumeDays: retention.getVolumeSnapshotRetentionDays,
+        setVolumeDays: retention.setVolumeSnapshotRetentionDays,
+        applyVolume: apply,
+        default: retention.RESTATE_RETENTION_DAYS_DEFAULT,
+        min: retention.RESTATE_RETENTION_DAYS_MIN,
+        max: retention.RESTATE_RETENTION_DAYS_MAX,
+      },
+    };
+    const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {}, apply };
+  }
+
+  it("answers 501 on GET and POST when retention is not configured", async () => {
+    const token = await login("secret");
+    for (const method of ["GET", "POST"] as const) {
+      const req = new MockRequest("/api/retention", method, { authorization: `Bearer ${token}` }, method === "POST" ? JSON.stringify({ restate: 10 }) : undefined);
+      const res = new MockResponse();
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+      await res.done;
+      expect(res.statusCode).toBe(501);
+    }
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    expect((await retentionRequest("not-a-session", "POST", { restate: 10 })).statusCode).toBe(401);
+  });
+
+  it("refuses a non-admin session as /api/deploy-policy does", async () => {
+    const user = adminSession.createSession({ email: "reader@eudoxus.ai", sub: "google|reader", provider: "google", name: "Reader" });
+    const policy = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${user}` }, JSON.stringify({ autoDeploy: true }));
+    const policyRes = new MockResponse();
+    admin.handleAdminRequest(policy as never, policyRes as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await policyRes.done;
+
+    const res = await retentionRequest(user, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(policyRes.statusCode);
+    expect(res.statusCode).toBe(403);
+    expect(res.apply).not.toHaveBeenCalled();
+  });
+
+  it("answers the fresh-database shape on GET", async () => {
+    const token = await login("secret");
+    const res = await retentionRequest(token, "GET", undefined);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      restate: { days: 14, appliesAt: "next deploy or restart" },
+      volume: { days: 14, lastApplied: null },
+      default: 14,
+      min: 1,
+      max: 60,
+    });
+  });
+
+  it("answers 400 naming restate_retention_days for 61 and stores nothing", async () => {
+    const token = await login("secret");
+    const { retention } = modules;
+    const res = await retentionRequest(token, "POST", { restate: 61 });
+    expect(res.statusCode).toBe(400);
+    expect(String(res.body.error)).toContain("restate_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+  });
+
+  it("stores neither value when one of two is bad, and rejects non-integers", async () => {
+    const token = await login("secret");
+    const { retention } = modules;
+    const mixed = await retentionRequest(token, "POST", { restate: 10, volume: 99 });
+    expect(mixed.statusCode).toBe(400);
+    expect(String(mixed.body.error)).toContain("volume_snapshot_retention_days");
+    expect(retention.getRestateRetentionDays()).toBe(14);
+    expect(mixed.apply).not.toHaveBeenCalled();
+    expect((await retentionRequest(token, "POST", { restate: "10" })).statusCode).toBe(400);
+    expect((await retentionRequest(token, "POST", { volume: 2.5 })).statusCode).toBe(400);
+  });
+
+  it("stores volume, applies it once, and reports lastApplied", async () => {
+    const token = await login("secret");
+    const { retention } = modules;
+    const res = await retentionRequest(token, "POST", { volume: 20 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getVolumeSnapshotRetentionDays()).toBe(20);
+    expect(res.apply).toHaveBeenCalledTimes(1);
+    expect(res.apply).toHaveBeenCalledWith(20);
+    const volume = res.body.volume as { days: number; lastApplied: { at: number; applied: string[]; skipped: string } };
+    expect(volume.days).toBe(20);
+    expect(volume.lastApplied).toMatchObject({ applied: ["vol_1"], skipped: "" });
+    expect(typeof volume.lastApplied.at).toBe("number");
+  });
+
+  it("stores restate without applying the volume", async () => {
+    const token = await login("secret");
+    const { retention } = modules;
+    const res = await retentionRequest(token, "POST", { restate: 10 });
+    expect(res.statusCode).toBe(200);
+    expect(retention.getRestateRetentionDays()).toBe(10);
+    expect(res.apply).toHaveBeenCalledTimes(0);
   });
 });
 
@@ -4889,6 +5643,12 @@ describe("per-page grants", () => {
       expect(res.statusCode).toBe(200);
     });
 
+    it("lets a reports-granted user read /api/log for the attribution card", async () => {
+      accessGrants.savePageGrants(["reports"], "ada@eudoxus.ai");
+      const res = await request("/api/log?since=1", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(200);
+    });
+
     it("leaves an admin unaffected by what is granted", async () => {
       accessGrants.savePageGrants([], "ada@eudoxus.ai");
       const res = await request("/api/mappings", "GET", "secret", undefined, adminSsoSession());
@@ -4902,6 +5662,13 @@ describe("per-page grants", () => {
     });
   });
 
+  describe("removed journal route", () => {
+    it("answers 404 for an admin session", async () => {
+      const res = await request("/api/restate/journal?id=inv_1", "GET", "secret", undefined, adminSsoSession());
+      expect(res.statusCode).toBe(404);
+    });
+  });
+
   describe("the grants endpoints", () => {
     it("returns what is granted alongside everything grantable", async () => {
       accessGrants.savePageGrants(["issues"], "ada@eudoxus.ai");
@@ -4912,6 +5679,17 @@ describe("per-page grants", () => {
       // Grantability comes from the route table, so Access itself can never appear here.
       expect(body.grantable).toContain("issues");
       expect(body.grantable).not.toContain("access");
+    });
+
+    it("lists no Journal page and still saves a grant while a stale journal row is stored", async () => {
+      dedup.getDb().prepare("INSERT INTO access_page_grants (page, granted_at, granted_by) VALUES ('journal', 'now', 'ada@eudoxus.ai')").run();
+      const token = adminSsoSession();
+      const got = JSON.parse((await request("/api/access-grants", "GET", "secret", undefined, token)).body);
+      expect(got.grantable).not.toContain("journal");
+      // The access page drops non-grantable keys from its draft, so this is what it posts.
+      const pages = got.granted.filter((k: string) => got.grantable.includes(k));
+      const res = await request("/api/access-grants", "POST", "secret", { pages: [...pages, "issues"] }, token);
+      expect(res.statusCode).toBe(200);
     });
 
     it("stores a grant an admin saves", async () => {
@@ -4945,6 +5723,57 @@ describe("per-page grants", () => {
       accessGrants.savePageGrants(["issues"], "ada@eudoxus.ai");
       const res = await request("/api/access-grants", "GET", "secret", undefined, userSession());
       expect(res.statusCode).toBe(403);
+    });
+  });
+
+  describe("the setup-check routes (AII-1538)", () => {
+    const RUN: SetupCheckRun = {
+      checkedAt: 7,
+      results: [{ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" }],
+    };
+    const ok = <T>(value: T) => vi.fn(async () => ({ status: "ok" as const, value }));
+
+    it("answers an admin the stored run with every field, and null before the first run", async () => {
+      expect(JSON.parse((await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(RUN) })).body)).toEqual(RUN);
+      const before = await requestWithDeps("/api/setup-checks", "GET", adminSsoSession(), { readSetupChecks: ok(null) });
+      expect(before.statusCode).toBe(200);
+      expect(JSON.parse(before.body)).toBeNull();
+    });
+
+    it("starts one run for an admin and answers it", async () => {
+      const run = ok(RUN);
+      const res = await requestWithDeps("/api/setup-checks/run", "POST", adminSsoSession(), { runSetupChecks: run });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(RUN);
+      expect(run).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses both routes to a user with no grant, and never calls the object", async () => {
+      const read = ok(RUN);
+      const run = ok(RUN);
+      expect((await requestWithDeps("/api/setup-checks", "GET", userSession(), { readSetupChecks: read })).statusCode).toBe(403);
+      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { runSetupChecks: run })).statusCode).toBe(403);
+      expect(read).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    });
+
+    it("refuses a run to a user granted every page, since a grant reaches only a page's GET routes", async () => {
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      const run = ok(RUN);
+      expect((await requestWithDeps("/api/setup-checks/run", "POST", userSession(), { runSetupChecks: run })).statusCode).toBe(403);
+      expect(run).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["GET", "/api/setup-checks", "readSetupChecks"],
+      ["POST", "/api/setup-checks/run", "runSetupChecks"],
+    ] as const)("%s %s answers 503 restate-unavailable when Restate could not take the call, or nothing is wired", async (method, url, dep) => {
+      const refused = vi.fn(async () => ({ status: "unavailable" as const }));
+      const res = await requestWithDeps(url, method, adminSsoSession(), { [dep]: refused });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+      const unwired = await requestWithDeps(url, method, adminSsoSession(), {});
+      expect(unwired.statusCode).toBe(503);
     });
   });
 
@@ -5039,7 +5868,7 @@ describe("GET /api/deploy-refs", () => {
   });
 
   it("returns 503 with install message when unauthenticated 404 indicates a private repo (public mode)", async () => {
-    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    const { GitHubApiError: GHError } = modules.githubErrors;
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: null, authMode: "public" });
     listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/foreign-org/private-repo/branches", bodyText: "" }));
     const token = await login("secret");
@@ -5049,7 +5878,7 @@ describe("GET /api/deploy-refs", () => {
   });
 
   it("returns 503 with install message on 403 regardless of auth mode", async () => {
-    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    const { GitHubApiError: GHError } = modules.githubErrors;
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
     listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 403, path: "/repos/owner/repo/branches", bodyText: "Forbidden" }));
     const token = await login("secret");
@@ -5059,7 +5888,7 @@ describe("GET /api/deploy-refs", () => {
   });
 
   it("returns generic 503 on 404 in installation mode (not treated as private-repo indicator)", async () => {
-    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    const { GitHubApiError: GHError } = modules.githubErrors;
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
     listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/owner/repo/branches", bodyText: "" }));
     const token = await login("secret");
@@ -5070,23 +5899,26 @@ describe("GET /api/deploy-refs", () => {
   });
 });
 
-// ---------- GET /api/kg/tracker-data (AII-597) ----------
+// ---------- GET /api/kg/tracker-data (AII-597, AII-1463) ----------
+
+type TrackerPageResult =
+  | { ok: true; page: { issues: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } }
+  | { ok: false; code: "tracker-unavailable" | "tracker-failed" | "unavailable" };
+
+function trackerOk(
+  issues: unknown[],
+  pageInfo: { hasNextPage: boolean; endCursor: string | null } = { hasNextPage: false, endCursor: null },
+): TrackerPageResult {
+  return { ok: true, page: { issues, pageInfo } };
+}
 
 describe("GET /api/kg/tracker-data", () => {
-  function linearPage(
-    issues: unknown[],
-    pageInfo: { hasNextPage: boolean; endCursor: string | null },
-  ): Response {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ data: { issues: { nodes: issues, pageInfo } } }),
-    } as unknown as Response;
-  }
+  const page = vi.fn();
 
   async function trackerDataRequest(
     qs: string,
     token?: string,
+    deps: Record<string, unknown> = { trackerExport: { page } },
   ): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(
       `/api/kg/tracker-data${qs}`,
@@ -5094,14 +5926,13 @@ describe("GET /api/kg/tracker-data", () => {
       token ? { authorization: `Bearer ${token}` } : {},
     );
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps as never);
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
 
   beforeEach(() => {
-    isLinearAuthConfiguredMock.mockReset();
-    withLinearTokenMock.mockReset();
+    page.mockReset();
   });
 
   it("returns 401 when unauthenticated", async () => {
@@ -5113,83 +5944,70 @@ describe("GET /api/kg/tracker-data", () => {
     const token = await login("secret");
     const res = await trackerDataRequest("?team=ZZZ", token);
     expect(res.statusCode).toBe(403);
+    expect(page).not.toHaveBeenCalled();
   });
 
-  it("treats a missing team as the default all-teams scope rather than 403 — 503 here since Linear is unconfigured", async () => {
+  it("answers 503 unavailable when no tracker client is injected", async () => {
     const token = await login("secret");
-    isLinearAuthConfiguredMock.mockReturnValue(false);
-    const res = await trackerDataRequest("", token);
-    expect(res.statusCode).toBe(503);
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const single = await trackerDataRequest("?team=AII", token, {});
+    const all = await trackerDataRequest("", token, {});
+    expect(single.statusCode).toBe(503);
+    expect(JSON.parse(single.body)).toEqual({ error: "unavailable" });
+    expect(all.statusCode).toBe(503);
   });
 
   it("returns the flat array of issues for a single-page team — the shape the kg-refresh dev harness's --tracker-data file expects", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const issues = [{ id: "1", identifier: "AII-1", title: "Test issue" }];
-    withLinearTokenMock.mockResolvedValueOnce(linearPage(issues, { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk(issues));
 
     const res = await trackerDataRequest("?team=AII", token);
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual(issues);
+    expect(page).toHaveBeenCalledWith({ team: "AII", cursor: null });
   });
 
-  it("aggregates issues across multiple pages via the same builder the runner route uses", async () => {
+  it("loops pages through the client, passing each endCursor on", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const page1 = [{ id: "1", identifier: "AII-1" }];
     const page2 = [{ id: "2", identifier: "AII-2" }];
-    withLinearTokenMock
-      .mockResolvedValueOnce(linearPage(page1, { hasNextPage: true, endCursor: "cursor-1" }))
-      .mockResolvedValueOnce(linearPage(page2, { hasNextPage: false, endCursor: null }));
+    page
+      .mockResolvedValueOnce(trackerOk(page1, { hasNextPage: true, endCursor: "cursor-1" }))
+      .mockResolvedValueOnce(trackerOk(page2));
 
     const res = await trackerDataRequest("?team=AII", token);
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual([...page1, ...page2]);
+    expect(page).toHaveBeenCalledTimes(2);
+    expect(page).toHaveBeenNthCalledWith(2, { team: "AII", cursor: "cursor-1" });
   });
 
-  it("returns 503 when Linear is not configured", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(false);
+  it.each(["tracker-unavailable", "tracker-failed", "unavailable"] as const)(
+    "answers 503 %s and sends no partial array when a page is not OK",
+    async (code) => {
+      const token = await login("secret");
+      await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+      page
+        .mockResolvedValueOnce(trackerOk([{ id: "1" }], { hasNextPage: true, endCursor: "c1" }))
+        .mockResolvedValueOnce({ ok: false, code });
 
-    const res = await trackerDataRequest("?team=AII", token);
+      const res = await trackerDataRequest("?team=AII", token);
 
-    expect(res.statusCode).toBe(503);
-  });
-
-  it("propagates an upstream Linear failure as the same status the runner route would return", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
-    withLinearTokenMock.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => ({}),
-    } as unknown as Response);
-
-    const res = await trackerDataRequest("?team=AII", token);
-
-    expect(res.statusCode).toBe(502);
-  });
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body)).toEqual({ error: code });
+    },
+  );
 });
 
 // ---------- GET /api/kg/tracker-data — no-team default scope (AII-608) ----------
 
 describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () => {
-  function linearPage(
-    issues: unknown[],
-    pageInfo: { hasNextPage: boolean; endCursor: string | null },
-  ): Response {
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ data: { issues: { nodes: issues, pageInfo } } }),
-    } as unknown as Response;
-  }
+  const page = vi.fn();
 
   async function trackerDataRequest(
     qs: string,
@@ -5207,19 +6025,18 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
       res as never,
       { ...adminConfig("secret"), ...overrides },
       makeFakeRegistry(provider),
+      { trackerExport: { page } } as never,
     );
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
 
   beforeEach(() => {
-    isLinearAuthConfiguredMock.mockReset();
-    withLinearTokenMock.mockReset();
+    page.mockReset();
   });
 
   it("returns 200 with an empty array when no teams are in scope", async () => {
     const token = await login("secret");
-    isLinearAuthConfiguredMock.mockReturnValue(true);
 
     const res = await trackerDataRequest("", token);
 
@@ -5227,27 +6044,13 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     expect(JSON.parse(res.body)).toEqual([]);
   });
 
-  it("returns 503 when Linear is not configured, before any per-team fetch is attempted", async () => {
-    const token = await login("secret");
-    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(false);
-
-    const res = await trackerDataRequest("", token);
-
-    expect(res.statusCode).toBe(503);
-    expect(withLinearTokenMock).not.toHaveBeenCalled();
-  });
-
   it("unions issues across every Linear-mapped team", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const aiiIssues = [{ id: "1", identifier: "AII-1" }];
     const buiIssues = [{ id: "2", identifier: "BUI-1" }];
-    withLinearTokenMock
-      .mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }))
-      .mockResolvedValueOnce(linearPage(buiIssues, { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk(aiiIssues)).mockResolvedValueOnce(trackerOk(buiIssues));
 
     const res = await trackerDataRequest("", token);
 
@@ -5261,11 +6064,8 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const shared = { id: "shared-1", identifier: "AII-1" };
-    withLinearTokenMock
-      .mockResolvedValueOnce(linearPage([shared], { hasNextPage: false, endCursor: null }))
-      .mockResolvedValueOnce(linearPage([shared], { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk([shared])).mockResolvedValueOnce(trackerOk([shared]));
 
     const res = await trackerDataRequest("", token);
 
@@ -5273,7 +6073,7 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
     expect(JSON.parse(res.body)).toEqual([shared]);
   });
 
-  it("excludes a Jira-mapped team from the union without failing the whole request", async () => {
+  it("includes a Jira-mapped team in the union", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", {
@@ -5281,39 +6081,83 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
       ticketingProvider: "jira",
       ticketingConfig: { kind: "jira", jql: "project = ACME", repoFieldValue: "org/jira-app" },
     }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const aiiIssues = [{ id: "1", identifier: "AII-1" }];
-    withLinearTokenMock.mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }));
+    const jiraIssues = [{ id: "10001", identifier: "ACME-1" }];
+    page.mockResolvedValueOnce(trackerOk(aiiIssues)).mockResolvedValueOnce(trackerOk(jiraIssues));
 
     const res = await trackerDataRequest("", token);
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual(aiiIssues);
-    expect(withLinearTokenMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(res.body)).toEqual(expect.arrayContaining([...aiiIssues, ...jiraIssues]));
+    expect(page).toHaveBeenCalledTimes(2);
+    expect(page.mock.calls.map((c) => c[0].team).sort()).toEqual(["AII", "JIRA1"]);
   });
 
-  it("short-circuits with a single coherent error when one team's fetch fails upstream, rather than a partial 200", async () => {
+  it("short-circuits with 503 and the code when one team's page is not OK, rather than a partial 200", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
     await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
-    withLinearTokenMock.mockResolvedValue({
-      ok: false,
-      status: 500,
-      json: async () => ({}),
-    } as unknown as Response);
+    page.mockResolvedValue({ ok: false, code: "tracker-failed" });
 
     const res = await trackerDataRequest("", token);
 
-    expect(res.statusCode).toBe(502);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "tracker-failed" });
+    expect(page).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a manifest team with no mapping, logs it, and still answers 200 with the mapped team's issues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const dir = testDir("kg-manifest");
+    fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: GHOST\n  - team: AII\n");
+    getScopedInstallationTokenMock.mockResolvedValue(makeScopedInstallationToken());
+    getRepoDefaultBranchMock.mockResolvedValue("main");
+    fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
+    extractSourceMock.mockResolvedValue(dir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const aiiIssues = [{ id: "1", identifier: "AII-1" }];
+    page.mockResolvedValue(trackerOk(aiiIssues));
+    try {
+      const res = await trackerDataRequest("", token, { kgSourceRepo: "org/kg" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual(aiiIssues);
+      expect(page.mock.calls.map((c) => c[0].team)).toEqual(["AII"]);
+      const skipLines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("no orchestrator mapping"));
+      expect(skipLines).toHaveLength(1);
+      expect(skipLines[0]).toContain("GHOST");
+      expect(skipLines[0]).not.toContain("AII,");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("emits no skip line when every manifest team is mapped", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    const dir = testDir("kg-manifest");
+    fs.writeFileSync(path.join(dir, "sources.yml"), "trackers:\n  - team: AII\n");
+    getScopedInstallationTokenMock.mockResolvedValue(makeScopedInstallationToken());
+    getRepoDefaultBranchMock.mockResolvedValue("main");
+    fetchRepoTarballMock.mockResolvedValue(Buffer.from(""));
+    extractSourceMock.mockResolvedValue(dir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    page.mockResolvedValue(trackerOk([]));
+    try {
+      const res = await trackerDataRequest("", token, { kgSourceRepo: "org/kg" });
+      expect(res.statusCode).toBe(200);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("no orchestrator mapping"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("degrades to mapped-teams-only when the KG manifest fetch fails (e.g. a malformed kgSourceRepo)", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
-    isLinearAuthConfiguredMock.mockReturnValue(true);
     const aiiIssues = [{ id: "1", identifier: "AII-1" }];
-    withLinearTokenMock.mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }));
+    page.mockResolvedValueOnce(trackerOk(aiiIssues));
 
     const res = await trackerDataRequest("", token, { kgSourceRepo: "not-a-valid-repo-slug" });
 
@@ -5352,7 +6196,7 @@ describe("admin sessions — kg-refresh destroy", () => {
     );
     const res = new MockResponse();
     admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
-      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() },
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), cancel: vi.fn(async () => ({ status: 409, body: { error: "no-refresh-in-flight" } })) },
     });
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
@@ -5360,101 +6204,136 @@ describe("admin sessions — kg-refresh destroy", () => {
 
   beforeEach(() => {
     destroyMachineMock.mockReset();
-    destroyMachineMock.mockResolvedValue(undefined);
+    getMachineMock.mockReset();
     cancelWorkflowRunMock.mockReset();
-    cancelWorkflowRunMock.mockResolvedValue(true);
     getInstallationTokenMock.mockReset();
-    getInstallationTokenMock.mockResolvedValue("gh-token-mock");
     notifyTextMock.mockReset();
   });
 
-  it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel" });
-    log.updateJobMachineId(jobId, "m-kg-cancel");
+  type KgCancel = NonNullable<NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>["kgRefresh"]>["cancel"];
+  const answers = (status: number, body: unknown) => vi.fn(async () => ({ status, body })) as unknown as KgCancel & ReturnType<typeof vi.fn>;
+  const deps = (cancel: KgCancel) => ({ trigger: vi.fn(), status: vi.fn(), cancel });
 
-    const res = await deleteSession("m-kg-cancel", token);
+  async function flyKgJob(machineId: string, dispatchId: string | null = "t-fly"): Promise<number> {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines", repo: "TestOrg/test-kg", ...(dispatchId ? { dispatchId } : {}) });
+    log.setJobMachineNonce(jobId, "nonce-kg");
+    log.setJobMachineId(jobId, machineId);
+    log.updateJobMachineId(jobId, machineId);
+    return jobId;
+  }
+
+  async function ghaKgJob(): Promise<number> {
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "github-actions", repo: "TestOrg/test-kg", dispatchId: "t-gha" });
+    log.updateJobRunId(jobId, 12345);
+    return jobId;
+  }
+
+  it("Fly kg-refresh Stop whose cancel answers 409 past-merge returns it, leaves the row unchanged and destroys no machine", async () => {
+    const token = await login("secret");
+    const jobId = await flyKgJob("m-kg-merge");
+    const before = log.getJobById(jobId);
+    const cancel = answers(409, { error: "past-merge" });
+    const res = await deleteSession("m-kg-merge", token, deps(cancel));
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "past-merge" });
+    expect(cancel).toHaveBeenCalledWith({ jobId, dispatchId: "t-fly", reason: "operator_cancelled" });
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it.each([["fly", "fly"], ["gha", "gha"]])("%s kg-refresh Stop answering 200 writes nothing, destroys nothing and sends one 'stop requested' notice", async (mode) => {
+    const token = await login("secret");
+    const jobId = mode === "fly" ? await flyKgJob("m-kg-200") : await ghaKgJob();
+    const before = log.getJobById(jobId);
+    const res = await deleteSession(mode === "fly" ? "m-kg-200" : String(jobId), token, deps(answers(200, { cancelled: true })));
 
     expect(res.statusCode).toBe(200);
-    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
+    expect(JSON.parse(res.body)).toEqual({ requested: true });
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe(before?.status);
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    const text = (notifyTextMock.mock.calls[0] as unknown as [string, string])[1];
+    expect(text).toContain("stop requested");
+    expect(text).not.toContain("cancelled");
   });
 
-  it("calls kgRefresh.onMachineLost with operator_cancelled failureCode", async () => {
+  it("stamps operator_cancelled once and sends the operator-cancel notice when no workflow knows the run", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel2" });
-    log.updateJobMachineId(jobId, "m-kg-cancel2");
+    const jobId = await flyKgJob("m-kg-stamp");
+    const updateSpy = vi.spyOn(log, "updateJobStatus");
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-kg-stamp", token, deps(answers(409, { error: "no-refresh-in-flight" })));
 
-    const onMachineLost = vi.fn();
-    await deleteSession("m-kg-cancel2", token, { trigger: vi.fn(), status: vi.fn(), onMachineLost });
-
-    expect(onMachineLost).toHaveBeenCalledOnce();
-    expect(onMachineLost).toHaveBeenCalledWith({ failureCode: "operator_cancelled" });
-  });
-
-  it("stamps the job row operator_cancelled before calling onMachineLost", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
-    log.updateJobMachineId(jobId, "m-kg-cancel3");
-
-    await deleteSession("m-kg-cancel3", token);
-
+    expect(res.statusCode).toBe(200);
+    expect(updateSpy.mock.calls.filter((c) => c[0] === jobId)).toHaveLength(1);
     const row = log.getJobById(jobId);
     expect(row?.status).toBe("failed");
     expect(row?.conclusion).toBe("operator_cancelled");
-  });
-
-  it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
-    const token = await login("secret");
-    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
-    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel4" });
-    log.updateJobMachineId(jobId, "m-kg-cancel4");
-
-    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
-    await deleteSession("m-kg-cancel4", token);
-
-    expect(notifyTextMock).toHaveBeenCalledOnce();
+    expect(destroyMachineMock).not.toHaveBeenCalled();
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    expect((notifyTextMock.mock.calls[0] as unknown as [string, string])[1]).toContain("cancelled by operator");
     expect(clearWorkingState).not.toHaveBeenCalled();
+    updateSpy.mockRestore();
   });
 
-  it("GHA-mode kg-refresh cancel reaches cancelWorkflowRun and returns 200 (not 422)", async () => {
+  it.each([
+    ["GHA", async () => ghaKgJob(), (id: number) => String(id)],
+    ["Fly", async () => flyKgJob("m-kg-closed"), () => "m-kg-closed"],
+  ])("%s kg-refresh Stop on a completed row answers 409 and leaves the row untouched", async (_n, mk, ident) => {
     const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      repo: "TestOrg/test-kg",
-    });
-    log.updateJobRunId(jobId, 12345);
-    // GHA jobs have no machineId; pass the numeric jobId so handleDestroySession
-    // falls back to getJobById (Number.isFinite path in admin.ts).
-    const res = await deleteSession(String(jobId), token);
+    const jobId = await mk();
+    log.updateJobStatus(jobId, "completed");
+    const before = log.getJobById(jobId);
+    const res = await deleteSession(ident(jobId), token, deps(answers(409, { error: "no-refresh-in-flight" })));
 
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "no-refresh-in-flight" });
+    const after = log.getJobById(jobId);
+    expect(after?.status).toBe("completed");
+    expect(after?.conclusion).toBe(before?.conclusion);
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it("stamps a row with no dispatchId through the same path", async () => {
+    const token = await login("secret");
+    const jobId = await flyKgJob("m-kg-nodispatch", null);
+    const res = await deleteSession("m-kg-nodispatch", token, deps(answers(409, { error: "no-refresh-in-flight" })));
     expect(res.statusCode).toBe(200);
-    expect(cancelWorkflowRunMock).toHaveBeenCalledWith("gh-token-mock", "TestOrg", "test-kg", 12345);
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
 
-  it("GHA-mode kg-refresh cancel returns 422 when repo is absent on the row", async () => {
+  it("GHA kg-refresh Stop during the merge returns 409 past-merge, not 503, and stamps nothing", async () => {
     const token = await login("secret");
-    const jobId = log.appendLog({
-      issueId: "kg-refresh",
-      phase: "kg-refresh",
-      executionMode: "github-actions",
-      // repo intentionally omitted to confirm the guard fires
-    });
-    log.updateJobRunId(jobId, 99999);
-    const res = await deleteSession(String(jobId), token);
+    const jobId = await ghaKgJob();
+    const res = await deleteSession(String(jobId), token, deps(answers(409, { error: "past-merge" })));
 
-    expect(res.statusCode).toBe(422);
-    expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toEqual({ error: "past-merge" });
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
+    expect(notifyTextMock).not.toHaveBeenCalled();
+  });
+
+  it("kg-refresh Stop answers 503 when the workflow is unavailable, changing nothing and not notifying", async () => {
+    const token = await login("secret");
+    const jobId = await ghaKgJob();
+    const res = await deleteSession(String(jobId), token, deps(answers(503, { error: "restate-unavailable" })));
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ error: "restate-unavailable" });
+    expect(notifyTextMock).not.toHaveBeenCalled();
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("operator_cancelled");
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
     const token = await login("secret");
     // Create a mapping for the ENG team
-    config.initMappingsTable();
     await request("/api/mappings", "POST", "secret", {
       teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
     }, token);
@@ -5467,6 +6346,38 @@ describe("admin sessions — kg-refresh destroy", () => {
 
     expect(res.statusCode).toBe(200);
     expect(clearWorkingState).toHaveBeenCalled();
+  });
+
+  it("planning session destroy resets the ticket with the planning phase", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
+    }, token);
+    const jobId = log.appendLog({ issueId: "issue-pl", issueIdentifier: "ENG-3", teamKey: "ENG", repo: "org/repo", phase: "planning" });
+    log.updateJobMachineId(jobId, "m-pl-cancel");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-pl-cancel", token, undefined);
+
+    expect(res.statusCode).toBe(200);
+    expect(clearWorkingState).toHaveBeenCalledWith("issue-pl", "ENG", "planning");
+  });
+
+  it("gap-analysis session destroy leaves the ticket and dedup entry alone", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
+    }, token);
+    dedup.markDispatched("issue-ga", "ENG", "ENG-2", "t");
+    const jobId = log.appendLog({ issueId: "issue-ga", issueIdentifier: "ENG-2", teamKey: "ENG", repo: "org/repo", phase: "gap-analysis" });
+    log.updateJobMachineId(jobId, "m-ga-cancel");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-ga-cancel", token, undefined);
+
+    expect(res.statusCode).toBe(200);
+    expect(clearWorkingState).not.toHaveBeenCalled();
+    expect(dedup.isAlreadyDispatched("issue-ga")).toBe(true);
   });
 });
 
@@ -5514,5 +6425,1325 @@ describe("admin poll-now", () => {
     const token = await login("secret");
     const res = await pollNowRequest(undefined, token);
     expect(res.statusCode).toBe(503);
+  });
+});
+
+describe("model accounts and stage configuration (AII-962)", () => {
+  function sso(email: string, sub: string): string {
+    return adminSession.createSession({ email, sub, provider: "google", name: email });
+  }
+  const adminTok = () => sso("ada@eudoxus.ai", "google|ada");
+  const userTok = () => sso("reader@eudoxus.ai", "google|reader");
+
+  type Deps = NonNullable<Parameters<typeof admin.handleAdminRequest>[4]>;
+  const readyDeps = (inspect: (r: unknown) => Promise<unknown> = async () => ({ status: "ready", profiles: [] })): Deps => ({
+    agentConfig: {
+      inspectReadiness: inspect as never,
+      credentials: { sessionStore: {} as never, resolveProtectedSecret: () => null },
+    },
+  });
+
+  async function call(url: string, method: string, token: string, body?: unknown, deps: Deps = {}) {
+    const bindingDeps: Deps = {
+      bindKey: async (ref, destination) => {
+        const row = dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(ref) as { destination: string } | undefined;
+        if (row) return row.destination === destination ? "already-bound" : "conflict";
+        dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+        return "bound";
+      },
+      clearKeyBinding: async (ref) => dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes,
+    };
+    const res = await requestWithDeps(url, method, token, { ...bindingDeps, ...deps }, body);
+    return { status: res.statusCode, json: res.body ? JSON.parse(res.body) : null, raw: res.body };
+  }
+
+  const SENTINEL = "ref/sentinel-credential-ref";
+  const profileBody = (over: Record<string, unknown> = {}) => ({
+    profileId: "oai-1",
+    identity: "OpenAI team key",
+    agent: "codex",
+    provider: "openai",
+    authMode: "openai-api-key",
+    credentialRef: SENTINEL,
+    ...over,
+  });
+  const defaults = {
+    mode: "configured",
+    stages: Object.fromEntries(
+      ["planning", "implementation", "review"].map((s) => [
+        s,
+        { agent: "codex", provider: "openai", model: "gpt-x", accountProfileId: "oai-1", invocationTimeoutMs: 600000 },
+      ]),
+    ),
+  };
+
+  async function seed(deps: Deps = {}) {
+    const t = adminTok();
+    await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app" }, t);
+    expect((await call("/api/model-accounts", "POST", t, profileBody(), deps)).status).toBe(201);
+    expect((await call("/api/agent-defaults", "PUT", t, defaults, deps)).status).toBe(200);
+    return t;
+  }
+
+  const count = (table: string) => (dedup.getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+
+  it("refuses mode changes for a missing mapping before writing", () => {
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction("MISSING", mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+    }
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("refuses inherited mapping name %s in both modes without writing", async (projectKey) => {
+    await seed();
+    const before = count("stage_agent_config_revisions");
+    for (const mode of ["legacy", "configured"] as const) {
+      expect(admin.setProjectAgentModeAction(projectKey, mode, "operator")).toEqual({ ok: false, code: "mapping-not-found" });
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
+  describe.each(["constructor", "toString", "__proto__"])("own mapping lookup for %s", (projectKey) => {
+    it.each([
+      ["GET", ""],
+      ["GET", "/resolved"],
+      ["PUT", ""],
+    ])("rejects inherited name on %s agent-config%s without writing", async (method, suffix) => {
+      const t = await seed();
+      const before = count("stage_agent_config_revisions");
+      const result = await call(`/api/mappings/${projectKey}/agent-config${suffix}`, method, t,
+        method === "PUT" ? { stages: {} } : undefined, readyDeps());
+      expect.soft(result.status).toBe(404);
+      expect.soft(result.json).toEqual({ error: "mapping not found" });
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    });
+
+    it("upserts the inherited name as a new configured project", async () => {
+      const t = await seed();
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toBeNull();
+      const before = count("stage_agent_config_revisions");
+      const result = await request("/api/mappings", "POST", "secret", { teamKey: projectKey, owner: "org", repo: "new" }, t);
+      expect(result.statusCode).toBe(202);
+      expect(modules.agentConfigStore.getProjectStageConfig(projectKey)).toMatchObject({ config: { mode: "configured" } });
+      expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    });
+  });
+
+  it("keeps absent-row legacy unchanged and refuses unresolved configuration without writing", async () => {
+    await seed();
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toBeNull();
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it("logs a failed agent mode write and preserves its refusal code", async () => {
+    await seed();
+    const err = new Error("database write failed");
+    const write = vi.spyOn(modules.agentConfigStore, "setProjectConfigured").mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: false, code: "resolution-failed" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] set project agent mode failed:", err);
+    } finally {
+      write.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it.each(["getProjectStageConfig", "getOrchestratorDefaults"] as const)("keeps creation successful when %s throws", async (readName) => {
+    await seed();
+    const registry = makeFakeRegistry(provider);
+    const invalidate = vi.spyOn(registry, "invalidate");
+    const queue = await import("../workflow-sync-queue.js");
+    const sync = vi.spyOn(queue, "runWorkflowSync").mockResolvedValueOnce(undefined);
+    const err = new Error("stored configuration unreadable");
+    const read = vi.spyOn(modules.agentConfigStore, readName).mockImplementationOnce(() => { throw err; });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await requestWithRegistry("/api/mappings", "POST", adminTok(), registry, { teamKey: "NEW", owner: "org", repo: "new", defaultBranch: "main" });
+      expect(result.statusCode).toBe(202);
+      const body = JSON.parse(result.body);
+      expect(body.warnings).toEqual(["Project saved in legacy mode: resolution-failed"]);
+      expect(config.getMappings().NEW).toBeDefined();
+      expect(modules.agentConfigStore.isProjectConfigured("NEW")).toBe(false);
+      expect(invalidate).toHaveBeenCalledTimes(1);
+      expect(sync).toHaveBeenCalledExactlyOnceWith(body.syncJobId, expect.anything());
+      expect(queue.getWorkflowSyncById(body.syncJobId)).toMatchObject({ teamKey: "NEW" });
+      expect(log).toHaveBeenCalledExactlyOnceWith("[admin] configure new project failed:", err);
+    } finally {
+      read.mockRestore();
+      sync.mockRestore();
+      invalidate.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it("changes both modes preserving stages and actor, and unchanged modes append nothing even with invalid defaults", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", false);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { planning: { model: "project-model" } } });
+    const stages = modules.agentConfigStore.getProjectStageConfig("APP")!.config.stages;
+    const before = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator")).toEqual({ ok: true, teamKey: "APP", agentMode: "configured" });
+    expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "operator", config: { mode: "configured", stages } });
+    modules.agentConfigStore.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    const unchanged = count("stage_agent_config_revisions");
+    expect(admin.setProjectAgentModeAction("APP", "configured", "operator").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged);
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other")).toEqual({ ok: true, teamKey: "APP", agentMode: "legacy" });
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+    expect(modules.agentConfigStore.getProjectStageConfig("APP")).toMatchObject({ createdBy: "other", config: { mode: "legacy", stages } });
+    expect(admin.setProjectAgentModeAction("APP", "legacy", "other").ok).toBe(true);
+    expect(count("stage_agent_config_revisions")).toBe(unchanged + 1);
+  });
+
+  it("preserves resolution failure diagnostics when defaults become legacy", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+      stages: { planning: { model: "project-model" } },
+    }, readyDeps())).status).toBe(200);
+    expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy" })).status).toBe(200);
+
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json).toMatchObject({
+      enabled: true, mode: "configured", resolved: false,
+      error: {
+        code: "resolution_failed",
+        message: "project is configured for stage agents but the orchestrator stage defaults are off",
+      },
+    });
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(resolved.json.stages[stage]).toEqual({ entries: [], fallbacksDropped: false });
+    }
+  });
+
+  it("names the stage when every default account is later disabled", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    for (const profileId of ["review-1", "review-2"]) {
+      expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId }))).status).toBe(201);
+    }
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.review, { accounts: [{ accountProfileId: "review-1", model: "gpt-review" }, { accountProfileId: "review-2", model: "" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    for (const profileId of ["review-1", "review-2"]) {
+      expect((await call(`/api/model-accounts/${profileId}`, "PATCH", t, { status: "disabled" })).status).toBe(200);
+    }
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
+    expect(result.status).toBe(400);
+    expect(result.json.error).toBe("review.accounts: no entry resolves (resolution_failed)");
+  });
+
+  it("stores singleton accounts flat, refuses project lists, and exposes failed entries", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }] });
+    const singleton = await call("/api/agent-defaults", "PUT", t, config);
+    expect(singleton.status).toBe(200);
+    expect(singleton.json.stages.planning).not.toHaveProperty("accounts");
+    const refused = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { planning: { accounts: [] } } });
+    expect(refused.status).toBe(400);
+    expect(refused.json.error).toBe("accounts is only supported in orchestrator defaults");
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "oai-2" }));
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "gpt-list" }, { accountProfileId: "oai-2", model: "" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
+    await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.json.stages.planning.entries).toMatchObject([
+      { index: 0, accountProfileId: "oai-1", passes: false, reason: "resolution_failed" },
+      { index: 1, accountProfileId: "oai-2", passes: true, reason: null },
+    ]);
+  });
+
+  it.each([
+    { accounts: {}, message: "planning.accounts[0] must be a non-empty account list" },
+    { accounts: [], message: "planning.accounts[0] must be a non-empty account list" },
+    { accounts: [null], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "oai-1" }], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "oai-1", model: "m", extra: true }], message: "planning.accounts[0] is malformed" },
+    { accounts: [{ accountProfileId: "disabled", model: "m" }], message: "planning.accounts[0] does not resolve" },
+    { accounts: [{ accountProfileId: "invalid", model: "m" }], message: "planning.accounts[0] does not resolve" },
+    { accounts: [{ accountProfileId: "plan", model: "m" }, { accountProfileId: "oai-1", model: "m" }], message: "planning.accounts[1] cannot use paid API after subscription" },
+  ])("rejects invalid defaults without appending a revision: $message", async ({ accounts, message }) => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "disabled" }));
+    await call("/api/model-accounts/disabled", "PATCH", t, { status: "disabled" });
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan", authMode: "codex-subscription" }));
+    // A historical incompatible profile must also be refused at the configuration boundary.
+    // Keep the valid paid profile separate from the incompatible one.
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "invalid" }));
+    dedup.getDb().exec("DROP TRIGGER trg_model_account_profile_revisions_immutable");
+    dedup.getDb().prepare("UPDATE model_account_profile_revisions SET agent = 'claude' WHERE profile_id = 'invalid'").run();
+    const before = count("stage_agent_config_revisions");
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts });
+    const result = await call("/api/agent-defaults", "PUT", t, config);
+    expect(result.status).toBe(400);
+    expect(result.json.error).toBe(message);
+    expect(count("stage_agent_config_revisions")).toBe(before);
+  });
+
+  it.each([
+    { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+    { agent: "claude", provider: "bedrock", authMode: "bedrock" },
+  ])("refuses an incompatible account-only override ($provider)", async profile => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "other", ...profile }));
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "oai-1", model: "m" }, { accountProfileId: "other", model: "claude" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    // Simulate an existing project override with profile fields inherited from defaults.
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    dedup.getDb().prepare("INSERT INTO stage_agent_config_revisions (config_revision_id, scope_kind, scope_key, revision, version, config_json, created_at) VALUES ('override-test', 'project', 'APP', 2, 1, ?, ?)").run(
+      JSON.stringify({ version: 1, mode: "configured", stages: { planning: { accountProfileId: "other" } } }), Date.now());
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json.resolved).toBe(false);
+    expect(resolved.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "other", passes: false, reason: "resolution_failed" },
+      { accountProfileId: "oai-1", passes: true },
+    ]);
+    expect(resolved.json.stages.planning.values).toBeUndefined();
+  });
+
+  it.each([
+    { model: "api-model", chosenModel: "api-model", source: "orchestrator-default" },
+    { model: "", chosenModel: "project-model", source: "project" },
+  ])("reports selected account provenance or refuses cross-provider model inheritance ($source)", async ({ model, chosenModel, source }) => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+    for (const profile of [
+      { profileId: "brk", provider: "bedrock", authMode: "bedrock" },
+      { profileId: "cl-api", provider: "anthropic", authMode: "anthropic-api-key" },
+    ]) {
+      expect((await call("/api/model-accounts", "POST", t, profileBody({ ...profile, agent: "claude" }))).status).toBe(201);
+    }
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "primary" }, { accountProfileId: "cl-api", model }] });
+    const saved = await call("/api/agent-defaults", "PUT", t, config);
+    if (!model) {
+      expect(saved.status).toBe(400);
+      expect(saved.json.error).toContain("requires a model for another provider");
+      return;
+    }
+    expect(saved.status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, {
+      stages: { planning: { agent: "claude", provider: "bedrock", model: "project-model", invocationTimeoutMs: 700000 } },
+    }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(resolved.status).toBe(200);
+    expect(resolved.json.stages.planning).toMatchObject({
+      values: { accountProfileId: "cl-api", agent: "claude", provider: "anthropic", model: chosenModel, invocationTimeoutMs: 700000 },
+      sources: { accountProfileId: "orchestrator-default", agent: "orchestrator-default", provider: "orchestrator-default", model: source, invocationTimeoutMs: "project" },
+      entries: [{ index: 0, passes: false, reason: "unsupported_combination" }, { index: 1, passes: true }],
+    });
+  });
+
+  it("shows unsupported backend entries after a project account override", async () => {
+    const t = await seed();
+    await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "brk", agent: "claude", provider: "bedrock", authMode: "bedrock" }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-api", agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" }));
+    const config = structuredClone(defaults);
+    Object.assign(config.stages.planning, { accounts: [{ accountProfileId: "brk", model: "claude" }, { accountProfileId: "cl-api", model: "claude-api-model" }] });
+    expect((await call("/api/agent-defaults", "PUT", t, config)).status).toBe(200);
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: {} }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(resolved.json.stages.planning.entries).toMatchObject([{ passes: false, reason: "unsupported_combination" }, { passes: true }]);
+    expect(resolved.json.stages.planning.values.accountProfileId).toBe("cl-api");
+    expect((await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: { planning: { accountProfileId: "cl-api", provider: "anthropic" } } }, readyDeps())).status).toBe(200);
+    const overridden = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(overridden.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(overridden.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "cl-api", passes: true },
+      { accountProfileId: "brk", passes: false, reason: "unsupported_combination" },
+    ]);
+    expect(resolved.json.stages.planning.fallbacksDropped).toBe(false);
+    // A later profile change can make resolution fail; diagnostics retain the merged list.
+    expect((await call("/api/model-accounts/cl-api", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const failed = await call("/api/mappings/FLY/agent-config/resolved", "GET", t);
+    expect(failed.json.resolved).toBe(false);
+    expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(failed.json.stages.planning.entries).toMatchObject([
+      { accountProfileId: "cl-api", passes: false, reason: "resolution_failed" },
+      { accountProfileId: "brk", passes: false, reason: "unsupported_combination" },
+    ]);
+  });
+
+  it("reports dropped fallbacks only when an override has no following default entry", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+      stages: { implementation: { accountProfileId: "oai-1" } },
+    }, readyDeps())).status).toBe(200);
+    const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(resolved.json.resolved).toBe(true);
+    expect(resolved.json.stages.implementation.fallbacksDropped).toBe(true);
+    expect(resolved.json.stages.implementation.entries).toHaveLength(1);
+    expect(resolved.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
+    expect(resolved.json.stages.planning.fallbacksDropped).toBe(false);
+    for (const stage of ["planning", "review"]) {
+      expect(resolved.json.stages[stage].fallbacksDropped).toBe(false);
+      expect(resolved.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: true }]);
+      expect(resolved.json.stages[stage].entries).toHaveLength(1);
+    }
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    const failed = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(failed.json.resolved).toBe(false);
+    expect(failed.json.stages.implementation.fallbacksDropped).toBe(true);
+    expect(failed.json.stages.implementation.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    expect(failed.json.stages.planning.fallbacksDropped).toBe(false);
+    expect(failed.json.stages.planning.entries).toMatchObject([{ accountProfileId: "oai-1", passes: false }]);
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect(failed.json.stages[stage].entries).toHaveLength(1);
+      expect(failed.json.stages[stage].entries).toMatchObject([{ accountProfileId: "oai-1", model: "gpt-x", passes: false }]);
+    }
+    expect(failed.json.stages.review.fallbacksDropped).toBe(false);
+  });
+
+  it("refuses every write to a non-admin, even with every page granted, and changes nothing", async () => {
+    await seed();
+    accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+    const before = [count("model_account_profile_revisions"), count("stage_agent_config_revisions")];
+    const u = userTok();
+    for (const [url, method, body] of [
+      ["/api/model-accounts", "POST", profileBody({ profileId: "x1" })],
+      ["/api/model-accounts/oai-1", "PATCH", { status: "disabled" }],
+      ["/api/agent-defaults", "PUT", defaults],
+      ["/api/mappings/APP/agent-config", "PUT", { stages: {} }],
+    ] as const) {
+      expect((await call(url, method, u, body, readyDeps())).status).toBe(403);
+    }
+    expect([count("model_account_profile_revisions"), count("stage_agent_config_revisions")]).toEqual(before);
+  });
+
+  it("rejects credential values and unknown keys without echoing them, and appends nothing", async () => {
+    const t = await seed();
+    const revs = count("model_account_profile_revisions");
+    for (const bad of [{ apiKey: "sk-live-abc" }, { session: "s" }, { token: "t" }, { credentialRef: "sk-live-abc123" }]) {
+      const r = await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bad", ...bad }));
+      expect(r.status).toBe(400);
+      expect(r.raw).not.toContain("sk-live-abc");
+    }
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { apiKey: "x" })).status).toBe(400);
+    expect((await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bad", authMode: "bedrock" }))).status).toBe(400);
+    expect(count("model_account_profile_revisions")).toBe(revs);
+  });
+
+  it("reads only safe profile metadata and maps codex-subscription readiness", async () => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan-1", authMode: "codex-subscription", credentialRef: undefined }));
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+    const mk = (readPlanRecord: () => unknown): Deps => ({
+      agentConfig: {
+        inspectReadiness: async () => ({ status: "ready", profiles: [] }),
+        credentials: { sessionStore: { readPlanRecord } as never, resolveProtectedSecret: () => null },
+      },
+    });
+    const list = async (readPlanRecord: () => unknown) => (await call("/api/model-accounts", "GET", t, undefined, mk(readPlanRecord))).json.accounts;
+    const find = (accts: Array<Record<string, any>>, id: string) => accts.find((a) => a.profileId === id)!;
+
+    let accts = await list(() => ({ ok: false, reason: "no_state" }));
+    expect(find(accts, "plan-1").account.readiness).toBe("sign-in required");
+    accts = await list(() => ({ ok: false, reason: "decrypt_failed" }));
+    expect(find(accts, "plan-1").account.readiness).toBe("refresh failed (transient)");
+    expect(find(accts, "cl-sub").account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
+    expect(find(accts, "cl-sub").account).not.toHaveProperty("sessionRecovery");
+    expect(JSON.stringify(accts)).not.toContain("sessionRecovery");
+    expect(find(accts, "oai-1").account.sessionRecovery).toBeUndefined();
+    expect(find(accts, "oai-1").account.readiness).toBe("missing"); // reference is outside the protected namespace
+
+    const raw = (await call("/api/model-accounts", "GET", t, undefined, mk(() => ({ ok: false, reason: "no_state" })))).raw;
+    expect(raw).not.toContain(SENTINEL);
+    expect(raw).not.toContain("credentialRef");
+    expect(raw).not.toContain("metadata");
+    expect(raw).not.toContain("sessionRecovery");
+  });
+
+  it("keeps old revisions on PATCH of a disabled profile", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    const store = modules.agentConfigStore;
+    const patched = await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "Renamed" });
+    expect(patched.json).toMatchObject({ revision: 2, identity: "Renamed", profileStatus: "active" });
+    expect(store.getAccountProfileRevision("oai-1", 1)?.identity).toBe("OpenAI team key");
+    expect(store.lookupCredentialReference("oai-1", 2)).toBe(SENTINEL); // reference carried forward
+    expect((await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+    expect(store.getAccountProfile("oai-1")?.revision).toBe(3);
+    // A disabled profile is refused by a new project config.
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
+    expect(put.status).toBe(400);
+    expect((await call("/api/model-accounts/nope", "PATCH", t, { status: "disabled" })).status).toBe(404);
+  });
+
+  it("reads a profile's own readiness with no mapped project", async () => {
+    const t = await seed();
+    await call("/api/model-accounts", "POST", t, profileBody({ profileId: "free-1" }));
+    const deps: Deps = {
+      agentConfig: {
+        inspectReadiness: async () => ({ status: "ready", profiles: [] }),
+        credentials: {
+          sessionStore: {} as never,
+          resolveProtectedSecret: () => null,
+        },
+      },
+    };
+    const acct = (await call("/api/model-accounts", "GET", t, undefined, deps)).json.accounts.find((a: Record<string, any>) => a.profileId === "free-1");
+    expect(acct.account.readiness).toBe("missing");
+    expect(acct).not.toHaveProperty(RETIRED_GRANT_FIELD);
+  });
+
+  it("answers 400 for the retired grant field on POST and PATCH", async () => {
+    const t = await seed();
+    const retired = { [RETIRED_GRANT_FIELD]: ["*"] };
+    const post = await call("/api/model-accounts", "POST", t, profileBody({ profileId: "x2", ...retired }));
+    expect(post.status).toBe(400);
+    expect(post.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
+    const patch = await call("/api/model-accounts/oai-1", "PATCH", t, retired);
+    expect(patch.status).toBe(400);
+    expect(patch.json.error).toContain(`unsupported field(s): ${RETIRED_GRANT_FIELD}`);
+  });
+
+  it.each([false, true])("saves the inactive preference for configured=%s and rejects invalid scope/types", async (configured) => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", configured);
+    const deps = readyDeps();
+    for (const preferOpenModel of [true, false]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { implementation: { preferOpenModel } } }, deps)).status).toBe(200);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t, undefined, deps)).json.stages.implementation.preferOpenModel).toBe(preferOpenModel);
+    }
+    const revs = count("stage_agent_config_revisions");
+    for (const [stage, value] of [["implementation", null], ["implementation", "true"], ["implementation", 1], ["planning", true], ["review", false]]) {
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { [stage as string]: { preferOpenModel: value } } }, deps)).status).toBe(400);
+    }
+    for (const stage of ["planning", "implementation", "review"]) {
+      expect((await call("/api/agent-defaults", "PUT", t, { mode: "configured", stages: { [stage]: { preferOpenModel: false } } })).status).toBe(400);
+    }
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+  });
+
+  it("saves and resolves fallback models with field provenance", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    const deps = readyDeps();
+    const configuredDefaults = { ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, fallbackModel: "backup" } } };
+    expect((await call("/api/agent-defaults", "PUT", t, configuredDefaults)).status).toBe(200);
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, deps)).status).toBe(200);
+    const resolved = async () => (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json.stages.review;
+    expect(await resolved()).toMatchObject({ values: { fallbackModel: "backup" }, sources: { fallbackModel: "orchestrator-default" } });
+    expect((await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel: "project-backup" } } }, deps)).status).toBe(200);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { invocationTimeoutMs: 900000 } } }, deps);
+    expect(await resolved()).toMatchObject({ values: { fallbackModel: "project-backup", invocationTimeoutMs: 900000 }, sources: { fallbackModel: "project" } });
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel: null } } }, deps);
+    expect(await resolved()).toMatchObject({ values: { fallbackModel: "backup" }, sources: { fallbackModel: "orchestrator-default" } });
+    const revs = count("stage_agent_config_revisions");
+    for (const fallbackModel of ["", "   ", 123, "gpt-x"]) {
+      const badDefault = { ...configuredDefaults, stages: { ...configuredDefaults.stages, review: { ...configuredDefaults.stages.review, fallbackModel } } };
+      const d = await call("/api/agent-defaults", "PUT", t, badDefault);
+      expect(d.status).toBe(400);
+      expect(d.json.error).toContain("review");
+      const p = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { fallbackModel } } }, deps);
+      expect(p.status).toBe(400);
+      expect(p.json.error).toContain("review");
+    }
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+  });
+
+  it("validates defaults atomically", async () => {
+    const t = await seed();
+    const revs = count("stage_agent_config_revisions");
+    const bad = { mode: "configured", stages: { planning: { agent: "codex", provider: "openai", model: "m", accountProfileId: "missing", invocationTimeoutMs: 1000 } } };
+    expect((await call("/api/agent-defaults", "PUT", t, bad)).status).toBe(400);
+    expect((await call("/api/agent-defaults", "PUT", t, { ...defaults, extra: 1 })).status).toBe(400);
+    expect((await call("/api/agent-defaults", "PUT", t, { mode: "legacy", stages: { planning: { model: 5 } } })).status).toBe(400);
+    expect(count("stage_agent_config_revisions")).toBe(revs);
+    expect((await call("/api/agent-defaults", "GET", t)).json).toMatchObject({ configured: true, enabled: true });
+  });
+
+  it("round-trips individual inheritance fields on a configured project", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    const deps = readyDeps();
+    const put = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } }, deps);
+    expect(put.status).toBe(200);
+    let got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+    expect(got).toMatchObject({ enabled: true, stages: { review: { model: "gpt-review", invocationTimeoutMs: 900000 } } });
+
+    let resolved = (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json;
+    expect(resolved.stages.review.values.model).toBe("gpt-review");
+    expect(resolved.stages.review.sources.model).toBe("project");
+    expect(resolved.stages.planning.sources.model).toBe("orchestrator-default");
+    expect(resolved.stages.review.account.readiness).toBe("missing");
+    expect(JSON.stringify(resolved)).not.toContain(SENTINEL);
+
+    // null restores inheritance for that field only.
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: null } } }, deps);
+    got = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+    expect(got.enabled).toBe(true);
+    expect(got.stages.review.invocationTimeoutMs).toBe(900000);
+    resolved = (await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, deps)).json;
+    expect(resolved.stages.review.values.model).toBe("gpt-x");
+    expect(resolved.stages.review.sources.model).toBe("orchestrator-default");
+    expect(resolved.stages.review.sources.invocationTimeoutMs).toBe("project");
+
+    expect((await call("/api/mappings/NOPE/agent-config", "GET", t)).status).toBe(404);
+  });
+
+  it("returns actionable resolution errors instead of a 500", async () => {
+    const t = await seed();
+    modules.agentConfigStore.setProjectConfigured("APP", true);
+    await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps());
+    await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const r = await call("/api/mappings/APP/agent-config/resolved", "GET", t);
+    expect(r.status).toBe(200);
+    expect(r.json).toMatchObject({ resolved: false, error: { code: "resolution_failed" } });
+  });
+
+  describe("readiness gate on configured stage changes", () => {
+    const optIn = (t: string, inspect: (r: any) => Promise<unknown>) => {
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      return call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps(inspect));
+    };
+
+    it("refuses an unready GitHub Actions project, names the workflow-sync action and preserves configured mode", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      for (const code of ["runner_incompatible", "retired_workflow_present"]) {
+        const r = await optIn(t, async () => ({ status: "not-ready", code }));
+        expect(r.status).toBe(409);
+        expect(r.json).toMatchObject({ code, backend: "github-actions" });
+        expect(r.json.action).toMatch(/workflow sync/);
+        expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
+      }
+    });
+
+    it("serialises concurrent PUTs so a refusal's rollback cannot clobber a later valid write", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const first = optIn(t, async () => {
+        await gate;
+        return { status: "not-ready", code: "runner_incompatible" };
+      });
+      const second = call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "m-2" } } }, readyDeps());
+      release();
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.status).toBe(409);
+      expect(b.status).toBe(200);
+      const head = (await call("/api/mappings/APP/agent-config", "GET", t)).json;
+      expect(head.enabled).toBe(true);
+      expect(head.stages.review.model).toBe("m-2");
+    });
+
+    it("inspects the candidate without publishing it: no revision is appended while inspection is pending or after a refusal", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const store = modules.agentConfigStore;
+      const revs = count("stage_agent_config_revisions");
+      let release!: () => void;
+      let entered!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const inside = new Promise<void>((r) => (entered = r));
+      const seen: unknown[] = [];
+      const pending = optIn(t, async (req: any) => {
+        seen.push(req);
+        entered();
+        await gate;
+        return { status: "not-ready", code: "runner_incompatible" };
+      });
+      await inside;
+      expect(store.isProjectConfigured("APP")).toBe(true);
+      expect(store.getProjectStageConfig("APP")?.config.mode).toBe("configured");
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+      release();
+      expect((await pending).status).toBe(409);
+      expect(store.getProjectStageConfig("APP")?.config.mode).toBe("configured");
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+      expect(seen).toHaveLength(1);
+    });
+
+    it("refuses to commit readiness when the defaults, a profile or the project head moved during inspection", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const store = modules.agentConfigStore;
+      const moves: Array<[string, () => void]> = [
+        ["defaults", () => store.setOrchestratorDefaults({ version: 1, ...defaults, stages: { ...defaults.stages, review: { ...defaults.stages.review, model: "gpt-y" } } } as never)],
+        ["profile", () => void store.saveAccountProfileRevision({ profileId: "oai-1", revision: store.getAccountProfile("oai-1")!.revision + 1, identity: "renamed", agent: "codex", provider: "openai", authMode: "openai-api-key", metadata: { credentialRef: SENTINEL } } as never)],
+        ["project", () => void store.setProjectStageConfig("APP", { version: 1, mode: "legacy", stages: { review: { model: "newer" } } } as never)],
+      ];
+      for (const [name, move] of moves) {
+        const before = store.getProjectStageConfig("APP")?.revision ?? 0;
+        const r = await optIn(t, async () => {
+          move();
+          return { status: "ready", profiles: [] };
+        });
+        expect(r.status).toBe(409);
+        expect(r.json.code).toBe("stale_inputs");
+        expect(store.isProjectConfigured("APP")).toBe(name !== "project");
+        // Only the concurrent writer's own revision (project move) may exist; the stale candidate never lands.
+        expect(store.getProjectStageConfig("APP")?.revision ?? 0).toBeLessThanOrEqual(before + 1);
+      }
+      expect(store.getProjectStageConfig("APP")?.config.stages?.review?.model).toBe("newer");
+    });
+
+    it("rejects invalid candidates, skips readiness in legacy mode and appends nothing on inspection failure", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const store = modules.agentConfigStore;
+      const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { accountProfileId: "missing" } } }, readyDeps(inspect));
+      expect(r.status).toBe(400);
+      expect(inspect).not.toHaveBeenCalled();
+      store.setProjectConfigured("APP", false);
+      const off = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} }, readyDeps(inspect));
+      expect(off.status).toBe(200);
+      expect(inspect).not.toHaveBeenCalled();
+      const backendFail = await optIn(t, async () => {
+        throw new Error("boom");
+      });
+      expect(backendFail.status).toBe(503);
+      expect(store.isProjectConfigured("APP")).toBe(true);
+    });
+
+    it("refuses unreadable GitHub Actions workflows with the sync action and appends nothing", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const revs = count("stage_agent_config_revisions");
+      const r = await optIn(t, async () => ({ status: "not-ready", code: "delivery_unreadable" }));
+      expect(r.status).toBe(409);
+      expect(r.json).toMatchObject({ code: "delivery_unreadable", backend: "github-actions",
+        action: "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows." });
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(true);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")?.config.mode).toBe("configured");
+      expect(count("stage_agent_config_revisions")).toBe(revs);
+    });
+
+    it("saves a configured GitHub Actions project after inspecting readiness", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const inspect = vi.fn(async () => ({ status: "ready", profiles: [] }));
+      expect((await optIn(t, inspect)).status).toBe(200);
+      expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ backend: "github-actions", projectKey: "APP" }), expect.objectContaining({ mode: "configured" }));
+      expect(modules.agentConfigStore.isProjectConfigured("APP")).toBe(true);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
+    });
+
+    it("inspects the Fly backend without GHA template checks", async () => {
+      const t = await seed();
+      await request("/api/mappings", "POST", "secret", { teamKey: "FLY", owner: "org", repo: "fly", executionMode: "fly-machines" }, t);
+      const seen: string[] = [];
+      const r = await call("/api/mappings/FLY/agent-config", "PUT", t, { stages: {} }, readyDeps(async (req: any) => {
+        seen.push(req.backend);
+        return { status: "ready", profiles: [] };
+      }));
+      expect(r.status).toBe(200);
+      expect(seen).toEqual(["fly-machines"]);
+    });
+
+    it("fails closed when no readiness inspection is configured", async () => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: {} });
+      expect(r.status).toBe(501);
+      expect((await call("/api/mappings/APP/agent-config", "GET", t)).json.enabled).toBe(true);
+    });
+
+    it.each([true, false])("continues Claude subscription stage changes to readiness (ready: %s)", async (ready) => {
+      const t = await seed();
+      modules.agentConfigStore.setProjectConfigured("APP", true);
+      const store = modules.agentConfigStore;
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef: undefined }));
+      expect((await call("/api/mappings/APP/agent-config", "PUT", t, {
+        stages: { review: { model: "previous-model" } },
+      }, readyDeps())).status).toBe(200);
+      const previousConfig = store.getProjectStageConfig("APP");
+      const revs = count("stage_agent_config_revisions");
+      const inspect = vi.fn(async () => ready
+        ? { status: "ready", profiles: [] }
+        : { status: "not-ready", code: "runner_incompatible" });
+      const r = await call("/api/mappings/APP/agent-config", "PUT", t, {
+        stages: { review: { agent: "claude", provider: "anthropic", accountProfileId: "cl-sub", model: "m" } },
+      }, readyDeps(inspect));
+      expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ projectKey: "APP" }),
+        expect.objectContaining({ stages: expect.objectContaining({ review: expect.objectContaining({ accountProfileId: "cl-sub" }) }) }));
+      expect(r.status).toBe(ready ? 200 : 409);
+      expect(store.isProjectConfigured("APP")).toBe(true);
+      if (ready) {
+        expect(store.getProjectStageConfig("APP")?.config.stages?.review?.accountProfileId).toBe("cl-sub");
+        const resolved = await call("/api/mappings/APP/agent-config/resolved", "GET", t, undefined, readyDeps());
+        // Admission is mocked ready; the read still reports the profile's missing protected reference.
+        expect(resolved.json.stages.review.account).toEqual({ readiness: "missing", failureCode: "reference_missing" });
+        expect(resolved.raw).not.toContain("sessionRecovery");
+      } else {
+        expect(r.json.code).toBe("runner_incompatible");
+        expect(store.getProjectStageConfig("APP")).toEqual(previousConfig);
+        expect(count("stage_agent_config_revisions")).toBe(revs);
+      }
+    });
+  });
+
+  it.each([true, false, null, 0, "yes", {}, []])("refuses enabled without storing (%j)", async (enabled) => {
+    const t = await seed();
+    for (const mode of ["absent", "legacy", "configured"] as const) {
+      if (mode !== "absent") modules.agentConfigStore.setProjectStageConfig("APP", { version: 1, mode });
+      const before = count("stage_agent_config_revisions");
+      const row = modules.agentConfigStore.getProjectStageConfig("APP");
+      const result = await call("/api/mappings/APP/agent-config", "PUT", t, { enabled });
+      expect(result).toMatchObject({ status: 400, json: { error: "unsupported field(s): enabled" } });
+      expect(count("stage_agent_config_revisions")).toBe(before);
+      expect(modules.agentConfigStore.getProjectStageConfig("APP")).toEqual(row);
+    }
+  });
+
+  it.each(["absent", "legacy", "configured"] as const)("stores stages preserving %s mode", async (mode) => {
+    const t = await seed();
+    if (mode !== "absent") modules.agentConfigStore.setProjectStageConfig("APP", { version: 1, mode });
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, { stages: { review: { model: "override" } } }, readyDeps());
+    expect(result.status).toBe(200);
+    expect(result.json.mode).toBe(mode === "configured" ? "configured" : "legacy");
+  });
+
+  it.each([
+    { body: {}, status: 200 },
+    { body: { stages: {} }, status: 200 },
+    { body: { stages: null }, status: 400 },
+    { body: { stages: [] }, status: 400 },
+    { body: { stages: { unknown: {} } }, status: 400 },
+    { body: { mode: "configured" }, status: 400 },
+  ])("preserves other body validation: $body", async ({ body, status }) => {
+    const t = await seed();
+    const before = count("stage_agent_config_revisions");
+    const result = await call("/api/mappings/APP/agent-config", "PUT", t, body);
+    expect(result.status).toBe(status);
+    expect(count("stage_agent_config_revisions")).toBe(before + (status === 200 ? 1 : 0));
+  });
+
+  it.each(["configured", "legacy", "absent", "failure", "existing-legacy", "existing-configured"])("creates with defaults and project state %s", async (state) => {
+    const t = state === "absent" ? adminTok() : await seed();
+    const store = modules.agentConfigStore;
+    if (state === "legacy") store.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    if (state.startsWith("existing-")) store.setProjectStageConfig("NEW", { version: 1, mode: state === "existing-configured" ? "configured" : "legacy" });
+    if (state === "failure") await call("/api/model-accounts/oai-1", "PATCH", t, { status: "disabled" });
+    const row = store.getProjectStageConfig("NEW");
+    const before = count("stage_agent_config_revisions");
+    const result = await request("/api/mappings", "POST", "secret", { teamKey: "NEW", owner: "org", repo: "new" }, t);
+    expect(result.statusCode).toBe(202);
+    const body = JSON.parse(result.body);
+    expect(config.getMappings().NEW).toBeDefined();
+    if (state === "configured") {
+      expect(store.getProjectStageConfig("NEW")).toMatchObject({ createdBy: null, config: { mode: "configured" } });
+      expect(count("stage_agent_config_revisions")).toBe(before + 1);
+    } else {
+      expect(store.getProjectStageConfig("NEW")).toEqual(row);
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+    if (state === "failure") expect(body.warnings).toEqual(["Project saved in legacy mode: resolution-failed"]);
+    else expect(body.warnings).toBeUndefined();
+  });
+
+  it.each(["absent", "legacy", "configured"] as const)("mapping updates preserve %s with defaults on for every body", async (mode) => {
+    const t = await seed();
+    const store = modules.agentConfigStore;
+    if (mode !== "absent") store.setProjectStageConfig("APP", { version: 1, mode });
+    const before = count("stage_agent_config_revisions");
+    const row = store.getProjectStageConfig("APP");
+    for (const body of [{}, { enabled: true }, { enabled: false }, { agentConfig: { mode: "configured" } }]) {
+      const r = await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
+      expect(r.statusCode).toBe(202);
+      expect(store.getProjectStageConfig("APP")).toEqual(row);
+      expect(count("stage_agent_config_revisions")).toBe(before);
+    }
+  });
+
+  it("keeps ordinary mapping CRUD from touching agent configuration", async () => {
+    const t = await seed();
+    const store = modules.agentConfigStore;
+    const body = { enabled: true, agentConfig: { mode: "configured" } };
+    await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", ...body }, t);
+    await request("/api/mappings/APP", "PATCH", "secret", body, t);
+    expect(store.isProjectConfigured("APP")).toBe(false);
+    expect(store.getProjectStageConfig("APP")).toBeNull();
+  });
+
+  describe("ChatGPT pairing code mint (AII-1501)", () => {
+    const SECRET_ENV = "test-runner-token-secret-1501";
+    const saved = process.env.RUNNER_TOKEN_SECRET;
+    beforeEach(() => { process.env.RUNNER_TOKEN_SECRET = SECRET_ENV; });
+    afterEach(() => {
+      if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+    });
+    const url = (id: string) => `/api/model-accounts/${id}/chatgpt-pairing`;
+    const codex = (over: Record<string, unknown> = {}) =>
+      profileBody({ profileId: "gpt-1", agent: "codex", provider: "openai", authMode: "codex-subscription", credentialRef: undefined, ...over });
+
+    it("mints once for an active codex-subscription profile and stores only the hash", async () => {
+      const t = adminTok();
+      expect((await call("/api/model-accounts", "POST", t, codex())).status).toBe(201);
+      const r = await call(url("gpt-1"), "POST", t);
+      expect(r.status).toBe(200);
+      expect(r.json.code).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(r.json.command).toContain("chatgpt-plan-login.js connect --orchestrator https://");
+      expect(r.json.command).not.toContain(r.json.code);
+      const rows = dedup.getDb().prepare("SELECT * FROM chatgpt_pairing_codes").all() as { code_hash: string; profile_id: string; used_at: number | null }[];
+      expect(rows).toHaveLength(1);
+      expect(rows[0].code_hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.stringify(rows)).not.toContain(r.json.code);
+      expect(rows[0].used_at).toBeNull();
+      const list = await call("/api/model-accounts", "GET", t);
+      expect(list.raw).not.toContain(r.json.code);
+      expect(list.raw).not.toContain(rows[0].code_hash);
+      // A second mint invalidates the first.
+      expect((await call(url("gpt-1"), "POST", t)).status).toBe(200);
+      const after = dedup.getDb().prepare("SELECT used_at FROM chatgpt_pairing_codes ORDER BY created_at, rowid").all() as { used_at: number | null }[];
+      expect(after.filter((x) => x.used_at === null)).toHaveLength(1);
+    });
+
+    it("refuses non-admins, unknown, wrong-type and inactive profiles", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, codex());
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: "model-account:oai-1" }));
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      expect((await call(url("gpt-1"), "POST", userTok())).status).toBe(403);
+      expect((await call(url("nope"), "POST", t)).status).toBe(404);
+      expect((await call(url("oai-1"), "POST", t)).status).toBe(400);
+      expect((await call("/api/model-accounts/gpt-1", "PATCH", t, { status: "disabled" })).status).toBe(200);
+      expect((await call(url("gpt-1"), "POST", t)).status).toBe(400);
+      expect(count("chatgpt_pairing_codes")).toBe(0);
+    });
+
+    it("serves the status route to admins only, with status fields and no tokens", async () => {
+      const t = adminTok();
+      const status = (id: string) => `/api/model-accounts/${id}/chatgpt-status`;
+      await call("/api/model-accounts", "POST", t, codex());
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: "model-account:oai-1" }));
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      expect((await call(status("gpt-1"), "GET", userTok())).status).toBe(403);
+      expect((await call(status("nope"), "GET", t)).status).toBe(404);
+      expect((await call(status("oai-1"), "GET", t)).status).toBe(400);
+      const r = await call(status("gpt-1"), "GET", t);
+      expect(r.status).toBe(200);
+      expect(Object.keys(r.json).sort()).toEqual(["connected", "email", "lastRefresh", "secondsLeft"]);
+      expect(r.json.connected).toBe(false);
+      expect(r.raw).not.toMatch(/accessToken|refreshToken|idToken/);
+    });
+
+    it("reports a connected profile's real fields and no token value", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, codex());
+      const saved = process.env.RUNNER_TOKEN_SECRET;
+      process.env.RUNNER_TOKEN_SECRET = "test-runner-token-secret-1502";
+      try {
+        const sessions = createModelSessionStore({
+          keys: createModelSessionKeyProvider(),
+          verifyOwner: () => false,
+          authorizeOperator: (o) => o === "chatgpt-pairing",
+          db: () => dedup.getDb(),
+        });
+        const written = sessions.writePlanRecord({
+          profileId: "gpt-1",
+          expectedSequence: null,
+          operator: "chatgpt-pairing",
+          sessionData: JSON.stringify({
+            email: "op@example.com",
+            refreshToken: "SYNTH-REFRESH-1502",
+            accessToken: "SYNTH-ACCESS-1502",
+            idToken: "SYNTH-ID-1502",
+            accessTokenExpiresAt: Date.now() + 3_600_000,
+          }),
+        });
+        expect(written.ok).toBe(true);
+        const r = await call(`/api/model-accounts/gpt-1/chatgpt-status`, "GET", t);
+        expect(r.status).toBe(200);
+        expect(Object.keys(r.json).sort()).toEqual(["connected", "email", "lastRefresh", "secondsLeft"]);
+        expect(r.json.connected).toBe(true);
+        expect(r.json.email).toBe("op@example.com");
+        expect(Number.isInteger(r.json.secondsLeft)).toBe(true);
+        expect(r.json.secondsLeft).toBeGreaterThan(3500);
+        expect(typeof r.json.lastRefresh).toBe("string");
+        expect(r.raw).not.toMatch(/SYNTH-|accessToken|refreshToken|idToken/);
+      } finally {
+        if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+      }
+    });
+
+    it("answers 500 with a fixed error when the store read throws", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, codex());
+      const saved = process.env.RUNNER_TOKEN_SECRET;
+      process.env.RUNNER_TOKEN_SECRET = "test-runner-token-secret-1502";
+      createModelSessionStoreMock.mockImplementationOnce(() => { throw new Error("SYNTH-DB-DETAIL"); });
+      try {
+        const r = await call(`/api/model-accounts/gpt-1/chatgpt-status`, "GET", t);
+        expect(r.status).toBe(500);
+        expect(r.json).toEqual({ error: "could not read the status" });
+        expect(r.raw).not.toContain("SYNTH-DB-DETAIL");
+      } finally {
+        if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+      }
+    });
+  });
+
+  describe("browser API key entry (AII-1500)", () => {
+    const KEY = "sk-synthetic-sentinel-1500";
+    const SECRET_ENV = "test-runner-token-secret-1500";
+    const saved = process.env.RUNNER_TOKEN_SECRET;
+    beforeEach(() => { process.env.RUNNER_TOKEN_SECRET = SECRET_ENV; });
+    afterEach(() => {
+      if (saved === undefined) delete process.env.RUNNER_TOKEN_SECRET; else process.env.RUNNER_TOKEN_SECRET = saved;
+      vi.restoreAllMocks();
+    });
+    const store = () => createModelProtectedSecrets({ env: process.env, db: () => dedup.getDb() });
+    const url = (id: string) => `/api/model-accounts/${id}/credential`;
+    const REF = "model-account:oai-1";
+
+    async function seedProfile(over: Record<string, unknown> = {}) {
+      const t = adminTok();
+      const r = await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: REF, ...over }));
+      expect(r.status).toBe(201);
+      return t;
+    }
+
+    it.each(["PUT", "DELETE"] as const)("orders overlapping operations while %s ingress response is delayed", async (first) => {
+      const t = await seedProfile();
+      if (first === "DELETE") expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const deps = first === "PUT" ? {
+        bindKey: async (ref: string, destination: string) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered(); await paused; return "bound" as const;
+        },
+      } : {
+        clearKeyBinding: async (ref: string) => {
+          const removed = dedup.getDb().prepare("DELETE FROM key_bindings WHERE key_ref = ?").run(ref).changes;
+          entered(); await paused; return removed;
+        },
+      };
+      const a = call(url("oai-1"), first, t, first === "PUT" ? { apiKey: KEY } : undefined, deps);
+      await started;
+      const second = first === "PUT" ? "DELETE" : "PUT";
+      const b = call(url("oai-1"), second, t, second === "PUT" ? { apiKey: KEY } : undefined);
+      const patch = call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      release();
+      expect((await a).status).toBe(200);
+      expect((await b).status).toBe(200);
+      expect((await patch).status).toBe(first === "DELETE" ? 409 : 200);
+      if (first === "DELETE") {
+        expect(store().resolve(REF)).toBe(KEY);
+        expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF)).toEqual({ destination: "openai/openai-api-key" });
+      } else expect(store().resolve(REF)).toBeNull();
+    });
+
+    it.each(["PUT", "PATCH"] as const)("a disconnected %s cannot stall mutations behind paused ingress", async (method) => {
+      const t = await seedProfile();
+      let release!: () => void;
+      let entered!: () => void;
+      const paused = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const first = call(url("oai-1"), "PUT", t, { apiKey: KEY }, {
+        bindKey: async (ref, destination) => {
+          dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(ref, destination, 1);
+          entered();
+          await paused;
+          return "bound";
+        },
+      });
+      await started;
+      try {
+        // A partial request loses its socket while the earlier PUT waits on ingress.
+        // Its body reader must already be listening, outside the mutation queue.
+        const req = new MockRequest(method === "PUT" ? url("oai-1") : "/api/model-accounts/oai-1", method,
+          { authorization: `Bearer ${t}` });
+        req.removeAllListeners("newListener");
+        const res = new MockResponse();
+        admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await vi.waitFor(() => expect(req.listenerCount("data")).toBe(1));
+        req.emit("data", Buffer.from('{"'));
+        Object.assign(req, { destroyed: true, aborted: true });
+        req.emit("aborted");
+        req.emit("close");
+        await res.done;
+        expect(res.statusCode).toBe(400);
+
+        // A request that was destroyed before routing must also settle immediately.
+        const dead = new MockRequest(req.url!, method, { authorization: `Bearer ${t}` });
+        dead.removeAllListeners("newListener");
+        Object.assign(dead, { destroyed: true, aborted: true });
+        const deadRes = new MockResponse();
+        admin.handleAdminRequest(dead as never, deadRes as never, adminConfig("secret"), makeFakeRegistry(provider));
+        await deadRes.done;
+        expect(deadRes.statusCode).toBe(400);
+      } finally {
+        release();
+      }
+      expect((await first).status).toBe(200);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      expect(store().resolve(REF)).toBe(KEY);
+      expect(dedup.getDb().prepare("SELECT destination FROM key_bindings WHERE key_ref = ?").get(REF))
+        .toEqual({ destination: "openai/openai-api-key" });
+    });
+
+    it.each(["conflict", "unavailable"] as const)("PUT fails closed on %s before storing", async (outcome) => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => outcome);
+      const r = await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey });
+      expect(r.status).toBe(outcome === "conflict" ? 409 : 503);
+      expect(bindKey).toHaveBeenCalledWith(REF, "openai/openai-api-key");
+      expect(count("model_protected_secrets")).toBe(0);
+    });
+
+    it.each(["binding", "legacy"])("PATCH refuses a provider change with a %s key and preserves revision", async (kind) => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      if (kind === "legacy") dedup.getDb().prepare("DELETE FROM key_bindings").run();
+      const before = count("model_account_profile_revisions");
+      const r = await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" });
+      expect(r.status).toBe(409);
+      expect(r.json.error).toContain("remove the stored key first");
+      expect(count("model_account_profile_revisions")).toBe(before);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { identity: "renamed", status: "disabled" })).status).toBe(200);
+    });
+
+    it("PATCH refuses a manually selected reference bound to another destination", async () => {
+      const t = await seedProfile();
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run("model-account:other", "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { credentialRef: "model-account:other" })).status).toBe(409);
+    });
+
+    it("PATCH refuses an auth mode change when only the binding remains", async () => {
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" });
+      dedup.getDb().prepare("INSERT INTO key_bindings VALUES (?, ?, ?)").run(REF, "anthropic/anthropic-api-key", 1);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { authMode: "claude-subscription" })).status).toBe(409);
+    });
+
+    it("binds before writing and clears after deletion, returning a safe failure if clear fails", async () => {
+      const t = await seedProfile();
+      const bindKey = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        return "bound" as const;
+      });
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY }, { bindKey })).status).toBe(200);
+      const clearKeyBinding = vi.fn(async () => {
+        expect(count("model_protected_secrets")).toBe(0);
+        throw new Error(KEY);
+      });
+      const r = await call(url("oai-1"), "DELETE", t, undefined, { clearKeyBinding });
+      expect(r.status).toBe(503);
+      expect(r.raw).not.toContain(KEY);
+      expect(clearKeyBinding).toHaveBeenCalledWith(REF);
+    });
+
+    it.each([
+      { agent: "codex", provider: "openai", authMode: "openai-api-key" },
+      { agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+      { agent: "claude", provider: "anthropic", authMode: "claude-subscription" },
+    ])("round-trips $authMode like secret-import, never leaks it, and DELETE removes it", async (mode) => {
+      const logs: string[] = [];
+      for (const m of ["log", "info", "warn", "error"] as const) vi.spyOn(console, m).mockImplementation((...a) => { logs.push(a.join(" ")); });
+      const t = await seedProfile(mode);
+      const revs = count("model_account_profile_revisions");
+      const put = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(put.status).toBe(200);
+      expect(put.json).toEqual({ ref: REF, result: "set" });
+      expect(put.raw).not.toContain(KEY);
+      expect(store().resolve(REF)).toBe(KEY);
+      expect(count("model_account_profile_revisions")).toBe(revs);
+      const list = await call("/api/model-accounts", "GET", t);
+      const row = list.json.accounts.find((a: { profileId: string }) => a.profileId === "oai-1");
+      expect(row.credentialSet).toBe(true);
+      expect(typeof row.credentialUpdatedAt).toBe("number");
+      expect(row.account).toEqual({ readiness: "unknown", failureCode: null });
+      expect(list.raw).not.toContain("sessionRecovery");
+      const withDeps = await call("/api/model-accounts", "GET", t, undefined, readyDeps());
+      expect(withDeps.json.accounts[0].account).toEqual({ readiness: "ready", failureCode: null });
+      expect(withDeps.raw).not.toContain(KEY);
+      expect(list.raw).not.toContain(KEY);
+      expect(list.raw).not.toContain(REF);
+      const del = await call(url("oai-1"), "DELETE", t);
+      expect(del.status).toBe(200);
+      expect(del.raw).not.toContain(KEY);
+      expect(del.json).toEqual({ ref: REF, result: "removed" });
+      expect(store().resolve(REF)).toBeNull();
+      expect(count("model_protected_secrets")).toBe(0);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      const after = (await call("/api/model-accounts", "GET", t)).json.accounts[0];
+      expect(after.credentialSet).toBe(false);
+      expect(after.credentialUpdatedAt).toBeNull();
+      expect(logs.filter((l) => l.includes("[admin] model-account credential"))).toHaveLength(3);
+      expect(logs.join("\n")).not.toContain(KEY);
+    });
+
+    it.each([undefined, "model-account:claude-token"])("saves, replaces and removes a Claude setup-token (ref: %s)", async (credentialRef) => {
+      const token = "sk-ant-oat01-synthetic-setup-token";
+      const t = await seedProfile({ profileId: "cl-sub", agent: "claude", provider: "anthropic", authMode: "claude-subscription", credentialRef });
+      const ref = credentialRef ?? "model-account:cl-sub";
+      const deps = readyDeps();
+      const resolveSecret = vi.fn(() => { throw new Error("status must not read a secret"); });
+      deps.agentConfig!.credentials.resolveProtectedSecret = resolveSecret;
+      const read = async () => {
+        const r = await call("/api/model-accounts", "GET", t, undefined, deps);
+        expect(r.raw).not.toContain(token);
+        expect(r.raw).not.toContain(ref);
+        expect(resolveSecret).not.toHaveBeenCalled();
+        return r.json.accounts.find((a: { profileId: string }) => a.profileId === "cl-sub");
+      };
+      expect((await read()).credentialSet).toBe(false);
+      expect((await read()).account).toEqual({ readiness: "missing", failureCode: credentialRef ? "secret_unavailable" : "reference_missing" });
+      const revs = count("model_account_profile_revisions");
+      for (const value of [token, token + "-replacement"]) {
+        const put = await call(url("cl-sub"), "PUT", t, { apiKey: value });
+        expect(put.status).toBe(200);
+        expect(put.raw).not.toContain(token);
+        expect(store().resolve(ref)).toBe(value);
+        const row = await read();
+        expect(row.credentialSet).toBe(true);
+        expect(typeof row.credentialUpdatedAt).toBe("number");
+        expect(row.account.readiness).toBe("ready");
+      }
+      expect(count("model_account_profile_revisions")).toBe(revs + (credentialRef ? 0 : 1));
+      for (let i = 0; i < 2; i++) expect((await call(url("cl-sub"), "DELETE", t)).status).toBe(200);
+      expect(store().resolve(ref)).toBeNull();
+      expect(await read()).toMatchObject({ credentialSet: false, credentialUpdatedAt: null, account: { readiness: "missing", failureCode: "secret_unavailable" } });
+    });
+
+    it("redacts a Claude setup-token when the protected store fails", async () => {
+      const logs: string[] = [];
+      for (const m of ["log", "info", "warn", "error", "debug"] as const) vi.spyOn(console, m).mockImplementation((...a) => { logs.push(a.join(" ")); });
+      const t = await seedProfile({ agent: "claude", provider: "anthropic", authMode: "claude-subscription" });
+      // Make SQLite's raw error contain the token, proving that it is redacted.
+      dedup.getDb().exec(`CREATE TRIGGER fail_credential_write BEFORE INSERT ON model_protected_secrets
+        BEGIN SELECT RAISE(ABORT, '${KEY}'); END`);
+      try {
+        const failed = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+        expect(failed.status).toBe(500);
+        expect(failed.json).toEqual({ error: "could not write the credential" });
+        expect(failed.raw).not.toContain(KEY);
+        expect(logs.join("\n")).not.toContain(KEY);
+        expect(count("model_protected_secrets")).toBe(0);
+      } finally {
+        dedup.getDb().exec("DROP TRIGGER fail_credential_write");
+      }
+    });
+
+    it("derives model-account:<id> and appends one revision for a profile without a ref", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: undefined }));
+      const revs = count("model_account_profile_revisions");
+      const put = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(put.json).toEqual({ ref: REF, result: "set" });
+      expect(count("model_account_profile_revisions")).toBe(revs + 1);
+      expect(store().resolve(REF)).toBe(KEY);
+      const acct = (await call("/api/model-accounts", "GET", t)).json.accounts[0];
+      expect(acct.credentialSet).toBe(true);
+    });
+
+    it("refuses bad refs, wrong modes, unknown profiles and bad bodies without writing", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "Upper-1", credentialRef: undefined }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "badref", credentialRef: SENTINEL }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "plan-1", authMode: "codex-subscription", credentialRef: undefined }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "bed", provider: "bedrock", agent: "claude", authMode: "bedrock", credentialRef: REF }));
+      await seedProfile();
+      const revs = count("model_account_profile_revisions");
+      const cases: Array<[string, unknown, number]> = [
+        ["Upper-1", { apiKey: KEY }, 400],
+        ["badref", { apiKey: KEY }, 400],
+        ["plan-1", { apiKey: KEY }, 400],
+        ["bed", { apiKey: KEY }, 400],
+        ["nope", { apiKey: KEY }, 404],
+        ["oai-1", { apiKey: "" }, 400],
+        ["oai-1", { apiKey: "   " }, 400],
+        ["oai-1", { apiKey: 5 }, 400],
+        ["oai-1", {}, 400],
+        ["oai-1", { apiKey: KEY, extra: 1 }, 400],
+      ];
+      for (const id of ["plan-1", "bed"]) {
+        expect((await call(url(id), "DELETE", t)).status).toBe(400);
+      }
+      for (const [id, body, status] of cases) {
+        const r = await call(url(id), "PUT", t, body);
+        expect(r.status, id).toBe(status);
+        expect(r.raw).not.toContain(KEY);
+      }
+      expect(count("model_protected_secrets")).toBe(0);
+      expect(count("model_account_profile_revisions")).toBe(revs);
+    });
+
+    it("answers 503 with fixed text when RUNNER_TOKEN_SECRET is unset", async () => {
+      const t = await seedProfile();
+      delete process.env.RUNNER_TOKEN_SECRET;
+      const r = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(r.status).toBe(503);
+      expect(r.raw).not.toContain(KEY);
+      expect(count("model_protected_secrets")).toBe(0);
+    });
+
+    it("refuses PUT with 409 and leaves another profile's key alone when the fallback ref is taken", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "a", credentialRef: "model-account:b" }));
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "b", credentialRef: undefined }));
+      expect(store().write("model-account:b", "sk-synthetic-owner-a" as never).ok).toBe(true);
+      const revs = count("model_account_profile_revisions");
+      const put = await call(url("b"), "PUT", t, { apiKey: KEY });
+      expect(put.status).toBe(409);
+      expect(put.raw).not.toContain(KEY);
+      expect(store().resolve("model-account:b")).toBe("sk-synthetic-owner-a");
+      expect(count("model_account_profile_revisions")).toBe(revs);
+      const del = await call(url("b"), "DELETE", t);
+      expect(del.status).toBe(200);
+      expect(store().resolve("model-account:b")).toBe("sk-synthetic-owner-a");
+      expect(count("model_protected_secrets")).toBe(1);
+    });
+
+    it("does not treat a non-head revision of another profile as a clash", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "a", credentialRef: "model-account:b" }));
+      await call("/api/model-accounts/a", "PATCH", t, { credentialRef: "model-account:a" });
+      await call("/api/model-accounts", "POST", t, profileBody({ profileId: "b", credentialRef: undefined }));
+      expect((await call(url("b"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+      expect(store().resolve("model-account:b")).toBe(KEY);
+    });
+
+    it("keeps a pre-existing row when the revision save fails, and removes a row it created", async () => {
+      const t = adminTok();
+      await call("/api/model-accounts", "POST", t, profileBody({ credentialRef: undefined }));
+      expect(store().write(REF, "sk-synthetic-prior" as never).ok).toBe(true);
+      const spy = vi.spyOn(modules.agentConfigStore, "saveAccountProfileRevision").mockImplementation(() => { throw new Error("boom"); });
+      const failed = await call(url("oai-1"), "PUT", t, { apiKey: KEY });
+      expect(failed.status).toBe(500);
+      expect(store().resolve(REF)).toBe("sk-synthetic-prior");
+      expect(store().delete(REF).ok).toBe(true);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(500);
+      expect(count("model_protected_secrets")).toBe(0);
+      spy.mockRestore();
+      expect(count("key_bindings")).toBe(1);
+      expect((await call(url("oai-1"), "DELETE", t)).status).toBe(200);
+      expect(count("key_bindings")).toBe(0);
+      expect((await call("/api/model-accounts/oai-1", "PATCH", t, { provider: "openrouter", authMode: "openrouter-api-key" })).status).toBe(200);
+      expect((await call(url("oai-1"), "PUT", t, { apiKey: KEY })).status).toBe(200);
+    });
+
+    it.each(["openai-api-key", "claude-subscription"])("refuses a non-admin with every page granted for %s", async (authMode) => {
+      await seedProfile(authMode === "claude-subscription" ? { agent: "claude", provider: "anthropic", authMode } : {});
+      accessGrants.savePageGrants(Object.keys(accessGrants.PAGE_ROUTES), "ada@eudoxus.ai");
+      const u = userTok();
+      expect((await call(url("oai-1"), "PUT", u, { apiKey: KEY })).status).toBe(403);
+      expect((await call(url("oai-1"), "DELETE", u)).status).toBe(403);
+      expect(count("model_protected_secrets")).toBe(0);
+    });
   });
 });

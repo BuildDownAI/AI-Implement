@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { sidebarHtml, SIDEBAR_ROUTES } from "../sidebar.js";
+import { sidebarHtml, SIDEBAR_ROUTES, GRANT_BLOCKERS } from "../sidebar.js";
+import { PAGE_ROUTES } from "../../access-page-grants.js";
 import { componentsCss } from "../components.js";
 
 describe("sidebar", () => {
@@ -8,6 +9,20 @@ describe("sidebar", () => {
     for (const label of ["Work", "Configure", "Platform", "Developer"]) {
       expect(html).toContain(`>${label}<`);
     }
+  });
+
+  it("lists Knowledge Graph Pipelines as the last Work item, after Reports", () => {
+    const html = sidebarHtml();
+    const work = html.slice(html.indexOf(">Work<"), html.indexOf(">Configure<"));
+    const routes = [...work.matchAll(/data-route="([^"]+)"/g)].map((m) => m[1]);
+    expect(routes[routes.length - 1]).toBe("kg-pipelines");
+    expect(routes[routes.length - 2]).toBe("reports");
+    expect(html).toContain("Knowledge Graph Pipelines");
+  });
+
+  it("keeps kg-pipelines admin-only: a grant blocker and no PAGE_ROUTES entry", () => {
+    expect(GRANT_BLOCKERS["kg-pipelines"]).toBe("Starts knowledge-graph refreshes and changes the materialize setting.");
+    expect(Object.keys(PAGE_ROUTES)).not.toContain("kg-pipelines");
   });
 
   it("includes a data-route attribute for every routable item", () => {

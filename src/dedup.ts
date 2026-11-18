@@ -4,21 +4,45 @@ import { dirname } from "path";
 
 const FALLBACK_DB_PATH = "/tmp/ai-implement.sqlite";
 
-function resolveDbPath(): string {
+/** Where the database lives, and whether creating its directory failed so `/tmp` was used instead. */
+export interface DatabasePath {
+  path: string;
+  configured: string;
+  fellBack: boolean;
+}
+
+function resolveDbPath(): DatabasePath {
   const configured = process.env.DEDUP_DB_PATH || "/data/dedup.sqlite";
   try {
     mkdirSync(dirname(configured), { recursive: true });
-    return configured;
+    return { path: configured, configured, fellBack: false };
   } catch (err: any) {
     if (!["EACCES", "ENOENT", "EPERM", "EROFS"].includes(err.code)) throw err;
     console.warn(`[db] Cannot create ${dirname(configured)} (${err.code}), falling back to ${FALLBACK_DB_PATH}`);
-    return FALLBACK_DB_PATH;
+    return { path: FALLBACK_DB_PATH, configured, fellBack: true };
   }
 }
 
-const DB_PATH = resolveDbPath();
+let resolvedPath: DatabasePath | null = null;
+
+/** Resolved on first use, so a process that imports this module and never opens the database creates nothing. */
+function dbPath(): DatabasePath {
+  resolvedPath ??= resolveDbPath();
+  return resolvedPath;
+}
+
+export function getDatabasePath(): DatabasePath {
+  return { ...dbPath() };
+}
 
 let db: Database.Database | null = null;
+let readOnly = false;
+
+/** Opens the database read-only from here on, with no migrations, and never creates it: for a command run beside the orchestrator. */
+export function useReadOnlyDb(): void {
+  if (db) throw new Error("useReadOnlyDb() must run before the database is opened");
+  readOnly = true;
+}
 
 function ensureDispatchedColumns(): void {
   if (!db) return;
@@ -47,26 +71,6 @@ function ensureAdminSessionColumns(): void {
   if (!names.has("name")) db.exec("ALTER TABLE admin_sessions ADD COLUMN name TEXT");
 }
 
-/** AII-781: tombstones are tracked independently of payload retention — a delivery
- *  can be tombstoned without its payload_json being purged, and a later payload-purge
- *  path (if one is ever added) must not clear this column. `conflict_at` /
- *  `conflict_count` mark that an identity was reused with different content
- *  (rejected, not overwritten) without disturbing the originally accepted row. */
-function ensureReviewFixInboxColumns(): void {
-  if (!db) return;
-  const info = db.prepare("PRAGMA table_info(review_fix_inbox)").all() as Array<{ name: string }>;
-  const names = new Set(info.map((c) => c.name));
-  if (!names.has("tombstoned_at")) {
-    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN tombstoned_at INTEGER");
-  }
-  if (!names.has("conflict_at")) {
-    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_at INTEGER");
-  }
-  if (!names.has("conflict_count")) {
-    db.exec("ALTER TABLE review_fix_inbox ADD COLUMN conflict_count INTEGER NOT NULL DEFAULT 0");
-  }
-}
-
 /** AII-792: the source event identity a webhook-intake caller supplies to
  *  `acceptReviewFixWebhookEvent` (review-fix-queue.ts) — the GitHub delivery id when
  *  present, else a synthesized hash. NULL for the pre-existing internal producers
@@ -78,6 +82,18 @@ function ensureReviewFixEventsColumns(): void {
   const names = new Set(info.map((c) => c.name));
   if (!names.has("source_event_id")) {
     db.exec("ALTER TABLE review_fix_events ADD COLUMN source_event_id TEXT");
+  }
+}
+
+function ensureReviewFixAttemptsColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(review_fix_attempts)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+  if (!names.has("execution_backend")) {
+    db.exec("ALTER TABLE review_fix_attempts ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'github-actions'");
+  }
+  if (!names.has("execution_ref")) {
+    db.exec("ALTER TABLE review_fix_attempts ADD COLUMN execution_ref TEXT");
   }
 }
 
@@ -148,9 +164,248 @@ function ensureRunnerTokensTable(): void {
   createRunnerTokensTable();
 }
 
+// CHECK constraints cannot be altered in place. Each table upgrades independently and atomically.
+function ensureOpenRouterTable(createSql: string, table: string, columns: string, objectSql: string): void {
+  if (!db) return;
+  const connection = db;
+  connection.exec(createSql);
+  const stored = connection.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(table) as { sql: string };
+  if (!stored.sql.includes("openrouter")) {
+    connection.transaction(() => {
+      connection.exec(createSql.replace(`IF NOT EXISTS ${table}`, `${table}_new`));
+      connection.exec(`INSERT INTO ${table}_new (${columns}) SELECT ${columns} FROM ${table}`);
+      // SQLite validates other tables' triggers during RENAME. Preserve the prune trigger,
+      // whose DELETE references attribution, while that table is temporarily absent.
+      const pruneTrigger = table === "model_invocation_attribution"
+        ? connection.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_dispatch_log_pruned'")
+          .get() as { sql: string } | undefined
+        : undefined;
+      if (pruneTrigger) connection.exec("DROP TRIGGER trg_dispatch_log_pruned");
+      connection.exec(`DROP TABLE ${table}`);
+      connection.exec(`ALTER TABLE ${table}_new RENAME TO ${table}`);
+      connection.exec(objectSql);
+      if (pruneTrigger) connection.exec(pruneTrigger.sql);
+    })();
+  } else {
+    connection.exec(objectSql);
+  }
+}
+
+function createAgentConfigurationTables(): void {
+  if (!db) return;
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_account_profiles (
+      profile_id TEXT PRIMARY KEY,
+      current_profile_revision INTEGER NOT NULL CHECK (current_profile_revision > 0),
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      CHECK (status IN ('active', 'disabled', 'archived'))
+    )
+  `);
+  const immutableProfileTriggerSql = `CREATE TRIGGER IF NOT EXISTS trg_model_account_profile_revisions_immutable
+    BEFORE UPDATE ON model_account_profile_revisions
+    BEGIN SELECT RAISE(ABORT, 'model account profile revisions are immutable'); END`;
+  ensureOpenRouterTable(
+    `
+    CREATE TABLE IF NOT EXISTS model_account_profile_revisions (
+      profile_id TEXT NOT NULL,
+      profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+      agent TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      auth_mode TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      PRIMARY KEY (profile_id, profile_revision),
+      CHECK (agent IN ('claude', 'codex')),
+      CHECK (provider IN ('anthropic', 'bedrock', 'openai', 'openrouter')),
+      CHECK (auth_mode IN ('anthropic-api-key', 'claude-subscription', 'bedrock', 'openai-api-key', 'codex-subscription', 'openrouter-api-key'))
+    )
+  `,
+    "model_account_profile_revisions",
+    "profile_id, profile_revision, agent, provider, auth_mode, display_name, created_at, metadata_json",
+    immutableProfileTriggerSql,
+  );
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stage_agent_config_revisions (
+      config_revision_id TEXT PRIMARY KEY,
+      scope_kind TEXT NOT NULL,
+      scope_key TEXT NOT NULL,
+      version INTEGER NOT NULL CHECK (version = 1),
+      revision INTEGER NOT NULL CHECK (revision > 0),
+      config_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      created_by TEXT,
+      supersedes_revision_id TEXT,
+      CHECK (scope_kind IN ('orchestrator', 'project'))
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_stage_agent_config_revisions_scope
+    ON stage_agent_config_revisions(scope_kind, scope_key, revision)`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS run_agent_config_snapshots (
+      snapshot_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL UNIQUE,
+      project_key TEXT NOT NULL,
+      resolved_config_json TEXT NOT NULL,
+      source_map_json TEXT NOT NULL,
+      config_revision_ids_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_run_agent_config_snapshots_immutable
+    BEFORE UPDATE ON run_agent_config_snapshots
+    BEGIN SELECT RAISE(ABORT, 'run agent config snapshots are immutable'); END`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_profile_reservations (
+      reservation_id TEXT PRIMARY KEY,
+      profile_id TEXT NOT NULL,
+      dispatch_id TEXT NOT NULL,
+      owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+      owner_kind TEXT NOT NULL,
+      recovery_status TEXT NOT NULL DEFAULT 'reserved',
+      reserved_at INTEGER NOT NULL,
+      heartbeat_at INTEGER,
+      released_at INTEGER,
+      release_reason TEXT,
+      CHECK (recovery_status IN ('reserved', 'held', 'recovering', 'released', 'failed')),
+      CHECK (released_at IS NULL OR recovery_status IN ('released', 'failed'))
+    )
+  `);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_model_profile_reservations_active_profile
+    ON model_profile_reservations(profile_id) WHERE released_at IS NULL`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_model_profile_reservations_dispatch_profile
+    ON model_profile_reservations(dispatch_id, profile_id)`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_model_profile_reservations_generation_fence
+    BEFORE INSERT ON model_profile_reservations
+    WHEN NEW.owner_generation <= COALESCE((SELECT MAX(owner_generation) FROM model_profile_reservations WHERE profile_id = NEW.profile_id), 0)
+    BEGIN SELECT RAISE(ABORT, 'model profile reservation generation must increase'); END`);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_session_generations (
+      profile_id TEXT NOT NULL,
+      owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+      checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence >= 0),
+      encrypted_session_state BLOB NOT NULL,
+      encryption_key_id TEXT NOT NULL,
+      nonce BLOB NOT NULL,
+      auth_tag BLOB NOT NULL,
+      checkpointed_at INTEGER NOT NULL,
+      valid_until_at INTEGER,
+      state_status TEXT NOT NULL DEFAULT 'checkpointed',
+      PRIMARY KEY (profile_id, owner_generation, checkpoint_sequence),
+      CHECK (state_status IN ('checkpointed', 'held', 'expired', 'revoked'))
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_protected_secrets (
+      secret_ref TEXT PRIMARY KEY,
+      ciphertext BLOB NOT NULL,
+      nonce BLOB NOT NULL,
+      auth_tag BLOB NOT NULL,
+      encryption_key_id TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_credential_grants (
+      grant_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      project_key TEXT NOT NULL,
+      backend TEXT NOT NULL,
+      audience TEXT NOT NULL,
+      bearer_hash TEXT NOT NULL,
+      scope_json TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      consumed_at INTEGER,
+      revoked_at INTEGER
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS model_credential_grant_profiles (
+      grant_id TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+      owner_generation INTEGER CHECK (owner_generation IS NULL OR owner_generation > 0),
+      PRIMARY KEY (grant_id, stage, profile_id),
+      CHECK (stage IN ('planning', 'implementation', 'review'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_model_credential_grants_dispatch
+    ON model_credential_grants(dispatch_id)`);
+  const invocationDispatchIndexSql = `CREATE INDEX IF NOT EXISTS idx_model_invocation_attribution_dispatch
+    ON model_invocation_attribution(dispatch_id, stage)`;
+  ensureOpenRouterTable(
+    `
+    CREATE TABLE IF NOT EXISTS model_invocation_attribution (
+      invocation_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
+      agent TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      auth_mode TEXT NOT NULL,
+      config_revision_id TEXT,
+      snapshot_id TEXT,
+      status TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      usage_json TEXT NOT NULL DEFAULT '{}',
+      CHECK (stage IN ('planning', 'implementation', 'review')),
+      CHECK (agent IN ('claude', 'codex')),
+      CHECK (provider IN ('anthropic', 'bedrock', 'openai', 'openrouter')),
+      CHECK (status IN ('started', 'succeeded', 'failed', 'timed_out', 'cancelled'))
+    )
+  `,
+    "model_invocation_attribution",
+    "invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, config_revision_id, snapshot_id, status, started_at, completed_at, usage_json",
+    invocationDispatchIndexSql,
+  );
+  // What the runner reported about one job beyond the single attribution (AII-1562, AII-1566): the SHAs it
+  // pushed, oldest first, as a JSON array (null = not reported, '[]' = nothing pushed), and whether its
+  // `invocations` list arrived whole (1 only when the result carried the list and none was dropped or unstored).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS dispatch_job_report (
+      dispatch_id TEXT PRIMARY KEY,
+      pushed_shas_json TEXT,
+      invocations_complete INTEGER NOT NULL DEFAULT 0 CHECK (invocations_complete IN (0, 1)),
+      recorded_at INTEGER NOT NULL
+    )
+  `);
+  // The newest (changed_at, jid) of any finished job the prune deleted (AII-1566); one row, never moves back.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_accounting_pruned (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      changed_at INTEGER NOT NULL,
+      jid TEXT NOT NULL
+    )
+  `);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_model_profile_reservations_owner_immutable
+    BEFORE UPDATE OF profile_id, dispatch_id, owner_generation, owner_kind ON model_profile_reservations
+    WHEN NEW.profile_id <> OLD.profile_id
+      OR NEW.dispatch_id <> OLD.dispatch_id
+      OR NEW.owner_generation <> OLD.owner_generation
+      OR NEW.owner_kind <> OLD.owner_kind
+    BEGIN SELECT RAISE(ABORT, 'model profile reservation owner identity is immutable'); END`);
+}
+
 export function getDb(): Database.Database {
+  if (!db && readOnly) {
+    // A read-only open never creates the file, so a wrong path throws here instead of creating an empty database there.
+    try {
+      db = new Database(dbPath().path, { readonly: true });
+    } catch (err) {
+      throw new Error(`Cannot open the database at ${dbPath().path} read-only (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
   if (!db) {
-    db = new Database(DB_PATH);
+    db = new Database(dbPath().path);
     db.pragma("journal_mode = WAL");
     db.exec(`
       CREATE TABLE IF NOT EXISTS dispatched (
@@ -191,10 +446,21 @@ export function getDb(): Database.Database {
     // the new version field as 1 for old rows without a rewrite or backfill.
     const findingColumns = new Set((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
       .map((column) => column.name));
+    if (!findingColumns.has("disposition")) {
+      db.exec("ALTER TABLE review_findings ADD COLUMN disposition TEXT");
+    }
     if (!findingColumns.has("revision")) {
       db.exec("ALTER TABLE review_findings ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
     }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_findings_open ON review_findings(repo, pr_number, status)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS internal_review_finding_reports (
+        dispatch_id TEXT NOT NULL,
+        finding_id INTEGER NOT NULL REFERENCES review_findings(id),
+        revision INTEGER NOT NULL,
+        PRIMARY KEY (dispatch_id, finding_id)
+      )
+    `);
     db.exec(`
       CREATE TABLE IF NOT EXISTS review_fix_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -303,6 +569,7 @@ export function getDb(): Database.Database {
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_dispatch_budget_entries_pr_window
       ON dispatch_budget_entries(repository, pr_number, created_at)`);
+    createAgentConfigurationTables();
     // AII-774: immutable attempt snapshots and authenticated event inbox. No
     // consumer is wired here; accepted deliveries retain identity tombstones.
     db.exec(`
@@ -322,6 +589,8 @@ export function getDb(): Database.Database {
         authority_revoked_at INTEGER,
         github_run_id INTEGER,
         github_run_attempt INTEGER,
+        execution_backend TEXT NOT NULL DEFAULT 'github-actions',
+        execution_ref TEXT,
         task_snapshot_json TEXT NOT NULL,
         finding_versions_json TEXT NOT NULL,
         accepted_result_json TEXT,
@@ -329,38 +598,30 @@ export function getDb(): Database.Database {
         result_conflict_at INTEGER,
         terminal_outcome_json TEXT,
         completed_at INTEGER,
+        changed_at INTEGER,
         CHECK ((github_run_id IS NULL) = (github_run_attempt IS NULL)),
         CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
       )
     `);
+    ensureReviewFixAttemptsColumns();
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_attempts_pr_history
       ON review_fix_attempts(installation_id, repository, pr_number, created_at)`);
+    // AII-1566: when a record the control plane reads last changed (epoch ms, set by SQLite).
+    const fixCols = db.prepare("PRAGMA table_info(review_fix_attempts)").all() as Array<{ name: string }>;
+    if (!fixCols.some((c) => c.name === "changed_at")) {
+      db.exec("ALTER TABLE review_fix_attempts ADD COLUMN changed_at INTEGER");
+    }
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_attempts_changed_at
+      AFTER UPDATE OF state, terminal_outcome_json, completed_at ON review_fix_attempts
+      BEGIN UPDATE review_fix_attempts SET changed_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        WHERE attempt_id = NEW.attempt_id; END`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS trg_review_fix_attempt_owner_immutable
       BEFORE UPDATE OF owner ON review_fix_attempts
       WHEN NEW.owner <> OLD.owner
       BEGIN SELECT RAISE(ABORT, 'review-fix attempt owner is immutable'); END`);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS review_fix_inbox (
-        authenticated_source TEXT NOT NULL,
-        event_id TEXT NOT NULL,
-        installation_id TEXT NOT NULL,
-        repository TEXT NOT NULL,
-        pr_number INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        payload_hash TEXT NOT NULL,
-        accepted_at INTEGER NOT NULL,
-        delivery_state TEXT NOT NULL DEFAULT 'pending',
-        retry_at INTEGER,
-        delivered_at INTEGER,
-        PRIMARY KEY (authenticated_source, event_id)
-      )
-    `);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_due
-      ON review_fix_inbox(delivery_state, retry_at, accepted_at)`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_inbox_pr
-      ON review_fix_inbox(installation_id, repository, pr_number, accepted_at)`);
-    ensureReviewFixInboxColumns();
+    // The `review_fix_inbox` table (AII-781) is no longer created or read: review-fix events go
+    // straight to Restate ingress (AII-1187, ADR 031). An existing table is left in place, rows
+    // and all, for history; nothing drops it.
     // AII-779: retain bounded redacted activity independently from completed
     // cycle evidence. The byte tally is updated only after a new event insert,
     // so replayed identities cannot consume the allowance again.
@@ -470,6 +731,18 @@ export function getDb(): Database.Database {
         processed_at INTEGER
       )
     `);
+    const gapfillColumns = new Set((db.prepare("PRAGMA table_info(comment_gapfill_queue)").all() as Array<{ name: string }>).map(c => c.name));
+    if (!gapfillColumns.has("refusal_count")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN refusal_count INTEGER NOT NULL DEFAULT 0");
+    if (!gapfillColumns.has("last_refusal_reason")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN last_refusal_reason TEXT");
+    if (!gapfillColumns.has("last_refusal_dispatch_id")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN last_refusal_dispatch_id TEXT");
+    db.exec(`CREATE TABLE IF NOT EXISTS comment_gapfill_refusals (
+      queue_item_id INTEGER NOT NULL, dispatch_id TEXT NOT NULL, reason TEXT NOT NULL,
+      PRIMARY KEY (queue_item_id, dispatch_id)
+    )`);
+    // Preserve the replay decision available from pre-ledger databases.
+    db.exec(`INSERT OR IGNORE INTO comment_gapfill_refusals
+      SELECT id, last_refusal_dispatch_id, last_refusal_reason FROM comment_gapfill_queue
+      WHERE last_refusal_dispatch_id IS NOT NULL AND last_refusal_reason IS NOT NULL`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_status ON comment_gapfill_queue(status, created_at)`);
     // PR #202 review (minor): countConflictAttempts / hasPendingConflictResolution /
     // markCommentGapfillRunTerminal all filter by repo+PR — give them an index.
@@ -521,6 +794,16 @@ export function getDb(): Database.Database {
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_reaper_created_at ON reaper_actions(created_at)
     `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS chatgpt_pairing_codes (
+        code_hash  TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at    INTEGER,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_chatgpt_pairing_profile ON chatgpt_pairing_codes(profile_id, used_at)`);
   }
   return db;
 }

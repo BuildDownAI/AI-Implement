@@ -18,7 +18,17 @@ export interface ResolvedFieldIds {
   baseBranchFieldId: string | null;
 }
 
-interface OverrideOptions {
+/** A required field that matches no field or several by name, so the poll cannot read its project. */
+export class JiraFieldResolutionError extends Error {
+  constructor(readonly fieldName: string, readonly fault: "missing" | "duplicate") {
+    super(fault === "missing"
+      ? `Custom field "${fieldName}" not found in Jira instance`
+      : `Multiple custom fields named "${fieldName}" — set explicit ID override`);
+    this.name = "JiraFieldResolutionError";
+  }
+}
+
+export interface OverrideOptions {
   statusOverride: string | null;
   repoOverride: string | null;
   profilesOverride: string | null;
@@ -49,12 +59,8 @@ export async function resolveCustomFieldIds(
   const epicLink = fields.find((f) => f.name === "Epic Link");
   const lookup = (name: string): string => {
     const matches = fields.filter((f) => f.name === name);
-    if (matches.length === 0) {
-      throw new Error(`Custom field "${name}" not found in Jira instance`);
-    }
-    if (matches.length > 1) {
-      throw new Error(`Multiple custom fields named "${name}" — set explicit ID override`);
-    }
+    if (matches.length === 0) throw new JiraFieldResolutionError(name, "missing");
+    if (matches.length > 1) throw new JiraFieldResolutionError(name, "duplicate");
     return matches[0].id;
   };
 
@@ -103,12 +109,21 @@ export async function getCachedFieldIds(
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
   // Override values must participate in the key — changing them on a live mapping otherwise serves stale IDs.
-  const fullKey = `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}::${overrides.baseBranchOverride ?? ""}`;
+  const fullKey = fieldCacheKey(cacheKey, overrides);
   const existing = cache.get(fullKey);
   if (existing) return existing;
   const ids = await resolveCustomFieldIds(client, overrides);
   cache.set(fullKey, ids);
   return ids;
+}
+
+function fieldCacheKey(cacheKey: string, overrides: OverrideOptions): string {
+  return `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}::${overrides.baseBranchOverride ?? ""}`;
+}
+
+/** Inspect without resolving or populating the poll's cache. */
+export function peekCachedFieldIds(cacheKey: string, overrides: OverrideOptions): ResolvedFieldIds | undefined {
+  return cache.get(fieldCacheKey(cacheKey, overrides));
 }
 
 export function clearFieldCache(): void {
@@ -118,7 +133,7 @@ export function clearFieldCache(): void {
 export const STATUS_VALUES = {
   READY: "Ready",
   PLANNING: "Planning",
-  /** Reserved for a future approval-gating phase; never written by Phase 2's verbs. */
+  /** Written by `markPlanComplete` when the mapping's "Auto-approve plans" is off; the Jira field needs this option. */
   AWAITING_APPROVAL: "Awaiting Approval",
   APPROVED: "Plan Approved",
   IMPLEMENTING: "Implementing",
@@ -147,4 +162,15 @@ export function adfWithLink(prefix: string, label: string, url: string): unknown
       ],
     }],
   };
+}
+
+/** A field as JQL names it: REST's `customfield_N` is `cf[N]`, which some instances require. Any other ID is used as given. */
+export function jqlFieldRef(fieldId: string): string {
+  const match = /^customfield_(\d+)$/.exec(fieldId);
+  return match ? `cf[${match[1]}]` : fieldId;
+}
+
+/** A project's JQL as the poll runs it, so the poll and the setup checks run the same search. */
+export function buildBucketQuery(jql: string, statusFieldId: string): string {
+  return `(${jql}) AND ${jqlFieldRef(statusFieldId)} in (Ready, "Plan Approved")`;
 }

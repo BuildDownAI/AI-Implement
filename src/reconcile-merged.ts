@@ -7,15 +7,14 @@ import {
   updateReconciliationStatus,
 } from "./reconciliation.js";
 import { capturePrMerge } from "./merge-capture.js";
-import { getLatestDispatchForPr } from "./log.js";
+import { findLinkByPr } from "./pr-links.js";
 
 export function resolvePrMapping(mappings: Record<string, RepoMapping>, repo: string, prNumber: number):
   { scopeKey: string; mapping: RepoMapping } | undefined {
-  const [owner, name] = repo.split("/");
-  const dispatch = getLatestDispatchForPr(owner, name, prNumber);
+  const link = findLinkByPr(repo, prNumber);
   const candidates = Object.entries(mappings).filter(([, mapping]) => `${mapping.owner}/${mapping.repo}` === repo);
-  const entry = dispatch?.teamKey
-    ? candidates.find(([key]) => key === dispatch.teamKey)
+  const entry = link
+    ? candidates.find(([key]) => key === link.issue.mappingKey)
     : candidates.length === 1 ? candidates[0] : undefined;
   return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
 }

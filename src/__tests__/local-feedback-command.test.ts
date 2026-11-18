@@ -1,0 +1,429 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as devHarnessIndex from "../dev-harness/index.js";
+import { runDevHarnessCli } from "../dev-harness/cli.js";
+import { testDir, testTempRoot } from "./helpers/test-dir.js";
+
+// The local feedback command is a Node ESM script with pure helper exports.
+// @ts-ignore no declaration file for the repo-local .mjs command module
+const localFeedbackCommand = await import("../../scripts/local-feedback.mjs");
+const {
+  assertLiveReferencesOutsideActiveAuth,
+  assertSafeEnvironment,
+  createSourceContext,
+  buildDevHarnessArgs,
+  buildLocalFeedbackOptions,
+  buildSyntheticAgentConfig,
+  finishLiveRun,
+  gateMarkerPath,
+  parseArgs,
+  parseGitHubProjectKey,
+  pathAbsent,
+  makeCliDeps,
+  resolveSourceIdentity,
+  runScenarioFinally,
+  subscriptionUnknownProof,
+  summarizeResult,
+  runLiveHarness,
+  writeLiveResult,
+  writeLiveStderrArtifact,
+} = localFeedbackCommand;
+
+function runGit(cwd: string, args: string[]) {
+  return spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe("local feedback command helpers", () => {
+  it("parses synthetic and live modes with the expected gate rules", () => {
+    expect(parseArgs([])).toMatchObject({ live: false, rebuild: false });
+    expect(parseArgs(["--rebuild", "--artifacts-dir", "/tmp/out"])).toMatchObject({
+      rebuild: true,
+      artifactsDir: "/tmp/out",
+    });
+    expect(() => parseArgs(["--scenario", "success"])).toThrow(/Unknown argument/);
+    expect(() => parseArgs(["--agent-config", "cfg.json"])).toThrow(/only valid with --live/);
+    expect(() => parseArgs(["--live", "--agent-config", "cfg.json"])).toThrow(/requires --agent-config, --workspace, and --task/);
+    expect(parseArgs(["--live", "--agent-config", "cfg.json", "--workspace", "repo", "--task", "task.md"])).toMatchObject({
+      live: true,
+      agentConfig: "cfg.json",
+      workspace: "repo",
+      task: "task.md",
+    });
+  });
+
+  it("rejects credential and preload collisions while allowing inherited Codex app metadata", () => {
+    expect(assertSafeEnvironment({ PATH: "/bin", CODEX_HOME: "/active/codex", CODEX_SESSION_ID: "metadata" }, "synthetic")).toBe(true);
+    expect(() => assertSafeEnvironment({ PATH: "/bin", OPENAI_BASE_URL: "http://ambient.invalid" }, "synthetic")).toThrow(/OPENAI_BASE_URL/);
+    expect(() => assertSafeEnvironment({ PATH: "/bin", AI_IMPLEMENT_MODEL_AUTH_TOKEN: "secret" }, "synthetic")).toThrow(/AI_IMPLEMENT_MODEL_AUTH_TOKEN/);
+    expect(() => assertSafeEnvironment({ PATH: "/bin", NODE_OPTIONS: "--require ./preload.js" }, "synthetic")).toThrow(/NODE_OPTIONS/);
+  });
+
+  it("refuses a live reference at Codex's own auth.json but accepts a chatgpt-sign-in record elsewhere", () => {
+    const home = testDir("live-home");
+    const codexDir = join(home, ".codex");
+    const planDir = join(home, "plan");
+    mkdirSync(codexDir);
+    mkdirSync(planDir);
+    writeFileSync(join(codexDir, "auth.json"), "{}");
+    writeFileSync(join(planDir, "credentials.json"), "{}");
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("CODEX_HOME", undefined);
+    const ref = (canonicalPath: string) => new Map([["p", { profileId: "p", authMode: "codex-subscription", kind: "session", sessionSource: "chatgpt-sign-in", canonicalPath }]]);
+    expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(codexDir, "auth.json")))).toThrow(/active app auth/);
+    expect(() => assertLiveReferencesOutsideActiveAuth(ref(join(planDir, "credentials.json")))).not.toThrow();
+  });
+
+  it("keeps the live gate marker outside the checkout", () => {
+    const marker = gateMarkerPath("/tmp/example-checkout");
+    expect(marker).toContain(tmpdir());
+    expect(marker).toContain("bd-local-feedback-gates");
+    expect(marker).not.toContain("/tmp/example-checkout/.local-feedback-gate.json");
+  });
+
+
+  it("parses only exact GitHub origins for live project keys", () => {
+    expect(parseGitHubProjectKey("git@github.com:BuildDownAI/AI-Implement.git")).toBe("BuildDownAI/AI-Implement");
+    expect(parseGitHubProjectKey("https://github.com/BuildDownAI/repo.with.dots.git")).toBe("BuildDownAI/repo.with.dots");
+    expect(parseGitHubProjectKey("https://evilgithub.com/BuildDownAI/AI-Implement.git")).toBeNull();
+    expect(parseGitHubProjectKey("https://github.com/BuildDownAI/AI-Implement/extra.git")).toBeNull();
+  });
+
+  it("builds local feedback options and dev-harness args for a full copy-mode configured run", () => {
+    expect(buildLocalFeedbackOptions({ providerPort: 8080, bridgePort: 8090, networkName: "bd-local-feedback-net", hostGateway: "172.18.0.2" })).toEqual({
+      providerPort: 8080,
+      bridgePort: 8090,
+      networkName: "bd-local-feedback-net",
+      hostGateway: "172.18.0.2",
+    });
+    expect(buildDevHarnessArgs({ workspace: "/repo", task: "/task.md", imageId: "sha256:image", agentConfig: "/cfg.json" })).toEqual([
+      "--workspace", "/repo",
+      "--task", "/task.md",
+      "--phase", "full",
+      "--workspace-mode", "copy",
+      "--image", "sha256:image",
+      "--agent-config", "/cfg.json",
+    ]);
+  });
+
+  it("writes a three-stage synthetic local config with private key paths under the requested private root", () => {
+    const privateRoot = testDir("lf-private");
+    const { configPath, config, profileIds } = buildSyntheticAgentConfig({ root: privateRoot });
+    expect(configPath.startsWith(privateRoot)).toBe(true);
+    expect(profileIds).toEqual(["local-feedback-planning", "local-feedback-implementation", "local-feedback-review"]);
+    expect(Object.keys(config.stages)).toEqual(["planning", "implementation", "review"]);
+    expect(config.stages.planning.model).toBe("gpt-local-planning");
+    expect(config.stages.implementation.invocationTimeoutMs).toBeGreaterThan(config.stages.review.invocationTimeoutMs);
+    for (const profile of config.profiles) {
+      expect(profile.credentialPath.startsWith(privateRoot)).toBe(true);
+      expect(readFileSync(profile.credentialPath, "utf8")).toMatch(/^sk-local-feedback-/);
+    }
+  });
+
+  it("rejects untracked source that would be missing from archive plus tracked patch proof", async () => {
+    const repo = testDir("lf-source");
+    await mkdir(join(repo, "represented"), { recursive: true });
+    writeFileSync(join(repo, "represented", "file.txt"), "ok\n");
+    const responses = new Map<string, { status: number; stdout: string; stderr: string }>([
+      ["git rev-parse HEAD", { status: 0, stdout: "abc123\n", stderr: "" }],
+      ["git diff --binary HEAD", { status: 0, stdout: "", stderr: "" }],
+      ["git status --porcelain", { status: 0, stdout: "?? scratch.txt\n?? .local-feedback/cache.json\n", stderr: "" }],
+    ]);
+    const exec = (command: string, args: string[]) => responses.get(`${command} ${args.join(" ")}`) ?? { status: 1, stdout: "", stderr: "unexpected" };
+    expect(() => resolveSourceIdentity(repo, exec)).toThrow(/scratch.txt/);
+  });
+
+
+  it("creates represented source contexts from git archive plus tracked diff without corrupting binary files", () => {
+    const repo = testDir("lf-binary-source");
+    const binary = Buffer.from([0, 255, 1, 2, 128, 10, 13, 90]);
+    writeFileSync(join(repo, "blob.bin"), binary);
+    writeFileSync(join(repo, "text.txt"), "before\n");
+    expect(runGit(repo, ["init"]).status).toBe(0);
+    expect(runGit(repo, ["config", "user.email", "local-feedback@example.invalid"]).status).toBe(0);
+    expect(runGit(repo, ["config", "user.name", "Local Feedback"]).status).toBe(0);
+    expect(runGit(repo, ["add", "."]).status).toBe(0);
+    expect(runGit(repo, ["commit", "-m", "base"]).status).toBe(0);
+    writeFileSync(join(repo, "text.txt"), "after\n");
+    const source = resolveSourceIdentity(repo);
+    testTempRoot("lf-context");
+    const context = createSourceContext({ repoRoot: repo, source });
+    expect(readFileSync(join(context, "blob.bin"))).toEqual(binary);
+    expect(readFileSync(join(context, "text.txt"), "utf8")).toBe("after\n");
+  });
+
+
+  it("wires and disposes process signal cancellation for wrapped CLI runs", () => {
+    const signalProcess = new EventEmitter() as EventEmitter & {
+      once(event: "SIGINT" | "SIGTERM", listener: () => void): EventEmitter;
+      off(event: "SIGINT" | "SIGTERM", listener: () => void): EventEmitter;
+    };
+    const cliModule = {
+      startDevRun: async () => ({ containerName: "runner", containerId: "cid", task: {}, startedAt: new Date(), artifactsDir: "/tmp/a", workspace: "/tmp/w", phase: "full" }),
+      streamLogs: async () => undefined,
+      streamLogsUntilShellReady: async () => ({ ready: false, exitCode: null }),
+      getRunStatus: async () => ({ running: false, exitCode: 130 }),
+      collectRunArtifacts: async () => undefined,
+      stopDevRun: async () => undefined,
+    };
+    const { deps, dispose } = makeCliDeps({ cliModule, artifactsDir: "/tmp/artifacts", signalProcess });
+    expect(deps.cancelSignal.aborted).toBe(false);
+    signalProcess.emit("SIGTERM");
+    expect(deps.cancelSignal.aborted).toBe(true);
+    expect(signalProcess.listenerCount("SIGINT")).toBe(1);
+    dispose();
+    expect(signalProcess.listenerCount("SIGINT")).toBe(0);
+    expect(signalProcess.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("captures unknown termination hold before confirmed release retry", () => {
+    expect(subscriptionUnknownProof({
+      category: "termination_unconfirmed",
+      heldBeforeRetry: true,
+      busyCategory: "session_busy",
+      releasedAfterRetry: true,
+    })).toEqual({
+      unknownTerminationCategory: "termination_unconfirmed",
+      unknownTerminationHeldLock: true,
+      unknownTerminationBlocksOtherOwner: true,
+      unknownRetryConfirmedReleased: true,
+    });
+    expect(subscriptionUnknownProof({
+      category: "termination_unconfirmed",
+      heldBeforeRetry: false,
+      busyCategory: "session_busy",
+      releasedAfterRetry: true,
+    }).unknownTerminationHeldLock).toBe(false);
+  });
+
+
+  it("always cleans a scenario peer even when disposer fails", async () => {
+    const events: string[] = [];
+    await expect(runScenarioFinally({
+      dispose: async () => { events.push("dispose"); throw new Error("dispose failed"); },
+      cleanup: async () => { events.push("cleanup"); },
+    })).rejects.toThrow(/dispose failed/);
+    expect(events).toEqual(["dispose", "cleanup"]);
+  });
+
+  it("only treats ENOENT as confirmed path absence", async () => {
+    await expect(pathAbsent("/tmp/missing", async () => { const error = new Error("missing") as NodeJS.ErrnoException; error.code = "ENOENT"; throw error; })).resolves.toBe(true);
+    await expect(pathAbsent("/tmp/eio", async () => { const error = new Error("io") as NodeJS.ErrnoException; error.code = "EIO"; throw error; })).resolves.toBe(false);
+    await expect(pathAbsent("/tmp/present", async () => ({}))).resolves.toBe(false);
+  });
+
+  it.each([
+    [0, "success"],
+    [1, "failure"],
+  ])("rewrites the live summary with the finished run's outcome (exit %i → %s)", (exitCode, outcome) => {
+    const artifactsDir = testDir("live-result");
+    const input = {
+      source: { head: "abc", trackedDiffSha256: "def" },
+      image: "sha256:123",
+      stages: { review: { model: "gpt-local-review", authMode: "codex-subscription" } },
+    };
+    // The preflight summary is written before launch and must not survive as the final word.
+    writeFileSync(join(artifactsDir, "summary.md"), summarizeResult({ ok: false, mode: "live-preflight", artifactsDir, ...input }));
+
+    writeLiveResult({ artifactsDir, exitCode, ...input });
+
+    const summary = readFileSync(join(artifactsDir, "summary.md"), "utf8");
+    expect(summary).toContain(`- outcome: ${outcome}`);
+    expect(summary).toContain("- mode: live\n");
+    expect(summary).not.toContain("live-preflight");
+    expect(summary).toContain("sha256:123");
+    expect(summary).toContain("gpt-local-review");
+    expect(summary).toContain(`exit code ${exitCode}`);
+    expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode, live: true });
+  });
+
+  describe("live startup diagnostics", () => {
+    const FRONT_MATTER_ERROR = "Task file must begin with a YAML front matter block delimited by ---";
+
+    function liveInput(task: string) {
+      const artifactsDir = testDir("live-diag-artifacts");
+      const workspace = testDir("live-diag-workspace");
+      return {
+        artifactsDir,
+        input: {
+          cliModule: { ...devHarnessIndex, runDevHarnessCli },
+          artifactsDir,
+          workspace,
+          task,
+          imageId: "sha256:123",
+          agentConfig: join(workspace, "agent.yml"),
+          source: { head: "abc", trackedDiffSha256: "def" },
+          stages: {},
+          signalProcess: new EventEmitter(),
+        },
+      };
+    }
+
+    it("reports a real pre-run validation failure, keeps exit 1, and does not promise runner artifacts", async () => {
+      const task = join(testDir("live-diag-task"), "task.md");
+      writeFileSync(task, "no front matter here\n");
+      const { artifactsDir, input } = liveInput(task);
+      const echoed: string[] = [];
+
+      const exitCode = await runLiveHarness({ ...input, echoStderr: (text: string) => echoed.push(text) });
+
+      expect(exitCode).toBe(1);
+      expect(echoed.join("")).toContain(FRONT_MATTER_ERROR);
+      expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain(FRONT_MATTER_ERROR);
+      const summary = readFileSync(join(artifactsDir, "summary.md"), "utf8");
+      expect(summary).not.toContain("runner.log and run/ hold the stage outcomes");
+      expect(summary).toContain("no runner was started");
+      expect(summary).toContain("runner.stderr.log");
+      expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode: 1, live: true });
+    });
+
+    it("keeps the harness error and still records stderr when the harness throws", async () => {
+      const { artifactsDir, input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("partial diagnostics\n");
+          throw new Error("harness exploded");
+        },
+      };
+      await expect(runLiveHarness({ ...input, cliModule, echoStderr: () => undefined })).rejects.toThrow("harness exploded");
+      expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain("partial diagnostics");
+    });
+
+    it("keeps the harness error when the echo writer also fails", async () => {
+      const { artifactsDir, input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("partial diagnostics\n");
+          throw new Error("PRIMARY_HARNESS_FAILURE");
+        },
+      };
+      const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        await expect(
+          runLiveHarness({ ...input, cliModule, echoStderr: () => { throw new Error("SECONDARY_DIAGNOSTIC_FAILURE"); } }),
+        ).rejects.toThrow("PRIMARY_HARNESS_FAILURE");
+      } finally {
+        logged.mockRestore();
+      }
+      expect(readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8")).toContain("partial diagnostics");
+      expect(JSON.parse(readFileSync(join(artifactsDir, "result.json"), "utf8"))).toEqual({ exitCode: 1, live: true });
+    });
+
+    it("surfaces an echo writer failure when the run itself succeeded", async () => {
+      const { input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("note\n");
+          return 0;
+        },
+      };
+      await expect(
+        runLiveHarness({ ...input, cliModule, echoStderr: () => { throw new Error("SECONDARY_DIAGNOSTIC_FAILURE"); } }),
+      ).rejects.toThrow("SECONDARY_DIAGNOSTIC_FAILURE");
+    });
+
+    it("withholds a sensitive diagnostic from both the echo and the artifact, even when split across calls", async () => {
+      const { artifactsDir, input } = liveInput("unused");
+      const cliModule = {
+        runDevHarnessCli: async (_args: string[], deps: { writeStderr: (t: string) => void }) => {
+          deps.writeStderr("Task file must begin with a YAML front matter block delimited by ---\n");
+          deps.writeStderr("Author");
+          deps.writeStderr("ization: Bearer planted-secret\n");
+          return 1;
+        },
+      };
+      const echoed: string[] = [];
+      const exitCode = await runLiveHarness({ ...input, cliModule, echoStderr: (text: string) => echoed.push(text) });
+      expect(exitCode).toBe(1);
+      const artifact = readFileSync(join(artifactsDir, "runner.stderr.log"), "utf8");
+      for (const text of [echoed.join(""), artifact]) {
+        expect(text).toContain("withheld");
+        expect(text).not.toContain("planted-secret");
+        expect(text).not.toContain("Authorization");
+      }
+    });
+
+    it("withholds stderr that matches a sensitive pattern", () => {
+      const artifactsDir = testDir("live-diag-sensitive");
+      const name = writeLiveStderrArtifact({ artifactsDir, err: ["Authorization: Bearer abc\n"] });
+      const text = readFileSync(join(artifactsDir, name), "utf8");
+      expect(text).toContain("withheld");
+      expect(text).not.toContain("Bearer abc");
+    });
+
+    it("writes no artifact when stderr is empty and keeps the runner wording when a runner started", () => {
+      const artifactsDir = testDir("live-diag-empty");
+      expect(writeLiveStderrArtifact({ artifactsDir, err: [] })).toBeUndefined();
+      writeLiveResult({ artifactsDir, exitCode: 0, source: { head: "a", trackedDiffSha256: "b" }, image: "i", stages: {} });
+      expect(readFileSync(join(artifactsDir, "summary.md"), "utf8")).toContain("runner.log and run/ hold the stage outcomes");
+    });
+  });
+
+  describe("finishLiveRun", () => {
+    function harness(overrides: { runHarness?: () => Promise<number>; dispose?: () => void; writeResult?: (code: number) => void } = {}) {
+      const events: string[] = [];
+      const written: number[] = [];
+      const run = () => finishLiveRun({
+        runHarness: overrides.runHarness ?? (async () => { events.push("run"); return 0; }),
+        dispose: overrides.dispose ?? (() => { events.push("dispose"); }),
+        writeResult: overrides.writeResult ?? ((code: number) => { events.push("write"); written.push(code); }),
+      });
+      return { run, events, written };
+    }
+
+    it("disposes, then records the harness exit code", async () => {
+      const h = harness({ runHarness: async () => { h.events.push("run"); return 3; } });
+      await expect(h.run()).resolves.toBe(3);
+      expect(h.events).toEqual(["run", "dispose", "write"]);
+      expect(h.written).toEqual([3]);
+    });
+
+    it("records a failure and rethrows when the harness throws", async () => {
+      const h = harness({ runHarness: async () => { throw new Error("harness exploded"); } });
+      await expect(h.run()).rejects.toThrow("harness exploded");
+      expect(h.written).toEqual([1]);
+    });
+
+    it("keeps the harness error when recording the result also fails", async () => {
+      const h = harness({
+        runHarness: async () => { throw new Error("harness exploded"); },
+        writeResult: () => { throw new Error("disk full"); },
+      });
+      await expect(h.run()).rejects.toThrow("harness exploded");
+    });
+
+    it("surfaces a result-write failure after a clean run", async () => {
+      const h = harness({ writeResult: () => { throw new Error("disk full"); } });
+      await expect(h.run()).rejects.toThrow("disk full");
+    });
+
+    it("still records the result when dispose fails, then reports the dispose error", async () => {
+      const h = harness({ dispose: () => { throw new Error("dispose failed"); } });
+      await expect(h.run()).rejects.toThrow("dispose failed");
+      expect(h.written).toEqual([0]);
+    });
+  });
+
+  it("summarizes redacted result evidence without credential material", () => {
+    const summary = summarizeResult({
+      ok: true,
+      mode: "synthetic",
+      source: { head: "abc", trackedDiffSha256: "def" },
+      image: { imageId: "sha256:123" },
+      artifactsDir: "/tmp/artifacts",
+      stages: { planning: { model: "gpt-local-planning", authMode: "openai-api-key" } },
+      note: "Scenarios: success=ok",
+    });
+    expect(summary).toContain("outcome: success");
+    expect(summary).toContain("gpt-local-planning");
+    expect(summary).not.toContain("sk-local-feedback");
+  });
+});

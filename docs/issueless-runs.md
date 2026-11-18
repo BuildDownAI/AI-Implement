@@ -16,7 +16,7 @@ An issueless run kind has no tracker issue. The `dispatch_log` row **is** the tr
 - `issue_identifier = null`, `issue_title = null`, `team_key = null`, `repo = null`
 - a `phase` tag that identifies the run kind across the whole observability surface
 
-Nothing in the dispatch or callback path touches the ticketing provider. The lifecycle is driven by the in-process state machine inside the orchestrator (`KgRefreshHandle`, `makeKgRefresh()` in `src/kg-refresh.ts`), backed by the settings table for crash recovery.
+Nothing in the dispatch or callback path touches the ticketing provider. The lifecycle is driven by two Restate services (ADR 032, [restate.md](restate.md) § "Writing a workflow for a run kind"): the `KgRepo` coordinator object, keyed by the KG source repo, holds the single in-flight marker and is the lock; the `KgRefresh` workflow, keyed by a trigger id the object mints, is the run — it reserves the row, dispatches, waits for the report under two deadlines, runs the rail, and releases the marker. Restate holds the workflow's position and the marker; the `dispatch_log` row and the last-refresh outcome are projections of journaled step results (ADR 018 amendment, 2026-10-08): SQLite stays the read model that `/api/token`, the callbacks, and the admin pages use, and the journal is the record. There is no in-process state machine and no sweep: a restart replays the journal and resumes at the step that did not finish.
 
 ---
 
@@ -24,25 +24,29 @@ Nothing in the dispatch or callback path touches the ticketing provider. The lif
 
 ```mermaid
 flowchart TD
-    A["POST /api/kg/refresh"] --> B["trigger()"]
-    B --> PF["credential preflight\nprobe KG write token + code/secondary-repo read tokens"]
-    PF -->|"any grant missing"| PFF["422 preflight-failed\ngate=preflight, no dispatch"]
-    PF -->|"all grants present"| C{"snapshot SHA\nup to date?"}
-    C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
-    C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
-    D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
-    E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest\n→ kg-snapshot-push"]
-    F --> G["POST /api/runner/result\nphase=kg-refresh"]
-    G --> I["onRunnerComplete()\nmerge refresh PR (merge commit)\ndelete the kg-refresh branch\nverify snapshot commit"]
-    I --> H
-    H -->|"success"| J["stage=serving\nonOutcome('success')\ncloseJobLog(completed)"]
-    H -->|"failure / revert"| K["stage=failed or reverted\nonOutcome('failure')\ncloseJobLog(failed)"]
-    J --> L["notifyKgRefreshOutcome\n(webhook)"]
-    K --> L
-    K --> M["postComment on\nkgRefreshReportIssue\n(if configured)"]
+    A["POST /api/kg/refresh\nor trigger_kg_refresh (MCP)"] --> B["trigger_kg_refresh tool handler\nsynchronous checks + credential preflight\neach inside ctx.run"]
+    B -->|"refused"| R["409 / 422 / 501 / 507\nno dispatch"]
+    B -->|"pass"| O["KgRepo.trigger\nmints triggerId, sets marker"]
+    O -->|"marker live"| O2["409 refresh-in-progress"]
+    O -->|"one-way send"| W["KgRefresh.run\nreserve → dispatch"]
+    W --> E["GitHub Actions, Fly Machine,\nor local Docker"]
+    E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → kg-snapshot-push"]
+    W --> T["wait: report | cancel | progress\nbootstrap deadline 10 min, total deadline 4 h\nGHA: watch the run's status;\nstarted evidence = status in_progress\nor the runner progress heartbeat, first wins"]
+    F -->|"progress heartbeat"| T
+    F -->|"POST /api/runner/result"| G["KgRefresh.report\nidempotency key = dispatch id"]
+    G --> T
+    T -->|"report, fresh snapshot"| I["merge PR → delete branch\nfetch → stage → swap → verify\none ctx.run per gate"]
+    T -->|"timeout, lost run, failed report, cancel"| K["persist → close-row → outcome"]
+    I -->|"a gate fails"| V["revert (compensation)"]
+    V --> K
+    I -->|"success"| J["persist → close-row → outcome"]
+    J --> Z["release marker on KgRepo"]
+    K --> Z
 ```
 
 ---
+
+KG dispatch rows record `trigger` as `manual` for a human caller (including admin sessions without email), otherwise `schedule`. The admin route preserves the authenticated caller; the cron schedule uses the system caller. Older trigger inputs without an explicit category use `actorEmail` presence. Only the trigger category is stored in the row. Jobs and the KG dispatch log show `KG refresh` with a `manual` or `scheduled` badge; legacy rows without a trigger have no badge. Their dispatch count reads `run #N` without re-dispatch styling. Issue-backed runs retain re-dispatch styling.
 
 ## 3. Envelope and dispatch
 
@@ -75,55 +79,73 @@ The route `/api/runner/result` does **not** exist. Any value that appends a path
 What is **absent** vs a normal implementation run:
 - No `prNumber`, `baseBranch`, `branchPrefix`
 - No `profiles`, `planningContext`, `groupingParent`
-- No publication token (there is no target repo to push a PR to)
+- No target repository: the publication token is bound to the KG source repo itself (§6)
 
-The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on both Fly Machines and local Docker. The dispatch path is `dispatchKgRefreshRun()` in `src/index.ts` (~line 3019), which is wired into `makeKgRefresh()` as `input.dispatchRun`.
+The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on both Fly Machines and local Docker. The workflow's journaled `envelope` step builds it with `buildKgRefreshRunConfig` (`src/run-config.ts`), and its `dispatch-N` step hands it to `createKgRefreshDispatch` (`src/restate/kg-refresh-production.ts`), a lookup in the sender table from `createKgRefreshSenders` (`src/restate/kg-refresh-senders.ts`) keyed by the journaled execution mode. Each sender (GitHub Actions, Fly Machines, local Docker) starts the run from that envelope; an unknown mode returns `rejected`.
 
-**Credential preflight (AII-585):** When `input.dispatchRun` is defined, `trigger()` calls `runKgRefreshPreflight()` synchronously before setting `running = true`. The preflight:
+**Credential preflight (AII-585):** The `trigger_kg_refresh` tool handler (`src/restate/tools.ts`) calls `runKgRefreshPreflight()` inside a `ctx.run` before it calls `KgRepo.trigger`. The preflight:
 1. Fetches `sources.yml` from the KG source repo (via a temporary read-only tarball token) and parses `code_repo` and `secondary_repos[].slug`.
 2. Probes the KG source repo's **write** token (`contents: write`, single-repo): `getScopedInstallationToken` must succeed.
 3. Mints the installation-wide dependency token (`contents: read`, `pull_requests: read`) and probes each slug with `GET /repos/{slug}` and `GET /repos/{slug}/pulls?per_page=1`.
-4. **(AII-594, renamed AII-654)** Fetches `.github/workflows/claude-implement.yml` from the KG source repo's default branch (reusing the read token/branch from step 1) and checks whether `on.workflow_dispatch.inputs` declares `run_config` — i.e. the repo is on the envelope contract, where the entrypoint reads the kg-refresh phase and callback URL from `run_config` itself (AII-653) rather than needing the `runner_phase`/`runner_callback_url` top-level inputs. This row (`grant: "workflow:envelope"`) used to require `runner_phase` specifically; it was renamed and loosened once `postWorkflowDispatch`'s 422 strip-and-retry (see `docs/workflow-envelope.md` § Compatibility with older templates) made those two inputs optional on the wire — a repo can pass this row whether or not its synced copy still declares them, as long as it declares `run_config`. A repo that predates the envelope entirely (no `run_config` at all) still fails this row, and on failure it carries a `hint` naming the fix: re-run workflow sync for the KG repo mapping.
+4. **(AII-594, renamed AII-654)** Fetches `.github/workflows/claude-implement.yml` from the KG source repo's default branch (reusing the read token/branch from step 1) and checks whether `on.workflow_dispatch.inputs` declares `run_config` — i.e. the repo is on the envelope contract, where the entrypoint reads the kg-refresh phase and callback URL from `run_config` itself (AII-653) rather than needing the `runner_phase`/`runner_callback_url` top-level inputs. This row (`grant: "workflow:envelope"`) requires `run_config` because KG dispatches carry phase and callback URL only in the envelope. A repo that predates the envelope entirely (no `run_config` at all) still fails this row, and on failure it carries a `hint` naming the fix: re-run workflow sync for the KG repo mapping.
 5. **(AII-598)** Compares the KG repo's default branch against its `base_repo:` (default `BuildDownAI/bd-knowledge-graph-base`) and adds a `grant: "base:drift"` row carrying how many commits the derivative is behind, via `hint`. This row is purely advisory — `ok` is always `true` and a base repo the token can't read reports `hint: "base drift unknown"` rather than failing — so it never contributes to the 422 refusal below; it surfaces only through `get_tenant_health`.
 
-If any probe fails, `trigger()` sets `lastRefresh.gate = "preflight"` and returns `HTTP 422 preflight-failed` with a `detail` field listing every failing (repo, grant) pair — appending the row's `hint`, when present, after the HTTP status. No dispatch occurs. The same function is callable on demand via `get_tenant_health` (MCP) which returns the result as `kgRefreshPreflight: { ok, checkedAt, results }`, each row's optional `hint` included verbatim.
+If any probe fails, the handler persists the failure as `lastRefresh.gate = "preflight"` and answers `HTTP 422 preflight-failed` with a `detail` field listing every failing (repo, grant) pair — appending the row's `hint`, when present, after the HTTP status. No dispatch occurs. The same function is callable on demand via `get_tenant_health` (MCP) which returns the result as `kgRefreshPreflight: { ok, checkedAt, results }`, each row's optional `hint` included verbatim.
 
-Gate `"preflight"` is added to the `RefreshGate` union in `src/kg-refresh.ts`. `runKgRefreshPreflight` is a standalone exported function; all network calls are injectable for tests (`mintToken`, `fetchTarball`, `fetchDefaultBranch`, `probeRepo`, `fetchCompare`).
+Gate `"preflight"` is a member of the `RefreshGate` union in `src/kg-refresh.ts`. `runKgRefreshPreflight` is a standalone exported function; all network calls are injectable for tests (`mintToken`, `fetchTarball`, `fetchDefaultBranch`, `probeRepo`, `fetchCompare`).
 
-**Callback-config guard (422):** The guard at `src/kg-refresh.ts:547` fires *synchronously* inside `trigger()` before any dispatch attempt. If `input.dispatchRun` is defined but `RUNNER_CALLBACK_BASE_URL` or `RUNNER_TOKEN_SECRET` is missing, it returns HTTP 422 (`callback-unconfigured`) immediately — dispatching without a callback URL would stall the refresh with no way to report completion.
+**Callback-config guard (422):** The same tool handler checks, before any dispatch attempt, that `RUNNER_CALLBACK_BASE_URL` and `RUNNER_TOKEN_SECRET` are set; if either is missing it answers HTTP 422 (`callback-unconfigured`) immediately — dispatching without a callback URL would stall the refresh with no way to report completion.
 
-**Execution backend selection** (evaluated inside `dispatchKgRefreshRun()`):
+**Execution backend selection** (resolved by `resolveKgExecutionMode()`):
 
-`dispatchKgRefreshRun()` calls `resolveExecutionPath(getRunnerMode().mode, "github-actions")` to determine the backend. The `"github-actions"` second argument is the kg-refresh-specific default: on a GHA-primary orchestrator running with `runnerMode = "default"`, this produces `"github-actions"`. The selector honours the global runner mode override before choosing a path:
+`resolveKgExecutionMode(config)` (`src/restate/kg-refresh-production.ts`) applies one rule: global runner mode, then the KG page's Backend setting, then whether Fly is configured (`FLY_SESSIONS_TOKEN` and `FLY_SESSIONS_APP` both set). The workflow's `reserve` step resolves the backend one time and returns it; the journaled step result is the record of the choice, so a replay and every retry of the dispatch step read the same value. `reserve` records it on the `dispatch_log` row, and `createKgRefreshDispatch` acts on the value in its input rather than resolving again. `FlyMachineProfile.claim` runs only for `fly-machines`; `attach` follows only a Fly dispatch that created a machine, and `finish()` still sends `release`, a logged no-op for a run that never claimed. The machine size comes from the `FlyMachineProfile/kg-refresh` object (read by the workflow before the dispatch step), not from the runner mode.
 
-| Global runner mode | Resolved path |
-|---|---|
-| `default` | `github-actions` (kg-refresh default) |
-| `gha` | `github-actions` |
-| `fly` | `fly-machines` (requires `FLY_SESSIONS_TOKEN` + `FLY_SESSIONS_APP`) |
-| `local` | `local-docker` (requires `LOCAL_RUNNER_IMAGE`) |
-| `shadow` | collapses to `github-actions` — two concurrent ingest runs would race to push the same snapshot commit |
+The **Backend setting** is the `kg_execution_mode` row in `settings` (`github-actions` or `fly-machines`), edited in the "Backend" row of the KG pipeline page through `GET`/`POST /api/kg/execution-mode` (admin-only write). `KG_EXECUTION_MODE` only seeds it on first boot. With nothing stored the setting defaults to `fly-machines` when Fly is configured, else `github-actions`, which is the behaviour before the setting existed.
 
-**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-implement.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, `runner_phase: "kg-refresh"`, `job_timeout_minutes: "240"`, and optionally `runner_image` and `runner_callback_url`. `run_progress_token` is the HMAC progress token; the workflow masks it and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `runner_phase: "kg-refresh"` and `runner_callback_url` still ride as top-level inputs on this dispatch for compatibility with older templates, but a current template no longer declares either — the entrypoint takes the phase and callback URL from `run_config` instead ([AII-653](https://linear.app/eudoxus/issue/AII-653/entrypoint-reads-the-phase-and-callback-url-from-the-envelope)), and the orchestrator still sends both for older templates and strips whichever one a template rejects, retrying once ([AII-654](https://linear.app/eudoxus/issue/AII-654/dispatcher-retries-a-422-once-without-an-optional-input-kg-refresh)). `job_timeout_minutes: "240"` preserves the 240-minute ceiling that `claude-kg-refresh.yml` formerly hard-coded; the implement template defaults to 90 minutes when the input is absent. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. `claude-implement.yml` is in `ALWAYS_SYNC_FILES` and is delivered to the KG source repo mapping automatically by workflow sync — no manual copy step is needed. The dispatch itself goes through the shared `postWorkflowDispatch` poster (`src/github.ts`), built from `buildKgRefreshGhaDispatchBody`'s inputs: `runner_phase` and `runner_callback_url` are the two inputs in `ENVELOPE_OPTIONAL_INPUTS` (see `docs/workflow-envelope.md` § Compatibility with older templates), so a KG source repo whose synced template has moved on and no longer declares them gets a single stripped-and-retried dispatch rather than a hard 422 — `dispatchKgRefreshRun()` is not itself aware of the retry; it just reads the poster's `DispatchResult`. If the workflow file is absent entirely (e.g. the KG repo mapping predates the sync that delivered `claude-implement.yml`) or the retry itself still 422s, the poster's result is a failure and `dispatchKgRefreshRun()` throws with a message directing the operator to re-run workflow sync for the KG source repo mapping. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
+| Global runner mode | KG Backend setting | Fly configured | Resolved path (source) |
+|---|---|---|---|
+| `local` | any | any | `local-docker` (`runner-mode`; requires `LOCAL_RUNNER_IMAGE`) |
+| `gha` | any | any | `github-actions` (`runner-mode`) |
+| `fly` | any | yes | `fly-machines` (`runner-mode`) |
+| `fly` | any | no | `github-actions` (`fly-unconfigured`) |
+| `default` | `github-actions` | any | `github-actions` (`kg-setting`) |
+| `default` | `fly-machines` | yes | `fly-machines` (`kg-setting`) |
+| `default` | `fly-machines` | no | `github-actions` (`fly-unconfigured`) |
+| `shadow` | the setting | per setting | the setting's own backend, never `both` |
+
+`get_kg_status` and `GET /api/kg/status` carry `executionMode: { effective, source, setting }`; the page paints the "next run" line from it and shows the Fly machine profile row only when `effective` is `fly-machines`. `shadow` stays on one backend because two concurrent ingest runs would race to push the same snapshot commit. An unconfigured Fly routes to `github-actions` because retrying cannot configure Fly. The rule does not read a mapping's `executionMode`. The `fly-machines` rejection in `createKgRefreshDispatch` ("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured", run ends `dispatch_rejected`) remains as a guard the rule makes unreachable in production.
+
+**GitHub Actions backend (the branch that runs when `resolveKgExecutionMode()` answers `github-actions`):** dispatches `workflow_dispatch` to `claude-implement.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, `job_timeout_minutes`, and optionally `runner_image`. `run_progress_token` is the HMAC progress token; the workflow masks it and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. The phase (`runnerPhase: "kg-refresh"`) and callback URL (`runnerCallbackUrl`) travel only inside `run_config`; the entrypoint reads them from the envelope (AII-653). `job_timeout_minutes` comes from `GhaRunProfile/kg-refresh` (`jobTimeoutMinutes`, an integer 10 to 360, default 240, the ceiling `claude-kg-refresh.yml` formerly hard-coded); the workflow reads it in its own journaled call before the dispatch step, only on the GitHub Actions backend, so a later change applies to the next run and a replay keeps the value it read; an admin sets it with `set_run_profile { pipeline: "kg-refresh", backend: "github-actions", patch: { jobTimeoutMinutes } }`, and `get_kg_status` reports the effective backend's profile as `runProfile: { backend, config, source }` (absent for local Docker, which has no profile). Runner size is not part of it: it stays with the repo variable `AI_IMPLEMENT_RUNNER_LABEL`; the implement template defaults to 90 minutes when the input is absent. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. `claude-implement.yml` is in `ALWAYS_SYNC_FILES` and is delivered to the KG source repo mapping automatically by workflow sync — no manual copy step is needed. The dispatch itself goes through the shared `postWorkflowDispatch` poster (`src/github.ts`), built from `buildKgRefreshGhaDispatchBody`'s inputs. The shared poster retains its compatibility retry for optional inputs such as `issue_identifier` (see `docs/workflow-envelope.md` § Compatibility with older templates). The wrapper posts with `returnRunDetails: true`, so an accepted dispatch carries the exact GitHub run id and URL: the workflow never guesses the run by time window. The `dispatch` step looks the run up by title before it dispatches, so a retry adopts a run whose acknowledgement was lost. A lookup that fails (`findRunByTitle` throws on any non-ok GitHub response, and the step no longer swallows the throw) is retried with the step and is **not** "no run": only a 200 with no matching title lets the step dispatch, so a GitHub error never causes a second dispatch. A throw inside the `reconcile-N` / `reconcile-cancel-N` steps is retried up to three times and then counts as "not found yet"; a `watch-N` / `watch-cancel-N` status read that fails three times counts as no new evidence. Every `watch-*` and `reconcile-*` read is bounded (`readBoundedOwnedRun`, AII-1066), so a read that fails on each attempt cannot hold the workflow past its deadline or the release of the `KgRepo` marker; one log line names each exhausted read. A gate failure keeps the served `stampBefore` the gate had already read, so the failure outcome (and `get_kg_status`) still reports the serving stamp. An `unknown` outcome (the dispatch's own acknowledgement was lost) is not re-dispatched; the workflow's watch reconciles the run by its exact title (`KG-REFRESH · <triggerId>`, through `findRunByTitle`) until it appears or a deadline fires. If the workflow file is absent entirely (e.g. the KG repo mapping predates the sync that delivered `claude-implement.yml`) or the retry itself still 422s, the poster's result is a rejection and the workflow ends the run as `dispatch_rejected`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
 
 The kg-refresh runner reads `AI_IMPLEMENT_LOG_LEVEL` the same way the implement runner does: the synced workflow passes the repo Actions variable into the `Run pipeline` step, and `summary` (default) prints one result line per Claude invocation while `stream` also tees each tool call. The kg-refresh pipeline has no agent step since 2026-09-08: the ingest is deterministic and `kg-snapshot-push` is both the guard and the report. The report step it once had re-ran the ingest by hand without a GitHub token and deleted `snapshot/parts/pr.nt` (AII-575 runs 2–4); `stream` remains useful for any future agent step.
 
-**Late-callback handling:** If the reaper declares `dispatch_lost` but the GHA run was actually in progress, the runner's result callback eventually arrives at `POST /api/runner/result`. `onRunnerComplete()` detects that `stage` is already `"failed"` and — rather than silently discarding the result — supersedes the reaper's synthetic outcome: it updates `lastRefresh` with the runner's actual conclusion, persists it, and logs `"[kg-refresh] late callback after reaper close — updating lastRefresh"`. The `dispatch_log` row itself remains closed (no re-open); only the in-memory and persisted `lastRefresh` is updated. `onOutcome` is not fired a second time.
+**Late-report handling:** A report that arrives after the run has completed is answered by the `KgRefresh.report` handler, not dropped: an identical body is a duplicate and acknowledged, a different body is refused with `409 conflicting_report` (§6).
 
 
-**Fly Machines backend:** unchanged from the original implementation. Creates a session machine with `phase: "kg-refresh"`. Returns `machineId + machineNonce`.
+**Fly Machines backend:** runs on the pipeline's kept machine ([fly-machine-lifecycle.md](fly-machine-lifecycle.md)). Before dispatch the workflow reads the size from `FlyMachineProfile/kg-refresh` (default 2 performance CPUs / 8192 MB; the 4096 MB mapping default fails the ingest; an admin changes it with `set_fly_machine_profile` or from the KG Pipelines page (the same `kg-refresh` profile), and `get_kg_status` reports it as `flyMachine` with a `source` of `profile` or `default`; the mapping's `machineCpus` / `machineMemoryMb` do not size a KG run) and calls `claim` on the same object, which answers the kept machine's id or `null`. The `dispatch-1` step builds the config with `purpose: durable-runner`, `pipeline: kg-refresh`, and `dispatch_id`, then creates a machine when none is kept, or reconciles the kept one with `getMachine` and runs `update` then `start` (about 2.5 s against 5 to 39 s for `create`). A created machine is `attach`ed to the object. The tokens are minted and used inside that step only. Timeout and cancel `stop` the kept machine rather than destroying it, and the workflow `release`s it at the end, which scrubs its env and schedules its expiry (the reaper destroys a `durable-runner` machine only past `durable_until`). Returns `machineId + machineNonce`.
 
 **Local Docker backend:** starts a local container via `startLocalRunnerContainer()`. Returns `machineNonce` only.
 
-If the resolved path requires a backend that is not configured (e.g. `fly-machines` but no sessions app), `dispatchKgRefreshRun()` throws immediately. The throw is caught by the async IIFE catch block in `trigger()`, which sets `stage = "failed"` and fires `onOutcome("failure", ...)`.
+If the dispatch `ctx.run` throws (for example a resolved backend that is not configured, such as `fly-machines` with no sessions app), it retries up to three times; when the retries are exhausted the workflow's catch path records the run as failed with `failureCode: "workflow_error"` and releases the marker, so the operator can retry at once.
 
-**The KG source repo also needs the runner secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
+A KG refresh carries no model credential on any backend. A model secret (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) on the KG source repo is unused; the GitHub Actions template passes repo secrets, but the runner unsets model credentials for kg-refresh. Fly machines and local Docker containers receive neither model variable.
+
+Before releasing credential-free KG dispatch, validate the paired runner image on a Docker-capable host. Build this revision with `npm run build:runner:local`, then capture its immutable ID with `docker image inspect --format '{{.Id}}' ai-implement-runner:local`. Run the following with the intended KG source checkout and tracker export, replacing `<image-id>` with that ID:
+
+```sh
+env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_USE_BEDROCK -u AWS_BEDROCK_ROLE_ARN \
+  npm run dev:run -- --workspace /path/to/kg-source --tracker-data /path/to/tracker-export.json \
+  --image <image-id> --phase kg-refresh --until kg-ingest
+```
+
+Record the source revision, exact command, immutable image ID, and successful completion through `kg-ingest` in the PR. An older runner image can still require model credentials; a mutable image tag or mocked launch test does not establish compatibility.
+
+**The KG source repo still needs the GitHub App secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
 
 | Secret | Purpose |
 |---|---|
 | `AI_IMPLEMENT_APP_ID` | GitHub App numeric ID |
 | `AI_IMPLEMENT_PRIVATE_KEY` | GitHub App PEM private key |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code OAuth token (preferred) — or `ANTHROPIC_API_KEY` |
 
 Optional variables: `AI_IMPLEMENT_RUNNER_LABEL`. `AI_IMPLEMENT_RUNNER_IMAGE` is no longer needed on the KG source repo when the orchestrator is pinned to a specific image — the orchestrator now forwards `runner_image` in the dispatch, so the workflow receives the correct image without a repo-level variable. Leaving an existing `AI_IMPLEMENT_RUNNER_IMAGE` in place is safe (the orchestrator's forwarded value takes precedence when set). Verify with `gh secret list --repo <owner>/<kg-repo>` (names only). Observed live 2026-09-05: the workflow file was added and dispatch would have succeeded, but the repo carried no secrets.
 
@@ -135,22 +157,23 @@ The `dispatch_log` row (schema in `src/log.ts`, `initLogTable`) written by `appe
 
 | Column | Value | Notes |
 |--------|-------|-------|
-| `issue_id` | `"kg-refresh"` | Synthetic string constant, not a UUID |
+| `issue_id` | `"kg-refresh"` | Synthetic string constant, not a UUID; journaled by `resolve`, written by `reserve` |
 | `issue_identifier` | `null` | No tracker issue |
 | `issue_title` | `null` | |
 | `team_key` | `null` | No ticketing mapping |
-| `repo` | KG source repo (`owner/repo`) | Populated from `KG_SOURCE_REPO`; required by `handleDestroySession` to cancel a GHA-backed run |
-| `phase` | `"kg-refresh"` | Run-kind tag, drives observability and routing |
-| `execution_mode` | `"fly-machines"`, `"local-docker"`, or `"github-actions"` | Resolved from global runner mode at dispatch time |
-| `machine_id` | Fly machine ID | null for GHA and local Docker |
-| `machine_nonce` | Generated for Fly/local | null for GHA; `updateJobStatus` clears it on terminal outcome |
-| `run_id` | GHA workflow run ID | Set via `updateJobRunId()` when `findWorkflowRunId` succeeds; null for Fly/local |
-| `pr_url` | Fly machine URL or GHA run URL | Stored via `updateJobPrUrl(jobId, logsUrl)` on dispatch; used as the logs link |
+| `repo` | KG source repo (`owner/repo`) | Populated from `KG_SOURCE_REPO` by `resolve`, written by `reserve`; required by `handleDestroySession` to cancel a GHA-backed run |
+| `phase` | `"kg-refresh"` | Run-kind tag, drives observability and routing; journaled by `resolve`, written by `reserve` |
+| `execution_mode` | `"fly-machines"`, `"local-docker"`, or `"github-actions"` | Resolved from global runner mode one time by `resolve`, written by `reserve` |
+| `machine_id` | Fly machine ID, or local container ID | Projected by `record-dispatch-N`; null for GHA |
+| `machine_nonce` | Derived for Fly/local: HMAC of `dispatchId:attempt` under the runner token secret | Written by `nonce-N` before the dispatch; never in the journal; null for GHA; `updateJobStatus` clears it on terminal outcome |
+| `run_id` | GHA workflow run ID | Projected by `record-dispatch-N`, or by `record-reconcile-N` when a reconcile by title finds the run; null for Fly/local |
+| `pr_url` | Fly machine URL or GHA run URL | Projected by `record-dispatch-N` or `record-reconcile-N` (`updateJobPrUrl`); used as the logs link |
+
+The row is a projection of the journal. `resolve` journals the record (`dispatchId`, `issueId`, `phase`, `repo`, `executionMode`) and `reserve` writes it. For a Fly or local-Docker run, `nonce-N` derives the machine nonce (`deriveMachineNonce`) and writes it before `dispatch-N` creates the machine, so `/api/token` never sees a row with no nonce; `dispatch-N` derives the same value to hand to the dispatcher, and neither step returns it. `record-dispatch-N` writes the machine id, logs URL, and run id from the journaled dispatch result, and `record-reconcile-N` does the same for a run a title reconcile found (the reconcile read itself writes nothing). `close-row` and `persist` write the outcome. See [restate.md](restate.md) § "Journal projections".
 
 The row lifecycle:
-1. Inserted with `status = "dispatched"` when the runner is launched
-2. For GHA: updated to `status = "running"` immediately when a `run_id` is found by `findWorkflowRunId()`; for Fly/local, updated to `status = "running"` when a progress callback arrives (if configured)
-3. Closed to `"completed"`, `"failed"`, or `"timed_out"` by `closeJobLog()` on every terminal outcome
+1. Inserted with `status = "dispatched"` by the workflow's `reserve` step, before the dispatch; the workflow's own dispatch id is the job id
+2. Closed to `"completed"`, `"failed"`, or `"timed_out"` by the workflow's `close-row` step on every terminal outcome
 
 `machine_nonce` being cleared on terminal outcome is load-bearing: the row-eviction logic in `appendLog()` only prunes rows where `machine_nonce IS NULL`, so an in-flight row is never evicted while the runner holds its nonce.
 
@@ -168,12 +191,12 @@ mintRunToken({
   mappingTeamKey: "",      // empty — no ticketing mapping bound
   phase: "kg-refresh",
   audience: "result",
-  ttlSeconds: 4 * 60 * 60, // matches KG_REFRESH_TTL_MS
+  ttlSeconds: 4 * 60 * 60, // matches KG_REFRESH_TOTAL_DEADLINE_MS
   secret: runnerTokenSecret,
 })
 ```
 
-Two tokens are minted at dispatch time: the result token above (as `runToken`) and a progress token:
+Three tokens are minted at dispatch time, inside the workflow's `dispatch` step: the result token above (as `runToken`), a progress token, and a publication token (below):
 
 ```typescript
 mintRunToken({
@@ -188,7 +211,7 @@ mintRunToken({
 
 The result token is placed in the machine environment as `RUN_TOKEN`; the progress token as `RUN_PROGRESS_TOKEN`. Both tokens carry an empty `mappingTeamKey` — the team identity for tracker-data fetches comes from the KG source repo's `sources.yml`, not the token.
 
-A third (`publication`) token is **not** minted: there is no target repository, so the runner never calls `POST /api/runner/publication-token`.
+The third (`publication`) token is bound to the KG source repo and exchanged for a scoped GitHub token at push time (§6).
 
 ### Dependency token and code repo clone
 
@@ -258,11 +281,7 @@ The `kg-ingest` step passes `--repos-root <workspaceDir>/repos` to `python -m kg
 
 ### KG push token
 
-The runner calls `GET /api/runner/kg-push-token` to receive a `contents: write` GitHub App token scoped to the KG source repository. The endpoint is implemented in `src/kg-push-token-vending.ts`:
-
-- Verifies the bearer token with `audience = "progress"` (multi-use, non-consuming, so the git credential helper can re-mint on expiry)
-- Phase-gates: only `phase === "kg-refresh"` tokens are accepted
-- Returns a token scoped exclusively to `owner/repo` of `KG_SOURCE_REPO`
+The runner's `kg-snapshot-push` step pushes the snapshot branch with the primary token, exactly as the implement pipeline's `push` step does; there is no separate push-token endpoint. The publication token (§6) is the credential the runner exchanges for that scoped token.
 
 ### Scope endpoint
 
@@ -281,11 +300,11 @@ The endpoint (`handleKgScopeRequest` in `src/runner-callback.ts`) is gated the s
 ]
 ```
 
-Only these four fields cross the boundary — no `ticketingConfig`, token, or other credential-shaped field ever leaves the orchestrator. The step diffs this scope against `secondary_repos`/`trackers` already present in the cloned `sources.yml` and appends any missing entries (see `docs/kg-architecture.md`'s "Scope contract" section for what the rail will and will not touch).
+Only these four fields cross the boundary — no `ticketingConfig`, token, or other credential-shaped field ever leaves the orchestrator. The step diffs this scope against `secondary_repos`/`trackers` already present in the cloned `sources.yml` and appends any missing entries (see `docs/kg-architecture.md`'s "Scope contract" section for what the rail will and will not touch). It parses `sources.yml` with `yaml` only to find offsets and splices the new entries into the original text, so comments and alignment on unrelated lines stay byte-for-byte. For an empty value (`trackers:` or `trackers: []`, as the `bd-knowledge-graph-base` template ships) the block is spliced in after the key's `:`, and the commented example lines that follow stay in the file. Before writing, the step re-parses its output and passes it only when the document has no parse errors, `secondary_repos` and `trackers` are sequences, and every added slug and team is present. On failure it logs the generated text under the `[kg-scope-reconcile]` prefix and throws without writing, so the run fails at this step rather than letting `kg-ingest` run against a scope it was not given. A dry run does the same splice, parse check and write into its own scratch clone and logs `dry-run: added repos=N teams=M to the scratch clone (not pushed)`, so `kg-tracker-data` and `kg-ingest` test the scope a live run would use; `kg-snapshot-push` exits before any commit, so the reconciled manifest is never pushed.
 
 ### Tracker-data endpoint
 
-The runner calls `POST /api/runner/kg-tracker-data` once per configured team. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads the team list from `sources.yml` in the cloned KG source repo:
+The runner calls `POST /api/runner/kg-tracker-data` once per configured team. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads the team list from `sources.yml` in the cloned KG source repo. `kg-scope-reconcile` runs first and writes the mapped teams into that scratch clone, in a dry run as well; a dry run commits and pushes nothing, so the write never leaves the run:
 
 ```yaml
 trackers:
@@ -303,7 +322,7 @@ Authorization: Bearer <RUN_PROGRESS_TOKEN>
 { "teamKey": "AII", "cursor": "<optional>" }
 ```
 
-The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. Each issue record carries: `id`, `identifier`, `title`, `description`, `branchName`, `state { name type }`, `labels { nodes { name } }`, `project { name }`, `parent { identifier }`, `comments(first: 100) { nodes { body user { name } createdAt } }`, and `relations { nodes { type relatedIssue { identifier } } }`. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the flag-based regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
+The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and answers an unmapped team with 404 `{ "error": "unmapped-team" }`. The mapping check runs after the bearer, progress-token, and `phase = kg-refresh` checks (a missing or bad token or the wrong phase stays 403), so only a caller with a valid progress token learns whether a team is mapped. After those checks, the page is read through the `TrackerExport` Restate service (`TrackerExport.page({ team, cursor })`, [ADR 043](adr/043-a-tracker-read-is-one-restate-service-call.md)) rather than by a direct tracker call, so the tracker read, its retry, and its missing-credential answer live in one place. A team's tracker follows its mapping: Linear with the team key, Jira with the mapping's `jql` and `repoFieldValue` (`JiraProvider.listIssuesPage`, see [ticketing-providers.md](ticketing-providers.md)). A page that cannot be read answers 503 `{ "error": "tracker-unavailable" | "tracker-failed" | "unavailable" }`: `tracker-unavailable` is an unconfigured tracker or credential, `tracker-failed` is a read that failed every retry, and `unavailable` is Restate itself unreachable or timing out. The admin export `GET /api/kg/tracker-data` loops the same service and ends with the same 503 and code on a non-OK page, so a full export needs Restate up (the local dev harness included). Each issue record carries: `id`, `identifier`, `title`, `description`, `branchName`, `state { name type }`, `labels { nodes { name } }`, `project { name }`, `parent { identifier }`, `comments(first: 100) { nodes { body user { name } createdAt } }`, and `relations { nodes { type relatedIssue { identifier } } }`. The admin export skips `sources.yml` teams that have no mapping and logs them. The step fetches every team in `sources.yml` and has three outcomes for a non-OK answer. A **404** (no orchestrator mapping) is **skipped**: the step logs `[kg-tracker-data] team <key>: skipped (no orchestrator mapping)`; the team is neither failed nor counted. A **401 or 403** (a bad token or a config defect) is a **hard failure**: the step throws `KgTrackerDataFetchError` and the run fails at once. Every other non-OK status (503 included) or a thrown fetch is a **failed team**: the step logs `[kg-tracker-data] team <key>: failed (<status>)`, records it, and continues. A team that answers OK with zero issues is valid data (count 0). The outputs are `fetched` (true only when no team failed) and `failedTeams`. The issues of the teams that succeeded are still combined into `tracker-data.json`. With `fetched: false` and `issue.nt` / `comment.nt` in the cloned snapshot, `kg-snapshot-push` opens the snapshot PR with a warning naming the failed teams and the run is held at the decision gate (cause `tracker-missing`) instead of failing; a dry run completes with warnings (`guardVerdict: "warnings"`, the per-source and part tables, no push, no throw), and a live run holds with Accept blocked when a skipped or failed team has issues in the served snapshot (or its count is unknown: the served `trackerTeam` literals include one that is no `sources.yml` tracker key, as in a snapshot written before KGB-33), and publishes with a warning only when the team has none; a tracker-file shrink with no lost team still holds, with both decisions open (see `docs/kg-architecture.md` § "Decision gate"). Only an OK response with a malformed body, or a 401/403, throws `KgTrackerDataFetchError`. One log line is emitted per team:
 
 ```
 [kg-tracker-data] team AII: 312 issues
@@ -313,115 +332,116 @@ The endpoint validates that `teamKey` is present in the orchestrator's configure
 
 ### Callback
 
-The runner reports completion to `POST /api/runner/result` with `{ phase: "kg-refresh", outcome: "success"|"failure", snapshotCommit?, snapshotPr?, snapshotBranch?, failureCode?, failureReason? }`. `snapshotPr` and `snapshotBranch` are set when `kg-snapshot-push` pushed the snapshot and opened the refresh PR (AII-593, below). The routing carve-out in `src/runner-callback.ts` (~line 252):
+The runner reports completion to `POST /api/runner/result` with `{ phase: "kg-refresh", outcome: "success"|"failure", snapshotCommit?, snapshotPr?, snapshotBranch?, failureCode?, failureReason? }`. `snapshotPr` and `snapshotBranch` are set when `kg-snapshot-push` pushed the snapshot and opened the refresh PR (AII-593, below). The routing carve-out in `src/runner-callback.ts` (`handleRunnerResult`, the `body.phase === "kg-refresh"` branch, line 724):
 
 ```typescript
-if (input.body.phase === "kg-refresh") {
-  input.onKgRefreshRunnerComplete?.(input.body.outcome, { ... });
+if (body.phase === "kg-refresh") {
+  // verify the result token without consuming it, resolve the triggerId from the KgRepo marker,
+  // then forward to KgRefresh.report with the dispatch id as the idempotency key
+  ...
   return { status: 200, body: { acknowledged: true } };
 }
 ```
 
-This returns before the code that resolves the ticketing provider, posts comments, or transitions issue labels. **No tracker writes ever occur for an issueless run.**
+The callback is verify-only: it checks the signature and row but never consumes the token, so a runner retry is safe. A duplicate body is absorbed by Restate; a different body for the same run answers `409 conflicting_report`; Restate unreachable answers `503 kg_refresh_unavailable` and the runner retries; no refresh in flight answers `409 no-refresh-in-flight`. A progress heartbeat from the runner resolves the workflow's `progress` promise the same way. The carve-out returns before the code that resolves the ticketing provider, posts comments, or transitions issue labels. **No tracker writes ever occur for an issueless run.**
 
 ---
 
 ## 6. Lifecycle
 
-### State machine
+The workflow key is the dispatch id (`KgRepo` mints it as the trigger id), so the runner callback addresses `KgRefresh/{dispatchId}` directly from the verified token claims.
 
-`makeKgRefresh()` maintains an in-process `KgRefreshStage` state:
+The three run tokens (result, progress, publication) are minted inside the workflow's one journaled `dispatch` step, so the mint and the dispatch are one unit and a replay never re-mints for a dispatch that already committed; the tokens never enter the journal; the publication token is bound to the KG source repo and exchanged for a scoped GitHub token at push time.
 
-```
-idle → checking → ingest-running → snapshot-landed → staging → serving
-                                                              └→ reverted
-                                                              └→ failed
-```
+### Reserve and dispatch
 
-Each stage transition is persisted to the `settings` table under the key `kg_refresh_stage` (`persistStageFn` in `src/kg-refresh.ts`), enabling crash recovery.
+`trigger_kg_refresh` (the one door; `POST /api/kg/refresh` reaches the same handler through `callToolAsSystem`) runs its synchronous checks and the credential preflight, then calls `KgRepo.trigger`. The object's exclusive handler reads the `inFlight` marker. A set marker answers `refresh-in-progress` (HTTP 409); the marker has no age and no lease clock. Otherwise the object mints a `triggerId`, starts `KgRefresh.run` by one-way send, awaits the invocation id of that send, and stores `{ triggerId, startedAt, invocationId }`. The run invocation holds the lock for its whole life (AII-1297): in the same handler `submit` sends the shared, `ingressPrivate` `KgRepo.watch({ triggerId, invocationId })` (`explicitCancellation: true`, so a cancel of `watch` itself cannot free a live run's lock), which `attach`es to the run invocation, catches every error, and then sends `release({ triggerId })` to its own key. Restate therefore frees the lock however the run ends: a normal end, a Restate kill, or a cancel. `release` also comes from the run's `finally` (the fast release after `persist` and `close-row`); a second `release` for the same trigger id does nothing. A paused run keeps the lock until an operator cancels the invocation in the Restate UI. There is no `extend`. `expire` survives only for a legacy marker with no `invocationId` (from before AII-1297): it clears that marker when the trigger id matches and logs `[KgRepo] expired legacy in-flight marker`; for a marker that has an `invocationId` it does nothing. A suspended `watch` is a non-completed invocation and counts toward the deploy drain. Run, progress and publication tokens are minted inside the journaled `dispatch` step, which checks for an existing run by exact title before each attempt and returns only the run identifiers, so no token is written to the Restate journal. Restate unreachable at the door answers `503 restate-unavailable` rather than hanging, except while a deploy hold is set: `POST /api/kg/refresh` (`trigger_kg_refresh`) then answers `409 deploy-in-progress`, as does every other tool. Two tools are allowlisted through the hold in `callTool` (AII-1401): `get_kg_status` and `decide_kg_refresh`, so `GET /api/kg/status` keeps answering (with `deployHeld: true`) and the operator can accept or cancel a run held at the decision gate, which lets the deploy drain finish. The Knowledge Graph Pipelines page shows a deploy-in-progress notice, keeps Accept and Cancel enabled, and keeps Refresh graph now disabled. The Restate-not-ready check still applies to both, and MCP `tools/call` follows the same allowlist.
 
-### Crash recovery (boot)
+A scheduled refresh (AII-1432, [ADR 042](adr/042-a-pipeline-schedule-is-a-due-or-fired-state-checked-by-the-poll-loop.md)) is the first pipeline on the `PipelineSchedule` object, key `kg-refresh` (`src/restate/kg-refresh-schedule.ts`). The poll loop calls `checkPipelineSchedules(["kg-refresh"])` once per cycle, only when `KG_SOURCE_REPO` binds the KG services. When the day's occurrence is due, `busy` reads `KgRepo.status`; a free lease goes straight to `fire`, which calls `trigger_kg_refresh` as `systemCaller()`, the same door `POST /api/kg/refresh` uses, so the credential preflight is not copied. A 202 is `started`; a 409 `refresh-in-progress` or `deploy-in-progress` is `busy` and the occurrence stays due, because `busy` does not read the deploy hold and the deploy hold arrives as a `busy` fire answer; any other status or an `isError` result is `refused`, which counts as fired for that occurrence. A held lease makes the occurrence wait, with one exception: when the holder is the run this schedule started and `KgRefresh.status` shows it at the decision gate, `replace` sends a one-way `cancel` with reason `superseded_by_schedule`, and the next check fires once the lease clears. A manual refresh, a PR-check dry run, or a run past the snapshot merge is never cancelled. At the gate, that reason closes the held snapshot PR with gate `superseded_by_schedule`; every other cancel reason keeps `operator_cancelled`, and the run's failure classification stays `operator_cancelled` either way. A person's Accept wins over the replace (AII-1441): when the `superseded_by_schedule` cancel is recorded after the accept, at the commit point the run ignores it and merges; any other reason still cancels there.
 
-On construction, `makeKgRefresh()` loads the persisted stage and last refresh outcome:
+PR-check dry runs (AII-730, AII-977) use the same object: `enqueueDryRun` runs one now or holds it in `pending`, and `release` submits the oldest held head. The verdict of a dry run is not stored: the workflow's `dry-run-report` step sets the commit status and posts its sticky comment on the PR's own head SHA, and nothing is read back. `forgetPr` clears the PR's held head on PR close. `forgetPr` also records the PR in a bounded `closedKeys` list, and `enqueueDryRun` answers `{ closed: true }` for a recorded PR (no state write, no send); the webhook never dry-runs the rail's own `kg-refresh/<stamp>` snapshot PRs (`rail_snapshot_pr`). The webhook has no sha dedup of its own: the delivery id is the `enqueueDryRun` idempotency key, and a held entry for the same PR is replaced. While the Restate registration is not `registered` (or the sidecar is not ready) the webhook does not send to `KgRepo` (AII-1405): `makeKgDryRunEnqueue` logs one line with the key and answers `unavailable`, so a PR push in that window gets no dry run and the next push runs one. There is no admin dry run: `POST /api/kg/refresh` and `trigger_kg_refresh` refuse `dryRun: true` and `acceptNewBaseline: true` with `option-removed` (400 / error), so a dry run always has a report target. Nothing is stored for a dry run without one; the `recordAdminDryRun` and `recordDryRunOutcome` handlers are no-ops kept until 2026-11-13 for dry-run workflows in flight at deploy, and `get_kg_status` has no `lastDryRun`. The `kg_refresh_dry_run_outcomes` settings row is deleted at boot (logged with its entry count).
 
-- `ingest-running` within TTL → restores `running = true`, `stage = "ingest-running"`, `currentDispatchId`, and `currentJobId` from the persisted envelope; re-arms the TTL watchdog as a `setTimeout` for the remaining window
-- `ingest-running` past TTL → clears the lock (`persistStageFn("idle", ...)`) so a new dispatch can proceed
-- `snapshot-landed` or `staging` → the orchestrator restarted mid-rail with no pending callback; marks `"failed"` immediately so the operator can retry
+`KgRefresh.run` then runs, each as a named `ctx.run`: `resolve` (computes the row record, including the one-time backend choice), `reserve` (inserts the `dispatch_log` row, §4), `envelope` (builds the `RunConfigV1`; the journaled envelope is the run's configuration record and every dispatch retry reuses it, and it carries no token), then per attempt `nonce-N` (container backends only: derives and arms the machine nonce), `dispatch-N` (mints the tokens, then dispatches through the sender table, up to three attempts, each preceded by an exact-title lookup), and `record-dispatch-N` (projects the journaled result onto the row). The dispatch uses `returnRunDetails: true`, so the workflow holds the **exact run identity** of the GitHub run; an `unknown` outcome is reconciled by exact run title, never by a second dispatch (§3). A `rejected` outcome ends the run with `dispatch_rejected`.
 
-The in-flight dispatch envelope is stored under the same `kg_refresh_stage` settings key as the stage, atomically on every transition to `ingest-running`. The envelope carries `dispatchId` and `jobId` so that:
-- A result callback arriving after restart can close the `dispatch_log` row (`closeJobLog(jobId, ...)`) and report the correct `dispatchId` through `onOutcome`
-- `GET /api/kg/status` shows the adopted run in `stage: "ingest-running"` until the callback arrives
+### The two deadlines and the watch
 
-`lastRefresh` is persisted under a separate `kg_refresh_last_refresh` settings key on every terminal outcome (success, no-new-data, failure) and loaded on boot. It survives restarts independently of the in-flight state.
+The workflow waits on a race of durable promises and timers: `report`, `cancel`, `progress`, and a tick.
 
-The per-PR dry-run outcome cache behind the KG PR check (AII-633/636) is persisted under a third key, `kg_refresh_dry_run_outcomes`, as one JSON blob (same bounded shape as the in-memory map, insertion order kept for eviction) written on every record and eviction and loaded on boot beside the stage envelope (AII-640). A restart between a dry run finishing and a later `accept-baseline` `labeled`/`unlabeled` event therefore re-reports that PR's own verdict instead of answering `no_dry_run_outcome`.
+| Deadline | Value | Runs from | Expires as |
+|---|---|---|---|
+| Bootstrap | 10 min (`KG_REFRESH_BOOTSTRAP_DEADLINE_MS`) | dispatch, until the first `progress` heartbeat | `bootstrap_timeout` |
+| Total | 4 h (`KG_REFRESH_TOTAL_DEADLINE_MS`) | dispatch, until the `report` | `timed_out` |
 
-**Token validation survives restarts** because `verifyAndConsumeRunToken` and `verifyRunToken` are DB-only — they read `runner_tokens` rows written at dispatch time. The 401 seen in run 34006075078 was caused by the progress token not being minted (AII-544, now fixed), not by in-memory state loss.
+Started evidence moves the workflow from the bootstrap deadline to the total deadline. It comes from either of two sources, whichever comes first: the orchestrator's own status read showing the run started, or the runner's `progress` heartbeat. On GitHub Actions the read shows the run `in_progress` (`queued` does not count); on a Fly machine it shows the machine `started`, and on a local Docker container it shows the container running (`created` and `starting` do not count). See [ADR 034](adr/034-an-owned-run-wait-names-each-signal-and-its-producer.md). Both expiries close the row as `timed_out` and notify with "KG Refresh hit the time limit." (§8). Before it gives up, the wait takes a `report` that is already resolved (and, for the bootstrap deadline, a `progress` that is) over the timeout, and on GitHub Actions a timeout with a known run id cancels that run (`cancel-run`, bounded to three attempts, a failure only logged) so the lock does not open beside a live run. On a Fly machine or a local Docker container a timeout with a known `jobId` (the machine id, or the container id the local Docker sender returns) stops it through `stopMachineRun` (`stop-machine-run`: `destroyMachine`, or `docker rm -f` via `stopLocalContainer`; bounded to three attempts, a failure only logged). With no `jobId` the workflow logs one warning naming the dispatch id and stops nothing; the reaper's 4-hour sweep stays the backstop.
 
-**SQLite volume must persist across deploys.** An orchestrator that redeploys with a fresh volume loses both the `runner_tokens` rows and the persisted stage — token validation returns `reason: "malformed"` (row absent) and `GET /api/kg/status` shows `lastRefresh: null`.
+The runner's steps are in the workflow, not a black box. The kg-refresh runner reports each pipeline step (`clone` through `kg-snapshot-push`) with `TokenStepReporter`, once at `running` and once at the final status; a skipped step reports once. The callback validates the body, redacts it with `redactStepCredentials` (`src/pipeline/step-redaction.ts`), and sends it to the `progress` handler, which keeps it as a durable promise named `step:<id>:running` or `step:<id>:ended`. `status().runnerStep` names the last step in pipeline order that has a resolved promise (`KG_REFRESH_RUNNER_STEPS`), so a refresh is no longer a black box between `dispatch` and `report`. A repeated report is left alone, and a report after the run completed is accepted and ignored, with no 409. A `progress` with no body (an old runner image) still resolves the heartbeat. The step promises are evidence only: the wait never awaits them ([ADR 034](adr/034-an-owned-run-wait-names-each-signal-and-its-producer.md)). The row for them lives in the signal table in [docs/restate.md](restate.md), and a test (`src/__tests__/kg-refresh-runner-steps.test.ts`) holds `KG_REFRESH_RUNNER_STEPS` equal to the steps of `pipelines/kg-refresh.yml`.
 
-### TTL (4 hours)
+On the GitHub Actions backend the workflow also **watches the run itself**, by one status read of the exact run each 60 seconds (`KG_REFRESH_WATCH_INTERVAL_MS`, about 240 per 4 h run). Each tick it reads the run's status inside a `watch-N` step, or reconciles the run by title inside a `reconcile-N` step while no run id is known. A run whose status is `completed` with no report in hand ends as `dispatch_lost` and carries the GitHub conclusion in its detail. With a known `jobId` the workflow reads the machine or container each tick too, inside a `watch-N` step through `readMachineRun` (`readBackendRun`, `src/backend-run.ts`). On Fly, `started` is started evidence; `stopped`, `destroyed`, or a 404 is `ended`; `created`, `starting`, a lookup error, or a failed step is `unknown` and the wait continues. On local Docker, `classifyLocalContainer` knows only running or not running, so a running container is `started` and a container that is not running (or `No such container`) is `ended`, with no exit; any other inspect error is `unknown`. `ended` with no report (a `report` already resolved wins) ends the run as `dispatch_lost` within about one interval, and the detail names the newest exit event, for example `machine stopped with no report (exit 137, signal 9, oomKilled)` or `machine stopped with no report (exit 0)`; a signal is reported as the signal, never as an exit code. With no `jobId` there is no status read. No GitHub App event subscription or other customer-side setup is necessary ([ADR 033](adr/033-a-run-signal-uses-a-channel-every-deployment-already-has.md)). No reaper rule and no monitor module exist for this run kind, and no settings-backed state is kept for the watch; the stuck-watchdog and reaper skip kg-refresh rows (below).
 
-`KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000`. Three enforcement paths:
-1. **Live process watchdog**: each `trigger()` call checks whether `Date.now() - ingestStartedAt >= KG_REFRESH_TTL_MS`; if so, calls `failIngestRunner(...)` before proceeding
-2. **Boot re-adoption watchdog**: when an in-flight run is re-adopted on boot, a `setTimeout` is armed for the remaining TTL window; fires `failIngestRunner(...)` if no callback arrives within that window
-3. **Boot recovery (past TTL)**: as above — clears the stale lock on construction
+### Report
 
-When the TTL fires, `onOutcome("failure", { timedOut: true })` is called with `timedOut: true`. `handleKgRefreshOutcome()` in `src/index.ts` uses `timedOut` to build a synthetic `"timed_out"` job for `classifyCompletion()` so the notification reads "KG Refresh hit the time limit." rather than a generic failure message.
+The runner's result callback reaches `KgRefresh.report` (§5, Callback). The first body resolves the `report` promise; an identical retry answers `duplicate`; a different body answers a conflict (HTTP 409); any report after the run completes is a duplicate or a conflict by the same rule. The workflow then branches:
 
-### Stuck-watchdog carve-out
+| Report | Result |
+|---|---|
+| dry run (PR check only; the admin doors refuse `dryRun`) | `dry-run-report`, then `closed` (row `passed`, `warnings` for a dry run with skipped or failed sources, or `failed`); nothing is merged and the served graph is untouched. A dry run that fails before a report (rejected dispatch, timeout, lost run, cancel, workflow error) still records and posts a failure verdict for its PR, and writes neither the last-refresh record nor the operator notification |
+| `KG_SNAPSHOT_STALE` | `no-new-data`, a success outcome |
+| failure, or no `snapshotPr` / `snapshotCommit` | `failed`; a reported `snapshotPr` is closed unmerged and its branch deleted |
+| success with a snapshot | `merge` (merge commit, never squash), `delete-branch`, then the four rail gates |
 
-`src/stuck-watchdog.ts` (~line 147) skips kg-refresh jobs entirely:
+### The rail is a saga
+
+After the merge, `fetch`, `stage`, `swap`, and `verify` each run as one `ctx.run`. A gate that fails throws a terminal error carrying the gate name; the workflow runs `revert` as the compensation and ends as `failed` with that gate. If `fetch` finds the served snapshot already current, the run ends as `no-new-data` without staging. Replay resumes at the gate that did not finish, never at one that did, and the workflow's `step` names the gate in flight. Every terminal path of a real refresh runs `persist` (the last-refresh outcome, SQLite), `close-row`, and `outcome` (the notification and the report-issue comment, §8), and ends by sending `release` to `KgRepo`, which clears the marker only when the trigger id matches.
+
+### Cancel
+
+`cancel` resolves the workflow's `cancel` promise and revokes nothing by itself. The admin cancel route cancels the workflow of the clicked row (the row's `dispatchId` is the trigger id) and reads no `KgRepo` marker; a row without a `dispatchId`, or a workflow that is not found, answers `409 no-refresh-in-flight`. The workflow sets `step = cancelling`, asks the backend to cancel the run (`cancel-run`, or `stop-machine-run` on Fly and local Docker, same rules as the timeout), and on GitHub Actions keeps watching until the run concludes; a run that only the reconcile finds is cancelled once when found, and while no run id is known the wait ends at the earlier of the total deadline and the cancel time plus the bootstrap deadline. It holds the marker until then, so a new refresh cannot start beside a run that is still going. The run ends with `conclusion = operator_cancelled`, which suppresses the failure notification.
+
+### Replay and crash recovery
+
+Restate re-delivers an invocation whose attempt died and replays the journal, so a restart mid-run resumes at the step that did not finish instead of dispatching a second runner. No boot-time recovery of a settings-backed stage exists. The one boot step is a one-shot sweep of rows left by the previous owner: if the old stage settings key is present, every in-flight kg-refresh row is closed `timed_out` and the key deleted. The workflow, journal, and idempotency retention is the `restate_retention_days` setting, 14 days by default, read at boot.
+
+The last refresh outcome is persisted under the `kg_refresh_last_refresh` settings key on every terminal outcome of a real refresh (success, no-new-data, failure), never for a dry-run, and survives restarts. When the record carries no stamp (a failure before the rail: timeout, rejected dispatch), `get_kg_status` reads the serving stamp live (`readServedStamp` over `getServedNamespace()`, in one `ctx.run`; an error gives `null`).
+
+**Token validation survives restarts** because `verifyAndConsumeRunToken` and `verifyRunToken` are DB-only — they read `runner_tokens` rows written at dispatch time.
+
+**SQLite volume must persist across deploys.** An orchestrator that redeploys with a fresh volume loses the `runner_tokens` rows and the last-refresh outcome — token validation returns `reason: "malformed"` (row absent) and `GET /api/kg/status` shows `lastRefresh: null`. The Restate data directory must persist too, or the in-flight marker and every workflow position are lost.
+
+### Status
+
+`GET /api/kg/status` and `get_kg_status` derive `stage` from the marker, the workflow's `step`, and `lastRefresh`; the full table is in [mcp-server.md](mcp-server.md) (`get_kg_status`). In short:
+
+While a runner step is in flight, `status` and `get_kg_status` also show `runnerStep: { id, status }` (and `stage` follows it); after the run ends, `lastRefresh.steps` holds the table of runner steps with status and duration.
+
+| Marker | Workflow `step` | `stage` |
+|---|---|---|
+| none | — (from `lastRefresh`) | `idle`, `serving`, `reverted`, or `failed` |
+| present | `reserve`, `dispatch` | `checking` |
+| present | `await-progress`, `cancelling`, `dry-run-report`, `watch-*`, `reconcile-*` | `ingest-running` |
+| present | `merge`, `delete-branch` | `snapshot-landed` |
+| present | `fetch`, `stage`, `swap`, `verify`, `revert`, and the closing steps | `staging` |
+
+### Stuck-watchdog and reaper carve-outs
+
+`src/stuck-watchdog.ts` (line 276) skips kg-refresh jobs entirely:
 
 ```typescript
 if (job.phase === "kg-refresh") return;
 ```
 
-The stuck-watchdog path re-queues issues through the ticketing system. Since there is no tracker issue, that path would corrupt state — the carve-out is required for every issueless run kind.
-
-### Reaper reconciliation
-
-`src/reaper.ts`: at the end of each `sweepOrphanedMachines()` call, `sweepOrphanedKgRefreshJobs()` is invoked. It is **Fly-mode and local-Docker only**; GHA rows are skipped (`continue`) because the implement-path monitor owns them. For GHA rows that never receive a run ID, the equivalent of the 5-minute Fly bootstrap deadline is handled by `monitorKgRefreshGhaJob`'s `GHA_DISPATCH_GRACE_MS` (10 minutes) in the poll cycle — see "GHA monitor" above.
-
-**Fly-mode rows**: the already-fetched machine set is consulted. For each row whose `machine_id` is absent from the active set, `helpers.failKgRefreshMachine(job)` is called. A row still in `"dispatched"` state past the 5-minute bootstrap deadline is closed with `failureCode: "bootstrap_timeout"` regardless of machine presence. Local-Docker rows (no `machine_id`) are skipped.
-
-All Fly paths converge on `kgRefresh.onMachineLost()`:
-
-```typescript
-onMachineLost(opts?: { failureCode?: string }) {
-  if (stage !== "ingest-running") return; // idempotent
-  failIngestRunner("ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
-}
-```
-
-`failIngestRunner()` closes the chain: sets `stage = "failed"`, clears `running`, fires `onOutcome("failure", { timedOut: true })`, and calls `closeJobLog(jobId, "timed_out")`.
-
-### GHA monitor (lazy bind and run closure)
-
-GHA kg-refresh rows are monitored by `monitorKgRefreshGhaJob` in `src/monitor-gha.ts`. `monitorGitHubActionsJob` in `src/index.ts` delegates to it immediately for any row where `job.phase === "kg-refresh"`. `getInFlightJobs()` returns kg-refresh rows because it is phase-agnostic; the main monitor loop routes all non-Fly, non-local-Docker rows through `monitorGitHubActionsJob`, which then delegates.
-
-**Lazy bind (run_id IS NULL):** `monitorKgRefreshGhaJob` resolves the workflow file as `"claude-implement.yml"` (the file kg-refresh dispatches to) and the ref via `getRepoDefaultBranch()`, bypassing the `teamRepoMap` lookup that would return nothing for the KG source repo. It calls `attachJobRunIdIfMissing` and adds to `claimedRunIds`, which are shared with implement rows in the same poll cycle. If `findWorkflowRunId` returns null and the dispatch is older than `GHA_DISPATCH_GRACE_MS` (10 minutes, matching `RUN_ID_TIMEOUT_MS` for issue-keyed runs), `onHandleLost({ failureCode: "dispatch_lost" })` is called to close the chain — covering the case where a `workflow_dispatch` was silently rejected (e.g. workflow file absent) and no run ever appeared.
-
-**Run closure:** once `run_id` is set, `monitorKgRefreshGhaJob` polls `getWorkflowRunStatus()` and calls `updateJobStatus(job.id, jobStatus, conclusion, null)` on completion. kg-refresh rows are issueless — no PR URL, no ticket side effects. Issue-keyed side effects (ticket comments, labels) are suppressed by the existing `shouldSkipCompletionNotice(job)` guard in `reportJobCompletion` (AII-539). The reaper is **Fly-only** for kg-refresh; GHA rows are owned entirely by the monitor.
-
-**`onHandleLost` wiring:** `monitorKgRefreshGhaJob` receives `onHandleLost` from its caller in `src/index.ts`, wired as `(opts) => activeKgRefresh?.onMachineLost(opts)`. It is called on three paths: (1) dispatch-lost (no run ID after `GHA_DISPATCH_GRACE_MS`), (2) watchdog-overdue (run stuck in non-terminal state past the threshold), and (3) run-conclusion (GHA run completed but runner callback never arrived). All three paths release the in-memory `running` lock and advance `stage` out of `"ingest-running"` so a new refresh can be triggered without waiting for the TTL. `onMachineLost` is idempotent (no-op when `stage ≠ "ingest-running"`), so calling it after the callback already landed is safe.
-
-**Conclusion-then-handle-lost overwrite:** on the run-conclusion path, `updateJobStatus` first writes the accurate terminal status (`completed`, `failed`, or `timed_out` from the GHA conclusion). `onHandleLost` then calls `onMachineLost` → `failIngestRunner` → `closeJobLog(jobId, "timed_out")`, which unconditionally overwrites the row to `status="timed_out"`, `conclusion=NULL` if the runner callback never arrived. This matches the pre-existing Fly-machine-lost path and is intentional: when the callback is absent, the pipeline's success or failure is unknown and `timed_out` is the conservative classification.
-
-**Late-callback safety:** `onRunnerComplete` in `KgRefreshHandle` checks the in-memory `stage`, not the DB row status. If the monitor has already called `updateJobStatus` before the runner's own callback arrives, `stage` is still `"ingest-running"` and the callback proceeds normally, recording `lastRefresh` and calling `closeJobLog` (a no-op re-update on an already-terminal row). `onHandleLost` and `updateJobStatus` are co-atomic in the monitor — both are called synchronously with no `await` between them — so there is no window where `updateJobStatus` has written but `onHandleLost` has not yet fired.
+The stuck-watchdog path re-queues issues through the ticketing system. Since there is no tracker issue, that path would corrupt state — the carve-out is required for every issueless run kind. The reaper (`src/reaper.ts`, line 138) likewise skips kg-refresh rows, since there is no provider record to look up; the workflow's deadlines are the only timeout.
 
 ### Deploy interlock
 
-`src/in-flight-work.ts`: `getInFlightWork()` calls `getInFlightJobs()`, which returns all `"dispatched"` or `"running"` rows regardless of phase. This means an in-flight kg-refresh job blocks self-deploy the same way an in-flight implementation job does. No special carve-out is needed.
+`src/in-flight-work.ts`: `getInFlightWork()` calls `getInFlightJobs()`, which returns all `"dispatched"` or `"running"` rows regardless of phase. This means an in-flight kg-refresh job blocks self-deploy the same way an in-flight implementation job does. No special carve-out is needed. The deploy drain also counts the `KgRefresh` invocation itself as non-completed work (ADR 032).
 
 ### Operator cancel
 
-`DELETE /api/sessions/:machineId` (`src/admin.ts`) handles kg-refresh jobs as a special case when `job.phase === "kg-refresh"`:
+`DELETE /api/sessions/:machineId` (`src/admin.ts`, `handleDestroySession`) handles kg-refresh jobs as a special case when `job.phase === "kg-refresh"`:
 
-1. Destroys the Fly machine (or cancels the GHA workflow run) via the execution backend
-2. Stamps `conclusion = "operator_cancelled"` on the DB row with `updateJobStatus(job.id, "failed", "operator_cancelled")`
-3. Calls `deps.kgRefresh?.onMachineLost({ failureCode: "operator_cancelled" })` to close the chain
-4. Sends a single `notifyText` webhook alert (the `"operator_cancelled"` failureCode causes `handleKgRefreshOutcome()` to suppress its own notification, preventing a second alert)
+1. Reads the in-flight `triggerId` from the `KgRepo` marker and calls the workflow's `cancel`; the workflow requests the GitHub cancellation and confirms termination (above). A Fly job also has its machine destroyed, since the workflow has no Fly dependency
+2. Stamps `conclusion = "operator_cancelled"` on the DB row with `updateJobStatus(job.id, "failed", "operator_cancelled")` — only after the cancel was accepted, so a `409` or `503` answer leaves the row as it was
+3. Sends a single `notifyText` webhook alert (the `"operator_cancelled"` conclusion suppresses the outcome notification, preventing a second alert)
 
 ---
 
@@ -445,7 +465,7 @@ The `kg-ingest` step writes every line of the ingest subprocess's stdout and std
 
 ### `list_in_flight_jobs` MCP tool
 
-`src/mcp.ts`, tool `list_in_flight_jobs` — returns all rows from `getInFlightJobs()` including kg-refresh jobs. A kg-refresh row is distinguishable by `phase: "kg-refresh"` and `issueIdentifier: null`. This is the operator's primary tool for checking whether a refresh is in flight before an operation that the deploy interlock would block.
+`src/mcp.ts`, tool `list_in_flight_jobs` — returns all rows from `getInFlightJobs()` including kg-refresh jobs. A kg-refresh row is distinguishable by `phase: "kg-refresh"` and `issueIdentifier: null`. This is the operator's primary tool for checking whether a refresh is in flight before an operation that the deploy interlock would block. A refresh held at the decision gate closes its row (`completed` / `awaiting_decision`), so it is not listed; it appears in `get_kg_status` and counts as `awaitingDecisionCount` in `get_tenant_health`.
 
 ---
 
@@ -462,25 +482,25 @@ The `kg-ingest` step writes every line of the ingest subprocess's stdout and std
 | `failed` | `operator_cancelled` | `null` — benign, suppress alert |
 | `timed_out` | any | `{ summary: "KG Refresh hit the time limit." }` |
 | `failed` | `KG_SNAPSHOT_MISSING` | `{ summary: "KG Refresh failed." }` — snapshot parts or embeddings absent |
-| `failed` | `KG_SNAPSHOT_TRACKER_REGRESSION` | `{ summary: "KG Refresh failed." }` — push refused due to content regression: either the tracker-data step was skipped but the previous snapshot contains tracker files (`issue.nt`/`comment.nt`), or one or more snapshot parts shrank beyond the acceptance thresholds (any part below 50 % of its previous line count, or `issue.nt`/`comment.nt` shrinking at all when the tracker reported a non-zero issue count) |
-| `failed` | `KG_TRACKER_DATA_FETCH_FAILED` | `{ summary: "KG Refresh failed." }` — tracker-data endpoint returned a non-503 error |
+| `failed` | `KG_SNAPSHOT_TRACKER_REGRESSION` | `{ summary: "KG Refresh failed." }` — push refused due to content regression (missing tracker data alone no longer refuses: a dry run completes with warnings, a live run holds as `KG_SNAPSHOT_HELD` with cause `tracker-missing` or publishes with a warning when no lost team explains it): a non-tracker snapshot part went missing, or one or more snapshot parts shrank beyond the acceptance thresholds (any part below 50 % of its previous line count, or `issue.nt`/`comment.nt` shrinking at all when the tracker reported a non-zero issue count) |
+| `failed` | `KG_TRACKER_DATA_FETCH_FAILED` | `{ summary: "KG Refresh failed." }` — tracker-data endpoint answered OK with a malformed body, or answered 401/403. Any other non-OK answer (404 is skipped) or a thrown fetch is not this code: it fails that team and the run holds at the decision gate |
 | `failed` | `exit_<N>` | `{ summary: "KG Refresh failed.", detail: "The runner exited with code N." }` |
 | `failed` | other | `{ summary: "KG Refresh failed." }` |
 
 ### One notification per outcome
 
-`handleKgRefreshOutcome()` in `src/index.ts` (~line 2941) fires at most one webhook notification per terminal outcome via `notifyKgRefreshOutcome()` (`src/notify.ts:687`). The function is gated on `config.notifyWebhookUrl`; no webhook configured = silent. Provider: `NOTIFY_TYPE` (Slack default, or Teams).
+The workflow's `outcome` step calls `handleKgRefreshOutcome()` in `src/index.ts`, which fires at most one webhook notification per terminal outcome via `notifyKgRefreshOutcome()` (`src/notify.ts`). The function is gated on `config.notifyWebhookUrl`; no webhook configured = silent. Provider: `NOTIFY_TYPE` (Slack default, or Teams).
 
 Three outcomes:
 - `"success"` → `:white_check_mark: KG Refresh succeeded`
 - `"no-new-data"` → `KG Refresh: graph is current — no new data to ingest`
 - `"failure"` → `:x: KG Refresh failed` + summary/detail from `classifyCompletion`
 
-`KG_SNAPSHOT_STALE` maps to `"no-new-data"` inside `onRunnerComplete()`. The benign `"no-new-data"` outcome still sends a notification (it is informational); only `operator_cancelled` suppresses the notification entirely.
+The workflow passes the kind and a meta object (`failureCode`, `timedOut`, `dispatchId`) to `onOutcome` explicitly; no text match decides the kind. The `KG_SNAPSHOT_STALE` branch and the rail's `ingest-needed` gate send `"no-new-data"` whatever the runner's `failureReason` says; the two timeout conclusions (`bootstrap_timeout`, `timed_out`) send `"failure"` with `timedOut: true`, which `classifyCompletion` turns into the time-limit summary. Every failure carries its conclusion as `failureCode`. The benign `"no-new-data"` outcome still sends a notification (it is informational). The workflow's cancel path skips `onOutcome` altogether, and `handleKgRefreshOutcome` also returns early on `operator_cancelled`; a dry-run sends no operator notification.
 
 ### No retry storm
 
-There is no automatic re-dispatch on failure. The rail advances only when an operator calls `POST /api/kg/refresh`. A failed outcome leaves `stage = "failed"` or `stage = "reverted"` (query via `GET /api/kg/status`). The `"reverted"` stage means the previous overlay is still serving — the sidecar was rolled back and is healthy; the operator can retry immediately. The `"failed"` stage means the local rail never reached a swap point; the previously serving graph is untouched.
+There is no automatic re-dispatch on failure. The rail advances only when an operator calls `POST /api/kg/refresh` (or `trigger_kg_refresh`). A failed outcome leaves `stage = "failed"` or `stage = "reverted"` (query via `GET /api/kg/status`). The `"reverted"` stage means the previous overlay is still serving — the sidecar was rolled back and is healthy; the operator can retry immediately. The `"failed"` stage means the local rail never reached a swap point; the previously serving graph is untouched.
 
 ### Report-issue posting
 
@@ -494,13 +514,13 @@ The comment includes the failure code and dispatch ID for correlation.
 
 The runner pushes the new snapshot to a per-refresh branch `kg-refresh/<stamp>` in the KG source repository (`KG_SOURCE_REPO`) and opens a **refresh PR** against the default branch (title `kg-refresh: snapshot @ <stamp> (<N> quads)`). The PR body is the refresh report: the per-part line-count table (prev, new, delta), quads serialized, issue counts by team, each secondary repo with its branch and commit, ingest warnings (`WARN`/`ERROR` lines from `ai-output/kg-ingest.log`), and the guard verdict. The step reuses the implement pipeline's PR helper (`openOrFindPullRequest` in `src/pipeline/step-utils.ts`); no second PR helper exists (ADR 013).
 
-On a successful callback the orchestrator (`onRunnerComplete` in `src/kg-refresh.ts`) merges that PR with the **merge** method — never squash or rebase, because it then verifies `snapshotCommit` is reachable on the default branch — deletes the `kg-refresh/<stamp>` branch, and continues with the local rail (fetch, stage, swap, verify). A merge that returns `blocked` or `conflict`, or a callback that carries `snapshotPr` without `snapshotCommit`, ends the refresh as `failed` with the PR named in `lastRefresh.detail`; the default branch is untouched. On a failed callback that carries `snapshotPr`, the orchestrator posts a comment naming the gate, closes the PR unmerged, and deletes the branch.
+On a successful report the workflow's `merge` step merges that PR with the **merge** method — never squash or rebase, because it then verifies `snapshotCommit` is reachable on the default branch — deletes the `kg-refresh/<stamp>` branch, and continues with the local rail (fetch, stage, swap, verify). A merge that returns `blocked` or `conflict`, or a callback that carries `snapshotPr` without `snapshotCommit`, ends the refresh as `failed` with the PR named in `lastRefresh.detail`; the default branch is untouched. On a failed report that carries `snapshotPr`, the workflow's `close-snapshot-pr` step posts a comment naming the gate, closes the PR unmerged, and deletes the branch.
 
 The refresh PR is the persistent record of what ran, and the KG ingests PRs, so every refresh becomes searchable. The refresh PR is never picked up by the grouping auto-merge (`src/auto-merge.ts` only considers `ai-implement/feature/*` and `ai-implement/multi-issue/*` bases). The laptop never pushes `snapshot/`: `bd-kg-refresh` triggers the rail, and `bd-mega-kg-refresh` iterates on the ingest locally and PRs manifest changes only.
 
 The designated tracker issue (if configured) receives failure comments; there is no "success" comment posted to it. Success is observable through the KG stamp served by `GET /api/kg/status`.
 
-After the refresh PR is open, `kg-snapshot-push` classifies the run and, for exactly one matching class, posts a second comment on that PR whose first line is the exact marker `# ai-implement-kg-refresh-learnings` — the marker `kg_ingest/cards.py` (in the KG base repo) matches to file a comment as a Learning card, so a stamped refresh becomes searchable as a lesson, not just a diff. The four classes, checked in this order, are: `guard-refused` (the push guard reported a non-clean verdict — structurally unreachable today, since both content-regression guards throw before any push or PR exists; kept for a future guard that reports a verdict instead of throwing), `source-missing` (a secondary repo configured in `sources.yml` has no cloned checkout under `repos/`, or the configured `code_repo` was cloned but its checkout under `code-repo/` has no content — a code-repo clone *failure* aborts the pipeline before this step runs, since `clone-code-repo` throws rather than soft-failing, so only the "came back empty" half of the code-repo case is reachable here), `count-step` (a part's line count moved more than 20% against the served snapshot in either direction — looser than the push guard's 50%-shrink refusal, so it also fires on runs that already cleared that guard), and `ingest-warnings` (`ai-output/kg-ingest.log` has a `WARN` or `ERROR` line). A clean run matches none of these and posts nothing. Reading these comments to decide whether a sanitized note goes to `bd-knowledge-graph-base` is skills-side work (`bd-kg-refresh` Step 8), tracked separately.
+After the refresh PR is open, `kg-snapshot-push` classifies the run and, for exactly one matching class, posts a second comment on that PR whose first line is the exact marker `# ai-implement-kg-refresh-learnings` — the marker `kg_ingest/cards.py` (in the KG base repo) matches to file a comment as a Learning card, so a stamped refresh becomes searchable as a lesson, not just a diff. The five classes, checked in this order, are: `guard-held` (a soft shrink: the snapshot is pushed and the PR is open, waiting for an operator decision — the comment says so, never that the push was refused), `guard-refused` (the push guard reported a non-clean verdict — structurally unreachable today, since both content-regression guards throw before any push or PR exists; kept for a future guard that reports a verdict instead of throwing), `source-missing` (a secondary repo configured in `sources.yml` has no cloned checkout under `repos/`, or the configured `code_repo` was cloned but its checkout under `code-repo/` has no content — a code-repo clone *failure* aborts the pipeline before this step runs, since `clone-code-repo` throws rather than soft-failing, so only the "came back empty" half of the code-repo case is reachable here), `count-step` (a part's line count moved more than 20% against the served snapshot in either direction — looser than the push guard's 50%-shrink refusal, so it also fires on runs that already cleared that guard), and `ingest-warnings` (`ai-output/kg-ingest.log` has a `WARN` or `ERROR` line). A clean run matches none of these and posts nothing. Reading these comments to decide whether a sanitized note goes to `bd-knowledge-graph-base` is skills-side work (`bd-kg-refresh` Step 8), tracked separately.
 
 ---
 
@@ -529,7 +549,7 @@ npm run dev:run -- \
   --until clone-secondary-repos
 ```
 
-An unmapped `team` returns 403; a missing/invalid admin bearer returns 401; an unconfigured tracker (no Linear auth) returns 503 for either form. A `td.json` produced by hand from a single team is a **partial file relative to the default export** — a partial file trips the snapshot guard the same way a genuinely stale one would (the regression guard cannot tell "this team was never fetched" from "this team lost issues"), so prefer the no-`team` export or the harness's automatic fetch for anything beyond a single-team smoke test.
+An unmapped `team` returns 403; a missing/invalid admin bearer returns 401; an unconfigured tracker (no Linear or Jira credential) returns 503 for either form. A `td.json` produced by hand from a single team is a **partial file relative to the default export** — a partial file trips the snapshot guard the same way a genuinely stale one would (the regression guard cannot tell "this team was never fetched" from "this team lost issues"), so prefer the no-`team` export or the harness's automatic fetch for anything beyond a single-team smoke test.
 
 **What differs from a dispatched run:**
 
@@ -566,7 +586,7 @@ Compile-time guards will surface every switch statement that needs a new case.
 Do not include `prNumber`, `baseBranch`, `branchPrefix`, `profiles`, `planningContext`, or `groupingParent`. Include only `v`, `issue` (with the synthetic id/identifier), `runnerPhase`, and whatever data the runner needs via the envelope.
 
 **4. Mint the required run token(s)**
-Always mint a result token (`audience: "result"`, `mappingTeamKey: ""`) and set `ttlSeconds` to the TTL you will enforce. Do **not** mint a `publication` audience token — there is no target repository.
+Always mint a result token (`audience: "result"`, `mappingTeamKey: ""`) and set `ttlSeconds` to the TTL you will enforce. A kg-refresh run also mints a `publication` token bound to the KG source repo; a run kind with no repository to publish to does not mint one.
 
 If your run kind needs to call any orchestrator vending endpoint — analogous to `POST /api/runner/kg-tracker-data` — those endpoints verify `audience = "progress"`. You must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv` when building the machine config:
 
@@ -586,9 +606,9 @@ extraEnv.RUN_PROGRESS_TOKEN = progressToken;
 Without the progress token, vending endpoints return 403 and dependent pipeline steps skip silently — the same degraded state kg-refresh exhibited before AII-544 was fixed.
 
 **5. Write a dispatch function with all three backends**
-Follows the pattern of `dispatchKgRefreshRun()` in `src/index.ts`. Call `resolveExecutionPath(getRunnerMode().mode, <defaultMode>)` to select the backend. Choose `<defaultMode>` based on what is "universally available" for the run kind (`"github-actions"` is the safest default). Passes `AI_IMPLEMENT_RUN_CONFIG` (the base64-encoded `RunConfigV1`) in `extraEnv` for Fly/local. For GHA, passes `run_config` + `run_token` as workflow_dispatch inputs. Returns `{ machineId?, machineNonce?, logsUrl?, workflowRunId? }` — `machineNonce` is present only for Fly/local, `workflowRunId` only for GHA.
+Follows the pattern of `createKgRefreshDispatch` in `src/restate/kg-refresh-production.ts`. Call `resolveExecutionPath(getRunnerMode().mode, <defaultMode>)` to select the backend. Choose `<defaultMode>` based on what is "universally available" for the run kind (`"github-actions"` is the safest default). Passes `AI_IMPLEMENT_RUN_CONFIG` (the base64-encoded `RunConfigV1`) in `extraEnv` for Fly/local. For GHA, passes `run_config` + `run_token` as workflow_dispatch inputs. Returns `{ machineId?, machineNonce?, logsUrl?, workflowRunId? }` — `machineNonce` is present only for Fly/local, `workflowRunId` only for GHA.
 
-If a GHA backend is needed, dispatch to `claude-implement.yml` with `runner_phase: "<your-phase>"` and `job_timeout_minutes` set to your TTL ceiling. `claude-implement.yml` is auto-synced by workflow sync, so no manual copy step is required. Add a case arm in `session/entrypoint.sh` to route the new phase to your runner entry point.
+If a GHA backend is needed, dispatch to `claude-implement.yml` with `runnerPhase: "<your-phase>"` and `runnerCallbackUrl` inside `run_config`, and `job_timeout_minutes` set to your TTL ceiling. `claude-implement.yml` is auto-synced by workflow sync, so no manual copy step is required. Add a case arm in `session/entrypoint.sh` to route the new phase to your runner entry point.
 
 **6. Record a `dispatch_log` row**
 Call `appendLog()` from `src/log.ts` with:
@@ -602,10 +622,10 @@ Call `appendLog()` from `src/log.ts` with:
 If you have a `logsUrl`, call `updateJobPrUrl(jobId, logsUrl)` immediately after (the `pr_url` column doubles as the logs link for issue-less rows).
 
 **7. Add a callback routing carve-out**
-In `src/runner-callback.ts`, add an `if (input.body.phase === "<your-phase>")` guard before the `resolveProvider` call. Route to your in-process handler and `return` early. Never let an issueless callback reach the tracker-write path.
+In `src/runner-callback.ts`, add an `if (body.phase === "<your-phase>")` guard before the `resolveProvider` call. Verify the token without consuming it, forward to your workflow's `report` handler with the dispatch id as idempotency key, and `return` early. Never let an issueless callback reach the tracker-write path.
 
 **8. Carve out the stuck watchdog**
-In `src/stuck-watchdog.ts`, add:
+In `src/stuck-watchdog.ts` (kg-refresh's own carve-out is at line 276), add:
 ```typescript
 if (job.phase === "<your-phase>") return;
 ```
@@ -614,8 +634,8 @@ before any logic that re-queues through the ticketing system.
 **9. Handle `getInFlightJobs()` null tolerance**
 `getInFlightJobs()` (and its caller `getInFlightWork()`) already query without a phase filter, so your job row will appear in deploy-interlock checks and the `list_in_flight_jobs` MCP tool automatically. No changes needed — just know that `issueIdentifier` will be `null` in the MCP output.
 
-**10. Add a reaper sweep for Fly-mode jobs**
-In `src/reaper.ts`, write an inverse-sweep function modelled on `sweepOrphanedKgRefreshJobs()`. Add a `failYourKindMachine?(job: Job): void` to `ReaperHelpers`, add a query in `src/log.ts` modelled on `getInFlightKgRefreshJobs()`, and call your sweep at the end of `sweepOrphanedMachines()` with the already-fetched `activeMachineIds` set.
+**10. Define a workflow and a coordinator object**
+In `src/restate/<kind>-workflow.ts` and `src/restate/<kind>-<resource>.ts`, build the workflow (reserve, dispatch with exact run identity, bootstrap and total deadlines, the watch, `report`, `cancel`) and the coordinator object that holds the in-flight marker, following `src/restate/kg-refresh-workflow.ts` and `src/restate/kg-repo.ts`. Compose them in `src/restate/<kind>-production.ts` and register them in `src/index.ts`. Add no reaper sweep and no monitor: the deadlines and the watch are the workflow's. Full pattern: [restate.md](restate.md) § "Writing a workflow for a run kind".
 
 **11. Add a completion classification case**
 In `src/completion-classification.ts`, add phase-specific handling in `classifyCompletion()`. Map your benign non-failure conclusions to `null` to suppress alerts.
@@ -624,10 +644,10 @@ In `src/completion-classification.ts`, add phase-specific handling in `classifyC
 In `src/notify.ts`, add a `notifyYourKindOutcome()` export following the shape of `notifyKgRefreshOutcome()` (Slack + Teams implementations, typed payload interface). Call it from your outcome handler in `src/index.ts`.
 
 **13. Wire the operator cancel** — include the GHA cancellation branch as the kg-refresh handler does, even when the run kind is Fly-only today
-In `src/admin.ts` `handleDestroySession()`, add a `job.phase === "<your-phase>"` branch that destroys the machine/run, stamps `operator_cancelled`, calls your `onMachineLost()` equivalent, and sends a single notification.
+In `src/admin.ts` `handleDestroySession()`, add a `job.phase === "<your-phase>"` branch that sends the workflow's `cancel` and returns its answer (AII-1364): a 200 means the stop was requested, a 409 passes through. Only a row no workflow will close (an unknown dispatch) is stamped `operator_cancelled`, and only while it is still open (AII-1406). The route sends a single notification.
 
-**14. Wire the in-process state machine and crash recovery**
-Persist stage + start time to the `settings` table. On orchestrator boot, load the persisted stage and either resume or mark failed. Gate dispatch on `running === false` and `deployHeld() === false`.
+**14. Wire the trigger door and the status**
+Add one tool handler on `orchestratorTools` that runs the synchronous checks inside `ctx.run` and calls the coordinator object, and route the REST endpoint to it through `callToolAsSystem`. Derive the status from the object's marker and the workflow's `step`; persist only the last outcome in SQLite. Gate dispatch on the object's marker and `deployHeld() === false`. Nothing is persisted to the `settings` table to recover a stage.
 
 ---
 
@@ -635,12 +655,16 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 
 | Concern | File |
 |---------|------|
-| KG refresh state machine and dispatch | `src/kg-refresh.ts` (`makeKgRefresh`) |
+| Coordinator object (the lock) | `src/restate/kg-repo.ts` (`createKgRepo`) |
+| Workflow (reserve, dispatch, deadlines, watch, report, cancel, rail saga) | `src/restate/kg-refresh-workflow.ts` (`createKgRefreshWorkflow`) |
+| Production composition, dispatch wrapper, ingress client | `src/restate/kg-refresh-production.ts` |
+| Trigger door and `get_kg_status` | `src/restate/tools.ts` (`triggerKgRefreshTool`, `getKgStatusTool`) |
+| Rail gates and revert | `src/kg-refresh-rail.ts` |
 | Credential preflight | `src/kg-refresh.ts` (`runKgRefreshPreflight`) |
 | RunConfigV1 envelope | `src/run-config.ts` |
 | Runner token mint/verify | `src/runner-tokens.ts` |
-| dispatch_log row (schema, write, query) | `src/log.ts` (`appendLog`, `getInFlightJobs`, `getInFlightKgRefreshJobs`) |
-| Callback routing carve-out | `src/runner-callback.ts` (~line 252) |
+| dispatch_log row (schema, write, query) | `src/log.ts` (`appendLog`, `getInFlightJobs`) |
+| Callback routing carve-out | `src/runner-callback.ts` (`handleRunnerResult`, line 724; progress heartbeat at line 1268) |
 | Scope endpoint | `src/index.ts` (`/api/runner/kg-scope` handler), `src/runner-callback.ts` (`handleKgScopeRequest`) |
 | Scope reconcile pipeline step | `src/pipeline/steps/kg-scope-reconcile.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
@@ -648,15 +672,15 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | Secondary repo clone step | `src/pipeline/steps/clone.ts` (targets input) |
 | Ingest pipeline step | `src/pipeline/steps/kg-ingest.ts` |
 | KG refresh pipeline definition | `pipelines/kg-refresh.yml` |
-| Fly / local Docker dispatch | `src/index.ts` (`dispatchKgRefreshRun`) |
+| Fly / local Docker / GHA senders | `src/restate/kg-refresh-senders.ts` (`createKgRefreshSenders`), called from `createKgRefreshDispatch` |
 | Outcome handler (notify + report issue) | `src/index.ts` (`handleKgRefreshOutcome`) |
 | Outcome notification | `src/notify.ts` (`notifyKgRefreshOutcome`) |
 | Completion classification | `src/completion-classification.ts` |
-| Stuck-watchdog carve-out | `src/stuck-watchdog.ts` (~line 147) |
-| Reaper inverse sweep | `src/reaper.ts` (`sweepOrphanedKgRefreshJobs`) |
+| Stuck-watchdog carve-out | `src/stuck-watchdog.ts` (line 276) |
+| Reaper carve-out | `src/reaper.ts` (line 138) |
 | Deploy interlock | `src/in-flight-work.ts` (`getInFlightWork`) |
-| Operator cancel | `src/admin.ts` (`handleDestroySession`, kg-refresh branch) |
+| Operator cancel | `src/admin.ts` (`handleDestroySession`, kg-refresh branch), `src/index.ts` (`makeKgRefreshAdminDeps`) |
 | Admin log proxy | `src/admin.ts` (`GET /api/sessions/:id/logs`) |
 | Pipelines UI (Logs button) | `src/admin-ui/pages/pipelines.ts` |
 | Report-issue setting | `src/orchestrator-settings.ts` (`kgRefreshReportIssue`) |
-| Crash recovery persistence | `src/kg-refresh.ts` (`persistStageFn`, `loadStageFn`) |
+| Last-refresh persistence | `src/kg-refresh.ts` (`defaultPersistLastRefresh`, `defaultLoadLastRefresh`) |

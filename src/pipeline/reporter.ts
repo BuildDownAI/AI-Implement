@@ -1,3 +1,4 @@
+import { redactStepCredentials } from "./step-redaction.js";
 import type { Step, StepReporter } from "./types.js";
 
 export interface StepReport {
@@ -70,7 +71,8 @@ export class TokenStepReporter implements StepReporter {
   async report(step: Step): Promise<void> {
     const url = `${this.callbackUrl.replace(/\/$/, "")}/runner/progress`;
     const attempts = this.retryDelaysMs.length + 1;
-    const body = this.githubRunId === null ? { step } : { step, githubRunId: this.githubRunId };
+    const safeStep = redactStepCredentials(step);
+    const body = this.githubRunId === null ? { step: safeStep } : { step: safeStep, githubRunId: this.githubRunId };
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
@@ -95,6 +97,26 @@ export class TokenStepReporter implements StepReporter {
       }
 
       await sleep(this.retryDelaysMs[attempt - 1] ?? 0);
+    }
+  }
+}
+
+/** The slice of the runner activity sink that `ActivityStepReporter` needs. */
+export interface StepActivityRecorder {
+  recordStep(step: Step): void;
+  flushSteps(): Promise<void>;
+}
+
+/** Reports each step through the activity stream (`/runner/activity`), flushing as it happens. */
+export class ActivityStepReporter implements StepReporter {
+  constructor(private readonly recorder: StepActivityRecorder) {}
+
+  async report(step: Step): Promise<void> {
+    try {
+      this.recorder.recordStep(step);
+      await this.recorder.flushSteps();
+    } catch (err) {
+      console.error(`[StepReporter] Failed to report step ${step.id}: ${errorSummary(err)}`);
     }
   }
 }

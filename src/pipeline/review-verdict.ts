@@ -14,7 +14,9 @@ export interface ReviewVerdict {
 }
 
 // Keep wire constraints within the provider-supported subset; parseReviewVerdict
-// enforces non-empty strings and numeric bounds locally.
+// enforces non-empty strings and numeric bounds locally. Codex sends this schema to
+// OpenAI strict mode, which rejects any property missing from `required`: an
+// optional field is required and nullable, and the parser treats null as absent.
 export const REVIEW_VERDICT_JSON_SCHEMA: Record<string, unknown> = {
   type: "object",
   additionalProperties: false,
@@ -26,10 +28,10 @@ export const REVIEW_VERDICT_JSON_SCHEMA: Record<string, unknown> = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["title", "problem", "required_fix"],
+        required: ["title", "location", "problem", "required_fix"],
         properties: {
           title: { type: "string", description: "Must contain non-whitespace text." },
-          location: { type: "string" },
+          location: { type: ["string", "null"], description: "File or symbol the issue is in, or null when it has no single location." },
           problem: { type: "string", description: "Must contain non-whitespace text." },
           required_fix: { type: "string", description: "Must contain non-whitespace text." },
         },
@@ -92,7 +94,7 @@ function parseIssue(value: unknown, index: number): ReviewIssue {
   if (!problem) throw new Error(`expected blocking_issues[${index}].problem to be a non-empty string`);
   const requiredFix = nonEmptyString(issue.required_fix);
   if (!requiredFix) throw new Error(`expected blocking_issues[${index}].required_fix to be a non-empty string`);
-  if (issue.location !== undefined && typeof issue.location !== "string") {
+  if (issue.location !== undefined && issue.location !== null && typeof issue.location !== "string") {
     throw new Error(`expected blocking_issues[${index}].location to be a string when present`);
   }
   const location = nonEmptyString(issue.location) ?? undefined;

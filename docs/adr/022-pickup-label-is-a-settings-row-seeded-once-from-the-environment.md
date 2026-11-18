@@ -44,12 +44,7 @@ fixed. One label per orchestrator; the setting is not per mapping.
 
 ## Consequences
 
-- Editing `LINEAR_PICKUP_LABEL` after first boot does nothing. Change the value on
-  `/admin#settings`, or reset it to default there. This matches `KG_BASE_REPO`.
-- Two orchestrators on one team share the lifecycle labels. Each counts the other's `AI-Working`
-  and `AI-Planning` issues against its own capacity cap. Each skips the other's `Ready for Review`
-  issues. This is bounded and documented; it is not fixed here.
-- A typo in the label stops all Linear pickup with no error. The poll log names the active label
-  when a snapshot returns no candidates.
-- The skills bind `{{IMPLEMENT_LABEL}}` in each project's `CLAUDE.md`. That binding is now a copy
-  of an orchestrator setting. AII-687 tracks moving skills to read it from the orchestrator.
+- Editing `LINEAR_PICKUP_LABEL` after first boot does nothing. Change the value on `/admin#settings`, or reset it to default there. This matches `KG_BASE_REPO`.
+- Two orchestrators on one team share the lifecycle labels. Each counts the other's `AI-Working` and `AI-Planning` issues against its own capacity cap. Each skips the other's `Ready for Review` issues. This is bounded and documented; it is not fixed here.
+- A typo in the label stops all Linear pickup, with no error from the poll. The poll log names the active label when a snapshot returns no candidates, and the setup check `tracker.linear.pickup-label` fails when no label with that name exists at workspace level or in a mapped team, and warns when one exists only in a different case (amended by AII-1534).
+- The skills bind `{{IMPLEMENT_LABEL}}` in each project's `CLAUDE.md`. That binding is now a copy of an orchestrator setting. AII-687 tracks moving skills to read it from the orchestrator.

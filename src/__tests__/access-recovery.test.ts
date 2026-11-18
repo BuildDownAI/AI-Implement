@@ -4,7 +4,7 @@ import type { AccessEntry } from "../access-entries.js";
 
 /** A stored row, with the provenance fields the command never sets itself. */
 function entry(kind: "address" | "domain", value: string, role: "user" | "admin" = "user"): AccessEntry {
-  return { kind, value, role, provider: null, subject: null, addedAt: 0, addedBy: null };
+  return { kind, value, role, bindings: [], addedAt: 0, addedBy: null };
 }
 
 /**

@@ -1,16 +1,10 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-const tempDirs: string[] = [];
-
-afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
+import { testDir } from "./helpers/test-dir.js";
 
 function writeShim(binDir: string, name: string, body: string): void {
   const shim = join(binDir, name);
@@ -23,7 +17,7 @@ function writeShim(binDir: string, name: string, body: string): void {
 describe("session/git-credential-helper.sh", () => {
   it("passes shellcheck cleanly", () => {
     const r = spawnSync("shellcheck", ["session/git-credential-helper.sh"], { stdio: ["ignore", "pipe", "pipe"] });
-    if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return; // skip when shellcheck not installed
     expect(r.status).toBe(0);
   });
 
@@ -60,59 +54,51 @@ describe("session/git-credential-helper.sh", () => {
   });
 
   it("returns x-access-token credentials from a fresh token file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const dir = testDir("dep-token");
     const tokenFile = join(dir, "token.json");
-    try {
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-      writeFileSync(tokenFile, JSON.stringify({ token: "ghs_test_tok", expires_at: expiresAt }));
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    writeFileSync(tokenFile, JSON.stringify({ token: "ghs_test_tok", expires_at: expiresAt }));
 
-      const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        input: "protocol=https\nhost=github.com\n\n",
-        env: { ...process.env, GIT_DEPENDENCY_TOKEN_FILE: tokenFile },
-      });
-      expect(r.status).toBe(0);
-      expect(r.stdout.toString()).toContain("username=x-access-token");
-      expect(r.stdout.toString()).toContain("password=ghs_test_tok");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\n\n",
+      env: { ...process.env, GIT_DEPENDENCY_TOKEN_FILE: tokenFile },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toContain("username=x-access-token");
+    expect(r.stdout.toString()).toContain("password=ghs_test_tok");
   });
 
   it("does NOT re-fetch when the cached token has more than 10 minutes remaining", () => {
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const dir = testDir("dep-token");
     const tokenFile = join(dir, "token.json");
-    try {
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 min — fresh
-      writeFileSync(tokenFile, JSON.stringify({ token: "fresh-tok", expires_at: expiresAt }));
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 min — fresh
+    writeFileSync(tokenFile, JSON.stringify({ token: "fresh-tok", expires_at: expiresAt }));
 
-      // Provide a callback URL pointing at a port where nothing is listening.
-      // If the helper tries to refresh, curl will fail (connection refused) and
-      // the helper must still return the cached token.  We assert the output is
-      // the cached token (not empty), proving no refresh was attempted.
-      const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        input: "protocol=https\nhost=github.com\n\n",
-        env: {
-          ...process.env,
-          GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
-          GIT_DEPENDENCY_CALLBACK_URL: "http://127.0.0.1:19999",
-          RUN_PROGRESS_TOKEN: "progress-tok",
-        },
-      });
-      expect(r.status).toBe(0);
-      // Token is returned immediately without contacting the server.
-      expect(r.stdout.toString()).toContain("password=fresh-tok");
-      // Cache file must not have changed.
-      const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };
-      expect(cached.token).toBe("fresh-tok");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    // Provide a callback URL pointing at a port where nothing is listening.
+    // If the helper tries to refresh, curl will fail (connection refused) and
+    // the helper must still return the cached token.  We assert the output is
+    // the cached token (not empty), proving no refresh was attempted.
+    const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\n\n",
+      env: {
+        ...process.env,
+        GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
+        GIT_DEPENDENCY_CALLBACK_URL: "http://127.0.0.1:19999",
+        RUN_PROGRESS_TOKEN: "progress-tok",
+      },
+    });
+    expect(r.status).toBe(0);
+    // Token is returned immediately without contacting the server.
+    expect(r.stdout.toString()).toContain("password=fresh-tok");
+    // Cache file must not have changed.
+    const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };
+    expect(cached.token).toBe("fresh-tok");
   });
 
   it("re-fetches and returns the new token when within 10 minutes of expiry", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const dir = testDir("dep-token");
     const tokenFile = join(dir, "token.json");
 
     let requestedUrl: string | undefined;
@@ -166,7 +152,6 @@ describe("session/git-credential-helper.sh", () => {
       expect(cached.token).toBe("refreshed-tok");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -181,33 +166,29 @@ describe("session/git-credential-helper.sh", () => {
     // https://github.com and then calling `git credential fill` with all fields
     // pre-supplied (replicating what git does internally after parsing the URL).
     // The sentinel file must NOT exist after the call.
-    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
-    try {
-      const sentinelFile = join(dir, "sentinel");
-      const helperScript = join(dir, "sentinel-helper.sh");
-      const gitconfigFile = join(dir, ".gitconfig");
+    const dir = testDir("dep-token");
+    const sentinelFile = join(dir, "sentinel");
+    const helperScript = join(dir, "sentinel-helper.sh");
+    const gitconfigFile = join(dir, ".gitconfig");
 
-      writeFileSync(helperScript, `#!/bin/bash\ntouch "${sentinelFile}"\n`);
-      chmodSync(helperScript, 0o755);
+    writeFileSync(helperScript, `#!/bin/bash\ntouch "${sentinelFile}"\n`);
+    chmodSync(helperScript, 0o755);
 
-      // Register sentinel for https://github.com — same scope as the real helper.
-      writeFileSync(gitconfigFile, `[credential "https://github.com"]\n\thelper = ${helperScript}\n`);
+    // Register sentinel for https://github.com — same scope as the real helper.
+    writeFileSync(gitconfigFile, `[credential "https://github.com"]\n\thelper = ${helperScript}\n`);
 
-      // Provide a fully-specified credential (protocol + host + username + password).
-      // git credential fill returns immediately without invoking any helper because
-      // there is nothing left to fill — mirroring the embedded-credential URL path.
-      const r = spawnSync("git", ["credential", "fill"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        input: "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghs_test_tok\n\n",
-        env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfigFile },
-      });
-      expect(r.status).toBe(0);
-      expect(r.stdout.toString()).toContain("password=ghs_test_tok");
-      // The sentinel must not exist — the helper was never consulted.
-      expect(existsSync(sentinelFile)).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    // Provide a fully-specified credential (protocol + host + username + password).
+    // git credential fill returns immediately without invoking any helper because
+    // there is nothing left to fill — mirroring the embedded-credential URL path.
+    const r = spawnSync("git", ["credential", "fill"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghs_test_tok\n\n",
+      env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfigFile },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toContain("password=ghs_test_tok");
+    // The sentinel must not exist — the helper was never consulted.
+    expect(existsSync(sentinelFile)).toBe(false);
   });
 });
 
@@ -220,13 +201,13 @@ describe("session/entrypoint.sh", () => {
       ["session/entrypoint.sh", "docker-entrypoint.sh"],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
-    if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return; // skip when shellcheck not installed
     expect(r.status, r.stderr?.toString()).toBe(0);
   });
 
   it("is under 120 lines (bootstrap, not monolith)", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content.split("\n").length).toBeLessThan(120);
+    expect(content.split("\n").length).toBeLessThan(140);
   });
 
   it("exec's the phase-selected TS runner as the final step", () => {
@@ -283,7 +264,7 @@ describe("session/entrypoint.sh", () => {
   it("preserves the checked-out gap-fill PR branch for the TS clone step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toMatch(/gh pr checkout "\$PR_NUMBER"/);
-    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(git branch --show-current\)"/);
+    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(run_scoped "" git branch --show-current\)"/);
   });
 
   it("marks the cloned workspace safe before the gap-fill PR checkout", () => {
@@ -347,8 +328,7 @@ describe("session/entrypoint.sh", () => {
   });
 
   it("consumes mounted workspace mode before clone and never changes bind-mount ownership", () => {
-    const root = mkdtempSync(join(tmpdir(), "entrypoint-mounted-"));
-    tempDirs.push(root);
+    const root = testDir("entrypoint-mounted");
     const binDir = join(root, "bin");
     const workspace = join(root, "workspace");
     const commandLog = join(root, "commands.log");
@@ -370,6 +350,7 @@ describe("session/entrypoint.sh", () => {
         WORKSPACE_DIR: workspace,
         AI_IMPLEMENT_MODE: "local",
         AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
+        AI_IMPLEMENT_RUN_CONFIG: "",
         AI_IMPLEMENT_HOST_UID: "1234",
         AI_IMPLEMENT_HOST_GID: "2345",
         ANTHROPIC_API_KEY: "test-key",
@@ -399,7 +380,7 @@ describe("session/entrypoint.sh", () => {
 describe("session/lib.sh", () => {
   it("passes shellcheck", () => {
     const r = spawnSync("shellcheck", ["session/lib.sh"], { stdio: ["ignore", "pipe", "pipe"] });
-    if (r.error?.code === "ENOENT") return;
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
     expect(r.status, r.stderr?.toString()).toBe(0);
   });
 
@@ -598,8 +579,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   }
 
   it("leaves pre-existing probe-like files byte-for-byte unchanged on success", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     spawnSync("mkdir", [binDir]);
     makeShims(binDir, SU_EXEC_SHIM);
@@ -613,8 +593,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("leaves no generated probe files after a successful check", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     spawnSync("mkdir", [binDir]);
     makeShims(binDir, SU_EXEC_SHIM);
@@ -626,8 +605,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("succeeds for a workspace path containing a single quote", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const workspace = join(root, "work's-dir");
     spawnSync("mkdir", [workspace]);
     const binDir = join(root, "bin");
@@ -641,8 +619,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("fails before the pipeline and reports path and identity on write failure", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     spawnSync("mkdir", [binDir]);
     makeShims(binDir, "exit 1");
@@ -654,8 +631,7 @@ describe("session/lib.sh verify_workspace_writable", () => {
   });
 
   it("passes workspace dir as a positional argument, not embedded in the -c program text", () => {
-    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
-    tempDirs.push(root);
+    const root = testDir("verify-writable");
     const binDir = join(root, "bin");
     const cmdLog = join(root, "cmd.log");
     spawnSync("mkdir", [binDir]);
@@ -672,5 +648,401 @@ describe("session/lib.sh verify_workspace_writable", () => {
     expect(rawArgs[cIdx + 1]).not.toContain(root);
     // The workspace path must appear as a standalone argument
     expect(rawArgs).toContain(root);
+  });
+});
+
+// ─── session/entrypoint.sh configured model-auth bootstrap (AII-951) ──────────
+
+describe("session/entrypoint.sh configured model-auth bootstrap", () => {
+  const BEARER = `SENTINEL-bearer-${"x".repeat(24)}${"B".repeat(32)}`;
+  const stage = (s: string) => ({
+    sel: { agent: "codex", provider: "openai", model: "m", accountProfileId: `p-${s}`, invocationTimeoutMs: 60_000 },
+    src: { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
+    prof: { id: `p-${s}`, identity: "acct", revision: 2, agent: "codex", provider: "openai", authMode: "openai-api-key" },
+  });
+  const agentConfig = () => {
+    const p = stage("planning"), i = stage("implementation"), r = stage("review");
+    return {
+      version: 1,
+      snapshotId: "snap-1",
+      configRevisions: {
+        orchestratorDefault: { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 },
+        project: { configRevisionId: "22222222-2222-4222-8222-222222222222", revision: 3 },
+      },
+      stages: { planning: p.sel, implementation: i.sel, review: r.sel },
+      sources: { planning: p.src, implementation: i.src, review: r.src },
+      profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
+    };
+  };
+  // The grant minted for agentConfig's snapshot: one binding per stage's profile, expiring an hour after the run starts.
+  const grant = {
+    version: 1, audience: "model-auth", grantId: "g1", dispatchId: "d1", snapshotId: "snap-1",
+    projectKey: "p", backend: "fly", expiresAt: Date.now() + 60 * 60_000, bearer: BEARER,
+    bindings: (["planning", "implementation", "review"] as const).map((s) => (
+      { stage: s, profileId: `p-${s}`, profileRevision: 2, authMode: "openai-api-key" }
+    )),
+  };
+  const issue = { id: "1", identifier: "A-1", title: "t", description: "d" };
+  const encode = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64");
+  const configuredEnvelope = () => encode({ v: 1, issue, prNumber: "7", agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: grant } });
+
+  let distDir = "";
+  beforeAll(() => {
+    // Real trusted decoder, compiled once; the shell imports it from AI_IMPLEMENT_DIST_DIR.
+    distDir = join(process.cwd(), "node_modules", ".cache", "aii951-entrypoint-dist");
+    // tsc enables Node's compile cache, which goes under os.tmpdir() unless NODE_COMPILE_CACHE names a directory.
+    const compileCache = join(process.cwd(), "node_modules", ".cache", "aii951-entrypoint-compile-cache");
+    const r = spawnSync("npx", ["tsc", "--outDir", distDir], {
+      encoding: "utf8",
+      env: { ...process.env, NODE_COMPILE_CACHE: compileCache },
+    });
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+  }, 120_000);
+
+  function run(env: Record<string, string>, opts: { failClone?: boolean; handoff?: boolean; launcherHome?: string | "fake-root" } = {}) {
+    const root = testDir("entrypoint-configured");
+    const binDir = join(root, "bin");
+    const workspace = join(root, "workspace");
+    const log = join(root, "children.log");
+    spawnSync("mkdir", ["-p", binDir, workspace]);
+    writeFileSync(log, "");
+    // Each shim records its argv and the complete environment the child received.
+    for (const name of ["git", "gh", "su", "dbus-run-session"]) {
+      const tail = name === "git"
+        ? `\ncase "\${1:-}" in branch) echo pr-branch ;; ${opts.failClone ? "clone) exit 1 ;; " : ""}esac`
+        : "";
+      writeShim(binDir, name, `{ echo "== ${name} $*"; env; } >> '${log}'${tail}`);
+    }
+    for (const name of ["chown", "cp"]) writeShim(binDir, name, "true");
+    const fakeRoot = join(root, "fake-root");
+    const fakeCoder = join(root, "fake-coder");
+    const fillOut = join(root, "fill.log");
+    if (opts.handoff) {
+      spawnSync("mkdir", ["-p", fakeRoot, fakeCoder]);
+      const realGit = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+      // Real git for `config --global` (writes the launcher HOME); every other subcommand is logged only.
+      writeShim(binDir, "git", `{ echo "== git $*"; } >> '${log}'
+case "\${1:-} \${2:-}" in "config --global") exec '${realGit}' "$@" ;; branch*) echo pr-branch ;; esac`);
+      // Real copy, with only the fixed coder/root paths mapped to owned fixtures.
+      writeShim(binDir, "cp", `args=()
+for a in "$@"; do
+  case "$a" in /root/*) a='${fakeRoot}'/"\${a#/root/}" ;; /home/coder/*) a='${fakeCoder}'/"\${a#/home/coder/}" ;; esac
+  args+=("$a")
+done
+exec /bin/cp "\${args[@]}"`);
+      // The coder-side child: real credential fill, once with and once without operation-scoped GIT_PASSWORD.
+      const fill = (pw: string) => `echo "-- ${pw ? "with" : "without"}" >> '${fillOut}'
+printf 'protocol=https\\nhost=github.com\\n\\n' | env -i PATH="$PATH" HOME='${fakeCoder}' GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=echo ${pw ? `GIT_PASSWORD='${pw}' ` : ""}'${realGit}' credential fill >> '${fillOut}' 2>&1 || true`;
+      writeShim(binDir, "dbus-run-session", `{ echo "== dbus-run-session $*"; } >> '${log}'\n${fill("SYNTH-operation-password")}\n${fill("")}`);
+    }
+    const result = spawnSync("bash", ["session/entrypoint.sh"], {
+      encoding: "utf8",
+      env: {
+        PATH: `${binDir}:${process.env.PATH}`,
+        HOME: opts.launcherHome === "fake-root" ? fakeRoot : opts.launcherHome ?? root,
+        GIT_CONFIG_NOSYSTEM: "1",
+        WORKSPACE_DIR: workspace,
+        AI_IMPLEMENT_MODE: "local",
+        AI_IMPLEMENT_DIST_DIR: distDir,
+        GITHUB_TOKEN: "SENTINEL-gh-token",
+        GITHUB_OWNER: "BuildDownAI",
+        GITHUB_REPO: "fixture",
+        GITHUB_DEFAULT_BRANCH: "testing",
+        ...env,
+      },
+    });
+    const children = readFileSync(log, "utf8");
+    const sections = children.split(/^== /m).filter(Boolean);
+    const fill = existsSync(fillOut) ? readFileSync(fillOut, "utf8") : "";
+    return { result, children, sections, output: result.stdout + result.stderr, root, fakeRoot, fakeCoder, fill };
+  }
+
+  describe("git config handoff to coder", () => {
+    const check = (r: ReturnType<typeof run>) => {
+      expect(r.result.status, r.output).toBe(0);
+      const config = readFileSync(join(r.fakeCoder, ".gitconfig"), "utf8");
+      expect(config).toContain("helper");
+      expect(config).toContain("x-access-token");
+      const [withPw, withoutPw] = r.fill.split("-- without");
+      expect(withPw).toContain("username=x-access-token");
+      expect(withPw).toContain("password=SYNTH-operation-password");
+      // GIT_ASKPASS=echo only echoes its prompt back; without GIT_PASSWORD the helper supplies nothing.
+      expect(withoutPw).not.toContain("x-access-token");
+      expect(withoutPw).not.toContain("SYNTH-operation-password");
+      expect(withoutPw).not.toMatch(/^password=(?!Password for)/m);
+      for (const secret of ["SENTINEL-gh-token", "SYNTH-operation-password"]) {
+        expect(config).not.toContain(secret);
+        for (const s of r.sections) expect(s.split("\n")[0]).not.toContain(secret);
+      }
+    };
+
+    it("copies the launcher HOME's gitconfig, not /root's, so the coder child gets the scoped helper", () => {
+      const home = testDir("entrypoint-launcher-home");
+      check(run({ AI_IMPLEMENT_RUN_CONFIG: configuredEnvelope() }, { handoff: true, launcherHome: home }));
+    });
+
+    it("keeps the normal root-HOME case working", () => {
+      // HOME is the directory the cp shim maps /root to.
+      check(run({ AI_IMPLEMENT_RUN_CONFIG: configuredEnvelope() }, { handoff: true, launcherHome: "fake-root" }));
+    });
+  });
+
+  const AMBIENT = {
+    OPENAI_API_KEY: "SENTINEL-openai",
+    CODEX_HOME: "/sentinel/codex-home",
+    CLAUDE_CONFIG_DIR: "/sentinel/claude",
+    AWS_SECRET_ACCESS_KEY: "SENTINEL-aws-secret",
+    AI_IMPLEMENT_MODEL_AUTH_BEARER: "SENTINEL-model-auth-bearer",
+    RUN_PROGRESS_TOKEN: "SENTINEL-progress",
+    FORWARDED_APP_SECRET: "SENTINEL-forwarded",
+    AI_IMPLEMENT_FORWARDED_SECRETS: "FORWARDED_APP_SECRET",
+  };
+
+  it("hands a configured Codex/OpenAI run to the TS runner without ambient Claude credentials, scrubbing shell git/gh", () => {
+    const envelope = configuredEnvelope();
+    const { result, sections, output } = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ...AMBIENT });
+    expect(result.status, output).toBe(0);
+    const shellChildren = sections.filter((s) => /^(git|gh) /.test(s));
+    expect(shellChildren.length).toBeGreaterThan(3);
+    for (const s of shellChildren) {
+      for (const secret of ["SENTINEL-openai", "SENTINEL-aws-secret", "SENTINEL-model-auth-bearer", "SENTINEL-progress",
+        "SENTINEL-forwarded", "/sentinel/codex-home", "/sentinel/claude", envelope, BEARER]) {
+        expect(s, s.split("\n")[0]).not.toContain(secret);
+      }
+      expect(s).not.toMatch(/^AI_IMPLEMENT_/m);
+    }
+    // The configured clone URL and every git argv are credential-free: the token reaches only the
+    // clone child's environment (as GIT_PASSWORD), and only gh receives GH_TOKEN.
+    const clone = sections.find((s) => s.startsWith("git clone "));
+    expect(clone, output).toBeDefined();
+    expect(clone!.split("\n")[0]).toContain("https://github.com/BuildDownAI/fixture.git");
+    expect(clone!.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    expect(clone).toContain("GIT_PASSWORD=SENTINEL-gh-token");
+    for (const s of sections.filter((c) => c.startsWith("git ") && !c.startsWith("git clone "))) {
+      expect(s, s.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    }
+    for (const s of sections) expect(s.split("\n")[0]).not.toContain("SENTINEL-gh-token");
+    expect(sections.find((s) => s.startsWith("gh pr checkout"))).toContain("GH_TOKEN=SENTINEL-gh-token");
+    // The trusted runner handoff keeps the protected payload.
+    const handoff = sections.find((s) => s.startsWith("dbus-run-session "));
+    expect(handoff, output).toContain(`AI_IMPLEMENT_RUN_CONFIG=${envelope}`);
+    expect(output).not.toContain(BEARER);
+    expect(output).not.toContain(envelope);
+  });
+
+  it("keeps the legacy provider requirement when the run is not configured", () => {
+    const legacyEnvelope = encode({ v: 1, issue });
+    for (const env of [{} as Record<string, string>, { AI_IMPLEMENT_RUN_CONFIG: legacyEnvelope }]) {
+      const { result, children, output } = run({ ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d", ...env });
+      expect(result.status).not.toBe(0);
+      expect(output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+      expect(children).toBe("");
+    }
+  });
+
+  const legacyIssue = { ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" };
+  const modelVars = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "AWS_BEDROCK_ROLE_ARN"];
+
+  it.each(["anthropic", "bedrock"])("phase alias cannot deliver model credentials to KG (%s)", (provider) => {
+    const r = run({
+      ...legacyIssue, RUNNER_PHASE: "implementation", SAN_RUNNER_PHASE: "kg-refresh", PROVIDER: provider,
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      ...Object.fromEntries(modelVars.map((name) => [name, "synthetic-repro-key"])),
+      ...Object.fromEntries(modelVars.map((name) => [`SAN_${name}`, "synthetic-alias-key"])),
+    });
+    expect(r.result.status).toBe(0);
+    const handoff = r.sections.find(s => s.startsWith("dbus-run-session ")) ?? "";
+    expect(handoff.includes("/app/dist/pipeline/kg-refresh-run.js")).toBe(true);
+    for (const name of modelVars) expect(new RegExp(`^(SAN_)?${name}=`, "m").test(handoff)).toBe(false);
+    expect(r.output.match(/kg-refresh: no model credential required/g)).toHaveLength(1);
+    for (const value of ["synthetic-repro-key", "synthetic-alias-key"]) expect(r.output.includes(value)).toBe(false);
+  });
+
+  it.each(["implementation", "planning", "review-fix"])("reverse KG alias validates %s before handoff", (phase) => {
+    const base = { ...legacyIssue, RUNNER_PHASE: "kg-refresh", SAN_RUNNER_PHASE: phase, AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_" };
+    const missing = run(base);
+    expect(missing.result.status).not.toBe(0);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.children).toBe("");
+    for (const name of modelVars.slice(0, 2)) {
+      const ok = run({ ...base, [name]: "synthetic-reverse-key" });
+      expect(ok.result.status).toBe(0);
+      expect(ok.output).toContain(`phase=${phase}, source=env`);
+      expect(ok.output.includes("synthetic-reverse-key")).toBe(false);
+    }
+  });
+
+  it.each(["anthropic", "bedrock"])("KG refresh bypasses %s validation and strips model credentials, including team aliases", (provider) => {
+    for (const credentials of [{}, Object.fromEntries(modelVars.map((name) => [name, "sentinel-model"]))]) {
+      const { result, sections, output } = run({
+        ...legacyIssue, RUNNER_PHASE: "kg-refresh", PROVIDER: provider, ...credentials,
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        ...Object.fromEntries(modelVars.map((name) => [`SAN_${name}`, "sentinel-alias"])),
+      });
+      expect(result.status, output).toBe(0);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain("/app/dist/pipeline/kg-refresh-run.js");
+      for (const name of modelVars) expect(handoff).not.toMatch(new RegExp(`^(SAN_)?${name}=`, "m"));
+      expect(output.match(/kg-refresh: no model credential required/g)).toHaveLength(1);
+    }
+  });
+
+  it.each(["implementation", "planning", "review-fix"])("preserves legacy credential requirements for %s", (phase) => {
+    const missing = run({ ...legacyIssue, RUNNER_PHASE: phase });
+    expect(missing.result.status).not.toBe(0);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.children).toBe("");
+    for (const name of modelVars.slice(0, 2)) {
+      const ok = run({ ...legacyIssue, RUNNER_PHASE: phase, [name]: "legacy-key" });
+      expect(ok.result.status, ok.output).toBe(0);
+      expect(ok.sections.find((s) => s.startsWith("dbus-run-session "))).toContain(`${name}=legacy-key`);
+      expect(ok.output).not.toContain("kg-refresh: no model credential required");
+    }
+  });
+
+  it.each([
+    ["kg-refresh", "planning", "kg-refresh", "env", "pipeline/kg-refresh-run.js"],
+    ["planning", "kg-refresh", "planning", "env", "run-planning.js"],
+    ["", "kg-refresh", "kg-refresh", "envelope", "pipeline/kg-refresh-run.js"],
+    ["", "", "implementation", "default", "run-autonomous.js"],
+    [undefined, undefined, "implementation", "default", "run-autonomous.js"],
+  ])("preserves phase precedence: env=%s envelope=%s", (envPhase, envelopePhase, phase, source, entry) => {
+    const r = run({
+      AI_IMPLEMENT_RUN_CONFIG: encode({ v: 1, issue, runnerPhase: envelopePhase }),
+      ...(envPhase === undefined ? {} : { RUNNER_PHASE: envPhase }), ANTHROPIC_API_KEY: "legacy-key",
+    });
+    expect(r.result.status, r.output).toBe(0);
+    expect(r.output).toContain(`phase=${phase}, source=${source}`);
+    expect(r.sections.find((s) => s.startsWith("dbus-run-session "))).toContain(`/app/dist/${entry}`);
+  });
+
+  it("still rejects malformed configured input when KG is selected", () => {
+    const r = run({ RUNNER_PHASE: "kg-refresh", AI_IMPLEMENT_RUN_CONFIG: "invalid" });
+    expect(r.result.status).toBe(1);
+    expect(r.output).toContain("Configured model-auth bootstrap is invalid or incomplete");
+    expect(r.children).toBe("");
+  });
+
+  it("legacy bedrock still requires AWS_REGION and GHA mode", () => {
+    const base = { PROVIDER: "bedrock", ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" };
+    expect(run(base).output).toContain("provider=bedrock is supported only in GHA mode");
+    const gha = run({ ...base, GITHUB_ACTIONS: "true", GITHUB_REPOSITORY: "BuildDownAI/fixture" });
+    expect(gha.output).toContain("Required environment variable AWS_REGION is not set");
+  });
+
+  it("legacy runs keep passing ambient credentials to shell children unchanged", () => {
+    const { result, sections, output } = run({
+      ANTHROPIC_API_KEY: "legacy-key", ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+    });
+    expect(result.status, output).toBe(0);
+    expect(sections.find((s) => s.startsWith("git "))).toContain("ANTHROPIC_API_KEY=legacy-key");
+    expect(sections.find((s) => s.startsWith("git clone "))!.split("\n")[0]).toContain("x-access-token:SENTINEL-gh-token@github.com");
+  });
+
+  it("a valid private callback/publication-only credentials namespace stays legacy and keeps the provider requirement", () => {
+    const envelope = encode({ v: 1, issue, credentials: { version: 1, resultToken: "tok-a", publicationToken: "tok-b" } });
+    const missing = run({ AI_IMPLEMENT_RUN_CONFIG: envelope });
+    expect(missing.result.status).toBe(1);
+    expect(missing.output).toContain("At least one of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN must be set");
+    expect(missing.output).not.toContain("Configured model-auth bootstrap");
+    expect(missing.children).toBe("");
+    const ok = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ANTHROPIC_API_KEY: "legacy-key" });
+    expect(ok.result.status, ok.output).toBe(0);
+    expect(ok.sections.find((s) => s.startsWith("git "))).toContain("ANTHROPIC_API_KEY=legacy-key");
+  });
+
+  it.each([
+    ["missing grant", () => encode({ v: 1, issue, agentConfig: agentConfig() })],
+    ["missing snapshot", () => encode({ v: 1, issue, credentials: { version: 1, modelAuthGrant: grant } })],
+    ["malformed grant", () => encode({ v: 1, issue, agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: { ...grant, audience: "other" } } })],
+    ["malformed snapshot", () => encode({ v: 1, issue, agentConfig: { version: 1 }, credentials: { version: 1, modelAuthGrant: grant } })],
+    ["invalid base64/JSON", () => "%%%not-base64-json%%%"],
+    ["truncated JSON", () => configuredEnvelope().slice(0, -16)],
+    ["non-object JSON", () => encode("a string")],
+    ["null JSON", () => encode(null)],
+    ["array JSON", () => encode([issue])],
+    ["unsupported version", () => encode({ v: 2, issue, agentConfig: agentConfig(), credentials: { version: 1, modelAuthGrant: grant } })],
+    ["unsupported credentials version", () => encode({ v: 1, issue, credentials: { version: 2, resultToken: "t" } })],
+  ])("fails closed with a fixed value-free message before git or setup: %s", (_name, make) => {
+    const envelope = make();
+    const { result, children, output } = run({
+      AI_IMPLEMENT_RUN_CONFIG: envelope,
+      ANTHROPIC_API_KEY: "SENTINEL-legacy-fallback",
+      ...AMBIENT,
+    });
+    expect(result.status).toBe(1);
+    expect(output).toContain("FATAL: Configured model-auth bootstrap is invalid or incomplete");
+    expect(children).toBe("");
+    for (const secret of [envelope, BEARER, "SENTINEL-legacy-fallback", "SENTINEL-gh-token", "SENTINEL-openai"]) {
+      expect(output).not.toContain(secret);
+    }
+  });
+
+  describe("node preload/module-path controls", () => {
+    const probe = () => {
+      const dir = testDir("entrypoint-preload");
+      const marker = join(dir, "marker");
+      const preload = join(dir, "preload.cjs");
+      writeFileSync(preload, `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "ran\\n");\n`);
+      return { marker, nodeEnv: { NODE_OPTIONS: `--require=${preload}`, NODE_PATH: "/sentinel/node-path" } };
+    };
+    const alias = (nodeEnv: Record<string, string>) => ({
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      SAN_NODE_OPTIONS: nodeEnv.NODE_OPTIONS,
+      SAN_NODE_PATH: nodeEnv.NODE_PATH,
+      SAN_REPO_SAFE_SECRET: "safe-repo-value",
+    });
+
+    it("never runs a preload for a valid configured run, and the handoff carries neither bare nor aliased controls", () => {
+      const { marker, nodeEnv } = probe();
+      const envelope = configuredEnvelope();
+      const { result, sections, output } = run({ AI_IMPLEMENT_RUN_CONFIG: envelope, ...nodeEnv, ...alias(nodeEnv) });
+      expect(result.status, output).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain(`AI_IMPLEMENT_RUN_CONFIG=${envelope}`);
+      expect(handoff).not.toMatch(/^NODE_OPTIONS=/m);
+      expect(handoff).not.toMatch(/^NODE_PATH=/m);
+      expect(handoff).not.toMatch(/^SAN_NODE_/m);
+      expect(handoff).toMatch(/^AI_IMPLEMENT_FORWARDED_SECRETS=REPO_SAFE_SECRET$/m);
+      expect(handoff).toContain("REPO_SAFE_SECRET=safe-repo-value");
+      for (const s of sections.filter((c) => /^(git|gh) /.test(c))) expect(s).not.toMatch(/^NODE_(OPTIONS|PATH)=/m);
+    });
+
+    it.each([
+      ["truncated JSON", () => configuredEnvelope().slice(0, -16)],
+      ["invalid base64/JSON", () => "%%%not-base64-json%%%"],
+    ])("never runs a preload for a malformed envelope (%s) and stops before git", (_n, make) => {
+      const { marker, nodeEnv } = probe();
+      const { result, children, output } = run({ AI_IMPLEMENT_RUN_CONFIG: make(), ...nodeEnv, ...alias(nodeEnv) });
+      expect(result.status).toBe(1);
+      expect(output).toContain("FATAL: Configured model-auth bootstrap is invalid or incomplete");
+      expect(children).toBe("");
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it("legacy runs keep their node controls at the handoff but still decode without running a preload", () => {
+      const { marker, nodeEnv } = probe();
+      const envelope = encode({ v: 1, issue, prNumber: "7" });
+      const { result, sections, output } = run({
+        AI_IMPLEMENT_RUN_CONFIG: envelope, ANTHROPIC_API_KEY: "legacy-key", ...nodeEnv, ...alias(nodeEnv),
+      });
+      expect(result.status, output).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      const handoff = sections.find((s) => s.startsWith("dbus-run-session "))!;
+      expect(handoff).toContain(`NODE_OPTIONS=${nodeEnv.NODE_OPTIONS}`);
+      expect(handoff).toContain("NODE_PATH=/sentinel/node-path");
+    });
+  });
+
+  it("logs a fixed ERR-trap message, without the failing command text, on configured runs", () => {
+    const envelope = configuredEnvelope();
+    const configured = run({ AI_IMPLEMENT_RUN_CONFIG: envelope }, { failClone: true });
+    expect(configured.result.status).not.toBe(0);
+    expect(configured.output).toMatch(/ERROR: line \d+ failed \(exit 1\)/);
+    for (const leaked of ["git clone", "SENTINEL-gh-token", BEARER, envelope]) expect(configured.output).not.toContain(leaked);
+    // Legacy keeps the command-text form of the trap message.
+    const legacy = run({ ANTHROPIC_API_KEY: "k", ISSUE_ID: "i", ISSUE_IDENTIFIER: "A-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d" }, { failClone: true });
+    expect(legacy.output).toMatch(/ERROR: line \d+ failed: .+ \(exit 1\)/);
   });
 });

@@ -22,7 +22,8 @@ import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
-import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
+import { getEffectiveAllowlist, hasOrgClaimRole, isBoundTo, matchAccessEntryOrOrgClaim, ORG_CLAIM_ROLE_TTL_MS } from "./access-entries.js";
+import { bindAccessIdentity, clearClaimRoleViaObject, recordClaimRoleViaObject } from "./restate/access-binding.js";
 import type { DescribeOutcome, IssueInput, IssueOutcome, RefreshAuthority, RefreshInput, RefreshOutcome } from "./mcp-identity.js";
 import { recordAuthEvent, resolveClientPath, isLoopbackHost, type AuthEventCause, type ClientPath } from "./mcp-auth-events.js";
 import { RestateRefreshAuthority } from "./restate/operator-object.js";
@@ -456,12 +457,43 @@ export async function handleMcpOidcCallback(
 
   const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
+    // Best-effort: the denial stands either way, and an unreachable ingress leaves a row that expires.
+    if (identity.provider === "builddown" && identity.email && hasOrgClaimRole(identity)) {
+      await clearClaimRoleViaObject(identity.email, identity.provider);
+    }
     console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
   }
 
-  if (decision.entry.kind === "address") {
-    bindAccessEntry(decision.entry.value, identity.provider, identity.sub);
+  // Fail closed: an identity is never admitted without a recorded binding.
+  console.log(`[mcp-oauth] admitting ${identity.email} via ${providerId} as ${decision.entry.role} (source: ${decision.source})`);
+  if (decision.entry.kind === "address" && !isBoundTo(decision.entry, identity)) {
+    const bound = await bindAccessIdentity(decision.entry.value, identity.provider, identity.sub);
+    if (bound === "conflict") {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: subject mismatch for ${providerId}`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
+    }
+    if (bound === "unavailable") {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: binding unavailable`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+    }
+  }
+
+  // The claim-role row is written through the AccessBinding object; fail closed when it cannot be.
+  if (identity.provider === "builddown") {
+    const recorded =
+      decision.source === "org-claim"
+        ? await recordClaimRoleViaObject(identity.email!, {
+            provider: identity.provider,
+            subject: identity.sub,
+            role: decision.entry.role,
+            expiresAt: Date.now() + ORG_CLAIM_ROLE_TTL_MS,
+          })
+        : !hasOrgClaimRole(identity) || (await clearClaimRoleViaObject(identity.email!, identity.provider));
+    if (!recorded) {
+      console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: claim role unavailable`);
+      return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+    }
   }
 
   db.prepare("UPDATE mcp_clients SET used_at = ? WHERE client_id = ?").run(Date.now(), stateRow.client_id);
@@ -680,7 +712,7 @@ export class SqliteRefreshAuthority implements RefreshAuthority {
       emit("unavailable");
       return { status: "unavailable", cause: "allowlist" };
     }
-    if (!matchAccessEntry(row, allowlist.entries)) {
+    if (!matchAccessEntryOrOrgClaim(row, allowlist.entries)) {
       await this.revokeFamily(row.family_id);
       console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
       emit("allowlist");
@@ -853,4 +885,62 @@ function redirectWithError(
   if (clientState) url.searchParams.set("state", clientState);
   res.writeHead(302, { Location: url.href });
   res.end();
+}
+
+// ---------- Routing ----------
+
+/**
+ * Routes the well-known metadata documents and every `/mcp/*` OAuth route. Returns false for
+ * any other path, including `/mcp` itself, which `handleMcpRequest` serves.
+ *
+ * Gated on the redirect base URL alone, the same as `handleMcpRequest`. These routes used to
+ * 503 without a KG memory provider too — a leftover from when `/mcp` was only a sidecar proxy —
+ * which on a sidecar-less deploy locked every client out of the non-`kg_*` tools.
+ */
+export function routeMcpOAuth(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  baseUrl: string | null,
+): boolean {
+  const isWellKnown =
+    pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-authorization-server";
+  if (!isWellKnown && !pathname.startsWith("/mcp/")) return false;
+  if (isWellKnown && req.method !== "GET") return false;
+
+  if (!baseUrl) {
+    json(res, 503, { error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" });
+    return true;
+  }
+  if (pathname === "/.well-known/oauth-protected-resource") {
+    handleMcpProtectedResourceMetadata(res, baseUrl);
+    return true;
+  }
+  if (pathname === "/.well-known/oauth-authorization-server") {
+    handleMcpAuthorizationServerMetadata(res, baseUrl);
+    return true;
+  }
+
+  const run = (label: string, handler: () => Promise<void>): true => {
+    handler().catch((err) => {
+      console.error(`[mcp-oauth] ${label} error:`, err);
+      if (!res.headersSent) json(res, 500, { error: "Internal server error" });
+    });
+    return true;
+  };
+  if (pathname === "/mcp/register" && req.method === "POST") {
+    return run("register", () => handleMcpClientRegistration(req, res));
+  }
+  if (pathname === "/mcp/authorize" && req.method === "GET") {
+    return run("authorize", () => handleMcpAuthorize(req, res, baseUrl));
+  }
+  const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
+  if (callbackMatch && req.method === "GET") {
+    const [, providerId] = callbackMatch;
+    return run("callback", () => handleMcpOidcCallback(req, res, providerId, baseUrl));
+  }
+  if (pathname === "/mcp/token" && req.method === "POST") {
+    return run("token", () => handleMcpTokenRequest(req, res));
+  }
+  return false;
 }

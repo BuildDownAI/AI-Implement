@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   DISPOSITIONS_FILE,
+  buildClosedFindingsMarker,
+  parseClosedFindingsMarkers,
+  readClosedFindingKeys,
   buildDispositionInstructions,
   readFindingDispositions,
   replyToDispositionThreads,
@@ -12,6 +14,7 @@ import {
   type FindingDisposition,
 } from "../pipeline/finding-dispositions.js";
 import type { GhSpawn } from "../pipeline/review-ledger.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function hexKey(n: number): string {
   return n.toString(16).padStart(64, "0");
@@ -129,13 +132,15 @@ describe("buildDispositionInstructions", () => {
     expect(text).toContain("fixed");
     expect(text).toContain("follow-up");
     expect(text).toContain("invalid");
+    expect(text).toContain("This closes the finding");
+    expect(text).toContain("reason is shown to a person");
     expect(text).toMatch(/never.*follow-up/i);
   });
 });
 
 describe("readFindingDispositions", () => {
   it("returns an empty result without throwing when the file is missing", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "finding-dispositions-"));
+    const dir = testDir("finding-dispositions");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       expect(() => readFindingDispositions(dir)).not.toThrow();
@@ -143,12 +148,11 @@ describe("readFindingDispositions", () => {
       expect(logSpy).toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it("returns an empty result without throwing when the file has invalid JSON", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "finding-dispositions-"));
+    const dir = testDir("finding-dispositions");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
@@ -158,25 +162,20 @@ describe("readFindingDispositions", () => {
       expect(logSpy).toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it("reads and sanitizes a valid dispositions file", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "finding-dispositions-"));
-    try {
-      fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
-      fs.writeFileSync(
-        path.join(dir, DISPOSITIONS_FILE),
-        JSON.stringify([{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }]),
-      );
-      expect(readFindingDispositions(dir)).toEqual({
-        valid: [{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }],
-        dropped: 0,
-      });
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+    const dir = testDir("finding-dispositions");
+    fs.mkdirSync(path.join(dir, "ai-output"), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, DISPOSITIONS_FILE),
+      JSON.stringify([{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }]),
+    );
+    expect(readFindingDispositions(dir)).toEqual({
+      valid: [{ findingKey: hexKey(1), disposition: "fixed", reason: "done" }],
+      dropped: 0,
+    });
   });
 });
 
@@ -247,7 +246,7 @@ describe("replyToDispositionThreads", () => {
     ];
   }
 
-  it("resolves a follow-up thread, replies without resolving on invalid, ignores fixed, and marks every reply", () => {
+  it("resolves a follow-up thread, replies and resolves on invalid, ignores fixed, and marks every reply", () => {
     const calls: string[][] = [];
     const ghSpawn: GhSpawn = (args) => {
       calls.push(args);
@@ -289,10 +288,22 @@ describe("replyToDispositionThreads", () => {
     const invalidResolveCall = calls.find(
       (call) => call.includes("threadId=RT_2") && call.some((a) => a.includes("resolveReviewThread")),
     );
-    expect(invalidResolveCall).toBeUndefined();
+    expect(invalidResolveCall).toBeTruthy();
+    expect(calls.indexOf(invalidResolveCall!)).toBeGreaterThan(calls.indexOf(invalidReplyCall!));
 
     const fixedCall = calls.find((call) => call.includes("threadId=RT_3"));
     expect(fixedCall).toBeUndefined();
+  });
+
+  it("does not resolve an invalid thread if its reply fails", () => {
+    const calls: string[][] = [];
+    replyToDispositionThreads((args) => {
+      calls.push(args);
+      if (args.some(a => a.includes("addPullRequestReviewThreadReply"))) return { exitCode: 1, stdout: "", stderr: "reply failed" };
+      return threadsResponse();
+    }, "42", [{ findingKey: invalidKey, disposition: "invalid", reason: "Already correct." }]);
+    expect(calls.some(args => args.some(a => a.includes("addPullRequestReviewThreadReply")))).toBe(true);
+    expect(calls.some(args => args.some(a => a.includes("resolveReviewThread")))).toBe(false);
   });
 
   it("does not throw when a gh call errors, and continues to the remaining threads", () => {
@@ -369,5 +380,44 @@ describe("replyToDispositionThreads", () => {
       (call) => call.includes("threadId=RT_5") && call.some((a) => a.includes("resolveReviewThread")),
     );
     expect(resolveCall).toBeTruthy();
+  });
+});
+
+
+describe("closed finding PR markers", () => {
+  const entry = (disposition: FindingDisposition["disposition"]): FindingDisposition => ({ findingKey: hexKey(1), disposition, reason: "Reason" });
+  it("round trips dispositions and ignores malformed, unsupported and invalid keys", () => {
+    for (const disposition of ["invalid", "follow-up", "fixed"] as const) {
+      expect(parseClosedFindingsMarkers("<!-- ai-implement post-push iter=1 -->\n" + buildClosedFindingsMarker([entry(disposition)]))).toEqual([[{ ...entry(disposition), reason: "" }]]);
+    }
+    expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v2 {} -->')).toEqual([]);
+    expect(parseClosedFindingsMarkers('<!-- ai-implement closed-findings v1 broken -->')).toEqual([]);
+    expect(parseClosedFindingsMarkers('<!-- ai-implement post-push iter=1 -->\n<!-- ai-implement closed-findings v1 {"rejected":["bad",null]} -->')).toEqual([[]]);
+  });
+  it("ignores bare markers and markers in quoted or repeated body text", () => {
+    const marker = buildClosedFindingsMarker([entry("invalid")]);
+    expect(parseClosedFindingsMarkers(marker)).toEqual([]);
+    expect(parseClosedFindingsMarkers("<!-- ai-implement post-push iter=1 -->\nReviewer said:\n" + marker)).toEqual([]);
+    expect(parseClosedFindingsMarkers("Text\n<!-- ai-implement post-push iter=1 -->\n" + marker)).toEqual([]);
+  });
+  it("folds all pages and markers, reopening and closing by newest disposition", () => {
+    const comment = (disposition: FindingDisposition["disposition"]) => ({ user: { login: "deployment-bot" }, body: "<!-- ai-implement post-push iter=1 -->\n" + buildClosedFindingsMarker([entry(disposition)]) });
+    const spawn = vi.fn((_args: string[]) => ({ exitCode: 0, stdout: JSON.stringify([[comment("invalid")], [comment("fixed")]]) }));
+    expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
+    spawn.mockReturnValue({ exitCode: 0, stdout: JSON.stringify([[comment("fixed")], [{ ...comment("invalid"), body: comment("invalid").body + "\n" + comment("follow-up").body }]]) });
+    expect([...readClosedFindingKeys(spawn, "42", "deployment-bot")]).toEqual([hexKey(1)]);
+    expect(spawn.mock.calls[0][0]).toEqual(["api", "--paginate", "--slurp", "repos/:owner/:repo/issues/42/comments?per_page=100"]);
+  });
+  it("rejects foreign authors and fails closed without identity or history", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const spawn = vi.fn((_args: string[]) => ({ exitCode: 0, stdout: JSON.stringify([{ user: { login: "attacker" }, body: "<!-- ai-implement post-push iter=1 -->\n" + buildClosedFindingsMarker([entry("invalid")]) }]) }));
+    expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    spawn.mockClear();
+    expect(readClosedFindingKeys(spawn, "42", undefined).size).toBe(0);
+    expect(spawn).not.toHaveBeenCalled();
+    spawn.mockReturnValue({ exitCode: 1, stdout: "[]" });
+    expect(readClosedFindingKeys(spawn, "42", "deployment-bot").size).toBe(0);
+    warn.mockRestore();
   });
 });

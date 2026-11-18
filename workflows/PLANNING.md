@@ -16,6 +16,10 @@ model: claude-sonnet-5-5
   and DEPENDENCIES in braced dollar tokens. Unrecognised uppercase tokens become
   empty strings. Machine-comment delimiters are described in parts below so
   stripping does not erase the instructions given to the planner.
+
+  ${ISSUE_ID} is the tracker-native issue id (for example, a Linear UUID or Jira
+  numeric id), provided for reference only. Planning writes comment files to
+  ai-output/comments/; the orchestrator posts them to the issue.
 -->
 
 Read `CLAUDE.md` if present and the repository's contribution guidance for

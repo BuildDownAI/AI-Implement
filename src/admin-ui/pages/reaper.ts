@@ -99,7 +99,7 @@ export const reaperScript = `
     const summaryEl = document.getElementById('reaper-summary-block');
     if (summaryEl) {
       const byRule = summary.byRule || {};
-      const rules = ['orphan', 'stale-terminal-job', 'max-age-exceeded', 'issue-terminal'];
+      const rules = ['orphan', 'stale-terminal-job', 'max-age-exceeded', 'issue-terminal', 'durable-expired'];
       let html = '<div style="display:flex;gap:20px;flex-wrap:wrap;font-size:0.9em">';
       html += '<span><b>24h total: ' + (summary.total24h != null ? summary.total24h : 0) + '</b></span>';
       for (const rule of rules) {

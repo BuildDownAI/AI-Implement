@@ -1,7 +1,12 @@
+import { DEFAULT_REVIEWER_SELECTION } from "../config.js";
 import { describe, expect, it, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
-import type { PipelineContext } from "../pipeline/types.js";
 import { readFileSync } from "node:fs";
+import { BUILTIN_REVIEWER_VERDICT_SCHEMA, REVIEWER_VERDICT_SCHEMA } from "../pipeline/reviewers/schema.js";
+import type { ReviewerPromptInput } from "../pipeline/reviewers/registry.js";
+import { makeContext } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDir } from "./helpers/test-dir.js";
 
 const checks = [{
   check: "Pulse speed matches the requested behavior",
@@ -14,12 +19,10 @@ const checks = [{
 }];
 const summary = "The requested animation change is implemented in the shared pulse setting.";
 
-async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { strictReport?: boolean; reviewUrl?: string; reviewFailure?: boolean } = {}) {
+async function runReview(verdict: Record<string, unknown>, externalPending = false, maxIterations = 1, options: { groupingParent?: boolean; buildPrompt?: (input: ReviewerPromptInput) => string; strictReport?: boolean; outputSchema?: Record<string, unknown>; reviewUrl?: string; reviewFailure?: boolean } = {}) {
   const ghSpawn = vi.fn((args: string[]) => {
     if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-    if (args.includes("repos/:owner/:repo/pulls/42/reviews") && args.includes("POST")) {
-      return { stdout: JSON.stringify({ html_url: options.reviewUrl }), exitCode: options.reviewFailure ? 1 : 0 };
-    }
+    if (args.includes("POST") && args.some(arg => /\/reviews$/.test(arg))) throw new Error("Runner must not publish GitHub reviews");
     if (args.includes("repos/:owner/:repo/pulls/42")) {
       return { stdout: JSON.stringify({ state: "open", head: { sha: "head123" } }), exitCode: 0 };
     }
@@ -32,33 +35,42 @@ async function runReview(verdict: Record<string, unknown>, externalPending = fal
     stdout: "", exitCode: 0, tokensUsed: 100, structuredOutput: verdict,
     terminalStatus: { subtype: "success", isError: false },
   }));
-  const context = {
-    data: { issueId: "filesystem:SAN:SAN-1", issueIdentifier: "SAN-1", issueTitle: "Slow the pulse", issueDescription: "Slow the animation" },
-    llmExecutor: { invoke }, getOutputs: () => ({}), setOutputs: () => {}, resolveInputs: (i: unknown) => i,
-  } as unknown as PipelineContext;
+  const publication = fakeFetch({ "POST /runner/review-publication": {
+    status: options.reviewFailure ? 503 : 200,
+    json: { status: "posted", reviewUrl: options.reviewUrl },
+  } }).install();
+  const context = makeContext({ groupingParent: options.groupingParent, callbackUrl: "https://orchestrator.test", progressToken: "progress-token" }, { invoke });
   const report = vi.fn(async (_row: Record<string, any>) => {});
   const result = await postPushReviewStep.run(context, {
-    prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn,
+    prNumber: "42", workspaceDir: testDir("reviewer-reporting"), maxIterations, ghSpawn,
     gitSpawn: () => ({ stdout: "", exitCode: 0 }),
     reviewProviders: externalPending ? ["github-claude-code-review"] : [],
     sleep: async () => {}, reviewWaitPollMs: 1, reviewWaitTimeoutMs: 2,
-    reviewers: [{ id: "code-review", gates: true }],
-    trustedReviewerDefinitions: new Map([["code-review", { id: "code-review", buildPrompt: () => "Review", outputSchema: { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }]]),
+    reviewers: DEFAULT_REVIEWER_SELECTION,
+    trustedReviewerDefinitions: new Map(DEFAULT_REVIEWER_SELECTION.map(({ id }) => [id, { id, buildPrompt: options.buildPrompt ?? (() => "Review"), outputSchema: options.outputSchema ?? { type: "object", ...(options.strictReport ? { required: ["approved", "findings", "summary", "checks"] } : {}) } }])),
   }, { report });
-  const nativeBodies = ghSpawn.mock.calls.filter(([args]) => args.includes("event=COMMENT"))
-    .map(([args]) => args.find(arg => arg.startsWith("body=")) || "");
+  const nativeBodies = publication.calls.map(call => JSON.parse(call.body).body as string);
   const comments = ghSpawn.mock.calls.filter(([args]) => args[0] === "pr" && args[1] === "comment")
     .map(([args]) => args[args.indexOf("--body") + 1]);
   return { result, report, nativeBodies, comments };
 }
 
 describe("reviewer evidence reports", () => {
+  it.each([undefined, false, true])("passes groupingParent to the selected reviewer (%s)", async groupingParent => {
+    const buildPrompt = vi.fn((_input: ReviewerPromptInput) => "Review");
+    const { result } = await runReview({ approved: true, findings: [] }, false, 1, { groupingParent, buildPrompt });
+    expect(result.approved).toBe(true);
+    expect(buildPrompt).toHaveBeenCalledWith(expect.objectContaining({
+      issueIdentifier: expect.any(String), diff: "diff", groupingParent,
+    }));
+  });
+
   it("rejects the actual PR8 built-in response with its checklist embedded in summary", async () => {
     const malformed = JSON.parse(readFileSync(new URL("./fixtures/pr8-malformed-review-report.json", import.meta.url), "utf8"));
     const { result, nativeBodies } = await runReview(malformed, false, 1, { strictReport: true });
     expect(result.approved).toBe(false);
     expect(result.terminationReason).toBe("invalid_review");
-    expect(nativeBodies.join("\n")).not.toContain("approved this PR");
+    expect(nativeBodies.join("\n")).not.toContain("approved this pull request");
   });
 
   it("renders markup in report text visibly rather than letting GitHub interpret it", async () => {
@@ -111,6 +123,39 @@ describe("reviewer evidence reports", () => {
     expect(result.approved).toBe(true);
     const child = report.mock.calls.find(([row]) => row.id.includes("reviewer.0"))![0];
     expect(child.outputs.checks).toBeUndefined();
+  });
+
+  it("treats null optional report fields as absent for a config reviewer under the strict-mode schema", async () => {
+    const { result, report } = await runReview(
+      { approved: true, findings: [], summary: null, checks: null },
+      false, 1, { outputSchema: REVIEWER_VERDICT_SCHEMA },
+    );
+    expect(result.approved).toBe(true);
+    const child = report.mock.calls.find(([row]) => row.id.includes("reviewer.0"))![0];
+    expect(child.outputs.summary).toBeUndefined();
+    expect(child.outputs.checks).toBeUndefined();
+  });
+
+  it("treats a null finding path and line as absent", async () => {
+    const { result, report } = await runReview(
+      { approved: false, findings: [{ severity: "blocking", body: "The renderer ignores the new setting.", path: null, line: null }], summary: null, checks: null },
+      false, 1, { outputSchema: REVIEWER_VERDICT_SCHEMA },
+    );
+    expect(result.terminationReason).toBe("iterations_exhausted");
+    const child = report.mock.calls.find(([row]) => row.id.includes("reviewer.0"))![0];
+    expect(child.outputs.findings).toHaveLength(1);
+    expect(child.outputs.findings[0]).toMatchObject({ severity: "blocking", body: "The renderer ignores the new setting." });
+    expect(child.outputs.findings[0]).not.toHaveProperty("path");
+    expect(child.outputs.findings[0]).not.toHaveProperty("line");
+  });
+
+  it("still requires a built-in reviewer to report a summary and checks", async () => {
+    const { result } = await runReview(
+      { approved: true, findings: [], summary: null, checks: null },
+      false, 1, { outputSchema: BUILTIN_REVIEWER_VERDICT_SCHEMA },
+    );
+    expect(result.approved).toBe(false);
+    expect(result.terminationReason).toBe("invalid_review");
   });
 
   it("does not let a positive report override actionable findings", async () => {

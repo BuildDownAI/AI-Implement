@@ -1,23 +1,19 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach, onTestFinished, vi } from "vitest";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import type * as DedupModule from "../dedup.js";
+import { testDb } from "./helpers/test-db.js";
+import { testDir } from "./helpers/test-dir.js";
 
 let dbPath: string;
 let dedup: typeof DedupModule;
 
+// Left unopened, so a schema-upgrade test can write the older schema before dedup opens the file.
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `dedup-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  const db = await testDb({ tables: "none", modules: { dedup: () => import("../dedup.js") } });
+  dbPath = db.path;
+  ({ dedup } = db.modules);
 });
 
 describe("dedup", () => {
@@ -139,7 +135,384 @@ describe("dispatch admission schema", () => {
   });
 });
 
-describe("review-fix attempt and inbox schema", () => {
+describe("agent configuration and account ownership schema", () => {
+  it("initializes additive tables twice without changing legacy dispatch, token, or settings rows", () => {
+    const old = new Database(dbPath);
+    old.exec(`
+      CREATE TABLE dispatched (issue_id TEXT PRIMARY KEY, dispatched_at INTEGER NOT NULL);
+      CREATE TABLE runner_tokens (
+        dispatch_id TEXT NOT NULL,
+        audience TEXT NOT NULL DEFAULT 'result',
+        issue_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        mapping_team_key TEXT NOT NULL,
+        PRIMARY KEY (dispatch_id, audience)
+      );
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE model_account_profiles (
+        profile_id TEXT PRIMARY KEY,
+        current_profile_revision INTEGER NOT NULL CHECK (current_profile_revision > 0),
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (status IN ('active', 'disabled', 'archived'))
+      );
+      CREATE TABLE model_session_generations (
+        profile_id TEXT NOT NULL,
+        owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+        checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence >= 0),
+        encrypted_session_state BLOB NOT NULL,
+        encryption_key_id TEXT NOT NULL,
+        nonce BLOB NOT NULL,
+        auth_tag BLOB NOT NULL,
+        checkpointed_at INTEGER NOT NULL,
+        valid_until_at INTEGER,
+        state_status TEXT NOT NULL DEFAULT 'checkpointed',
+        PRIMARY KEY (profile_id, owner_generation, checkpoint_sequence),
+        CHECK (state_status IN ('checkpointed', 'held', 'expired', 'revoked'))
+      );
+    `);
+    old.prepare(`INSERT INTO model_account_profiles
+      (profile_id, current_profile_revision, status, created_at, updated_at)
+      VALUES ('legacy-profile', 3, 'active', 10, 20)`).run();
+    old.prepare(`INSERT INTO model_session_generations
+      (profile_id, owner_generation, checkpoint_sequence, encrypted_session_state, encryption_key_id,
+       nonce, auth_tag, checkpointed_at, valid_until_at, state_status)
+      VALUES ('legacy-profile', 2, 5, ?, 'legacy-key', ?, ?, 30, NULL, 'held')`)
+      .run(Buffer.from([9, 8, 7]), Buffer.from([1, 2]), Buffer.from([3]));
+    old.prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES (?, ?)").run("legacy-issue", 123);
+    old.prepare(`INSERT INTO runner_tokens
+      (dispatch_id, audience, issue_id, phase, expires_at, consumed_at, mapping_team_key)
+      VALUES ('dispatch-1', 'result', 'issue-1', 'implementation', 999, NULL, 'AII')`).run();
+    old.prepare("INSERT INTO settings (key, value) VALUES ('linear_pickup_label', 'AI-Implement')").run();
+    old.close();
+
+    dedup.getDb();
+    dedup.closeDb();
+    const db = dedup.getDb();
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+    const tableNames = new Set(tables.map((table) => table.name));
+    expect(tableNames).toContain("model_account_profiles");
+    expect(tableNames).toContain("model_account_profile_revisions");
+    expect(tableNames).toContain("stage_agent_config_revisions");
+    expect(tableNames).toContain("run_agent_config_snapshots");
+    expect(tableNames).toContain("model_profile_reservations");
+    expect(tableNames).toContain("model_session_generations");
+    expect(tableNames).toContain("model_protected_secrets");
+    expect(tableNames).toContain("model_credential_grants");
+    expect(tableNames).toContain("model_credential_grant_profiles");
+    expect(tableNames).toContain("model_invocation_attribution");
+    expect(db.prepare("SELECT issue_id, dispatched_at FROM dispatched").all())
+      .toEqual([{ issue_id: "legacy-issue", dispatched_at: 123 }]);
+    expect(db.prepare("SELECT dispatch_id, mapping_team_key FROM runner_tokens").all())
+      .toEqual([{ dispatch_id: "dispatch-1", mapping_team_key: "AII" }]);
+    expect(db.prepare("SELECT key, value FROM settings").all())
+      .toEqual([{ key: "linear_pickup_label", value: "AI-Implement" }]);
+    expect(db.prepare("SELECT * FROM model_account_profiles").all()).toEqual([
+      { profile_id: "legacy-profile", current_profile_revision: 3, status: "active", created_at: 10, updated_at: 20 },
+    ]);
+    expect(db.prepare("SELECT * FROM model_session_generations").all()).toEqual([{
+      profile_id: "legacy-profile", owner_generation: 2, checkpoint_sequence: 5,
+      encrypted_session_state: Buffer.from([9, 8, 7]), encryption_key_id: "legacy-key",
+      nonce: Buffer.from([1, 2]), auth_tag: Buffer.from([3]), checkpointed_at: 30,
+      valid_until_at: null, state_status: "held",
+    }]);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM model_protected_secrets").get() as { n: number }).n).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM stage_agent_config_revisions").get() as { n: number }).n).toBe(0);
+  });
+
+  it("enforces one active reservation per profile and monotonically fenced owner generations", () => {
+    const db = dedup.getDb();
+    const reserve = db.prepare(`INSERT INTO model_profile_reservations
+      (reservation_id, profile_id, dispatch_id, owner_generation, owner_kind,
+       recovery_status, reserved_at, heartbeat_at)
+      VALUES (?, 'profile-openai', ?, ?, 'dispatch', ?, ?, ?)`);
+    reserve.run("reservation-1", "dispatch-1", 1, "reserved", 10, 11);
+    expect(() => reserve.run("reservation-conflict", "dispatch-2", 2, "reserved", 12, 12)).toThrow(/UNIQUE/);
+    db.prepare(`UPDATE model_profile_reservations
+      SET released_at = 20, release_reason = 'terminal', recovery_status = 'released'
+      WHERE reservation_id = 'reservation-1'`).run();
+    expect(() => db.prepare("UPDATE model_profile_reservations SET owner_generation = 9 WHERE reservation_id = 'reservation-1'").run())
+      .toThrow(/immutable/);
+    expect(() => reserve.run("reservation-stale", "dispatch-3", 1, "reserved", 21, 21)).toThrow(/generation/);
+    reserve.run("reservation-2", "dispatch-4", 2, "held", 22, 22);
+    expect(db.prepare(`SELECT reservation_id, owner_generation, recovery_status
+      FROM model_profile_reservations ORDER BY owner_generation`).all()).toEqual([
+      { reservation_id: "reservation-1", owner_generation: 1, recovery_status: "released" },
+      { reservation_id: "reservation-2", owner_generation: 2, recovery_status: "held" },
+    ]);
+  });
+
+  it("keeps snapshots immutable and credential material in encrypted or hashed tables only", () => {
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO model_account_profiles
+      (profile_id, current_profile_revision, status, created_at, updated_at)
+      VALUES ('profile-openai', 2, 'active', 10, 20)`).run();
+    db.prepare(`INSERT INTO model_account_profile_revisions
+      (profile_id, profile_revision, agent, provider, auth_mode, display_name,
+       created_at, metadata_json)
+      VALUES ('profile-openai', 1, 'codex', 'openai', 'openai-api-key',
+              'Testing API key', 10, '{"label":"api"}')`).run();
+    db.prepare(`INSERT INTO model_account_profile_revisions
+      (profile_id, profile_revision, agent, provider, auth_mode, display_name,
+       created_at, metadata_json)
+      VALUES ('profile-openai', 2, 'codex', 'openai', 'codex-subscription',
+              'Testing subscription', 20, '{"email":"operator@example.com"}')`).run();
+    expect(() => db.prepare(`UPDATE model_account_profile_revisions
+      SET display_name = 'rewrite' WHERE profile_id = 'profile-openai' AND profile_revision = 1`).run())
+      .toThrow(/immutable/);
+    db.prepare(`INSERT INTO stage_agent_config_revisions
+      (config_revision_id, scope_kind, scope_key, version, revision, config_json, created_at)
+      VALUES ('cfg-1', 'project', 'AII', 1, 1, '{"mode":"configured"}', 11)`).run();
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json,
+       config_revision_ids_json, created_at)
+      VALUES ('snapshot-1', 'dispatch-1', 'AII', '{"stages":{}}', '{}', '["cfg-1"]', 12)`).run();
+    expect(() => db.prepare(`UPDATE run_agent_config_snapshots
+      SET resolved_config_json = '{}' WHERE snapshot_id = 'snapshot-1'`).run()).toThrow(/immutable/);
+    db.prepare(`INSERT INTO model_session_generations
+      (profile_id, owner_generation, checkpoint_sequence, encrypted_session_state, encryption_key_id,
+       nonce, auth_tag, checkpointed_at, valid_until_at, state_status)
+      VALUES ('profile-openai', 1, 0, X'CAFE', 'key-1', X'01', X'02', 13, 100, 'checkpointed')`).run();
+    db.prepare(`INSERT INTO model_session_generations
+      (profile_id, owner_generation, checkpoint_sequence, encrypted_session_state, encryption_key_id,
+       nonce, auth_tag, checkpointed_at, valid_until_at, state_status)
+      VALUES ('profile-openai', 1, 1, X'BEEF', 'key-1', X'03', X'04', 14, 100, 'checkpointed')`).run();
+    db.prepare(`INSERT INTO model_credential_grants
+      (grant_id, dispatch_id, snapshot_id, project_key, backend, audience,
+       bearer_hash, scope_json, expires_at)
+      VALUES ('grant-1', 'dispatch-1', 'snapshot-1', 'AII', 'github-actions',
+              'codex-exec', 'sha256:abc123', '{"repo":"BuildDownAI/AI-Implement"}', 14)`).run();
+    db.prepare(`INSERT INTO model_credential_grant_profiles
+      (grant_id, stage, profile_id, profile_revision, owner_generation)
+      VALUES ('grant-1', 'implementation', 'profile-openai', 2, 1)`).run();
+    db.prepare(`INSERT INTO model_credential_grant_profiles
+      (grant_id, stage, profile_id, profile_revision, owner_generation)
+      VALUES ('grant-1', 'planning', 'profile-openai', 1, NULL)`).run();
+    db.prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent,
+       provider, model, auth_mode, config_revision_id, snapshot_id, status,
+       started_at, completed_at, usage_json)
+      VALUES ('invocation-1', 'dispatch-1', 'implementation', 'profile-openai', 1,
+              'codex', 'openai', 'gpt-5.6-sol', 'codex-subscription', 'cfg-1',
+              'snapshot-1', 'succeeded', 15, 16, '{"inputTokens":1}')`).run();
+
+    const ordinaryColumns = db.prepare(`
+      SELECT m.name AS table_name, p.name AS column_name
+      FROM sqlite_master AS m, pragma_table_info(m.name) AS p
+      WHERE m.type = 'table'
+        AND m.name IN (
+          'model_account_profiles',
+          'model_account_profile_revisions',
+          'stage_agent_config_revisions',
+          'run_agent_config_snapshots',
+          'model_profile_reservations',
+          'model_invocation_attribution'
+        )
+      ORDER BY m.name, p.name
+    `).all() as Array<{ table_name: string; column_name: string }>;
+    expect(ordinaryColumns.filter((column) => /credential|secret|token|bearer|session/i.test(column.column_name))).toEqual([]);
+    expect(db.prepare("SELECT checkpoint_sequence, length(encrypted_session_state) AS n FROM model_session_generations ORDER BY checkpoint_sequence").all()).toEqual([
+      { checkpoint_sequence: 0, n: 2 },
+      { checkpoint_sequence: 1, n: 2 },
+    ]);
+    expect(db.prepare("SELECT dispatch_id, snapshot_id, project_key, backend, bearer_hash FROM model_credential_grants").get()).toEqual({
+      dispatch_id: "dispatch-1",
+      snapshot_id: "snapshot-1",
+      project_key: "AII",
+      backend: "github-actions",
+      bearer_hash: "sha256:abc123",
+    });
+    expect(db.prepare(`SELECT stage, profile_revision, owner_generation
+      FROM model_credential_grant_profiles ORDER BY stage`).all()).toEqual([
+      { stage: "implementation", profile_revision: 2, owner_generation: 1 },
+      { stage: "planning", profile_revision: 1, owner_generation: null },
+    ]);
+    expect(db.prepare(`SELECT agent, provider, model, auth_mode, usage_json FROM model_invocation_attribution`).get()).toEqual({
+      agent: "codex",
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      auth_mode: "codex-subscription",
+      usage_json: "{\"inputTokens\":1}",
+    });
+  });
+});
+
+const RETIRED_TABLE = ["model_account_profile", "project", "permissions"].join("_");
+
+describe("retired model account permissions table", () => {
+  it("leaves an existing table and its rows untouched on boot", () => {
+    const old = new Database(dbPath);
+    old.exec(`CREATE TABLE ${RETIRED_TABLE} (
+      profile_id TEXT NOT NULL, project_key TEXT NOT NULL, permission_revision INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'allowed', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, project_key))`);
+    old.prepare(`INSERT INTO ${RETIRED_TABLE}
+      (profile_id, project_key, permission_revision, status, created_at, updated_at)
+      VALUES ('profile-openai', 'AII', 1, 'allowed', 10, 10)`).run();
+    old.close();
+
+    const db = dedup.getDb();
+    expect(db.prepare(`SELECT profile_id, project_key FROM ${RETIRED_TABLE}`).all())
+      .toEqual([{ profile_id: "profile-openai", project_key: "AII" }]);
+  });
+});
+
+describe("review-fix execution backend schema", () => {
+  const expectedColumns = [
+    { name: "execution_backend", type: "TEXT", nn: 1, defaultValue: "'github-actions'" },
+    { name: "execution_ref", type: "TEXT", nn: 0, defaultValue: null },
+  ];
+  const executionColumns = (db: Database.Database) => db.prepare(`
+    SELECT name, type, "notnull" AS nn, dflt_value AS defaultValue
+    FROM pragma_table_info('review_fix_attempts')
+    WHERE name IN ('execution_backend', 'execution_ref') ORDER BY name
+  `).all();
+
+  function oldAttempts(): Database.Database {
+    const old = new Database(dbPath);
+    old.exec(`CREATE TABLE review_fix_attempts (
+      attempt_id TEXT PRIMARY KEY,
+      dispatch_id TEXT NOT NULL UNIQUE,
+      mapping_key TEXT NOT NULL,
+      installation_id TEXT NOT NULL,
+      repository TEXT NOT NULL,
+      pr_number INTEGER NOT NULL,
+      issue_scope TEXT NOT NULL,
+      issue_id TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      state TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      deadline_at INTEGER NOT NULL,
+      authority_revoked_at INTEGER,
+      github_run_id INTEGER,
+      github_run_attempt INTEGER,
+      task_snapshot_json TEXT NOT NULL,
+      finding_versions_json TEXT NOT NULL,
+      accepted_result_json TEXT,
+      accepted_result_hash TEXT,
+      result_conflict_at INTEGER,
+      terminal_outcome_json TEXT,
+      completed_at INTEGER,
+      changed_at INTEGER,
+      CHECK ((github_run_id IS NULL) = (github_run_attempt IS NULL)),
+      CHECK ((accepted_result_json IS NULL) = (accepted_result_hash IS NULL))
+    )`);
+    old.exec(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       github_run_id, github_run_attempt, task_snapshot_json, finding_versions_json,
+       accepted_result_json, accepted_result_hash)
+      VALUES ('attempt-old', 'dispatch-old', 'APP', '7', 'acme/app', 42,
+              'team', 'issue-old', 'attempt-old', 'running', 10, 1000,
+              111, 2, '{}', '[]', '{}', 'hash-old')`);
+    return old;
+  }
+
+  it("creates the execution columns with GitHub defaults on a new database", () => {
+    expect(executionColumns(dedup.getDb())).toEqual(expectedColumns);
+  });
+
+  it("upgrades old attempts twice without changing rows, existing columns or checks", () => {
+    const old = oldAttempts();
+    const original = old.prepare<[], Record<string, unknown>>("SELECT * FROM review_fix_attempts").get();
+    const originalColumns = old.prepare("PRAGMA table_info(review_fix_attempts)").all();
+    old.close();
+    if (!original) throw new Error("legacy attempt fixture is missing");
+
+    const db = dedup.getDb();
+    expect(executionColumns(db)).toEqual(expectedColumns);
+    expect(db.prepare(`SELECT * FROM pragma_table_info('review_fix_attempts')
+      WHERE name NOT IN ('execution_backend', 'execution_ref') ORDER BY cid`).all())
+      .toEqual(originalColumns);
+    expect(db.prepare("SELECT * FROM review_fix_attempts").get()).toEqual({
+      ...original,
+      execution_backend: "github-actions",
+      execution_ref: null,
+    });
+    expect(() => db.prepare("UPDATE review_fix_attempts SET github_run_attempt = NULL").run())
+      .toThrow(/CHECK/);
+    expect(() => db.prepare("UPDATE review_fix_attempts SET accepted_result_hash = NULL").run())
+      .toThrow(/CHECK/);
+    expect(() => db.prepare("UPDATE review_fix_attempts SET owner = 'other'").run())
+      .toThrow(/immutable/);
+
+    db.prepare("UPDATE review_fix_attempts SET execution_backend = 'fly-machines', execution_ref = 'machine-1'").run();
+    const migrated = db.prepare("SELECT * FROM review_fix_attempts").get();
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'review_fix_attempts'").get();
+    dedup.closeDb();
+    const reopened = dedup.getDb();
+    expect(executionColumns(reopened)).toEqual(expectedColumns);
+    expect(reopened.prepare("SELECT * FROM review_fix_attempts").get()).toEqual(migrated);
+    expect(reopened.prepare("SELECT sql FROM sqlite_master WHERE name = 'review_fix_attempts'").get()).toEqual(schema);
+  });
+
+  it.each([
+    { column: "execution_backend", sql: "ALTER TABLE review_fix_attempts ADD COLUMN execution_backend TEXT NOT NULL DEFAULT 'github-actions'" },
+    { column: "execution_ref", sql: "ALTER TABLE review_fix_attempts ADD COLUMN execution_ref TEXT" },
+  ])("completes an interrupted upgrade with only $column present", ({ sql }) => {
+    const old = oldAttempts();
+    old.exec(sql);
+    old.close();
+
+    expect(executionColumns(dedup.getDb())).toEqual(expectedColumns);
+    expect(dedup.getDb().prepare(`SELECT execution_backend, execution_ref, github_run_id, github_run_attempt
+      FROM review_fix_attempts WHERE attempt_id = 'attempt-old'`).get()).toEqual({
+      execution_backend: "github-actions", execution_ref: null, github_run_id: 111, github_run_attempt: 2,
+    });
+  });
+});
+
+describe("review-fix attempt schema", () => {
+  it("creates model_protected_secrets with ciphertext-only columns and keeps rows across startups", () => {
+    const db = dedup.getDb();
+    const columns = db.prepare("SELECT name, type, \"notnull\" AS nn, pk FROM pragma_table_info('model_protected_secrets') ORDER BY cid").all();
+    expect(columns).toEqual([
+      { name: "secret_ref", type: "TEXT", nn: 0, pk: 1 },
+      { name: "ciphertext", type: "BLOB", nn: 1, pk: 0 },
+      { name: "nonce", type: "BLOB", nn: 1, pk: 0 },
+      { name: "auth_tag", type: "BLOB", nn: 1, pk: 0 },
+      { name: "encryption_key_id", type: "TEXT", nn: 1, pk: 0 },
+      { name: "updated_at", type: "INTEGER", nn: 1, pk: 0 },
+    ]);
+    db.prepare(`INSERT INTO model_protected_secrets
+      (secret_ref, ciphertext, nonce, auth_tag, encryption_key_id, updated_at)
+      VALUES ('model-account:acct-1', ?, ?, ?, 'key-1', 42)`)
+      .run(Buffer.from([1, 2, 3]), Buffer.from([4, 5]), Buffer.from([6]));
+    expect(() => db.prepare(`INSERT INTO model_protected_secrets
+      (secret_ref, ciphertext, nonce, auth_tag, encryption_key_id, updated_at)
+      VALUES ('model-account:acct-2', NULL, x'00', x'00', 'key-1', 1)`).run()).toThrow();
+
+    dedup.closeDb();
+    const reopened = dedup.getDb();
+    expect(reopened.prepare(`SELECT secret_ref, typeof(ciphertext) AS c, typeof(nonce) AS n,
+      typeof(auth_tag) AS a, encryption_key_id, typeof(updated_at) AS u, updated_at, hex(ciphertext) AS ch
+      FROM model_protected_secrets`).all()).toEqual([
+      { secret_ref: "model-account:acct-1", c: "blob", n: "blob", a: "blob", encryption_key_id: "key-1", u: "integer", updated_at: 42, ch: "010203" },
+    ]);
+  });
+
+  it("leaves an existing review_fix_inbox table and its rows in place without altering it", () => {
+    const old = new Database(dbPath);
+    old.exec(`CREATE TABLE review_fix_inbox (
+      authenticated_source TEXT NOT NULL, event_id TEXT NOT NULL, installation_id TEXT NOT NULL,
+      repository TEXT NOT NULL, pr_number INTEGER NOT NULL, kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL, accepted_at INTEGER NOT NULL,
+      delivery_state TEXT NOT NULL DEFAULT 'pending', retry_at INTEGER, delivered_at INTEGER,
+      PRIMARY KEY (authenticated_source, event_id))`);
+    old.prepare(`INSERT INTO review_fix_inbox
+      (authenticated_source, event_id, installation_id, repository, pr_number, kind, payload_json, payload_hash, accepted_at)
+      VALUES ('github', 'event-1', '7', 'acme/app', 42, 'feedback', '{}', 'h', 20)`).run();
+    old.close();
+
+    const db = dedup.getDb();
+    expect(db.prepare("SELECT event_id FROM review_fix_inbox").all()).toEqual([{ event_id: "event-1" }]);
+    expect((db.prepare("PRAGMA table_info(review_fix_inbox)").all() as Array<{ name: string }>).map((c) => c.name))
+      .not.toContain("tombstoned_at");
+  });
+
   it("upgrades old findings and queue history twice without rewriting legacy rows", () => {
     const old = new Database(dbPath);
     old.exec(`
@@ -176,7 +549,7 @@ describe("review-fix attempt and inbox schema", () => {
     expect((db.prepare("PRAGMA table_info(review_findings)").all() as Array<{ name: string }>)
       .filter((column) => column.name === "revision")).toHaveLength(1);
     expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
-    expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_inbox").get() as { n: number }).n).toBe(0);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'review_fix_inbox'").get()).toBeUndefined();
   });
 
   it("keeps attempt ownership immutable and duplicate identities from allocating another record", () => {
@@ -204,19 +577,6 @@ describe("review-fix attempt and inbox schema", () => {
       SET accepted_result_json = '{}', accepted_result_hash = 'hash-1'
       WHERE attempt_id = 'attempt-1'`).run();
 
-    const insertEvent = db.prepare(`INSERT INTO review_fix_inbox
-      (authenticated_source, event_id, installation_id, repository, pr_number,
-       kind, payload_json, payload_hash, accepted_at)
-      VALUES (?, ?, '7', 'acme/app', 42, ?, '{}', 'hash-1', 20)`);
-    insertEvent.run("github", "event-1", "feedback");
-    db.prepare("UPDATE review_fix_inbox SET delivery_state = 'delivered', delivered_at = 30 WHERE event_id = 'event-1'").run();
-    expect(() => insertEvent.run("github", "event-1", "feedback")).toThrow(/UNIQUE/);
-    insertEvent.run("runner", "event-1", "result");
-    expect(db.prepare("SELECT authenticated_source, event_id, kind FROM review_fix_inbox ORDER BY authenticated_source").all())
-      .toEqual([
-        { authenticated_source: "github", event_id: "event-1", kind: "feedback" },
-        { authenticated_source: "runner", event_id: "event-1", kind: "result" },
-      ]);
     expect((db.prepare("SELECT COUNT(*) AS n FROM review_fix_dispatches").get() as { n: number }).n).toBe(0);
   });
 });
@@ -436,9 +796,192 @@ describe("runner_tokens table", () => {
 describe("getDispatchedRows", () => {
   it("returns teamKey null for legacy rows", () => {
     dedup.markDispatched("new-1", "TEAM");
-    new Database(dbPath).prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES ('old-1', 1)").run();
+    dedup.getDb().prepare("INSERT INTO dispatched (issue_id, dispatched_at) VALUES ('old-1', 1)").run();
     const rows = dedup.getDispatchedRows();
     expect(rows.find((r) => r.issueId === "old-1")?.teamKey).toBeNull();
     expect(rows.find((r) => r.issueId === "new-1")?.teamKey).toBe("TEAM");
+  });
+});
+
+describe("getDatabasePath", () => {
+  it("reports the configured path when its directory can be created", () => {
+    expect(dedup.getDatabasePath()).toEqual({ path: dbPath, configured: dbPath, fellBack: false });
+  });
+
+  // A command that imports a database module without opening the database, such as provision-client, must leave no directory and log no fallback.
+  it("creates nothing when imported, and the directory on first use", async () => {
+    const dir = join(testDir("dedup-path"), "not-yet");
+    vi.stubEnv("DEDUP_DB_PATH", join(dir, "dedup.sqlite"));
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+    });
+    vi.resetModules();
+    const fresh = await import("../dedup.js");
+
+    expect(existsSync(dir)).toBe(false);
+    expect(fresh.getDatabasePath()).toMatchObject({ path: join(dir, "dedup.sqlite"), fellBack: false });
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  // The path resolves once per module copy, on first use, so each case mocks fs and imports a fresh copy.
+  it.each(["EACCES", "ENOENT", "EPERM", "EROFS"])("falls back to /tmp, and says so, when creating the directory fails with %s", async (code) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.doMock("fs", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("fs")>()),
+      mkdirSync: () => {
+        throw Object.assign(new Error(code), { code });
+      },
+    }));
+    onTestFinished(() => {
+      vi.doUnmock("fs");
+      warn.mockRestore();
+    });
+    vi.resetModules();
+    const fresh = await import("../dedup.js");
+    expect(fresh.getDatabasePath()).toEqual({ path: "/tmp/ai-implement.sqlite", configured: dbPath, fellBack: true });
+    expect(String(warn.mock.calls[0][0])).toContain(`(${code}), falling back to /tmp/ai-implement.sqlite`);
+  });
+
+  // volume.database reads this to say where the open database lives, so it must not change once the database has a path.
+  it("keeps reporting a fallback after the directory becomes creatable", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let failures = 1;
+    vi.doMock("fs", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("fs")>();
+      return {
+        ...actual,
+        mkdirSync: (...args: Parameters<typeof actual.mkdirSync>) => {
+          if (failures-- > 0) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+          return actual.mkdirSync(...args);
+        },
+      };
+    });
+    onTestFinished(() => {
+      vi.doUnmock("fs");
+      warn.mockRestore();
+    });
+    vi.resetModules();
+    const fresh = await import("../dedup.js");
+
+    expect(fresh.getDatabasePath().fellBack).toBe(true);
+    expect(fresh.getDatabasePath().fellBack).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useReadOnlyDb", () => {
+  it("never creates the database: a missing file throws, naming the path, and leaves nothing behind", () => {
+    dedup.useReadOnlyDb();
+
+    expect(() => dedup.getDb()).toThrow(`Cannot open the database at ${dbPath} read-only`);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("reads an existing database without migrating it, and refuses writes", () => {
+    const seed = new Database(dbPath);
+    seed.pragma("journal_mode = WAL");
+    seed.exec("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)");
+    seed.prepare("INSERT INTO settings VALUES (?, ?)").run("runner_mode", "gha");
+    seed.close();
+
+    dedup.useReadOnlyDb();
+    const db = dedup.getDb();
+
+    expect(db.prepare("SELECT value FROM settings WHERE key = ?").get("runner_mode")).toEqual({ value: "gha" });
+    // The read-write open creates `dispatched` first, so its absence shows no migration ran.
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'dispatched'").get()).toBeUndefined();
+    let code: string | undefined;
+    try {
+      db.prepare("INSERT INTO settings VALUES ('x', 'y')").run();
+    } catch (err) {
+      code = (err as { code?: string }).code;
+    }
+    expect(code).toBe("SQLITE_READONLY");
+  });
+
+  it("refuses once the database is already open read-write", () => {
+    dedup.getDb();
+
+    expect(() => dedup.useReadOnlyDb()).toThrow("useReadOnlyDb() must run before the database is opened");
+  });
+});
+
+describe("OpenRouter database constraints", () => {
+  const tables = ["model_account_profile_revisions", "model_invocation_attribution"];
+  function insertProfile(db: Database.Database, id: string, provider = "openrouter", auth = "openrouter-api-key") {
+    db.prepare(`INSERT INTO model_account_profile_revisions VALUES (?, 1, 'claude', ?, ?, 'Account', 123, '{"legacy":true}')`)
+      .run(id, provider, auth);
+  }
+  function insertInvocation(db: Database.Database, id: string, provider = "openrouter") {
+    db.prepare(`INSERT INTO model_invocation_attribution VALUES
+      (?, 'dispatch-old', 'implementation', 'profile-old', 1, 'claude', ?, 'model', 'openrouter-api-key',
+       NULL, 'snapshot-old', 'succeeded', 123, NULL, '{"tokens":42}')`).run(id, provider);
+  }
+  function checkConstraints(db: Database.Database, suffix: string) {
+    insertProfile(db, `profile-${suffix}`);
+    insertInvocation(db, `invocation-${suffix}`);
+    expect(() => insertProfile(db, 'bad-provider', 'unknown')).toThrow(/CHECK/);
+    expect(() => insertProfile(db, 'bad-auth', 'openrouter', 'unknown')).toThrow(/CHECK/);
+    expect(() => insertInvocation(db, 'bad-provider', 'unknown')).toThrow(/CHECK/);
+    expect(() => insertProfile(db, `profile-${suffix}`)).toThrow(/UNIQUE/);
+    expect(() => insertInvocation(db, `invocation-${suffix}`)).toThrow(/UNIQUE/);
+    expect(() => db.exec("UPDATE model_account_profile_revisions SET display_name = 'changed'"))
+      .toThrow(/model account profile revisions are immutable/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET stage = 'unknown'" )).toThrow(/CHECK/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET profile_revision = 0" )).toThrow(/CHECK/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET agent = 'unknown'" )).toThrow(/CHECK/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET status = 'unknown'" )).toThrow(/CHECK/);
+  }
+
+  it("accepts OpenRouter on a fresh database while retaining constraints", () => {
+    checkConstraints(dedup.getDb(), 'fresh');
+  });
+
+  it.each([false, true])("upgrades old tables twice with rows and accounting triggers (mixed schema: %s)", async (mixed) => {
+    // Derive the legacy CHECK lists, retaining all the other production columns and constraints.
+    const db = dedup.getDb();
+    const { initLogTable } = await import("../log.js");
+    initLogTable();
+    const schemas = tables.map((table) => (db.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(table) as { sql: string }).sql);
+    dedup.closeDb();
+    const old = new Database(dbPath);
+    // Simulate the pre-upgrade tables, including the existing accounting/prune triggers.
+    old.exec("DROP TRIGGER trg_dispatch_log_pruned");
+    for (const [i, table] of tables.entries()) {
+      old.exec(`DROP TABLE ${table}`);
+      old.exec(mixed && i === 0 ? schemas[i]! : schemas[i]!.replace(", 'openrouter'", "").replace(", 'openrouter-api-key'", ""));
+    }
+    insertProfile(old, 'profile-old', 'anthropic', 'anthropic-api-key');
+    insertInvocation(old, 'invocation-old', 'anthropic');
+    const rows = tables.map((table) => old.prepare(`SELECT * FROM ${table}`).all());
+    old.close();
+    // Initialize the old accounting triggers without running getDb's migration yet.
+    const raw = new Database(dbPath);
+    raw.exec(`CREATE TRIGGER trg_invocation_attribution_changed_at AFTER INSERT ON model_invocation_attribution
+      BEGIN UPDATE dispatch_log SET changed_at = 999 WHERE dispatch_id = NEW.dispatch_id; END`);
+    raw.exec(`CREATE TRIGGER trg_dispatch_log_pruned AFTER DELETE ON dispatch_log
+      BEGIN DELETE FROM model_invocation_attribution WHERE dispatch_id = OLD.dispatch_id; END`);
+    raw.exec(`INSERT INTO dispatch_log (issue_id, dispatched_at, dispatch_id, changed_at)
+      VALUES ('issue-old', 123, 'dispatch-old', 1)`);
+    raw.close();
+
+    for (let boot = 0; boot < 2; boot++) {
+      const upgraded = dedup.getDb();
+      tables.forEach((table, i) => {
+        expect(upgraded.prepare(`SELECT * FROM ${table} WHERE ${i === 0 ? 'profile_id' : 'invocation_id'} = ?`)
+          .all(i === 0 ? 'profile-old' : 'invocation-old')).toEqual(rows[i]);
+      });
+      expect(upgraded.prepare("SELECT changed_at FROM dispatch_log").get()).toEqual({ changed_at: boot === 0 ? 1 : 2 });
+      initLogTable();
+      checkConstraints(upgraded, `boot-${boot}`);
+      expect((upgraded.prepare("SELECT changed_at FROM dispatch_log").get() as { changed_at: number }).changed_at).toBeGreaterThan(2);
+      expect(upgraded.prepare("SELECT name FROM pragma_index_info('idx_model_invocation_attribution_dispatch') ORDER BY seqno").all())
+        .toEqual([{ name: 'dispatch_id' }, { name: 'stage' }]);
+      upgraded.exec("UPDATE dispatch_log SET changed_at = 2");
+      const version = upgraded.pragma('schema_version', { simple: true });
+      dedup.closeDb();
+      expect(dedup.getDb().pragma('schema_version', { simple: true })).toBe(version);
+      dedup.closeDb();
+    }
   });
 });

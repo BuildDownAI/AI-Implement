@@ -1,11 +1,17 @@
 import { spawnSync } from "node:child_process";
+import { parseSourceResults } from "../../kg-source-results.js";
+import type { SourceResult } from "../../kg-source-results.js";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { getPublicationCredential } from "../../publication-credential.js";
 import { openOrFindPullRequest } from "../step-utils.js";
 import { postPrComment } from "../../github.js";
-import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./kg-tracker-data.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml, readTrackerRecords } from "./kg-tracker-data.js";
+
+/** Head-branch prefix of the rail's own snapshot PRs; the PR-check webhook ignores PRs from it. */
+export const KG_SNAPSHOT_BRANCH_PREFIX = "kg-refresh/";
 
 /** Coded failure raised when the snapshot parts or embeddings file are absent. */
 export class KgSnapshotMissingError extends Error {
@@ -13,6 +19,46 @@ export class KgSnapshotMissingError extends Error {
   constructor(detail: string) {
     super(`KG_SNAPSHOT_MISSING: ${detail}`);
   }
+}
+
+/** GitHub rejects a pushed file over 100 MB; refuse above this margin under it. */
+export const SNAPSHOT_MAX_FILE_BYTES = 95 * 1024 * 1024;
+
+/** Coded failure raised when a file under snapshot/ is too large for GitHub to accept. */
+export class KgSnapshotFileTooLargeError extends Error {
+  readonly code = "KG_SNAPSHOT_FILE_TOO_LARGE";
+  readonly files: Array<{ path: string; bytes: number }>;
+  constructor(files: Array<{ path: string; bytes: number }>) {
+    const list = files.map((f) => `${f.path} (${(f.bytes / (1024 * 1024)).toFixed(2)} MB)`).join(", ");
+    super(
+      `KG_SNAPSHOT_FILE_TOO_LARGE: ${list} exceed${files.length === 1 ? "s" : ""} the ${SNAPSHOT_MAX_FILE_BYTES / (1024 * 1024)} MB per-file limit (GitHub rejects files over 100 MB). ` +
+        "Update the KG repo to a KGB version that splits oversized parts into numbered pieces.",
+    );
+    this.files = files;
+  }
+}
+
+/** Every regular file under `dir` (recursive) larger than the limit; a missing dir yields none. */
+function findOversizedFiles(root: string, dir: string): Array<{ path: string; bytes: number }> {
+  if (!existsSync(dir)) return [];
+  const out: Array<{ path: string; bytes: number }> = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...findOversizedFiles(root, full));
+    } else if (entry.isFile()) {
+      const bytes = statSync(full).size;
+      if (bytes > SNAPSHOT_MAX_FILE_BYTES) out.push({ path: relative(root, full).split(sep).join("/"), bytes });
+    }
+  }
+  return out;
+}
+
+/** Logical part of a file name: a piece `<part>.<NN>.nt` maps to `<part>.nt`; any other name is its own part. */
+export function logicalPartName(file: string): string {
+  const base = file.split("/").pop() ?? file;
+  const m = /^(.+)\.\d{2,}\.nt$/.exec(base);
+  return m ? `${m[1]}.nt` : base;
 }
 
 /** Coded failure raised when the snapshot stamp is not newer than the previous one. */
@@ -36,6 +82,83 @@ export class KgSnapshotTrackerRegressionError extends Error {
     super(`KG_SNAPSHOT_TRACKER_REGRESSION: ${detail}`);
     this.partTable = partTable;
   }
+}
+
+/**
+ * Coded failure raised after a soft shrink (zero-shrink or 50% rule, no missing part)
+ * has pushed its snapshot branch and opened the PR. The run is held, never a success:
+ * the orchestrator decides whether to merge or close the PR.
+ */
+export class KgSnapshotHeldError extends Error {
+  readonly code = "KG_SNAPSHOT_HELD";
+  readonly partTable: Array<{ part: string; prev: string; new: string }>;
+  /** Null only when no target repo identity was available, so the branch pushed without a PR. */
+  readonly prNumber: number | null;
+  readonly commitSha: string | null;
+  readonly branchName: string;
+  /** Why the run waits: a content shrink, or tracker data that could not be read. */
+  readonly cause: "shrink" | "tracker-missing" | "source-failed";
+  /** Teams whose tracker fetch failed; empty for a shrink. */
+  readonly failedTeams: string[];
+  /** Per-source results (tracker + ingest) for the operator's decision. */
+  readonly sources: SourceResult[];
+  /** True when accepting would publish a graph without a skipped or failed team's served issues; the gate then offers cancel only. */
+  readonly acceptBlocked: boolean;
+  /** Skipped or failed teams that have issues in the served snapshot. */
+  readonly lostTeams: LostTeam[];
+  constructor(
+    detail: string,
+    partTable: Array<{ part: string; prev: string; new: string }>,
+    prNumber: number | null,
+    commitSha: string | null,
+    branchName: string,
+    cause: "shrink" | "tracker-missing" | "source-failed" = "shrink",
+    failedTeams: string[] = [],
+    sources: SourceResult[] = [],
+    acceptBlocked = false,
+    lostTeams: LostTeam[] = [],
+  ) {
+    super(`KG_SNAPSHOT_HELD: ${detail}`);
+    this.partTable = partTable;
+    this.prNumber = prNumber;
+    this.commitSha = commitSha;
+    this.branchName = branchName;
+    this.cause = cause;
+    this.failedTeams = failedTeams;
+    this.sources = sources;
+    this.acceptBlocked = acceptBlocked;
+    this.lostTeams = lostTeams;
+  }
+}
+
+/** A skipped or failed tracker team whose issues the served snapshot carries. */
+export interface LostTeam {
+  team: string;
+  /** Issue count in the served snapshot; -1 when the served issue.nt could not be read, which counts as lost. */
+  servedIssues: number;
+}
+
+/** Team name of a `tracker:<team>` source row; null for any other row, including the team-less "no trackers" row. */
+function trackerTeamOf(row: SourceResult): string | null {
+  return row.kind === "tracker" && row.source.startsWith("tracker:") ? row.source.slice("tracker:".length) : null;
+}
+
+/** Count the `trackerTeam "<team>"` literals in an issue.nt body: one per served issue of that team. */
+function countTeamIssues(issueNt: string, team: string): number {
+  const escaped = team.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`onto#trackerTeam>?\\s+"${escaped}"`);
+  return issueNt.split("\n").filter((line) => re.test(line)).length;
+}
+
+/** The distinct `trackerTeam "<literal>"` values in an issue.nt body. */
+function servedTeamLiterals(issueNt: string): Set<string> {
+  const out = new Set<string>();
+  const re = /onto#trackerTeam>?\s+"([^"]*)"/;
+  for (const line of issueNt.split("\n")) {
+    const m = re.exec(line);
+    if (m) out.add(m[1]);
+  }
+  return out;
 }
 
 /** Refuse a part that shrinks below this fraction of its previous line count. */
@@ -62,16 +185,6 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
    */
   dryRun?: boolean;
   /**
-   * When true (AII-628): downgrade the zero-shrink and 50%-shrink content regressions
-   * (guard 0b) from a refusal to a warning for this one run — the shrink still appears
-   * in the printed table and the refresh PR's ### Baseline section, but the push proceeds.
-   * Does not affect the "missing part" rule or the fetched=false tracker guard (guard 0),
-   * both of which stay hard refusals regardless of this flag.
-   */
-  acceptNewBaseline?: boolean;
-  /** Email of the admin who set acceptNewBaseline — logged and written into the ### Baseline section. */
-  baselineActor?: string;
-  /**
    * Target repo, from the clone step's outputs. When both are present the push
    * sets `origin` to a token-in-URL remote with the run's active primary token —
    * the same push shape as `push.ts` — so no credential helper decides the push.
@@ -93,9 +206,17 @@ interface KgSnapshotPushOutputs extends Record<string, unknown> {
   /** The per-refresh branch (`kg-refresh/<stamp>`) the snapshot was pushed to. Null when nothing was pushed. */
   branchName: string | null;
   /** Set only in dry-run mode (AII-632): "clean" once every guard above has passed. */
-  guardVerdict?: "clean";
+  guardVerdict?: "clean" | "warnings";
   /** Set only in dry-run mode (AII-632): the per-part {part, prev, new} rows from the report table. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
+  /** Per-source results (tracker teams, repos, docs sites). */
+  sources?: SourceResult[];
+  /** True when the run is held and accepting would drop a skipped or failed team's served issues. */
+  acceptBlocked?: boolean;
+  /** Skipped or failed teams with issues in the served snapshot. */
+  lostTeams?: LostTeam[];
+  /** Warnings on a run that completed: skipped or failed teams with no served issues, or a dry run's tracker problem. */
+  warnings?: string[];
 }
 
 interface KgStats {
@@ -220,17 +341,29 @@ function readCodeRepoOutcome(workspaceDir: string): { slug: string; empty: boole
   return { slug: codeRepo.slug, empty };
 }
 
+/** Escape a value for a Markdown table cell. */
+function cell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
+/** Tracker entries win over ingest entries for the same source: only the tracker step saw the fetch. */
+function mergeSources(trackerPart: SourceResult[], ingestPart: SourceResult[]): SourceResult[] {
+  const trackerKeys = new Set(trackerPart.map((r) => r.source));
+  return [...ingestPart.filter((r) => !trackerKeys.has(r.source)), ...trackerPart];
+}
+
 interface RefreshReportInputs {
   stampCompact: string;
   quads: number | null;
   partRows: Array<{ part: string; prev: string; next: string; delta: string }>;
   teamCounts: Array<{ team: string; count: number }>;
+  sources: SourceResult[];
   secondaryRepos: Array<{ slug: string; branch: string; commit: string }>;
   ingestWarnings: string[];
   guardVerdict: string;
   scope: { addedRepos: string[]; addedTeams: string[]; mappedProjectCount: number };
-  /** Set only when acceptNewBaseline overrode a content regression this run (AII-628). */
-  baseline?: { actor: string; shrunkParts: string[] };
+  /** Blockquote warning placed above the heading (tracker data missing). */
+  warning?: string;
 }
 
 /**
@@ -240,6 +373,7 @@ interface RefreshReportInputs {
  */
 function buildRefreshReport(data: RefreshReportInputs): string {
   const lines: string[] = [
+    ...(data.warning ? [data.warning, ""] : []),
     `## kg-refresh report — ${data.stampCompact}`,
     "",
     `**Guard verdict:** ${data.guardVerdict}`,
@@ -253,24 +387,24 @@ function buildRefreshReport(data: RefreshReportInputs): string {
     lines.push("| _(no previous snapshot to diff against)_ | | | |");
   } else {
     for (const row of data.partRows) {
-      // AII-628: mark the row whose shrink acceptNewBaseline overrode, so the table itself says which part was accepted.
-      const accepted = data.baseline?.shrunkParts.includes(row.part) ? " ← accepted" : "";
-      lines.push(`| ${row.part} | ${row.prev} | ${row.next} | ${row.delta}${accepted} |`);
+      lines.push(`| ${row.part} | ${row.prev} | ${row.next} | ${row.delta} |`);
     }
-  }
-  if (data.baseline) {
-    lines.push(
-      "",
-      "### Baseline",
-      "",
-      `Accepted by ${data.baseline.actor}. This run pushed despite a content regression the zero-shrink/50% guards would otherwise have refused — shrunk part(s): ${data.baseline.shrunkParts.join(", ")}.`,
-    );
   }
   lines.push("", `**Quads serialized:** ${data.quads ?? "unknown"}`, "", "### Issues by team", "");
   if (data.teamCounts.length === 0) {
     lines.push("_(no tracker data fetched this run)_");
   } else {
     for (const tc of data.teamCounts) lines.push(`- ${tc.team}: ${tc.count}`);
+  }
+  lines.push("", "### Sources", "");
+  if (data.sources.length === 0) {
+    lines.push("_(no per-source results reported)_");
+  } else {
+    lines.push("| Source | Status | Reason | Counts |", "|---|---|---|---|");
+    for (const r of data.sources) {
+      const counts = Object.entries(r.counts).map(([k, v]) => `${k}: ${v}`).join(", ");
+      lines.push(`| ${cell(r.source)} | ${r.status} | ${cell(r.reason)} | ${cell(counts)} |`);
+    }
   }
   lines.push("", "### Secondary repositories", "");
   if (data.secondaryRepos.length === 0) {
@@ -309,7 +443,7 @@ const LEARNINGS_MARKER = "# ai-implement-kg-refresh-learnings";
  */
 const COUNT_STEP_LEARNING_THRESHOLD = 0.2;
 
-export type RefreshAnomalyClass = "guard-refused" | "source-missing" | "count-step" | "ingest-warnings";
+export type RefreshAnomalyClass = "guard-refused" | "guard-held" | "source-missing" | "count-step" | "ingest-warnings";
 
 export interface RefreshAnomaly {
   class: RefreshAnomalyClass;
@@ -321,12 +455,10 @@ export interface RefreshAnomaly {
 
 interface ClassifyRefreshAnomalyInput {
   /**
-   * "clean" once every push guard has passed. At the one call site in this file
-   * (after openOrFindPullRequest resolves) this is always "clean" — a non-clean
-   * guard verdict throws before any push or PR exists, so nothing survives to be
-   * classified. This param exists so the classifier stays generic for a future
-   * guard that reports a verdict instead of throwing, and so it can be tested in
-   * isolation with a non-clean verdict without needing that guard to exist yet.
+   * "clean" once every push guard has passed; "held" for a soft shrink, where the
+   * snapshot is pushed and the PR is open but waits for an operator decision. Any
+   * other non-clean value classifies as "guard-refused" — no call site passes one
+   * today, since a refusal throws before any push or PR exists.
    */
   guardVerdict: string;
   partRows: Array<{ part: string; prev: string; next: string; delta: string }>;
@@ -344,12 +476,36 @@ interface ClassifyRefreshAnomalyInput {
   ingestWarnings: string[];
 }
 
+function shrunkRows(rows: ClassifyRefreshAnomalyInput["partRows"]): ClassifyRefreshAnomalyInput["partRows"] {
+  return rows.filter((r) => {
+    const prev = Number(r.prev);
+    const next = Number(r.next);
+    return Number.isFinite(prev) && Number.isFinite(next) && next < prev;
+  });
+}
+
+function partShrinkFacts(rows: ClassifyRefreshAnomalyInput["partRows"]): string[] {
+  const shrunk = shrunkRows(rows);
+  return [
+    "gate verdict: held",
+    ...shrunk.map((r) => `${r.part}: ${r.prev} → ${r.next} lines (${r.delta})`),
+  ];
+}
+
+function heldSubjects(rows: ClassifyRefreshAnomalyInput["partRows"]): string[] {
+  const shrunk = shrunkRows(rows);
+  return shrunk.length > 0 ? shrunk.map((r) => r.part) : ["held"];
+}
+
 /**
- * Classifies a refresh into at most one of the four learning classes, in the
- * precedence order the ticket lists them (guard-refused, source-missing,
+ * Classifies a refresh into at most one of the five learning classes, in the
+ * precedence order the ticket lists them (guard-held, guard-refused, source-missing,
  * count-step, ingest-warnings). Returns null for a clean run — nothing to post.
  */
 export function classifyRefreshAnomaly(input: ClassifyRefreshAnomalyInput): RefreshAnomaly | null {
+  if (input.guardVerdict === "held") {
+    return { class: "guard-held", facts: partShrinkFacts(input.partRows), subjects: heldSubjects(input.partRows) };
+  }
   if (input.guardVerdict !== "clean") {
     return { class: "guard-refused", facts: [`gate verdict: ${input.guardVerdict}`], subjects: [input.guardVerdict] };
   }
@@ -399,6 +555,7 @@ export function classifyRefreshAnomaly(input: ClassifyRefreshAnomalyInput): Refr
 /** Mechanical, factual explanation per class — never speculation about root cause. */
 const CLASS_WHY: Record<RefreshAnomalyClass, string> = {
   "guard-refused": "The push guard reported a non-clean verdict; the gate text above is the guard's own reasoning for refusing the push.",
+  "guard-held": "The push guard held a shrink: the snapshot was pushed and this PR is open, and it waits for an operator decision to merge or close it.",
   "source-missing": "clone-secondary-repos soft-fails per entry rather than aborting the pipeline, so a failed or skipped clone for a secondary repo leaves no repos/<slug> checkout without failing the run; a configured code repo whose checkout has no content is included here too, since kg-ingest only checks that a code-repo directory was produced, not that it has content.",
   "count-step": `The push guard only refuses a part below ${PART_SHRINK_THRESHOLD * 100}% of its previous line count (or any shrink of a non-empty tracker part); a move past the ${COUNT_STEP_LEARNING_THRESHOLD * 100}% learnings threshold in either direction clears that guard but is still a large enough step to record.`,
   "ingest-warnings": "ai-output/kg-ingest.log recorded at least one WARN or ERROR line during this run's ingest; the lines above are copied verbatim.",
@@ -456,11 +613,30 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null };
     }
 
-    const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, acceptNewBaseline, baselineActor, repoOwner, repoRepo } = inputs;
+    const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
+
+    // ── Size check ───────────────────────────────────────────────────────────
+    // Runs first (before the dry-run exit in guard 0b and before any commit): GitHub refuses
+    // files over 100 MB, so refuse here with a clear message rather than fail at push time.
+    const oversized = findOversizedFiles(workspaceDir, join(workspaceDir, "snapshot"));
+    if (oversized.length > 0) throw new KgSnapshotFileTooLargeError(oversized);
+
     /** Per-part "prev/new/delta" rows for the report table. Populated by guard 0b when a previous snapshot exists. */
     const partRows: Array<{ part: string; prev: string; next: string; delta: string }> = [];
-    /** Part names whose shrink was overridden by acceptNewBaseline this run (AII-628); populated by guard 0b. */
-    const acceptedShrinkParts: string[] = [];
+    /** Set by guard 0b on a soft-only shrink in a real run: push and open the PR, then throw KgSnapshotHeldError. */
+    let held = false;
+    let heldDetail = "";
+    let heldCause: "shrink" | "tracker-missing" | "source-failed" = "shrink";
+    /** Teams whose tracker fetch failed; set with heldCause "tracker-missing". */
+    let failedTeams: string[] = [];
+    /** True when fetched=false and the cloned snapshot has a tracker part: tracker parts may be missing or smaller. */
+    let trackerMissing = false;
+    /** Skipped or failed teams that have issues in the served snapshot; blocks Accept at the gate. */
+    let lostTeams: LostTeam[] = [];
+    /** Skipped or failed teams with no served issues: the snapshot publishes, with a warning. */
+    let emptyTeams: string[] = [];
+    /** Set by guard 0b when the only problem is skipped or failed tracker sources: complete with warnings. */
+    let trackerWarning = false;
 
     // ── 0. Tracker regression guard ──────────────────────────────────────────
     // If the tracker-data step did not fetch (fetched=false) and the previous
@@ -468,21 +644,58 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // replace a tracker-enriched one.
     const trackerOutputs = context.getOutputs("kg-tracker-data");
     const trackerFetched = trackerOutputs.fetched === true;
-    if (!trackerFetched && clonedRef && clonedRef !== "unknown") {
+    const rawFailedTeams = trackerOutputs.failedTeams;
+    // A skipped team (404, "no mapping") is in teamResults only, never in failedTeams.
+    const affectedTeams = [
+      ...new Set([
+        ...(Array.isArray(rawFailedTeams) ? rawFailedTeams.filter((t): t is string => typeof t === "string") : []),
+        ...parseSourceResults(trackerOutputs.teamResults)
+          .filter((r) => r.status !== "success")
+          .map(trackerTeamOf)
+          .filter((t): t is string => t !== null),
+      ]),
+    ];
+    if ((!trackerFetched || affectedTeams.length > 0) && clonedRef && clonedRef !== "unknown") {
       const lsTreeResult = spawnSync(
         "git", ["ls-tree", "--name-only", clonedRef, "--", "snapshot/parts/"],
         { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
       );
       const previousTrackerFiles = lsTreeResult.status === 0
         ? lsTreeResult.stdout.toString().split("\n").filter((f) => {
-            const base = f.trim().split("/").pop() ?? "";
-            return TRACKER_NT_FILES.has(base);
+            return TRACKER_NT_FILES.has(logicalPartName(f.trim()));
           })
         : [];
       if (previousTrackerFiles.length > 0) {
-        throw new KgSnapshotTrackerRegressionError(
-          `tracker-data step reported fetched=false but previous snapshot has tracker file(s) (${previousTrackerFiles.join(", ")}) — refusing to push a docs-only graph`,
+        // Not a refusal: guard 0b computes the part table, then the run holds only when a skipped or
+        // failed team has issues in the served snapshot; otherwise it completes with a warning.
+        trackerMissing = true;
+        failedTeams = affectedTeams;
+        heldCause = "tracker-missing";
+        heldDetail = `tracker-data step reported ${trackerFetched ? "skipped" : "fetched=false"}${failedTeams.length > 0 ? ` (teams: ${failedTeams.join(", ")})` : ""} but previous snapshot has tracker file(s) (${previousTrackerFiles.join(", ")})`;
+        // Count from the clone: the working tree already holds the new, reduced issue.nt.
+        // The served issue part may be split into pieces (issue.nt or issue.NN.nt); read them all.
+        const issuePieces = previousTrackerFiles.map((f) => f.trim()).filter((f) => logicalPartName(f) === "issue.nt");
+        const issueShows = issuePieces.map((f) =>
+          spawnSync(
+            "git",
+            ["show", `${clonedRef}:${f}`],
+            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
+          ),
         );
+        // Only a clone that carries issue.nt can serve issues; a failed read of any piece is unknown, and unknown counts as lost.
+        const hasServedIssueNt = issuePieces.length > 0;
+        const readFailed = hasServedIssueNt && issueShows.some((r) => r.status !== 0 || r.error != null);
+        const servedIssueNt = hasServedIssueNt && !readFailed ? issueShows.map((r) => r.stdout.toString()).join("\n") : "";
+        // A snapshot written by an older ingest holds the identifier prefix, not the sources.yml key. A zero
+        // count is then unreliable: with any served literal that is no tracker key, an empty team is unknown.
+        const trackerKeys = new Set(readTrackerRecords(workspaceDir).map((r) => r.team));
+        const hasForeignLiteral = [...servedTeamLiterals(servedIssueNt)].some((l) => !trackerKeys.has(l));
+        for (const team of affectedTeams) {
+          let servedIssues = readFailed ? -1 : countTeamIssues(servedIssueNt, team);
+          if (servedIssues === 0 && hasForeignLiteral) servedIssues = -1;
+          if (servedIssues !== 0) lostTeams.push({ team, servedIssues });
+          else emptyTeams.push(team);
+        }
       }
     }
 
@@ -511,46 +724,85 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       if (previousParts.length > 0) {
         const issueCount =
           typeof trackerOutputs.issueCount === "number" ? trackerOutputs.issueCount : 0;
-        // "missing" (a part vanishing entirely) is never overridable by acceptNewBaseline —
-        // only the content-shrink rules (zero-shrink, 50%) are (AII-628).
+        // "missing" (a part vanishing entirely) is a hard refusal; the content-shrink
+        // rules (zero-shrink, 50%) are soft: the snapshot PR opens and the run ends held.
         const hardRegressions: string[] = [];
         const softRegressions: string[] = [];
         const partLogLines: string[] = [];
 
+        // Group by logical part so a part split into pieces (or merged back) compares as one.
+        const previousByPart = new Map<string, string[]>();
         for (const partPath of previousParts) {
-          const partName = partPath.split("/").pop()!;
+          const name = logicalPartName(partPath);
+          previousByPart.set(name, [...(previousByPart.get(name) ?? []), partPath]);
+        }
+        const newPartsDir = join(workspaceDir, "snapshot", "parts");
+        const newFiles = existsSync(newPartsDir) ? readdirSync(newPartsDir).filter((f) => f.endsWith(".nt")) : [];
+
+        for (const [partName, partPaths] of previousByPart) {
           // git show buffers the entire file in memory — adequate for current graph scale.
           // Switch to git cat-file --batch streaming if parts grow beyond tens of MB.
-          const prevShowResult = spawnSync(
-            "git",
-            ["show", `${clonedRef}:${partPath}`],
-            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
-          );
-          if (prevShowResult.status !== 0) {
+          let prevLines = 0;
+          let prevFailure: ReturnType<typeof spawnSync> | null = null;
+          let failedPath = "";
+          for (const partPath of partPaths) {
+            const prevShowResult = spawnSync(
+              "git",
+              ["show", `${clonedRef}:${partPath}`],
+              { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1024 * 1024 * 1024 },
+            );
+            if (prevShowResult.status !== 0 || prevShowResult.error != null) {
+              prevFailure = prevShowResult;
+              failedPath = partPath;
+              break;
+            }
+            prevLines += prevShowResult.stdout.toString().split("\n").filter(Boolean).length;
+          }
+          if (prevFailure) {
+            if (trackerMissing && TRACKER_NT_FILES.has(partName)) {
+              // Unreadable served tracker part: the hold built from section 0 already counts it as lost, so
+              // record it as a soft regression rather than crashing before the hold is raised.
+              partLogLines.push(`${partName} prev=unreadable`);
+              partRows.push({ part: partName, prev: "unreadable", next: "—", delta: "—" });
+              softRegressions.push(`${partName}: previous copy unreadable (tracker data missing)`);
+              continue;
+            }
             throw new Error(
-              `git show failed reading previous ${partPath} (exit ${prevShowResult.status ?? "null"}): ${prevShowResult.stderr?.toString().trim() ?? ""}`,
+              `git show failed reading previous ${failedPath} (exit ${prevFailure.status ?? "null"}): ${prevFailure.stderr?.toString().trim() ?? ""}`,
             );
           }
-          const prevLines = prevShowResult.stdout.toString().split("\n").filter(Boolean).length;
 
-          const newPartPath = join(workspaceDir, "snapshot", "parts", partName);
-          if (!existsSync(newPartPath)) {
+          const newPieces = newFiles.filter((f) => logicalPartName(f) === partName);
+          if (newPieces.length === 0) {
             partLogLines.push(`${partName} prev=${prevLines} new=missing`);
             partRows.push({ part: partName, prev: String(prevLines), next: "missing", delta: "—" });
-            hardRegressions.push(`${partName}: missing (was ${prevLines} lines)`);
+            if (trackerMissing && TRACKER_NT_FILES.has(partName)) {
+              softRegressions.push(`${partName}: missing (was ${prevLines} lines; tracker data missing)`);
+            } else {
+              hardRegressions.push(`${partName}: missing (was ${prevLines} lines)`);
+            }
             continue;
           }
 
-          const newLines = readFileSync(newPartPath, "utf-8").split("\n").filter(Boolean).length;
+          const newLines = newPieces.reduce(
+            (sum, f) => sum + readFileSync(join(newPartsDir, f), "utf-8").split("\n").filter(Boolean).length,
+            0,
+          );
           partLogLines.push(`${partName} prev=${prevLines} new=${newLines}`);
           const delta = newLines - prevLines;
           partRows.push({ part: partName, prev: String(prevLines), next: String(newLines), delta: `${delta >= 0 ? "+" : ""}${delta}` });
+
+          if (trackerMissing && TRACKER_NT_FILES.has(partName) && newLines < prevLines) {
+            softRegressions.push(
+              `${partName}: shrank from ${prevLines} to ${newLines} lines (tracker data missing)`,
+            );
+            continue;
+          }
 
           if (TRACKER_NT_FILES.has(partName) && issueCount > 0 && newLines < prevLines) {
             softRegressions.push(
               `${partName}: shrank from ${prevLines} to ${newLines} lines (issueCount=${issueCount}; zero-shrink enforced)`,
             );
-            if (acceptNewBaseline) acceptedShrinkParts.push(partName);
             continue;
           }
 
@@ -558,31 +810,53 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
             softRegressions.push(
               `${partName}: shrank from ${prevLines} to ${newLines} lines (below ${PART_SHRINK_THRESHOLD * 100}% threshold)`,
             );
-            if (acceptNewBaseline) acceptedShrinkParts.push(partName);
           }
         }
 
         console.log(`[kg-snapshot-push] parts: ${partLogLines.join(", ")}`);
 
+        const partTable = partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next }));
         if (hardRegressions.length > 0) {
           throw new KgSnapshotTrackerRegressionError(
             `content regression detected — ${[...hardRegressions, ...softRegressions].join("; ")}`,
-            partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
+            partTable,
           );
         }
 
-        if (softRegressions.length > 0) {
-          if (!acceptNewBaseline) {
-            throw new KgSnapshotTrackerRegressionError(
-              `content regression detected — ${softRegressions.join("; ")}`,
-              partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
-            );
+        // Tracker problems alone: a dry run completes with warnings; a live run holds only when
+        // a team's served issues would be lost (or, with no team named, the fetch is unaccounted for).
+        // A tracker-file shrink is explained only by teams that lose served issues; with none, it is
+        // an unrelated shrink and keeps the hold (live) or refusal (dry run).
+        const trackerOnly =
+          trackerMissing &&
+          softRegressions.every((r) => TRACKER_NT_FILES.has(r.split(":")[0]!)) &&
+          (lostTeams.length > 0 || softRegressions.length === 0);
+        const unaccountedFetch = trackerMissing && !trackerFetched && affectedTeams.length === 0;
+        if (trackerMissing && trackerOnly && !unaccountedFetch && lostTeams.length === 0) {
+          // Publish with a warning (live) or complete with warnings (dry run): no hold.
+          trackerWarning = true;
+        } else if (trackerMissing || softRegressions.length > 0) {
+          const detail = trackerMissing
+            ? [heldDetail, ...softRegressions].join("; ")
+            : `content regression detected — ${softRegressions.join("; ")}`;
+          // A dry run pushes nothing, so there is no PR to hold: it completes with warnings
+          // when the only problem is the tracker; any other soft shrink keeps the refusal.
+          if (dryRun) {
+            if (!(trackerMissing && trackerOnly)) throw new KgSnapshotTrackerRegressionError(detail, partTable);
+            trackerWarning = true;
+          } else {
+            // A shrink still ships its snapshot PR; the run ends held (thrown after the PR opens).
+            held = true;
+            heldDetail = detail;
           }
-          // acceptNewBaseline downgrades the zero-shrink/50% rules to a warning: the
-          // table above already shows the shrink, so just log who accepted it and continue.
-          console.log(`[kg-refresh] baseline accepted by ${baselineActor || "unknown"}`);
         }
       }
+    }
+
+    // A skipped or failed team in a run that never reached the guard (no tracker part in the clone) still warns.
+    if (!trackerMissing && affectedTeams.length > 0) {
+      emptyTeams = affectedTeams;
+      trackerWarning = true;
     }
 
     // ── 1. Validate snapshot/parts/*.nt ─────────────────────────────────────
@@ -661,21 +935,68 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // so the two can never disagree about counts.
     const secondaryRepoOutcomes = readSecondaryRepoOutcomes(workspaceDir);
     const ingestWarnings = readIngestWarnings(workspaceDir);
+    const sources = mergeSources(
+      parseSourceResults(trackerOutputs.teamResults),
+      parseSourceResults(context.getOutputs("kg-ingest").sourceResults),
+    );
     const scope = inputs.scope ?? { addedRepos: [], addedTeams: [], mappedProjectCount: 0 };
-    const baselineAccepted = acceptedShrinkParts.length > 0;
-    const guardVerdictText = dryRun
-      ? (baselineAccepted ? "clean (dry-run — no push; baseline accepted)" : "clean (dry-run — no push)")
-      : (baselineAccepted ? "clean (baseline accepted)" : "clean");
+    // A failed non-tracker source may have left half-written triples (the ingest does not roll back
+    // a source that raised), so a run with one never publishes: live holds with Accept blocked,
+    // a dry run completes with warnings. Skipped sources and tracker rows (guard 0b) are unaffected.
+    const failedSources = sources.filter((s) => s.status === "failed" && s.kind !== "tracker");
+    const failedSourceText = `Source(s) failed: ${failedSources.map((s) => `${s.source}${s.reason ? ` (${s.reason})` : ""}`).join(", ")}; the graph may be partial`;
+    if (failedSources.length > 0 && !dryRun) {
+      if (held) {
+        heldDetail = [heldDetail, failedSourceText].join("; ");
+      } else {
+        held = true;
+        heldCause = "source-failed";
+        heldDetail = failedSourceText;
+      }
+    }
+    const acceptBlocked =
+      held && ((heldCause === "tracker-missing" && lostTeams.length > 0) || failedSources.length > 0);
+    const warnings: string[] = [];
+    if (failedSources.length > 0 && dryRun) warnings.push(failedSourceText);
+    if (trackerWarning && !held) {
+      const names = [...lostTeams.map((t) => t.team), ...emptyTeams];
+      if (names.length > 0) warnings.push(`Tracker data was skipped or failed for team(s): ${names.join(", ")}`);
+      else warnings.push("Tracker data was not fetched this run");
+    }
+    const guardVerdictText = held
+      ? heldCause === "source-failed"
+        ? "held — " + failedSourceText
+        : heldCause === "tracker-missing"
+        ? acceptBlocked
+          ? "held — accepting would drop served issues of: " + lostTeams.map((t) => `${t.team} (${t.servedIssues < 0 ? "unknown" : t.servedIssues})`).join(", ")
+          : "held — tracker data is missing and the run waits for an operator decision"
+        : "held — a shrink waits for an operator decision"
+      : warnings.length > 0
+        ? dryRun
+          ? "warnings (dry-run — no push)"
+          : "warnings"
+        : dryRun
+          ? "clean (dry-run — no push)"
+          : "clean";
     const reportBody = buildRefreshReport({
       stampCompact,
       quads: stats?.quads ?? null,
       partRows,
       teamCounts,
+      sources,
       secondaryRepos: secondaryRepoOutcomes,
       ingestWarnings,
       guardVerdict: guardVerdictText,
       scope,
-      ...(baselineAccepted ? { baseline: { actor: baselineActor || "unknown", shrunkParts: acceptedShrinkParts } } : {}),
+      warning: held && heldCause === "source-failed"
+        ? `> ⚠️ ${failedSourceText}.`
+        : held && heldCause === "tracker-missing"
+        ? failedTeams.length > 0
+          ? `> ⚠️ Tracker data could not be read for team(s): ${failedTeams.join(", ")}. The tracker parts of this snapshot are missing or reduced.`
+          : "> ⚠️ Tracker data was not fetched this run. The tracker parts of this snapshot are missing or reduced."
+        : warnings.length > 0
+          ? `> ⚠️ ${warnings.join("; ")}.`
+          : undefined,
     });
 
     // ── dry-run exit ─────────────────────────────────────────────────────────
@@ -689,8 +1010,10 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         commitSha: null,
         prNumber: null,
         branchName: null,
-        guardVerdict: "clean",
+        guardVerdict: warnings.length > 0 ? "warnings" : "clean",
         partTable: partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
+        sources,
+        ...(warnings.length > 0 ? { warnings } : {}),
       };
     }
 
@@ -727,17 +1050,22 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // ── 6. Push to a per-refresh branch and open the refresh PR ──────────────
     // Refresh the dispatch-time token immediately before the push — the same
     // pattern as push.ts. In Fly/local-docker mode the machine nonce re-mints a
-    // fresh token; in GHA mode this returns the current token unchanged.
+    // fresh token; in GHA mode the single-use publication credential does (the
+    // dispatch-time token expires after ~1h, which a long ingest can outlast).
+    // Read after the dry-run exit so a dry run never consumes the credential;
+    // no earlier kg-refresh step exchanges it. Absent when the workflow does not
+    // support it, in which case the current token comes back unchanged.
     const activeGithubToken = await refreshRunnerGithubCredentials({
       currentToken: githubToken,
       orchestratorUrl: inputs.orchestratorUrl,
       machineNonce: inputs.machineNonce,
       callbackUrl: inputs.callbackUrl,
+      publicationToken: getPublicationCredential(),
       owner: repoOwner ?? "",
       repo: repoRepo ?? "",
       workspaceDir,
     });
-    const branchName = `kg-refresh/${stampCompact}`;
+    const branchName = `${KG_SNAPSHOT_BRANCH_PREFIX}${stampCompact}`;
     // Push with that token embedded in the origin URL — the shape push.ts uses.
     // The entrypoint strips the token from origin at start, and in GitHub Actions
     // mode the refresh does not re-embed it, so without this the push falls to
@@ -766,7 +1094,8 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       // Dev/test scenario with no target repo identity: the branch pushed, but there is
       // nothing to build a GitHub API URL from, so the refresh PR cannot be opened.
       console.warn("[kg-snapshot-push] repoOwner/repoRepo absent — pushed the branch but skipped opening the refresh PR");
-      return { snapshotPushed: true, commitSha, prNumber: null, branchName };
+      if (held) throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), null, commitSha, branchName, heldCause, failedTeams, sources, acceptBlocked, lostTeams);
+      return { snapshotPushed: true, commitSha, prNumber: null, branchName, sources, ...(warnings.length > 0 ? { warnings } : {}) };
     }
 
     const quadsLabel = stats?.quads != null ? String(stats.quads) : "?";
@@ -788,7 +1117,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // disagree. Best-effort: the snapshot already pushed and the PR is already
     // open, so a comment failure should not fail an otherwise-successful refresh.
     const anomaly = classifyRefreshAnomaly({
-      guardVerdict: "clean",
+      guardVerdict: held ? "held" : "clean",
       partRows,
       configuredSecondaryRepos: readSecondaryReposFromSourcesYml(workspaceDir),
       secondaryRepoOutcomes,
@@ -804,7 +1133,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       }
     }
 
-    return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName };
+    if (held) {
+      throw new KgSnapshotHeldError(heldDetail, partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })), pr.number, commitSha, branchName, heldCause, failedTeams, sources, acceptBlocked, lostTeams);
+    }
+
+    return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName, sources, ...(warnings.length > 0 ? { warnings } : {}) };
   },
 };
 

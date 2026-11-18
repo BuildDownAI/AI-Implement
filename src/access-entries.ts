@@ -3,8 +3,9 @@
  *
  * One row per entry — a whole email domain, or one address.
  * - A domain admits as`user`; only a listed address may carry `admin`
- * - `provider`/`subject` bind on first successful sign-in and match from then on, so a rename keeps its role
- * and a reassigned address inherits nothing.
+ * - An address binds once per sign-in provider, on first successful sign-in through it (`access_entry_bindings`,
+ * written by the `AccessBinding` Restate object). A bound provider matches on its subject alone, so a rename
+ * keeps its role and a reassigned address inherits nothing; an unbound provider matches on the email.
  */
 
 import { recordAccessChange, type AccessAuditAction } from "./access-audit.js";
@@ -36,10 +37,14 @@ export interface AccessEntry {
   kind: AccessEntryKind;
   value: string;
   role: AccessRole;
-  provider: string | null;
-  subject: string | null;
+  bindings: AccessBinding[];
   addedAt: number;
   addedBy: string | null;
+}
+
+export interface AccessBinding {
+  provider: string;
+  subject: string;
 }
 
 export interface AccessEntryInput {
@@ -52,8 +57,6 @@ interface AccessEntryRow {
   kind: string;
   value: string;
   role: string;
-  provider: string | null;
-  subject: string | null;
   added_at: number;
   added_by: string | null;
 }
@@ -64,6 +67,7 @@ const DOMAIN_SHAPE = /^[^\s@.]+(\.[^\s@.]+)+$/;
 
 let cached: EffectiveAllowlist | null = null;
 let cachedAt = 0;
+let allowlistReadAvailable = false;
 
 /**
  * How long a cached list serves before it is re-read: one poll interval, so a write from another
@@ -89,14 +93,95 @@ export function initAccessEntriesTable(): void {
       PRIMARY KEY (kind, value)
     )
   `);
+  // No foreign key: access_entries is keyed (kind, value), and an env-seeded address has no row there.
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS access_entry_bindings (
+      value    TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      subject  TEXT NOT NULL,
+      bound_at INTEGER NOT NULL,
+      PRIMARY KEY (value, provider)
+    )
+  `);
+  // Roles granted by the BuildDown organization claim, so the per-request re-check can honour them.
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS org_claim_roles (
+      email    TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      subject  TEXT NOT NULL,
+      role     TEXT NOT NULL,
+      PRIMARY KEY (email, provider)
+    )
+  `);
+  // Added after the table first shipped; rows from before it expire at once, so they cost one re-sign-in.
+  const claimCols = getDb().prepare("PRAGMA table_info(org_claim_roles)").all() as { name: string }[];
+  if (!claimCols.some((c) => c.name === "expires_at")) {
+    getDb().exec("ALTER TABLE org_claim_roles ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0");
+  }
+  // The legacy columns stay for rollback but are read only here, once per entry.
+  getDb().exec(`
+    INSERT OR IGNORE INTO access_entry_bindings (value, provider, subject, bound_at)
+    SELECT value, provider, subject, added_at FROM access_entries
+    WHERE kind = 'address' AND provider IS NOT NULL AND subject IS NOT NULL
+  `);
 }
 
-/** Re-check a persisted identity against the list in force. */
+/** Re-check a persisted identity against the list in force, and the organization role its last sign-in recorded. */
 export function recheckIdentity(identity: MatchableIdentity): RecheckResult {
   const allowlist = getEffectiveAllowlist();
   if (!allowlist) return { status: "unavailable" };
-  const entry = matchAccessEntry(identity, allowlist.entries);
+  const entry = matchAccessEntryOrOrgClaim(identity, allowlist.entries);
   return entry ? { status: "ok", entry } : { status: "denied" };
+}
+
+/**
+ * How long a claim-granted role outlives the sign-in that read it. Refresh families live for weeks, so
+ * without a bound a person removed from the organization would keep access until they chose to sign in
+ * again; after this window refresh fails and the client must sign in through BuildDown, re-reading the role.
+ */
+export const ORG_CLAIM_ROLE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Record the role the organization claim granted at sign-in; the next sign-in rewrites or clears it. Called only by `AccessBinding`. */
+export function recordOrgClaimRole(identity: MatchableIdentity, role: AccessRole, expiresAt: number): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO org_claim_roles (email, provider, subject, role, expires_at) VALUES (?, ?, ?, ?, ?)")
+    .run((identity.email ?? "").trim().toLowerCase(), identity.provider, identity.sub, role, expiresAt);
+}
+
+/** Forget the claim-granted role: a sign-in without the claim ends the access it gave. Called only by `AccessBinding`. */
+export function clearOrgClaimRole(identity: { email: string | null; provider: string }): number {
+  return getDb()
+    .prepare("DELETE FROM org_claim_roles WHERE email = ? AND provider = ?")
+    .run((identity.email ?? "").trim().toLowerCase(), identity.provider).changes;
+}
+
+/** True when a claim-role row exists for the identity (expired or not), so a sign-in knows whether a clear is needed. */
+export function hasOrgClaimRole(identity: { email: string | null; provider: string }): boolean {
+  return !!getDb()
+    .prepare("SELECT 1 FROM org_claim_roles WHERE email = ? AND provider = ?")
+    .get((identity.email ?? "").trim().toLowerCase(), identity.provider);
+}
+
+/** A stored match, or the synthetic entry for an unexpired recorded claim role (same subject only); the higher role wins. */
+export function matchAccessEntryOrOrgClaim(
+  identity: MatchableIdentity,
+  entries: AccessEntry[],
+  now: number = Date.now(),
+): AccessEntry | null {
+  const stored = matchAccessEntry(identity, entries);
+  if (identity.provider !== "builddown" || stored?.role === "admin") return stored;
+  const email = (identity.email ?? "").trim().toLowerCase();
+  const row = getDb()
+    .prepare("SELECT role FROM org_claim_roles WHERE email = ? AND provider = ? AND subject = ? AND expires_at > ?")
+    .get(email, identity.provider, identity.sub, now) as { role: string } | undefined;
+  if (!row || (row.role !== "admin" && row.role !== "user")) return stored;
+  if (stored && row.role === "user") return stored;
+  return { kind: "address", value: email, role: row.role, bindings: [], addedAt: 0, addedBy: null };
+}
+
+/** True when the entry already holds this identity's binding, so a sign-in needs no write (and no Restate). */
+export function isBoundTo(entry: AccessEntry, identity: { provider: string; sub: string }): boolean {
+  return entry.bindings.some((b) => b.provider === identity.provider && b.subject === identity.sub);
 }
 
 /** The entry admitting this identity, or null. Entries arrive normalized; only the identity is folded here. */
@@ -107,10 +192,12 @@ export function matchAccessEntry(identity: MatchableIdentity, entries: AccessEnt
   // An address outranks a domain: it is the more specific grant and the only one carrying a role.
   for (const entry of entries) {
     if (entry.kind !== "address") continue;
-    if (entry.provider && entry.subject) {
-      // Bound entries match on the provider identity alone, so a reassigned address inherits nothing.
-      if (entry.provider === identity.provider && entry.subject === identity.sub) return entry;
+    const bound = entry.bindings.find((b) => b.provider === identity.provider);
+    if (bound) {
+      // A bound provider matches on its subject alone, so a reassigned address inherits nothing there.
+      if (bound.subject === identity.sub) return entry;
     } else if (entry.value === email) {
+      // Unbound for this provider: the caller binds it through AccessBinding.
       return entry;
     }
   }
@@ -124,13 +211,18 @@ export function matchAccessEntry(identity: MatchableIdentity, entries: AccessEnt
   return null;
 }
 
+/** Whether the list names an admin, which only an address entry can be. */
+export function hasAdminAddress(entries: readonly AccessEntry[]): boolean {
+  return entries.some((e) => e.kind === "address" && e.role === "admin");
+}
+
 /** The list in force admits people but nobody as admin: sign-in works, administering it does not. */
 export function allowlistHasNoAdmin(): boolean {
   const list = getEffectiveAllowlist();
   if (!list) return false;
   // Checked, not assumed: only the env seed reaches this while the last-admin guard holds, which is
   // why callers name OAUTH_ALLOWED_EMAILS — reword them if a stored list ever can.
-  return list.entries.length > 0 && !list.entries.some((e) => e.kind === "address" && e.role === "admin");
+  return list.entries.length > 0 && !hasAdminAddress(list.entries);
 }
 
 /** The list in force. Null only when no list has ever loaded — callers must deny. */
@@ -139,15 +231,24 @@ export function getEffectiveAllowlist(): EffectiveAllowlist | null {
   return cached;
 }
 
+/** Whether the latest stored-list read succeeded, independently of the last good entries.
+ * Call after getEffectiveAllowlist so an expired cache has been refreshed first.
+ */
+export function isAllowlistReadAvailable(): boolean {
+  return allowlistReadAvailable;
+}
+
 /** Re-read after a write, or once the cached list has aged out. */
 export function refreshEffectiveAllowlist(): void {
   try {
     const stored = listAccessEntries();
     cached = stored.length > 0
       ? { entries: stored, source: "db" }
-      : { entries: allowlistFromEnv(process.env), source: "env" };
+      : { entries: withBindings(allowlistFromEnv(process.env), loadBindings()), source: "env" };
     cachedAt = Date.now();
+    allowlistReadAvailable = true;
   } catch (err) {
+    allowlistReadAvailable = false;
     if (cached) {
       // Back off to one attempt per window: the last good list serves correctly meanwhile, and
       // retrying per request would warn on every one.
@@ -161,16 +262,16 @@ export function refreshEffectiveAllowlist(): void {
 }
 
 /** The env values, which apply until the first save hands authority to the stored list. */
-function allowlistFromEnv(env: NodeJS.ProcessEnv): AccessEntry[] {
+export function allowlistFromEnv(env: NodeJS.ProcessEnv): AccessEntry[] {
   const split = (raw: string | undefined) =>
     (raw || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   // addedAt 0: env entries are synthesized per read and carry no provenance.
   return [
     ...split(env.OAUTH_ALLOWED_DOMAINS).map((value): AccessEntry => ({
-      kind: "domain", value, role: "user", provider: null, subject: null, addedAt: 0, addedBy: null,
+      kind: "domain", value, role: "user", bindings: [], addedAt: 0, addedBy: null,
     })),
     ...split(env.OAUTH_ALLOWED_EMAILS).map((value): AccessEntry => ({
-      kind: "address", value, role: "admin", provider: null, subject: null, addedAt: 0, addedBy: null,
+      kind: "address", value, role: "admin", bindings: [], addedAt: 0, addedBy: null,
     })),
   ];
 }
@@ -180,19 +281,36 @@ export function getEnvAllowlist(): AccessEntry[] {
   return allowlistFromEnv(process.env);
 }
 
+function loadBindings(): Map<string, AccessBinding[]> {
+  const rows = getDb()
+    .prepare("SELECT value, provider, subject FROM access_entry_bindings ORDER BY provider")
+    .all() as { value: string; provider: string; subject: string }[];
+  const map = new Map<string, AccessBinding[]>();
+  for (const r of rows) {
+    const list = map.get(r.value) ?? [];
+    list.push({ provider: r.provider, subject: r.subject });
+    map.set(r.value, list);
+  }
+  return map;
+}
+
+function withBindings(entries: AccessEntry[], map: Map<string, AccessBinding[]>): AccessEntry[] {
+  return entries.map((e) => (e.kind === "address" ? { ...e, bindings: map.get(e.value) ?? [] } : e));
+}
+
 /** Every stored entry. Zero rows means the env->DB handover has not happened and the env list still applies. */
 export function listAccessEntries(): AccessEntry[] {
   const rows = getDb()
-    .prepare("SELECT kind, value, role, provider, subject, added_at, added_by FROM access_entries ORDER BY kind, value")
+    .prepare("SELECT kind, value, role, added_at, added_by FROM access_entries ORDER BY kind, value")
     .all() as AccessEntryRow[];
+  const bindings = loadBindings();
   // Both checks name the permissive value, so an unreadable row falls back to the restrictive one
   // ('domain' admits a whole company, 'address' admits one person)
   return rows.map((r) => ({
     kind: r.kind === "domain" ? "domain" : "address",
     value: r.value,
     role: r.role === "admin" ? "admin" : "user",
-    provider: r.provider,
-    subject: r.subject,
+    bindings: r.kind === "domain" ? [] : bindings.get(r.value) ?? [],
     addedAt: r.added_at,
     addedBy: r.added_by,
   }));
@@ -254,6 +372,8 @@ export function saveAccessEntries(
     for (const entry of before) {
       if (!keep.has(`${entry.kind}:${entry.value}`)) {
         db.prepare("DELETE FROM access_entries WHERE kind = ? AND value = ?").run(entry.kind, entry.value);
+        // A re-added address must start unbound, or it inherits the previous holder's subjects.
+        if (entry.kind === "address") db.prepare("DELETE FROM access_entry_bindings WHERE value = ?").run(entry.value);
       }
     }
     const upsert = db.prepare(
@@ -269,7 +389,7 @@ export function saveAccessEntries(
       throw new Error("this change would remove your own access");
     }
     // An empty list is not adminless — it hands authority back to the environment.
-    if (after.length > 0 && !after.some((e) => e.kind === "address" && e.role === "admin")) {
+    if (after.length > 0 && !hasAdminAddress(after)) {
       throw new Error("this change would leave nobody able to administer this orchestrator");
     }
 
@@ -280,20 +400,27 @@ export function saveAccessEntries(
   refreshEffectiveAllowlist();
 }
 
-/** Record the provider identity an address resolved to, the first time it signs in. */
-export function bindAccessEntry(value: string, provider: string, subject: string): void {
-  const result = getDb()
-    .prepare(
-      "UPDATE access_entries SET provider = ?, subject = ? WHERE kind = 'address' AND value = ? AND provider IS NULL",
-    )
-    .run(provider, subject, value.trim().toLowerCase());
-  // Without this the binding is written but never consulted: the cache still holds the entry as
-  // unbound, so matching keeps taking the address branch and admits whoever holds it.
-  if (result.changes > 0) refreshEffectiveAllowlist();
+/** Delete every binding of an address, so its next sign-in through each provider binds afresh. */
+export function clearAccessBindings(value: string, actor: string | null): number {
+  const key = value.trim().toLowerCase();
+  const db = getDb();
+  const removed = db.transaction(() => {
+    const result = db.prepare("DELETE FROM access_entry_bindings WHERE value = ?").run(key);
+    // The startup migration copies the legacy columns; null them so a cleared binding cannot return on restart.
+    db.prepare("UPDATE access_entries SET provider = NULL, subject = NULL WHERE kind = 'address' AND value = ?").run(key);
+    if (result.changes > 0) {
+      const entries = listAccessEntries().map(({ kind, value: v, role }) => ({ kind, value: v, role }));
+      recordAccessChange({ actor, action: "clear-bindings", before: entries, after: entries, address: key });
+    }
+    return result.changes;
+  })();
+  refreshEffectiveAllowlist();
+  return removed;
 }
 
 /** Test hook: drop the cached list. */
 export function __resetAllowlistCacheForTest(): void {
   cached = null;
   cachedAt = 0;
+  allowlistReadAvailable = false;
 }

@@ -25,6 +25,14 @@ interface TokenResponse {
   expires_in: number;
 }
 
+/** Linear answered a request with an HTTP error: the token mint, or a GraphQL call. */
+export class LinearApiError extends Error {
+  constructor(readonly status: number, readonly bodyText: string, message: string) {
+    super(message);
+    this.name = "LinearApiError";
+  }
+}
+
 // Singleton state: one app credential per orchestrator, one cached token.
 let clientId: string | null = null;
 let clientSecret: string | null = null;
@@ -35,6 +43,15 @@ let inflightMint: Promise<CachedToken> | null = null;
 export function configureLinearAuth(id: string, secret: string): void {
   clientId = id;
   clientSecret = secret;
+}
+
+/** Configures the credential from `LINEAR_CLIENT_ID` and `LINEAR_CLIENT_SECRET` when both are set, and says whether it did. */
+export function configureLinearAuthFromEnv(env: Readonly<Record<string, string | undefined>> = process.env): boolean {
+  const id = env.LINEAR_CLIENT_ID;
+  const secret = env.LINEAR_CLIENT_SECRET;
+  if (!id || !secret) return false;
+  configureLinearAuth(id, secret);
+  return true;
 }
 
 /** Whether the app credential is present — the "is Linear usable?" signal for callers. */
@@ -62,7 +79,7 @@ async function mintToken(): Promise<CachedToken> {
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Linear token mint failed (${res.status}): ${body}`);
+    throw new LinearApiError(res.status, body, `Linear token mint failed (${res.status}): ${body}`);
   }
 
   const data = (await res.json()) as TokenResponse;

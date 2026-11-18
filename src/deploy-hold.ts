@@ -33,8 +33,7 @@ export function setDeployHold(): void {
   const alreadyHeld = isDeployHeld();
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')").run(DEPLOY_HOLD_KEY);
 
-  // One deploy claims the hold twice — atomically at the trigger, then again inside
-  // runDeploy. Only the first claim starts the clock, so elapsed covers the whole deploy.
+  // Only the first claim starts the clock, so elapsed covers the whole deploy.
   if (!alreadyHeld) {
     db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
       .run(DEPLOY_STARTED_AT_KEY, String(Date.now()));

@@ -1,0 +1,14 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "[{\"teamKey\":\"APP\",\"repo\":\"acme/app\",\"pr\":{\"number\":42,\"url\":\"https://github.com/acme/app/pull/42\",\"headRef\":\"ai-implement/aii-12\",\"baseRef\":\"main\",\"openedAt\":1700000000000,\"draft\":false,\"role\":\"implementation\"},\"issue\":{\"identifier\":\"AII-12\",\"title\":\"Implement a feature\",\"url\":\"https://linear.app/acme/issue/AII-12\"},\"lastJob\":{\"phase\":\"implementation\",\"status\":\"completed\",\"conclusion\":\"success\",\"finishedAt\":1700000002000},\"tracked\":true,\"workflow\":{\"state\":\"settled\",\"reason\":\"completed\"}}]"
+      }
+    ]
+  }
+}

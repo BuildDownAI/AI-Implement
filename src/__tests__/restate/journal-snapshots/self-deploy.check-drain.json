@@ -1,0 +1,26 @@
+[
+  {
+    "type": "Input",
+    "name": ""
+  },
+  {
+    "type": "GetEagerState",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "quiet probe"
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "OneWayCall",
+    "name": ""
+  },
+  {
+    "type": "Output",
+    "name": ""
+  }
+]

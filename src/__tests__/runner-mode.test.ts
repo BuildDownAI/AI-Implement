@@ -1,34 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as DedupModule from "../dedup.js";
+import type * as SeedOnceSettingsModule from "../seed-once-settings.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let runnerMode: typeof RunnerModeModule;
 let dedup: typeof DedupModule;
+let seeds: typeof SeedOnceSettingsModule;
 
 beforeEach(async () => {
-  dbPath = path.join(os.tmpdir(), `runner-mode-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
   delete process.env.RUNNER_MODE;
   delete process.env.FLY_PROCESS_LEVEL_SECRETS;
   delete process.env.KG_MATERIALIZE_DIRECT;
-  // Fresh module imports each test so DB singleton is reset
-  const { vi } = await import("vitest");
-  vi.resetModules();
-  runnerMode = await import("../runner-mode.js");
-  dedup = await import("../dedup.js");
-  runnerMode.initSettingsTable();
+  ({ runnerMode, dedup, seeds } = (
+    await testDb({
+      modules: {
+        runnerMode: () => import("../runner-mode.js"),
+        dedup: () => import("../dedup.js"),
+        seeds: () => import("../seed-once-settings.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
   delete process.env.RUNNER_MODE;
   delete process.env.FLY_PROCESS_LEVEL_SECRETS;
   delete process.env.KG_MATERIALIZE_DIRECT;
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 describe("runner-mode", () => {
@@ -304,30 +302,74 @@ describe("runner-mode", () => {
       expect(enabled).toBe(false);
     });
 
-    it("env var wins over DB", () => {
-      runnerMode.setKgMaterializeDirect(false);
+    it("ignores the env var at read time", () => {
       process.env.KG_MATERIALIZE_DIRECT = "true";
-      const { enabled, source } = runnerMode.getKgMaterializeDirect();
-      expect(enabled).toBe(true);
-      expect(source).toBe("env");
+      expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "default" });
     });
 
-    it("a non-'true' env value is an explicit off, still sourced from env", () => {
-      runnerMode.setKgMaterializeDirect(true);
-      process.env.KG_MATERIALIZE_DIRECT = "false";
-      const { enabled, source } = runnerMode.getKgMaterializeDirect();
-      expect(enabled).toBe(false);
-      expect(source).toBe("env");
+    describe("seeding KG_MATERIALIZE_DIRECT (AII-1109)", () => {
+      const rowCount = () =>
+        (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM settings WHERE key = 'kg_materialize_direct'").get() as { n: number }).n;
+
+      it("env true, no row → seeds the row", () => {
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: "true" });
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: true, source: "db" });
+      });
+
+      it("env false, no row → seeds a false row", () => {
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: "false" });
+        expect(rowCount()).toBe(1);
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "db" });
+      });
+
+      it("env true, row false → row stays false", () => {
+        runnerMode.setKgMaterializeDirect(false);
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: "true" });
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "db" });
+      });
+
+      it.each([undefined, "", "  "])("env %j writes no row", (val) => {
+        seeds.seedSettingsFromEnv({ KG_MATERIALIZE_DIRECT: val });
+        expect(rowCount()).toBe(0);
+        expect(runnerMode.getKgMaterializeDirect()).toEqual({ enabled: false, source: "default" });
+      });
     });
 
-    it.each(["", " "])(
-      "env var value %j is blank, falls through to DB/default",
-      (val) => {
-        process.env.KG_MATERIALIZE_DIRECT = val;
-        const { source } = runnerMode.getKgMaterializeDirect();
-        expect(source).not.toBe("env");
-      },
-    );
+    describe("kg execution mode (AII-1218)", () => {
+      const rowCount = () =>
+        (dedup.getDb().prepare("SELECT COUNT(*) AS n FROM settings WHERE key = 'kg_execution_mode'").get() as { n: number }).n;
+
+      it("defaults to today's behaviour by Fly configuration", () => {
+        expect(runnerMode.getKgExecutionMode(true)).toEqual({ mode: "fly-machines", source: "default" });
+        expect(runnerMode.getKgExecutionMode(false)).toEqual({ mode: "github-actions", source: "default" });
+      });
+
+      it("parses only the two values", () => {
+        expect(runnerMode.parseKgExecutionModeEnv("github-actions")).toBe("github-actions");
+        expect(runnerMode.parseKgExecutionModeEnv("fly-machines")).toBe("fly-machines");
+        for (const v of [undefined, "", "  ", "local-docker", "both", "fly"]) {
+          expect(runnerMode.parseKgExecutionModeEnv(v)).toBeUndefined();
+        }
+      });
+
+      it("a saved value wins over the default", () => {
+        runnerMode.setKgExecutionMode("github-actions");
+        expect(runnerMode.getKgExecutionMode(true)).toEqual({ mode: "github-actions", source: "db" });
+      });
+
+      it("seeds once and is inert after a save", () => {
+        seeds.seedSettingsFromEnv({ KG_EXECUTION_MODE: "fly-machines" });
+        expect(runnerMode.getKgExecutionMode(false)).toEqual({ mode: "fly-machines", source: "db" });
+        runnerMode.setKgExecutionMode("github-actions");
+        seeds.seedSettingsFromEnv({ KG_EXECUTION_MODE: "fly-machines" });
+        expect(runnerMode.getKgExecutionMode(false).mode).toBe("github-actions");
+      });
+
+      it.each([undefined, "", "  ", "bogus"])("env %j writes no row", (val) => {
+        seeds.seedSettingsFromEnv({ KG_EXECUTION_MODE: val });
+        expect(rowCount()).toBe(0);
+      });
+    });
 
     it("returns disabled default when DB is unavailable", () => {
       dedup.closeDb();
@@ -414,6 +456,18 @@ describe("runner-mode", () => {
       expect(r.reason).toMatch(/FLY_SESSIONS_APP/);
     });
 
+    it("ephemeral full-access opt-in is ineligible on fly, local, shadow and fly-machines mappings, eligible on gha", () => {
+      const optIn = { ...ghaMapping, extraEnv: { AI_IMPLEMENT_EPHEMERAL_FULL_ACCESS: "ephemeral-runner-asserted-v1" } };
+      for (const mode of ["fly", "local", "shadow"] as const) {
+        const r = runnerMode.checkForcedPathEligibility(mode, optIn, true);
+        expect(r.eligible).toBe(false);
+        expect(r.reason).toMatch(/GitHub Actions/);
+      }
+      expect(runnerMode.checkForcedPathEligibility("default", { ...optIn, executionMode: "fly-machines" }, true).eligible).toBe(false);
+      expect(runnerMode.checkForcedPathEligibility("default", optIn, true).eligible).toBe(true);
+      expect(runnerMode.checkForcedPathEligibility("gha", optIn, true).eligible).toBe(true);
+    });
+
     it("forced fly + fly-capable mapping → eligible", () => {
       const r = runnerMode.checkForcedPathEligibility("fly", ghaMapping, true);
       expect(r).toEqual({ eligible: true, reason: null });
@@ -431,4 +485,5 @@ describe("runner-mode", () => {
       expect(r.reason).toMatch(/bedrock/i);
     });
   });
+
 });

@@ -15,7 +15,11 @@ Beyond the usual POSIX toolbox, this runner ships with:
 - `gh` — GitHub CLI; authenticated for the current repo.
 - `corepack` — enables `yarn` and `pnpm` on demand without extra installs.
 - `@anthropic-ai/claude-code` — this is the `claude` CLI itself; don't re-invoke.
+- `@openai/codex` — the `codex` CLI, pinned in the runner image for
+  orchestrator-managed Codex stages. `codex exec --json` emits JSONL events, and
+  `codex exec --output-schema <FILE>` constrains the final response when
+  a run needs machine-checkable output.
 
-Standard runtimes present: Node.js 22, Python 3 (Bookworm), build-essential toolchain.
+Standard runtimes present: Node.js 24, Python 3 (Bookworm), build-essential toolchain.
 Language runtimes beyond Node/Python belong in a per-repo custom image — see
 `.ai-implement/image.yml` in the target repo.

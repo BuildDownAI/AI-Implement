@@ -37,6 +37,7 @@ export const drawerHtml = `
         <div class="section-h"><h3>Recovery actions</h3></div>
         <div id="drawer-pilot-actions" style="margin-bottom:20px"></div>
       </div>
+      <div id="drawer-restate-link" style="margin-bottom:20px" hidden></div>
     </div>
     <div class="drawer-footer">
       <div></div>
@@ -136,7 +137,7 @@ export const drawerScript = `
     if (failure.code === 'REVIEWER_TURNS_EXHAUSTED') {
       return {
         title: 'Review incomplete',
-        detail: 'The post-push reviewer ran out of turns before reaching a verdict.',
+        detail: 'The second review (on the pull request) did not finish. A reviewer used all of its permitted steps.',
         cause: 'reviewer turn limit',
         limit: failure.reviewMaxTurns,
         reviewer: reviewerNameFromFailure(failure),
@@ -147,8 +148,8 @@ export const drawerScript = `
     if (failure.code === 'PROVIDER_UNAVAILABLE' && (!failure.stage || String(failure.stage).includes('review'))) {
       return {
         title: 'Review incomplete',
-        detail: 'The model provider was unavailable during automated review.',
-        cause: 'provider unavailable',
+        detail: 'The AI service was not available during the review.',
+        cause: 'AI service not available',
         limit: failure.reviewMaxTurns,
         reviewer: reviewerNameFromFailure(failure),
         failureDetails: failure.message || null,
@@ -303,7 +304,7 @@ export const drawerScript = `
       { label: 'Queued', detail: 'queued in ticketing system' },
       { label: 'Planning', detail: 'claude-plan.yml' },
       { label: 'Implementing', detail: job.executionMode ? window.esc(job.executionMode) + ' run' : 'implementation run' },
-      { label: 'Review', detail: reviewIncompleteInfo(job, steps) ? 'post-push review incomplete' : (job.status === 'review_failed' ? 'post-push review needs attention' : (latestRunningStep && latestRunningStep.stepId === 'post-push-review' ? 'post-push review running' : (job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR'))) },
+      { label: 'Review', detail: reviewIncompleteInfo(job, steps) ? 'second review incomplete' : (job.status === 'review_failed' ? 'second review needs attention' : (latestRunningStep && latestRunningStep.stepId === 'post-push-review' ? 'second review running' : (job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR'))) },
       { label: 'Done', detail: 'merged' }
     ];
 
@@ -673,6 +674,23 @@ export const drawerScript = `
       el.innerHTML = '<div class="field"><div class="field-label">Execution</div><div style="font-size:12.5px" class="text-tertiary">launch state unknown — no execution recorded yet</div></div>';
       return;
     }
+    const backend = attempt.execution.backend;
+    switch (backend) {
+      case undefined: // Older orchestrators return the GitHub shape without a backend.
+      case 'github-actions':
+        break;
+      case 'fly-machines':
+      case 'local-docker': {
+        const label = backend === 'fly-machines' ? 'Fly machine' : 'Container';
+        el.innerHTML = '<div class="field"><div class="field-label">' + label + '</div><div style="font-size:12.5px"><span class="mono">'
+          + window.esc(attempt.execution.runRef) + '</span></div></div>';
+        return;
+      }
+      default:
+        el.innerHTML = '<div class="field"><div class="field-label">Execution</div><div style="font-size:12.5px"><span class="mono">'
+          + window.esc(backend) + ' ' + window.esc(attempt.execution.runRef) + '</span></div></div>';
+        return;
+    }
     const repoParts = repoPartsForJob(job, null);
     let html = '<div class="field"><div class="field-label">Workflow run</div><div style="font-size:12.5px">';
     if (repoParts) {
@@ -943,6 +961,7 @@ export const drawerScript = `
   }
 
   async function renderPilotAttempt(job, background) {
+    pilotOwnedDispatchId = null;
     if (!job.dispatchId) {
       resetPilotState();
       hidePilotSection();
@@ -965,6 +984,7 @@ export const drawerScript = `
       hidePilotSection();
       return;
     }
+    if (result.kind === 'ok') pilotOwnedDispatchId = job.dispatchId;
     document.getElementById('drawer-pilot-heading').hidden = false;
     document.getElementById('drawer-pilot').hidden = false;
     if (result.kind === 'unavailable') {
@@ -1009,6 +1029,45 @@ export const drawerScript = `
     // renderSteps preserves open evidence panels across its own 5s re-render.
   }
 
+  // ---- Open in Restate UI link (AII-1262) ----
+  //
+  // The orchestrator serves the Restate UI at /ui/, admin only. Prefer the API
+  // reference from restateRefForJob in report-card.ts. For older orchestrators,
+  // the legacy service fallback counts a review-fix job only when the attempt
+  // section just confirmed a Restate attempt for this dispatch id (pilotOwnedDispatchId),
+  // so a legacy job shows no link.
+
+  // Set by renderPilotAttempt when the attempt read succeeded; null otherwise.
+  let pilotOwnedDispatchId = null;
+
+  function journalServiceForJob(job) {
+    if (!job.dispatchId || !job.phase || job.phase === 'implementation') return null;
+    if (job.phase === 'kg-refresh') return 'KgRefresh';
+    if (job.phase === 'planning') return 'PlanningRun';
+    return pilotOwnedDispatchId === job.dispatchId ? 'ReviewFixAttempt' : null;
+  }
+
+  function hideRestateLink() {
+    const box = document.getElementById('drawer-restate-link');
+    box.hidden = true;
+    box.innerHTML = '';
+  }
+
+  function renderRestateLink(job) {
+    const legacyService = job.restate === undefined ? journalServiceForJob(job) : null;
+    const ref = window.isAdmin()
+      ? (job.restate === undefined ? (legacyService ? { service: legacyService, key: job.dispatchId } : null) : job.restate)
+      : null;
+    if (!ref) {
+      hideRestateLink();
+      return;
+    }
+    const box = document.getElementById('drawer-restate-link');
+    box.innerHTML = '<a href="/ui/workflows/' + window.escAttr(encodeURIComponent(ref.service)) + '/'
+      + window.escAttr(encodeURIComponent(ref.key)) + '" target="_blank" rel="noopener noreferrer">Open in Restate UI</a>';
+    box.hidden = false;
+  }
+
   function resetDrawerContent() {
     document.getElementById('drawer-title').textContent = 'Loading…';
     document.getElementById('drawer-issue-row').innerHTML = '';
@@ -1025,6 +1084,7 @@ export const drawerScript = `
     document.getElementById('drawer-local-logs').onclick = null;
     resetPilotState();
     hidePilotSection();
+    hideRestateLink();
   }
 
   function stopDrawerAutoRefresh() {
@@ -1070,6 +1130,8 @@ export const drawerScript = `
       if (currentJobId !== id) return;
       renderDrawer(json.job, json.steps, mappings);
       await renderPilotAttempt(json.job, background);
+      if (currentJobId !== id) return;
+      renderRestateLink(json.job);
       if (currentJobId !== id) return;
       // A finished job's steps cannot change — stop polling instead of collapsing
       // an open evidence panel and resetting scroll every 5s for no reason.

@@ -9,8 +9,13 @@ export interface StuckGiveUpNotification {
   issueUrl: string;
   repoFullName: string;
   runUrl: string | null;
-  attempts: number;
+  /** Omitted for a stopped fix run, which has no attempt count. */
+  attempts?: number;
   lastRunStatus: string; // "queued" | "in_progress" | "run_not_found"
+  /** A stopped review-fix run: the alert names the fix run and the next step, and shows no attempt count. */
+  fixRun?: boolean;
+  /** The pull request a stopped fix run belongs to, when known. */
+  prUrl?: string;
 }
 
 // The run phases that produce a user-facing notification
@@ -46,12 +51,13 @@ export interface CompletionNotification {
 }
 
 export interface DeployNotification {
-  kind: "shutdown" | "deployed" | "restarted" | "available";
+  kind: "shutdown" | "deployed" | "restarted" | "available" | "deploy-failed" | "deploy-cancelled";
   appName: string;
   region: string | null;
   imageRef: string | null; // Full FLY_IMAGE_REF, only the deployment-<id> tag is displayed.
   downtimeMs?: number | null; // Gap between the shutdown notice and the boot that answered it, when both were observed.
-  commit?: string | null; // Only the "available" kind — there is no image to reference yet.
+  detail?: string | null; // Only the "deploy-failed" kind: the reason code.
+  commit?: string | null; // The "available", "deploy-failed" and "deploy-cancelled" kinds — there is no image to reference yet.
   kgDegraded?: boolean; // True when embeddings were not built — /mcp serves lexical-only search.
   kgUnavailable?: boolean; // True when the last sidecar liveness probe failed (AII-648/650).
   sidecarError?: string | null; // The probe's lastError, shown alongside kgUnavailable.
@@ -102,7 +108,26 @@ const DEPLOY_EVENTS: Record<DeployNotification["kind"], {
     summary: "Deploy from /admin#deployments when you are ready.",
     broadcast: false,
   },
+  // A success is announced by the "deployed" boot notice of the new process, so only the endings that boot never sees post here.
+  "deploy-failed": {
+    slackEmoji: ":x:",
+    teamsIcon: "&#x274C;",
+    title: "Orchestrator deploy failed",
+    summary: "The previous version keeps running and dispatch resumes.",
+    broadcast: true,
+  },
+  "deploy-cancelled": {
+    slackEmoji: ":no_entry_sign:",
+    teamsIcon: "&#x1F6AB;",
+    title: "Orchestrator deploy cancelled",
+    summary: "Dispatch resumes on the running version.",
+    broadcast: false,
+  },
 };
+
+/** `lastRunStatus` of a give-up after a runner-image pull failure. */
+export const IMAGE_PULL_FAILED_STATUS = "runner_image_pull_failed";
+const IMAGE_PULL_GIVE_UP_TITLE = "AI Implementation could not pull the runner image \u2014 Needs Human";
 
 export async function notifyStuckGiveUp(
   type: string,
@@ -479,7 +504,7 @@ function imageTag(imageRef: string | null): string | null {
 // printing it would be ambiguous (two differing versions for same deploy, same version twice for a restart)
 function displayedVersion(n: DeployNotification): string | null {
   // An availability notice names the commit that is waiting; no image exists yet.
-  if (n.kind === "available") return n.commit ? n.commit.slice(0, 7) : null;
+  if (n.kind === "available" || n.kind === "deploy-failed" || n.kind === "deploy-cancelled") return n.commit ? n.commit.slice(0, 7) : null;
   return n.kind === "shutdown" ? null : imageTag(n.imageRef);
 }
 
@@ -492,6 +517,7 @@ async function notifyDeploySlack(webhookUrl: string, n: DeployNotification): Pro
   const version = displayedVersion(n);
   if (version) details.push(`Version: \`${version}\``);
   if (n.downtimeMs != null) details.push(`Down for ${formatDuration(n.downtimeMs)}`);
+  if (n.detail) details.push(`Reason: \`${n.detail}\``);
 
   let text = `${event.slackEmoji} ${mention}*${event.title}* — ${event.summary}\n${details.join(" · ")}`;
   if (n.kgDegraded) text += "\n⚠️ KG embeddings missing — /mcp is lexical-only";
@@ -529,6 +555,7 @@ async function notifyDeployTeams(webhookUrl: string, n: DeployNotification): Pro
   const version = displayedVersion(n);
   if (version) facts.push({ title: "Version", value: version });
   if (n.downtimeMs != null) facts.push({ title: "Down for", value: formatDuration(n.downtimeMs) });
+  if (n.detail) facts.push({ title: "Reason", value: n.detail });
 
   const cardBody: unknown[] = [
     { type: "TextBlock", text: `${event.teamsIcon} ${event.title}`, weight: "Bolder", size: "Medium" },
@@ -575,7 +602,9 @@ async function notifyStuckGiveUpSlack(
   webhookUrl: string,
   n: StuckGiveUpNotification,
 ): Promise<void> {
-  let text = `:rotating_light: *AI Implementation Stuck — Needs Human*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`\nAttempts: ${n.attempts}\nLast status: \`${n.lastRunStatus}\``;
+  let text = n.fixRun
+    ? `:rotating_light: *AI Fix Run Stopped — Needs Human*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`\nLast status: \`${n.lastRunStatus}\`\nNext step: comment \`/ai-implement\` on the pull request${n.prUrl ? ` (${n.prUrl})` : ""} to start a new fix run.`
+    : `:rotating_light: *${n.lastRunStatus === IMAGE_PULL_FAILED_STATUS ? IMAGE_PULL_GIVE_UP_TITLE : "AI Implementation Stuck — Needs Human"}*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`${n.attempts != null ? `\nAttempts: ${n.attempts}` : ""}\nLast status: \`${n.lastRunStatus}\``;
   if (n.runUrl) {
     text += `\nRun: <${n.runUrl}|View Workflow Run>`;
   }
@@ -601,9 +630,15 @@ async function notifyStuckGiveUpTeams(
   const facts: Array<{ title: string; value: string }> = [
     { title: "Issue", value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})` },
     { title: "Repo", value: n.repoFullName },
-    { title: "Attempts", value: String(n.attempts) },
+    ...(n.attempts != null ? [{ title: "Attempts", value: String(n.attempts) }] : []),
     { title: "Last status", value: n.lastRunStatus },
   ];
+  if (n.fixRun) {
+    facts.push({
+      title: "Next step",
+      value: `Comment \`/ai-implement\` on the pull request${n.prUrl ? ` (${n.prUrl})` : ""} to start a new fix run.`,
+    });
+  }
   if (n.runUrl) {
     facts.push({ title: "Run", value: `[View Workflow Run](${n.runUrl})` });
   }
@@ -620,7 +655,11 @@ async function notifyStuckGiveUpTeams(
           body: [
             {
               type: "TextBlock",
-              text: "&#x1F6A8; AI Implementation Stuck \u2014 Needs Human",
+              text: n.fixRun
+                ? "&#x1F6A8; AI Fix Run Stopped \u2014 Needs Human"
+                : n.lastRunStatus === IMAGE_PULL_FAILED_STATUS
+                  ? `&#x1F6A8; ${IMAGE_PULL_GIVE_UP_TITLE}`
+                  : "&#x1F6A8; AI Implementation Stuck \u2014 Needs Human",
               weight: "Bolder",
               size: "Medium",
             },
@@ -816,8 +855,9 @@ async function notifyKgRefreshOutcomeTeams(webhookUrl: string, n: KgRefreshOutco
 // ---------- Plain-text notification (best-effort; used where no issue context is available) ----------
 
 /** Posts a plain { text } payload — supported by both Slack and Teams incoming webhooks. */
-export async function notifyText(webhookUrl: string, message: string): Promise<void> {
+export async function notifyText(webhookUrl: string, message: string, signal?: AbortSignal): Promise<void> {
   const res = await fetch(webhookUrl, {
+    signal,
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text: message }),
@@ -826,4 +866,9 @@ export async function notifyText(webhookUrl: string, message: string): Promise<v
     const body = await res.text();
     throw new Error(`Webhook notification failed: ${res.status} — ${body}`);
   }
+}
+
+/** A recovery pairs only with a successfully posted sidecar warning. */
+export async function notifyKgRecovery(webhookUrl: string, signal?: AbortSignal): Promise<void> {
+  await notifyText(webhookUrl, "✅ KG sidecar serving again", signal);
 }
