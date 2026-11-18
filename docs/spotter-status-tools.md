@@ -12,15 +12,15 @@ The tool lists every open PR in every distinct mapped repository, including PRs 
 
 | Field | Value |
 |---|---|
-| `teamKey` | Job's mapping key; without a job, the sole mapping key for the repository, or `null` when ambiguous |
+| `teamKey` | Linked issue's mapping key; without a link, the sole mapping key for the repository, or `null` when ambiguous |
 | `repo` | `owner/repo` |
 | `pr` | `number`, `url`, `headRef`, `baseRef`, `openedAt`, and boolean `draft` |
-| `issue` | `{ identifier, title, url }`, or `null` without a job identifier; title and URL can be `null` |
+| `issue` | `{ identifier, title, url }`, or `null` without a link or when the linked issue identifier is `null`; title and URL can be `null` |
 | `lastJob` | `{ phase, status, conclusion, finishedAt }`, or `null`; phase and conclusion can be `null` |
-| `tracked` | Whether a matching dispatch was found |
+| `tracked` | Whether a pull request link exists |
 | `workflow` | Optional `{ state, reason }`; omitted when there is no verdict, never replaced by `null` |
 
-Tracking first uses the newest dispatch by dispatch time for the repository and PR URL. Without that match, a grouping head branch can recover its parent's dispatch by case-insensitive identifier within the repository; a successful recovery marks the PR as a roll-up. `lastJob` independently selects the finished dispatch for the PR URL with the greatest log ID, not the greatest completion timestamp. Workflow uses the job's mapping when available, otherwise the repository's sole mapping; ambiguous mappings yield no mapping-dependent verdict.
+Identity comes from `findLinkByPr(repo, pr.number)` in [src/pr-links.ts](../src/pr-links.ts), which joins `pull_request_link` to `tracked_issue`. A link keeps the PR tracked even when all its job rows have been pruned; dispatch rows and grouping branch names do not provide fallback identity. Workflow receives the linked issue's tracker ID and identifier, and treats the PR as a roll-up only when the link's stored `role` is `roll-up`. It uses the repository mapping matching the linked issue's mapping key; if that key is missing, the mapping is `null`. Only without a link does workflow use the repository's sole mapping, or `null` when ambiguous. `lastJob` independently selects the finished dispatch for the PR URL with the greatest log ID, not the greatest completion timestamp; it is `null` when no finished job exists, even for a tracked PR.
 
 ### Workflow rules
 
