@@ -29,6 +29,7 @@ export interface LinkPullRequestInput {
   baseRef?: string | null;
   role: PullRequestRole;
   source: LinkSource;
+  groupingParent?: boolean;
   issue: IssueInput;
 }
 
@@ -182,13 +183,13 @@ export function linkPullRequest(input: LinkPullRequestInput): PullRequestLink {
       .get(issue.trackerKind, issue.mappingKey, issue.trackerIssueId, issue.identifier,
         issue.title, issue.url, now, now) as { id: number };
     db.prepare(`INSERT INTO pull_request_link
-      (repository, number, url, head_ref, base_ref, issue_id, role, source, linked_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (repository, number, url, head_ref, base_ref, issue_id, role, source, linked_at, grouping_parent)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (repository, number) DO UPDATE SET
         head_ref = COALESCE(pull_request_link.head_ref, excluded.head_ref),
         base_ref = COALESCE(pull_request_link.base_ref, excluded.base_ref)`)
       .run(input.repository, input.number, input.url, input.headRef ?? null,
-        input.baseRef ?? null, storedIssue.id, input.role, input.source, now);
+        input.baseRef ?? null, storedIssue.id, input.role, input.source, now, input.groupingParent ? 1 : 0);
     const link = findLinkByPr(input.repository, input.number)!;
     if (link.issueId !== storedIssue.id) {
       console.warn(`Pull request ${input.repository}#${input.number} already belongs to ${link.issue.identifier ?? link.issue.trackerIssueId}; ignoring link to ${issue.identifier ?? issue.trackerIssueId}`);
@@ -210,6 +211,12 @@ export function listLinksByOutcome(outcome: LinkOutcome): PullRequestLink[] {
 export function listOpenLinksForIssue(trackerKind: TrackerKind, trackerIssueId: string): PullRequestLink[] {
   return (database().prepare(`${selectLinks} WHERE i.tracker_kind = ? AND i.tracker_issue_id = ?
     AND p.outcome = 'open' ORDER BY p.id`).all(trackerKind, trackerIssueId) as LinkRow[]).map(toLink);
+}
+
+/** A successful implementation takes precedence over cancellation of a sibling. */
+export function hasMergedImplementationForIssue(trackerKind: TrackerKind, trackerIssueId: string): boolean {
+  return Boolean(database().prepare(`${selectLinks} WHERE i.tracker_kind = ? AND i.tracker_issue_id = ?
+    AND p.role = 'implementation' AND p.outcome = 'merged' LIMIT 1`).get(trackerKind, trackerIssueId));
 }
 
 export function setLinkOutcome(repository: string, number: number, outcome: LinkOutcome, closedAt: number | null): boolean {
@@ -261,8 +268,7 @@ export function recordLinkJob(link: PullRequestLink, groupingParent: boolean, di
 export function isCurrentGroupingParent(link: PullRequestLink): boolean {
   if (!link.groupingParent) return false;
   const latest = database().prepare(`SELECT id FROM pull_request_link
-    WHERE issue_id = ? AND role = 'implementation' AND job_dispatched_at IS NOT NULL
-      AND job_current = 1
-    ORDER BY job_dispatched_at DESC, job_id DESC LIMIT 1`).get(link.issueId) as { id: number } | undefined;
+    WHERE issue_id = ? AND role = 'implementation' AND job_current = 1
+    ORDER BY COALESCE(job_dispatched_at, linked_at) DESC, COALESCE(job_id, id) DESC LIMIT 1`).get(link.issueId) as { id: number } | undefined;
   return latest?.id === link.id;
 }

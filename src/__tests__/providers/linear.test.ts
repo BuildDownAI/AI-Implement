@@ -1981,18 +1981,36 @@ runPrClosedUnmergedContract("LinearProvider", async (terminal) => {
     data({ issue: { state: { type: terminal ? "completed" : "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "review", name: "Ready for Review" }, { id: "plan", name: "Plan-Complete" }, { id: "bug", name: "bug" }] } } }),
     ...(terminal ? [] : [data({ teams: { nodes: [{ id: "team", key: "ENG" }] } }),
       data({ workflowStates: { nodes: [{ id: "other", name: "Rejected", type: "canceled" }, { id: "cancel", name: "cAnCeLlEd", type: "canceled" }] } }),
-      data({ issueUpdate: { success: true } }), data({ commentCreate: { success: true } })]),
+      data({ commentCreate: { success: true } }), data({ issueUpdate: { success: true } })]),
   );
   return { provider: new LinearProvider({}), issueId: "i", scopeKey: "ENG", restartSentence: "To run it again, move the issue back to Todo.",
     verify: async (terminal, comment) => {
       expect(fake.calls).toHaveLength(terminal ? 1 : 5);
       if (!terminal) {
-        expect(variables(fake, 3)).toEqual({ issueId: "i", stateId: "cancel", labelIds: ["plan", "bug"] });
-        expect(variables(fake, 4)).toEqual({ issueId: "i", body: comment });
+        expect(variables(fake, 4)).toEqual({ issueId: "i", stateId: "cancel", labelIds: ["plan", "bug"] });
+        expect(variables(fake, 3)).toEqual({ issueId: "i", body: comment });
       }
     } };
 });
 describe("LinearProvider unmerged close state lookup", () => {
+  it("does not cancel before the explanation comment succeeds", async () => {
+    const fake = linear(
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [] } } }),
+      data({ teams: { nodes: [{ id: "team", key: "ENG" }] } }),
+      data({ workflowStates: { nodes: [{ id: "cancel", name: "Canceled", type: "canceled" }] } }),
+      { json: { errors: [{ message: "comment unavailable" }] } },
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [] } } }),
+      data({ commentCreate: { success: true } }), data({ issueUpdate: { success: true } }),
+    );
+    const provider = new LinearProvider({});
+    await expect(provider.markPrClosedUnmerged("i", "ENG", "url")).rejects.toThrow();
+    expect(JSON.parse(fake.calls[3].body).query).toContain("commentCreate");
+    expect(fake.calls.some(call => JSON.parse(call.body).query.includes("issueUpdate"))).toBe(false);
+    await expect(provider.markPrClosedUnmerged("i", "ENG", "url")).resolves.toBe(true);
+    expect(JSON.parse(fake.calls[5].body).query).toContain("commentCreate");
+    expect(JSON.parse(fake.calls[6].body).query).toContain("issueUpdate");
+  });
+
   it.each(["canceled", "completed", "duplicate"])("does not write to %s issues", async (type) => {
     const fake = linear(data({ issue: { state: { type }, team: { key: "ENG" }, labels: { nodes: [{ id: "r", name: "Ready for Review" }] } } }));
     expect(await new LinearProvider({}).markPrClosedUnmerged("i", "ENG", "url")).toBe(false);
@@ -2006,12 +2024,12 @@ describe("LinearProvider unmerged close state lookup", () => {
         { id: "cancel", name, type: "canceled" },
         { id: "last", name: "Archived", type: "canceled" },
       ] : [] } }),
-      data({ issueUpdate: { success: true } }), data({ commentCreate: { success: true } }));
+      data({ commentCreate: { success: true } }), data({ issueUpdate: { success: true } }));
     const result = new LinearProvider({}).markPrClosedUnmerged("i", "ENG", "url");
     if (!name) {
       await expect(result).rejects.toThrow('No "canceled" workflow state');
       expect(fake.calls).toHaveLength(3);
     }
-    else { expect(await result).toBe(true); expect(variables(fake, 3).stateId).toBe("cancel"); }
+    else { expect(await result).toBe(true); expect(variables(fake, 4).stateId).toBe("cancel"); }
   });
 });

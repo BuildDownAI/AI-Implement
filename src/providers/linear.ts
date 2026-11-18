@@ -1172,6 +1172,8 @@ export class LinearProvider implements TicketingProvider {
     if (!issue || isTerminalStateType(issue.state.type)) return false;
     const stateId = await this.getCanceledStateId(issue.team.key);
     const labelIds = issue.labels.nodes.filter((l) => l.name !== LINEAR_LABELS.readyForReview.name).map((l) => l.id);
+    // Comment first: a failed comment must leave the issue active for the next retry.
+    await this.postComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, move the issue back to Todo.`);
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
       `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
         issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) { success }
@@ -1179,7 +1181,6 @@ export class LinearProvider implements TicketingProvider {
       { issueId, stateId, labelIds },
       "issueUpdate",
     );
-    await this.postComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, move the issue back to Todo.`);
     return true;
   }
 

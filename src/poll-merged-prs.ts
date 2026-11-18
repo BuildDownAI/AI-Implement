@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import { getInFlightIssueIds } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
-import { isCurrentGroupingParent, listLinksByOutcome, listOpenLinksForIssue, listUncheckedClosedLinks, setCancelCheckedAt, setLinkOutcome } from "./pr-links.js";
+import { hasMergedImplementationForIssue, isCurrentGroupingParent, listLinksByOutcome, listOpenLinksForIssue, listUncheckedClosedLinks, setCancelCheckedAt, setLinkOutcome } from "./pr-links.js";
 import type { PullRequestLink } from "./pr-links.js";
 import {
   enqueueReconciliation,
@@ -98,6 +98,7 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
     // current-PR identity.
     if (link.role === "roll-up" ||
         link.groupingParent ||
+        hasMergedImplementationForIssue(issue.trackerKind, issue.trackerIssueId) ||
         listOpenLinksForIssue(issue.trackerKind, issue.trackerIssueId).length > 0) {
       setCancelCheckedAt(repository, number, Date.now());
       continue;

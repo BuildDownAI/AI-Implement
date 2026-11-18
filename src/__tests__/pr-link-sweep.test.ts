@@ -8,8 +8,8 @@ const pull = (overrides: Partial<OpenPullRequest> = {}): OpenPullRequest => ({
   number: 1, url: "https://github.com/test-org/test-repo/pull/1", head: "ai-implement/aii-1981-some-slug",
   base: "main", headSha: "sha", title: "PR", createdAt: 1, draft: false, author: "app[bot]", ...overrides,
 });
-async function fixture() {
-  const { modules } = await testDb({ tables: "none", modules: {
+async function fixture(tables: "all" | "none" = "none") {
+  const { modules } = await testDb({ tables, modules: {
     sweep: () => import("../pr-link-sweep.js"), links: () => import("../pr-links.js"),
     github: () => import("../github.js"),
   } });
@@ -23,6 +23,27 @@ async function fixture() {
 afterEach(() => vi.restoreAllMocks());
 
 describe("sweepUnlinkedPulls", () => {
+  it.each(["feature", "multi-issue"])("recovers a grouping parent's implementation on its own %s branch", async (mode) => {
+    const { sweep, links, deps } = await fixture("all");
+    deps.listRepoPulls.mockResolvedValue([pull({ base: `custom/ai-implement/${mode}/aii-1981` })]);
+    await sweep.sweepUnlinkedPulls(deps);
+    const link = links.findLinkByPr("test-org/test-repo", 1)!;
+    expect(link.groupingParent).toBe(true);
+    expect(links.isCurrentGroupingParent(link)).toBe(true);
+    const { detectMergedPrs } = await import("../poll-merged-prs.js");
+    const finalizeGroupingParent = vi.fn(async () => true);
+    const cancelIssue = vi.fn(async () => true);
+    await detectMergedPrs({
+      mappingForRepo: () => deps.mappings.AII,
+      tokenForOwner: async () => "token",
+      getPullRequestState: async () => ({ merged: false, state: "closed" }),
+      finalizeGroupingParent, cancelIssue,
+    });
+    expect(finalizeGroupingParent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ number: 1 }));
+    expect(cancelIssue).not.toHaveBeenCalled();
+    expect(links.findLinkByPr("test-org/test-repo", 1)?.outcome).toBe("closed-unmerged");
+  });
+
   it.each([
     ["ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],
     ["custom/ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],

@@ -46,7 +46,7 @@ The unique key is (`tracker_kind`, `tracker_issue_id`). Metadata refreshes repla
 | `job_id` | Nullable ID of that job; breaks dispatch-time ties |
 | `job_current` | Whether this is that job's current PR association; defaults to 1, cleared when a replacement PR is reported |
 
-The unique key is (`repository`, `number`). `linkPullRequest` writes both rows transactionally. An existing PR keeps its original issue, role, source, URL and linked time; subsequent writes only fill missing branch refs. A conflicting issue association logs a warning. Existing databases gain `cancel_checked_at`, `grouping_parent`, `job_dispatched_at`, `job_id` and `job_current` on initialization.
+The unique key is (`repository`, `number`). `linkPullRequest` writes both rows transactionally. An existing PR keeps its original issue, role, source, URL and linked time; subsequent writes only fill missing branch refs. Branch recovery sets `grouping_parent` when an implementation PR targets its own issue’s feature or multi-issue branch. A conflicting issue association logs a warning. Existing databases gain `cancel_checked_at`, `grouping_parent`, `job_dispatched_at`, `job_id` and `job_current` on initialization.
 
 ## Writers and recovery
 
@@ -66,6 +66,7 @@ Backfill cannot recover already-pruned jobs or closed PRs with no surviving job 
 - `src/open-pulls.ts`: `listOpenPulls` uses `findLinkByPr` for `tracked`, issue metadata, mapping ownership and `pr.role`. Job history supplies optional `lastJob` only. A stored link with a null identifier can still be tracked while returning `issue: null`. See [Spotter status tools](spotter-status-tools.md) for the response contract and five-minute fallback rules for both status tools.
 - `src/poll-merged-prs.ts`: `detectMergedPrs` walks `listLinksByOutcome("open")`, independent of job retention, and checks GitHub for terminal PRs. Missing mappings and unreadable PR states leave links open for retry.
 - `src/webhook.ts`: the merged-PR webhook reads `findLinkByPr`; an unknown PR is ignored. Both merge detectors use the stored issue identity for reconciliation.
+- `src/comment-gapfill-drain.ts`: `drainCommentGapfillQueue` falls back to `findLinkByPr` when the PR's dispatch history is unavailable, recovering tracker identity and mapping ownership. Live PR terminal-state, mapping, in-flight, capacity and budget safeguards still apply before submission.
 - `src/reconcile-merged.ts`: `resolvePrMapping` uses the link's mapping key to disambiguate mappings sharing a repository. Without a link it resolves only a sole repository mapping. `runReconciliations` drains the queue through the provider's `markMerged`, including paused projects, with bounded failure retries. Roll-up completion belongs to `src/merge-up.ts`.
 
 | Outcome | Who writes it |
@@ -93,13 +94,13 @@ flowchart TD
 
 ## Cancellation after an unmerged close
 
-After outcome detection, `detectMergedPrs` walks `listUncheckedClosedLinks`. Cancellation applies to implementation links only, when there is no other open link for the same tracker issue and no run in flight. Roll-ups are exempt. Every link with `groupingParent` set (`grouping_parent` in storage) is also exempt, whether current or superseded. `recordLinkJob` never clears that flag, including on later non-grouping gap-fill reports. Only finalization (`isCurrentGroupingParent`) requires the link to be the current pull request of the issue's newest job, selected by `job_dispatched_at`, `job_id` and `job_current`. That path calls `markMerged` before tombstoning, deferring while a run is in flight or finalization fails.
+After outcome detection, `detectMergedPrs` walks `listUncheckedClosedLinks`. Cancellation applies to implementation links only, when there is no other open link or merged implementation link for the same tracker issue and no run in flight. `hasMergedImplementationForIssue` protects successful merges before reconciliation runs, including sibling outcomes detected in the same poll. Roll-ups are exempt. Every link with `groupingParent` set (`grouping_parent` in storage) is also exempt, whether current or superseded. `recordLinkJob` never clears that flag, including on later non-grouping gap-fill reports. Only finalization (`isCurrentGroupingParent`) requires the link to be the current pull request of the issue's newest job, selected among `job_current` links by dispatch time and job ID, falling back to linked time and link ID for branch-recovered links without job metadata. That path calls `markMerged` before tombstoning, deferring while a run is in flight or finalization fails.
 
 Exempt links and links superseded by another open PR get `cancel_checked_at` immediately. An in-flight run defers the decision without setting it. Otherwise `src/index.ts` resolves the stored mapping and calls the provider's `markPrClosedUnmerged`. On a nonthrowing return (including a provider no-op), the poll removes the issue's `dispatched` dedup row and calls `setCancelCheckedAt`. Missing mappings and provider errors leave the decision unchecked for retry.
 
 | Provider implementation | Cancellation write |
 |---|---|
-| `src/providers/linear.ts` | Moves a nonterminal issue to Canceled, removes Ready for Review, and posts a comment naming the PR and how to restart. Missing or terminal issues are no-ops. |
+| `src/providers/linear.ts` | Moves a nonterminal issue to Canceled, removes Ready for Review, and posts a comment naming the PR and how to restart before the state transition. A failed comment leaves the issue active for retry; a failed state transition may cause a repeated comment on retry. Missing or terminal issues are no-ops. |
 | `src/providers/jira.ts` | Sets the AI-Implement status to `Implementation Failed` and posts the cancellation/restart comment. Native terminal issues and issues already marked Merged are no-ops. |
 | `src/providers/filesystem.ts` | Sets an active task to `cancelled` and appends the cancellation/restart comment. Completed or cancelled tasks are no-ops. |
 
@@ -116,10 +117,10 @@ retain the newest dispatch ordering for each implementation link. `job_current`
 marks the latest PR association reported by that job, so replacement URLs do not
 tie with obsolete links. These columns are added on initialization; surviving
 job history resolves replacements during backfill. Only finalization uses that
-ordering (`job_dispatched_at`, `job_id`, `job_current`) to identify the current PR
+ordering (`job_dispatched_at`, `job_id`, `job_current`, with linked time and link ID as fallbacks for recovered links) to identify the current PR
 after job pruning; cancellation exempts every link with `grouping_parent` set.
 Backfill enriches existing links only for the same tracker issue, preserving their
-metadata and role. Already-pruned grouping history cannot be reconstructed.
+metadata and role. Branch recovery can identify a grouping parent’s own implementation from its target branch even without surviving job history.
 
 A confirmed implementation merge atomically promotes a skipped reconciliation
 tombstone to pending in the same queue row, updating the merge SHA and resetting

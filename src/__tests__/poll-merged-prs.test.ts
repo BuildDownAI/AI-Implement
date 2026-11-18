@@ -57,6 +57,21 @@ describe("prNumberFromUrl", () => {
 });
 
 describe("detectMergedPrs", () => {
+  it.each([true, false])("does not cancel when a sibling merges in the same poll (merge first: %s)", async (mergeFirst) => {
+    seedLink(mergeFirst ? 1 : 2);
+    seedLink(mergeFirst ? 2 : 1);
+    const cancelIssue = vi.fn(async () => true);
+    await mod.detectMergedPrs({
+      getPullRequestState: async (_token, _owner, _repo, number) => ({ merged: number === 1, state: "closed" }),
+      tokenForOwner: async () => "tok", cancelIssue,
+      finalizeGroupingParent: async () => true,
+      mappingForRepo: () => makeMapping({ owner: "o", repo: "r" }),
+    });
+    expect(cancelIssue).not.toHaveBeenCalled();
+    expect(recon.getPendingReconciliations()).toHaveLength(1);
+    expect(links.findLinkByPr("o/r", 2)?.cancelCheckedAt).not.toBeNull();
+  });
+
   it("reconciles a job-row misread: 'failed' row with a recorded PR that actually merged (AII-264 r6)", async () => {
     seedLink(3610, "i-r6", "OOL-183");
     const jobId = log.appendLog({ issueId: "i-r6", issueIdentifier: "OOL-183", repo: "o/r" });

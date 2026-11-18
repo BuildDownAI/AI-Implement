@@ -58,6 +58,8 @@ export async function sweepUnlinkedPulls(deps: SweepUnlinkedPullsDeps): Promise<
         linkPullRequest({
           repository, number: pull.number, url: pull.url, headRef: pull.head, baseRef: pull.base,
           role: grouping ? "roll-up" : "implementation", source: "branch-match",
+          // A parent's closing implementation targets its own grouping branch.
+          groupingParent: !grouping && /^(?:[^/]+\/)*ai-implement\/(?:feature|multi-issue)\/([^/]+)$/.exec(pull.base)?.[1]?.toLowerCase() === issue.identifier.toLowerCase(),
           issue: { trackerKind: mapping.ticketingConfig.kind, mappingKey: teamKey,
             trackerIssueId: issue.id, identifier: issue.identifier, title: issue.title, url: provider.issueUrl(issue) },
         });
