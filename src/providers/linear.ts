@@ -1106,11 +1106,25 @@ export class LinearProvider implements TicketingProvider {
     );
     const issue = data.issue;
     if (!issue) return;
-    if (isTerminalStateType(issue.state.type)) return;
-    const stateId = await this.getCompletedStateId(issue.team.key);
     const labelIds = issue.labels.nodes
-      .filter((l) => l.name !== LINEAR_LABELS.readyForReview.name)
+      .filter((l) => l.name !== LINEAR_LABELS.readyForReview.name && l.name !== LINEAR_LABELS.planComplete.name)
       .map((l) => l.id);
+    if (isTerminalStateType(issue.state.type)) {
+      if (labelIds.length === issue.labels.nodes.length) return;
+      // Native integrations can close the issue before merge reconciliation runs.
+      // Clean up labels without changing its terminal state or looking up Done.
+      await this.linearMutation<{ issueUpdate: { success: boolean } }>(
+        `mutation($issueId: String!, $labelIds: [String!]!) {
+          issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
+            success
+          }
+        }`,
+        { issueId, labelIds },
+        "issueUpdate",
+      );
+      return;
+    }
+    const stateId = await this.getCompletedStateId(issue.team.key);
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
       `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
         issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) {
