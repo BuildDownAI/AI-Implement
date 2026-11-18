@@ -1239,3 +1239,67 @@ describe("job drawer Open in Restate UI link", () => {
     win.closeJobDrawer();
   });
 });
+
+describe("job drawer row parity", () => {
+  it("shows the table's issue ID fallback when the identifier is unavailable", async () => {
+    const issueId = 'issue-<img src=x>"quoted"';
+    const { win, doc } = mountDrawer({ ...BASE_JOB, issueIdentifier: "", issueId }, []);
+    try {
+      await win.openJobDrawer(1);
+      const issue = Array.from(doc.querySelectorAll("#drawer-context .field"))
+        .find(field => field.querySelector(".field-label")?.textContent === "Issue");
+      expect(issue?.lastElementChild?.textContent).toBe(issueId);
+      expect(issue?.querySelector("img")).toBeNull();
+    } finally { win.closeJobDrawer(); win.close(); }
+  });
+
+  it.each(["planning", "implementation", "kg-refresh"])("shows exact dispatch metadata for %s", async phase => {
+    const job = {
+      ...BASE_JOB, phase, issueState: 'Ready <img src=x> "quoted"',
+      sessionImage: 'registry.example/team/full/image:tag<test>',
+      runnerMode: "fly", prUrl: "https://github.com/org/repo/pull/42",
+    };
+    const { win, doc } = mountDrawer(job, []);
+    try {
+      await win.openJobDrawer(1);
+      expect(doc.getElementById("drawer-meta")?.textContent).toContain(new Date(job.dispatchedAt).toLocaleString());
+      expect(doc.getElementById("drawer-meta")?.textContent).toContain("started ");
+      const fields = new Map(Array.from(doc.querySelectorAll("#drawer-context .field")).map(field => [
+        field.querySelector(".field-label")?.textContent,
+        field.lastElementChild?.textContent,
+      ]));
+      expect(fields.get("Dispatch #")).toBe("1");
+      expect(fields.get("Phase")).toBe(phase);
+      expect(fields.get("Issue state")).toBe(job.issueState);
+      expect(fields.get("Image")).toBe(job.sessionImage);
+      expect(doc.querySelector("#drawer-context img")).toBeNull();
+      expect(doc.querySelector("#drawer-context .mono")?.textContent).toBe(job.sessionImage);
+      expect(fields.get("Issue")).toContain("ENG-1");
+      expect(fields.get("Project")).toBe("ENG");
+      expect(fields.get("Repository")).toBe("org/repo");
+      expect(fields.get("Runner")).toContain("fly");
+      expect(fields.get("Pull request")).toContain("#42");
+    } finally { win.closeJobDrawer(); win.close(); }
+  });
+
+  it("retains grouped planning status on refresh, opens its dispatch and clears the association", async () => {
+    const { win, doc } = mountDrawer({ ...BASE_JOB, dispatchNumber: 3 }, []);
+    try {
+      await win.openJobDrawer(1, 9, 'completed <img src=x> "quoted"');
+      expect(doc.getElementById("drawer-context")?.textContent).toContain("Dispatch #3");
+      expect(doc.getElementById("drawer-planning-job")?.textContent).toContain('completed <img src=x> "quoted"');
+      expect(doc.querySelector("#drawer-context img")).toBeNull();
+      await win.refreshJobDrawer(1, { background: true });
+      expect(doc.getElementById("drawer-planning-job")).not.toBeNull();
+      const api = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ job: { ...BASE_JOB, id: 9, phase: "planning" }, steps: [] }) }));
+      win.api = api;
+      (doc.getElementById("drawer-planning-job") as HTMLElement).click();
+      await vi.waitFor(() => expect(api).toHaveBeenCalledWith("/api/jobs/9/steps"));
+      await vi.waitFor(() => expect(doc.getElementById("drawer-planning-job")).toBeNull());
+      await win.openJobDrawer(1);
+      expect(doc.getElementById("drawer-planning-job")).toBeNull();
+      expect(doc.getElementById("drawer-context")?.textContent).not.toContain("undefined");
+      expect(doc.getElementById("drawer-context")?.textContent).not.toContain("Issue state");
+    } finally { win.closeJobDrawer(); win.close(); }
+  });
+});
