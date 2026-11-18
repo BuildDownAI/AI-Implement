@@ -6719,7 +6719,7 @@ describe("owned result accounting boundary", () => {
   });
 });
 
-it.each(["success", "failure"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
+it.each(["success", "failure", "skipped"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
   const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
     ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET });
   const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
@@ -6732,7 +6732,8 @@ it.each(["success", "failure"] as const)("review-only %s preserves findings and 
   const provider = new FakeProvider({ recordCalls: true });
   const res = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
     resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
-    body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [],
+    body: { phase: "gap-analysis", outcome: outcome === "skipped" ? "success" : outcome, reviewOnly: true, comments: [],
+      ...(outcome === "skipped" ? { rollupReview: { headSha: "a".repeat(40), verdictUrl: "", skipReason: "PR head moved" } } : {}),
       internalFindings: [...findings, { source: "ai-implement-internal", severity: "blocking", body: "new" }],
       findingDispositions: findings.map((f, i) => ({ findingKey: reviewStore.stableReviewFindingKey(f),
         disposition: (["fixed", "invalid", "follow-up"] as const)[i], reason: "test" })),
@@ -6740,7 +6741,7 @@ it.each(["success", "failure"] as const)("review-only %s preserves findings and 
   });
   expect(res.status).toBe(200);
   expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual(before);
-  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome === "success" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
+  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome !== "failure" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
   expect(submit).not.toHaveBeenCalled();
   expect(provider.recordedCalls()).toHaveLength(0);
 });
@@ -6773,7 +6774,7 @@ describe("roll-up review follow-up children", () => {
     ];
     async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success",
       failedReviewers = outcome === "failure" ? ["code-review", "integration-review"] : [],
-      incompleteReviews?: Array<{ reviewerId: string; failure?: { category: import("../pipeline/failure-classification.js").FailureCategory; code: string } }>) {
+      incompleteReviews?: Array<{ reviewerId: string; failure?: { category: import("../pipeline/failure-classification.js").FailureCategory; code: string } }>, skipReason?: string) {
       const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
       const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
@@ -6782,7 +6783,7 @@ describe("roll-up review follow-up children", () => {
         checkImplementationAdmissionTermination: async () => ({ status: "accepted" }),
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
         body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
-          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers, incompleteReviews } } });
+          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers, incompleteReviews, skipReason } } });
       return { deliver, dispatchId };
     }
     async function run(head: string, internalFindings = findings) {
@@ -6796,6 +6797,18 @@ describe("roll-up review follow-up children", () => {
     }
     return { provider, children, listing, create, update, run, prepare, findings };
   }
+
+  it("acknowledges a stale-head skip without child, tracker verdict, or retry", async () => {
+    const { prepare, provider, create, listing, update, findings } = await setup();
+    const { deliver, dispatchId } = await prepare("a", findings, "success", [], [], "PR head moved from A to B");
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "completed", conclusion: "rollup_review", approved: false });
+    expect(create).not.toHaveBeenCalled();
+    expect(listing).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(provider.recordedCalls()).toEqual([]);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(0);
+  });
 
   it("queues one retry for PROVIDER_OVERLOADED incomplete reviewers", async () => {
     const { prepare, update } = await setup();

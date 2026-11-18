@@ -1,4 +1,6 @@
 export interface RollupReviewResult {
+  /** Stale queued head: no reviewer or verdict was produced. */
+  skipReason?: string;
   headSha: string;
   verdictUrl: string;
   failedReviewers?: string[];
