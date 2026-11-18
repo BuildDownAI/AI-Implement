@@ -121,8 +121,40 @@ until those are present.
 | Codex on Restate: expired-token resume | Pending | Live run ID, snapshot ID, head SHA |
 | Codex on Restate review-fix, live | Pending | Live run ID, snapshot ID, head SHA |
 
-Managed Restate review-fix admission still refuses until AII-1335/1336. AII-1338 is generic Fly proof, not Codex-specific.
+Managed Restate review-fix now requires private-envelope capability at admission and prepares model authentication
+inside the guarded launch effect. This is local implementation evidence, not live acceptance.
+AII-1338 is generic Fly proof, not Codex-specific.
 AII-1289 owns the final Codex-specific evidence.
+
+## AII-2026 validation blocker (2026-11-18)
+
+The current checkout is based on `3da438d30d3fa9502a9b17f8882ecb3473ab1627`; the local candidate-readiness
+repair does not supply live acceptance evidence. All pending rows above remain unaccepted. This environment has no
+configured orchestrator endpoint or live model/admin credentials, and neither Docker nor Fly CLI is installed.
+No live run, attempt or frozen snapshot was created, so there are no new identifiers or execution head SHAs to record.
+
+The local integration now connects `createManagedReviewFixWorker` to production Restate composition. It freezes
+stage configuration under the admitted attempt ID with `prepareManagedDispatch`, carries the snapshot and model grant
+alongside the callback credentials in the trusted private envelope, and calls `settleLaunch` on launch failure or
+uncertainty. Managed admission requires private-envelope support; legacy work retains its existing transport.
+The existing durable launch intent still prevents a replay from dispatching twice. Preparation and bootstrap consumption
+stay inside that effect, so no bearer is returned to the Restate journal. Reconstruction uses the durable attempt scope
+store for cancellation and terminal inspection.
+
+Local regression evidence on this uncommitted working tree: 130 tests pass across `model-auth-runtime.test.ts`,
+`managed-dispatch-auth.test.ts`, `review-fix-production-model-auth.test.ts` and `review-fix-worker.test.ts`.
+The new managed-worker cases use real SQLite configuration, sign-in, grant and attempt stores with synthetic GitHub I/O.
+They cover accepted/rejected/unknown dispatch, lost response, private capability loss, snapshot reuse and no second launch
+on reconstruction; the accepted case also checks duplicate results, cancellation after reconstruction, an immutable
+terminal outcome and stale results after release. These are adapter/store regressions, not proof of Restate replay.
+
+The three review-fix Restate suites were attempted with `npm run test:restate --` and their file paths. All failed during
+setup because this sandbox denies `listen` on `127.0.0.1` (`EPERM`); 87 tests did not execute. The live matrix above
+remains pending, including real Codex turns, mixed stages, recovery/retry/callback faults and expired-token resume.
+Completing it requires a reachable deployment of the reviewed head, synced workflows and authorized model/admin
+credentials. Record each run/attempt, frozen snapshot and deployed head, plus launch/terminal-effect counts and
+stale-callback outcomes. No deployed head or live identifier can be attributed to this local change. AII-1289 must
+remain incomplete until that evidence exists.
 
 ## Release order
 

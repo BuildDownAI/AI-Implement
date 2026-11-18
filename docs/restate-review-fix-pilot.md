@@ -73,7 +73,16 @@ Open the PR's job drawer. Record the attempt ID, lifecycle owner, deadline, pend
 
 `GithubReviewFixWorker.launch` probes `resolveWorkflowCapabilities` for the exact owner, repo, workflow file and ref it dispatches, using the same installation token. Only a strict `supportsPrivateRunConfig === true` carries the result, progress and publication bearers in the trusted `run_config` credentials namespace (no top-level bearer inputs). An absent, old, or failed probe keeps the generic envelope plus masked top-level bearers. Work that requires protected transport (`requiresProtectedTransport`) returns `unknown` before dispatch instead of downgrading. `run_attempt_token` stays the public correlation marker on both paths, and the callback URL rides the envelope on both. Bearers are built only inside `launch`, never in the plan, scope store, or outcome.
 
-**Opted-in projects are refused.** GitHub Actions cannot carry a model-auth grant yet, so `canAdmit` returns `configuration_error` when `isManagedProject(<mapping key>)` is true, before any GitHub call. `admit` then marks the queue row `failed`, logs `[review-fix] <repo>#<pr> not launched: configuration_error (gha_not_supported)`, and returns `deferred`/`paused` without calling the store's `admit`, so nothing is reserved. The row is no longer `pending`, so the PR object stops rechecking. The worker's protected-transport `unknown` hook is never reached for such a project.
+**Managed projects require private transport.** Admission checks the mapping's default-branch workflow for
+`supportsPrivateRunConfig` as well as attempt correlation and publication support; a missing capability defers the
+pending row without reserving an attempt. Inside the attempt's guarded `launch-once` effect,
+`createManagedReviewFixWorker` calls `prepareManagedDispatch` using the attempt ID as dispatch ID. This persists the
+frozen stage snapshot and supplies the model grant only to the trusted private envelope, alongside callback credentials.
+The bootstrap never enters a Restate journal result or launch plan. Pre-dispatch prerequisite failures reject the launch;
+rejected and uncertain launches settle/revoke the grant through `settleLaunch`. An uncertain dispatch retains attempt
+occupancy for exact reconciliation, and replayed launch intent never dispatches again. Recovery and cancellation use the
+persisted attempt scope. Live Codex acceptance is still pending; see [codex-parity-validation.md](codex-parity-validation.md).
+
 ## Callback URL and the "run ended without a result" path (AII-1273)
 
 The run envelope (`RunConfigV1`) carries `runnerCallbackUrl`, the orchestrator's callback base URL, as the implementation envelope does. The `claude-implement.yml` template no longer declares a `runner_callback_url` input, and in envelope mode the runner reads the URL only from the envelope. The result, progress and publication tokens stay workflow inputs and never enter the envelope. `runner_image` is likewise a workflow input, resolved by `resolveRunnerImageForDispatch` as in the implementation dispatch, so a review-fix run uses the same runner channel as the orchestrator (or the repo's `image.yml`) rather than the workflow's `:latest` fallback. If a review-fix runner has no callback URL or `RUN_TOKEN`, `postRunnerResult` logs one `[runner-callback]` warning naming what is missing.

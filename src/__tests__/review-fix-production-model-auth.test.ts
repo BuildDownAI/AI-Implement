@@ -7,7 +7,7 @@ const isManagedProject = vi.fn();
 const getInstallationToken = vi.fn(async () => "tok");
 const getInstallationId = vi.fn(async () => 1);
 const resolveWorkflowCapabilities = vi.fn(async () => ({
-  contract: "envelope", supportsAttemptCorrelation: true, supportsRunPublicationToken: true }));
+  contract: "envelope", supportsAttemptCorrelation: true, supportsRunPublicationToken: true, supportsPrivateRunConfig: true }));
 const getPullRequestState = vi.fn(async () => ({ state: "open", merged: false }));
 
 vi.mock("../config.js", () => ({
@@ -41,38 +41,18 @@ const request = { scope, feedback: { taskText: "t", findings: [], queueCursor: {
 afterEach(() => vi.clearAllMocks());
 
 describe("review-fix admission and model authentication", () => {
-  it("refuses an opted-in project before any GitHub call, keyed by the mapping key", async () => {
+  it("admits a managed project only with private-envelope support", async () => {
     getMappings.mockReturnValue({ "proj-key": mapping });
     isManagedProject.mockReturnValue(true);
-    expect(await canAdmit(scope, config)).toBe("configuration_error");
+    expect(await canAdmit(scope, config)).toBe("admit");
     expect(isManagedProject).toHaveBeenCalledWith("proj-key");
-    expect(getInstallationToken).not.toHaveBeenCalled();
-    expect(getInstallationId).not.toHaveBeenCalled();
-    expect(resolveWorkflowCapabilities).not.toHaveBeenCalled();
-    expect(getPullRequestState).not.toHaveBeenCalled();
-  });
-
-  it("admit reserves nothing, fails the queue row and logs the exact line", async () => {
-    getMappings.mockReturnValue({ k: mapping });
-    isManagedProject.mockReturnValue(true);
-    const store = { admit: vi.fn() };
-    const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    const outcome = await admitReviewFix(request, config, store);
-    expect(outcome).toEqual({ status: "deferred", reason: "paused" });
-    expect(store.admit).not.toHaveBeenCalled();
-    expect(updateReviewFixStatus).toHaveBeenCalledWith(42, "failed");
-    expect(err).toHaveBeenCalledWith("[review-fix] acme/app#7 not launched: configuration_error (gha_not_supported)");
-    err.mockRestore();
-  });
-
-  it("still defers without touching the queue when the opted-in request has no cursor", async () => {
-    getMappings.mockReturnValue({ k: mapping });
-    isManagedProject.mockReturnValue(true);
-    const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    const noCursor = { ...(request as object), feedback: { taskText: "t", findings: [] } } as never;
-    expect(await admitReviewFix(noCursor, config, { admit: vi.fn() })).toEqual({ status: "deferred", reason: "paused" });
+    const store = { admit: vi.fn(async () => ({ status: "prepared" })) };
+    await admitReviewFix(request, config, store as never);
+    expect(store.admit).toHaveBeenCalledWith(request);
     expect(updateReviewFixStatus).not.toHaveBeenCalled();
-    err.mockRestore();
+    resolveWorkflowCapabilities.mockResolvedValueOnce({ contract: "envelope", supportsAttemptCorrelation: true,
+      supportsRunPublicationToken: true, supportsPrivateRunConfig: false });
+    expect(await canAdmit(scope, config)).toBe("defer");
   });
 
   it("keeps the opted-out path: same GitHub calls, admit", async () => {
