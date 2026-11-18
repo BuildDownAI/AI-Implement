@@ -71,6 +71,7 @@ vi.mock("../github.js", async (importOriginal) => {
     postWorkflowDispatch: vi.fn(),
     getBranchSha: vi.fn(actual.getBranchSha),
     getRepoDefaultBranch: vi.fn(),
+    listAllOpenPullRequests: vi.fn(async () => []),
   };
 });
 
