@@ -25,6 +25,8 @@ afterEach(() => vi.restoreAllMocks());
 describe("sweepUnlinkedPulls", () => {
   it.each([
     ["ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],
+    ["custom/ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],
+    ["custom/nested/ai-implement/aii-1981-some-slug", "implementation", "AII-1981"],
     ["ai-implement/feature/aii-1979", "roll-up", "AII-1979"],
     ["ai-implement/multi-issue/aii-1979", "roll-up", "AII-1979"],
   ])("links %s without job rows", async (head, role, key) => {

@@ -39,8 +39,8 @@ export async function sweepUnlinkedPulls(deps: SweepUnlinkedPullsDeps): Promise<
           continue;
         }
         if (!deps.appBotLogin || pull.author !== deps.appBotLogin || missingIssues.has(pr)) continue;
-        const grouping = /^ai-implement\/(?:feature|multi-issue)\/([^/]+)$/.exec(pull.head);
-        const implementation = /^ai-implement\/([a-zA-Z0-9]+-\d+)-.+$/.exec(pull.head);
+        const grouping = /^(?:[^/]+\/)*ai-implement\/(?:feature|multi-issue)\/([^/]+)$/.exec(pull.head);
+        const implementation = /^(?:[^/]+\/)*ai-implement\/([a-zA-Z0-9]+-\d+)-.+$/.exec(pull.head);
         const identifier = grouping?.[1] ?? implementation?.[1];
         if (!identifier) continue;
         const prefix = identifier.split("-")[0];
