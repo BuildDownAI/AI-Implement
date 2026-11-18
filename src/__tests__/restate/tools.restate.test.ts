@@ -170,7 +170,14 @@ const SETUP_RUN: SetupCheckRun = {
   checkedAt: 4242,
   results: [{ id: "restate", title: "Restate engine", group: "orchestrator", tier: "core", onAdminPath: true, state: "fail", detail: "The sidecar is exited", fix: "Read the [restate] lines" }],
 };
-const setupChecks = createSetupChecks({ runChecks: async () => SETUP_RUN, runChecksQuietly: async () => SETUP_RUN, runProjectChecks: async () => null });
+const setupChecks = createSetupChecks({
+  runChecks: async () => SETUP_RUN,
+  runChecksQuietly: async () => SETUP_RUN,
+  runProjectChecks: async () => null,
+  runOrchestratorWideChecks: async () => SETUP_RUN,
+  mappedProjects: () => [],
+  runScope: async () => null,
+});
 
 describe("orchestratorTools (Restate)", () => {
   let environments: Map<string, RestateEnvironment>;

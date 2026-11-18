@@ -79,6 +79,11 @@ export const SETUP_CHECK_IDS = [
 
 export type SetupCheckId = (typeof SETUP_CHECK_IDS)[number];
 
+/** The runtime failures that ask for a check to run again, each kept as the `cause` of the rows its recheck answers. */
+export const SETUP_RECHECK_CAUSES = ["dispatch-404", "launch-refused", "planning-refused", "token-step"] as const;
+
+export type SetupRecheckCause = (typeof SETUP_RECHECK_CAUSES)[number];
+
 export interface SetupCheckResult {
   id: SetupCheckId;        // stable, e.g. "admin.allowlist"; runtime failures and self-heal actions name checks by id
   title: string;           // a human name for the check
@@ -93,6 +98,7 @@ export interface SetupCheckResult {
   fixUrl?: string;         // a page that applies the fix; shown where detail is
   waitsOn?: SetupCheckId;  // the check this row cannot be read without, which its fix names (`waitOn`)
   checkedAt?: number;      // set by a run narrower than a full one; absent means the run's checkedAt
+  cause?: SetupRecheckCause; // the runtime failure whose recheck answered this row
 }
 
 /**
@@ -154,7 +160,7 @@ export interface GitHubSetupFacts {
   /** The knowledge-graph refresh preflight, or null when `kgSourceRepo()` is. */
   kgPreflight(): Promise<PreflightCheckResult | null>;
   /** A project's workflow sync row, or null when none was ever queued. */
-  workflowSync(teamKey: string): WorkflowSyncJob | null;
+  workflowSync(project: string): WorkflowSyncJob | null;
 }
 
 /** What a check reports; the runner adds the check's own identity fields. */

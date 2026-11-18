@@ -469,7 +469,8 @@ export const projectsScript = `
     }
     const own = ownSetupRows(key, stored);
     if (!own.length) return null;
-    const checked = 'Checked ' + window.fmtAgo(own[0].checkedAt || stored.run.checkedAt);
+    // Dated by the project's oldest row, since a recheck refreshes one row at a time.
+    const checked = 'Checked ' + window.fmtAgo(Math.min.apply(null, own.map(function (row) { return row.checkedAt || stored.run.checkedAt; })));
     return [
       setupMarker(own.filter(function (row) { return row.tier !== 'feature'; }), checked),
       setupMarker(own.filter(function (row) { return row.tier === 'feature'; }), checked),
@@ -1477,8 +1478,7 @@ export const projectsScript = `
       }
       let html = '<option value="">(select)</option>';
       for (const o of options) {
-        const v = window.esc(o.value);
-        html += '<option value="' + v + '">' + v + '</option>';
+        html += '<option value="' + window.escAttr(o.value) + '">' + window.esc(o.value) + '</option>';
       }
       select.innerHTML = html;
       select.classList.remove('hidden');

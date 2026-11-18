@@ -245,6 +245,14 @@ describe("projects page setup columns", () => {
     await win.loadMappings();
     expect(marker(required()).title).toContain("1h ago");
   });
+
+  // A recheck refreshes one row, so the project's other rows can be older than its newest.
+  it("dates the markers by the project's oldest row", async () => {
+    const rechecked = row("github.installation", "fail", { checkedAt: CHECKED + 50 * 60 * 1000 });
+    const { win, required } = mountWithRun({ checkedAt: CHECKED, results: [rechecked, row("github.permissions", "pass")] });
+    await win.loadMappings();
+    expect(marker(required()).title).toContain("1h ago");
+  });
 });
 
 describe("projects page sync poll — the project's setup checks", () => {
@@ -1033,5 +1041,24 @@ describe("projects page agents tab", () => {
     await save(m.win);
     expect(JSON.stringify(m.posts[0])).not.toMatch(/agent|stages/i);
     expect(puts(m)).toHaveLength(0);
+  });
+});
+
+describe("the Edit dialog's Jira repository values", () => {
+  // Whoever administers the Jira field names its options, so a quote in one must stay inside its option.
+  const VALUE = 'acme/app"><option value="injected';
+
+  it("lists each option as one choice, its value and its text as Jira has them", async () => {
+    const { win, doc } = mountAdminPage({
+      html: projectsHtml,
+      script: projectsScript,
+      route: "projects",
+      api: async (url) => ({ ok: true, status: 200, json: async () => (url.startsWith("/api/jira/field-options") ? [{ value: VALUE }] : {}) }),
+    });
+    const field = doc.getElementById("md-jira-repo-field") as HTMLSelectElement;
+    field.innerHTML = '<option value="customfield_1">Repo</option>';
+    await win.onRepoFieldChange();
+    const options = Array.from((doc.getElementById("md-jira-repo-value") as HTMLSelectElement).options);
+    expect(options.map((o) => [o.value, o.textContent])).toEqual([["", "(select)"], [VALUE, VALUE]]);
   });
 });

@@ -1768,6 +1768,21 @@ export interface PublicRepositoryRead {
   status: number;
   /** Whether the requested ref resolves, or null when no ref was asked or the repository read failed. */
   refExists: boolean | null;
+  /** When GitHub refused a read for its rate limit, the time it may be read again, in epoch milliseconds. */
+  rateLimitedUntil?: number;
+}
+
+/**
+ * When a refused response may be retried, by GitHub's rate-limit rules, or null when GitHub did not refuse it for a rate limit:
+ * `retry-after` seconds from now, else the primary limit's `x-ratelimit-reset` (UTC epoch seconds), else a minute.
+ */
+export function gitHubRateLimitedUntil(res: Response, now: number = Date.now()): number | null {
+  if (res.status !== 403 && res.status !== 429) return null;
+  const retryAfter = res.headers.get("retry-after");
+  if (retryAfter !== null && /^\d+$/.test(retryAfter)) return now + Number(retryAfter) * 1000;
+  if (res.headers.get("x-ratelimit-remaining") !== "0") return null;
+  const reset = Number(res.headers.get("x-ratelimit-reset"));
+  return reset > 0 ? reset * 1000 : now + 60_000;
 }
 
 /**
@@ -1777,10 +1792,14 @@ export interface PublicRepositoryRead {
 export async function readPublicRepository(owner: string, repo: string, ref?: string): Promise<PublicRepositoryRead> {
   const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const res = await fetch(base, { headers: srcHeaders(null), signal: defaultFetchSignal() });
+  const limited = gitHubRateLimitedUntil(res);
+  if (limited !== null) return { status: res.status, refExists: null, rateLimitedUntil: limited };
   if (!res.ok || ref === undefined) return { status: res.status, refExists: null };
   const commit = await fetch(`${base}/commits?sha=${encodeURIComponent(ref)}&per_page=1`, { headers: srcHeaders(null), signal: defaultFetchSignal() });
   // getRefSha's reading: 404 is a missing repository and 422 an invalid ref. Anything else is not an answer about the ref.
   if (commit.status === 404 || commit.status === 422) return { status: res.status, refExists: false };
+  const commitLimited = gitHubRateLimitedUntil(commit);
+  if (commitLimited !== null) return { status: res.status, refExists: null, rateLimitedUntil: commitLimited };
   if (!commit.ok) throw new GitHubApiError({ status: commit.status, path: `/repos/${owner}/${repo}/commits`, bodyText: await commit.text() });
   return { status: res.status, refExists: true };
 }

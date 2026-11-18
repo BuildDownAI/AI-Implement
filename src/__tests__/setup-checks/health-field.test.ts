@@ -1,7 +1,7 @@
-import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { runSetupChecks, setupChecksHealthField, type SetupCheckRun } from "../../setup-checks/index.js";
 import { ORCHESTRATOR_CONFIG_CHECKS } from "../../setup-checks/orchestrator-config.js";
+import { makeAppPrivateKey } from "../helpers/builders.js";
 import { makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
 import { fakeFetch } from "../helpers/fake-fetch.js";
@@ -57,12 +57,11 @@ describe("setupChecksHealthField", () => {
   });
 
   it("keeps an empty bootstrap list when no local check reports fail", async () => {
-    const { privateKey } = generateKeyPairSync("ed25519");
     let allowlistReads = 0;
     const ctx = makeSetupCheckContext({
       env: {
         GITHUB_APP_ID: "123",
-        GITHUB_APP_PRIVATE_KEY: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        GITHUB_APP_PRIVATE_KEY: makeAppPrivateKey(),
         GOOGLE_OAUTH_CLIENT_ID: "client", GOOGLE_OAUTH_CLIENT_SECRET: "secret",
         OAUTH_REDIRECT_BASE_URL: "https://example.com",
       },

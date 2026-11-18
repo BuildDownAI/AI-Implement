@@ -71,6 +71,28 @@ describe("deploy hold", () => {
   });
 });
 
+describe("waiting out the hold", () => {
+  // Whether the promise has settled by the time every pending callback has run, without waiting on it.
+  const settled = async (promise: Promise<void>) => {
+    let done = false;
+    void promise.then(() => { done = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    return done;
+  };
+
+  it("resolves at once when nothing is held", async () => {
+    expect(await settled(hold.whenDeployHoldClears())).toBe(true);
+  });
+
+  it("resolves only once the hold is cleared", async () => {
+    hold.setDeployHold();
+    const cleared = hold.whenDeployHoldClears();
+    expect(await settled(cleared)).toBe(false);
+    hold.clearDeployHold();
+    expect(await settled(cleared)).toBe(true);
+  });
+});
+
 describe("deploy started-at clock", () => {
   it("has no start time on a fresh database", () => {
     expect(hold.getDeployStartedAt()).toBeNull();

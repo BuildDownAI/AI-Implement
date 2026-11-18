@@ -1,7 +1,8 @@
 // Must stay first: sets RESTATE_LOGGING before the Restate SDK loads and reads it (AII-1189).
 import "./restate/log-level-boot.js";
 import { buildHealthBody } from "./health-body.js";
-import { BEFORE_FIRST_SYNC, createSetupCheckContext, getLastSetupCheckRun, getSetupCheckProgress, runProjectSetupChecks, setupChecksHealthField } from "./setup-checks/index.js";
+import { BEFORE_FIRST_SYNC, createSetupCheckContext, getCachedSetupCheckRun, getSetupCheckProgress, runProjectSetupChecks, setupChecksHealthField } from "./setup-checks/index.js";
+import { createSetupCheckChangeDetector, readSavedSetup } from "./setup-checks/change-detector.js";
 import { managedRunConfigFields } from "./managed-dispatch-auth.js";
 import { armModelPricesSchedule } from "./restate/model-prices.js";
 import { realpathSync } from "node:fs";
@@ -60,7 +61,7 @@ import { configureLinearAuthFromEnv } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, resolveProviders } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { clearAccessBindingsViaObject } from "./restate/access-binding.js";
-import { createSetupChecksHydration, readSetupChecksViaObject, runProjectSetupChecksViaObject, startSetupChecksViaObject } from "./restate/setup-checks.js";
+import { createProductionBootSetupChecks, createSetupChecksHydration, createSetupChecksIngressClient } from "./restate/setup-checks.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
 import { initAuthEventsTable } from "./mcp-auth-events.js";
@@ -244,7 +245,7 @@ export interface AppConfig {
   selfDeployTarget: SelfDeployTarget | null; // build-stamped; null when the image carries no stamps
 }
 
-function loadConfig(): AppConfig {
+export function loadConfig(): AppConfig {
   const required = (key: string): string => {
     const val = process.env[key];
     if (!val) throw new Error(`Missing required env var: ${key}`);
@@ -449,6 +450,16 @@ async function getTargetRepoToken(
 /** True once the KG composition (and so the `PipelineSchedule` service) is bound at boot. */
 let kgScheduleBound = false;
 
+/** Fills this process's cache of the stored setup-check run: at registration, then each cycle until a read answers. */
+const setupChecksClient = createSetupChecksIngressClient();
+const hydrateSetupChecks = createSetupChecksHydration(() => setupChecksClient.read());
+/** The setup checks' change detector. Each cycle compares with the one before, so its memory lives as long as the process. */
+const setupCheckChangeDetector = createSetupCheckChangeDetector({
+  readSavedSetup: () => readSavedSetup(createSetupCheckContext({ restateStatus: getRestateStatus })),
+  send: (run) => setupChecksClient.send(run),
+  log: (line) => { console.log(line); },
+});
+
 /** Tracker kind and issue URL for a review-fix job row; a lookup failure never blocks the row. */
 async function reviewFixAccounting(
   registry: ProviderRegistry,
@@ -475,6 +486,9 @@ export async function poll(config: AppConfig, registry: ProviderRegistry): Promi
     await checkPipelineSchedules(["kg-refresh"]);
     await checkKgSidecarHealth();
   }
+  // Outside the cycle deadline too: neither throws, and each bounds its own reads.
+  void hydrateSetupChecks();
+  await setupCheckChangeDetector.onPollCycle();
   await runWithDeadline(
     cycleId,
     started,
@@ -4056,7 +4070,7 @@ const submitLateExternalReview = createLateExternalReviewSubmitHook({
   restateReady: restateCanServe,
 });
 // A repository-fix project's workflow follows the auto-fix to its new head (ADR 038); the mode rides the input.
-const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
+export const lateExternalReviewSubmitHook: typeof submitLateExternalReview = (input) => {
   const mapping = Object.values(getMappings()).find((m) => m.owner === input.owner && m.repo === input.repo);
   const followHead = resolveReviewProcess(mapping?.reviewProcess).fixer === "repository";
   return submitLateExternalReview(followHead ? { ...input, followHead } : input);
@@ -4262,7 +4276,7 @@ export function handleReviewPublicationRequest(
   });
 }
 
-function startServer(
+export function startServer(
   config: AppConfig,
   registry: ProviderRegistry,
   memoryProvider: MemoryProvider | null,
@@ -4300,7 +4314,7 @@ function startServer(
         sidecarHealthFields,
         restateStatus: getRestateStatus,
         deployHealth,
-        setupChecks: () => setupChecksHealthField(getLastSetupCheckRun(), createSetupCheckContext({ restateStatus: getRestateStatus })),
+        setupChecks: () => setupChecksHealthField(getCachedSetupCheckRun(), createSetupCheckContext({ restateStatus: getRestateStatus })),
       }).then((body) => {
         const json = JSON.stringify(body);
         res.writeHead(body.status === "unavailable" ? 503 : 200, { "Content-Type": "application/json" });
@@ -4887,9 +4901,9 @@ function startServer(
           return { started: getPollStats().pollCount > before };
         },
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: readSetupChecksViaObject, startSetupChecks: startSetupChecksViaObject, setupCheckProgress: getSetupCheckProgress,
+      }, registry, { selfDeploy: canSelfDeploy(config) ? selfDeployClient : undefined, selfDeployTarget: config.selfDeployTarget, kgRefresh: kgRefreshAdminDeps, callTool, trackerExport: trackerExportClient, readChatGptPlanState, clearAccessBindings: clearAccessBindingsViaObject, readSetupChecks: () => setupChecksClient.read(), startSetupChecks: () => setupChecksClient.start(), setupCheckProgress: getSetupCheckProgress,
         runCandidateChecks: (key, mapping) => runProjectSetupChecks(createSetupCheckContext({ restateStatus: getRestateStatus, mappings: () => ({ [key]: mapping }) }), key, BEFORE_FIRST_SYNC),
-        runProjectSetupChecks: (project) => runProjectSetupChecksViaObject(project),
+        runProjectSetupChecks: (project) => setupChecksClient.runProject(project),
         retention: {
           getRestateDays: getRestateRetentionDays,
           setRestateDays: setRestateRetentionDays,
@@ -4941,7 +4955,7 @@ function restateRegistrationStatusFor(outcome: RestateRegisterOutcome): RestateR
 export interface RestateEndpointWireDeps {
   startRestateEndpoint: () => Promise<unknown>;
   registerRestateEndpoint: () => Promise<RestateRegisterResult>;
-  /** Runs after any non-conflict registration outcome, including `unreachable`; must not throw. */
+  /** Runs once the endpoint registers, before boot settles as serving. A throw settles boot as `hook-failed`. */
   onRegistered?: () => Promise<void>;
 }
 
@@ -5185,6 +5199,10 @@ export async function runMainBoot(deps: {
   isShuttingDown: () => boolean;
   shutdown: (reason: string, exitCode?: number) => Promise<void>;
   onServing?: () => void;
+  /** Starts the setup checks boot logs while Restate starts. Boot never waits for them. */
+  setupChecksBeforeRestate?: () => void;
+  /** Starts the setup checks boot stores once Restate serves. Boot never waits for them. */
+  setupChecksAfterServing?: () => void;
   logFly: () => void;
   refreshCache: () => Promise<void>;
   reconcile: () => Promise<void>;
@@ -5197,6 +5215,7 @@ export async function runMainBoot(deps: {
     deps.registerSignal(signal, () => { void deps.shutdown(signal); });
   }
   deps.startServer();
+  deps.setupChecksBeforeRestate?.();
   const now = deps.now ?? Date.now;
   const started = now();
   const result = await deps.wait();
@@ -5207,6 +5226,7 @@ export async function runMainBoot(deps: {
     return;
   }
   deps.onServing?.();
+  deps.setupChecksAfterServing?.();
   console.log(`[main] Restate serving after ${now() - started} ms`);
   deps.logFly();
   await deps.refreshCache();
@@ -5417,12 +5437,12 @@ async function main(): Promise<void> {
     // Only the notification/outcome copy carries diagnostic text; the durable record stays stable.
     onOutcome: createSelfDeployOutcomeHandler(config),
   })];
-  const hydrateSetupChecks = createSetupChecksHydration();
   const restateRegistration = createRestateRegistrationGate(() => shuttingDown, {
     startRestateEndpoint: () => startRestateEndpoint([...RESTATE_SERVICES, ...reviewFixServices, ...kgServices, ...planningRunServices, ...implementationRunServices, ...lateExternalReviewServices, postPushReviewPublication, ...trackerExportServices, ...selfDeployServices], restateSidecar.identityKey),
     registerRestateEndpoint,
     onRegistered: async () => {
-      await hydrateSetupChecks();
+      // Boot settles as serving only once this hook returns, and the first poll waits for that.
+      void hydrateSetupChecks();
       await onRestateRegistered({
         sweep: () => sweepOnRegistered(config),
         scrub: async () => { await scrubOperatorLegacyTokens(); },
@@ -5480,6 +5500,7 @@ async function main(): Promise<void> {
   });
 
   let server: ReturnType<typeof startServer>;
+  const bootSetupChecks = createProductionBootSetupChecks(() => server, setupChecksClient);
   await runMainBoot({
     registerSignal: (signal, handler) => { process.on(signal, handler); },
     startServer: () => { server = startServer(config, registry, memoryProvider, memoryProviderDiagnostic); },
@@ -5491,6 +5512,8 @@ async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     shutdown,
     onServing: () => restateExit.arm(shutdown),
+    setupChecksBeforeRestate: () => { void bootSetupChecks.beforeRestate(); },
+    setupChecksAfterServing: () => { void bootSetupChecks.afterServing(); },
     logFly: () => {
       // Check if Fly config is needed
       const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");

@@ -1523,6 +1523,8 @@ describe("poll implementation submission — ImplementationRun for every project
   const issue = makeIssue({ identifier: "AII-1555", scopeKey: "AII" });
   const config = makeAppConfig({ ...CALLBACK_CONFIG, runnerTokenSecret: "TOKEN_SENTINEL" });
   const ctx = { execPath: "github-actions" as const, runnerMode: "default", baseBranch: "feature/group", baseBranchFieldValue: null as string | null };
+  // What every poll cycle reads from Restate before its own work: the runner backend cache, and the stored setup-check run until one read answers.
+  const POLL_CYCLE_ROUTES = { "POST /RunnerBackend/fly-machines/get": { json: {} }, "POST /SetupChecks/orchestrator/get": { json: null } } as const;
   let indexModule: typeof import("../index.js");
   let dedup: typeof DedupModule;
   let status: typeof import("../restate/status.js");
@@ -1566,7 +1568,7 @@ describe("poll implementation submission — ImplementationRun for every project
 
   describe.each([null, "legacy", "restate"] as const)("poll with stored lifecycle %s", (reviewFixLifecycle) => {
     it.each(["github-actions", "fly-machines", "local-docker"] as const)("submits through ImplementationRun on %s", async (executionMode) => {
-      fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+      fakeFetch(POLL_CYCLE_ROUTES).install();
       const store = await import("../config.js");
       const auth = await import("../github-app-auth.js");
       const github = await import("../github.js");
@@ -1611,7 +1613,7 @@ describe("poll implementation submission — ImplementationRun for every project
   });
 
   it("dispatches on every poll when the provider cannot enumerate roll-up children", async () => {
-    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    fakeFetch(POLL_CYCLE_ROUTES).install();
     const store = await import("../config.js");
     const auth = await import("../github-app-auth.js");
     store.upsertMapping("AII", jiraMapping("AII"));
@@ -1631,7 +1633,7 @@ describe("poll implementation submission — ImplementationRun for every project
   it.each(["planning", "implementation"].flatMap(kind =>
     ["success", "lookup-null", "lookup-error", "park-rejected", "park-error"].map(outcome => ({ kind, outcome }))))(
     "blocks $kind pickup when roll-up reconciliation outcome is $outcome", async ({ kind, outcome }) => {
-    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    fakeFetch(POLL_CYCLE_ROUTES).install();
     const store = await import("../config.js");
     const auth = await import("../github-app-auth.js");
     const github = await import("../github.js");
@@ -1682,7 +1684,7 @@ describe("poll implementation submission — ImplementationRun for every project
   });
 
   it.each([false, true, "reconciliation-failure"])("dispatches filesystem work with mixed providers=%s", async (mixed) => {
-    fakeFetch({ "POST /RunnerBackend/fly-machines/get": { json: {} } }).install();
+    fakeFetch(POLL_CYCLE_ROUTES).install();
     const store = await import("../config.js");
     const auth = await import("../github-app-auth.js");
     vi.mocked(auth.getInstallationToken).mockResolvedValue("token");

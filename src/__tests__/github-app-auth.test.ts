@@ -1,23 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
 import { getInstallationToken, getInstallationId, refreshInstallationToken, getInstallation, getAppInstallation, getAppSlug, readAppIdentity, appCredentialsRefused, listInstallationRepositoryNames, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
 import { GitHubApiError } from "../github-errors.js";
 import { fakeFetch, type Reply, type ReplyInit } from "./helpers/fake-fetch.js";
+import { makeAppPrivateKey } from "./helpers/builders.js";
 import { githubError } from "./helpers/replies/github.js";
 
-// Generate a real RSA key pair for tests so JWT signing works correctly
-const { privateKey } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs8", format: "pem" },
-});
-
-// Same key in PKCS#1 format (GitHub's default download format)
-const { privateKey: pkcs1Key } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs1", format: "pem" },
-});
+const privateKey = makeAppPrivateKey();
+// The same key in PKCS#1, GitHub's download format.
+const pkcs1Key = makeAppPrivateKey("pkcs1");
 
 const APP_ID = "123456";
 

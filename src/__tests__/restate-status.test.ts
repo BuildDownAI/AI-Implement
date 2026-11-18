@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   getRestateStatus,
   resetRestateStatus,
+  restateCanStartWork,
   setRestateStatus,
   type RestateRegistrationStatus,
   type RestateSidecarStatus,
@@ -100,5 +101,22 @@ describe("exited payload nullability", () => {
   it("round-trips a normal exit (code set, signal: null)", () => {
     setRestateStatus({ sidecar: { state: "exited", code: 0, signal: null } });
     expect(getRestateStatus().sidecar).toEqual({ state: "exited", code: 0, signal: null });
+  });
+});
+
+describe("restateCanStartWork", () => {
+  it.each([
+    ["serves and nothing is held", false, true, true],
+    ["serves while a deploy holds new work back", true, true, false],
+    ["cannot serve", false, false, false],
+    ["cannot serve while a deploy holds new work back", true, false, false],
+  ] as const)("is %s: %s", (_case, held, serves, starts) => {
+    expect(restateCanStartWork({ deployHeld: () => held, canServe: () => serves })).toBe(starts);
+  });
+
+  it("reads this process's Restate status and deploy hold when given neither", () => {
+    expect(restateCanStartWork()).toBe(false);
+    setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "registered" } });
+    expect(restateCanStartWork()).toBe(true);
   });
 });

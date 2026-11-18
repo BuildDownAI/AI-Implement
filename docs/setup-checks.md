@@ -58,7 +58,7 @@ A warning, a check that cannot verify, and a failing `mode` or `feature` check a
 
 ## In a running orchestrator
 
-Inside the server, the checks run in the `SetupChecks` Restate object (`src/restate/setup-checks.ts`), which keeps the last run. Nothing starts a full run on its own yet: an admin starts one from the Setup page. One project's checks run on their own from the admin UI (below), and each surface shows the stored run, or nothing before the first.
+Inside the server, the checks run in the `SetupChecks` Restate object (`src/restate/setup-checks.ts`), which keeps the last run. An admin starts a full run from the Setup page, one project's checks run from the admin UI (below), and the orchestrator runs them itself at boot, after a saved change and after a runtime failure ([When the checks run on their own](#when-the-checks-run-on-their-own)). Each surface shows the stored run, or nothing before the first.
 
 | Where | Who | Shows |
 |---|---|---|
@@ -72,9 +72,51 @@ Inside the server, the checks run in the `SetupChecks` Restate object (`src/rest
 | `GET /api/setup-checks` | admins, and users granted the Setup page | `run`, the stored run with every field (`null` before the first); `progress`, the run in progress (`null` when none), with its `startedAt`, the `total` number of checks, the `finished` rows and the checks still `running` by `id`, `title` and `group`; and `groups`, each group's display name |
 | `get_tenant_health`, field `setupChecks` | every allowlisted identity | each row's `id`, `title`, `state` and `project`, the count of failing core rows (`failingCore`) and `checkedAt`; `null` before the first run |
 
-**A project's own run** (`runProjectSetupChecks`, `src/setup-checks/index.ts`) narrows the checks to that one project. It runs every check that judges projects (`perProject` on `SetupCheck`), plus the orchestrator-wide rows those depend on: `tracker.provider`, the project's ticketing system's credentials check, `github.app-identity` and `github.clock`. A per-project check that throws answers one row, stamped with the project. It runs in the `SetupChecks` object's `runProject` handler, behind any full run, and never touches a full run's progress. Its rows merge into the stored run (`mergeProjectRun`): the project's stored rows are replaced by the new ones, and so are the orchestrator-wide rows it read afresh, so a pointer at a failed dependency points at that dependency's current row. The exception is `tracker.provider`, which keeps its stored row, since that row names every project on a provider. Each merged row carries its own `checkedAt`, while the run's `startedAt` and `checkedAt` keep dating the last full run. With no stored run yet, the whole project run becomes it. **When one of those orchestrator-wide rows fails or cannot verify** (`projectRunNeedsFullRun`), the fault reaches every project that shares the check, whose stored rows one project's run cannot correct, so the handler runs every check instead and stores that run whole. It shows no progress, so a run an admin started meanwhile, queued behind it, keeps its claim and a second start is still refused. The admin UI runs a project's checks from three places: the Projects page's **Check setup** for a project no run has checked, the Setup page's **Check this project** on its card, and once a sync the admin UI started ends.
+**A project's own run** (`runProjectSetupChecks`, `src/setup-checks/index.ts`) narrows the checks to that one project. It runs every check that judges projects (`perProject` on `SetupCheck`), plus the orchestrator-wide rows those depend on: `tracker.provider`, the project's ticketing system's credentials check, `github.app-identity` and `github.clock`. A per-project check that throws answers one row, stamped with the project. It runs in the `SetupChecks` object's `runProject` handler, behind any full run, and never touches a full run's progress. Its rows merge into the stored run (`mergeSetupCheckRun`): the project's stored rows are replaced by the new ones, and so are the orchestrator-wide rows it read afresh, so a pointer at a failed dependency points at that dependency's current row. The exception is `tracker.provider`, which keeps its stored row, since that row names every project on a provider. Each merged row carries its own `checkedAt`, while the run's `startedAt` and `checkedAt` keep dating the last full run. **With no stored run yet**, a partial run would stand for every check, so the handler runs every check instead and stores that run whole; the orchestrator-wide run and a recheck do the same. **When one of those orchestrator-wide rows fails or cannot verify** and the stored run does not already show it so (`projectRunNeedsFullRun`), the fault reaches every project that shares the check, whose stored rows one project's run cannot correct, so the handler runs every check instead and stores that run whole. Once a full run has stored the fault on every project, a later project run that finds the same fault merges as it is. It shows no progress, so a run an admin started meanwhile, queued behind it, keeps its claim and a second start is still refused. The admin UI runs a project's checks from three places: the Projects page's **Check setup** for a project no run has checked, the Setup page's **Check this project** on its card, and once a sync the admin UI started ends.
 
 **An unsaved project's run** is the same narrowed run, for the mapping a save would store. It runs in process, stores nothing, and leaves out `github.workflow-default-branch` and `github.workflow-mapping-branch`, which no project passes before its first workflow sync (`BEFORE_FIRST_SYNC`).
+
+**A partial run carries its scope** (`SetupCheckRun.scope`: the checks it ran, and its projects when it names some), and `mergeSetupCheckRun` replaces exactly the stored rows in that scope. A check in scope that now answers nothing leaves no row. A full run replaces the stored run whole, and rows of projects no longer saved are dropped. Every partial run is the one scoped run (`runSetupChecksInScope`) with its own list of checks.
+
+### When the checks run on their own
+
+| When | What runs | Where it goes |
+|---|---|---|
+| Boot, once the server listens | the orchestrator group, less `restate` and `runner.fly-sessions`, which read what only Restate fills, in this process | one `[setup-checks]` log line per row that fails, cannot verify or warns. Nothing is stored |
+| Boot, once Restate serves | every orchestrator-wide check, through the object's `runOrchestratorWide` | the stored run, and a log line per row the first run did not cover |
+| A poll cycle after a saved change | the run that change needs (below) | the stored run |
+| A runtime failure that names a check | `recheck` for that check (below) | the stored run, the rows marked with the failure's `cause` |
+
+Boot waits for neither of its runs, and a run that throws logs one line.
+
+**During a deploy hold.** While a self-deploy holds new work back, nothing starts a run through the `SetupChecks` object ([restate.md](restate.md#a-call-or-send-that-starts-an-invocation-waits-out-a-deploy-hold) has the rule). Boot's run once Restate serves waits for the hold to clear, which on a boot after a self-deploy is when that deploy ends. The change detector's runs wait for a later cycle, a recheck is refused, and the Setup page's **Run checks** and **Check this project** answer 503 `restate-unavailable`. The stored run is still read.
+
+**After a saved change.** Each poll cycle, the change detector (`createSetupCheckChangeDetector`, `src/setup-checks/change-detector.ts`) reads the saved setup (`readSavedSetup`) through the checks' own readers and compares it with the last cycle's. So a change made anywhere, from the admin UI, an MCP tool, the setup command, the control plane or by hand, gets its run.
+
+| Change | Run sent |
+|---|---|
+| A project's mapping saved, added or deleted | that project's run, and the orchestrator-wide run, since three orchestrator-wide checks name projects |
+| A project's workflow sync started or ended | that project's run |
+| A seed-once setting, a runner setting, the allowlist, an agent configuration revision or the Fly sessions settings | the orchestrator-wide run |
+| The runner mode or the pickup label | a full run, since both reach checks of each kind |
+
+Nothing the orchestrator writes for itself is read, so a cycle with nothing saved sends nothing. Which of the checks' readers the saved setup reads, and why each other one is left out (a variable, the process's own state, or a read from GitHub or the ticketing system, none of which a save changes), is `SAVED_SETUP_READERS`: a reader added to the context does not compile until it is placed there, and a test holds each placement to what `readSavedSetup` reads. The detector writes its record to the `setup_checks_change_detector` settings row, which is not one of the settings it reads, whenever the record changes: a fingerprint of each part of the saved setup it last read, which tells a change apart without holding the setup, and the runs still waiting. So a process's first cycle compares with what the last process read: a restart with nothing saved is not a change, while a save made just before it, or while the orchestrator was down, and a run still waiting when it stopped all keep their runs. With no record written yet, the first cycle only reads. One run of each kind is sent per cycle, at most once per five minutes, so the last of a burst of saves is always checked. More than three project runs waiting become one full run, and a full run answers for every other. A run Restate could not take, a run held back by a deploy hold, or a full run refused because one is already going, waits for the next cycle.
+
+**After a runtime failure.** `recheck({ id, project?, cause? })` on the `SetupChecks` object runs one check again: one project's rows of a per-project check given a project, else every row of the check. A check its rows wait on (`waitsOn`) runs with it, and so does each check that check's rows wait on in turn, since a later read can find what the first did not, so no row waits on an older one (`recheckWaitedOn`, `src/setup-checks/index.ts`). The rows keep the failure's `cause`, one of `SETUP_RECHECK_CAUSES` (`src/setup-checks/contract.ts`). A recheck is held for an hour, whatever the check answered: a recheck of the same rows within the hour does nothing, and so does one whose stored rows all already need attention and were checked within the hour. So a failure path that fires on every poll runs its check at most once an hour. Each check it waits on is held the same way, so a check many projects' rows wait on runs once in the hour, and runs at most once in any one recheck, so the chain always ends. An unknown check, or a project no mapping holds, does nothing. A caller sends it through the object's ingress client (`createSetupChecksIngressClient().recheck(...)`), which answers false while Restate cannot serve or a deploy holds new work back.
+
+### Times
+
+Each module keeps its setup-check times together, and these are all of them.
+
+| Time | Value | Where | What it is |
+|---|---|---|---|
+| `MIN_SETUP_CHECK_RUN_INTERVAL_MS` | 5 minutes | `src/setup-checks/change-detector.ts` | the least time between two runs of one kind the change detector sends |
+| `RECHECK_HOLD_MS` | 1 hour | `src/setup-checks/index.ts` | how long a recheck answers for its rows |
+| `INGRESS_TIMEOUT_MS` | 10 seconds | `src/restate/setup-checks.ts` | bound on reading the stored run, and on Restate accepting a sent run |
+| `WAITED_RUN_TIMEOUT_MS` | 60 seconds | `src/restate/setup-checks.ts` | bound on a run its caller waits for: a project run, or boot's orchestrator-wide run |
+| `ORCHESTRATOR_HEALTH_TIMEOUT_MS` | 5 seconds | `src/health-body.ts` | bound on `callback.reachable`'s read of this orchestrator's `GET /` |
+| `RUNNING_POLL_MS`, `IDLE_POLL_MS` | 5 seconds, 60 seconds | `src/admin-ui/pages/setup.ts` | how often the Setup page reads while a run goes, and otherwise |
+| `START_WAIT_MS` | 30 seconds | `src/admin-ui/pages/setup.ts` | how long the Setup page waits for a started run to show its progress |
 
 Why each audience sees what it sees is [ADR 047](adr/047-orchestrator-setup-checks-only-read-and-what-they-show-depends-on-who-can-reach-an-admin.md)'s second decision. Starting a run is admin-only even for a user granted the page, since a grant reaches only a page's `GET` routes. Both routes answer 503 `restate-unavailable` while Restate cannot take the call (the sidecar not ready, or the endpoint not registered) or does not answer; the `GET`'s 503 also carries `setupCommand`, the setup command as an operator runs it against this orchestrator (`setupCommandFor`: the `fly ssh` form for the app when `FLY_APP_NAME` is set, otherwise `npm run check-setup`), which the Setup page shows, since that command runs without Restate. A run's progress is kept in the orchestrator's memory while the run goes, not in Restate: each check adds its rows as it finishes, and the record clears once the finished run is stored, so a restart mid-run loses it, and Restate retrying the run starts a fresh record. For the same reason a stored run's `restate` row always passes: a run reaches the object only while Restate can serve. A Restate fault shows on `GET /` and in the setup command instead. `failingCore` counts rows, as the command's last line does, so a check that fails for two projects counts twice. A run's detail and fix are kept in the object's state and journal, which only admins can read, through the Restate UI. Neither carries a secret's value.
 
@@ -82,7 +124,7 @@ Why each audience sees what it sees is [ADR 047](adr/047-orchestrator-setup-chec
 
 This is the one list of every check. Each group has its own heading, and each id links to the section of that group's reference that explains the value it reads. An id never changes, so search for the one the command printed.
 
-In the code, each group's checks are a module beside `src/setup-checks/index.ts`, which builds the list from them and runs it. A check is written against `src/setup-checks/contract.ts` (the ids, a result, the context it reads, and `waitOn` for a row that waits on another check), never against `index.ts`, which imports every check module at load, so the dependency runs one way.
+In the code, each group's checks are a module beside `src/setup-checks/index.ts`, which builds the list from them and runs it. A check is written against `src/setup-checks/contract.ts` (the ids, a result, the context it reads, and `waitOn` for a row that waits on another check), never against `index.ts`, which imports every check module at load, so the dependency runs one way. The change detector is `src/setup-checks/change-detector.ts`, which reads the saved setup through the same context and imports nothing from `index.ts`.
 
 ### orchestrator
 
@@ -154,3 +196,22 @@ The GitHub App and each project's repository on GitHub (`GITHUB_CONFIG_CHECKS`, 
 Before an admin path is configured, unauthenticated `GET /` shows `setupChecks.failingOnAdminPath`: the ids of failing local checks that can block reaching an admin. It checks these afresh on each request, even while Restate is down, without contacting any network service. It never shows titles, details, fixes, projects or configured values. Use the ids to identify what needs attention before anyone can sign in.
 
 This list stops appearing once a real access code is set, a kept SSO provider has its redirect URL and an admin address in the effective allowlist, or BuildDown has its redirect URL. An unreadable allowlist keeps bootstrap mode off, so an outage does not expose diagnostics. `setupChecks.checkedAt` and `failingCore` remain: they describe the last known setup run, restored after Restate registration on restart, or are both `null` before a run is known.
+
+## Terms
+
+The setup checks' code and this page use these words in one sense each. Where the rest of the orchestrator uses a word another way, the last column says so.
+
+| Term | Means here | Elsewhere |
+|---|---|---|
+| check | one entry on the list (`SetupCheck`), with its `id` | |
+| row | one check's answer for one project, or for none (`SetupCheckResult`) | the type keeps its name, `SetupCheckResult` |
+| per-project, orchestrator-wide | a check that answers a row per project (`perProject`), or one whose rows no one project owns | "shared" is a Restate handler kind, not the opposite of per-project |
+| the orchestrator group | the checks in `src/setup-checks/orchestrator-config.ts`, always said with *group* | not the same as orchestrator-wide: the tracker and GitHub groups hold orchestrator-wide checks too |
+| project | a saved mapping, named by its key | the same key is `teamKey` on a mapping, `scopeKey` on issues and `mappingKey` in dispatch admissions |
+| run, partial run, scope | one pass over some checks (`SetupCheckRun`); a run narrower than a full one; the checks and projects a partial run answers for (`SetupCheckScope`) | `scopeKey` is a project's key, unrelated |
+| saved setup, its fingerprints | what the change detector compares between poll cycles (`SavedSetup`), holding the values themselves; the same parts each replaced by a hash (`fingerprintSavedSetup`), which tells a change apart without holding the setup | a fingerprint elsewhere also identifies inputs to tell whether they changed: a hash (`ownedRunReportFingerprint`), or the inputs themselves as text (`readStageInputsFingerprint`) |
+| the change detector's record | what the detector writes for the next process: the saved setup's fingerprints and the runs still waiting (`ChangeDetectorRecord`, the `setup_checks_change_detector` settings row) | not the progress record, the run in progress this process holds |
+| run kind | what the change detector sends: a full, an orchestrator-wide or a project run (`SetupCheckRunKind`) | |
+| the stored run, the cache | the run the `SetupChecks` object keeps (`lastRun`); this process's copy of it, which `GET /` reads (`getCachedSetupCheckRun`) | |
+| recheck, cause | one check run again for a runtime failure; the kind of failure that sent it (`SETUP_RECHECK_CAUSES`) | |
+| ingress client | `createSetupChecksIngressClient()`, the one way code outside a Restate handler reaches the object, a method per handler | as SelfDeploy's and the other `create…IngressClient` clients |

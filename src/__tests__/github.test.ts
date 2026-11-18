@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, onTestFinished, vi } from "vitest";
 import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob, readPublicRepository, readRepositoryFacts } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
@@ -1318,6 +1318,33 @@ describe("readPublicRepository", () => {
     expect(await readPublicRepository("o", "r", "nope")).toEqual({ status: 200, refExists: false });
     expect(await readPublicRepository("o", "r", "nope")).toEqual({ status: 200, refExists: false });
     await expect(readPublicRepository("o", "r", "nope")).rejects.toMatchObject({ name: "GitHubApiError", status: 403 });
+  });
+
+  // GitHub's rate-limit page: a limited request gets 403 or 429, `retry-after` in seconds when present, else `x-ratelimit-remaining: 0`
+  // with `x-ratelimit-reset` in UTC epoch seconds, and with neither, at least a minute's wait.
+  it("reads a refusal for GitHub's rate limit as the time the repository may be read again, on either read", async () => {
+    const now = Date.parse("2026-11-17T07:00:00Z");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    onTestFinished(() => clock.mockRestore());
+    const reset = Date.parse("2026-11-17T08:00:00Z") / 1000;
+    const limited = { ...githubError(403, "API rate limit exceeded"), headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } };
+    fakeFetch({
+      "GET /repos/o/primary": limited,
+      "GET /repos/o/secondary": { ...githubError(429, "You have exceeded a secondary rate limit"), headers: { "retry-after": "30" } },
+      "GET /repos/o/unmarked": { ...githubError(403, "API rate limit exceeded"), headers: { "x-ratelimit-remaining": "0" } },
+      "GET /repos/o/forbidden": githubError(403, "Forbidden"),
+      // The last read the limit allows answers, with nothing left after it.
+      "GET /repos/o/last": { json: {}, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } },
+      "GET /repos/o/r": { json: {} },
+      "GET /repos/o/r/commits": limited,
+    }).install();
+
+    expect(await readPublicRepository("o", "primary")).toEqual({ status: 403, refExists: null, rateLimitedUntil: reset * 1000 });
+    expect(await readPublicRepository("o", "secondary")).toEqual({ status: 429, refExists: null, rateLimitedUntil: now + 30_000 });
+    expect(await readPublicRepository("o", "unmarked")).toEqual({ status: 403, refExists: null, rateLimitedUntil: now + 60_000 });
+    expect(await readPublicRepository("o", "forbidden")).toEqual({ status: 403, refExists: null });
+    expect(await readPublicRepository("o", "last")).toEqual({ status: 200, refExists: null });
+    expect(await readPublicRepository("o", "r", "v1")).toEqual({ status: 200, refExists: null, rateLimitedUntil: reset * 1000 });
   });
 });
 

@@ -2,8 +2,9 @@
  * Orchestrator setup checks: read-only checks of an orchestrator's setup, each naming its fix.
  *
  * This module holds the list, the context every caller starts from and the runner, with a project's own run and the stored
- * run's merge. The contract a check is written against (the check ids, a result, the context a check reads) is contract.ts,
- * re-exported here. The checks sit beside it, one module per group, each named `<group>-config.ts`:
+ * run's merge, the scoped runs a recheck makes, and boot's runs. The contract a check is written against (the check ids, a result,
+ * the context a check reads) is contract.ts, re-exported here. The change detector, which sends runs after a saved change, is
+ * change-detector.ts. The checks sit beside this module, one module per group, each named `<group>-config.ts`:
  * `orchestrator-config.ts` holds the orchestrator's own environment and settings checks.
  */
 
@@ -23,12 +24,16 @@ import type { TrackerSetupFacts } from "../providers/types.js";
 import { getRunnerMode } from "../runner-mode.js";
 import { listRecentAppDeliveries } from "../webhook-redelivery.js";
 import { getWorkflowSyncByTeam } from "../workflow-sync-queue.js";
-import type { GitHubSetupFacts, SetupCheck, SetupCheckContext, SetupCheckId, SetupCheckResult } from "./contract.js";
+import type { GitHubSetupFacts, SetupCheck, SetupCheckContext, SetupCheckId, SetupCheckResult, SetupCheckState, SetupRecheckCause } from "./contract.js";
 import { GITHUB_CONFIG_CHECKS, ownerRepositoryRequests } from "./github-config.js";
 import { isAdminPathConfigured, ORCHESTRATOR_CONFIG_CHECKS } from "./orchestrator-config.js";
 import { TRACKER_CONFIG_CHECKS } from "./tracker-config.js";
 
 export * from "./contract.js";
+
+// The setup checks' time in this module. The change detector's interval is in change-detector.ts, the ingress bounds in src/restate/setup-checks.ts, the Setup page's polls in its own module.
+/** How long a recheck answers for its rows: within it, another recheck of them does nothing. */
+export const RECHECK_HOLD_MS = 60 * 60_000;
 
 /** How each group is named to an operator. The keys stay as they are, since stored runs and their readers use them. */
 export const SETUP_CHECK_GROUP_LABELS: Record<SetupCheckResult["group"], string> = {
@@ -47,6 +52,16 @@ export interface SetupCheckRun {
   startedAt?: number;      // when the run began; absent on a run an older orchestrator stored
   checkedAt: number;       // when its last check finished
   results: SetupCheckResult[];
+  scope?: SetupCheckScope; // set by a run narrower than a full one: the stored rows it answers for
+}
+
+/**
+ * The stored rows a partial run answers for: its checks' rows, limited to the given projects when it names some.
+ * A row with no project, of a check every project shares, is answered by any run of that check.
+ */
+export interface SetupCheckScope {
+  checks: readonly SetupCheckId[];
+  projects?: readonly string[];
 }
 
 /** A run as every allowlisted identity may see it on `get_tenant_health`: each row's identity and state, never its detail or fix (ADR 047). */
@@ -225,31 +240,182 @@ export async function runProjectSetupChecks(
   if (projects.length !== 1 || projects[0] !== key) throw new Error(`A run for ${key} needs a context holding that project alone`);
   const credentials = CREDENTIALS_CHECK[ctx.mappings()[key].ticketingProvider];
   const checks = SETUP_CHECKS.filter((check) => !exclude.includes(check.id)
-    && (check.perProject || check.id === credentials || PROJECT_RUN_DEPENDENCIES.includes(check.id)));
+    && (check.perProject || check.id === credentials || PROJECT_RUN_DEPENDENCIES.includes(check.id))).map((check) => check.id);
+  const run = await runSetupChecksInScope(ctx, { checks, projects: [key] }, now);
+  // tracker.provider runs only so a failing provider escalates: its stored row names every project on the provider, and this run's names one.
+  return { ...run, scope: { checks: checks.filter((id) => id !== "tracker.provider"), projects: [key] } };
+}
+
+/** The checks whose rows no one project owns. */
+const ORCHESTRATOR_WIDE_CHECKS = SETUP_CHECKS.filter((check) => !check.perProject);
+
+/** The states of a row someone should look at. */
+const NEEDS_ATTENTION: readonly SetupCheckState[] = ["fail", "cannot-verify", "warn"];
+
+/**
+ * Runs every check whose rows no one project owns: the orchestrator's own, each ticketing system's credentials, the App's.
+ * The credentials checks judge only whether a ticketing system accepts the app, which a read for no project answers, so no project's setup is read.
+ */
+export async function runOrchestratorWideSetupChecks(ctx: SetupCheckContext, now: () => number = Date.now): Promise<SetupCheckRun> {
+  // Only each ticketing system's own credentials check reads its facts here, so there is no read to share.
+  const credentialsOnly: SetupCheckContext["trackerSetupFacts"] = (providerId) =>
+    ctx.trackerProvider(providerId).then((provider) => provider.fetchSetupFacts?.([]) ?? null);
+  return runSetupChecksInScope({ ...ctx, trackerSetupFacts: credentialsOnly }, { checks: ORCHESTRATOR_WIDE_CHECKS.map((check) => check.id) }, now);
+}
+
+/**
+ * Runs the checks a scope names and answers them as a partial run with that scope. A scope naming projects needs a context whose
+ * `ctx.mappings()` answers those projects alone, and with one project, a per-project row with no project, from a check that threw, is that project's.
+ */
+export async function runSetupChecksInScope(ctx: SetupCheckContext, scope: SetupCheckScope, now: () => number = Date.now): Promise<SetupCheckRun> {
+  const checks = SETUP_CHECKS.filter((check) => scope.checks.includes(check.id));
   const run = await runSetupChecks(ctx, checks, now);
-  return { ...run, results: run.results.map((row) => (row.project === undefined && checks.some((check) => check.id === row.id && check.perProject) ? { ...row, project: key } : row)) };
+  const only = scope.projects?.length === 1 ? scope.projects[0] : undefined;
+  const results = only === undefined ? run.results
+    : run.results.map((row) => (row.project === undefined && checks.some((check) => check.id === row.id && check.perProject) ? { ...row, project: only } : row));
+  return { ...run, results, scope };
+}
+
+/** A runtime failure's request to run a check again: the check, the project it failed for, and what kind of failure named it. */
+export interface SetupCheckRecheck {
+  id: SetupCheckId;
+  project?: string;
+  cause?: SetupRecheckCause;
+}
+
+/** The scope of a recheck: one project's rows of a per-project check given one, else every row of the check. Null for a check not on the list. */
+export function recheckScope(id: string, project?: string): SetupCheckScope | null {
+  const check = SETUP_CHECKS.find((candidate) => candidate.id === id);
+  if (!check) return null;
+  return check.perProject && project !== undefined ? { checks: [check.id], projects: [project] } : { checks: [check.id] };
+}
+
+
+/** The key a recheck's time is kept under: its scope's checks, and its projects when it names some. */
+export function recheckKey(scope: SetupCheckScope): string {
+  return scope.projects === undefined ? scope.checks.join(",") : `${scope.checks.join(",")} ${scope.projects.join(",")}`;
+}
+
+/** The recheck times still within the hold, with this one added, so the kept times never outgrow the hour. */
+export function rememberRecheck(times: Readonly<Record<string, number>>, key: string, now: number): Record<string, number> {
+  return { ...Object.fromEntries(Object.entries(times).filter(([, at]) => now - at < RECHECK_HOLD_MS)), [key]: now };
 }
 
 /**
- * Whether a project run found an orchestrator-wide check its rows depend on failing or unread. Such a fault reaches every project
- * that shares the check, whose stored rows a project run cannot correct, so the run is answered by a full run instead.
+ * Whether a recheck does nothing, so a failure path that fires on every poll runs its check at most once an hour: a recheck of the same rows
+ * ran within the hour (`lastRecheckAt`), or every stored row of them already needs attention and was checked within the hour.
  */
-export function projectRunNeedsFullRun(run: SetupCheckRun): boolean {
-  return run.results.some((row) => row.project === undefined && (row.state === "fail" || row.state === "cannot-verify"));
+export function recheckHeld(stored: SetupCheckRun | null, scope: SetupCheckScope, lastRecheckAt: number | undefined, now: number): boolean {
+  if (lastRecheckAt !== undefined && now - lastRecheckAt < RECHECK_HOLD_MS) return true;
+  if (stored === null) return false;
+  const rows = stored.results.filter((row) => inScope(row, scope));
+  return rows.length > 0 && rows.every((row) => NEEDS_ATTENTION.includes(row.state) && now - (row.checkedAt ?? stored.checkedAt) < RECHECK_HOLD_MS);
+}
+
+/** The checks a run's rows wait on, in the order the rows name them. */
+const checksWaitedOn = (run: SetupCheckRun): SetupCheckId[] => run.results.flatMap((row) => (row.waitsOn ? [row.waitsOn] : []));
+
+/**
+ * Rechecks each check a rechecked run's rows wait on, and each check those rows wait on in turn, since a dependency's read can find what
+ * the first read did not. `rerun` answers a dependency's run, or null when it did not run. Each scope runs at most once, so the chain ends
+ * whatever the hold or the checks' `waitsOn` become.
+ */
+export async function recheckWaitedOn(
+  scope: SetupCheckScope,
+  run: SetupCheckRun,
+  rerun: (dependency: SetupCheckScope, waited: SetupCheckId) => Promise<SetupCheckRun | null>,
+): Promise<void> {
+  const rechecked = new Set([recheckKey(scope)]);
+  const toRecheck = checksWaitedOn(run);
+  for (let waited = toRecheck.shift(); waited !== undefined; waited = toRecheck.shift()) {
+    const dependency = recheckScope(waited, scope.projects?.[0])!;
+    if (rechecked.has(recheckKey(dependency))) continue;
+    rechecked.add(recheckKey(dependency));
+    const answered = await rerun(dependency, waited);
+    if (answered !== null) toRecheck.push(...checksWaitedOn(answered));
+  }
+}
+
+/** The orchestrator's own checks that read what only Restate fills: its status, and the Fly sessions it holds. */
+const NEEDS_RESTATE: readonly SetupCheckId[] = ["restate", "runner.fly-sessions"];
+
+/** Runs the orchestrator's own checks that need nothing Restate holds, for boot to log while Restate starts. */
+export function runSetupChecksBeforeRestate(ctx: SetupCheckContext, now: () => number = Date.now): Promise<SetupCheckRun> {
+  return runSetupChecks(ctx, ORCHESTRATOR_CONFIG_CHECKS.filter((check) => !NEEDS_RESTATE.includes(check.id)), now);
+}
+
+const end = (text: string): string => (/[.!?]$/.test(text) ? text : `${text}.`);
+
+/** One log line per row that needs attention: the check and its project, the state, what was found and the fix. */
+export function setupCheckLogLines(rows: readonly SetupCheckResult[]): string[] {
+  return rows.filter((row) => NEEDS_ATTENTION.includes(row.state)).map((row) => {
+    const subject = row.project === undefined ? row.id : `${row.id} (${row.project})`;
+    return `[setup-checks] ${subject} ${row.state}:${row.detail ? ` ${end(row.detail)}` : ""}${row.fix ? ` Fix: ${row.fix}` : ""}`;
+  });
 }
 
 /**
- * The stored run with one project's rows, and the orchestrator-wide rows the project run read afresh, replaced by the project run's,
- * each dated by that run. So a project row that points at a failed dependency points at that dependency's current row.
- * tracker.provider keeps its stored row: it names every project on a provider, and a project run's names one. With no stored run, the whole project run starts one.
+ * Boot's two runs, which boot never waits for. Before Restate serves, the orchestrator's own checks run in this process and are only logged,
+ * since a recorded run would keep hydration from reading the stored one. Once Restate serves, every orchestrator-wide check runs through the
+ * SetupChecks object, which stores it, and the rows the first run did not log are logged.
  */
-export function mergeProjectRun(stored: SetupCheckRun | null, key: string, run: SetupCheckRun): SetupCheckRun {
+export function createBootSetupChecks(deps: {
+  runBeforeRestate: () => Promise<SetupCheckRun>;
+  /** The stored run the orchestrator-wide run was merged into, or null when Restate did not answer. */
+  storeOrchestratorWide: () => Promise<SetupCheckRun | null>;
+  log: (line: string) => void;
+}): { beforeRestate: () => Promise<void>; afterServing: () => Promise<void> } {
+  const logged = new Set(ORCHESTRATOR_CONFIG_CHECKS.map((check) => check.id).filter((id) => !NEEDS_RESTATE.includes(id)));
+  const failed = (when: string, err: unknown) => deps.log(`[setup-checks] the checks ${when} could not run: ${err instanceof Error ? err.message : String(err)}`);
+  return {
+    beforeRestate: async () => {
+      try {
+        for (const line of setupCheckLogLines((await deps.runBeforeRestate()).results)) deps.log(line);
+      } catch (err) {
+        failed("before Restate serves", err);
+      }
+    },
+    afterServing: async () => {
+      try {
+        const stored = await deps.storeOrchestratorWide();
+        if (stored === null) return;
+        const unlogged = stored.results.filter((row) => !logged.has(row.id) && ORCHESTRATOR_WIDE_CHECKS.some((check) => check.id === row.id));
+        for (const line of setupCheckLogLines(unlogged)) deps.log(line);
+      } catch (err) {
+        failed("once Restate serves", err);
+      }
+    },
+  };
+}
+
+/**
+ * Whether a project run found an orchestrator-wide check its rows depend on failing or unread, where the stored run does not show it so.
+ * Such a fault reaches every project that shares the check, whose stored rows a project run cannot correct, so the run is answered by
+ * a full run instead; once a full run has stored the fault on every project, later project runs merge as they are.
+ */
+export function projectRunNeedsFullRun(run: SetupCheckRun, stored: SetupCheckRun | null): boolean {
+  return run.results.some((row) => row.project === undefined && (row.state === "fail" || row.state === "cannot-verify")
+    && !stored?.results.some((kept) => kept.id === row.id && kept.project === undefined && kept.state === row.state));
+}
+
+function inScope(row: SetupCheckResult, scope: SetupCheckScope): boolean {
+  if (!scope.checks.includes(row.id)) return false;
+  if (scope.projects === undefined) return true;
+  return row.project === undefined ? ORCHESTRATOR_WIDE_CHECKS.some((check) => check.id === row.id) : scope.projects.includes(row.project);
+}
+
+/**
+ * The stored run with every row a partial run answers for replaced by the partial run's, each dated by that run,
+ * so a check in scope that now answers nothing leaves no row. Rows of projects no longer mapped are dropped.
+ * A full run replaces the stored run, and with no stored run the whole partial run starts one, its rows outside the scope included.
+ */
+export function mergeSetupCheckRun(stored: SetupCheckRun | null, run: SetupCheckRun, mapped: readonly string[]): SetupCheckRun {
+  const { scope } = run;
+  if (scope === undefined) return run;
   const dated = (row: SetupCheckResult): SetupCheckResult => ({ ...row, checkedAt: run.checkedAt });
   if (stored === null) return { checkedAt: run.checkedAt, results: run.results.map(dated) };
-  const rows = run.results.filter((row) => row.project === key || (row.project === undefined && row.id !== "tracker.provider")).map(dated);
-  const refreshed = new Set(rows.filter((row) => row.project === undefined).map((row) => row.id));
-  const kept = stored.results.filter((row) => row.project !== key && !(row.project === undefined && refreshed.has(row.id)));
-  return { ...stored, results: [...kept, ...rows] };
+  const kept = stored.results.filter((row) => !inScope(row, scope) && (row.project === undefined || mapped.includes(row.project)));
+  return { ...stored, results: [...kept, ...run.results.filter((row) => inScope(row, scope)).map(dated)] };
 }
 
 /** The run in progress in this process, as the admin Setup page shows it while it runs. */
@@ -324,11 +490,11 @@ export async function setupChecksHealthField(run: SetupCheckRun | null, ctx: Set
   return field;
 }
 
-// Process-local health snapshot, independent of Restate availability.
-let lastRun: SetupCheckRun | null = null;
-export function recordSetupCheckRun(run: SetupCheckRun): void {
-  lastRun = structuredClone(run);
+// This process's cache of the stored run, which GET / reads even while Restate cannot answer.
+let cachedRun: SetupCheckRun | null = null;
+export function cacheSetupCheckRun(run: SetupCheckRun): void {
+  cachedRun = structuredClone(run);
 }
-export function getLastSetupCheckRun(): SetupCheckRun | null {
-  return lastRun === null ? null : structuredClone(lastRun);
+export function getCachedSetupCheckRun(): SetupCheckRun | null {
+  return cachedRun === null ? null : structuredClone(cachedRun);
 }
