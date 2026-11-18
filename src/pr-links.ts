@@ -90,6 +90,7 @@ function database() {
     ["grouping_parent", "INTEGER NOT NULL DEFAULT 0"],
     ["job_dispatched_at", "INTEGER"],
     ["job_id", "INTEGER"],
+    ["job_current", "INTEGER NOT NULL DEFAULT 1"],
   ]) {
     if (!columns.some(column => column.name === name)) {
       db.exec(`ALTER TABLE pull_request_link ADD COLUMN ${name} ${type}`);
@@ -239,20 +240,29 @@ export function setCancelCheckedAt(repository: string, number: number, checkedAt
 
 /** Retain grouping ownership and the newest dispatch ordering independently of job retention. */
 export function recordLinkJob(link: PullRequestLink, groupingParent: boolean, dispatchedAt: number, jobId: number): void {
-  database().prepare(`UPDATE pull_request_link SET
-    grouping_parent = MAX(grouping_parent, ?),
-    job_dispatched_at = ?, job_id = ?
-    WHERE id = ? AND (job_dispatched_at IS NULL OR
-      job_dispatched_at < ? OR (job_dispatched_at = ? AND job_id <= ?))`)
-    .run(groupingParent ? 1 : 0, dispatchedAt, jobId, link.id, dispatchedAt, dispatchedAt, jobId);
-  // An older grouping run may be reported after a newer non-grouping gap-fill.
-  if (groupingParent) database().prepare("UPDATE pull_request_link SET grouping_parent = 1 WHERE id = ?").run(link.id);
+  const db = database();
+  db.transaction(() => {
+    // Replacement reports supersede only this job's prior association. Keep its
+    // dispatch ordering so a late report cannot outrank a newer job.
+    db.prepare(`UPDATE pull_request_link SET job_current = 0
+      WHERE issue_id = ? AND job_dispatched_at = ? AND job_id = ? AND id != ?`)
+      .run(link.issueId, dispatchedAt, jobId, link.id);
+    db.prepare(`UPDATE pull_request_link SET
+      grouping_parent = MAX(grouping_parent, ?),
+      job_dispatched_at = ?, job_id = ?, job_current = 1
+      WHERE id = ? AND (job_dispatched_at IS NULL OR
+        job_dispatched_at < ? OR (job_dispatched_at = ? AND job_id <= ?))`)
+      .run(groupingParent ? 1 : 0, dispatchedAt, jobId, link.id, dispatchedAt, dispatchedAt, jobId);
+    // An older grouping run may be reported after a newer non-grouping gap-fill.
+    if (groupingParent) db.prepare("UPDATE pull_request_link SET grouping_parent = 1 WHERE id = ?").run(link.id);
+  })();
 }
 
 export function isCurrentGroupingParent(link: PullRequestLink): boolean {
   if (!link.groupingParent) return false;
   const latest = database().prepare(`SELECT id FROM pull_request_link
     WHERE issue_id = ? AND role = 'implementation' AND job_dispatched_at IS NOT NULL
+      AND job_current = 1
     ORDER BY job_dispatched_at DESC, job_id DESC LIMIT 1`).get(link.issueId) as { id: number } | undefined;
   return latest?.id === link.id;
 }

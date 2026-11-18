@@ -33,7 +33,7 @@ describe("pull request links", () => {
     }
     const db = dedup.getDb();
     expect(db.prepare("PRAGMA table_info(tracked_issue)").all()).toHaveLength(9);
-    expect(db.prepare("PRAGMA table_info(pull_request_link)").all()).toHaveLength(16);
+    expect(db.prepare("PRAGMA table_info(pull_request_link)").all()).toHaveLength(17);
     expect(db.prepare("PRAGMA foreign_key_list(pull_request_link)").all()).toEqual([
       expect.objectContaining({ table: "tracked_issue", from: "issue_id", to: "id" }),
     ]);

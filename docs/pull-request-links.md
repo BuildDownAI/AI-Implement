@@ -108,7 +108,10 @@ Nothing automatically prunes either table: job-history retention and reconciliat
 Grouping ownership is retained on each PR link with an additive `grouping_parent`
 flag. Job writers and surviving-history backfill enrich it without clearing a
 previous grouping flag on later gap-fill reports. `job_dispatched_at` and `job_id`
-retain the newest dispatch ordering for each implementation link; finalization
+retain the newest dispatch ordering for each implementation link. `job_current`
+marks the latest PR association reported by that job, so replacement URLs do not
+tie with obsolete links. These columns are added on initialization; surviving
+job history resolves replacements during backfill. Finalization
 and cancellation use that ordering to identify the current PR after job pruning.
 Backfill enriches existing links only for the same tracker issue, preserving their
 metadata and role. Already-pruned grouping history cannot be reconstructed.
