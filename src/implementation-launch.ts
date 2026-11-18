@@ -405,6 +405,7 @@ export async function launchImplementationFlySession(args: FlyImplementationSess
     machineNonce,
     sessionMode: mapping.sessionMode,
     region: config.flySessionsRegion ?? undefined,
+    cpuKind: mapping.machineCpuKind,
     cpus: mapping.machineCpus,
     memoryMb: mapping.machineMemoryMb,
     teamKey: issue.scopeKey,

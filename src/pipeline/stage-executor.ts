@@ -82,12 +82,17 @@ export interface StageExecutorOptions {
   createCodex?: (profileId: string) => LLMExecutor;
 }
 
+/** Provider failures that permit trying the next configured account. Planning uses model fallback only. */
+export const ACCOUNT_FALLBACK_CODES: ReadonlySet<string> = new Set([
+  "ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG",
+]);
+
 /** Decide account rotation from public metadata only. Used profiles retain insertion order. */
 export function nextAccount(fallbacks: readonly StageAccount[] | undefined, used: ReadonlySet<string>, failure?: Pick<FailureRecord, "code">):
   | { kind: "switch"; to: StageAccount }
   | { kind: "exhausted"; profiles: string[] }
   | { kind: "none" } {
-  if (failure?.code !== "ACCOUNT_USAGE_LIMIT") return { kind: "none" };
+  if (!failure || !ACCOUNT_FALLBACK_CODES.has(failure.code)) return { kind: "none" };
   const to = fallbacks?.find(entry => !used.has(entry.accountProfileId));
   return to ? { kind: "switch", to } : { kind: "exhausted", profiles: [...used] };
 }
@@ -128,8 +133,8 @@ export function createStageExecutor(options: StageExecutorOptions): LLMExecutor 
       effectiveAccounts.set(stage, decision.to);
       effectiveModels.delete(stage);
       failure.accountFallback = { stage, from: current, to: decision.to.accountProfileId };
-      console.log(`[account-fallback] stage=${stage} from=${current} to=${decision.to.accountProfileId} after=ACCOUNT_USAGE_LIMIT`);
-    } else if (decision.kind === "exhausted") {
+      console.log(`[account-fallback] stage=${stage} from=${current} to=${decision.to.accountProfileId} after=${failure.code}`);
+    } else if (decision.kind === "exhausted" && failure.code === "ACCOUNT_USAGE_LIMIT") {
       failure.message = `Usage limit reached on every account: ${decision.profiles.join(", ")}`;
       failure.evidence.llmErrorMessage = failure.message;
     }

@@ -32,6 +32,7 @@ export const SETUP_CHECK_IDS = [
   "env.github-app",
   "env.admin-access-code",
   "env.runner-mode",
+  "kg.remote-store",
   "env.poll-interval",
   "env.breaker-threshold",
   "model.credentials-adopted",

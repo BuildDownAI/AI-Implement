@@ -228,6 +228,7 @@ const INHERITED_CREDENTIAL_KEYS: readonly string[] = [
   "CLAUDE_CODE_USE_BEDROCK",
   "CLAUDE_CONFIG_DIR",
   "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
   "CODEX_API_KEY",
   "CODEX_HOME",
 ];
@@ -280,6 +281,7 @@ const STRIPPED_PREFIXES: readonly string[] = [
  * pattern wildcards, so an unlisted name (LC_SECRET, COMPOSER_AUTH, ...) never inherits.
  */
 const SAFE_CONTEXT_KEYS: ReadonlySet<string> = new Set([
+  "CI", "GITHUB_ACTIONS",
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "TZ",
   "LANG", "LANGUAGE",
   "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
@@ -345,6 +347,14 @@ export function buildModelInvocationEnv(input: {
     case "anthropic-api-key":
       if (secret.kind !== "api-key") fail("credential_source_mismatch");
       env.ANTHROPIC_API_KEY = secret.apiKey;
+      break;
+    case "openrouter-api-key":
+      if (secret.kind !== "api-key") fail("credential_source_mismatch");
+      // Keep the destination fixed: an outside endpoint could receive the key and source code.
+      env.ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
+      env.ANTHROPIC_AUTH_TOKEN = secret.apiKey;
+      env.ANTHROPIC_API_KEY = "";
+      env.OPENROUTER_API_KEY = secret.apiKey;
       break;
     case "openai-api-key":
       if (secret.kind !== "api-key") fail("credential_source_mismatch");
@@ -479,8 +489,8 @@ export interface ModelAuthClientOptions {
 export interface ModelInvocation {
   readonly env: Record<string, string>;
   readonly strippedKeys: readonly string[];
-  /** Set only when the secret is a ChatGPT plan access token. */
-  readonly codexProvider?: "chatgpt-plan";
+  /** Explicit Codex provider selected from the trusted auth mode; omitted for OpenAI API keys. */
+  readonly codexProvider?: "chatgpt-plan" | "openrouter";
 }
 
 export interface ModelInvokeOptions {
@@ -948,7 +958,9 @@ export function createModelAuthClient(options: ModelAuthClientOptions): ModelAut
         result = await run({
           env: built.env,
           strippedKeys: built.strippedKeys,
-          ...(entry.secret.kind === "chatgpt-access-token" ? { codexProvider: "chatgpt-plan" as const } : {}),
+          ...(entry.authMode === "openrouter-api-key"
+            ? { codexProvider: "openrouter" as const }
+            : entry.authMode === "codex-subscription" ? { codexProvider: "chatgpt-plan" as const } : {}),
         });
       } catch (e) {
         runFailed = true;

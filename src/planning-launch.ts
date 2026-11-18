@@ -537,6 +537,7 @@ export async function launchPlanningSession(args: LaunchPlanningSessionArgs): Pr
           phase: "planning",
           sessionMode: mapping.sessionMode,
           region: config.flySessionsRegion ?? undefined,
+          cpuKind: mapping.machineCpuKind,
           cpus: mapping.machineCpus,
           memoryMb: mapping.machineMemoryMb,
           teamKey: issue.scopeKey,

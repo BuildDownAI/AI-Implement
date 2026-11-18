@@ -109,8 +109,8 @@ export function copyAccountFallbacks(value: unknown): AccountFallbacks | undefin
         || typeof entry.accountProfileId !== "string" || !entry.accountProfileId.trim()
         || !Number.isSafeInteger(entry.profileRevision) || (entry.profileRevision as number) < 1
         || !["claude", "codex"].includes(entry.agent as string)
-        || !["anthropic", "bedrock", "openai"].includes(entry.provider as string)
-        || !["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription"].includes(entry.authMode as string)
+        || !["anthropic", "bedrock", "openai", "openrouter"].includes(entry.provider as string)
+        || !["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key"].includes(entry.authMode as string)
         || typeof entry.model !== "string" || !entry.model.trim()) return fail();
       copied.push({ accountProfileId: entry.accountProfileId, profileRevision: entry.profileRevision,
         agent: entry.agent, provider: entry.provider, authMode: entry.authMode, model: entry.model } as StageAccount);
@@ -218,7 +218,7 @@ const MAX_DESCRIPTION_CHARS = 40_000;
 const TRUNCATION_MARKER = "\n\n[truncated by ai-implement: description exceeded envelope cap]";
 
 const AUTH_MODES: readonly AccountAuthMode[] = [
-  "anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription",
+  "anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key",
 ];
 const FIELD_SOURCES: readonly FieldSource[] = ["orchestrator-default", "project", "job-deadline"];
 const PROFILE_KEYS = ["id", "identity", "revision", "agent", "provider", "authMode"] as const;
@@ -262,6 +262,7 @@ function snapshotEnum<T extends string>(v: unknown, allowed: readonly T[], path:
 }
 
 function supportedCombination(agent: string, provider: string, authMode: string): boolean {
+  if (provider === "openrouter" && authMode === "openrouter-api-key") return true;
   if (agent === "claude") {
     return (provider === "anthropic" && (authMode === "anthropic-api-key" || authMode === "claude-subscription"))
       || (provider === "bedrock" && authMode === "bedrock");
@@ -309,7 +310,7 @@ export function validateResolvedAgentSnapshot(value: unknown): ResolvedAgentSnap
     snapshotKeys(sel, STAGE_SELECTION_FIELDS, sp);
     const selection: StageSelection = {
       agent: snapshotEnum(sel.agent, ["claude", "codex"], `${sp}.agent`),
-      provider: snapshotEnum(sel.provider, ["anthropic", "bedrock", "openai"], `${sp}.provider`),
+      provider: snapshotEnum(sel.provider, ["anthropic", "bedrock", "openai", "openrouter"], `${sp}.provider`),
       model: snapshotString(sel.model, `${sp}.model`),
       accountProfileId: snapshotString(sel.accountProfileId, `${sp}.accountProfileId`),
       invocationTimeoutMs: snapshotPositiveInt(sel.invocationTimeoutMs, `${sp}.invocationTimeoutMs`),
@@ -329,7 +330,7 @@ export function validateResolvedAgentSnapshot(value: unknown): ResolvedAgentSnap
       identity: snapshotString(prof.identity, `${pp}.identity`),
       revision: snapshotPositiveInt(prof.revision, `${pp}.revision`),
       agent: snapshotEnum(prof.agent, ["claude", "codex"], `${pp}.agent`),
-      provider: snapshotEnum(prof.provider, ["anthropic", "bedrock", "openai"], `${pp}.provider`),
+      provider: snapshotEnum(prof.provider, ["anthropic", "bedrock", "openai", "openrouter"], `${pp}.provider`),
       authMode: snapshotEnum(prof.authMode, AUTH_MODES, `${pp}.authMode`),
     };
     if (profile.id !== selection.accountProfileId) snapshotFail(pp, "does not match the stage accountProfileId");

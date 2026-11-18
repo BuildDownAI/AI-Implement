@@ -68,9 +68,10 @@ export interface ReviewFixAttemptDependencies {
    * value here, the same way a short `jobTimeoutMinutes` on an admission request
    * shrinks `deadlineAt` without touching the production buffer constant. */
   unknownLaunchAlertMs?: number;
-  /** Test timing overrides; production uses a fixed 30-minute grace and five-minute backoff. */
-  unknownLaunchGraceMs?: number;
-  postDeadlineReconcileIntervalMs?: number;
+  /** Test timing overrides; production uses a fixed 30-minute grace and five-minute backoff.
+   * Scope callbacks must be pure: they are evaluated again on workflow replay. */
+  unknownLaunchGraceMs?: number | ((scope: PreparedReviewFixAttempt["scope"]) => number);
+  postDeadlineReconcileIntervalMs?: number | ((scope: PreparedReviewFixAttempt["scope"]) => number);
   /** Test seam for how often the workflow reads the run's status while it waits; production leaves it unset (60 s). */
   runStatusTickMs?: number;
 }
@@ -180,7 +181,13 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
       execution = normalizeExecutionIdentity(launch.execution);
     } else {
       const unknownSince = await ctx.date.now();
-      const unresolvedUntil = attempt.deadlineAt + (deps.unknownLaunchGraceMs ?? UNKNOWN_LAUNCH_GRACE_MS);
+      const unknownLaunchGraceMs = typeof deps.unknownLaunchGraceMs === "function"
+        ? deps.unknownLaunchGraceMs(attempt.scope)
+        : deps.unknownLaunchGraceMs ?? UNKNOWN_LAUNCH_GRACE_MS;
+      const postDeadlineReconcileIntervalMs = typeof deps.postDeadlineReconcileIntervalMs === "function"
+        ? deps.postDeadlineReconcileIntervalMs(attempt.scope)
+        : deps.postDeadlineReconcileIntervalMs ?? POST_DEADLINE_RECONCILE_INTERVAL_MS;
+      const unresolvedUntil = attempt.deadlineAt + unknownLaunchGraceMs;
       let revoked = false;
       let warned = false;
       let lookupIndex = 0;
@@ -212,7 +219,7 @@ export function createReviewFixAttempt(deps: ReviewFixAttemptDependencies) {
           revoked = true;
         }
         const interval = now >= attempt.deadlineAt
-          ? deps.postDeadlineReconcileIntervalMs ?? POST_DEADLINE_RECONCILE_INTERVAL_MS
+          ? postDeadlineReconcileIntervalMs
           : RECONCILE_INTERVAL_MS;
         const boundary = now >= attempt.deadlineAt ? unresolvedUntil : attempt.deadlineAt;
         await restate.RestatePromise.race([

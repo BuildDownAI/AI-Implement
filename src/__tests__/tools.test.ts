@@ -29,6 +29,8 @@ import {
   setRunnerModeTool,
   pauseProjectTool,
   addProjectTool,
+  setProjectAgentModeTool,
+  SetProjectAgentModeArgsSchema,
   addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
@@ -53,6 +55,7 @@ import { initLogTable } from "../log.js";
 import { getRestateStatus, setRestateStatus, resetRestateStatus } from "../restate/status.js";
 import { getIssueReportCard, getFleetReport } from "../report-card.js";
 import {
+  setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
   upsertMappingAction,
@@ -63,7 +66,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as InFlightModule from "../in-flight-work.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
-import { makeAppendLogEntry, makeMapping, makeRegistry } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeMapping, makeProvider, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -82,10 +85,11 @@ vi.mock("../config.js", async (importOriginal) => ({
   getMappings: vi.fn(),
 }));
 
-// The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
-// wholesale (no importOriginal) since tools.ts only imports these five names from admin.ts
+// The six non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
+// wholesale (no importOriginal) since tools.ts only imports these six names from admin.ts
 // and nothing here needs the rest of that module's (much heavier) real behaviour.
 vi.mock("../admin.js", () => ({
+  setProjectAgentModeAction: vi.fn(),
   setRunnerModeAction: vi.fn(),
   pauseProjectAction: vi.fn(),
   upsertMappingAction: vi.fn(),
@@ -782,7 +786,7 @@ describe("migrated read handlers (AII-711)", () => {
   it("list_projects selects its fields explicitly — extraEnv never leaves the handler", async () => {
     vi.mocked(getMappings).mockReturnValue({
       BDS: makeMapping({
-        owner: "BuildDownAI", repo: "skills", extraEnv: { SUPER_SECRET: "leak-me" },
+        owner: "BuildDownAI", repo: "skills", machineCpuKind: "performance", extraEnv: { SUPER_SECRET: "leak-me" },
         trustedReviewAuthors: ["codex-reviewer[bot]"], reviewProcess: "claude-code-review",
       }),
     });
@@ -790,6 +794,7 @@ describe("migrated read handlers (AII-711)", () => {
     expect(result.isError).toBeUndefined();
     const rows = JSON.parse(result.content[0].text) as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(1);
+    expect(rows[0].machineCpuKind).toBe("performance");
     expect(rows[0].teamKey).toBe("BDS");
     expect(rows[0].repo).toBe("BuildDownAI/skills");
     expect(rows[0].trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
@@ -1058,6 +1063,48 @@ describe("migrated read handlers (AII-711)", () => {
         ["currentRun", "deployHeld", "executionMode", "flyMachine", "kgDegraded", "kgUnavailable", "lastRefresh", "materialize", "restate", "runProfile", "running", "servedStamp", "sidecar", "stage"].sort(),
       );
     });
+  });
+});
+
+describe("get_tenant_health stageAgents", () => {
+  let tools: typeof ToolsModule;
+  let store: typeof import("../agent-config-store.js");
+
+  beforeEach(async () => {
+    ({ tools, store } = (await testDb({ modules: {
+      tools: () => import("../restate/tools.js"),
+      store: () => import("../agent-config-store.js"),
+    } })).modules);
+    vi.mocked(getMappings).mockReturnValue({});
+  });
+
+  const health = async () => JSON.parse((await tools.getTenantHealth(fakeContext("get_tenant_health"), { caller: SYSTEM_ADMIN, args: {} })).content[0].text);
+
+  it("defaults to legacy without a defaults row and returns no projects without mappings", async () => {
+    expect((await health()).stageAgents).toEqual({ defaultsMode: "legacy", projects: [] });
+  });
+
+  it("reports mapped keys only, sorted, with missing project rows treated as legacy", async () => {
+    store.saveAccountProfileRevision(makeStageAgentProfile());
+    store.setOrchestratorDefaults(makeStageAgentDefaults());
+    store.setProjectConfigured("UNMAPPED", true);
+    store.setProjectConfigured("AII", true);
+    store.setProjectConfigured("EXPLICIT", true);
+    store.setProjectConfigured("EXPLICIT", false);
+    vi.mocked(getMappings).mockReturnValue({
+      EXPLICIT: makeMapping(), BDS: makeMapping(),
+      AII: makeMapping({ extraEnv: { SECRET: "must-not-leak" } }),
+    });
+    expect((await health()).stageAgents).toEqual({
+      defaultsMode: "configured",
+      projects: [
+        { teamKey: "AII", agentMode: "configured" },
+        { teamKey: "BDS", agentMode: "legacy" },
+        { teamKey: "EXPLICIT", agentMode: "legacy" },
+      ],
+    });
+    store.setOrchestratorDefaults({ version: 1, mode: "legacy" });
+    expect((await health()).stageAgents.defaultsMode).toBe("legacy");
   });
 });
 
@@ -1341,12 +1388,12 @@ describe("get_issue_report_card and get_fleet_report thread their arguments (AII
   });
 });
 
-// ---- The six writes AII-713 moved off WRITE_TOOLS in src/mcp.ts. Each action call, its args
+// ---- The five writes AII-713 moved off WRITE_TOOLS in src/mcp.ts. Each action call, its args
 // validation, and its status-to-text mapping are unchanged — see mcp.test.ts for the same
 // cases exercised through the /mcp adapter, and tools.restate.test.ts for the idempotency
 // scenario and the forbidden-role case over a real ingress.
 //
-// AII-717: every one of these six also now runs its side effect through ctx.run with
+// AII-717: every one of these writes also now runs its side effect through ctx.run with
 // { maxRetryAttempts: 1 } and declares retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" }
 // on its tool() definition — see the "retryPolicy declarations (AII-717)" describe below for
 // the latter. fakeContext's `run` records each call so a scenario here can assert the step
@@ -1450,7 +1497,12 @@ describe("migrated write handlers (AII-713)", () => {
         { kind: "human", email: "user@example.com", role: "admin", grants: [] },
       ));
       expect(res).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
-      expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com" });
+      expect(trigger).toHaveBeenCalledWith({ kgSourceRef: "feature/x", actorEmail: "user@example.com", trigger: "manual" });
+    });
+
+    it("records a manual trigger for an admin session without an email", async () => {
+      await call({}, { kind: "human", email: null, role: "admin", grants: [] });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined, trigger: "manual" });
     });
 
     it("passes ref through as kgSourceRef to KgRepo.trigger", async () => {
@@ -1460,7 +1512,7 @@ describe("migrated write handlers (AII-713)", () => {
 
     it("omits ref and leaves actorEmail undefined for a null-email caller", async () => {
       await call();
-      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined, trigger: "schedule" });
     });
 
     it.each(["dryRun", "acceptNewBaseline"])("refuses %s:true with option-removed before any other gate, with no side effect", async (option) => {
@@ -1475,7 +1527,7 @@ describe("migrated write handlers (AII-713)", () => {
 
     it("runs a real refresh for dryRun:false and acceptNewBaseline:false", async () => {
       expect(answer(await call({ dryRun: false, acceptNewBaseline: false })).status).toBe(202);
-      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined });
+      expect(trigger).toHaveBeenCalledWith({ actorEmail: undefined, trigger: "schedule" });
     });
 
     it("answers 409 refresh-in-progress when KgRepo reports a live refresh", async () => {
@@ -1717,6 +1769,29 @@ describe("migrated write handlers (AII-713)", () => {
     });
   });
 
+  describe("set_project_agent_mode", () => {
+    it("journals the action once with its mode and actor", async () => {
+      vi.mocked(setProjectAgentModeAction).mockReturnValue({ ok: true, teamKey: "AII", agentMode: "configured" });
+      const calls: RunCall[] = [];
+      const result = await setProjectAgentModeTool(fakeContext("set_project_agent_mode", calls), {
+        caller: admin, args: { teamKey: "AII", mode: "configured" },
+      });
+      expect(setProjectAgentModeAction).toHaveBeenCalledWith("AII", "configured", "system");
+      expect(result).toEqual({ content: [{ type: "text", text: '{"teamKey":"AII","agentMode":"configured"}' }] });
+      expect(calls).toEqual([{ name: "set-project-agent-mode", options: { maxRetryAttempts: 1 },
+        result: { ok: true, teamKey: "AII", agentMode: "configured" } }]);
+    });
+    it.each(["mapping-not-found", "resolution-failed"] as const)("returns the bare refusal %s", async (code) => {
+      vi.mocked(setProjectAgentModeAction).mockReturnValue({ ok: false, code });
+      expect(await setProjectAgentModeTool(fakeContext("set_project_agent_mode"), {
+        caller: admin, args: { teamKey: "AII", mode: "configured" },
+      })).toEqual({ isError: true, content: [{ type: "text", text: code }] });
+    });
+    it.each(["action", "attemptId", "pipeline", "backend", "patch", "schedule", "paused", "issueId", "dispatchId"])("rejects unknown argument %s", (key) => {
+      expect(SetProjectAgentModeArgsSchema.safeParse({ teamKey: "AII", mode: "legacy", [key]: "x" }).success).toBe(false);
+    });
+  });
+
   describe("add_project", () => {
     it("has no separate pre-validation — a partial args object reaches upsertMappingAction through ctx.run, whose own 400 comes back verbatim", async () => {
       (upsertMappingAction as ReturnType<typeof vi.fn>).mockReturnValue({ status: 400, body: { error: "teamKey, owner, and repo are required" } });
@@ -1861,7 +1936,7 @@ describe("migrated write handlers (AII-713)", () => {
 // dead attempt from ever being re-delivered; no read handler does. Read off the handler
 // function's own closed-over options isn't possible from outside the module, so this checks
 // the same thing restate-boundary.test.ts's static check does — the declaration is present in
-// source — for the six write definitions specifically, plus a negative check on a read.
+// source — for the write definitions specifically, plus a negative check on a read.
 describe("retryPolicy declarations (AII-717)", () => {
   const TOOLS_SOURCE = readFileSync("src/restate/tools.ts", "utf8");
 
@@ -1878,6 +1953,7 @@ describe("retryPolicy declarations (AII-717)", () => {
     "setRunnerModeTool",
     "pauseProjectTool",
     "addProjectTool",
+    "setProjectAgentModeTool",
     "triggerWorkflowSyncTool",
     "clearDispatchDedupTool",
   ])("%s declares retryPolicy: { maxAttempts: 1, onMaxAttempts: \"kill\" }", (exportName) => {
@@ -2126,4 +2202,171 @@ describe("list_job_accounting (AII-1564)", () => {
       expect(page.oldestRetainedCompletedAt).toBe(done);
     }
   });
+});
+
+describe("list_open_pulls (AII-1964)", () => {
+  afterEach(() => vi.restoreAllMocks());
+  let api: typeof import("../open-pulls.js");
+  let tools: typeof ToolsModule;
+  let github: typeof import("../github.js");
+
+  beforeEach(async () => {
+    ({ modules: { api, tools, github } } = await testDb({
+      modules: {
+        api: () => import("../open-pulls.js"),
+        tools: () => import("../restate/tools.js"),
+        github: () => import("../github.js"),
+      },
+    }));
+    vi.mocked(getMappings).mockReturnValue({ APP: makeMapping({ owner: "acme", repo: "app" }) });
+    api.clearOpenPullsCache();
+    const auth = await import("../github-app-auth.js");
+    vi.spyOn(auth, "getInstallationToken").mockResolvedValue("token");
+  });
+
+  it.each([false, true])("returns a top-level array (populated: %s) inside the named step", async (populated) => {
+    const reader = vi.spyOn(github, "listAllOpenPullRequests").mockResolvedValue(populated ? [{
+      number: 42, url: "https://github.com/acme/app/pull/42", head: "work",
+      base: "main", headSha: "sha", draft: false, title: "Title", createdAt: 123,
+    }] : []);
+    let insideStep = false;
+    const read = api.listOpenPulls;
+    vi.spyOn(api, "listOpenPulls").mockImplementation(() => {
+      expect(insideStep).toBe(true);
+      return read();
+    });
+    const calls: RunCall[] = [];
+    const ctx = fakeContext("list_open_pulls", calls);
+    const run = ctx.run;
+    ctx.run = ((name: string, action: () => unknown, options: Parameters<typeof run>[2]) => {
+      insideStep = true;
+      return run(name, action, options);
+    }) as typeof ctx.run;
+    const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    const entries = JSON.parse(result.content[0].text);
+    expect(Array.isArray(entries)).toBe(true);
+    expect(entries).toHaveLength(populated ? 1 : 0);
+    if (populated) expect(entries[0]).toMatchObject({ repo: "acme/app", pr: { number: 42 } });
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([{ name: "list-open-pulls", options: { maxRetryAttempts: 1 }, result: entries }]);
+  });
+
+  it("uses a recorded step result without reading the cache or GitHub again", async () => {
+    const reader = vi.spyOn(api, "listOpenPulls");
+    const recorded = [{ repo: "recorded/app" }];
+    const run = vi.fn(async () => recorded);
+    const ctx = { ...fakeContext("list_open_pulls"), run } as unknown as restate.Context;
+    const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(JSON.parse(result.content[0].text)).toEqual(recorded);
+    expect(run).toHaveBeenCalledWith("list-open-pulls", expect.any(Function), { maxRetryAttempts: 1 });
+    expect(reader).not.toHaveBeenCalled();
+  });
+
+  it.each(["credential", "GitHub"])("surfaces a %s failure as a named tool error with bounded retries", async (source) => {
+    const detail = `${source} unavailable`;
+    if (source === "credential") {
+      const auth = await import("../github-app-auth.js");
+      vi.mocked(auth.getInstallationToken).mockRejectedValue(new Error(detail));
+    } else {
+      vi.spyOn(github, "listAllOpenPullRequests").mockRejectedValue(new Error(detail));
+    }
+    const ctx = fakeContext("list_open_pulls");
+    const run = vi.spyOn(ctx, "run");
+    const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(run).toHaveBeenCalledWith("list-open-pulls", expect.any(Function), { maxRetryAttempts: 1 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("list_open_pulls");
+    expect(result.content[0].text).toContain(detail);
+  });
+});
+
+
+describe("list_issue_statuses (AII-1966)", () => {
+  let tools: typeof ToolsModule;
+  let api: typeof import("../issue-statuses.js");
+
+  beforeEach(async () => {
+    ({ modules: { tools, api } } = await testDb({
+      modules: {
+        tools: () => import("../restate/tools.js"),
+        api: () => import("../issue-statuses.js"),
+      },
+    }));
+    api.clearIssueStatusesCache();
+  });
+
+  afterEach(() => {
+    tools.setProviderRegistry(null);
+    api.clearIssueStatusesCache();
+    vi.restoreAllMocks();
+  });
+
+  it("returns a populated top-level array through the shared registry inside the named step", async () => {
+    const mapping = makeMapping();
+    vi.mocked(getMappings).mockReturnValue({ APP: mapping });
+    let insideStep = false;
+    const reader = vi.fn(async () => {
+      expect(insideStep).toBe(true);
+      return [{
+        id: "internal", identifier: "APP-1", title: "Issue", url: null,
+        state: "ready" as const, phase: null, labels: [], workflowState: null, updatedAt: 123,
+      }];
+    });
+    const registry = makeRegistry({ provider: makeProvider({ listIssueStatuses: reader }) });
+    const providerFor = vi.spyOn(registry, "forMapping");
+    tools.setProviderRegistry(registry);
+    const calls: RunCall[] = [];
+    const ctx = fakeContext("list_issue_statuses", calls);
+    const run = ctx.run;
+    ctx.run = ((name: string, action: () => unknown, options: Parameters<typeof run>[2]) => {
+      insideStep = true;
+      return run(name, action, options);
+    }) as typeof ctx.run;
+    const result = await tools.listIssueStatusesTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([{
+      teamKey: "APP", tracker: mapping.ticketingConfig.kind,
+      issue: { identifier: "APP-1", title: "Issue", url: null },
+      state: "ready", phase: null, raw: { labels: [], workflowState: null }, changedAt: 123,
+    }]);
+    const providerMapping = { ...mapping, teamKey: "APP" };
+    expect(providerFor).toHaveBeenCalledWith(providerMapping);
+    expect(reader).toHaveBeenCalledWith(providerMapping);
+    expect(mapping.teamKey).toBeUndefined();
+    expect(calls).toEqual([{ name: "list-issue-statuses", options: { maxRetryAttempts: 1 }, result: JSON.parse(result.content[0].text) }]);
+  });
+
+  it("returns an empty array successfully when there are no mappings", async () => {
+    vi.mocked(getMappings).mockReturnValue({});
+    const result = await tools.listIssueStatusesTool(fakeContext("list_issue_statuses"), { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+  });
+
+  it.each(["resolution", "unsupported", "read"])("surfaces a provider %s failure as a named tool error with bounded retries", async (failure) => {
+    vi.mocked(getMappings).mockReturnValue({ APP: makeMapping() });
+    const registry = makeRegistry({ provider: makeProvider({
+      listIssueStatuses: failure === "unsupported" ? undefined : vi.fn().mockRejectedValue(new Error("tracker unavailable")),
+    }) });
+    if (failure === "resolution") vi.spyOn(registry, "forMapping").mockImplementation(() => { throw new Error("provider unavailable"); });
+    tools.setProviderRegistry(registry);
+    const ctx = fakeContext("list_issue_statuses");
+    const run = vi.spyOn(ctx, "run");
+    const result = await tools.listIssueStatusesTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(run).toHaveBeenCalledWith("list-issue-statuses", expect.any(Function), { maxRetryAttempts: 1 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("list_issue_statuses");
+    expect(result.content[0].text).toContain(failure === "resolution" ? "provider unavailable" : failure === "unsupported" ? "cannot list issue statuses" : "tracker unavailable");
+  });
+});
+
+
+it("add_project accepts CPU kinds without defaulting omitted input", () => {
+  const base = { teamKey: "AII", owner: "org", repo: "repo" };
+  for (const machineCpuKind of ["shared", "performance"]) {
+    expect(addProjectArgsSchema.safeParse({ ...base, machineCpuKind }).success).toBe(true);
+  }
+  expect(addProjectArgsSchema.safeParse({ ...base, machineCpuKind: "invalid" }).success).toBe(false);
+  expect(addProjectArgsSchema.parse(base)).not.toHaveProperty("machineCpuKind");
 });

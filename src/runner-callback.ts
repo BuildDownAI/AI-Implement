@@ -1,3 +1,4 @@
+import { enqueueRollupReview, ROLLUP_REVIEW_RETRY_LIMIT } from "./comment-gapfill-queue.js";
 import { listRollupReviewChildren, reconcileRollupReviewChildren, ROLLUP_REVIEW_CHILD_PREFIX } from "./merge-up.js";
 import { getDb } from "./dedup.js";
 import { recordInternalReviewFinding, stableReviewFindingKey, markReviewFindingResolvedIfRevision } from "./review-ledger-store.js";
@@ -35,6 +36,7 @@ import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.j
 import { verifyAndConsumeRunToken, verifyPreparedReviewFixToken, verifyRunToken } from "./runner-tokens.js";
 import { getMappings } from "./config.js";
 import { parkIssue } from "./dispatch-breaker.js";
+import { LinearGraphQLError, LinearLabelWriteError } from "./providers/linear.js";
 import { JiraApiError } from "./providers/jira-client.js";
 import { read as readAdmission } from "./dispatch-admission.js";
 import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
@@ -49,7 +51,7 @@ import {
   type StoredReviewFinding,
 } from "./review-ledger-store.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { getCommitAuthorType, getPullRequestState, listPrComments, updatePrComment, postOrUpdateStickyComment } from "./github.js";
+import { postPrComment, getCommitAuthorType, getPullRequestState, listPrComments, updatePrComment, postOrUpdateStickyComment } from "./github.js";
 import {
   renderClassification,
   renderFailureRecord,
@@ -182,7 +184,7 @@ export interface RunnerResultBody {
   referenceRepoResults?: ReferenceRepoResult[];
   /** Internal findings collected across review iterations, validated before storage. */
   reviewOnly?: boolean;
-  rollupReview?: { headSha: string; verdictUrl: string };
+  rollupReview?: import("./runner-result.js").RollupReviewResult;
   internalFindings?: ReviewLedgerFinding[];
   /** Per-finding disposition from the fixing agent (fixed/follow-up/invalid). Shape-validated below. */
   findingDispositions?: FindingDisposition[];
@@ -768,6 +770,45 @@ export function describeTrackerWriteError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// The orchestrator owns one local callback/database writer. Reserve a dispatch before
+// the first await so overlapping deliveries cannot both pass the persisted guard.
+// Entries exist only while callbacks are running; completion survives in the database.
+const callbackLifecycleTails = new Map<string, Promise<void>>();
+
+async function withCallbackLifecycleLock<T>(dispatchId: string, effect: () => Promise<T>): Promise<T> {
+  const previous = callbackLifecycleTails.get(dispatchId);
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  callbackLifecycleTails.set(dispatchId, current);
+  try {
+    await previous;
+    return await effect();
+  } finally {
+    release();
+    if (callbackLifecycleTails.get(dispatchId) === current) callbackLifecycleTails.delete(dispatchId);
+  }
+}
+
+/** Describe the provider operation that failed after recording a plan. */
+export function planCompleteFailureText(providerId: string, awaitApproval: boolean, err: unknown): string {
+  if (providerId === "jira") {
+    return `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. ` +
+      `${describeTrackerWriteError(err)}. Fix the status field, then use Unpark at /admin#runners.`;
+  }
+  if (providerId === "linear") {
+    if (err instanceof LinearLabelWriteError) {
+      return `The plan was recorded, but Linear refused to create label "${err.label}" on team ${err.teamKey}: ${err.linearMessage}. ` +
+        "Create the label in the team by hand, or let the app create labels, then use Unpark at /admin#runners.";
+    }
+    if (err instanceof LinearGraphQLError) {
+      return `The plan was recorded, but Linear refused the plan-complete label write (${err.operation}): ${err.linearMessage}. ` +
+        "Fix the app's access to the team, then use Unpark at /admin#runners.";
+    }
+    return `The plan was recorded, but the plan-complete label write failed: ${describeTrackerWriteError(err)}. Then use Unpark at /admin#runners.`;
+  }
+  return `The plan was recorded, but the tracker refused the plan-complete write: ${describeTrackerWriteError(err)}. Then use Unpark at /admin#runners.`;
+}
+
 /**
  * Preserve callback-owned lifecycle outcomes, then deliver owned accounting through
  * the workflow intake. Persisted lifecycle completion skips effects on retry; the reusable
@@ -786,14 +827,19 @@ export async function handleRunnerResult(input: HandleRunnerResultInput): Promis
     console.warn(`[runner-callback] forward failed kind=${input.body.phase} dispatch=${verified.claims.dispatchId}`);
     return bad(503, "owned_result_intake_unavailable");
   }
-  const result = await handleRunnerResultInternal({
-    ...input,
-    checkPlanningAdmissionTermination: undefined,
-    checkImplementationAdmissionTermination: undefined,
+  const result = await withCallbackLifecycleLock(verified.claims.dispatchId, async () => {
+    const result = await handleRunnerResultInternal({
+      ...input,
+      checkPlanningAdmissionTermination: undefined,
+      checkImplementationAdmissionTermination: undefined,
+    });
+    // Persist before releasing the lock and before the fallible forward. A retry
+    // skips lifecycle effects but still delivers its report through workflow intake.
+    if (result.status < 300) markCallbackLifecycleCompleted(verified.claims.dispatchId);
+    return result;
   });
   if (result.status >= 300) return result;
-  // Persist before the fallible forward: workflow closure may still be pending.
-  markCallbackLifecycleCompleted(verified.claims.dispatchId);
+  // Restate uses the dispatch id as the report idempotency key, even after a lost ACK.
   try {
     const forwarded = await hook(verified.claims.dispatchId, toRecordedUsage(input.body));
     if (forwarded?.status === "conflict") return bad(409, "conflicting_report");
@@ -1382,8 +1428,44 @@ async function handleRunnerResultInternal(
         }
       }
       await sendImplementationReport();
+    } else if (job && owned && input.body.phase === "gap-analysis") {
+      // A gap-fill can report failure without a structured record (older runners).
+      // Keep the reported code/reason without guessing a retryable classification.
+      const reportedFailure: FailureRecord = failure ?? {
+        category: "unknown",
+        code: input.body.failureCode ?? "gap_analysis_failed",
+        stage: "gap-analysis",
+        attempt: 1,
+        retryable: false,
+        message: input.body.failureReason || input.body.failureCode || "Gap-fill failed",
+        evidence: { truncated: false },
+      };
+      if (!failure) updateJobFailure(job.id, reportedFailure);
+      // Keep this best-effort effect inside the lifecycle guard, before closing the row.
+      // Report retries forward again without reposting to GitHub or the tracker.
+      if (job.prUrl) {
+        try {
+          const autopsy = input.body.comments.find(c => c.body.startsWith("## 🔎 Run autopsy — "));
+          if (!autopsy) throw new Error("Gap-fill callback has no run autopsy");
+          const target = parsePrUrlTarget(job.prUrl);
+          const mapping = getMappings()[mappingTeamKey];
+          if (!target || job.repo !== `${target.owner}/${target.repo}` ||
+              mapping?.owner !== target.owner || mapping?.repo !== target.repo || !input.watchdogConfig) {
+            throw new Error("Gap-fill PR target or GitHub credentials unavailable");
+          }
+          const token = await getInstallationToken(input.watchdogConfig.githubAppId,
+            input.watchdogConfig.githubAppPrivateKey, target.owner);
+          await postPrComment(token, target.owner, target.repo, target.prNumber,
+            autopsy.body + "\n\nTo start a new round, post a new `/ai-implement` comment with a changed instruction.");
+        } catch (err) {
+          warn("postPrComment", err);
+        }
+      }
+      // The callback is not proof the backend stopped: the workflow releases admission.
+      updateJobStatus(job.id, "failed", reportedFailure.code, undefined, { skipAdmissionRelease: true });
+      await sendImplementationReport();
     }
-    // gap-analysis failure: no status transition (PR already terminal)
+    // Legacy gap-analysis failure remains for its monitor to close.
   } else if (input.body.phase === "planning") {
     let planStatusFailure: string | null = null;
     // A missing mapping defaults to auto-approve.
@@ -1392,9 +1474,7 @@ async function handleRunnerResultInternal(
       await provider.markPlanComplete(claims.issueId, mappingTeamKey, { awaitApproval });
     } catch (err) {
       warn("markPlanComplete", err);
-      planStatusFailure =
-        `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. ` +
-        `${describeTrackerWriteError(err)}. Fix the status field, then use Unpark at /admin#runners.`;
+      planStatusFailure = planCompleteFailureText(provider.id, awaitApproval, err);
     }
     if (planStatusFailure !== null) {
       // The plan comments are recorded, so the response stays 200. Local writes come first so the
@@ -2048,20 +2128,23 @@ export async function resubmitPendingGapFillReviews(opts: {
   return submitted;
 }
 
+const ROLLUP_REVIEW_CHILD_LIMIT = 2;
+
 /** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
 async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
   scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
   // Partial findings remain advisory evidence; only a complete review can request a fix.
-  if (input.body.outcome !== "success") return;
+  const complete = input.body.outcome === "success";
   const review = input.body.rollupReview;
-  if (!review || typeof review.headSha !== "string" || !/^[a-f0-9]{40,64}$/.test(review.headSha) ||
+  if (!review || typeof review.headSha !== "string" ||
+      (!/^[a-f0-9]{40,64}$/.test(review.headSha) && (complete || review.headSha !== "")) ||
       typeof review.verdictUrl !== "string" || !job?.prUrl || !input.watchdogConfig) return;
   const target = parsePrUrlTarget(job.prUrl);
   if (!target || job.repo !== `${target.owner}/${target.repo}`) return;
   const { owner, repo, prNumber } = target;
-  if (!provider.listIssuesPage) {
-    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up`);
-    return;
+  const canEnumerate = !!provider.listIssuesPage;
+  if (!canEnumerate) {
+    console.warn(`[roll-up-review] ${provider.id} cannot enumerate children; keeping verdict without filing a follow-up child`);
   }
   const reservationKey = `roll-up-review:children:${owner}/${repo}#${prNumber}`;
   const reserved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
@@ -2078,15 +2161,12 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   if (!branch || branch[1].toLowerCase() !== job.issueIdentifier?.toLowerCase()) return;
   const parent = await provider.findByKey(job.issueIdentifier!, scopeKey);
   if (!parent || parent.id !== parentId) return;
-  if (pr.merged || pr.state === "closed") {
-    await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
-    return;
-  }
+  const closed = pr.merged || pr.state === "closed";
+  if (closed) await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
   const blockers = (input.body.internalFindings ?? []).filter(f => f && f.severity === "blocking" &&
     typeof f.body === "string" && f.body.trim() && (f.path === undefined || typeof f.path === "string") &&
     (f.line === undefined || (Number.isInteger(f.line) && f.line > 0)));
-  if (!blockers.length) return;
-  const children = (await listRollupReviewChildren(provider, mapping)).filter(c =>
+  const children = (canEnumerate ? await listRollupReviewChildren(provider, mapping) : []).filter(c =>
     c.parent?.identifier === parent.identifier && c.title.startsWith(`${ROLLUP_REVIEW_CHILD_PREFIX} ${owner}/${repo}#${prNumber} `));
   const existingHeads = children.map(c => c.title.split(" ")[2]);
   if (existingHeads.includes(review.headSha)) onTrackerWriteReserved();
@@ -2095,8 +2175,8 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   const reservation = getDb().transaction(() => {
     const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(reservationKey) as { value: string } | undefined;
     const heads = new Set<string>([...existingHeads, ...(row ? JSON.parse(row.value) as string[] : [])]);
-    if (heads.has(review.headSha)) return { create: false, count: heads.size };
-    if (heads.size >= 2) return { create: false, count: heads.size };
+    if (!complete || !blockers.length || !canEnumerate || closed || heads.has(review.headSha)) return { create: false, count: heads.size };
+    if (heads.size >= ROLLUP_REVIEW_CHILD_LIMIT) return { create: false, count: heads.size };
     heads.add(review.headSha);
     getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(reservationKey, JSON.stringify([...heads]));
     return { create: true, count: heads.size };
@@ -2119,7 +2199,29 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   const verdict = comments.find(c => c.id === Number(verdictMatch[4]));
   if (!verdict) throw new Error("Cannot find roll-up verdict comment");
   const marker = "<!-- roll-up-review follow-up -->";
-  const notice = `${marker}\n\n${childIdentifier ? `Blocking findings filed as ${childIdentifier}.` : "No additional child filed."}` +
-    (reservation.count >= 2 ? " The automatic follow-up limit (two children per roll-up PR) is reached; a person decides any further fixes." : "");
+  const failedReviewers = Array.isArray(review.failedReviewers)
+    ? review.failedReviewers.filter((id): id is string => typeof id === "string" && !!id.trim()) : [];
+  const failures = review.incompleteReviews;
+  const transientOnly = Array.isArray(failures) && failures.length > 0 &&
+    failures.every(r => r && typeof r.reviewerId === "string" && r.reviewerId.trim() && r.failure?.category === "transient") &&
+    failedReviewers.every(id => failures.some(r => r.reviewerId === id));
+  // Remember which callback inserted the retry so notice-write failures can be
+  // redelivered without describing that callback's queued retry as exhausted.
+  const retryNoticeKey = `roll-up-review:retry-notice:${job.dispatchId}`;
+  const retryQueued = getDb().transaction(() => {
+    const prior = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(retryNoticeKey);
+    if (prior) return true;
+    if (complete || closed || !review.headSha || !transientOnly) return false;
+    const queued = enqueueRollupReview({ owner, repo, prNumber, headSha: review.headSha, attempt: ROLLUP_REVIEW_RETRY_LIMIT });
+    if (queued) getDb().prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run(retryNoticeKey, review.headSha);
+    return queued;
+  })();
+  const resultNotice = !complete
+    ? `The review did not finish. ${failedReviewers.length ? `Failed reviewers: ${failedReviewers.join(", ")}.` : "No failed reviewer was identified; the review could not complete."} ${retryQueued ? "one retry is queued" : "no retry is left; a person decides"}.`
+    : childIdentifier ? `Blocking findings filed as ${childIdentifier}.`
+    : blockers.length ? "No additional child filed." : "No blocking findings; no child filed.";
+  const notice = `${marker}\n\n${resultNotice}` +
+    (reservation.count >= ROLLUP_REVIEW_CHILD_LIMIT
+      ? ` The automatic follow-up limit (${ROLLUP_REVIEW_CHILD_LIMIT} children per roll-up PR) is reached; a person must decide any further fixes.` : "");
   await updatePrComment(token, owner, repo, verdict.id, verdict.body.split(marker)[0].trimEnd() + "\n\n" + notice);
 }

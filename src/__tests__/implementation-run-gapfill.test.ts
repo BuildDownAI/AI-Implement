@@ -31,8 +31,8 @@ vi.mock("../restate/implementation-run-workflow.js", async original => ({ ...awa
 vi.mock("../dispatch-admission.js", () => ({ acquire: vi.fn(), read: vi.fn(), release: vi.fn(), releaseByDispatchId: vi.fn() }));
 vi.mock("../dispatch-gate.js", () => ({ acquireDispatch: vi.fn() }));
 vi.mock("../dispatch-breaker.js", () => ({ isParked: vi.fn(() => false) }));
-vi.mock("../comment-gapfill-queue.js", () => ({ getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), ROLLUP_REVIEW_COMMENTER: "ai-implement-rollup-review", CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
-vi.mock("../comment-gapfill-drain.js", async original => ({ ...await original<typeof import("../comment-gapfill-drain.js")>(), buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
+vi.mock("../comment-gapfill-queue.js", async (importOriginal) => ({ MAX_COMMENT_GAPFILL_REFUSALS: (await importOriginal<typeof import("../comment-gapfill-queue.js")>()).MAX_COMMENT_GAPFILL_REFUSALS, getCommentGapfillLaunch: vi.fn((id: string) => intents.get(id) ?? null), stageCommentGapfillLaunch: vi.fn((id: string, value: unknown) => { if (!intents.has(id)) intents.set(id, JSON.parse(JSON.stringify(value))); }), confirmCommentGapfillLaunch: vi.fn((id: string) => { const intent = intents.get(id); if (intent) Object.assign(intent, { accepted: true }); }), rejectCommentGapfillLaunch: vi.fn((id: string, status: number) => intents.set(id, { ...intents.get(id) as object, rejected: { status } })), ROLLUP_REVIEW_COMMENTER: "ai-implement-rollup-review", CONFLICT_COMMENTER: "conflict", getCommentGapfillItem: vi.fn(), getCommentGapfillRefusal: vi.fn(() => null), recordCommentGapfillRefusal: vi.fn(), markCommentGapfillProcessed: vi.fn() }));
+vi.mock("../comment-gapfill-drain.js", async original => ({ ...await original<typeof import("../comment-gapfill-drain.js")>(), firePrBudgetPark: vi.fn(async () => {}), buildCommentGapfillInstruction: vi.fn(() => "COMMENT-SENTINEL"), gapfillAccounting: vi.fn(async () => ({ trackerKind: "linear", issueUrl: "url" })), resolveManagedDecision: vi.fn() }));
 vi.mock("../log.js", () => ({ appendLogIfAbsent: vi.fn(() => 7), getLatestDispatchForPr: vi.fn(), getLatestDispatchForIssueIdentifier: vi.fn(), getJobByDispatchId: vi.fn(), getClaimedRunIds: vi.fn(() => new Set([99])), updateJobPrUrl: vi.fn(), attachJobRunIdIfMissing: vi.fn(), updateJobRunId: vi.fn(), suppressStaleNotifications: vi.fn(), setJobMachineId: vi.fn(), updateJobStatus: vi.fn() }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn(async () => "TOKEN-SENTINEL"), getScopedInstallationToken: vi.fn(async () => ({ token: "TOKEN-SENTINEL" })) }));
 vi.mock("../github.js", async original => ({ ...await original<object>(), dispatchWorkflow: vi.fn(), getWorkflowRunStatus: vi.fn(async () => null), cancelWorkflowRun: vi.fn(async () => true) }));
@@ -48,8 +48,8 @@ vi.mock("../dedup.js", () => ({ markDispatched: vi.fn() }));
 import { createProductionImplementationRunServices, createImplementationFindExistingRun } from "../restate/implementation-run-production.js";
 import { acquire, read } from "../dispatch-admission.js";
 import { acquireDispatch } from "../dispatch-gate.js";
-import { getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
-import { resolveManagedDecision, buildCommentGapfillInstruction } from "../comment-gapfill-drain.js";
+import { getCommentGapfillRefusal, recordCommentGapfillRefusal, getCommentGapfillItem, markCommentGapfillProcessed } from "../comment-gapfill-queue.js";
+import { firePrBudgetPark, resolveManagedDecision, buildCommentGapfillInstruction } from "../comment-gapfill-drain.js";
 import { prepareGhaGapfillLaunch, dispatchGhaGapfill } from "../gapfill-launch.js";
 import { appendLogIfAbsent, getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getJobByDispatchId, updateJobPrUrl, attachJobRunIdIfMissing, suppressStaleNotifications } from "../log.js";
 import { surfaceDispatchFailure } from "../dispatch-failure.js";
@@ -145,8 +145,9 @@ it("first launch accepts GitHub repository casing differences", async () => {
 });
 it.each(["parked", "budget_exhausted", "occupied", "at_capacity"])("reserve refusal %s restores pending", async reason => {
   vi.mocked(acquire).mockReturnValue({ ok: false, reason } as never);
-  expect(await d.reserve(run)).toBe(false);
-  expect(markCommentGapfillProcessed).toHaveBeenCalledWith(1, "pending");
+  expect(await d.reserve(run)).toEqual({ ok: false, reason });
+  expect(recordCommentGapfillRefusal).toHaveBeenCalledWith(1, reason, run.dispatchId);
+  if (reason === "budget_exhausted") expect(firePrBudgetPark).toHaveBeenCalled();
 });
 it.each(["probe", "token", "managed"])("prep %s failure fails the queue and settles rejected", async source => {
   if (source === "probe") vi.mocked(prepareGhaGapfillLaunch).mockRejectedValueOnce(new Error("probe"));
@@ -803,7 +804,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
   m.config.saveAccountProfileRevision({ profileId: "api", identity: "API", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key", metadata: { credentialRef: "model-account:api" } });
   const stage = { agent: "claude" as const, provider: "anthropic" as const, model: "m", accountProfileId: "api", invocationTimeoutMs: 60000 };
   m.config.setOrchestratorDefaults({ version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } });
-  m.config.setProjectOptIn("ENG", true);
+  m.config.setProjectConfigured("ENG", true);
   const actual = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
   const req = { dispatchId: "before-intent", projectKey: "ENG", backend: "github-actions" as const, owner: "Org", repo: "repo", workflowFile: "claude-implement.yml" };
   const initialRuntime = makeRuntime(m);
@@ -814,7 +815,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
     const frozen = m.prep.loadStoredSnapshot(req.dispatchId);
     expect(frozen).not.toBeNull();
     expect(m.dedup.getDb().prepare("SELECT * FROM model_credential_grants").all()).toEqual([]);
-    m.config.setProjectOptIn("ENG", false);
+    m.config.setProjectConfigured("ENG", false);
     const reopened = await database.reopen();
     const managed = await import("../managed-dispatch-auth.js");
     const replay = await vi.importActual<typeof import("../managed-dispatch-auth.js")>("../managed-dispatch-auth.js");
@@ -860,7 +861,7 @@ it.each(["unchanged", "missing", "opted-out", "snapshot-before-grant"])("replays
   // Prove the actual retry returns no credential and cannot create another grant.
   expect(await replay.prepareManagedDispatch(req, runtime)).toEqual({ kind: "hold", code: "bootstrap_consumed" });
   if (configuration === "missing") input.getMapping = () => undefined;
-  if (configuration === "opted-out") reopened.config.setProjectOptIn("ENG", false);
+  if (configuration === "opted-out") reopened.config.setProjectConfigured("ENG", false);
   reopened.production.createProductionImplementationRunServices(input);
   const deps = captured.deps as ImplementationRunDependencies;
   const db = reopened.dedup.getDb();
@@ -984,4 +985,11 @@ it("dispatches synthetic roll-up review without fix instructions", async () => {
   expect(prepareGhaGapfillLaunch).toHaveBeenCalledWith(expect.objectContaining({
     reviewOnly: { reviewers: expect.arrayContaining([{ id: "integration-review", gates: true }]) },
   }));
+});
+
+it("replays a refused dispatch after skipping even when capacity becomes available", async () => {
+  vi.mocked(getCommentGapfillRefusal).mockReturnValue("at_capacity");
+  vi.mocked(getCommentGapfillItem).mockReturnValue({ status: "skipped", refusalCount: 3 } as never);
+  expect(await d.reserve(run)).toEqual({ ok: false, reason: "at_capacity" });
+  expect(acquire).not.toHaveBeenCalled();
 });

@@ -130,7 +130,7 @@ beforeEach(async () => {
       sessionData: JSON.stringify(makeChatGptPlanRecord({ subject: profileId, accessToken: ACCESS })) }).ok).toBe(true);
   }
   defaults();
-  profiles.setProjectOptIn("AII", true);
+  profiles.setProjectConfigured("AII", true);
   config.upsertMapping("AII", makeMapping({ owner: "acme", repo: "app", reviewFixLifecycle: "restate" }));
   attempts = new db.modules.attemptStore.SqliteReviewFixAttemptStore();
   const admitted = await attempts.admit({ scope: SCOPE, feedback: { taskText: "Fix the trusted review finding",
@@ -318,7 +318,7 @@ describe("production managed GHA review-fix launch", () => {
     expect((await first.worker.launch(first.plan)).status).toBe("accepted");
     const snapshotId = (await decode()).agentConfig!.snapshotId;
     defaults("other");
-    profiles.setProjectOptIn("AII", false);
+    profiles.setProjectConfigured("AII", false);
     const second = await launch();
     expect(await second.worker.launch(second.plan)).toEqual({ status: "unknown" });
     expect(sent).toHaveLength(1);
@@ -469,7 +469,7 @@ describe("production managed GHA review-fix launch", () => {
   });
 
   it.each([true, false])("preserves admitted legacy GHA attempts across a global Fly switch (private=%s)", async (privateCapable) => {
-    profiles.setProjectOptIn("AII", false);
+    profiles.setProjectConfigured("AII", false);
     vi.stubEnv("RUNNER_MODE", "fly");
     if (!privateCapable) workflow = workflow.replaceAll("private-run-config-v1", "unsupported-private");
     expect(await production.canAdmit(SCOPE, CONFIG)).toBe("defer");

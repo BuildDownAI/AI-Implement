@@ -65,7 +65,12 @@ const AGENT_PROVIDER = {
   bedrock: { agent: "claude", provider: "bedrock" },
   "openai-api-key": { agent: "codex", provider: "openai" },
   "codex-subscription": { agent: "codex", provider: "openai" },
-} as const satisfies Record<AccountAuthMode, Pick<AccountProfile, "agent" | "provider">>;
+} as const satisfies Record<Exclude<AccountAuthMode, "openrouter-api-key">, Pick<AccountProfile, "agent" | "provider">>;
+
+function agentProvider(authMode: AccountAuthMode) {
+  if (authMode === "openrouter-api-key") throw new Error("OpenRouter has no supported agent/provider combination");
+  return AGENT_PROVIDER[authMode];
+}
 
 function build(): ServerModule.ModelAuthHandlers {
   return server.createModelAuthHandlers(depsFrom());
@@ -90,7 +95,7 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     profileId: id,
     identity: "id",
     revision: b.profileRevision,
-    ...AGENT_PROVIDER[b.authMode],
+    ...agentProvider(b.authMode),
     authMode: b.authMode,
     status: "active" as const,
     ...profileOverrides[id],
@@ -121,7 +126,7 @@ function depsFrom(): ServerModule.ModelAuthHandlerDeps {
     getSnapshotSelection: (_s, profileId) => {
       if (profileId in selections) return selections[profileId];
       const authMode = all.find((b) => b.profileId === profileId)?.authMode ?? "openai-api-key";
-      return { provider: AGENT_PROVIDER[authMode].provider, revision: all.find((b) => b.profileId === profileId)?.profileRevision ?? 1, authMode };
+      return { provider: agentProvider(authMode).provider, revision: all.find((b) => b.profileId === profileId)?.profileRevision ?? 1, authMode };
     },
     credentials: {
       sessionStore,

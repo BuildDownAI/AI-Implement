@@ -45,6 +45,19 @@ describe("finishImplementationJob", () => {
     expect(deps.finalize).not.toHaveBeenCalled();
   });
 
+  describe.each(["run_ended", "deadline"] as const)("reported gap-fill failure after %s", kind => {
+    it.each([FAILURE, null])("preserves the failed row (failure=%s)", async failure => {
+      const job = makeJob({ phase: "gap-analysis", status: "failed", conclusion: "REVIEW_UNAPPROVED", prUrl: PR, failure });
+      const deps = { ...setup(job), neverStarted: vi.fn(async () => true) };
+      await finishImplementationJob(deps, "d", { kind });
+      expect(deps.closeRow).not.toHaveBeenCalled();
+      expect(deps.neverStarted).not.toHaveBeenCalled();
+      expect(deps.finalize).not.toHaveBeenCalled();
+      expect(deps.remediateStuck).not.toHaveBeenCalled();
+      expect(job).toMatchObject({ status: "failed", conclusion: "REVIEW_UNAPPROVED", failure });
+    });
+  });
+
   it("callback failure with no PR runs the failure fix-up", async () => {
     const deps = setup(makeJob({ status: "failed", failure: FAILURE, failureCommentedAt: 1, conclusion: "boom", prUrl: null }));
     await finishImplementationJob(deps, "d", { kind: "run_ended" });
@@ -112,5 +125,63 @@ describe("finishImplementationJob", () => {
     const deps = setup(null);
     expect(await finishImplementationJob(deps, "d", { kind: "run_ended" })).toEqual({});
     expect(deps.finalize).not.toHaveBeenCalled();
+  });
+});
+
+describe("never-started diagnostic", () => {
+  it("retains inferred grouping-parent no_work when the machine started", async () => {
+    const job = makeJob({ status: "running", groupingParent: true });
+    const deps = { ...setup(job), neverStarted: vi.fn(async () => false) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.neverStarted).toHaveBeenCalledExactlyOnceWith(job);
+    expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "no_work" }, job);
+  });
+
+  it.each([
+    { approved: true, conclusion: "runner_approved", prUrl: PR },
+    { failure: FAILURE, conclusion: "boom" },
+    { conclusion: "external_review_pending", prUrl: PR },
+    { conclusion: "rollup_review", prUrl: PR },
+    { status: "failed" as const, conclusion: "operator_cancelled" },
+  ])("preserves explicit $conclusion over the diagnostic", async callback => {
+    const job = makeJob({ status: "running", groupingParent: true, ...callback });
+    const deps = { ...setup(job), neverStarted: vi.fn(async () => true) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.neverStarted).not.toHaveBeenCalled();
+    expect(deps.closeRow).not.toHaveBeenCalledWith(job, "failed", "fly_machine_never_started", expect.anything());
+    if (callback.conclusion === "boom") {
+      expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion: "boom" }, job);
+    } else {
+      expect(deps.finalize).not.toHaveBeenCalled();
+    }
+  });
+
+  it("fails a never-started grouping parent instead of finalizing no_work", async () => {
+    const job = makeJob({ status: "running", groupingParent: true, prUrl: null });
+    const deps = { ...setup(job), neverStarted: vi.fn(async () => true) };
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.closeRow).toHaveBeenCalledExactlyOnceWith(job, "failed", "fly_machine_never_started", { skipAdmissionRelease: true });
+    expect(deps.finalize).toHaveBeenCalledExactlyOnceWith({ kind: "failed", conclusion: "fly_machine_never_started" }, job);
+    expect(deps.finalize).not.toHaveBeenCalledWith({ kind: "no_work" }, expect.anything());
+  });
+
+  it.each([
+    { value: true, groupingParent: false },
+    { value: false, groupingParent: false },
+    { value: true, groupingParent: true },
+  ])("preserves the conclusion on retry ($value, groupingParent=$groupingParent)", async ({ value, groupingParent }) => {
+    const job = makeJob({ status: "running", groupingParent });
+    const deps: ImplementationFinishDependencies = {
+      ...setup(job),
+      neverStarted: vi.fn(async () => value),
+      closeRow: vi.fn((row, status, conclusion) => { Object.assign(row, { status, conclusion }); }),
+    };
+    const conclusion = value ? "fly_machine_never_started" : "ended_without_callback";
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.closeRow).toHaveBeenCalledWith(job, "failed", conclusion, { skipAdmissionRelease: true });
+    await finishImplementationJob(deps, "d", { kind: "run_ended" });
+    expect(deps.neverStarted).toHaveBeenCalledTimes(1);
+    expect(deps.finalize).toHaveBeenNthCalledWith(2, { kind: "failed", conclusion }, job);
+    expect(job.conclusion).toBe(conclusion);
   });
 });

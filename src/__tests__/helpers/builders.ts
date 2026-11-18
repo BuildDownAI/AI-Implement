@@ -31,6 +31,7 @@ export function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxInProgressAiIssues: 3,
     executionMode: "github-actions",
     sessionMode: "autonomous",
+    machineCpuKind: "shared",
     machineCpus: 2,
     machineMemoryMb: 4096,
     planningEnabled: false,
@@ -425,4 +426,14 @@ export function makeAccessEntry(overrides: Partial<AccessEntry> = {}): AccessEnt
     addedBy: "admin@example.com",
     ...overrides,
   };
+}
+
+/** A complete configured defaults row backed by one compatible account profile. */
+export function makeStageAgentDefaults(): import("../../agent-config.js").StageAgentConfigurationV1 {
+  const stage = { agent: "claude", provider: "anthropic", model: "test-model", accountProfileId: "health-test", invocationTimeoutMs: 60_000 } as const;
+  return { version: 1, mode: "configured", stages: { planning: stage, implementation: stage, review: stage } };
+}
+
+export function makeStageAgentProfile(): import("../../agent-config-store.js").SaveAccountProfileRevisionInput {
+  return { profileId: "health-test", identity: "Health Test", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" };
 }

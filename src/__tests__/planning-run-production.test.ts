@@ -1,3 +1,4 @@
+import { FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,7 +27,7 @@ vi.mock("../log.js", () => ({
   recordGhaRunCompleted: vi.fn(),
 }));
 vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
-vi.mock("../fly-machines.js", () => ({ getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
+vi.mock("../fly-machines.js", () => ({ machineNeverStarted: vi.fn().mockReturnValue(false), getMachine: vi.fn(), destroyMachine: vi.fn(), listMachines: vi.fn() }));
 vi.mock("../local-docker.js", () => ({ inspectLocalContainer: vi.fn(), stopLocalContainer: vi.fn(), findLocalContainerIdByName: vi.fn(), removeLocalContainer: vi.fn() }));
 vi.mock("../stuck-watchdog.js", () => ({ remediateFailedJob: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../dispatch-admission.js", () => ({
@@ -42,7 +43,7 @@ import { getJobByDispatchId, markJobFailureCommented, updateJobRunId, updateJobS
 import { parkIssue } from "../dispatch-breaker.js";
 import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
 import { remediateFailedJob } from "../stuck-watchdog.js";
-import { destroyMachine, getMachine, listMachines } from "../fly-machines.js";
+import { destroyMachine, getMachine, listMachines, machineNeverStarted } from "../fly-machines.js";
 import { findLocalContainerIdByName, inspectLocalContainer, removeLocalContainer, stopLocalContainer } from "../local-docker.js";
 import { planningSessionName } from "../planning-launch.js";
 import {
@@ -451,6 +452,27 @@ describe("production deps", () => {
 
   describe("finishJob", () => {
     const row = { id: 7, issueId: "i-1", teamKey: "ENG", dispatchId: "d-1", status: "dispatched", conclusion: null };
+
+    it.each(["never-started", "started", "timeout", "read-error", "deadline"])("keeps planning semantics for %s", async scenario => {
+      vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, executionMode: "fly-machines", machineId: "m-1" } as never);
+      vi.mocked(machineNeverStarted).mockReturnValue(scenario === "never-started");
+      vi.mocked(getMachine).mockResolvedValue({ id: "m-1" } as never);
+      if (scenario === "timeout") vi.mocked(getMachine).mockRejectedValueOnce(new DOMException("Timed out", "AbortError"));
+      if (scenario === "read-error") vi.mocked(getMachine).mockRejectedValueOnce(new Error("unreadable"));
+      const { d } = compose();
+      await d.finishJob("d-1", { kind: scenario === "deadline" ? "deadline" : "run_ended" });
+      const conclusion = scenario === "deadline" ? "deadline_exceeded" : "ended_without_callback";
+      expect(updateJobStatus).toHaveBeenCalledWith(7, scenario === "deadline" ? "timed_out" : "failed", conclusion);
+      expect(parkIssue).toHaveBeenCalledWith("i-1", "planning", conclusion);
+      if (scenario === "deadline") expect(getMachine).not.toHaveBeenCalled();
+      else expect(getMachine).toHaveBeenCalledWith("fly-token", "fly-app", "m-1", 10_000);
+      const cause = scenario === "never-started" ? "Fly removed the machine before it started" :
+        scenario === "deadline" ? "the run deadline passed before a planning result arrived" : "the run ended with no planning result";
+      expect(provider.markPlanningFailed).toHaveBeenCalledWith("i-1", "ENG",
+        cause + ". The issue is parked and will not be retried by itself. " +
+        (scenario === "never-started" ? FLY_MACHINE_NEVER_STARTED_REMEDIATION + " " : "") +
+        "Next: press Unpark at /admin#runners, then set the status to `Ready` (Jira) or keep the AI-Implement label (Linear).");
+    });
 
     it("does nothing for a row the callback already closed", async () => {
       vi.mocked(getJobByDispatchId).mockReturnValue({ ...row, status: "completed" } as never);

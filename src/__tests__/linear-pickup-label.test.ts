@@ -55,6 +55,7 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
     expect(body.variables.label).toBe("AI-Implement");
     expect(body.query).toContain("$label: String!");
     expect(body.query).not.toContain('"AI-Implement"');
+    expect(body.query).toContain('nin: ["completed", "canceled", "duplicate"]');
   });
 
   it("sends the stored label as the variable once set", async () => {
@@ -137,6 +138,32 @@ describe("LinearProvider.fetchAIImplementSnapshot — pickup label", () => {
 
     // No child carries the configured label, so the parent is a waiting parent — skipped.
     expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+    expect(snap.parentsToFinalize).toEqual([]);
+  });
+
+  it.each([false, true])("dispatches closing work with a duplicate child (designated: %s)", async (designated) => {
+    settings.setOrchestratorSetting("linearPickupLabel", "AI Implement - New");
+    linearAnswers({ issues: {
+      nodes: [{
+        id: "parent", identifier: "ENG-1", title: "Closing work",
+        description: "Closing work spec.", team: { id: "team-id", key: "ENG" },
+        state: { id: "s", name: "Todo", type: "unstarted" },
+        labels: { nodes: [{ name: "AI Implement - New" }] },
+        inverseRelations: { nodes: [] }, parent: null,
+        children: { nodes: [
+          { identifier: "ENG-2", state: { type: "completed" }, labels: { nodes: [{ name: "AI Implement - New" }] } },
+          { identifier: "ENG-3", state: { type: "completed" }, labels: { nodes: [{ name: "AI Implement - New" }] } },
+          { identifier: "ENG-4", state: { type: "duplicate" }, labels: { nodes: designated ? [{ name: "AI Implement - New" }] : [] } },
+        ] },
+      }], pageInfo: { hasNextPage: false, endCursor: null },
+    } });
+
+    const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning).toEqual([expect.objectContaining({
+      id: "parent", featureBranchChain: [{ identifier: "ENG-1", mode: "feature" }],
+    })]);
     expect(snap.readyForImplementation).toEqual([]);
     expect(snap.parentsToFinalize).toEqual([]);
   });
@@ -300,5 +327,53 @@ describe("LinearProvider.fetchFeatureNodeRollUps — parked child", () => {
     }] } });
     const p = new LinearProvider({});
     expect(await p.fetchFeatureNodeRollUps()).toEqual([]);
+  });
+});
+
+
+describe("LinearProvider — duplicate terminal state", () => {
+  it("allows pickup when the blocker is a duplicate", async () => {
+    linearAnswers({ issues: { nodes: [{
+      id: "leaf", identifier: "ENG-2", title: "Work", description: "Spec",
+      team: { id: "team-id", key: "ENG" },
+      state: { name: "Todo", type: "unstarted" },
+      labels: { nodes: [{ name: "AI-Implement" }] },
+      inverseRelations: { nodes: [{ type: "blocks", issue: { state: { type: "duplicate" } } }] },
+      children: { nodes: [] }, parent: null,
+    }], pageInfo: { hasNextPage: false, endCursor: null } } });
+    const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+    expect(snap.needsPlanning.map((issue) => issue.id)).toEqual(["leaf"]);
+  });
+
+  it("allows a roll-up with a designated duplicate child", async () => {
+    linearAnswers({ issues: { nodes: [{
+      id: "parent", identifier: "ENG-1", description: null, team: { key: "ENG" },
+      children: { nodes: [{ identifier: "ENG-2", state: { type: "duplicate" }, labels: { nodes: [{ name: "AI-Implement" }] } }] },
+      parent: null,
+    }] } });
+    expect(await new LinearProvider({}).fetchFeatureNodeRollUps()).toEqual([
+      expect.objectContaining({ issueId: "parent", childIdentifiers: ["ENG-2"] }),
+    ]);
+  });
+
+  it("maps duplicate to cancelled while preserving other lifecycles", async () => {
+    linearAnswers({ issues: { nodes: [
+      { id: "duplicate", state: { type: "duplicate" } },
+      { id: "done", state: { type: "completed" } },
+      { id: "cancel", state: { type: "canceled" } },
+      { id: "active", state: { type: "started" } },
+    ] } });
+    expect(await new LinearProvider({}).fetchLifecycleStates(["duplicate", "done", "cancel", "active"]))
+      .toEqual(new Map([["duplicate", "cancelled"], ["done", "completed"], ["cancel", "cancelled"], ["active", "active"]]));
+  });
+
+  it("does not mutate a duplicate when marking merged or parking for a human", async () => {
+    const issue = { state: { type: "duplicate" }, team: { key: "ENG" }, labels: { nodes: [] } };
+    linearAnswers({ issue }, { issue });
+    const p = new LinearProvider({});
+    await p.markMerged("duplicate", "ENG");
+    expect(await p.parkForHuman("duplicate", "ENG", "implementation")).toBe(false);
+    expect(fake.calls).toHaveLength(2);
+    for (const call of fake.calls) expect(JSON.parse(call.body).query).not.toContain("mutation");
   });
 });

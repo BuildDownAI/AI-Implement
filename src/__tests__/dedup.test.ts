@@ -905,3 +905,83 @@ describe("useReadOnlyDb", () => {
     expect(() => dedup.useReadOnlyDb()).toThrow("useReadOnlyDb() must run before the database is opened");
   });
 });
+
+describe("OpenRouter database constraints", () => {
+  const tables = ["model_account_profile_revisions", "model_invocation_attribution"];
+  function insertProfile(db: Database.Database, id: string, provider = "openrouter", auth = "openrouter-api-key") {
+    db.prepare(`INSERT INTO model_account_profile_revisions VALUES (?, 1, 'claude', ?, ?, 'Account', 123, '{"legacy":true}')`)
+      .run(id, provider, auth);
+  }
+  function insertInvocation(db: Database.Database, id: string, provider = "openrouter") {
+    db.prepare(`INSERT INTO model_invocation_attribution VALUES
+      (?, 'dispatch-old', 'implementation', 'profile-old', 1, 'claude', ?, 'model', 'openrouter-api-key',
+       NULL, 'snapshot-old', 'succeeded', 123, NULL, '{"tokens":42}')`).run(id, provider);
+  }
+  function checkConstraints(db: Database.Database, suffix: string) {
+    insertProfile(db, `profile-${suffix}`);
+    insertInvocation(db, `invocation-${suffix}`);
+    expect(() => insertProfile(db, 'bad-provider', 'unknown')).toThrow(/CHECK/);
+    expect(() => insertProfile(db, 'bad-auth', 'openrouter', 'unknown')).toThrow(/CHECK/);
+    expect(() => insertInvocation(db, 'bad-provider', 'unknown')).toThrow(/CHECK/);
+    expect(() => insertProfile(db, `profile-${suffix}`)).toThrow(/UNIQUE/);
+    expect(() => insertInvocation(db, `invocation-${suffix}`)).toThrow(/UNIQUE/);
+    expect(() => db.exec("UPDATE model_account_profile_revisions SET display_name = 'changed'"))
+      .toThrow(/model account profile revisions are immutable/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET stage = 'unknown'" )).toThrow(/CHECK/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET profile_revision = 0" )).toThrow(/CHECK/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET agent = 'unknown'" )).toThrow(/CHECK/);
+    expect(() => db.exec("UPDATE model_invocation_attribution SET status = 'unknown'" )).toThrow(/CHECK/);
+  }
+
+  it("accepts OpenRouter on a fresh database while retaining constraints", () => {
+    checkConstraints(dedup.getDb(), 'fresh');
+  });
+
+  it.each([false, true])("upgrades old tables twice with rows and accounting triggers (mixed schema: %s)", async (mixed) => {
+    // Derive the legacy CHECK lists, retaining all the other production columns and constraints.
+    const db = dedup.getDb();
+    const { initLogTable } = await import("../log.js");
+    initLogTable();
+    const schemas = tables.map((table) => (db.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(table) as { sql: string }).sql);
+    dedup.closeDb();
+    const old = new Database(dbPath);
+    // Simulate the pre-upgrade tables, including the existing accounting/prune triggers.
+    old.exec("DROP TRIGGER trg_dispatch_log_pruned");
+    for (const [i, table] of tables.entries()) {
+      old.exec(`DROP TABLE ${table}`);
+      old.exec(mixed && i === 0 ? schemas[i]! : schemas[i]!.replace(", 'openrouter'", "").replace(", 'openrouter-api-key'", ""));
+    }
+    insertProfile(old, 'profile-old', 'anthropic', 'anthropic-api-key');
+    insertInvocation(old, 'invocation-old', 'anthropic');
+    const rows = tables.map((table) => old.prepare(`SELECT * FROM ${table}`).all());
+    old.close();
+    // Initialize the old accounting triggers without running getDb's migration yet.
+    const raw = new Database(dbPath);
+    raw.exec(`CREATE TRIGGER trg_invocation_attribution_changed_at AFTER INSERT ON model_invocation_attribution
+      BEGIN UPDATE dispatch_log SET changed_at = 999 WHERE dispatch_id = NEW.dispatch_id; END`);
+    raw.exec(`CREATE TRIGGER trg_dispatch_log_pruned AFTER DELETE ON dispatch_log
+      BEGIN DELETE FROM model_invocation_attribution WHERE dispatch_id = OLD.dispatch_id; END`);
+    raw.exec(`INSERT INTO dispatch_log (issue_id, dispatched_at, dispatch_id, changed_at)
+      VALUES ('issue-old', 123, 'dispatch-old', 1)`);
+    raw.close();
+
+    for (let boot = 0; boot < 2; boot++) {
+      const upgraded = dedup.getDb();
+      tables.forEach((table, i) => {
+        expect(upgraded.prepare(`SELECT * FROM ${table} WHERE ${i === 0 ? 'profile_id' : 'invocation_id'} = ?`)
+          .all(i === 0 ? 'profile-old' : 'invocation-old')).toEqual(rows[i]);
+      });
+      expect(upgraded.prepare("SELECT changed_at FROM dispatch_log").get()).toEqual({ changed_at: boot === 0 ? 1 : 2 });
+      initLogTable();
+      checkConstraints(upgraded, `boot-${boot}`);
+      expect((upgraded.prepare("SELECT changed_at FROM dispatch_log").get() as { changed_at: number }).changed_at).toBeGreaterThan(2);
+      expect(upgraded.prepare("SELECT name FROM pragma_index_info('idx_model_invocation_attribution_dispatch') ORDER BY seqno").all())
+        .toEqual([{ name: 'dispatch_id' }, { name: 'stage' }]);
+      upgraded.exec("UPDATE dispatch_log SET changed_at = 2");
+      const version = upgraded.pragma('schema_version', { simple: true });
+      dedup.closeDb();
+      expect(dedup.getDb().pragma('schema_version', { simple: true })).toBe(version);
+      dedup.closeDb();
+    }
+  });
+});

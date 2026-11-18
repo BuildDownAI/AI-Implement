@@ -99,7 +99,7 @@ describe("models page stage defaults", () => {
     const select = field("review", "accountProfileId") as unknown as HTMLSelectElement;
     expect(select.options[2].textContent).toBe("gpt (p-gpt)");
     expect(document.getElementById("mp-stage-card")!.textContent).toContain("same agent as the first account");
-    expect(document.getElementById("mp-stage-card")!.textContent).toContain("Agents tab runs without these fallbacks");
+    expect(document.getElementById("mp-stage-card")!.textContent).toContain("Agents tab uses these defaults as fallbacks after its project account");
   });
 
   for (const multiple of [false, true]) {

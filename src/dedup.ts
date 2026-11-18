@@ -164,6 +164,34 @@ function ensureRunnerTokensTable(): void {
   createRunnerTokensTable();
 }
 
+// CHECK constraints cannot be altered in place. Each table upgrades independently and atomically.
+function ensureOpenRouterTable(createSql: string, table: string, columns: string, objectSql: string): void {
+  if (!db) return;
+  const connection = db;
+  connection.exec(createSql);
+  const stored = connection.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(table) as { sql: string };
+  if (!stored.sql.includes("openrouter")) {
+    connection.transaction(() => {
+      connection.exec(createSql.replace(`IF NOT EXISTS ${table}`, `${table}_new`));
+      connection.exec(`INSERT INTO ${table}_new (${columns}) SELECT ${columns} FROM ${table}`);
+      // SQLite validates other tables' triggers during RENAME. Preserve the prune trigger,
+      // whose DELETE references attribution, while that table is temporarily absent.
+      const pruneTrigger = table === "model_invocation_attribution"
+        ? connection.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_dispatch_log_pruned'")
+          .get() as { sql: string } | undefined
+        : undefined;
+      if (pruneTrigger) connection.exec("DROP TRIGGER trg_dispatch_log_pruned");
+      connection.exec(`DROP TABLE ${table}`);
+      connection.exec(`ALTER TABLE ${table}_new RENAME TO ${table}`);
+      connection.exec(objectSql);
+      if (pruneTrigger) connection.exec(pruneTrigger.sql);
+    })();
+  } else {
+    connection.exec(objectSql);
+  }
+}
+
 function createAgentConfigurationTables(): void {
   if (!db) return;
   db.exec(`
@@ -176,7 +204,11 @@ function createAgentConfigurationTables(): void {
       CHECK (status IN ('active', 'disabled', 'archived'))
     )
   `);
-  db.exec(`
+  const immutableProfileTriggerSql = `CREATE TRIGGER IF NOT EXISTS trg_model_account_profile_revisions_immutable
+    BEFORE UPDATE ON model_account_profile_revisions
+    BEGIN SELECT RAISE(ABORT, 'model account profile revisions are immutable'); END`;
+  ensureOpenRouterTable(
+    `
     CREATE TABLE IF NOT EXISTS model_account_profile_revisions (
       profile_id TEXT NOT NULL,
       profile_revision INTEGER NOT NULL CHECK (profile_revision > 0),
@@ -188,13 +220,14 @@ function createAgentConfigurationTables(): void {
       metadata_json TEXT NOT NULL DEFAULT '{}',
       PRIMARY KEY (profile_id, profile_revision),
       CHECK (agent IN ('claude', 'codex')),
-      CHECK (provider IN ('anthropic', 'bedrock', 'openai')),
-      CHECK (auth_mode IN ('anthropic-api-key', 'claude-subscription', 'bedrock', 'openai-api-key', 'codex-subscription'))
+      CHECK (provider IN ('anthropic', 'bedrock', 'openai', 'openrouter')),
+      CHECK (auth_mode IN ('anthropic-api-key', 'claude-subscription', 'bedrock', 'openai-api-key', 'codex-subscription', 'openrouter-api-key'))
     )
-  `);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_model_account_profile_revisions_immutable
-    BEFORE UPDATE ON model_account_profile_revisions
-    BEGIN SELECT RAISE(ABORT, 'model account profile revisions are immutable'); END`);
+  `,
+    "model_account_profile_revisions",
+    "profile_id, profile_revision, agent, provider, auth_mode, display_name, created_at, metadata_json",
+    immutableProfileTriggerSql,
+  );
   db.exec(`
     CREATE TABLE IF NOT EXISTS stage_agent_config_revisions (
       config_revision_id TEXT PRIMARY KEY,
@@ -304,7 +337,10 @@ function createAgentConfigurationTables(): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_model_credential_grants_dispatch
     ON model_credential_grants(dispatch_id)`);
-  db.exec(`
+  const invocationDispatchIndexSql = `CREATE INDEX IF NOT EXISTS idx_model_invocation_attribution_dispatch
+    ON model_invocation_attribution(dispatch_id, stage)`;
+  ensureOpenRouterTable(
+    `
     CREATE TABLE IF NOT EXISTS model_invocation_attribution (
       invocation_id TEXT PRIMARY KEY,
       dispatch_id TEXT NOT NULL,
@@ -323,12 +359,14 @@ function createAgentConfigurationTables(): void {
       usage_json TEXT NOT NULL DEFAULT '{}',
       CHECK (stage IN ('planning', 'implementation', 'review')),
       CHECK (agent IN ('claude', 'codex')),
-      CHECK (provider IN ('anthropic', 'bedrock', 'openai')),
+      CHECK (provider IN ('anthropic', 'bedrock', 'openai', 'openrouter')),
       CHECK (status IN ('started', 'succeeded', 'failed', 'timed_out', 'cancelled'))
     )
-  `);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_model_invocation_attribution_dispatch
-    ON model_invocation_attribution(dispatch_id, stage)`);
+  `,
+    "model_invocation_attribution",
+    "invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, config_revision_id, snapshot_id, status, started_at, completed_at, usage_json",
+    invocationDispatchIndexSql,
+  );
   // What the runner reported about one job beyond the single attribution (AII-1562, AII-1566): the SHAs it
   // pushed, oldest first, as a JSON array (null = not reported, '[]' = nothing pushed), and whether its
   // `invocations` list arrived whole (1 only when the result carried the list and none was dropped or unstored).
@@ -693,6 +731,18 @@ export function getDb(): Database.Database {
         processed_at INTEGER
       )
     `);
+    const gapfillColumns = new Set((db.prepare("PRAGMA table_info(comment_gapfill_queue)").all() as Array<{ name: string }>).map(c => c.name));
+    if (!gapfillColumns.has("refusal_count")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN refusal_count INTEGER NOT NULL DEFAULT 0");
+    if (!gapfillColumns.has("last_refusal_reason")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN last_refusal_reason TEXT");
+    if (!gapfillColumns.has("last_refusal_dispatch_id")) db.exec("ALTER TABLE comment_gapfill_queue ADD COLUMN last_refusal_dispatch_id TEXT");
+    db.exec(`CREATE TABLE IF NOT EXISTS comment_gapfill_refusals (
+      queue_item_id INTEGER NOT NULL, dispatch_id TEXT NOT NULL, reason TEXT NOT NULL,
+      PRIMARY KEY (queue_item_id, dispatch_id)
+    )`);
+    // Preserve the replay decision available from pre-ledger databases.
+    db.exec(`INSERT OR IGNORE INTO comment_gapfill_refusals
+      SELECT id, last_refusal_dispatch_id, last_refusal_reason FROM comment_gapfill_queue
+      WHERE last_refusal_dispatch_id IS NOT NULL AND last_refusal_reason IS NOT NULL`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_status ON comment_gapfill_queue(status, created_at)`);
     // PR #202 review (minor): countConflictAttempts / hasPendingConflictResolution /
     // markCommentGapfillRunTerminal all filter by repo+PR — give them an index.
