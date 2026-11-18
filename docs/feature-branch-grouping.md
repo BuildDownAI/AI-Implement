@@ -345,10 +345,13 @@ repositories without a mapping remain open for retry.
 ### A parent's own PR closed without merging (AII-1294)
 
 A feature-node parent never blocks its own roll-up. When the PR from the parent's own run
-(identified by durable `pull_request_link.grouping_parent` ownership and
-`job_dispatched_at`/`job_id` ordering, with `job_current` selecting a job's replacement PR) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
+(identified for finalization by `isCurrentGroupingParent`: durable
+`pull_request_link.grouping_parent` ownership and the current PR of the issue's newest job,
+using `job_dispatched_at`/`job_id` ordering with `job_current` selecting a job's replacement PR) is closed unmerged, the merge poll (`detectMergedPrs`) calls `markMerged` on the
 parent, then writes the tombstone. Ownership survives dispatch-history pruning and
-a later gap-fill report does not clear it. It skips this while a run for the issue is in flight
+a later gap-fill report does not clear it (`recordLinkJob` never clears the flag).
+Cancellation exempts every link with `groupingParent` set, current or superseded;
+only finalization requires current-PR identity. The poll skips finalization while a run for the issue is in flight
 (nothing is written; the next poll re-checks) and when the closed PR is not the issue's latest
 PR (tombstone only). If `markMerged` throws or no mapping resolves, no tombstone is written
 and the link stays open for the next poll to retry. Existing queue rows only repair the

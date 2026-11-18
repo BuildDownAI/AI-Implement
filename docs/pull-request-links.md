@@ -41,8 +41,12 @@ The unique key is (`tracker_kind`, `tracker_issue_id`). Metadata refreshes repla
 | `linked_at` | Time first linked |
 | `closed_at` | Nullable time terminal outcome was recorded |
 | `cancel_checked_at` | Nullable time cancellation decision completed |
+| `grouping_parent` | Persistent grouping-parent ownership flag; defaults to 0 and is never cleared by `recordLinkJob` |
+| `job_dispatched_at` | Nullable dispatch time of the newest job associated with this implementation link |
+| `job_id` | Nullable ID of that job; breaks dispatch-time ties |
+| `job_current` | Whether this is that job's current PR association; defaults to 1, cleared when a replacement PR is reported |
 
-The unique key is (`repository`, `number`). `linkPullRequest` writes both rows transactionally. An existing PR keeps its original issue, role, source, URL and linked time; subsequent writes only fill missing branch refs. A conflicting issue association logs a warning. Existing databases gain `cancel_checked_at` on initialization.
+The unique key is (`repository`, `number`). `linkPullRequest` writes both rows transactionally. An existing PR keeps its original issue, role, source, URL and linked time; subsequent writes only fill missing branch refs. A conflicting issue association logs a warning. Existing databases gain `cancel_checked_at`, `grouping_parent`, `job_dispatched_at`, `job_id` and `job_current` on initialization.
 
 ## Writers and recovery
 
@@ -89,7 +93,7 @@ flowchart TD
 
 ## Cancellation after an unmerged close
 
-After outcome detection, `detectMergedPrs` walks `listUncheckedClosedLinks`. Cancellation applies to implementation links only, when there is no other open link for the same tracker issue and no run in flight. Roll-ups are exempt. A durable link identifying the issue's latest PR as a grouping-parent PR is also exempt: its existing finalization path calls `markMerged` before tombstoning, deferring while a run is in flight or finalization fails.
+After outcome detection, `detectMergedPrs` walks `listUncheckedClosedLinks`. Cancellation applies to implementation links only, when there is no other open link for the same tracker issue and no run in flight. Roll-ups are exempt. Every link with `groupingParent` set (`grouping_parent` in storage) is also exempt, whether current or superseded. `recordLinkJob` never clears that flag, including on later non-grouping gap-fill reports. Only finalization (`isCurrentGroupingParent`) requires the link to be the current pull request of the issue's newest job, selected by `job_dispatched_at`, `job_id` and `job_current`. That path calls `markMerged` before tombstoning, deferring while a run is in flight or finalization fails.
 
 Exempt links and links superseded by another open PR get `cancel_checked_at` immediately. An in-flight run defers the decision without setting it. Otherwise `src/index.ts` resolves the stored mapping and calls the provider's `markPrClosedUnmerged`. On a nonthrowing return (including a provider no-op), the poll removes the issue's `dispatched` dedup row and calls `setCancelCheckedAt`. Missing mappings and provider errors leave the decision unchecked for retry.
 
@@ -111,8 +115,9 @@ previous grouping flag on later gap-fill reports. `job_dispatched_at` and `job_i
 retain the newest dispatch ordering for each implementation link. `job_current`
 marks the latest PR association reported by that job, so replacement URLs do not
 tie with obsolete links. These columns are added on initialization; surviving
-job history resolves replacements during backfill. Finalization
-and cancellation use that ordering to identify the current PR after job pruning.
+job history resolves replacements during backfill. Only finalization uses that
+ordering (`job_dispatched_at`, `job_id`, `job_current`) to identify the current PR
+after job pruning; cancellation exempts every link with `grouping_parent` set.
 Backfill enriches existing links only for the same tracker issue, preserving their
 metadata and role. Already-pruned grouping history cannot be reconstructed.
 
