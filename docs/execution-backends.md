@@ -126,9 +126,10 @@ recovery.
 
 Fly implementation, planning, gap-fill and review-fix runs use the project's
 `machineCpus`, `machineMemoryMb` and `machineCpuKind`. Defaults are 2 CPUs,
-4096 MB and `shared`. Until the project drawer gains a CPU-kind selector, set
-the kind through `add_project` or the mapping API. Omitting the kind on an
-existing project's save preserves its stored value; new projects default to shared.
+4096 MB and `shared`. On `/admin#projects`, the project drawer's Execution tab
+and the New project stepper's Execution step have a **CPU kind** select beside
+CPUs and Memory. The kind can also be set through `add_project` or the mapping API.
+Omitting the kind on an existing project's save preserves its stored value; new projects default to shared.
 
 The mapping API accepts `shared` and `performance` only. Shared machines retain
 the existing rules: a positive integer CPU count and integer memory of at least
