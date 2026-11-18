@@ -32,43 +32,31 @@ export function appendExcludePaths(workspaceDir: string, paths: string[]): void 
   }
 }
 
+/** Remove scratch from the index, preserving files on disk. Fail closed on Git errors. */
+export function removeScratchFromIndex(
+  workspaceDir: string,
+  gitSpawn = (args: string[]): { exitCode: number | null; stderr?: string; stdout: string } => {
+    const result = spawnSync("git", args, { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] });
+    return { exitCode: result.status, stdout: result.stdout?.toString() ?? "", stderr: result.stderr?.toString() ?? "" };
+  },
+): void {
+  for (const p of SCRATCH_PATHS) {
+    const pathspec = p.replace(/\/$/, "");
+    const result = gitSpawn(["rm", "-r", "--cached", "--ignore-unmatch", pathspec]);
+    if (result.exitCode !== 0) {
+      throw new Error(`[scratch-exclude] git rm --cached ${pathspec} failed (exit ${result.exitCode ?? "null"}): ${result.stderr?.trim() || result.stdout.trim()}`);
+    }
+  }
+}
+
 /**
- * Make orchestrator scratch paths uncommittable in a freshly-prepared workspace.
- *
- * Two deterministic guards, applied once after the working tree exists so every
- * downstream `git add -A` (initial push, post-push review/fix loop, gap-fill)
- * honors them without per-call-site changes:
- *
- *  1. Seed the repo-local `.git/info/exclude` (never committed; unlike the target
- *     repo's `.gitignore` it doesn't mutate their tree) so untracked scratch
- *     files are never staged.
- *  2. Untrack any scratch path a previous run already committed to the branch
- *     (`git rm --cached`), self-healing branches that leaked it before this fix.
- *
- * Idempotent: safe to call on every run, including incremental re-use of a
- * workspace.
+ * Exclude untracked scratch and untrack scratch leaked by prior runs.
+ * Safe to repeat. Commit paths must also remove scratch after staging, because
+ * excludes do not protect files an agent force-adds to the index later.
  */
 export function prepareScratchExclusion(workspaceDir: string): void {
   appendExcludePaths(workspaceDir, [...SCRATCH_PATHS]);
-
-  // Untrack scratch paths a prior run committed; `--ignore-unmatch` makes this a
-  // no-op when nothing matches, so it's safe to run unconditionally. A non-zero
-  // exit means a real failure (bad repo state, wrong cwd) left the files tracked
-  // — non-fatal (the exclude above still blocks re-staging) but never silent.
-  for (const p of SCRATCH_PATHS) {
-    const pathspec = p.replace(/\/$/, "");
-    const result = spawnSync("git", ["rm", "-r", "--cached", "--ignore-unmatch", pathspec], {
-      cwd: workspaceDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    if (result.status !== 0) {
-      const stderr = (result.stderr?.toString() ?? "").trim();
-      console.warn(
-        `[scratch-exclude] git rm --cached ${pathspec} exited ${result.status ?? "null"}; ` +
-          `previously-committed files may remain tracked: ${stderr}`,
-      );
-    }
-  }
+  removeScratchFromIndex(workspaceDir);
 }
 
 /** Apply scratch exclusion only when workspaceDir is a Git repository root. */

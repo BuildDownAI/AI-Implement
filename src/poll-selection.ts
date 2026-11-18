@@ -1,14 +1,15 @@
 import type { RepoMapping } from "./config.js";
-import type { AIImplementSnapshot, TicketIssue } from "./providers/types.js";
+import type { AIImplementSnapshot, TicketIssue, TicketingProvider } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { parsePlanningBlock } from "./planning-block.js";
+import type { DispatchBlockReason } from "./dispatch-gate.js";
 
 export interface Blocker {
   issueId: string;
   issueIdentifier: string;
   issueTitle: string;
   teamKey: string;
-  reason: "no-mapping" | "dedup" | "concurrency" | "file-overlap";
+  reason: "no-mapping" | "dedup" | "concurrency" | "file-overlap" | "parked";
   detail: string;
 }
 
@@ -59,6 +60,64 @@ export function resolveInFlightSiblings(inFlightIds: Iterable<string>): TicketIs
   return [...inFlightIds]
     .map((id) => seenCandidatesById.get(id))
     .filter((i): i is TicketIssue => Boolean(i));
+}
+
+// The last dispatch-gate reason the poll logged for each blocked candidate, so a skip is
+// logged when it starts or changes rather than on every cycle.
+const lastSkipReasons = new Map<string, { identifier: string; reason: DispatchBlockReason }>();
+
+export interface SkipCandidate {
+  id: string;
+  identifier: string;
+  /** Phase the candidate would run next. */
+  phase: "planning" | "implementation";
+  /** This cycle's gate reason; null when the candidate is not blocked. */
+  reason: DispatchBlockReason | null;
+  /** Failure count behind a `parked` reason. */
+  failures?: number;
+}
+
+/** Log lines for candidates whose skip reason is new or changed, or that are no longer blocked.
+ *  Updates `last` in place; ids absent from `candidates` (left the snapshot) are dropped silently,
+ *  unless `pruneAbsent` is false: a cycle missing a provider's snapshot cannot tell an issue that left from one it never fetched. */
+export function diffSkipReasons(
+  last: Map<string, { identifier: string; reason: DispatchBlockReason }>,
+  candidates: SkipCandidate[],
+  options: { pruneAbsent?: boolean } = {},
+): string[] {
+  const { pruneAbsent = true } = options;
+  const lines: string[] = [];
+  const present = new Set<string>();
+  for (const c of candidates) {
+    present.add(c.id);
+    const prev = last.get(c.id);
+    if (c.reason === null) {
+      if (prev) {
+        lines.push(`[poll] ${c.identifier} is no longer blocked`);
+        last.delete(c.id);
+      }
+      continue;
+    }
+    if (prev?.reason === c.reason) continue;
+    last.set(c.id, { identifier: c.identifier, reason: c.reason });
+    lines.push(
+      c.reason === "parked"
+        ? `[poll] Skipping ${c.identifier}: parked for ${c.phase} after ${c.failures ?? "?"} failed runs — unpark at /admin#runners`
+        : `[poll] Skipping ${c.identifier}: ${c.reason}`,
+    );
+  }
+  if (pruneAbsent) for (const id of [...last.keys()]) if (!present.has(id)) last.delete(id);
+  return lines;
+}
+
+/** Poll entry point: diff this cycle's reasons against the module-level map. */
+export function logSkipReasons(candidates: SkipCandidate[], options: { pruneAbsent?: boolean } = {}): string[] {
+  return diffSkipReasons(lastSkipReasons, candidates, options);
+}
+
+/** Test hook: clear the last-skip-reason map. */
+export function resetSkipReasons(): void {
+  lastSkipReasons.clear();
 }
 
 /** Test hook: clear the seen-candidates cache. */
@@ -227,6 +286,7 @@ export function selectBlockers(
   teamRepoMap: Record<string, RepoMapping>,
   reservedCountsByTeam: Record<string, number>,
   isAlreadyDispatched: (issueId: string) => boolean,
+  parkedFor: (issue: TicketIssue) => { failures: number } | null,
 ): Blocker[] {
   const blockers: Blocker[] = [];
   for (const issue of issues) {
@@ -240,6 +300,18 @@ export function selectBlockers(
         teamKey,
         reason: "no-mapping",
         detail: `No mapping for team ${teamKey}. Add one in Projects.`,
+      });
+      continue;
+    }
+    const parked = parkedFor(issue);
+    if (parked) {
+      blockers.push({
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        issueTitle: issue.title,
+        teamKey,
+        reason: "parked",
+        detail: `Parked after ${parked.failures} failed runs. Unpark it on the Runners page.`,
       });
       continue;
     }
@@ -333,6 +405,38 @@ export interface ForeignTrackerIssue {
   providerId: string;
   /** ticketingProvider of the mapping holding its key. */
   mappingProvider: string;
+}
+
+/** One provider's snapshot, kept with its provider so a caller can act on that provider's own entries. */
+export interface ProviderSnapshotEntry {
+  provider: TicketingProvider;
+  snapshot: AIImplementSnapshot;
+}
+
+/** A provider whose snapshot rejected this cycle: its issues sit out, and nothing reads them as gone. */
+export interface FailedProvider {
+  providerId: string;
+  error: unknown;
+}
+
+/** Every provider's snapshot and their merge, shared by the poll and the admin pages.
+ *  A provider whose snapshot rejects is reported in `failed` instead of failing the rest. */
+export async function fetchProviderSnapshots(
+  providers: TicketingProvider[],
+  mappings: Record<string, RepoMapping>,
+): Promise<{ entries: ProviderSnapshotEntry[]; snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[]; failed: FailedProvider[] }> {
+  const settled = await Promise.allSettled(providers.map((p) => p.fetchAIImplementSnapshot()));
+  const entries: ProviderSnapshotEntry[] = [];
+  const failed: FailedProvider[] = [];
+  settled.forEach((result, i) => {
+    if (result.status === "fulfilled") entries.push({ provider: providers[i], snapshot: result.value });
+    else failed.push({ providerId: providers[i].id, error: result.reason });
+  });
+  const { snapshot, foreign } = mergeProviderSnapshots(
+    entries.map((e) => ({ providerId: e.provider.id, snapshot: e.snapshot })),
+    mappings,
+  );
+  return { entries, snapshot, foreign, failed };
 }
 
 /** Merge per-provider snapshots, dropping every entry whose scopeKey belongs to another tracker's mapping. */

@@ -1,0 +1,528 @@
+import { describe, it, expect, vi } from "vitest";
+import { aggregateUsage, normalizeInvocation, summarizeInvocations, toRecordedUsage } from "../agent-usage.js";
+import type { ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { INVOCATION_RECORDS_MAX, type InvocationAttributionV1, type RunTelemetry } from "../pipeline/types.js";
+
+const mk = (stage: string, agent: "claude" | "codex", provider: "anthropic" | "openai", authMode: string) => ({
+  sel: { agent, provider, model: `m-${stage}`, accountProfileId: `p-${stage}`, invocationTimeoutMs: 60_000 },
+  src: { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
+  prof: { id: `p-${stage}`, identity: "acct", revision: 2, agent, provider, authMode },
+});
+
+function snapshot(): ResolvedAgentSnapshotV1 {
+  const p = mk("planning", "claude", "anthropic", "anthropic-api-key");
+  const i = mk("implementation", "codex", "openai", "codex-subscription");
+  const r = mk("review", "codex", "openai", "openai-api-key");
+  return {
+    version: 1,
+    snapshotId: "snap-1",
+    configRevisions: {
+      orchestratorDefault: { configRevisionId: "r1", revision: 1 },
+      project: { configRevisionId: "r2", revision: 1 },
+    },
+    stages: { planning: p.sel, implementation: i.sel, review: r.sel },
+    sources: { planning: p.src, implementation: i.src, review: r.src },
+    profiles: { planning: p.prof, implementation: i.prof, review: r.prof },
+  } as unknown as ResolvedAgentSnapshotV1;
+}
+
+const snap = snapshot();
+
+function claim(stage: "planning" | "implementation" | "review", over: Partial<InvocationAttributionV1> = {}): InvocationAttributionV1 {
+  const s = snap.stages[stage];
+  return {
+    version: 1,
+    invocationId: `inv-${stage}`,
+    stage,
+    snapshotId: "snap-1",
+    agent: s.agent,
+    provider: s.provider,
+    model: s.model,
+    profileId: snap.profiles[stage].id,
+    authMode: snap.profiles[stage].authMode,
+    limit: null,
+    outcome: "success",
+    usage: { availability: "complete", tokensIn: 100, tokensOut: 10, costUsd: 0.5, costStatus: "reported" },
+    ...over,
+  };
+}
+
+const tel = (over: Partial<RunTelemetry> = {}): RunTelemetry => ({
+  outcome: "success", numTurns: 1, durationMs: 1, costUsd: null, tokensIn: null, tokensOut: null, ...over,
+});
+
+describe("normalizeInvocation", () => {
+  it("keeps per-row attribution for mixed Claude/Codex and API/subscription", () => {
+    const a = normalizeInvocation(snap, { attribution: claim("planning") })!;
+    const b = normalizeInvocation(snap, { attribution: claim("implementation", { usage: null }) })!;
+    expect([a.agent, a.provider, a.authMode, a.stage, a.profileId]).toEqual(["claude", "anthropic", "anthropic-api-key", "planning", "p-planning"]);
+    expect([b.agent, b.provider, b.authMode, b.stage, b.profileId]).toEqual(["codex", "openai", "codex-subscription", "implementation", "p-implementation"]);
+    const agg = aggregateUsage([a, b]);
+    expect(agg.rows).toHaveLength(2);
+    expect(agg.mixedAuth).toBe(true);
+  });
+
+  it("snapshot wins over disagreeing claims and flags them", () => {
+    const row = normalizeInvocation(snap, {
+      attribution: claim("review", { model: "evil", profileId: "repo-profile", agent: "claude", provider: "anthropic", authMode: "claude-subscription" }),
+    })!;
+    expect(row.model).toBe("m-review");
+    expect(row.profileId).toBe("p-review");
+    expect(row.authMode).toBe("openai-api-key");
+    expect(row.attribution).toBe("mismatch");
+    expect(row.mismatches).toEqual(["agent", "provider", "model", "profileId", "authMode"]);
+    expect(JSON.stringify(row)).not.toContain("evil");
+    expect(JSON.stringify(row)).not.toContain("repo-profile");
+  });
+
+  it("rejects a claim from another snapshot but keeps the observed outcome", () => {
+    const row = normalizeInvocation(snap, {
+      stage: "review",
+      attribution: claim("review", { snapshotId: "other" }),
+      telemetry: tel({ outcome: "error" }),
+    })!;
+    expect(row.attribution).toBe("rejected");
+    expect(row.outcome).toBe("error");
+    expect(row.usage.tokensIn).toBeNull();
+    expect(row.model).toBe("m-review");
+  });
+
+  it("drops malformed and credential-shaped attribution without throwing or echoing", () => {
+    const secret = "sk-abcdefghijklmnop";
+    const row = normalizeInvocation(snap, {
+      stage: "planning",
+      attribution: { ...claim("planning"), model: secret },
+      telemetry: tel({ outcome: "max_turns" }),
+    })!;
+    expect(row.attribution).toBe("rejected");
+    expect(row.outcome).toBe("max_turns");
+    expect(JSON.stringify(row)).not.toContain(secret);
+    expect(normalizeInvocation(snap, { stage: "planning", attribution: 42 })!.attribution).toBe("rejected");
+  });
+
+  it("prefers telemetry over claimed usage and flags disagreement", () => {
+    const row = normalizeInvocation(snap, {
+      attribution: claim("review"),
+      telemetry: tel({ tokensIn: 200, tokensOut: 20, costUsd: 1 }),
+    })!;
+    expect([row.usage.tokensIn, row.usage.tokensOut, row.usage.costUsd]).toEqual([200, 20, 1]);
+    expect(row.mismatches).toContain("usage");
+    expect(row.attribution).toBe("mismatch");
+  });
+
+  it("fills gaps from claimed usage when telemetry is null, without flagging", () => {
+    const row = normalizeInvocation(snap, {
+      attribution: claim("review"),
+      telemetry: tel({ tokensIn: 100 }),
+    })!;
+    expect([row.usage.tokensIn, row.usage.tokensOut, row.usage.costUsd]).toEqual([100, 10, 0.5]);
+    expect(row.mismatches).toEqual([]);
+  });
+
+  it("returns null when no stage is determinable", () => {
+    expect(normalizeInvocation(snap, { attribution: "junk" })).toBeNull();
+  });
+
+  it("flags a timeout limit that disagrees with the snapshot and accepts max_turns", () => {
+    const bad = normalizeInvocation(snap, { attribution: claim("review", { limit: { kind: "timeout_ms", value: 5 } }) })!;
+    expect(bad.mismatches).toContain("limit");
+    const ok = normalizeInvocation(snap, { attribution: claim("review", { limit: { kind: "max_turns", value: 7 } }) })!;
+    expect(ok.mismatches).toEqual([]);
+    expect(ok.limit).toEqual({ kind: "max_turns", value: 7 });
+  });
+
+  it("keeps zero as zero and absent as null, never pricing tokens", () => {
+    const zero = normalizeInvocation(snap, {
+      stage: "review", telemetry: tel({ tokensIn: 0, tokensOut: 0, costUsd: 0 }),
+    })!;
+    expect(zero.usage).toMatchObject({ availability: "complete", tokensIn: 0, costUsd: 0, costStatus: "reported" });
+    const none = normalizeInvocation(snap, { stage: "review", telemetry: tel() })!;
+    expect(none.usage).toMatchObject({ availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" });
+    const tokensOnly = normalizeInvocation(snap, { stage: "review", telemetry: tel({ tokensIn: 1000, tokensOut: 50 }) })!;
+    expect(tokensOnly.usage.costUsd).toBeNull();
+  });
+
+  it("preserves cache fields without adding them to input", () => {
+    const row = normalizeInvocation(snap, {
+      stage: "review", telemetry: tel({ tokensIn: 100, tokensOut: 5, cacheReadTokens: 60, cacheCreationTokens: 10 }),
+    })!;
+    expect(row.usage).toMatchObject({ tokensIn: 100, cacheReadTokens: 60, cacheCreationTokens: 10 });
+    const agg = aggregateUsage([row]);
+    expect(agg.totals).toMatchObject({ tokensIn: 100, cacheReadTokens: 60, cacheCreationTokens: 10 });
+  });
+
+  it("counts repeated model attempts separately from invocations", () => {
+    const row = normalizeInvocation(snap, { attribution: claim("review"), attempts: 3 })!;
+    const agg = aggregateUsage([row]);
+    expect(agg.invocations).toBe(1);
+    expect(agg.attempts).toBe(3);
+    expect(normalizeInvocation(snap, { stage: "review", attempts: 0 })!.attempts).toBe(1);
+  });
+});
+
+describe("aggregateUsage", () => {
+  it("ignores byte-equivalent duplicate delivery", () => {
+    const row = normalizeInvocation(snap, { attribution: claim("planning") })!;
+    const agg = aggregateUsage([row, { ...row }]);
+    expect(agg.invocations).toBe(1);
+    expect(agg.duplicatesIgnored).toBe(1);
+    expect(agg.totals.tokensIn).toBe(100);
+  });
+
+  it("surfaces a conflicting identity and keeps the first", () => {
+    const a = normalizeInvocation(snap, { attribution: claim("planning") })!;
+    const b = normalizeInvocation(snap, {
+      attribution: claim("planning", { usage: { availability: "complete", tokensIn: 999, tokensOut: 1, costUsd: 9, costStatus: "reported" } }),
+    })!;
+    const agg = aggregateUsage([a, b]);
+    expect(agg.conflicts).toBe(1);
+    expect(agg.totals.tokensIn).toBe(100);
+  });
+
+  it("counts distinct ids with identical usage separately", () => {
+    const a = normalizeInvocation(snap, { attribution: claim("planning") })!;
+    const b = normalizeInvocation(snap, { attribution: claim("planning", { invocationId: "inv-other" }) })!;
+    expect(aggregateUsage([a, b]).totals.tokensIn).toBe(200);
+  });
+
+  it("reports complete, partial, and unavailable cost", () => {
+    const priced = normalizeInvocation(snap, { attribution: claim("planning") })!;
+    const pricedB = normalizeInvocation(snap, { attribution: claim("review", { invocationId: "x" }) })!;
+    const unpriced = normalizeInvocation(snap, { attribution: claim("review", { invocationId: "y", usage: null }) })!;
+    const complete = aggregateUsage([priced, pricedB]);
+    expect(complete.costStatus).toBe("complete");
+    expect(complete.usageStatus).toBe("complete");
+    expect(complete.totals.costUsd).toBe(1);
+    const partial = aggregateUsage([priced, unpriced]);
+    expect(partial.costStatus).toBe("partial");
+    expect(partial.usageStatus).toBe("partial");
+    expect(partial.totals.costUsd).toBe(0.5);
+    const none = aggregateUsage([unpriced]);
+    expect(none).toMatchObject({ costStatus: "unavailable", usageStatus: "unavailable" });
+    expect(none.totals.costUsd).toBeNull();
+    expect(aggregateUsage([]).costStatus).toBe("unavailable");
+  });
+
+  it("never reports complete cost for a mixed subscription run", () => {
+    const api = normalizeInvocation(snap, { attribution: claim("planning") })!;
+    const sub = normalizeInvocation(snap, { attribution: claim("implementation") })!;
+    const agg = aggregateUsage([api, sub]);
+    expect(agg.mixedAuth).toBe(true);
+    expect(agg.costStatus).toBe("partial");
+    expect(agg.rows.map((r) => r.authMode)).toEqual(["anthropic-api-key", "codex-subscription"]);
+  });
+
+  it("keeps a zero sum distinct from a null sum", () => {
+    const zero = normalizeInvocation(snap, { stage: "review", telemetry: tel({ tokensIn: 0, tokensOut: 0 }) })!;
+    expect(aggregateUsage([zero]).totals.tokensIn).toBe(0);
+    expect(aggregateUsage([zero]).totals.cacheReadTokens).toBeNull();
+  });
+});
+
+describe("frozen configuration provenance", () => {
+  it("copies snapshot id, config revision refs and profile revision onto rows", () => {
+    const row = normalizeInvocation(snap, { attribution: claim("review") })!;
+    expect(row.snapshotId).toBe("snap-1");
+    expect(row.configRevisions).toEqual({
+      orchestratorDefault: { configRevisionId: "r1", revision: 1 },
+      project: { configRevisionId: "r2", revision: 1 },
+    });
+    expect(row.profileRevision).toBe(2);
+    const agg = aggregateUsage([row]);
+    expect(agg.rows[0].configRevisions).toEqual(row.configRevisions);
+    expect(agg.rows[0].profileRevision).toBe(2);
+  });
+
+  it("cannot be replaced by forged claimed references", () => {
+    const forged = {
+      ...claim("review"),
+      configRevisions: { orchestratorDefault: { configRevisionId: "evil", revision: 9 }, project: { configRevisionId: "evil2", revision: 9 } },
+      profileRevision: 99,
+    };
+    const row = normalizeInvocation(snap, { stage: "review", attribution: forged })!;
+    expect(row.attribution).toBe("rejected");
+    expect(row.configRevisions.project.configRevisionId).toBe("r2");
+    expect(row.profileRevision).toBe(2);
+    expect(JSON.stringify(row)).not.toContain("evil");
+    const other = normalizeInvocation(snap, { stage: "review", attribution: claim("review", { snapshotId: "other" }) })!;
+    expect(other.snapshotId).toBe("snap-1");
+  });
+
+  it("keeps identical invocation ids under different snapshots distinct", () => {
+    const snap2 = { ...snap, snapshotId: "snap-2", configRevisions: { ...snap.configRevisions, project: { configRevisionId: "r3", revision: 4 } } };
+    const a = normalizeInvocation(snap, { stage: "review", invocationId: "same", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const b = normalizeInvocation(snap2, { stage: "review", invocationId: "same", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const agg = aggregateUsage([a, b]);
+    expect(agg.invocations).toBe(2);
+    expect(agg.duplicatesIgnored).toBe(0);
+    expect(agg.conflicts).toBe(0);
+    expect(agg.totals.tokensIn).toBe(20);
+    expect(agg.rows.map((r) => r.configRevisions.project.configRevisionId)).toEqual(["r2", "r3"]);
+  });
+
+  it("distinguishes same-snapshot duplicates from conflicts", () => {
+    const a = normalizeInvocation(snap, { stage: "review", invocationId: "dup", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const b = normalizeInvocation(snap, { stage: "review", invocationId: "dup", telemetry: tel({ tokensIn: 10, tokensOut: 1 }) })!;
+    const c = normalizeInvocation(snap, { stage: "review", invocationId: "dup", telemetry: tel({ tokensIn: 11, tokensOut: 1 }) })!;
+    const agg = aggregateUsage([a, b, c]);
+    expect(agg).toMatchObject({ invocations: 1, duplicatesIgnored: 1, conflicts: 1 });
+    expect(agg.totals.tokensIn).toBe(10);
+  });
+
+  it("treats a same-snapshot record with different config refs as a conflict", () => {
+    const a = normalizeInvocation(snap, { stage: "review", invocationId: "x" })!;
+    const b = { ...a, profileRevision: 3 };
+    expect(aggregateUsage([a, b])).toMatchObject({ invocations: 1, conflicts: 1 });
+  });
+});
+
+describe("summarizeInvocations", () => {
+  it("counts unattributable observations instead of throwing", () => {
+    const out = summarizeInvocations(snap, [{ attribution: claim("planning") }, { attribution: null }]);
+    expect(out.invocations).toBe(1);
+    expect(out.unattributable).toBe(1);
+  });
+});
+
+
+describe("recorded usage", () => {
+  it("projects only sanitized JSON, preserving zero usage, cache counts and attempts", () => {
+    const attribution = claim("implementation", { usage: { availability: "complete", tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" } });
+    const usage = toRecordedUsage({ attribution, invocations: [{ attribution, cacheReadTokens: 0, cacheCreationTokens: 4, attempts: 2 }], pushedCommits: [], failureCode: "INVOCATION_TIMEOUT" });
+    expect(JSON.parse(JSON.stringify(usage))).toEqual(usage);
+    expect(usage).toMatchObject({ attribution, pushedCommits: [], listWhole: true, timedOut: true, records: [{ cacheReadTokens: 0, cacheCreationTokens: 4, attempts: 2 }] });
+    expect(toRecordedUsage({})).toEqual({ records: [], attribution: null, pushedCommits: null, listWhole: false, timedOut: false });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const invalid = toRecordedUsage({ attribution: { ...attribution, model: "sk-abcdefghijklmnop" }, invocations: [{ secret: "sk-abcdefghijklmnop" }], failure: { code: "INVOCATION_TIMEOUT" } });
+    expect(JSON.stringify(invalid)).not.toContain("sk-");
+    expect(invalid).toMatchObject({ attribution: null, records: [], listWhole: false, timedOut: false });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("sk-");
+    warn.mockRestore();
+  });
+
+  it("persists list-first and legacy-last exactly once on replay", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, "usage-dispatch",
+      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    const legacy = claim("implementation", { usage: { availability: "complete", tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" } });
+    const input = usage.toRecordedUsage({ attribution: legacy, invocations: [
+      { attribution: legacy, cacheReadTokens: 3, attempts: 2 },
+      { attribution: claim("review", { usage: null }) },
+    ], pushedCommits: ["a".repeat(40)], failure: {
+      category: "cancelled", code: "INVOCATION_TIMEOUT", stage: "implementation", attempt: 1,
+      retryable: false, message: "private failure detail", evidence: { truncated: false },
+    } });
+    expect(input.timedOut).toBe(true);
+    expect(JSON.stringify(input)).not.toContain("private failure detail");
+    expect(JSON.parse(JSON.stringify(input))).toEqual(input);
+    expect(usage.recordUsage("usage-dispatch", JSON.parse(JSON.stringify(input)))).toBe(0);
+    const rows = () => db.prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = 'usage-dispatch' ORDER BY rowid").all();
+    const report = () => db.prepare("SELECT * FROM dispatch_job_report WHERE dispatch_id = ?").get("usage-dispatch");
+    const reportBefore = report();
+    expect(reportBefore).toMatchObject({ pushed_shas_json: JSON.stringify(["a".repeat(40)]), invocations_complete: 1 });
+    const before = rows();
+    expect(before).toHaveLength(2);
+    const stored = db.prepare("SELECT usage_json FROM model_invocation_attribution ORDER BY rowid").all() as { usage_json: string }[];
+    expect(stored.map((r) => JSON.parse(r.usage_json))).toMatchObject([
+      { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" },
+      { availability: "complete", tokensIn: 0, tokensOut: 0, costUsd: 0, costStatus: "reported" },
+    ]);
+    expect(before).toMatchObject([{ invocation_id: "inv-review" }, { invocation_id: "inv-implementation", status: "timed_out" }]);
+    expect(usage.recordUsage("usage-dispatch", JSON.parse(JSON.stringify(input)))).toBe(0);
+    expect(rows()).toEqual(before);
+    expect(report()).toEqual(reportBefore);
+    const rejected = usage.toRecordedUsage({ invocations: [{ attribution: claim("review", { snapshotId: "other" }) }] });
+    expect(usage.recordUsage("usage-dispatch", rejected)).toBe(1);
+    expect(usage.recordUsage("usage-dispatch", rejected)).toBe(1);
+    expect(rows()).toEqual(before);
+  });
+
+  it.each([
+    { managed: true, mismatch: null, fallback: true, modelFallback: true },
+    { managed: false, mismatch: null, fallback: true, modelFallback: true },
+    { managed: true, mismatch: null, fallback: true },
+    { managed: false, mismatch: null, fallback: true },
+    { managed: true, mismatch: "model", fallback: true },
+    { managed: true, mismatch: "profileId", fallback: true },
+    { managed: true, mismatch: null, fallback: false },
+    { managed: true, mismatch: "model", fallback: false },
+    { managed: true, mismatch: "profileId", fallback: false },
+    { managed: false, mismatch: "model", fallback: false },
+    { managed: false, mismatch: "profileId", fallback: false },
+  ] as const)("applies managed acceptance policy (managed=$managed, mismatch=$mismatch, fallback=$fallback)", async (testCase) => {
+    const { managed, mismatch, fallback } = testCase;
+    const modelFallback = "modelFallback" in testCase && testCase.modelFallback;
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    const dispatchId = "policy-dispatch";
+    const fallbackAccount = {
+      accountProfileId: "fallback-claude", profileRevision: 7,
+      agent: "claude", provider: "anthropic", authMode: "claude-subscription", model: "claude-sonnet-4-6",
+    };
+    const policySnapshot = structuredClone(snap);
+    if (modelFallback) {
+      policySnapshot.stages.implementation.agent = "claude";
+      policySnapshot.stages.implementation.provider = "anthropic";
+      policySnapshot.profiles.implementation.agent = "claude";
+      policySnapshot.profiles.implementation.provider = "anthropic";
+      policySnapshot.profiles.implementation.authMode = "claude-subscription";
+    }
+    const fallbackClaim = fallback ? {
+      profileId: fallbackAccount.accountProfileId, agent: fallbackAccount.agent as "claude",
+      provider: fallbackAccount.provider as "anthropic", authMode: fallbackAccount.authMode as "claude-subscription",
+      model: modelFallback ? "claude-authorized-fallback" : fallbackAccount.model,
+    } : {};
+
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, dispatchId,
+      JSON.stringify({ stages: policySnapshot.stages, profiles: policySnapshot.profiles, fallbackModels: { implementation: "claude-authorized-fallback" }, accountFallbacks: { implementation: [fallbackAccount] } }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    if (managed) {
+      // Durable attempt ownership must enforce the policy even without an active admission.
+      db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number, issue_scope,
+         issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES ('policy-attempt', ?, 'ENG', '1', 'acme/widgets', 42, 'pr',
+                'acme/widgets#42', 'policy-attempt', 'prepared', 1, 60001, '{}', '[]')`).run(dispatchId);
+    }
+    const overrides = mismatch ? { [mismatch]: "different-selection" } : {};
+    // Distinct ids exercise both the invocation list and the legacy attribution path.
+    const input = usage.toRecordedUsage({
+      invocations: [{ attribution: claim("implementation", { ...fallbackClaim, ...overrides, invocationId: "policy-list" }) }],
+      attribution: claim("implementation", { ...fallbackClaim, ...overrides, invocationId: "policy-legacy" }),
+      pushedCommits: [],
+    });
+    expect(input.listWhole).toBe(true);
+    const rejected = managed && mismatch !== null;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const rows = () => db.prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY rowid")
+        .all(dispatchId) as { invocation_id: string; model: string; profile_id: string; usage_json: string }[];
+      const report = () => db.prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId);
+      expect(usage.recordUsage(dispatchId, input)).toBe(rejected ? 2 : 0);
+      const stored = rows();
+      expect(stored.map((row) => row.invocation_id)).toEqual(rejected ? [] : ["policy-list", "policy-legacy"]);
+      for (const row of stored) {
+        expect(row).toMatchObject(fallback && mismatch === null ? {
+          agent: "claude", provider: "anthropic", auth_mode: "claude-subscription",
+          model: modelFallback ? "claude-authorized-fallback" : fallbackAccount.model, profile_id: fallbackAccount.accountProfileId, profile_revision: 7,
+        } : { model: snap.stages.implementation.model, profile_id: snap.profiles.implementation.id });
+        expect(JSON.parse(row.usage_json)).toMatchObject({
+          attribution: mismatch ? "mismatch" : "verified",
+          mismatches: mismatch ? [mismatch] : [],
+          tokensIn: 100, tokensOut: 10, costUsd: 0.5,
+        });
+      }
+      expect(report()).toEqual({ invocations_complete: rejected ? 0 : 1 });
+      expect(usage.recordUsage(dispatchId, JSON.parse(JSON.stringify(input)))).toBe(rejected ? 2 : 0);
+      expect(rows()).toEqual(stored);
+      expect(report()).toEqual({ invocations_complete: rejected ? 0 : 1 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stores capped lists without marking them complete", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO run_agent_config_snapshots
+      (snapshot_id, dispatch_id, project_key, resolved_config_json, source_map_json, config_revision_ids_json, created_at)
+      VALUES (?, ?, 'ENG', ?, ?, ?, 1)`).run(snap.snapshotId, "capped-dispatch",
+      JSON.stringify({ stages: snap.stages, profiles: snap.profiles }), JSON.stringify(snap.sources), JSON.stringify(snap.configRevisions));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const capped = usage.toRecordedUsage({ invocations: Array.from({ length: INVOCATION_RECORDS_MAX + 1 }, (_, i) => ({
+      attribution: claim("review", { invocationId: `capped-${i}` }),
+    })) });
+    expect(capped.records).toHaveLength(INVOCATION_RECORDS_MAX);
+    expect(capped.listWhole).toBe(false);
+    expect(JSON.parse(JSON.stringify(capped))).toEqual(capped);
+    expect(warn).toHaveBeenCalledWith("[runner-callback] Dropped 1 invalid invocation record(s)");
+    expect(usage.recordUsage("capped-dispatch", JSON.parse(JSON.stringify(capped)))).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM model_invocation_attribution WHERE dispatch_id = ?").get("capped-dispatch"))
+      .toEqual({ count: INVOCATION_RECORDS_MAX });
+    expect(db.prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get("capped-dispatch"))
+      .toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it("persists empty pushed commits distinctly from absent commits", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    for (const [dispatchId, body, expected] of [
+      ["absent-commits", { invocations: [] }, null],
+      ["empty-commits", { invocations: [], pushedCommits: [] }, "[]"],
+    ] as const) {
+      const projection = usage.toRecordedUsage(body);
+      expect(projection.pushedCommits).toEqual(expected === null ? null : []);
+      expect(JSON.parse(JSON.stringify(projection))).toEqual(projection);
+      expect(usage.recordUsage(dispatchId, JSON.parse(JSON.stringify(projection)))).toBe(0);
+      expect(dedup.getDb().prepare("SELECT pushed_shas_json FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId))
+        .toEqual({ pushed_shas_json: expected });
+    }
+  });
+
+  it("stores snapshotless KG calls without trusting claimed configuration, leaving other legacy dispatches unchanged", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup, log } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"), log: () => import("../log.js"),
+    } });
+    log.appendLog({ dispatchId: "kg-legacy", issueId: "kg-refresh", phase: "kg-refresh" });
+    log.appendLog({ dispatchId: "other-legacy", issueId: "kg-refresh", phase: "implementation" });
+    const input = usage.toRecordedUsage({ attribution: claim("implementation"), invocations: [
+      { attribution: claim("implementation"), cacheReadTokens: 0, attempts: 2 },
+      { attribution: claim("review", { usage: null }) },
+    ], failureCode: "INVOCATION_TIMEOUT" });
+    expect(usage.recordUsage("kg-legacy", input)).toBe(0);
+    const rows = dedup.getDb().prepare("SELECT * FROM model_invocation_attribution WHERE dispatch_id = ? ORDER BY rowid");
+    const before = rows.all("kg-legacy");
+    expect(before).toMatchObject([
+      { invocation_id: "inv-review", snapshot_id: null, config_revision_id: null, profile_id: "unconfigured", auth_mode: "unknown" },
+      { invocation_id: "inv-implementation", status: "timed_out", snapshot_id: null },
+    ]);
+    expect(JSON.parse((before[1] as { usage_json: string }).usage_json)).toMatchObject({ attempts: 2, cacheReadTokens: 0, attribution: "absent" });
+    expect(usage.recordUsage("kg-legacy", JSON.parse(JSON.stringify(input)))).toBe(0);
+    expect(rows.all("kg-legacy")).toEqual(before);
+    expect(usage.recordUsage("other-legacy", input)).toBe(1);
+    expect(rows.all("other-legacy")).toEqual([]);
+    expect(dedup.getDb().prepare("SELECT * FROM run_agent_config_snapshots").all()).toEqual([]);
+    expect(dedup.getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get("kg-legacy"))
+      .toEqual({ invocations_complete: 1 });
+  });
+
+  it("marks only whole lists complete, allowing empty lists without a snapshot", async () => {
+    const { testDb } = await import("./helpers/test-db.js");
+    const { modules: { usage, dedup } } = await testDb({ modules: {
+      usage: () => import("../agent-usage.js"), dedup: () => import("../dedup.js"),
+    } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const cases = [
+      { body: {}, complete: false, mismatched: 0 },
+      { body: { invocations: [] }, complete: true, mismatched: 0 },
+      { body: { invocations: [], invocationsDropped: 1 }, complete: false, mismatched: 0 },
+      { body: { invocations: [{}] }, complete: false, mismatched: 0 },
+      { body: { invocations: [{ attribution: claim("review") }] }, complete: false, mismatched: 1 },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const dispatchId = `completeness-${i}`;
+      expect(usage.recordUsage(dispatchId, usage.toRecordedUsage(c.body))).toBe(c.mismatched);
+      const row = dedup.getDb().prepare("SELECT invocations_complete FROM dispatch_job_report WHERE dispatch_id = ?").get(dispatchId);
+      expect(row ?? null).toEqual(c.complete ? { invocations_complete: 1 } : null);
+    }
+    warn.mockRestore();
+  });
+
+});

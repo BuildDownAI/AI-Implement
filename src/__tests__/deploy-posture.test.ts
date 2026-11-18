@@ -246,6 +246,17 @@ describe("getDeployPosture", () => {
     expect(posture.deploy.lastOutcome).toBe("deployed-ok");
   });
 
+  it("lastOutcome surfaces deploy-failed", async () => {
+    (deployNotifyMock.getDeployOutcome as ReturnType<typeof vi.fn>).mockReturnValue({
+      kind: "deploy-failed",
+      commit: "aaa",
+      detail: "drain-timeout",
+      at: Date.now(),
+    });
+    const posture = await getDeployPosture();
+    expect(posture.deploy.lastOutcome).toBe("deploy-failed");
+  });
+
   it("registry failure → channelCommit null, matchesHead null, no error", async () => {
     (repoImageMock.resolveChannelCommit as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error("registry error"),

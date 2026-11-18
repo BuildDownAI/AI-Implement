@@ -1,33 +1,20 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { describe, it, expect, beforeEach } from "vitest";
+import { testDb } from "./helpers/test-db.js";
 
-// dedup.ts freezes its DB path at import time, so each test sets a unique DEDUP_DB_PATH and
-// re-imports the modules fresh (the same isolation pattern the sibling suites use).
 let audit: typeof import("../access-audit.js");
 let access: typeof import("../access-entries.js");
 let dedup: typeof import("../dedup.js");
-let dbPath: string;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `access-audit-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  audit = await import("../access-audit.js");
-  access = await import("../access-entries.js");
-  dedup = await import("../dedup.js");
-  audit.initAccessAuditTable();
-  access.initAccessEntriesTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ audit, access, dedup } = (
+    await testDb({
+      modules: {
+        audit: () => import("../access-audit.js"),
+        access: () => import("../access-entries.js"),
+        dedup: () => import("../dedup.js"),
+      },
+    })
+  ).modules);
 });
 
 describe("recordAccessChange", () => {
@@ -145,7 +132,8 @@ describe("saveAccessEntries auditing", () => {
     // keeper holds the admin role throughout, so ada is free to start as a user.
     const keeper = { kind: "address" as const, value: "keeper@eudoxus.ai", role: "admin" as const };
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], null);
-    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
+    dedup.getDb().prepare("INSERT INTO access_entry_bindings (value, provider, subject, bound_at) VALUES (?, ?, ?, ?)").run("ada@eudoxus.ai", "google", "google|123", 1);
+    access.refreshEffectiveAllowlist();
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, keeper], null);
 
     const [latest] = audit.listAccessChanges();

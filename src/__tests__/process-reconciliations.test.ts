@@ -1,30 +1,21 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-let dbPath: string;
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { makeMapping, makeProvider } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 let recon: typeof import("../reconciliation.js");
-let dedup: typeof import("../dedup.js");
+let links: typeof import("../pr-links.js");
 let mod: typeof import("../reconcile-merged.js");
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `procrecon-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  recon = await import("../reconciliation.js");
-  mod = await import("../reconcile-merged.js");
-  recon.initReconciliationTable();
-});
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ recon, mod, links } = (
+    await testDb({ modules: { links: () => import("../pr-links.js"), recon: () => import("../reconciliation.js"), mod: () => import("../reconcile-merged.js") } })
+  ).modules);
 });
 describe("runReconciliations", () => {
-  it("calls markMerged and marks the row dispatched", async () => {
+  it("calls markMerged for a promoted tombstone and marks the row dispatched", async () => {
+    recon.recordReconciliationTombstone({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r" });
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" });
     const markMerged = vi.fn(async () => {});
-    const resolveProvider = vi.fn(async () => ({ markMerged } as never));
-    const mappingForRepo = vi.fn(() => ({ scopeKey: "team-o", mapping: { owner: "o", repo: "r", paused: true } } as never));
+    const resolveProvider = vi.fn(async () => makeProvider({ markMerged }));
+    const mappingForRepo = vi.fn(() => ({ scopeKey: "team-o", mapping: makeMapping({ owner: "o", repo: "r", paused: true }) }));
     await mod.runReconciliations({ resolveProvider, mappingForRepo });
     expect(markMerged).toHaveBeenCalledWith("i1", "team-o");
     expect(recon.getPendingReconciliations()).toHaveLength(0);
@@ -40,8 +31,8 @@ describe("runReconciliations", () => {
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" });
     const markMerged = vi.fn(async () => { throw new Error("boom"); });
     await mod.runReconciliations({
-      resolveProvider: async () => ({ markMerged } as never),
-      mappingForRepo: () => ({ scopeKey: "team-o", mapping: { owner: "o", repo: "r", paused: false } } as never),
+      resolveProvider: async () => makeProvider({ markMerged }),
+      mappingForRepo: () => ({ scopeKey: "team-o", mapping: makeMapping({ owner: "o", repo: "r" }) }),
     });
     const pending = recon.getPendingReconciliations();
     expect(pending).toHaveLength(1);
@@ -51,8 +42,8 @@ describe("runReconciliations", () => {
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" });
     const markMerged = vi.fn(async () => { throw new Error("issue deleted"); });
     const deps = {
-      resolveProvider: async () => ({ markMerged } as never),
-      mappingForRepo: () => ({ scopeKey: "team-o", mapping: { owner: "o", repo: "r", paused: false } } as never),
+      resolveProvider: async () => makeProvider({ markMerged }),
+      mappingForRepo: () => ({ scopeKey: "team-o", mapping: makeMapping({ owner: "o", repo: "r" }) }),
     };
     for (let tick = 0; tick < recon.MAX_RECONCILIATION_ATTEMPTS; tick++) {
       await mod.runReconciliations(deps);
@@ -64,5 +55,34 @@ describe("runReconciliations", () => {
     expect(markMerged).toHaveBeenCalledTimes(recon.MAX_RECONCILIATION_ATTEMPTS);
     // The failed row still counts for PR dedup.
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(true);
+  });
+});
+
+describe("resolvePrMapping", () => {
+  const first = makeMapping({ owner: "o", repo: "r" });
+  const second = makeMapping({ owner: "o", repo: "r" });
+
+  function link(mappingKey: string) {
+    links.linkPullRequest({ repository: "o/r", number: 5, url: "https://github.com/o/r/pull/5",
+      role: "implementation", source: "backfill",
+      issue: { trackerKind: "linear", mappingKey, trackerIssueId: "i1", identifier: null, title: null, url: null } });
+  }
+
+  it("resolves two repository mappings using the link without a job row", () => {
+    link("second");
+    expect(mod.resolvePrMapping({ first, second }, "o/r", 5)).toEqual({ scopeKey: "second", mapping: second });
+  });
+
+  it("resolves a single candidate without a link", () => {
+    expect(mod.resolvePrMapping({ first }, "o/r", 5)).toEqual({ scopeKey: "first", mapping: first });
+  });
+
+  it("does not resolve multiple candidates without a link", () => {
+    expect(mod.resolvePrMapping({ first, second }, "o/r", 5)).toBeUndefined();
+  });
+
+  it.each(["missing", "otherRepo"])("does not fall back when linked key %s is outside repository candidates", (key) => {
+    link(key);
+    expect(mod.resolvePrMapping({ first, otherRepo: makeMapping({ owner: "o", repo: "other" }) }, "o/r", 5)).toBeUndefined();
   });
 });

@@ -1,12 +1,14 @@
 import type { RepoMapping } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import {
-  listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest,
+  listOpenPullRequests, getPrReadiness, mergePullRequest, mergeBranch,
 } from "./github.js";
 import {
   countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
 } from "./comment-gapfill-queue.js";
 import { getRunRecordMergeVerdict } from "./log.js";
+import { resolveReviewProcess } from "./review-process.js";
+import { headHasBlockingFinding, headReviewedClean } from "./review-head-clean.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
@@ -20,7 +22,41 @@ export const MAX_CONFLICT_RESOLUTION_ATTEMPTS = 2;
 // same PR (observed ~60s Slack spam). Notify once per PR per process; a restart
 // re-notifies at most once more. The log line stays every cycle (cheap, greppable).
 const capExhaustedNotified = new Set<string>();
-export function resetCapExhaustedNotifications(): void { capExhaustedNotified.clear(); }
+// Same once-per-process rule for a default-branch sync conflict, keyed per feature branch.
+const syncConflictNotified = new Set<string>();
+export function resetCapExhaustedNotifications(): void {
+  capExhaustedNotified.clear();
+  syncConflictNotified.clear();
+}
+
+/** No issue key and no branch name: a key in the commit makes Linear's GitHub integration mark the parent Done (AII-1412). */
+export const SYNC_DEFAULT_COMMIT_MESSAGE = "Merge default branch into feature branch";
+
+/** Merge the default branch into a grouping branch after a child merged. Never throws. */
+async function syncDefaultIntoFeature(
+  token: string, mapping: RepoMapping, featureBranch: string, deps: AutoMergeDeps,
+): Promise<void> {
+  const { owner, repo, defaultBranch } = mapping;
+  try {
+    const result = await mergeBranch(token, owner, repo, featureBranch, defaultBranch, SYNC_DEFAULT_COMMIT_MESSAGE);
+    if (result === "merged") {
+      console.log(`[auto-merge] Synced ${defaultBranch} into ${featureBranch}`);
+    } else if (result === "conflict") {
+      console.log(`[auto-merge] Conflict syncing ${defaultBranch} into ${featureBranch} (${owner}/${repo}) — leaving the branch as is`);
+      const key = `${owner}/${repo}:${featureBranch}`;
+      if (!syncConflictNotified.has(key)) {
+        syncConflictNotified.add(key);
+        if (deps.notify) {
+          await deps.notify(
+            `Conflict syncing \`${defaultBranch}\` into \`${featureBranch}\` (${owner}/${repo}) — needs a manual merge.`
+          ).catch(() => {});
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[auto-merge] Failed syncing ${defaultBranch} into ${featureBranch} (${owner}/${repo}):`, err);
+  }
+}
 export type StalledChildKind = "conflict" | "other";
 
 /** Named seam: AII-263 (max_turns/draft stalls) extends this classification later. */
@@ -34,35 +70,26 @@ export function isGroupingBranch(base: string): boolean {
   return base.startsWith("ai-implement/feature/") || base.startsWith("ai-implement/multi-issue/");
 }
 
+/**
+ * Merge approved child PRs into grouping branches (feature/multi-issue). A mapping is
+ * processed only when its `autoMerge` setting is on and it is not paused; a child merges
+ * only then, and only when its run left the approval mark. With the setting off, approved
+ * children are left for a person to merge. The top-of-tree feature→base PR still requires
+ * human review.
+ */
 export async function runAutoMerges(mappings: RepoMapping[], deps: AutoMergeDeps): Promise<void> {
   const seen = new Set<string>();
-  for (const mapping of mappings) {
-    if (!mapping.autoMerge || mapping.paused) continue;
-    const repoKey = `${mapping.owner}/${mapping.repo}`;
-    if (seen.has(repoKey)) continue;
-    seen.add(repoKey);
-    try {
-      await autoMergeRepo(mapping, deps);
-    } catch (err) {
-      console.error(`[auto-merge] Failed for ${repoKey}:`, err);
-    }
-  }
-}
-
-/**
- * Merge approved child PRs into grouping branches (feature/multi-issue) for all non-paused
- * mappings, regardless of the mapping's `autoMerge` setting. The top-of-tree feature→base PR
- * still requires human review.
- *
- * Unlike `runAutoMerges` this is unconditional — it runs every poll for cascade self-healing
- * so that a reopened parent's approved children merge without requiring per-project opt-in.
- * (AII-349 reopen re-arm.)
- */
-export async function runGroupingBranchAutoMerge(mappings: RepoMapping[], deps: AutoMergeDeps): Promise<void> {
-  const seen = new Set<string>();
+  const offLogged = new Set<string>();
   for (const mapping of mappings) {
     if (mapping.paused) continue;
     const repoKey = `${mapping.owner}/${mapping.repo}`;
+    if (!mapping.autoMerge) {
+      if (!offLogged.has(repoKey)) {
+        offLogged.add(repoKey);
+        console.log(`[auto-merge] Skipping ${repoKey}: Auto-merge setting is off — approved child PRs are left for a person to merge`);
+      }
+      continue;
+    }
     if (seen.has(repoKey)) continue;
     seen.add(repoKey);
     try {
@@ -81,13 +108,6 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
     try {
       if (!isGroupingBranch(pr.base) || pr.base === defaultBranch) continue;
       if (pr.draft) continue;
-      const checks = await getCombinedChecksState(token, owner, repo, pr.headSha);
-      if (checks === "pending") { console.log(`[auto-merge] Waiting on checks: PR #${pr.number} -> ${pr.base}`); continue; }
-      if (checks === "failure") { console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: checks failed`); continue; }
-      if (await hasChangesRequestedReview(token, owner, repo, pr.number)) {
-        console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: changes requested`);
-        continue;
-      }
       // If the PR title format ever changes (e.g. a leading emoji or prefix is added), non-matching
       // PRs will fall silently into the "no issue key" hold bucket rather than raising a visible error.
       const issueKeyMatch = pr.title.match(/^([A-Z][A-Z0-9]*-\d+):/);
@@ -104,12 +124,34 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
         console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: no approval mark`);
         continue;
       }
-      const result = await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");
+      // The repository's auto-fix pushes by design, so the mark may predate the current head.
+      if (resolveReviewProcess(mapping.reviewProcess).fixer === "repository"
+        && !(await headReviewedClean(token, owner, repo, pr.number, pr.headSha))) {
+        console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: current head not reviewed clean`);
+        continue;
+      }
+      // The mark records no head SHA: a verdict posted after it (AII-1291) must still hold the PR.
+      if (await headHasBlockingFinding(token, owner, repo, pr.number, pr.headSha)) {
+        console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: blocking finding on current head`);
+        continue;
+      }
+      // Last, after the local and per-head checks: an unknown mergeability re-reads with sleeps.
+      const readiness = await getPrReadiness(token, owner, repo, pr.number, pr.headSha);
+      // A dirty PR (GitHub reports a conflict) is not merged, but still flows into the conflict
+      // re-queue rail below. Every other not-ready reason waits for a later tick.
+      const dirty = readiness.reason === "dirty";
+      if (!readiness.ready && !dirty) {
+        console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: not ready (${readiness.reason}, mergeable_state=${readiness.mergeableState ?? "none"})`);
+        continue;
+      }
+      const result = dirty ? "conflict" : await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");
       if (result === "merged") {
         console.log(`[auto-merge] Merged PR #${pr.number} -> ${pr.base} (${owner}/${repo})`);
         if (deps.notify) {
           await deps.notify(`Auto-merged child PR #${pr.number} into \`${pr.base}\` (${owner}/${repo})`).catch(() => {});
         }
+        // After the child merge, not before: moving the base first can make the child look blocked.
+        await syncDefaultIntoFeature(token, mapping, pr.base, deps);
       } else {
         const kind = classifyStalledChild(result);
         if (kind === "conflict") {

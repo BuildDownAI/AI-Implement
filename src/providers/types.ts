@@ -1,4 +1,6 @@
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
+import type { RepoMapping } from "../config.js";
+import type { ResolvedFieldIds } from "./jira-fields.js";
 
 /** One rung of a feature-branch grouping chain → branch `ai-implement/<mode>/<identifier>`. */
 export interface FeatureBranchChainEntry {
@@ -24,7 +26,7 @@ export interface TicketIssue {
   nativeStatus: string;
   /**
    * Immediate parent identifier, when this issue has a parent. Logging/informational only.
-   * Populated by the Linear and Jira providers; undefined for others.
+   * Populated when the provider knows the parent association.
    */
   parentRef?: { identifier: string };
   /**
@@ -59,6 +61,25 @@ export interface TicketIssue {
   maxIterations?: number;
 }
 
+/** One vocabulary for issue status across trackers. `unknown` covers any tracker value with no mapping. */
+export type NormalizedIssueState =
+  | "ready" | "planning" | "awaiting-approval" | "plan-approved"
+  | "implementing" | "pr-ready" | "merged" | "failed" | "unknown";
+
+export interface IssueStatusRecord {
+  id: string;                    // tracker issue id (internal: used to join the dispatch breaker; never served)
+  identifier: string;            // the same string dispatch_log.issue_identifier holds
+  title: string | null;
+  url: string | null;
+  state: NormalizedIssueState;
+  phase: "planning" | "implementation" | null;   // set only when state is "failed" and the tracker says which
+  labels: string[];              // the tracker labels behind `state`, the deciding label first
+  workflowState: string | null;  // the tracker's own status name
+  updatedAt: number | null;      // epoch ms, the tracker's last-updated time
+}
+
+export const ISSUE_STATUS_RECENT_MS = 7 * 24 * 60 * 60 * 1000;
+
 export interface AIImplementSnapshot {
   needsPlanning: TicketIssue[];
   readyForImplementation: TicketIssue[];
@@ -91,9 +112,117 @@ export interface FeatureNodeRollUp {
   childIdentifiers: string[];
 }
 
+/** One issue as the knowledge-graph tracker export carries it: Linear field names, plus the two fields `TrackerExport` stamps. */
+export interface TrackerIssueRecord {
+  id: string;
+  identifier: string;
+  title: string;
+  description: string | null;
+  branchName?: string | null;
+  state: { name: string; type: string } | null;
+  labels: { nodes: Array<{ name: string }> };
+  project: { name: string } | null;
+  parent: { identifier: string } | null;
+  comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
+  relations: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
+  /** The provider's `id`. Set by the `TrackerExport` handler, never by a provider. */
+  sourceSystem?: string;
+  /** The mapping key. Set by the `TrackerExport` handler, never by a provider. */
+  team?: string;
+}
+
+export interface TrackerIssuePage {
+  issues: TrackerIssueRecord[];
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+}
+
+/** A label matched by name ignoring case: its exact name, and its team's key or null for a workspace label. */
+export interface FoundLabel {
+  name: string;
+  teamKey: string | null;
+}
+
+/** A tracker read that did not succeed: the tracker's HTTP status when it refused, or null when it could not be reached. */
+export interface TrackerReadFailure {
+  status: number | null;
+  error: string;
+}
+
+/** What one Linear read finds for the setup checks, which judge it (`src/setup-checks/tracker-config.ts`). */
+export type LinearSetupFacts =
+  | ({ kind: "linear"; token: "refused" } & TrackerReadFailure)
+  | {
+      kind: "linear";
+      token: "minted";
+      /** The pickup label as the poll reads it. */
+      pickupLabel: string;
+      /** The requested teams the app can see, each with the types of its `started` and `completed` states. */
+      teams: Record<string, string[]>;
+      /** For each label name the provider applies, every label matching it ignoring case, at workspace level or in a requested team. */
+      labels: Record<string, FoundLabel[]>;
+    };
+
+/** A select field's options, or why they cannot be judged. A field whose contexts answer 404 is not a select field. */
+export type JiraFieldOptions =
+  | { read: "options"; values: string[] }
+  | { read: "not-select" }
+  | { read: "failed"; failure: TrackerReadFailure };
+
+/** Whether Jira accepts a project's JQL as the poll runs it, asked for one result. */
+export type JiraJqlResult = { accepted: true } | { accepted: false; failure: TrackerReadFailure };
+
+/** What the reads for one Jira project find. Each read is recorded, so one fault never hides another project's facts. */
+export type JiraProjectSetupFacts =
+  | { fields: "unreadable"; failure: TrackerReadFailure }
+  /** A required field matches no field or several by name (`JiraFieldResolutionError`). */
+  | { fields: "unresolved"; field: string; fault: "missing" | "duplicate" }
+  | {
+      fields: "resolved";
+      ids: ResolvedFieldIds;
+      /** The IDs the poll cached for this project's site and overrides, or null before the poll has read them. */
+      cachedIds: ResolvedFieldIds | null;
+      /** Optional fields whose name matches several fields, so their feature stays off. */
+      ambiguousOptional: string[];
+      statusOptions: JiraFieldOptions;
+      repoOptions: JiraFieldOptions;
+      jql: JiraJqlResult;
+    };
+
+/** What one Jira read finds for the setup checks, which judge it (`src/setup-checks/tracker-config.ts`). */
+export type JiraSetupFacts =
+  | ({ kind: "jira"; credentials: "refused" } & TrackerReadFailure)
+  | {
+      kind: "jira";
+      credentials: "accepted";
+      /** OAuth mode, whose access token is never refreshed. */
+      oauth: boolean;
+      projects: Record<string, JiraProjectSetupFacts>;
+    };
+
+/** Each Filesystem project's ticket directory, resolved as the poll resolves it, and why the orchestrator cannot use it, or null when it can. */
+export interface FilesystemSetupFacts {
+  kind: "filesystem";
+  directories: Record<string, { directory: string; fault: "missing" | "not-writable" | null }>;
+}
+
+/** One provider's setup facts; each provider adds its own member. */
+export type TrackerSetupFacts = LinearSetupFacts | JiraSetupFacts | FilesystemSetupFacts;
+
+/** The tracker cannot be read and a retry will not help (a missing credential). `TrackerExport` answers it as terminal `tracker-unavailable`. */
+export class TrackerUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TrackerUnavailableError";
+  }
+}
+
 export type IssueLifecycleState = "active" | "completed" | "cancelled";
 
 export type ProviderId = "linear" | "jira" | (string & {});
+
+export type LifecycleLabelsResult =
+  | { ok: true }
+  | { ok: false; permanent: boolean; label: string; message: string };
 
 export interface TicketingProvider {
   readonly id: string;
@@ -105,6 +234,10 @@ export interface TicketingProvider {
    *  parent (feature-branch grouping merge-up). */
   fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]>;
 
+  /** Prepare lifecycle labels for a scope. May write by creating missing labels; safe
+   *  to call on every dispatch. Providers with nothing to prepare leave this out. */
+  ensureLifecycleLabels?(scopeKey: string): Promise<LifecycleLabelsResult>;
+
   // Lifecycle verbs.
   //
   // scopeKey is the authoritative capacity-bucket key the orchestrator chose
@@ -114,7 +247,7 @@ export interface TicketingProvider {
   // ignores it (it resolves the team from the issue itself); Jira needs it to
   // pick the right mapping without a fragile repo-field read-back.
   markPlanningStarted(issueId: string, scopeKey: string): Promise<void>;
-  markPlanComplete(issueId: string, scopeKey: string): Promise<void>;
+  markPlanComplete(issueId: string, scopeKey: string, opts: { awaitApproval: boolean }): Promise<void>;
   /** Returns whether a failure comment was actually posted — false when the status write
    *  was refused (issue already Merged) and no comment follows it. Callers must stamp
    *  their own "did we already comment" bookkeeping only on true, or a refusal silently
@@ -127,11 +260,29 @@ export interface TicketingProvider {
   markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<boolean>;
   /** Returns whether a failure comment was actually posted — see `markPlanningFailed`. */
   markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean>;
-  /** Returns whether the reset was applied; false when refused (issue already Merged). */
-  clearWorkingState(issueId: string, scopeKey: string): Promise<boolean>;
+  /** Put the issue back in pickup after a failed or timed-out run, so it can be dispatched again.
+   *  `phase` is the phase of the run that failed: a planning reset goes back to the planning pickup
+   *  state (Jira: Ready), an implementation reset to the implementation pickup state (Jira: Plan
+   *  Approved). Returns whether the reset was applied; false when refused (issue already Merged). */
+  clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
+  /** Move the issue out of pickup so a human decides what happens next, and post no comment (the
+   *  caller comments). Unlike `clearWorkingState`, the ticket must not look ready for pickup
+   *  (Jira: Planning Failed / Implementation Failed; Linear: the `AI-Needs-Human` label;
+   *  filesystem: a failed task). Returns whether the write was applied; false when refused
+   *  because the issue is already terminal (Jira: Merged; Linear: completed or canceled;
+   *  filesystem: a terminal task). Not the dispatch-breaker park (`src/dispatch-breaker.ts`),
+   *  which holds re-dispatch per phase. */
+  parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
+  /** The issue's pull request closed without a merge. Moves the issue to the tracker's
+   * cancelled state and posts one comment. Returns false, with no write, when the issue
+   * is already terminal. */
+  markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;
+
+  /** Create a native child in the parent's team/project, ready for pickup. */
+  createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }>;
 
   // Communication
   postComment(issueId: string, body: string): Promise<void>;
@@ -145,8 +296,21 @@ export interface TicketingProvider {
   issueUrl(issue: TicketIssue): string;
 
   /** Look up an issue by its human-readable identifier (e.g. "ENG-123", "PROJ-456").
-   *  Returns null if not found. */
-  findByKey(key: string): Promise<TicketIssue | null>;
+   *  Returns null if not found. With `scopeKey`, returns the issue as that mapping's poll
+   *  builds it (scope key, description, profiles, base branch, assignee). Without it, a
+   *  provider that cannot infer the mapping from the key (Jira) answers `scopeKey: ""`. */
+  findByKey(key: string, scopeKey?: string): Promise<TicketIssue | null>;
+
+  /** One page of the mapping's issues for export or review-child discovery. When supplied, filter must narrow results server-side (a title-prefix superset is allowed). Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
+  listIssuesPage?(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage>;
+  /** Every in-scope issue for this mapping with a normalized state: open issues the pickup query
+   *  matches, in any state, plus `merged` and `failed` issues updated in the last 7 days.
+   *  Throws `TrackerUnavailableError` when the credential is missing, and
+   *  throws on any read it cannot complete: never returns a partial list. Optional so a fork's
+   *  custom provider still compiles. */
+  listIssueStatuses?(mapping: RepoMapping): Promise<IssueStatusRecord[]>;
+  /** The facts the setup checks judge for these projects, read without any write. A Linear project's key is its team's key. Optional so a fork's custom provider still compiles. */
+  fetchSetupFacts?(projectKeys: string[]): Promise<TrackerSetupFacts>;
 }
 
 /** Configuration handed to provider factories. */

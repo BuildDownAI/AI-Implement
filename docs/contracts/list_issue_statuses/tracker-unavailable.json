@@ -1,0 +1,15 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "list_issue_statuses failed: Linear credential is unavailable"
+      }
+    ],
+    "isError": true
+  }
+}

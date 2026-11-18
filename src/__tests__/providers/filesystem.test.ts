@@ -1,63 +1,28 @@
-import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { access, constants, link, lstat, mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepoMapping } from "../../config.js";
 import { FilesystemProvider } from "../../providers/filesystem.js";
+import { makeIssue, makeMapping } from "../helpers/builders.js";
+import { testDir } from "../helpers/test-dir.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, link: vi.fn(actual.link) };
+  return { ...actual, access: vi.fn(actual.access), readdir: vi.fn(actual.readdir), link: vi.fn(actual.link), writeFile: vi.fn(actual.writeFile) };
 });
 
-const tempDirs: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
-  tempDirs.length = 0;
-  vi.mocked(link).mockClear();
+afterEach(() => {
+  vi.mocked(link).mockReset();
+  vi.mocked(writeFile).mockReset();
 });
 
-function mapping(overrides: Partial<RepoMapping> & { directory: string; planningEnabled?: boolean }): RepoMapping {
-  return {
-    owner: "acme",
-    repo: "widgets",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: overrides.planningEnabled ?? true,
-    planningWorkflowFile: "claude-plan.yml",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
+function mapping({ directory, ...overrides }: Partial<RepoMapping> & { directory: string }): RepoMapping {
+  return makeMapping({
+    planningEnabled: true,
     ticketingProvider: "filesystem",
-    ticketingConfig: { kind: "filesystem", directory: overrides.directory },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    referenceRepos: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    reviewers: null,
+    ticketingConfig: { kind: "filesystem", directory },
     ...overrides,
-  };
-}
-
-async function tempTicketDir(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "ai-implement-fs-provider-"));
-  tempDirs.push(dir);
-  return dir;
+  });
 }
 
 async function writeTask(dir: string, filename: string, body: string): Promise<void> {
@@ -70,7 +35,7 @@ function provider(mappings: Record<string, RepoMapping>): FilesystemProvider {
 
 describe("FilesystemProvider", () => {
   it("persists lifecycle state and parsed task limits across provider restarts", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-1.md", [
       "---",
       "title: Exercise the review loop",
@@ -105,7 +70,7 @@ describe("FilesystemProvider", () => {
       "filesystem:AII:AII-1",
       "## 🗺 AI Planning: Implementation Map\n\nTouch the local harness.",
     );
-    await p1.markPlanComplete("filesystem:AII:AII-1", "AII");
+    await p1.markPlanComplete("filesystem:AII:AII-1", "AII", { awaitApproval: false });
 
     const p2 = provider(mappings);
     snap = await p2.fetchAIImplementSnapshot();
@@ -122,18 +87,11 @@ describe("FilesystemProvider", () => {
 
   it("returns admin issue URLs for exact scoped filesystem issue ids", async () => {
     const p = provider({});
-    expect(p.issueUrl({
-      id: "filesystem:SAN2:SAN2-001",
-      identifier: "SAN2-001",
-      title: "Make the jellyfish pulse less",
-      description: null,
-      scopeKey: "SAN2",
-      nativeStatus: "ready",
-    })).toBe("/admin?filesystemIssue=filesystem%3ASAN2%3ASAN2-001");
+    expect(p.issueUrl(makeIssue({ id: "filesystem:SAN2:SAN2-001", identifier: "SAN2-001", scopeKey: "SAN2" }))).toBe("/admin?filesystemIssue=filesystem%3ASAN2%3ASAN2-001");
   });
 
   it("reads issue details without creating missing state", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "SAN2-1.md", "---\ntitle: Local detail\n---\n\nShow me.");
     const p = provider({ SAN2: mapping({ directory: dir }) });
 
@@ -152,7 +110,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("returns null details for corrupt state and duplicate scoped identifiers", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "SAN2-2.md", "---\ntitle: Corrupt state\n---\n\nSkip.");
     await writeTask(dir, "duplicate.md", "---\ntitle: Duplicate\nid: SAN2-3\n---\n\nFirst.");
     await writeTask(dir, "SAN2-3.md", "---\ntitle: Duplicate\n---\n\nSecond.");
@@ -171,7 +129,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("puts new tasks directly in the implementation bucket when planning is disabled", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-2.md", "---\ntitle: No planning\n---\n\nImplement directly.");
     const snap = await provider({ AII: mapping({ directory: dir, planningEnabled: false }) }).fetchAIImplementSnapshot();
     expect(snap.needsPlanning).toEqual([]);
@@ -179,7 +137,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("fails closed on malformed documents, corrupt state, and duplicate identifiers in one scope", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-3.md", "---\ntitle: Valid\n---\n\nOk.");
     await writeTask(dir, "AII-4.md", "No front matter");
     await writeTask(dir, "AII-5.md", "---\ntitle: First\nid: AII-6\n---\n\nDuplicate.");
@@ -193,8 +151,8 @@ describe("FilesystemProvider", () => {
   });
 
   it("keeps identifiers scoped and refuses ambiguous findByKey results", async () => {
-    const dirA = await tempTicketDir();
-    const dirB = await tempTicketDir();
+    const dirA = testDir("fs-provider");
+    const dirB = testDir("fs-provider");
     await writeTask(dirA, "AII-7.md", "---\ntitle: One\n---\n\nA.");
     await writeTask(dirB, "AII-7.md", "---\ntitle: Two\n---\n\nB.");
     const p = provider({
@@ -206,8 +164,30 @@ describe("FilesystemProvider", () => {
     await expect(p.markPlanningStarted("filesystem:A:AII-7", "B")).rejects.toThrow(/does not belong/);
   });
 
+  it("parkForHuman fails the task out of pickup without a comment, and refuses a terminal task", async () => {
+    const dir = testDir("fs-provider");
+    await writeTask(dir, "AII-20.md", "---\ntitle: Park me\n---\n\nBody.");
+    await writeTask(dir, "AII-21.md", "---\ntitle: Merged\n---\n\nBody.");
+    const mappings = { AII: mapping({ directory: dir }) };
+    const p = provider(mappings);
+    const id = "filesystem:AII:AII-20";
+
+    await p.markPlanComplete(id, "AII", { awaitApproval: false });
+    await expect(p.parkForHuman(id, "AII", "implementation")).resolves.toBe(true);
+
+    const state = JSON.parse(await readFile(join(dir, ".state", "AII", "AII-20.json"), "utf8"));
+    expect(state).toMatchObject({ status: "failed", failurePhase: "implementation" });
+    expect(state.comments).toEqual([]);
+    const snap = await provider(mappings).fetchAIImplementSnapshot();
+    expect(snap.readyForImplementation.map((i) => i.identifier)).not.toContain("AII-20");
+    expect(snap.needsPlanning.map((i) => i.identifier)).not.toContain("AII-20");
+
+    await p.markMerged("filesystem:AII:AII-21", "AII");
+    await expect(p.parkForHuman("filesystem:AII:AII-21", "AII", "planning")).resolves.toBe(false);
+  });
+
   it("serializes concurrent comments without losing updates", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-8.md", "---\ntitle: Comment storm\n---\n\nCollect comments.");
     const p = provider({ AII: mapping({ directory: dir }) });
 
@@ -219,13 +199,13 @@ describe("FilesystemProvider", () => {
   });
 
   it("preserves terminal state against late failures, resets, and PR callbacks", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "AII-9.md", "---\ntitle: Terminal guard\n---\n\nDone.");
     const p = provider({ AII: mapping({ directory: dir }) });
 
     await p.markMerged("filesystem:AII:AII-9", "AII");
     await expect(p.markImplementationFailed("filesystem:AII:AII-9", "AII", "late")).resolves.toBe(false);
-    await expect(p.clearWorkingState("filesystem:AII:AII-9", "AII")).resolves.toBe(false);
+    await expect(p.clearWorkingState("filesystem:AII:AII-9", "AII", "implementation")).resolves.toBe(false);
     await expect(p.markPrReady("filesystem:AII:AII-9", "AII", "https://github.com/acme/widgets/pull/9")).resolves.toBe(false);
 
     const state = JSON.parse(await readFile(join(dir, ".state", "AII", "AII-9.json"), "utf8"));
@@ -235,8 +215,8 @@ describe("FilesystemProvider", () => {
   });
 
   it("ignores symlinked task files", async () => {
-    const dir = await tempTicketDir();
-    const target = join(await tempTicketDir(), "target.md");
+    const dir = testDir("fs-provider");
+    const target = join(testDir("fs-provider"), "target.md");
     await writeFile(target, "---\ntitle: Linked\nid: AII-10\n---\n\nIgnore.", "utf8");
     await symlink(target, join(dir, "AII-10.md"));
 
@@ -245,15 +225,15 @@ describe("FilesystemProvider", () => {
   });
 
   it("accepts an explicit identifier independently of the filename", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "version-endpoint.md", "---\ntitle: Version endpoint\nid: LOCAL-1\n---\nImplement.");
     const snapshot = await provider({ LOCAL: mapping({ directory: dir }) }).fetchAIImplementSnapshot();
     expect(snapshot.needsPlanning[0]?.identifier).toBe("LOCAL-1");
   });
 
   it.each(["root", "scope", "file"])("refuses a symlinked state %s without writing outside the ticket directory", async (kind) => {
-    const dir = await tempTicketDir();
-    const outside = await tempTicketDir();
+    const dir = testDir("fs-provider");
+    const outside = testDir("fs-provider");
     await writeTask(dir, "LOCAL-2.md", "---\ntitle: State safety\n---\nImplement.");
     if (kind === "root") await symlink(outside, join(dir, ".state"));
     if (kind === "scope") {
@@ -272,15 +252,15 @@ describe("FilesystemProvider", () => {
   });
 
   it("serializes writes across provider replacements and ignores stale planning callbacks", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "LOCAL-3.md", "---\ntitle: Restart safety\n---\nImplement.");
     const mappings = { LOCAL: mapping({ directory: dir }) };
     const first = provider(mappings);
     const second = provider(mappings);
     const id = "filesystem:LOCAL:LOCAL-3";
-    await first.markPlanComplete(id, "LOCAL");
+    await first.markPlanComplete(id, "LOCAL", { awaitApproval: false });
     await second.markImplementing(id, "LOCAL");
-    await first.markPlanComplete(id, "LOCAL");
+    await first.markPlanComplete(id, "LOCAL", { awaitApproval: false });
     await first.markPlanningFailed(id, "LOCAL", "stale");
     expect((await second.fetchAIImplementSnapshot()).inProgressCountsByScope).toEqual({ LOCAL: 1 });
     await Promise.all([first.postComment(id, "first"), second.postComment(id, "second")]);
@@ -289,7 +269,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("archives completed tickets after merge while keeping details lifecycle and key lookup available", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await writeTask(dir, "LOCAL-4.md", "---\ntitle: Completed archive\n---\nDone.");
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     const id = "filesystem:LOCAL:LOCAL-4";
@@ -312,7 +292,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("reconciles preexisting completed root files during snapshot polling", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-5";
     await writeTask(dir, "LOCAL-5.md", "---\ntitle: Preexisting completed\n---\nDone.");
     await mkdir(join(dir, ".state", "LOCAL"), { recursive: true });
@@ -334,8 +314,26 @@ describe("FilesystemProvider", () => {
     });
   });
 
+  it("refuses an unmerged-close write for an archived failed task", async () => {
+    const dir = testDir("fs-close-archived");
+    const id = "filesystem:LOCAL:LOCAL-1";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-1.md", "---\ntitle: Archived task\n---\nNeeds a human.");
+    await p.markImplementationFailed(id, "LOCAL", "needs a human");
+    await expect(p.archiveFailed(id, "LOCAL", "implementation")).resolves.toBe(true);
+    const statePath = join(dir, ".state", "LOCAL", "LOCAL-1.json");
+    const before = await readFile(statePath, "utf8");
+    vi.mocked(writeFile).mockClear();
+
+    await expect(p.markPrClosedUnmerged(id, "LOCAL", "https://github.com/acme/widgets/pull/1")).resolves.toBe(false);
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(await readFile(statePath, "utf8")).toBe(before);
+    expect(await p.readIssueDetails(id)).toMatchObject({ location: "failed" });
+  });
+
   it("explicitly archives failed tickets and retries them without dropping history", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-6";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "retry-me.md", "---\ntitle: Retry me\nid: LOCAL-6\n---\nTry again.");
@@ -359,7 +357,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("archives exhausted active tickets after watchdog reset by stamping failed state before moving", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const planningId = "filesystem:LOCAL:LOCAL-17";
     const implementationId = "filesystem:LOCAL:LOCAL-18";
     const terminalId = "filesystem:LOCAL:LOCAL-19";
@@ -369,9 +367,9 @@ describe("FilesystemProvider", () => {
     await writeTask(dir, "LOCAL-19.md", "---\ntitle: Has PR\n---\nDo not archive.");
 
     await p.markPlanningStarted(planningId, "LOCAL");
-    await expect(p.clearWorkingState(planningId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(planningId, "LOCAL", "planning")).resolves.toBe(true);
     await p.markImplementing(implementationId, "LOCAL");
-    await expect(p.clearWorkingState(implementationId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(implementationId, "LOCAL", "implementation")).resolves.toBe(true);
     await p.markPrReady(terminalId, "LOCAL", "https://github.com/acme/widgets/pull/19");
 
     await expect(p.archiveFailed(planningId, "LOCAL", "planning")).resolves.toBe(true);
@@ -392,7 +390,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("recovers retry when a previous restore moved the file but failed before state reset", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-20";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-20.md", "---\ntitle: Root failed retry\n---\nRetry recovery.");
@@ -407,7 +405,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("archives exhausted dispatch failures before a runner created state", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-22";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-22.md", "---\ntitle: Never started\n---\nRunner unavailable.");
@@ -417,7 +415,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("retries implementation failures to plan-approved and refuses known PR histories", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-7";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-7.md", "---\ntitle: Retry implementation\n---\nTry implementation again.");
@@ -435,7 +433,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("does not dispatch archived failed tickets or manual root moves without retry reset", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-8";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-8.md", "---\ntitle: Manual restore\n---\nKeep failed.");
@@ -455,7 +453,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("ignores stale callbacks for archived failures but accepts comments and late merges", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-16";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-16.md", "---\ntitle: Late callbacks\n---\nCallbacks.");
@@ -463,9 +461,9 @@ describe("FilesystemProvider", () => {
     await p.markPlanningFailed(id, "LOCAL", "manual");
     await p.archiveFailed(id, "LOCAL", "planning");
     await p.markPlanningStarted(id, "LOCAL");
-    await p.markPlanComplete(id, "LOCAL");
+    await p.markPlanComplete(id, "LOCAL", { awaitApproval: false });
     await p.markImplementing(id, "LOCAL");
-    await expect(p.clearWorkingState(id, "LOCAL")).resolves.toBe(false);
+    await expect(p.clearWorkingState(id, "LOCAL", "implementation")).resolves.toBe(false);
     await p.postComment(id, "late comment");
     await expect(p.readIssueDetails(id)).resolves.toMatchObject({
       location: "failed",
@@ -486,7 +484,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("refuses duplicate ids across active completed and failed locations", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     await mkdir(join(dir, "completed"));
     await mkdir(join(dir, "failed"));
     await writeTask(dir, "LOCAL-9.md", "---\ntitle: Active\n---\nA.");
@@ -504,7 +502,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("refuses archive and restore collisions without overwriting files", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-11";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-11.md", "---\ntitle: Collide\n---\nOriginal.");
@@ -531,7 +529,7 @@ describe("FilesystemProvider", () => {
   });
 
   it.each(["archive", "restore"])("refuses a destination created concurrently during %s", async (operation) => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-21";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     await writeTask(dir, "LOCAL-21.md", "---\ntitle: Original\n---\nOriginal contents.");
@@ -553,8 +551,8 @@ describe("FilesystemProvider", () => {
   });
 
   it("skips symlink archive directories and shared-root archival", async () => {
-    const dir = await tempTicketDir();
-    const outside = await tempTicketDir();
+    const dir = testDir("fs-provider");
+    const outside = testDir("fs-provider");
     await symlink(outside, join(dir, "failed"));
     const id = "filesystem:LOCAL:LOCAL-13";
     const p = provider({ LOCAL: mapping({ directory: dir }) });
@@ -580,7 +578,7 @@ describe("FilesystemProvider", () => {
   });
 
   it("keeps active clearWorkingState retry behavior unchanged", async () => {
-    const dir = await tempTicketDir();
+    const dir = testDir("fs-provider");
     const p = provider({ LOCAL: mapping({ directory: dir }) });
     const planningId = "filesystem:LOCAL:LOCAL-14";
     const implementationId = "filesystem:LOCAL:LOCAL-15";
@@ -588,13 +586,318 @@ describe("FilesystemProvider", () => {
     await writeTask(dir, "LOCAL-15.md", "---\ntitle: Implementation retry\n---\nImplement again.");
 
     await p.markPlanningFailed(planningId, "LOCAL", "temporary");
-    await expect(p.clearWorkingState(planningId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(planningId, "LOCAL", "planning")).resolves.toBe(true);
     await p.markImplementing(implementationId, "LOCAL");
     await p.markImplementationFailed(implementationId, "LOCAL", "temporary");
-    await expect(p.clearWorkingState(implementationId, "LOCAL")).resolves.toBe(true);
+    await expect(p.clearWorkingState(implementationId, "LOCAL", "implementation")).resolves.toBe(true);
 
     const snap = await p.fetchAIImplementSnapshot();
     expect(snap.needsPlanning.map((issue) => issue.id)).toEqual([planningId]);
     expect(snap.readyForImplementation.map((issue) => issue.id)).toEqual([implementationId]);
   });
+});
+
+describe("FilesystemProvider.fetchSetupFacts", () => {
+  it("resolves each directory as the poll does, through symlinks, and writes nothing", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const root = testDir("fs-setup");
+    const target = join(root, "target");
+    await mkdir(target);
+    await writeFile(join(root, "file"), "file");
+    await symlink(target, join(root, "alias"));
+    const mappings = Object.fromEntries(["target", "alias", "file", "missing"].map((key) => [key, mapping({ directory: join(root, key) })]));
+    const before = await readdir(root);
+
+    const facts = await provider(mappings).fetchSetupFacts(Object.keys(mappings));
+
+    expect(facts).toEqual({
+      kind: "filesystem",
+      directories: {
+        target: { directory: target, fault: null },
+        alias: { directory: join(root, "alias"), fault: null },
+        file: { directory: join(root, "file"), fault: "missing" },
+        missing: { directory: join(root, "missing"), fault: "missing" },
+      },
+    });
+    expect(await readdir(root)).toEqual(before);
+    expect(await readdir(target)).toEqual([]);
+  });
+
+  it("asks for write and search access together, and records a directory missing either", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const root = testDir("fs-setup-no-search");
+    // Search denied alone: a check asking only for write access would pass this directory.
+    vi.mocked(access).mockImplementationOnce(async (_path, mode) => {
+      if (mode !== undefined && (mode & constants.X_OK) !== 0) throw new Error("EACCES");
+    });
+
+    const facts = await provider({ X: mapping({ directory: root }) }).fetchSetupFacts(["X"]);
+
+    expect(access).toHaveBeenLastCalledWith(root, constants.W_OK | constants.X_OK);
+    expect(facts.directories.X).toEqual({ directory: root, fault: "not-writable" });
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  it("reads only the Filesystem projects it is asked for", async () => {
+    const root = testDir("fs-setup-scope");
+    const facts = await provider({
+      LOCAL: mapping({ directory: root }),
+      ELSEWHERE: makeMapping({ ticketingProvider: "linear" }),
+    }).fetchSetupFacts(["LOCAL", "ELSEWHERE"]);
+
+    expect(Object.keys(facts.directories)).toEqual(["LOCAL"]);
+  });
+});
+
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
+
+for (const planningEnabled of [true, false]) {
+  runChildIssueContract(`FilesystemProvider planning=${planningEnabled}`, async () => {
+    const directory = testDir("fs-child-contract");
+    await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+    const mappings = { TEAM: mapping({ directory, planningEnabled }) };
+    return { provider: provider(mappings), parentId: "filesystem:TEAM:TEST-1", scopeKey: "TEAM", inspect: async (identity) => {
+      const restarted = provider(mappings);
+      const issue = (await restarted.findByKey(identity.identifier))!;
+      const snap = await restarted.fetchAIImplementSnapshot();
+      return { title: issue.title, body: issue.description!, parentId: `filesystem:TEAM:${issue.parentRef?.identifier}`,
+        scopeKey: issue.scopeKey, pickupReady: (planningEnabled ? snap.needsPlanning : snap.readyForImplementation).some((i) => i.id === identity.id) };
+    } };
+  });
+}
+
+it("discovers marked filesystem children across active and terminal states within their scope", async () => {
+  const directory = testDir("fs-review-discovery");
+  await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+  const mappings = { TEAM: mapping({ directory }), OTHER: mapping({ directory: testDir("fs-other") }) };
+  const p = provider(mappings);
+  const child = await p.createChildIssue("filesystem:TEAM:TEST-1", "TEAM", {
+    title: "[roll-up-review] acme/repo#1 " + "a".repeat(40) + " Fix blockers", body: "Blocking body",
+  });
+  await p.postComment(child.id, "Review handoff");
+  for (const terminal of [false, true]) {
+    if (terminal) await p.markMerged(child.id, "TEAM");
+    const page = await provider(mappings).listIssuesPage({ ...mappings.TEAM, teamKey: "TEAM" }, null, { titlePrefix: "[roll-up-review]" });
+    expect(page.pageInfo.hasNextPage).toBe(false);
+    expect(page.issues).toHaveLength(1);
+    expect(page.issues[0]).toMatchObject({ id: child.id, parent: { identifier: "TEST-1" },
+      description: "Blocking body", comments: { nodes: [expect.objectContaining({ body: "Review handoff" })] } });
+  }
+  expect((await p.listIssuesPage({ ...mappings.OTHER, teamKey: "OTHER" }, null)).issues).toEqual([]);
+});
+
+it("creates concurrent filesystem children without overwriting tasks", async () => {
+  const directory = testDir("fs-child-concurrent");
+  await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+  const p = provider({ TEAM: mapping({ directory }) });
+  const identities = await Promise.all(Array.from({ length: 3 }, () =>
+    p.createChildIssue("filesystem:TEAM:TEST-1", "TEAM", { title: "Child", body: "Body" })));
+  expect(new Set(identities.map((i) => i.id)).size).toBe(3);
+  expect((await p.fetchAIImplementSnapshot()).needsPlanning).toHaveLength(4);
+  await expect(p.createChildIssue("missing", "TEAM", { title: "Child", body: "Body" })).rejects.toThrow(/parent/);
+});
+
+for (const fail of [false, true]) {
+  it(`keeps partial child output invisible while writing (failure=${fail})`, async () => {
+    const directory = testDir("fs-child-publication");
+    await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+    const p = provider({ TEAM: mapping({ directory }) });
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(writeFile).mockImplementationOnce(async (path, data, options) => {
+      await actual.writeFile(path, String(data).slice(0, String(data).indexOf("---\n", 4) + 4), options);
+      expect((await p.fetchAIImplementSnapshot()).needsPlanning.map((i) => i.identifier)).toEqual(["TEST-1"]);
+      if (fail) throw new Error("partial write failed");
+      await actual.writeFile(path, data);
+    });
+    const creation = p.createChildIssue("filesystem:TEAM:TEST-1", "TEAM", { title: "Child", body: "Complete body" });
+    if (fail) {
+      await expect(creation).rejects.toThrow("partial write failed");
+      expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
+      expect((await readdir(directory)).filter((f) => f !== ".state")).toEqual(["TEST-1.md"]);
+    } else {
+      const child = await creation;
+      expect((await p.findByKey(child.identifier))?.description).toBe("Complete body");
+      expect((await readdir(directory)).some((f) => f.endsWith(".tmp"))).toBe(false);
+    }
+    expect((await p.fetchAIImplementSnapshot()).needsPlanning).toHaveLength(fail ? 1 : 2);
+  });
+}
+
+it("does not overwrite a task that appears before child publication", async () => {
+  const directory = testDir("fs-child-collision");
+  await writeTask(directory, "TEST-1.md", "---\ntitle: Parent\n---\nParent body");
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  let destination = "";
+  vi.mocked(link).mockImplementationOnce(async (source, target) => {
+    destination = String(target);
+    await actual.writeFile(target, "Existing task");
+    return actual.link(source, target);
+  });
+  await expect(provider({ TEAM: mapping({ directory }) }).createChildIssue(
+    "filesystem:TEAM:TEST-1", "TEAM", { title: "Child", body: "Body" },
+  )).rejects.toThrow();
+  expect(await readFile(destination, "utf8")).toBe("Existing task");
+  expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
+  expect((await readdir(directory)).some((f) => f.endsWith(".tmp"))).toBe(false);
+});
+
+describe("listIssueStatuses", () => {
+  async function fixture() {
+    const directory = testDir("fs-statuses");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    const p = provider({ TEAM: config });
+    await mkdir(join(directory, ".state", "TEAM"), { recursive: true });
+    return { directory, config, p };
+  }
+
+  async function task(directory: string, status: string, options: {
+    location?: "completed" | "failed"; age?: number; failurePhase?: string;
+  } = {}) {
+    const target = options.location ? join(directory, options.location) : directory;
+    await mkdir(target, { recursive: true });
+    await writeTask(target, "TEST-1.md", "---\ntitle: Status task\n---\nBody");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+      version: 1, status, comments: [], prUrls: [], failurePhase: options.failurePhase,
+      updatedAt: new Date(Date.now() - (options.age ?? 0) * 86400000).toISOString(),
+    }));
+  }
+
+  it.each([
+    ["ready", "ready", null], ["planning", "planning", null],
+    ["plan-approved", "plan-approved", null], ["implementing", "implementing", null],
+    ["pr-ready", "pr-ready", null], ["failed", "failed", "planning"],
+    ["failed", "failed", "implementation"], ["failed", "failed", null],
+    ["completed", "merged", null], ["cancelled", null, null],
+    ["unfamiliar", "unknown", null],
+  ])("normalizes %s to %s with phase %s", async (status, state, phase) => {
+    const { directory, config, p } = await fixture();
+    await task(directory, status, { failurePhase: phase ?? undefined });
+    const result = await p.listIssueStatuses(config);
+    if (state === null) expect(result).toEqual([]);
+    else expect(result).toEqual([{
+      id: "filesystem:TEAM:TEST-1", identifier: "TEST-1", title: "Status task",
+      url: "/admin?filesystemIssue=filesystem%3ATEAM%3ATEST-1",
+      state, phase, labels: [], workflowState: status, updatedAt: expect.any(Number),
+    }]);
+    expect(await readFile(join(directory, "TEST-1.md"), "utf8")).toContain("Status task");
+  });
+
+  it("keeps an active task with a malformed timestamp as null", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "implementing");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+      version: 1, status: "implementing", comments: [], prUrls: [], updatedAt: "invalid",
+    }));
+    expect(await p.listIssueStatuses(config)).toMatchObject([{
+      identifier: "TEST-1", state: "implementing", updatedAt: null,
+    }]);
+  });
+
+  it.each(["completed", "failed"] as const)("filters %s archives by timestamp", async (location) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-16T12:00:00Z"));
+    try {
+      const { directory, config, p } = await fixture();
+      for (const age of [6, 7, 8]) {
+        await task(directory, location, { location, age });
+        const result = await p.listIssueStatuses(config);
+        expect(result).toHaveLength(age <= 7 ? 1 : 0);
+        if (age <= 7) expect(result[0]).toMatchObject({
+          state: location === "completed" ? "merged" : "failed",
+          updatedAt: Date.now() - age * 86400000,
+        });
+      }
+      await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+        version: 1, status: location, comments: [], prUrls: [], updatedAt: "invalid",
+      }));
+      expect(await p.listIssueStatuses(config)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps old active tasks", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "completed", { age: 8 });
+    expect(await p.listIssueStatuses(config)).toMatchObject([{ state: "merged" }]);
+  });
+
+  it.each([true, false])("defaults missing state with planning=%s without writing", async (planningEnabled) => {
+    const { directory, config, p } = await fixture();
+    config.planningEnabled = planningEnabled;
+    await writeTask(directory, "TEST-1.md", "---\ntitle: No state\n---\nBody");
+    await mkdir(join(directory, "completed"));
+    await writeTask(join(directory, "completed"), "TEST-2.md", "---\ntitle: Archived\n---\nBody");
+    expect(await p.listIssueStatuses(config)).toMatchObject([{
+      state: planningEnabled ? "ready" : "plan-approved", phase: null, updatedAt: null,
+      workflowState: planningEnabled ? "ready" : "plan-approved",
+    }]);
+    expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
+  });
+
+  it("rejects invalid state JSON alongside a valid task", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "ready");
+    await writeTask(directory, "TEST-2.md", "---\ntitle: Broken\n---\nBody");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-2.json"), "{invalid");
+    await expect(p.listIssueStatuses(config)).rejects.toThrow(/Invalid state/);
+  });
+
+  it("rejects a missing configured task root", async () => {
+    const directory = join(testDir("fs-statuses-missing"), "missing");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a configured task root that is a regular file", async () => {
+    const directory = join(testDir("fs-statuses-file"), "file");
+    await writeFile(directory, "not a directory");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).rejects.toThrow("task root is not a directory");
+  });
+
+  it("allows an empty task root without optional archive directories", async () => {
+    const directory = testDir("fs-statuses-empty");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).resolves.toEqual([]);
+  });
+
+  it("rejects directory read errors", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "ready");
+    vi.mocked(readdir).mockRejectedValueOnce(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+    await expect(p.listIssueStatuses(config)).rejects.toThrow("permission denied");
+  });
+
+  it("only scans the requested mapping", async () => {
+    const { directory, config } = await fixture();
+    await task(directory, "ready");
+    const other = mapping({ directory: testDir("fs-other"), teamKey: "OTHER" });
+    await writeTask(other.ticketingConfig.kind === "filesystem" ? other.ticketingConfig.directory : "", "TEST-2.md", "invalid");
+    expect(await provider({ TEAM: config, OTHER: other }).listIssueStatuses(config)).toHaveLength(1);
+  });
+});
+
+runPrClosedUnmergedContract("FilesystemProvider", async (terminal) => {
+  const dir = testDir("fs-close");
+  await writeTask(dir, "TASK-1.md", "---\ntitle: Task\n---\nWork");
+  const p = provider({ TEAM: mapping({ directory: dir }) });
+  const id = "filesystem:TEAM:TASK-1";
+  await p.markPrReady(id, "TEAM", "url");
+  if (terminal) await p.markMerged(id, "TEAM");
+  const path = join(dir, ".state", "TEAM", "TASK-1.json");
+  const before = await readFile(path, "utf8");
+  return { provider: p, issueId: id, scopeKey: "TEAM", restartSentence: "To run it again, set the task status to its pickup value.",
+    verify: async (terminal, comment) => {
+      const after = await readFile(path, "utf8");
+      if (terminal) expect(after).toBe(before);
+      else {
+        const state = JSON.parse(after);
+        expect(state.status).toBe("cancelled");
+        expect(state.comments).toHaveLength(JSON.parse(before).comments.length + 1);
+        expect(state.comments.at(-1).body).toBe(comment);
+        expect(await p.markPrClosedUnmerged(id, "TEAM", "url")).toBe(false);
+        expect(await readFile(path, "utf8")).toBe(after);
+      }
+    } };
 });

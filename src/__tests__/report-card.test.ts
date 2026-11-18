@@ -1,37 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { readFileSync } from "node:fs";
+import type { ModelPrice } from "../restate/model-prices.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
-import type * as LogModule from "../log.js";
-import type * as StepLogModule from "../step-log.js";
-import type * as ReconModule from "../reconciliation.js";
 import type * as RcModule from "../report-card.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
-let log: typeof LogModule;
-let stepLog: typeof StepLogModule;
-let recon: typeof ReconModule;
 let rc: typeof RcModule;
 
 beforeEach(async () => {
-  const { vi } = await import("vitest");
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `rc-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  stepLog = await import("../step-log.js");
-  recon = await import("../reconciliation.js");
-  rc = await import("../report-card.js");
-
-  log.initLogTable();
-  stepLog.initStepLogTable();
-  recon.initReconciliationTable();
+  ({ dedup, rc } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), rc: () => import("../report-card.js") } })
+  ).modules);
 
   // Initialise pr_merge_capture manually (normally lazy-init inside capturePrMerge)
   dedup.getDb().exec(`
@@ -53,11 +33,6 @@ beforeEach(async () => {
   `);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
-
 // ---- Helpers ----
 
 function insertDispatch(opts: {
@@ -69,14 +44,15 @@ function insertDispatch(opts: {
   conclusion?: string;
   prUrl?: string;
   dispatchedAt?: number;
+  dispatchId?: string;
 }): number {
   const db = dedup.getDb();
   const now = opts.dispatchedAt ?? Date.now();
   const result = db
     .prepare(
       `INSERT INTO dispatch_log
-         (issue_id, issue_identifier, repo, dispatched_at, phase, status, conclusion, pr_url)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (issue_id, issue_identifier, repo, dispatched_at, phase, status, conclusion, pr_url, dispatch_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       opts.issueId ?? "issue-default",
@@ -87,6 +63,7 @@ function insertDispatch(opts: {
       opts.status ?? "completed",
       opts.conclusion ?? null,
       opts.prUrl ?? null,
+      opts.dispatchId ?? null,
     );
   return Number(result.lastInsertRowid);
 }
@@ -125,6 +102,72 @@ function insertSubStep(
 // ---- getIssueReportCard tests ----
 
 describe("getIssueReportCard", () => {
+  it("keeps reported totals separate from estimates across dispatches without storing estimates", () => {
+    const prices: ModelPrice[] = JSON.parse(readFileSync(new URL("./fixtures/contracts/model-prices/several-models.json", import.meta.url), "utf8")).response.body.prices;
+    const first = insertDispatch({ issueIdentifier: "AII-EST", dispatchId: "estimate-first" });
+    insertDispatch({ issueIdentifier: "AII-EST", dispatchId: "estimate-second" });
+    insertFeedbackLoopStep(first, { approved: true, iterations: 1, terminationReason: "approved", passes: [
+      { iteration: 1, costUsd: 2, implementOutcome: "success", reviewApproved: true },
+    ] });
+    const db = dedup.getDb();
+    const insert = db.prepare(`INSERT INTO model_invocation_attribution
+      (invocation_id, dispatch_id, stage, profile_id, profile_revision, agent, provider, model, auth_mode, status, started_at, usage_json)
+      VALUES (?, ?, 'implementation', 'test', 1, 'codex', 'openai', ?, 'test', 'succeeded', 1, ?)`);
+    const usages = [
+      { tokensIn: 100, tokensOut: 10, costUsd: 2, costStatus: "reported" },
+      { tokensIn: 100, tokensOut: 10, costStatus: "unavailable" },
+      { tokensIn: 0, tokensOut: 0, costStatus: "unavailable" },
+      { tokensIn: 100, tokensOut: null, costStatus: "unavailable" },
+      { tokensIn: 100, tokensOut: 10, costStatus: "unavailable" },
+    ];
+    usages.forEach((usage, i) => insert.run(`est-${i}`, i < 2 ? "estimate-first" : "estimate-second", i === 4 ? "unknown" : "a-dated", JSON.stringify(usage)));
+    const before = db.prepare("SELECT * FROM model_invocation_attribution").all();
+    expect(rc.getIssueReportCard("AII-EST", prices)!.totals).toEqual({
+      dispatches: 2, passes: 1, costUsd: 2, estimatedCostUsd: 0.00031234567890123456789, unpricedCalls: 2,
+    });
+    expect(rc.getIssueReportCard("AII-EST")!.totals).toMatchObject({ costUsd: 2, estimatedCostUsd: null, unpricedCalls: 4 });
+    expect(db.prepare("SELECT * FROM model_invocation_attribution").all()).toEqual(before);
+    db.prepare("DELETE FROM model_invocation_attribution WHERE invocation_id != 'est-2'").run();
+    expect(rc.getIssueReportCard("AII-EST", prices)!.totals.estimatedCostUsd).toBe(0);
+    expect(before.map(row => (row as { usage_json: string }).usage_json)).toEqual(usages.map(usage => JSON.stringify(usage)));
+  });
+
+  describe("review-fix rounds", () => {
+    it.each([
+      { legacy: 0, restate: 2, expected: 2 },
+      { legacy: 1, restate: 1, expected: 2 },
+      { legacy: 2, restate: 0, expected: 2 },
+      { legacy: 0, restate: 0, expected: 0 },
+      { legacy: 2, restate: 3, expected: 5 },
+    ])("counts $legacy Legacy dispatches and $restate Restate attempts as $expected rounds", ({ legacy, restate, expected }) => {
+      insertDispatch({ issueIdentifier: "AII-ROUNDS" });
+      const db = dedup.getDb();
+      const queue = db.prepare(`INSERT INTO review_fix_queue
+        (issue_id, issue_identifier, repo, pr_number, reason, created_at, updated_at)
+        VALUES ('issue-rounds', ?, 'org/repo', ?, 'review', 1, 1)`);
+      const queueId = Number(queue.run("AII-ROUNDS", 1).lastInsertRowid);
+      const otherQueueId = Number(queue.run("AII-OTHER", 2).lastInsertRowid);
+      const dispatch = db.prepare(`INSERT INTO review_fix_dispatches
+        (queue_id, dispatch_id, repo, pr_number, created_at)
+        VALUES (?, ?, 'org/repo', 1, 1)`);
+      for (let i = 0; i < legacy; i++) dispatch.run(queueId, `legacy-${i}`);
+      const attempt = db.prepare(`INSERT INTO review_fix_attempts
+        (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+         issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+        VALUES (?, ?, 'mapping', '1', 'org/repo', 1, 'linear', 'issue-rounds', 'restate', 'created', 1, 2, ?, '[]')`);
+      const snapshots = [
+        ...Array.from({ length: restate }, () => ({ taskText: "Fix review", queueCursor: { queueId, eventId: 1 } })),
+        { taskText: "Fix review", queueCursor: null },
+        { taskText: "Fix review" },
+        { taskText: "Fix review", queueCursor: { queueId: otherQueueId, eventId: 2 } },
+        { taskText: "Fix review", queueCursor: { queueId: otherQueueId + 1, eventId: 3 } },
+      ];
+      snapshots.forEach((snapshot, i) => attempt.run(`attempt-${i}`, `restate-${i}`, JSON.stringify(snapshot)));
+
+      expect(rc.getIssueReportCard("AII-ROUNDS")!.reviewFixRounds).toBe(expected);
+    });
+  });
+
   it("returns null for unknown identifier", () => {
     expect(rc.getIssueReportCard("AII-999")).toBeNull();
   });
@@ -934,5 +977,141 @@ describe("getFleetReport", () => {
       const r = report.byRepo.find((x) => x.repo === "org/rfe");
       expect(r!.avgPasses).toBeCloseTo(1.0);
     });
+  });
+});
+
+describe("getIssueReportCard restate (AII-1129)", () => {
+  async function admitPlanning(dispatchId: string, lifecycleOwner: { kind: "legacy" } | { kind: "restate"; attemptId: string }) {
+    const admission = await import("../dispatch-admission.js");
+    const res = admission.acquire({
+      dispatchId,
+      mappingKey: "m",
+      scope: { kind: "issue", issueScope: "s", issueId: `issue-${dispatchId}` },
+      kind: "planning",
+      backend: "fly-machines",
+      lifecycleOwner,
+      cap: 5,
+    });
+    expect(res.ok).toBe(true);
+    return admission;
+  }
+
+  it("returns null for a planning row with a real Legacy admission (AII-1425)", async () => {
+    await admitPlanning("plan-legacy", { kind: "legacy" });
+    insertDispatch({ issueIdentifier: "AII-PL", phase: "planning", dispatchId: "plan-legacy" });
+    expect(rc.getIssueReportCard("AII-PL")!.runs[0].restate).toBeNull();
+  });
+
+  it("returns PlanningRun for a Restate-owned planning row, even after release (AII-1425)", async () => {
+    const admission = await admitPlanning("plan-rs", { kind: "restate", attemptId: "att-1" });
+    admission.releaseByDispatchId("plan-rs", "finalized");
+    insertDispatch({ issueIdentifier: "AII-PR", phase: "planning", dispatchId: "plan-rs", status: "completed", conclusion: "success" });
+    expect(rc.getIssueReportCard("AII-PR")!.runs[0].restate).toEqual({ service: "PlanningRun", key: "plan-rs" });
+  });
+
+  it("does not fabricate or throw when the admissions table is absent (AII-1425)", () => {
+    dedup.getDb().exec("DROP TABLE IF EXISTS dispatch_admissions");
+    insertDispatch({ issueIdentifier: "AII-NT", phase: "planning", dispatchId: "plan-x" });
+    expect(rc.getIssueReportCard("AII-NT")!.runs[0].restate).toBeNull();
+  });
+
+  it("returns null without a dispatch id", () => {
+    insertDispatch({ issueIdentifier: "AII-NO-ID", phase: "kg-refresh" });
+    expect(rc.getIssueReportCard("AII-NO-ID")!.runs[0].restate).toBeNull();
+  });
+
+  it("maps kg-refresh to KgRefresh without admissions", () => {
+    dedup.getDb().exec("DROP TABLE dispatch_admissions");
+    insertDispatch({ issueIdentifier: "AII-KG", phase: "kg-refresh", dispatchId: "kg-1" });
+    expect(rc.getIssueReportCard("AII-KG")!.runs[0].restate).toEqual({ service: "KgRefresh", key: "kg-1" });
+  });
+
+  it("maps a restate-owned implementation row to ImplementationRun and a legacy one to null", async () => {
+    const admission = await import("../dispatch-admission.js");
+    for (const [id, lifecycleOwner] of [["impl-r", { kind: "restate", attemptId: "att-ir" }], ["impl-l", { kind: "legacy" }]] as const) {
+      admission.acquire({
+        dispatchId: id,
+        mappingKey: "m",
+        scope: { kind: "issue", issueScope: "s", issueId: `issue-${id}` },
+        kind: "implementation",
+        backend: "github-actions",
+        lifecycleOwner,
+        cap: 5,
+      });
+    }
+    insertDispatch({ issueIdentifier: "AII-IR", phase: "implementation", dispatchId: "impl-r", dispatchedAt: 1 });
+    insertDispatch({ issueIdentifier: "AII-IR", phase: "implementation", dispatchId: "impl-l", dispatchedAt: 2 });
+    expect(rc.getIssueReportCard("AII-IR")!.runs.map((r) => r.restate)).toEqual([{ service: "ImplementationRun", key: "impl-r" }, null]);
+  });
+
+  it.each([
+    ["rf-1", "ReviewFixAttempt"],
+    ["impl-gap", "ImplementationRun"],
+  ])("maps Restate gap-analysis %s to %s by matching attempt dispatch id", async (dispatchId, service) => {
+    dedup.getDb().prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+      VALUES ('att-rf', 'rf-1', 'm', '1', 'org/repo', 1, 's', 'issue-default',
+              'restate', 'created', 1, 2, '{}', '[]')`).run();
+    const admission = await import("../dispatch-admission.js");
+    admission.acquire({
+      dispatchId,
+      mappingKey: "m",
+      scope: { kind: "issue", issueScope: "s", issueId: "issue-default" },
+      kind: "gap-fill",
+      backend: "fly-machines",
+      lifecycleOwner: { kind: "restate", attemptId: "att-rf" },
+      cap: 5,
+    });
+    insertDispatch({ issueIdentifier: "AII-RF", phase: "gap-analysis", dispatchId });
+    expect(rc.getIssueReportCard("AII-RF")!.runs[0].restate).toEqual({ service, key: dispatchId });
+  });
+});
+
+
+describe("getReviewerScorecard", () => {
+  it("returns zero fixed for a source containing only legacy resolved findings", () => {
+    const now = Date.now();
+    dedup.getDb().prepare(`INSERT INTO review_findings
+      (repo, pr_number, finding_key, source, severity, body, status, first_seen_at, last_seen_at)
+      VALUES ('org/legacy', 1, 'legacy', 'github-review', 'blocking', 'legacy', 'resolved', ?, ?)`).run(now, now);
+    expect(rc.getReviewerScorecard()).toEqual([{
+      source: "github-review", total: 1, fixed: 0, rejected: 0, deferred: 0, ignored: 1, rejectedRate: 0,
+    }]);
+  });
+
+  it("counts first-seen cohorts, explicit fixes and merged open rows across sources and repos", () => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const db = dedup.getDb();
+      const insert = db.prepare(`INSERT INTO review_findings
+        (repo, pr_number, finding_key, source, severity, body, status, disposition, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, 'blocking', 'finding', ?, ?, ?, ?)`);
+      let key = 0;
+      const sources = ["claude-review-summary", "github-review-thread", "ai-implement-internal"];
+      for (const source of sources) {
+        for (const repo of ["org/a", "org/b"]) {
+          for (const [status, disposition, pr] of [
+            ["resolved", "fixed", 1], ["resolved", null, 1], ["rejected", null, 1],
+            ["deferred", null, 1], ["open", null, 1], ["open", null, 2],
+          ] as const) insert.run(repo, pr, String(++key), source, status, disposition, now - 86_400_000, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now - 86_400_001, now);
+          insert.run(repo, 1, String(++key), source, "resolved", "fixed", now + 1, now);
+          db.prepare("INSERT OR IGNORE INTO pr_merge_capture (repo, pr_number, merged_at, captured_at) VALUES (?, 1, ?, ?)").run(repo, now, now);
+        }
+      }
+      expect(rc.getReviewerScorecard({ days: 1 })).toEqual([...sources].sort().map(source => ({
+        source, total: 12, fixed: 2, rejected: 2, deferred: 2, ignored: 4, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ days: 1, repo: "org/a" })).toEqual([...sources].sort().map(source => ({
+        source, total: 6, fixed: 1, rejected: 1, deferred: 1, ignored: 2, rejectedRate: 1 / 6,
+      })));
+      expect(rc.getReviewerScorecard({ repo: "missing" })).toEqual([]);
+      db.exec("DROP TABLE pr_merge_capture");
+      expect(rc.getReviewerScorecard({ days: 1 })[0]!.ignored).toBe(2);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

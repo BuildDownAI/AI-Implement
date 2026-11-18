@@ -1,0 +1,18 @@
+{
+  "request": {
+    "args": {
+      "branch": "feature",
+      "requestedBy": "control-plane"
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "400 {\"code\":400,\"message\":\"Failed to deserialize input: [\\n  {\\n    \\\"code\\\": \\\"invalid_value\\\",\\n    \\\"values\\\": [\\n      \\\"testing\\\",\\n      \\\"main\\\"\\n    ],\\n    \\\"path\\\": [\\n      \\\"args\\\",\\n      \\\"branch\\\"\\n    ],\\n    \\\"message\\\": \\\"Invalid option: expected one of \\\\\\\"testing\\\\\\\"|\\\\\\\"main\\\\\\\"\\\"\\n  }\\n]\",\"source\":\"invocation\"}"
+      }
+    ],
+    "isError": true
+  }
+}

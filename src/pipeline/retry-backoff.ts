@@ -48,6 +48,16 @@ export function computeBackoffMs(
   return Math.min(Math.max(jittered, 0), policy.backoffMaxMs);
 }
 
+/**
+ * Awaited delay (a no-op under NODE_ENV=test). Async rather than `Atomics.wait` so a long
+ * backoff does not block the event loop and with it a SIGTERM handler.
+ */
+export function sleepAsync(ms: number): Promise<void> {
+  if (process.env.NODE_ENV === "test") return Promise.resolve();
+  if (!Number.isFinite(ms) || ms < 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const RETRY_POLICY_INT_RANGES: Record<
   "requestRetries" | "stageRetries" | "pushRetries" | "reviewMaxTurns" | "backoffInitialMs" | "backoffMaxMs",
   [min: number, max: number]

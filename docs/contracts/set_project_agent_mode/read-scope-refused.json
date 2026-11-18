@@ -1,0 +1,18 @@
+{
+  "request": {
+    "args": {
+      "teamKey": "BDS",
+      "mode": "configured"
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "forbidden: set_project_agent_mode requires the admin role"
+      }
+    ],
+    "isError": true
+  }
+}

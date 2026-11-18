@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import type { DispatchAdmissionDeferReason } from "./dispatch-admission.js";
 import { getDb } from "./dedup.js";
 
 export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed" | "completed";
@@ -13,6 +15,8 @@ export interface CommentGapfillQueueItem {
   status: CommentGapfillStatus;
   createdAt: number;
   processedAt: number | null;
+  refusalCount: number;
+  lastRefusalReason: string | null;
 }
 
 export interface EnqueueCommentGapfillInput {
@@ -35,12 +39,14 @@ interface CommentGapfillQueueRow {
   status: CommentGapfillStatus;
   created_at: number;
   processed_at: number | null;
+  refusal_count: number;
+  last_refusal_reason: string | null;
 }
 
-export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number {
+function insertCommentGapfill(input: EnqueueCommentGapfillInput): boolean {
   const now = Date.now();
   const db = getDb();
-  db.prepare(`
+  const result = db.prepare(`
     INSERT OR IGNORE INTO comment_gapfill_queue
       (owner, repo, pr_number, comment_id, commenter, instruction, status, created_at, processed_at)
     VALUES
@@ -55,10 +61,20 @@ export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number
     now,
   });
 
-  const row = db
+  return result.changes > 0;
+}
+
+export function enqueueCommentGapfill(input: EnqueueCommentGapfillInput): number {
+  insertCommentGapfill(input);
+  const row = getDb()
     .prepare("SELECT id FROM comment_gapfill_queue WHERE comment_id = ?")
     .get(input.commentId) as { id: number };
   return row.id;
+}
+
+export function getCommentGapfillItem(id: number): CommentGapfillQueueItem | null {
+  const row = getDb().prepare("SELECT * FROM comment_gapfill_queue WHERE id = ?").get(id) as CommentGapfillQueueRow | undefined;
+  return row ? mapRow(row) : null;
 }
 
 export function claimPendingCommentGapfills(limit = 20): CommentGapfillQueueItem[] {
@@ -70,8 +86,19 @@ export function claimPendingCommentGapfills(limit = 20): CommentGapfillQueueItem
 
 export function markCommentGapfillProcessed(id: number, status: CommentGapfillStatus): void {
   getDb()
-    .prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = ? WHERE id = ?")
+    .prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = MAX(?, COALESCE(processed_at + 1, 0)) WHERE id = ?")
     .run(status, Date.now(), id);
+}
+
+/** Complete the ingress handoff only if the workflow has not touched this row.
+ * processed_at advances on every transition, including pending -> pending refusals.
+ */
+export function markCommentGapfillSubmitted(item: CommentGapfillQueueItem): void {
+  getDb().prepare(`
+    UPDATE comment_gapfill_queue
+    SET status = 'dispatched', processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+    WHERE id = ? AND status = 'pending' AND processed_at IS ?
+  `).run(Date.now(), item.id, item.processedAt);
 }
 
 function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
@@ -86,8 +113,42 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
     status: row.status,
     createdAt: row.created_at,
     processedAt: row.processed_at,
+    refusalCount: row.refusal_count,
+    lastRefusalReason: row.last_refusal_reason,
   };
 }
+
+export const ROLLUP_REVIEW_RETRY_LIMIT = 1;
+
+export const ROLLUP_REVIEW_COMMENTER = "ai-implement-rollup-review";
+
+/** Read only the exact instruction emitted by enqueueRollupReview, including existing rows. */
+export function rollupReviewExpectedHead(instruction: string): string {
+  const match = /^Review the feature-branch roll-up at head ([a-f0-9]{40,64})\. Post an advisory verdict in the PR conversation\.$/i.exec(instruction);
+  if (!match) throw new Error("Cannot read queued roll-up review head");
+  return match[1];
+}
+
+/** Returns true only for a newly inserted head, including across terminal states. */
+export function enqueueRollupReview(input: { owner: string; repo: string; prNumber: number; headSha: string; attempt?: number }): boolean {
+  const attempt = input.attempt ?? 0;
+  if (!Number.isInteger(attempt) || attempt < 0 || attempt > ROLLUP_REVIEW_RETRY_LIMIT) return false;
+  // 48 hash bits fit exactly in a JS number; reserve IDs below the existing
+  // synthetic helpers' -2 billion range and keep real webhook IDs positive.
+  const key: Array<string | number> = ["rollup-review", input.owner, input.repo, input.prNumber, input.headSha];
+  // Keep the original key byte-for-byte for already queued initial reviews.
+  if (attempt > 0) key.push(attempt);
+  const digest = createHash("sha256")
+    .update(JSON.stringify(key))
+    .digest();
+  const commentId = -(digest.readUIntBE(0, 6) + 2_000_000_001);
+  return insertCommentGapfill({
+    owner: input.owner, repo: input.repo, prNumber: input.prNumber,
+    commentId, commenter: ROLLUP_REVIEW_COMMENTER,
+    instruction: `Review the feature-branch roll-up at head ${input.headSha}. Post an advisory verdict in the PR conversation.`,
+  });
+}
+
 
 export const CONFLICT_COMMENTER = "ai-implement-orchestrator";
 
@@ -107,15 +168,15 @@ export function syntheticConflictCommentId(owner: string, repo: string, prNumber
  *  cost — a cap exhausted with zero real attempts — is alerted, not silent. */
 export function countConflictAttempts(owner: string, repo: string, prNumber: number): number {
   const row = getDb().prepare(
-    "SELECT COUNT(*) AS n FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0",
-  ).get(owner, repo, prNumber) as { n: number };
+    "SELECT COUNT(*) AS n FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0 AND commenter=?",
+  ).get(owner, repo, prNumber, CONFLICT_COMMENTER) as { n: number };
   return row.n;
 }
 
 export function hasPendingConflictResolution(owner: string, repo: string, prNumber: number): boolean {
   const row = getDb().prepare(
-    "SELECT 1 FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0 AND status IN ('pending','dispatched') LIMIT 1",
-  ).get(owner, repo, prNumber);
+    "SELECT 1 FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0 AND commenter=? AND status IN ('pending','dispatched') LIMIT 1",
+  ).get(owner, repo, prNumber, CONFLICT_COMMENTER);
   return !!row;
 }
 
@@ -181,4 +242,96 @@ export function sweepOrphanedGapfillRows(): number {
     swept++;
   }
   return swept;
+}
+
+export const PUSH_RETRY_COMMENTER = "ai-implement-orchestrator-push-retry";
+
+/** Same scheme as syntheticConflictCommentId, keyed on the failed row so a row is retried at most once. */
+function syntheticPushRetryCommentId(rowId: number): number {
+  const s = `pushretry#${rowId}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return -(((h >>> 0) % 2_000_000_000) + 1);
+}
+
+/** AII-922: a gap-fill run that failed at `push` (after its work was approved) is not
+ *  re-dispatched by the poll, so its PR would stall. Re-enqueue the latest dispatched row's
+ *  instruction ONCE as a synthetic row. A row that is itself a push retry is never retried,
+ *  and the drain's per-PR dispatch budget still gates the retry. Call BEFORE
+ *  markCommentGapfillRunTerminal, which is what leaves the 'dispatched' state. */
+export function requeueGapfillAfterPushFailure(repoFull: string, prNumber: number): boolean {
+  const db = getDb();
+  const row = db.prepare(
+    "SELECT * FROM comment_gapfill_queue WHERE owner || '/' || repo = ? AND pr_number = ? AND status = 'dispatched' " +
+    "ORDER BY id DESC LIMIT 1",
+  ).get(repoFull, prNumber) as CommentGapfillQueueRow | undefined;
+  // A push-retry row is never retried again; a conflict-resolution row has its own rail and
+  // its instruction must not be replayed under a different commenter.
+  if (!row || row.commenter === PUSH_RETRY_COMMENTER || row.commenter === CONFLICT_COMMENTER) return false;
+  const before = db.prepare("SELECT COUNT(*) AS n FROM comment_gapfill_queue").get() as { n: number };
+  enqueueCommentGapfill({
+    owner: row.owner, repo: row.repo, prNumber: row.pr_number,
+    commentId: syntheticPushRetryCommentId(row.id),
+    commenter: PUSH_RETRY_COMMENTER,
+    instruction: row.instruction,
+  });
+  const after = db.prepare("SELECT COUNT(*) AS n FROM comment_gapfill_queue").get() as { n: number };
+  return after.n > before.n;
+}
+
+/** Non-secret write-ahead intent. Absence from a backend listing never clears it. */
+export interface CommentGapfillLaunch {
+  record: Parameters<typeof import("./log.js").appendLogIfAbsent>[0];
+  target: { owner: string; repo: string; workflowFile: string };
+  /** Frozen Fly identity; optional for GHA, Docker and older intents. */
+  flyApp?: string;
+  accepted: boolean;
+  rejected?: { status: number };
+}
+function launchStore() {
+  const db = getDb();
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_gapfill_launch (
+    dispatch_id TEXT PRIMARY KEY, recovery_json TEXT NOT NULL
+  )`);
+  return db;
+}
+export function stageCommentGapfillLaunch(dispatchId: string, launch: CommentGapfillLaunch): void {
+  launchStore().prepare("INSERT OR IGNORE INTO comment_gapfill_launch VALUES (?, ?)").run(dispatchId, JSON.stringify(launch));
+}
+export function getCommentGapfillLaunch(dispatchId: string): CommentGapfillLaunch | null {
+  const row = launchStore().prepare("SELECT recovery_json FROM comment_gapfill_launch WHERE dispatch_id = ?").get(dispatchId) as { recovery_json: string } | undefined;
+  return row ? JSON.parse(row.recovery_json) as CommentGapfillLaunch : null;
+}
+export function confirmCommentGapfillLaunch(dispatchId: string): void {
+  const launch = getCommentGapfillLaunch(dispatchId);
+  if (launch && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, accepted: true }), dispatchId);
+}
+export function rejectCommentGapfillLaunch(dispatchId: string, status: number): void {
+  const launch = getCommentGapfillLaunch(dispatchId);
+  if (launch && !launch.accepted && !launch.rejected) launchStore().prepare("UPDATE comment_gapfill_launch SET recovery_json = ? WHERE dispatch_id = ?").run(JSON.stringify({ ...launch, rejected: { status } }), dispatchId);
+}
+
+export const MAX_COMMENT_GAPFILL_REFUSALS = 3;
+
+/** Every dispatch keeps its original refusal across interleaved step retries. */
+export function getCommentGapfillRefusal(id: number, dispatchId: string): DispatchAdmissionDeferReason | null {
+  const row = getDb().prepare("SELECT reason FROM comment_gapfill_refusals WHERE queue_item_id = ? AND dispatch_id = ?")
+    .get(id, dispatchId) as { reason: DispatchAdmissionDeferReason } | undefined;
+  return row?.reason ?? null;
+}
+
+export function recordCommentGapfillRefusal(id: number, reason: string, dispatchId: string): void {
+  const db = getDb();
+  db.transaction(() => {
+    const inserted = db.prepare("INSERT OR IGNORE INTO comment_gapfill_refusals VALUES (?, ?, ?)").run(id, dispatchId, reason);
+    if (!inserted.changes) return;
+    db.prepare(`UPDATE comment_gapfill_queue SET
+      refusal_count = refusal_count + 1, last_refusal_reason = ?, last_refusal_dispatch_id = ?,
+      status = CASE WHEN refusal_count + 1 >= ? THEN 'skipped' ELSE 'pending' END,
+      processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+      WHERE id = ? AND status IN ('pending', 'dispatched')
+    `).run(reason, dispatchId, MAX_COMMENT_GAPFILL_REFUSALS, Date.now(), id);
+  })();
+  const item = getCommentGapfillItem(id);
+  console.log(`[comment-gapfill] Admission refused item #${id}: ${reason} (${item?.refusalCount}/${MAX_COMMENT_GAPFILL_REFUSALS}, ${item?.status})`);
 }

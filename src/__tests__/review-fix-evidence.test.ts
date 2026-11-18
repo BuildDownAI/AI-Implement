@@ -1,30 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { describe, it, expect, beforeEach } from "vitest";
 import type Database from "better-sqlite3";
 import type * as DedupModule from "../dedup.js";
 import type * as EvidenceModule from "../review-fix-evidence.js";
 import type { ReviewFixActivityEvent } from "../review-fix-contract.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let evidence: typeof EvidenceModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-evidence-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  evidence = await import("../review-fix-evidence.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ dedup, evidence } = (
+    await testDb({ modules: { dedup: () => import("../dedup.js"), evidence: () => import("../review-fix-evidence.js") } })
+  ).modules);
 });
 
 function makeEvent(input: {
@@ -109,13 +96,6 @@ function insertActiveReservation(db: Database.Database, dispatchId: string) {
     VALUES (@dispatchId, 'APP', 'pr', 'issue-1', '7', 'acme/app', 42,
             'restate', 'implementation', 'github-actions', 10, NULL)`)
     .run({ dispatchId });
-}
-
-function insertPendingInboxDelivery(db: Database.Database, opts: { installationId: string; repository: string; prNumber: number; eventId: string }) {
-  db.prepare(`INSERT INTO review_fix_inbox
-    (authenticated_source, event_id, installation_id, repository, pr_number, kind, payload_json, payload_hash, accepted_at, delivery_state)
-    VALUES ('github-webhook', @eventId, @installationId, @repository, @prNumber, 'feedback', '{}', 'hash', 10, 'pending')`)
-    .run(opts);
 }
 
 describe("appendReviewFixActivityBatch", () => {
@@ -523,6 +503,36 @@ describe("retention and tombstones", () => {
     expect(replayCycle.status).toBe("tombstoned");
   });
 
+  it.each(["fly-machines", "local-docker"])("purges bound %s evidence and retains unbound evidence", (backend) => {
+    const db = dedup.getDb();
+    const now = 1_700_000_000_000;
+    const old = now - evidence.REVIEW_FIX_EVIDENCE_RETENTION_MS - 1_000;
+    for (const [index, executionRef] of [null, "execution-1"].entries()) {
+      const attemptId = `backend-${index}`;
+      const dispatchId = `dispatch-${attemptId}`;
+      insertAttemptWithCompletion(db, attemptId, old, { githubRunId: null, prNumber: 60 + index });
+      db.prepare("UPDATE review_fix_attempts SET execution_backend = ?, execution_ref = ? WHERE attempt_id = ?")
+        .run(backend, executionRef, attemptId);
+      insertActiveReservation(db, dispatchId);
+      db.prepare("UPDATE dispatch_admissions SET backend = ?, released_at = ? WHERE dispatch_id = ?")
+        .run(backend, old, dispatchId);
+      evidence.appendReviewFixActivityBatch({
+        attemptId, producerId: "producer-1",
+        events: [makeEvent({ attemptId, producerId: "producer-1", sequence: 0, payload: "x" })],
+      });
+      evidence.recordReviewFixCycleSummary({
+        attemptId, cycle: 1, dispositions: [], tests: {}, verdict: "x", usage: {}, completedAt: old,
+      });
+    }
+    expect(evidence.sweepExpiredReviewFixEvidence(now).purgedAttemptIds).toEqual(["backend-1"]);
+    expect(evidence.listReviewFixActivity("backend-1", { pageSize: 10 }).events).toHaveLength(0);
+    expect(evidence.listReviewFixCycleSummaries("backend-1")).toHaveLength(0);
+    expect(evidence.isReviewFixEvidenceTombstoned("backend-1")).toBe(true);
+    expect(evidence.listReviewFixActivity("backend-0", { pageSize: 10 }).events).toHaveLength(1);
+    expect(evidence.listReviewFixCycleSummaries("backend-0")).toHaveLength(1);
+    expect(evidence.isReviewFixEvidenceTombstoned("backend-0")).toBe(false);
+  });
+
   it("never purges a long-completed attempt whose execution was never bound (unknown execution)", () => {
     const db = dedup.getDb();
     const now = 1_700_000_000_000;
@@ -577,27 +587,5 @@ describe("retention and tombstones", () => {
     const result = evidence.sweepExpiredReviewFixEvidence(now);
     expect(result.purgedAttemptIds).not.toContain("attempt-conflicted");
     expect(evidence.listReviewFixActivity("attempt-conflicted", { pageSize: 10 }).events).toHaveLength(1);
-  });
-
-  it("never purges a long-completed attempt while its PR still has a non-delivered inbox event, and purges it once delivered", () => {
-    const db = dedup.getDb();
-    const now = 1_700_000_000_000;
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
-
-    insertAttemptWithCompletion(db, "attempt-pending-delivery", now - sevenDaysMs - 1_000, {
-      installationId: "9", repository: "acme/pending", prNumber: 7,
-    });
-    insertPendingInboxDelivery(db, { installationId: "9", repository: "acme/pending", prNumber: 7, eventId: "evt-1" });
-    evidence.appendReviewFixActivityBatch({
-      attemptId: "attempt-pending-delivery", producerId: "producer-1",
-      events: [makeEvent({ attemptId: "attempt-pending-delivery", producerId: "producer-1", sequence: 0, payload: "x" })],
-    });
-
-    const held = evidence.sweepExpiredReviewFixEvidence(now);
-    expect(held.purgedAttemptIds).not.toContain("attempt-pending-delivery");
-
-    db.prepare(`UPDATE review_fix_inbox SET delivery_state = 'delivered' WHERE event_id = 'evt-1'`).run();
-    const released = evidence.sweepExpiredReviewFixEvidence(now);
-    expect(released.purgedAttemptIds).toContain("attempt-pending-delivery");
   });
 });

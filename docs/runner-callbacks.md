@@ -18,20 +18,49 @@ sequenceDiagram
     O->>O: mintRunToken(result), mintRunToken(progress)
     O->>D: RUN_TOKEN, RUN_PROGRESS_TOKEN, callback URL
     D->>R: container environment
-    R->>P: repoProcessEnv() keeps the run tokens
+    R->>P: repoProcessEnv() strips the run tokens
     R->>M: modelProcessEnv() strips the run tokens
     R->>O: POST /runner/progress (progress token, reusable)
     R->>O: POST /runner/result (result token, consumed on first use)
 ```
 
+**Token lifetime.** Implementation and gap-analysis launch tokens (`RUN_TOKEN`, `RUN_PROGRESS_TOKEN`, `RUN_PUBLICATION_TOKEN`) expire after `implementationTtlSeconds(mapping.maxJobMinutes)` (`src/runner-tokens.ts`): the larger of 2 hours and the normalized job timeout plus the 15-minute grace (`JOB_TTL_GRACE_MINUTES`). The default 90-minute timeout therefore still gives 2 hours, and `maxJobMinutes` 240 gives 4 h 15 min, so a long run can still report. An invalid timeout falls back to the 90-minute default. Planning tokens keep `PLANNING_TTL_SECONDS`. The mint sites are `src/implementation-launch.ts`, `dispatchFlyMachine` and `dispatchLocalDocker` (through `tokenTtlSeconds`) and `processReviewFixQueue` in `src/index.ts`, and `src/comment-gapfill-drain.ts`.
+
+**A 2xx from `/runner/result` means the callback was recorded.** A result that cannot be recorded answers a coded 4xx, which the runner logs as `POST failed`: `409 mapping_not_found` (the token's mapping key resolves to no mapping; the body names the key) and, for planning, `404 job_not_found` (no job row for the dispatch; checked before any comment is posted). Either answer follows token consumption, so a retry gets `already_consumed`. A duplicate callback for an already closed row stays 200. `mintRunToken` refuses an empty mapping key, so no token is minted that could hit this.
+
+## Post-push review publication
+
+`POST /runner/review-publication` accepts `{ prNumber, headSha, iteration, body, comments }`
+with a reusable `progress` bearer from an `implementation` or `gap-analysis` run.
+Other phases return 403 `phase_not_allowed` before run lookup or any Restate call.
+Only these two phases perform post-push reviews and already hold publication tokens;
+planning never pushes and has no publication token, while `kg-refresh` does not run
+post-push reviews. It resolves the repository from the token's dispatch
+run record, ignoring repository fields in the request; no PR URL on the run is required.
+Invalid publication fields or a publication exceeding 48,000 UTF-8 bytes return 400 before ingress;
+HTTP bodies exceeding 49,024 bytes return 413. Missing or invalid credentials return 401,
+and a missing run or repository returns 403.
+The route calls `PostPushReviewPublication.publish` through Restate ingress with object
+key `<owner>/<repo>#<prNumber>` and idempotency key
+`<owner>/<repo>#<prNumber>:<headSha>:<iteration>`. Only publication fields enter Restate;
+the bearer and headers stay at the callback boundary. A successful call returns the
+object's result as 200. Sidecar or registration unreadiness and ingress failures return
+503 with `error: "restate-unavailable"`. Unexpected route errors are logged and return
+500 with `error: "Internal server error"`.
+The runner’s `submitPrReview` in `src/pipeline/steps/post-push-review.ts` calls `POST <callbackUrl>/runner/review-publication`; see [In-run: the post-push-review step](review-fix-rail.md#in-run-the-post-push-review-step).
+
 ## Credentials
 
 | Name | Audience | Minted | Carried by | Read by | Verified by | Consumed |
 |---|---|---|---|---|---|---|
-| `RUN_TOKEN` | `result` | `mintRunToken` at dispatch (`src/runner-tokens.ts`) | GHA: `inputs.run_token` into the step env in `workflows/claude-implement.yml`, `claude-plan.yml`, `claude-kg-refresh.yml`. Fly: machine env in `buildSessionMachineConfig` (`src/fly-machines.ts`). Local: container env (`src/local-docker.ts`) | `postRunnerResult` (`src/runner-result.ts`) | `POST /runner/result` with `verifyRunToken(…, "result", { consume: true })` | Yes, on first use |
-| `RUN_PROGRESS_TOKEN` | `progress` | `mintRunToken` at dispatch | Same three carriers | `src/run-autonomous.ts`, `src/run-planning.ts`, `src/pipeline/kg-refresh-run.ts`, `src/pipeline/steps/dependency-auth.ts`, `reference-repos.ts`, `kg-tracker-data.ts` | `POST /runner/progress`, `GET /runner/planning-context`, `POST /api/runner/dependency-token`, `reference-token`, `kg-push-token`, `kg-tracker-data`, all with `{ consume: false }` | No |
-| `RUN_PUBLICATION_TOKEN` | `publication` | `mintRunToken` with a repository claim | Runner env | The push path exchanges it | `POST /api/runner/publication-token` returns a repository write credential; Legacy claims before mint, pilot verifies attempt authority and claims after mint | Yes after a successful exchange; a failed Legacy mint releases only its matching claim, while a failed pilot mint leaves the claim unused |
+| `RUN_TOKEN` | `result` | `mintLaunchTokens` at dispatch (`src/runner-tokens.ts`) | GHA: `inputs.run_token` into the step env in `workflows/claude-implement.yml`, `claude-plan.yml`. Fly: machine env in `buildSessionMachineConfig` (`src/fly-machines.ts`). Local: container env (`src/local-docker.ts`) | `postRunnerResult` (`src/runner-result.ts`) | `POST /runner/result` with `verifyRunToken(…, "result", { consume: true })`. The kg-refresh phase verifies with `{ consume: false }` instead and hands the report to the `KgRefresh` workflow's `report` handler with the dispatch id as idempotency key | Yes, on first use; **not** for kg-refresh, which is verify-only (a duplicate is absorbed by the workflow, a conflicting body refused) |
+| `RUN_PROGRESS_TOKEN` | `progress` | `mintLaunchTokens` at dispatch, for every run kind on every backend (`LAUNCH_TOKEN_AUDIENCES`, `src/runner-tokens.ts`) | Same three carriers | `src/run-autonomous.ts`, `src/run-planning.ts`, `src/pipeline/kg-refresh-run.ts`, `src/pipeline/steps/dependency-auth.ts`, `reference-repos.ts`, `kg-tracker-data.ts` | `POST /runner/progress`, `POST /runner/review-publication`, `GET /runner/planning-context`, `POST /api/runner/dependency-token`, `reference-token`, `kg-tracker-data`, all with `{ consume: false }` | No |
+| `RUN_PUBLICATION_TOKEN` | `publication` | `mintLaunchTokens` with a repository claim, for every run kind except planning, on every backend (`LAUNCH_TOKEN_AUDIENCES`). On GitHub Actions it is sent only when the workflow supports `run_publication_token` | Same three carriers | The push path exchanges it | `POST /api/runner/publication-token` returns a repository write credential; Legacy claims before mint, pilot verifies attempt authority and claims after mint | Yes after a successful exchange; a failed Legacy mint releases only its matching claim, while a failed pilot mint leaves the claim unused |
 | `RUNNER_CALLBACK_URL` | none, an address | Envelope `runnerCallbackUrl` or a plain env var | Same carriers | `postRunnerResult` fallback and the progress posters | none | No |
+
+Prepared review-fix publication checks require an unreleased admission, including pre-write checks that use the result bearer with `publicationExecution`. Ordinary result delivery without `publicationExecution` may retry after admission release until credential expiry, with all other scope and explicit revocation checks retained. Release still ends publication and progress authority. GHA publication requires matching positive run IDs; Fly and local Docker require an orchestrator-bound execution reference.
+
+Each publication mint logs one `[publication-token] minted` line (dispatch id, `owner/repo`, installation id, `expires_at`; never the token), and the push step logs `[push] credential source: boot-token | machine-nonce | publication-token`. A 403 on a token minted moments earlier (AII-922) is retried with the push backoff as `GIT_AUTH_FRESH_TOKEN`; the single-use credential is not re-minted. The `git ls-remote` inspection that runs right after the refresh retries the same way (five attempts over about 15 s, each failure logged as `[push] ls-remote attempt N/M failed`) and, if all fail, is classified `GIT_AUTH_FRESH_TOKEN` too. A gap-fill run that fails at `push` is re-enqueued once through `comment_gapfill_queue` (`requeueGapfillAfterPushFailure`, commenter `ai-implement-orchestrator-push-retry`) and still passes the per-PR dispatch budget. The requeue is for comment-triggered runs only: initial runs that die at `push` are already re-dispatched by the poll. The `GIT_AUTH_FRESH_TOKEN` reclassification applies to every attempt but the last, so a 403 that survives the whole backoff schedule stays `auth` / `GIT_AUTH`.
 
 A token is a signed claim set stored in the `runner_tokens` table with `dispatch_id`, `audience`, and `consumed_at`. `verifyRunToken` answers `already_consumed` when `consumed_at` is set. The callback endpoints answer 501 when `RUNNER_TOKEN_SECRET` is unset.
 
@@ -47,10 +76,20 @@ Unmarked Legacy callbacks retain the single-use result token above.
 | Process | Environment builder | Run tokens | Model credentials | Forwarded secrets | GitHub write tokens |
 |---|---|---|---|---|---|
 | The pipeline itself (Node) | `process.env` | present | present | present | present |
-| Repository processes: `install`, `setup`, `verify`, `teardown` hooks, and `preflight`, which runs the repository's `typecheck`, `lint`, and `test` scripts | `repoProcessEnv()` | **present** | stripped | present | present |
+| Repository processes: `install`, `setup`, `verify`, `teardown` hooks, and `preflight`, which runs the repository's `typecheck`, `lint`, and `test` scripts | `repoProcessEnv()` | stripped (`RUNNER_CREDENTIAL_KEYS`) | stripped | present | present |
 | The model process and everything it spawns | `modelProcessEnv()` | stripped (`RUNNER_CREDENTIAL_KEYS`, since AII-396 on 2026-09-02) | one of the two | stripped | stripped unless a gap-fill owns its branch |
 
-The consequence to remember: any code the repository runs under `preflight` or a hook holds the run's own authority. A test suite is repository code. The model process cannot reach the tokens, so "the agent did it" is the wrong model of this failure.
+The consequence to remember: only the runner's own Node process holds the run's authority. Code the repository runs under `preflight`, `install` or a hook (a test suite is repository code) cannot read the run tokens, so it cannot post a report or consume the single-use result token. Forwarded secrets stay available to those processes.
+
+## Configured-run model bootstrap (AII-951)
+
+A run is *configured* when its envelope carries both a resolved `agentConfig` snapshot and a `credentials.modelAuthGrant`. The shell bootstrap (`session/entrypoint.sh`, `classify_run_config` in `session/lib.sh`) validates **every nonempty envelope** with the compiled trusted decoder (`decodeTrustedRunConfig`) before any git, clone or setup. An envelope the decoder rejects (bad base64/JSON, non-object, unsupported version, invalid credentials) or one with only one of snapshot/grant fails closed with a fixed message and never falls back to legacy credentials. A valid envelope with neither — including a private `credentials` namespace holding only callback/publication tokens — is legacy and keeps the legacy `ANTHROPIC_*`/Bedrock provider requirements unchanged. The TS `isConfiguredModelRun` applies the same rule, treating undecodable input as configured so bad protected input can never select the legacy forwarded-collision exception.
+
+- **Shell children.** On configured runs `run_scoped` starts shell `git`/`gh` with a minimal environment (PATH, HOME, locale, TLS/proxy) plus only `GH_TOKEN` for `gh`. The configured clone uses a credential-free remote URL: `git_authed` places the GitHub token in the clone child's environment only (`GIT_PASSWORD`), answered by a global credential helper that reads that variable, so the token is in no argv, no remote URL and no file; the TS clone step's per-operation `GIT_PASSWORD` fetches use the same helper. Legacy runs keep the token-in-URL clone. Model, session, bootstrap and forwarded-secret variables never reach them, and the ERR trap logs a fixed line instead of the failing command text. The protected envelope stays in the trusted handoff only.
+- **TS children.** `repoProcessEnv` drops the forwarded-secret collision exception and every `OPENAI_`/`CODEX_`/`ANTHROPIC_`/`CLAUDE_CODE_`/`AWS_` name on configured runs (legacy keeps the exception). `modelProcessEnv(allow, selectedAuth)` returns a copy of the environment `ModelAuthClient` built for the selected credential, never merged with `process.env`; `allow` only decides whether GitHub write tokens already in that selected environment survive, and ambient `process.env` GitHub or runner credentials are never restored. The legacy form (no `selectedAuth`) is unchanged.
+- **Node launch controls.** Every shell-owned node decoder runs through `run_node` (`env -u NODE_OPTIONS -u NODE_PATH node`), so an ambient `--require` preload cannot execute with the protected envelope in its environment before classification, in any mode. Configured runs also `unset NODE_OPTIONS NODE_PATH` before the final handoff; legacy handoff keeps them.
+- **Team-secret remap.** Configured runs additionally reserve model, session, provider-routing and `NODE_OPTIONS`/`NODE_PATH` names in `_remap_is_reserved`, so an alias cannot restore them; ordinary secrets still forward. Legacy keeps the narrower list.
+- **Trust limit.** This is credential hygiene, not hostile-code isolation: commands the agent starts can read their parent model process's environment. Hosted session-key delivery to the runner is not part of this change.
 
 ## Blast radius
 
@@ -59,21 +98,34 @@ What one stray use of each credential destroys, and where the symptom appears.
 | Credential | One stray use | What is lost | Where the symptom appears | Recovery |
 |---|---|---|---|---|
 | Result token | One extra `POST /runner/result` before the real report | The real report is refused `409 already_consumed`: outcome, PR URL, implementation summary, and the approval mark (ADR 014). On GitHub Actions the tracker transition too: the issue keeps `AI-Working`, holds its dispatch slot, and fills the per-team cap | In other subsystems: the merge gate holds the PR with "no approval mark"; a fix that stamps the mark has nothing to stamp; the cap shows finished runs as in progress; `get_issue_dispatch_status` reads `conclusion: success` with `mergeVerdict: hold` | None for that run. A person merges by hand and clears the labels. Observed 2026-09-04 to 2026-09-07 (AII-567), about three days of build-down |
+| Result token (kg-refresh) | One extra `POST /runner/result` | Nothing: the path verifies without consuming, and the workflow absorbs a duplicate under the same idempotency key (a conflicting body is refused `409`) | Nothing; the real report still lands | None needed |
 | Progress token | A stray progress post or token exchange | Nothing is burned; the token is reusable. A stray exchange mints a dependency or reference token for the run's team, which reads every repository the App installation covers | `step_log` rows that do not match a real step; unexplained token rows | Tokens expire; nothing to repair |
 | Publication token | One stray successful exchange | The real push has no write credential and the run cannot open its PR | The push step fails | Re-dispatch. A failed Legacy GitHub mint releases its stamp-matched claim for retry; the pilot claims only after mint and rechecks authority. A successful exchange remains single-use |
 | Callback URL with a token | A test that reaches the live orchestrator | Whatever the token allows, above | See the result-token row | See above |
 
-## Pilot result retries (AII-794)
+## kg-refresh report retried after the run finished (AII-896)
 
-`postRunnerResult` sends exactly one `POST /runner/result` for a Legacy call (no `reviewFix`), unchanged from before. For a Restate review-fix pilot attempt (`reviewFix` present), it instead retries on a transient transport failure or a `429`/`5xx` response, using `pipeline/retry-backoff.ts`'s `computeBackoffMs` against the run's `retryPolicy`. The loop is bounded two ways: a hard cap of 8 attempts, and the attempt's own `deadlineAt` plus a 15-minute delivery grace (mirroring `runner-tokens.ts`'s `PILOT_DELIVERY_GRACE_MS` — the two constants must stay numerically in sync, since `runner-tokens.ts` cannot be imported into the runner bundle). Every retry resends the identical serialized JSON body built before the first attempt, never a freshly re-encoded one. Any other response — including the pilot's own `409 conflict` / `410 stale` classifications — stops the loop immediately; exhausting the deadline or the attempt cap logs an explicit `POST no-result` line rather than silently giving up. Neither path reruns agent work or mints a new attempt; this is delivery retry only.
+The workflow key is the dispatch id: the kg-refresh callback addresses `KgRefresh/{dispatchId}` directly, with the dispatch id taken from the verified run-token claims, and never consults the `KgRepo` marker. A key no `run` has started under answers `404` from `report`/`progress`, which the callback maps to **`409 no-refresh-in-flight`**. A report retried after the run finished reaches the completed workflow: an identical body is a duplicate and answers 200, a different body is refused. A late report from an older run can therefore only address its own workflow, never the run that is current. The kg-refresh runner reports each pipeline step with `TokenStepReporter` (see [The step reporter as the run signal](#the-step-reporter-as-the-run-signal)), and the first accepted post is one of the two sources of started evidence (ADR 034).
+
+**Acceptable for a runner retry after a lost 200.** A kg-refresh runner uses the shared bounded result-delivery retry policy described below. If the first report was accepted but its ACK was lost, the workflow has already recorded the outcome when the identical retry arrives.
+
+## Result delivery retries (AII-1630; pilot AII-794)
+
+Every `postRunnerResult` call — planning, implementation, KG refresh, and review-fix — uses the same `RESULT_DELIVERY_POLICY`: at most 8 total attempts, retrying transport failures, HTTP 429, and 5xx with `pipeline/retry-backoff.ts`'s `computeBackoffMs`. Backoff defaults to `DEFAULT_RETRY_POLICY` (30 seconds initially, doubling to a 5-minute cap, with up to 20% downward jitter); a caller can override the backoff via `retryPolicy`. Every retry resends the identical serialized JSON body built before the first attempt, including model usage.
+
+When a caller supplies `deadlineAt`, no new attempt starts at or after that deadline plus the 15-minute delivery grace, and backoff is clipped to the remaining time. `reviewFix.deadlineAt` takes precedence over the top-level deadline, preserving the pilot's existing bounds. The grace mirrors `runner-tokens.ts`'s `PILOT_DELIVERY_GRACE_MS`; keep the constants numerically in sync because the orchestrator module cannot be imported into the runner bundle. Each request has a 10-second transport timeout. Unused error-response bodies are cancelled without awaiting cleanup, so stalled bodies cannot delay retry or terminal-status handling.
+
+Planning, non-review-fix implementation, and KG refresh callers currently pass no delivery deadline, so they deliberately use the 8-attempt cap alone. Under persistent transient failure, the seven default backoff waits total roughly 18–22.5 minutes, plus request time, before delivery gives up. This can keep a finished runner waiting to report during an orchestrator outage.
+
+A 2xx stops delivery successfully. Any other nonretryable response, including a consumed Legacy token's 401 or the pilot's `409 conflict` / `410 stale`, stops immediately. Each retry logs the failed attempt number and status (or `transport_error`), never response bodies or tokens. Exhausting the deadline or attempt cap logs an explicit `POST no-result` line. Delivery retries do not rerun agent work or mint a new attempt.
 
 The pilot branch now authenticates the prepared result credential and checks the
 marker against its attempt before any Legacy token consumption or provider
-effect. The injected result seam records the canonical result and its durable
-delivery row in one SQLite transaction. An identical retry returns `200`
-`duplicate` and checks/repairs the same delivery identity; a conflicting result
-returns `409`, and a stale one returns `410`. The delivery pump contacts Restate
-afterward, so a sidecar outage does not reverse SQLite acceptance. A failed
+effect. The injected result seam records the canonical result and forwards it to
+`ReviewFixAttempt.result` through the ingress client. An identical retry returns
+`200` `duplicate` under the same forward key; a conflicting result returns `409`,
+and a stale one returns `410`. The callback answers `503` when Restate is
+unreachable; there is no delivery pump. A failed
 database write or missing persistence seam does not acknowledge the callback.
 Explicit pilot metadata cannot fall through to Legacy completion, finding
 resolution, or approval.
@@ -82,6 +134,57 @@ resolution, or approval.
 The handler validates and stores a bounded activity batch under the token's
 attempt identity before ACK. A missing store, forged attempt, or storage failure
 cannot produce a success ACK. Legacy runs do not use this route.
+
+## The step reporter as the run signal
+
+A run kind that a Restate workflow owns sends its "I started" signal as a step report: the kg-refresh runner uses `TokenStepReporter` (`src/pipeline/reporter.ts`), which posts `{ step }` to `/runner/progress` with the progress token, and the route forwards the validated, redacted step to the workflow's shared handler (`progress(dispatchId, step)`). A body with no `step` (an old runner image) is still a bare heartbeat. The result keeps `postRunnerResult` and `/runner/result` with the result token. The runner never calls the Restate ingress, which binds to loopback (ADR 023). A failed post logs and does not change the outcome of the run. `TokenStepReporter` removes credential keys from `inputs` and `outputs` with `redactStepCredentials` before the body is serialized.
+
+A Restate review-fix attempt does not post steps to `/runner/progress` (an attempt writes no `dispatch_log` row, so that route answers `404 job_not_found`). It reports each step through `/runner/activity` instead: `ActivityStepReporter` (`src/pipeline/reporter.ts`) records a `pipeline_step` event (`action` is the step id, `cycle` 1, `detail` carries `type`, `status`, `started_at`, `ended_at`, `parent_step_id`) on the `pipeline-steps` producer and flushes it at once. `RunnerActivitySink.shutdown()` finalizes that producer. The steps are readable through `get_review_fix_activity`. An older runner image still posts to `/runner/progress` and gets the 404.
+
+## The Restate planning callback
+
+The planning result callback still marks the planning job complete and still skips the admission release, for both lifecycles. For a Restate-owned reservation, the planning termination hook (`createPlanningAdmissionTerminationHook`) also sends `report` to the `PlanningRun` workflow whose key is the dispatch id (the handler takes no idempotency key; a second `report` is a no-op); a dispatch without a Restate owner is logged and left held for backend reconciliation. The planning failure callback calls the same hook, so it also sends `report`; for a Restate-owned dispatch it first writes the row as `failed` with the failure code as its conclusion, and the workflow keeps that conclusion. The `report` only wakes the workflow. The workflow still confirms the run ended with `readStatus` and releases the reservation itself. A lost signal costs at most one tick: 5 seconds in the confirm phase, 30 seconds in the wait (`PLANNING_RUN_CONFIRM_TICK_MS`, `PLANNING_RUN_TICK_MS`). See [restate.md](restate.md#the-planning-run).
+
+## Managed dispatch decisions
+
+`prepareManagedDispatch` (`src/managed-dispatch-auth.ts`, AII-1386) maps one `prepareAgentRun` result to one decision. Every dispatch path calls it so each makes the same choice for the same state. The checks run in this order. A `github-actions` backend has no special row (AII-1420): `prepareAgentRun` reads the default-branch workflow and the retired triggers, and only a template carrying `ai-implement-capability: stage-agent-config-v1` with no retired trigger reaches reservation and minting. An old, custom, unreadable or retired-trigger state refuses with a fixed code (`runner_incompatible`, `delivery_unreadable`, `retired_workflow_present`) and launches nothing.
+
+| State, in check order | Decision | Reserve | Mint |
+| -- | -- | -- | -- |
+| `isManagedProject` false (includes an empty `projectKey`) | `legacy`, `prepareAgentRun` not called | no | no |
+| `prepareAgentRun` throws | `hold` `preparation_failed` | n/a | n/a |
+| `legacy` | `legacy` | no | no |
+| `ready`, `reused: false`, `reservations: []` | `launch` | no | yes |
+| `ready`, `reused: true` (bootstrap already taken) | `hold` `bootstrap_consumed` | n/a | no |
+| `ready` with a non-empty `reservations` | `releaseRejectedLaunch`, then `refuse` configuration-error `reserved_account_unsupported` | released | revoked |
+| `queued` | `leave-queued` `profile_busy` | n/a | no |
+| `configuration-error` | `refuse` configuration-error, same code | no | no |
+| `authentication-required` | `refuse` authentication-required, same code | no | no |
+| `recovery-required` | `hold`, same code | n/a | n/a |
+
+Claude subscription profiles follow preparation: a resolvable stored setup-token permits launch without an account reservation (ADR 049); a missing token refuses with authentication-required `session_unavailable`.
+
+The empty-`projectKey` row exists because `prepareAgentRun` rejects an empty key as `invalid_request`, and Jira issues can carry an empty scope key.
+
+`settleLaunch` runs after the launch attempt:
+
+| Decision | Outcome | Action |
+| -- | -- | -- |
+| `launch` | `accepted` | nothing; the grant lives until the run ends |
+| `launch` | `rejected` or `unknown` | `releaseRejectedLaunch(dispatchId, [], runtime)`; revokes the grant |
+| any other kind | any | nothing, `{ revoked: false }` |
+
+A grant lives only when the launch is accepted, so `unknown` revokes too. `classifyLaunchError` returns `rejected` when no launch was attempted, for Fly only on a 4xx status in the message (the rule of `isDefinitiveFlyRejectionError`), and `unknown` for local Docker and anything else. A caller releases an owned admission with `launch_rejected` for `leave-queued`, `refuse` and `hold`, and only `refuse` writes a tracker failure, using `refusalText`. The bearer stays inside `takeBootstrap`; `refusalText` is built from `kind`, `category` and `code` only.
+
+## Model-auth routes (AII-1387)
+
+`src/model-auth-routes.ts` serves `POST /runner/model-auth/checkout`, `/checkpoint` and `/finish` from the orchestrator HTTP server, adapting Node requests to `createModelAuthHandlers` (`src/model-auth-server.ts`). The check sits right after the health check in `handleRequest`, before `/api/token`, so no general runner route shadows it. Every method on these paths reaches the handler, which answers 405 for non-POST.
+
+- **Authentication.** The grant bearer. The handler hashes it and looks up `model_credential_grants.bearer_hash`; bindings (with `authMode`) come from `scope_json`. A row whose `scope_json` does not parse is treated as no grant.
+- **Transport rule.** On Fly (`FLY_APP_NAME` set) a request is trusted only when `x-forwarded-proto` contains `https`. Off Fly (local development) it is trusted. A runner must reach the route through the public `RUNNER_CALLBACK_BASE_URL`; one that connects over 6PN carries no `x-forwarded-proto` and gets 403.
+- **Release rule.** The grant's dispatch must still have an unreleased `dispatch_admissions` row. Once the admission is released the grant stops working, whatever its expiry. Revoked and expired grants also fail.
+- **Refresh.** A near-expiry ChatGPT token is refused and `requestChatGptPlanRefresh` is called once.
+- **Logging.** One `[model-auth] <operation> <profile> <status> <category>` line per request, from `SafeModelAuthDiagnostic` only.
 
 ## Rules
 
@@ -101,6 +204,21 @@ Walk every row and cite the line.
 - Verifiers: every `verifyRunToken` call site, with its audience and its `consume` flag.
 - Strippers: `RUNNER_CREDENTIAL_KEYS` in `src/pipeline/process-env.ts`, and which builder each spawned process uses.
 - Tests: the setup file that disarms, and the tests that assert a stray post is refused.
+
+## Invocation attribution (AII-971)
+
+The terminal result may carry one optional `attribution` (`InvocationAttributionV1`): the last implementation invocation for an autonomous run, the planning invocation for a planning run. The runner sanitizes it before sending; the orchestrator sanitizes it again, then normalizes it against the dispatch's stored `run_agent_config_snapshots` row (`normalizeInvocation`) and inserts one `model_invocation_attribution` row, ignoring a repeated `invocation_id`. Identity comes from the snapshot, never the claim; a claim naming another snapshot stores nothing. A legacy dispatch (no snapshot) stores nothing, except a KG refresh identified by its trusted `dispatch_log.phase`: its sanitized reported calls are stored without configuration or snapshot references. KG rows use the reserved `unconfigured` profile (schema placeholder revision 1), unknown auth mode, and absent configuration attribution; runner-supplied profile and snapshot identities are discarded. Managed review-fix attempts never take this exception. Persistence failures log a count-only warning and never stall the terminal callback. `Job.attribution` and the local `summary.json` project the same bounded shape.
+
+### Every invocation and the pushed commits (AII-1562)
+
+The single `attribution` stays for older readers; the body also carries two additive lists. Both are optional, so an older runner (neither field) still stores its one row, and an older orchestrator ignores them.
+
+- `invocations`: one record per model call of the job — implement and review stages, every pass, stage-level retries, and planning. A record is `{ attribution, cacheReadTokens, cacheCreationTokens, attempts }`. The stage executor (`src/pipeline/stage-executor.ts`) appends it to a run-scoped collector (`src/pipeline/job-accounting.ts`) on every call, success or error, and `postRunnerResult` sends whatever was collected, so failed jobs report too. The record is a separate type from `InvocationAttributionV1` on purpose: `sanitizeAttribution` rejects unknown keys, so widening it would make an older orchestrator drop the single `attribution` of a newer runner. The list is capped at 200 records.
+- `pushedCommits`: the SHAs the job pushed, oldest first (`git rev-list --reverse <baseRef>..HEAD`, read by the push step after a landed push; on a gap-fill `baseRef` is the PR branch tip the run started from). `[]` means nothing was pushed (no-op run, mounted dev harness); a missing field means the runner did not report (it died, or the push failed). Capped at 1000 valid 40- or 64-hex SHAs; any other list is dropped whole.
+
+The orchestrator sanitizes both lists, then runs each record through the same snapshot normalization as the single attribution and inserts one `model_invocation_attribution` row per `invocation_id` (insert-or-ignore, so a retried callback stores nothing twice). Cache tokens and `attempts` land in `usage_json`. An invocation with no usage is stored with availability `unavailable` and a null cost, never dropped and never 0; a record naming another snapshot is dropped by count. List records are inserted before the legacy `attribution`, so the "latest row per dispatch" read (`Job.attribution`, the report card, reports) still resolves to the same row as before. The SHAs and a completeness flag go to `dispatch_job_report`, one row per dispatch: `pushed_shas_json` (null = not reported, `[]` = nothing pushed; the first report wins, read with `getPushedCommits`) and `invocations_complete`. The flag is set to 1 only when the result carried an `invocations` list, none of it was dropped (malformed, or past the `INVOCATION_RECORDS_MAX` = 200 cap) on the orchestrator, the runner reported no drops of its own (the result body's `invocationsDropped` is absent or 0; the runner sets it when `sanitizeInvocationRecords` removed records before sending), and every record was stored (none mismatched the snapshot or lacked an invocation id); a retried callback never clears it. `list_job_accounting` reports `usage: "reported"` only when it is 1 (`partial` for invocation rows without it, `unknown` for none). An insert or change on this table, like a new `model_invocation_attribution` row, moves the job's `changed_at`, so the job is served again. A runner process resets its collected invocations and SHAs at the start of `runAutonomous` and `runPlanning`. Malformed entries log a count-only warning and never fail the callback. The managed review-fix path stores the lists the same way.
+
+Limits: a dispatch with no stored snapshot (legacy) stores no rows. Commits pushed by `post-push-review` fixes outside the push step are not listed. Ship the orchestrator before the runner image.
 
 ## Related
 

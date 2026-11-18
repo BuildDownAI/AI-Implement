@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import type { SourceResult } from "../../kg-source-results.js";
 
 interface KgTrackerDataInputs extends Record<string, unknown> {
   callbackUrl: string | null | undefined;
@@ -15,10 +16,15 @@ interface KgTrackerDataInputs extends Record<string, unknown> {
 }
 
 interface KgTrackerDataOutputs extends Record<string, unknown> {
+  /** True only when no team failed. */
   fetched: boolean;
+  /** Teams whose page call answered non-OK or threw. Empty when fetched=true. */
+  failedTeams: string[];
   issueCount: number;
   /** Per-team issue counts, for the kg-refresh report. Empty when fetched=false. */
   teamCounts: Array<{ team: string; count: number }>;
+  /** One per-source result per team in sources.yml (see kg-source-results.ts). */
+  teamResults: SourceResult[];
 }
 
 /**
@@ -358,6 +364,16 @@ export function readBaseRepoFromSourcesYml(workspaceDir: string): { slug: string
   return { slug: DEFAULT_BASE_REPO };
 }
 
+function trackerResult(team: string, status: SourceResult["status"], reason: string, issues?: number): SourceResult {
+  return {
+    source: `tracker:${team}`,
+    kind: "tracker",
+    status,
+    reason,
+    counts: issues === undefined ? {} : { issues },
+  };
+}
+
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {
   async run(
     _context: PipelineContext,
@@ -393,7 +409,8 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       } catch {
         // malformed JSON — leave teamCounts empty
       }
-      return { fetched: true, issueCount, teamCounts };
+      const teamResults: SourceResult[] = teamCounts.map((t) => trackerResult(t.team, "success", "", t.count));
+      return { fetched: true, failedTeams: [], issueCount, teamCounts, teamResults };
     }
 
     // Read the bearer secret directly from the environment so it never appears
@@ -402,17 +419,23 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
 
     if (!callbackUrl) {
       console.log("[kg-tracker-data] no callback URL; skipping");
-      return { fetched: false, issueCount: 0, teamCounts: [] };
+      return { fetched: false, failedTeams: [], issueCount: 0, teamCounts: [], teamResults: [] };
     }
     if (!progressToken) {
       console.log("[kg-tracker-data] no progress token (RUN_PROGRESS_TOKEN); skipping");
-      return { fetched: false, issueCount: 0, teamCounts: [] };
+      return { fetched: false, failedTeams: [], issueCount: 0, teamCounts: [], teamResults: [] };
     }
 
     const teams = readTeams(workspaceDir);
     if (teams.length === 0) {
       console.warn("[kg-tracker-data] no teams found in sources.yml; skipping");
-      return { fetched: false, issueCount: 0, teamCounts: [] };
+      return {
+        fetched: false,
+        failedTeams: [],
+        issueCount: 0,
+        teamCounts: [],
+        teamResults: [{ source: "tracker", kind: "tracker", status: "skipped", reason: "no trackers in sources.yml", counts: {} }],
+      };
     }
     console.log(`[kg-tracker-data] teams from sources.yml: ${teams.join(", ")}`);
 
@@ -420,11 +443,15 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
     const url = `${base}/api/runner/kg-tracker-data`;
     const allIssues: TrackerIssue[] = [];
     const teamCounts: Array<{ team: string; count: number }> = [];
+    const failedTeams: string[] = [];
+    const teamResults: SourceResult[] = [];
 
     for (const team of teams) {
       let cursor: string | null = null;
       const teamIssues: TrackerIssue[] = [];
 
+      let failure: string | null = null;
+      let skipped = false;
       try {
         do {
           const body: Record<string, string> = { teamKey: team };
@@ -437,37 +464,57 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
             },
             body: JSON.stringify(body),
           });
-          if (res.status === 503) {
-            console.log("[kg-tracker-data] Tracker not configured (503) — skipping");
-            return { fetched: false, issueCount: 0, teamCounts: [] };
-          }
           if (!res.ok) {
-            console.error(`[kg-tracker-data] ${url} returned HTTP ${res.status}`);
-            throw new KgTrackerDataFetchError(`endpoint returned ${res.status}`);
+            if (res.status === 404) {
+              skipped = true;
+              break;
+            }
+            if (res.status === 401 || res.status === 403) {
+              throw new KgTrackerDataFetchError(`team ${team}: unauthorized (${res.status})`);
+            }
+            failure = String(res.status);
+            break;
           }
-          const page = (await res.json()) as TrackerDataPage;
+          let page: TrackerDataPage;
+          try {
+            page = (await res.json()) as TrackerDataPage;
+          } catch (err) {
+            throw new KgTrackerDataFetchError(
+              `team ${team}: malformed response: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          if (!page || !Array.isArray(page.issues) || !page.pageInfo) {
+            throw new KgTrackerDataFetchError(`team ${team}: malformed response body`);
+          }
           teamIssues.push(...page.issues);
           cursor = page.pageInfo.hasNextPage ? (page.pageInfo.endCursor ?? null) : null;
         } while (cursor !== null);
       } catch (err) {
         if (err instanceof KgTrackerDataFetchError) throw err;
-        throw new KgTrackerDataFetchError(
-          `fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        failure = `error: ${err instanceof Error ? err.message : String(err)}`;
+      }
+
+      if (skipped) {
+        console.log(`[kg-tracker-data] team ${team}: skipped (no orchestrator mapping)`);
+        teamResults.push(trackerResult(team, "skipped", "no mapping"));
+        continue;
+      }
+
+      if (failure !== null) {
+        console.log(`[kg-tracker-data] team ${team}: failed (${failure})`);
+        failedTeams.push(team);
+        teamResults.push(trackerResult(team, "failed", failure));
+        continue;
       }
 
       console.log(`[kg-tracker-data] team ${team}: ${teamIssues.length} issues`);
-      if (teamIssues.length === 0) {
-        throw new KgTrackerDataFetchError(
-          `team ${team} returned 0 issues — a configured team must not be empty`,
-        );
-      }
       teamCounts.push({ team, count: teamIssues.length });
+      teamResults.push(trackerResult(team, "success", "", teamIssues.length));
       allIssues.push(...teamIssues);
     }
 
     writeFn(join(workspaceDir, "tracker-data.json"), JSON.stringify(allIssues));
     console.log(`[kg-tracker-data] fetched ${allIssues.length} issues`);
-    return { fetched: true, issueCount: allIssues.length, teamCounts };
+    return { fetched: failedTeams.length === 0, failedTeams, issueCount: allIssues.length, teamCounts, teamResults };
   },
 };

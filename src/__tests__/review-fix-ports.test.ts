@@ -1,10 +1,8 @@
 /**
  * Type-shape and behavioral-contract tests for the AII-829 review-fix ports.
- * `npm run typecheck` excludes `src/__tests__`, and vitest strips types without
- * checking them, so the `@ts-expect-error` cases below only fail a build under
- * the throwaway `tsconfig.review-fix-ports-tests.json` — run explicitly via
- * `npx tsc --noEmit -p tsconfig.review-fix-ports-tests.json`, and wired into
- * `.github/workflows/unit-tests.yml` (`unit-tests` job) so a regression is
+ * Vitest strips types without checking them, so the `@ts-expect-error` cases
+ * below only fail a build under `npm run typecheck`, whose second pass
+ * (`tsconfig.tests.json`) covers this file and runs in CI, so a regression is
  * caught automatically rather than only by a human remembering to run it.
  * The `it()` blocks exercise representative, entirely in-memory test doubles
  * for all three ports; nothing here does real I/O.
@@ -45,8 +43,9 @@ import {
   type WorkerLaunchPlan,
   type WorkerTerminalInspection,
 } from "../review-fix-ports.js";
+import { makeReviewFixResult, makeScopedPrIdentity } from "./helpers/builders.js";
 
-const SCOPE: ScopedPrIdentity = { installationId: 1, repository: "eudoxus/ai-implement", prNumber: 42 };
+const SCOPE = makeScopedPrIdentity({ repository: "eudoxus/ai-implement" });
 
 // ---------------------------------------------------------------------------
 // Representative in-memory test doubles (no I/O, no SQLite, no Restate)
@@ -167,11 +166,11 @@ function createFinalizerDouble(): ReviewFixFinalizerPort {
   let nextEffectId = 1;
 
   return {
-    async recordOutcome(outcome: ReviewFixImmutableOutcome): Promise<RecordOutcomeResult> {
+    async recordOutcome(outcome: ReviewFixImmutableOutcome, now: number): Promise<RecordOutcomeResult> {
       const existing = outcomes.get(outcome.attemptId);
       if (existing) return { status: "already_recorded", outcome: existing };
       outcomes.set(outcome.attemptId, outcome);
-      return { status: "recorded" };
+      return { status: "recorded", completedAt: now };
     },
     async applyApproval(input: ReviewFixApprovalInput): Promise<ApprovalEffectOutcome> {
       if (!input.currentAuthority || input.currentPrHeadSha !== input.result.outputCommit || !input.policyAllows) {
@@ -272,9 +271,9 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
     const execution = await callerLaunchesAndReconcilesOnUnknown(worker, attempt!);
     expect(execution).not.toBeNull();
 
-    const bind = await store.bindExecution(attempt!.attemptId, execution!);
+    const bind = await store.bindExecution(attempt!.attemptId, execution!, Date.now());
     expect(bind.status).toBe("bound");
-    expect((await store.bindExecution(attempt!.attemptId, execution!)).status).toBe("already_bound");
+    expect((await store.bindExecution(attempt!.attemptId, execution!, Date.now())).status).toBe("already_bound");
 
     const found = await worker.reconcile(attempt!.attemptId, SCOPE);
     expect(found).toEqual({ status: "found", execution });
@@ -294,7 +293,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
 
     const execution = await callerLaunchesAndReconcilesOnUnknown(worker, attempt!);
     expect(execution).not.toBeNull();
-    await store.bindExecution(attempt!.attemptId, execution!);
+    await store.bindExecution(attempt!.attemptId, execution!, Date.now());
 
     const terminal = await worker.inspectTerminal(execution!);
     expect(terminal.reached).toBe(true);
@@ -302,6 +301,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
     expect(terminal.outcome.status).toBe("succeeded");
     const outputCommit = terminal.outcome.status === "succeeded" ? terminal.outcome.outputCommit : "";
 
+    if (!execution || (execution.backend !== undefined && execution.backend !== "github-actions")) throw new Error("expected GitHub execution");
     const result: ReviewFixResultMetadataV1 = {
       version: 1,
       attemptId: attempt!.attemptId,
@@ -313,9 +313,9 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
       githubRunAttempt: execution!.githubRunAttempt,
       outputCommit,
     };
-    const intake = await store.recordResult(attempt!.attemptId, result);
+    const intake = await store.recordResult(attempt!.attemptId, result, Date.now());
     expect(intake.status).toBe("stored");
-    expect((await store.recordResult(attempt!.attemptId, result)).status).toBe("duplicate");
+    expect((await store.recordResult(attempt!.attemptId, result, Date.now())).status).toBe("duplicate");
 
     const disposition: ReviewFixFindingDisposition = { findingKey: "f1", disposition: "addressed" };
     const approvalInput: ReviewFixApprovalInput = {
@@ -336,13 +336,13 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
       attemptId: attempt!.attemptId,
       scope: SCOPE,
       terminal: terminal.outcome,
-    });
+    }, Date.now());
     expect(outcomeRecord.status).toBe("recorded");
     const repeatOutcomeRecord = await finalizer.recordOutcome({
       attemptId: attempt!.attemptId,
       scope: SCOPE,
       terminal: terminal.outcome,
-    });
+    }, Date.now());
     expect(repeatOutcomeRecord).toEqual({
       status: "already_recorded",
       outcome: { attemptId: attempt!.attemptId, scope: SCOPE, terminal: terminal.outcome },
@@ -361,21 +361,11 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
       jobTimeoutMinutes: DEFAULT_REVIEW_FIX_JOB_TIMEOUT_MINUTES,
     });
     expect(attempt).not.toBeNull();
-    await store.revokeAuthority(attempt!.attemptId);
+    await store.revokeAuthority(attempt!.attemptId, Date.now());
     expect(await store.hasCurrentAuthority(attempt!.attemptId)).toBe(false);
 
     const outputCommit = "b".repeat(40);
-    const result: ReviewFixResultMetadataV1 = {
-      version: 1,
-      attemptId: attempt!.attemptId,
-      installationId: SCOPE.installationId,
-      repository: SCOPE.repository,
-      prNumber: SCOPE.prNumber,
-      deadlineAt: attempt!.deadlineAt,
-      githubRunId: 1,
-      githubRunAttempt: 1,
-      outputCommit,
-    };
+    const result = makeReviewFixResult({ attemptId: attempt!.attemptId, ...SCOPE, deadlineAt: attempt!.deadlineAt, outputCommit });
     const effectIdOrReason = await callerAppliesApprovalOrReportsWhyNot(finalizer, {
       attemptId: attempt!.attemptId,
       scope: SCOPE,
@@ -403,7 +393,7 @@ describe("review-fix ports: representative doubles exercise the full lifecycle",
 // ---------------------------------------------------------------------------
 
 describe("review-fix ports: negative type cases", () => {
-  it("would fail tsc under tsconfig.review-fix-ports-tests.json if any guard below were removed", () => {
+  it("would fail `npm run typecheck` (tsconfig.tests.json) if any guard below were removed", () => {
     // @ts-expect-error an immutable outcome is missing its attemptId identity
     const missingIdentity: ReviewFixImmutableOutcome = {
       scope: SCOPE,

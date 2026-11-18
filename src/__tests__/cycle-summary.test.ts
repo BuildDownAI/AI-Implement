@@ -1,6 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   writeCycleSummary,
@@ -10,9 +9,11 @@ import {
   toolTraceLines,
   CYCLE_SUMMARY_FILE,
   CYCLE_SUMMARY_MAX_BYTES,
+  buildPublicationCycleSummary,
   type CycleSummaryInput,
 } from "../pipeline/cycle-summary.js";
 import type { RunTelemetry } from "../pipeline/types.js";
+import { testDir } from "./helpers/test-dir.js";
 
 function baseInput(overrides: Partial<CycleSummaryInput> = {}): CycleSummaryInput {
   return {
@@ -34,11 +35,7 @@ describe("cycle-summary", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "cycle-summary-"));
-  });
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = testDir("cycle-summary");
   });
 
   it("writes and reads back a cycle summary", () => {
@@ -276,5 +273,125 @@ describe("cycle-summary", () => {
 
   it("toolTraceLines falls back to an empty array when telemetry is absent", () => {
     expect(toolTraceLines(undefined)).toEqual([]);
+  });
+});
+
+import { sanitizeAttribution, type InvocationAttributionV1 } from "../pipeline/types.js";
+import { isCycleSummary, sanitizeCycleSummaries, stripCycleAttribution } from "../pipeline/cycle-summary.js";
+
+describe("attribution contract (AII-946)", () => {
+  const attr = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    version: 1, invocationId: "inv-1", stage: "planning", snapshotId: "snap-1", agent: "codex",
+    provider: "openai", model: "gpt-synthetic", profileId: "prof-1", authMode: "openai-api-key",
+    limit: { kind: "timeout_ms", value: 1000 }, outcome: "success",
+    usage: { availability: "complete", tokensIn: 1, tokensOut: 2, costUsd: 0.5, costStatus: "reported" },
+    ...over,
+  });
+
+  it("round-trips a valid value, every stage and every auth mode", () => {
+    expect(sanitizeAttribution(attr())).toEqual(attr());
+    const openrouter = attr({ provider: "openrouter", authMode: "openrouter-api-key" });
+    expect(sanitizeAttribution(openrouter)).toEqual(openrouter);
+    for (const stage of ["planning", "implementation", "review"]) expect(sanitizeAttribution(attr({ stage }))?.stage).toBe(stage);
+    for (const authMode of ["anthropic-api-key", "bedrock", "claude-subscription", "openai-api-key", "codex-subscription", "openrouter-api-key"]) {
+      expect(sanitizeAttribution(attr({ authMode }))?.authMode).toBe(authMode);
+    }
+  });
+
+  it("keeps null usage and null cost null", () => {
+    expect(sanitizeAttribution(attr({ usage: null }))?.usage).toBeNull();
+    const u = sanitizeAttribution(attr({ usage: { availability: "unavailable", tokensIn: null, tokensOut: null, costUsd: null, costStatus: "unavailable" } }));
+    expect(u?.usage?.costUsd).toBeNull();
+    expect(u?.usage?.tokensIn).toBeNull();
+  });
+
+  it("enforces cost honesty", () => {
+    const usage = (over: Record<string, unknown>) => ({ availability: "complete", tokensIn: 1, tokensOut: 1, costUsd: null, costStatus: "unavailable", ...over });
+    expect(sanitizeAttribution(attr({ usage: usage({}) }))).not.toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage({ costStatus: "reported" }) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage({ costUsd: 0 }) }))).toBeNull();
+  });
+
+  it("enforces usage availability against token presence", () => {
+    const usage = (availability: string, tokensIn: number | null, tokensOut: number | null) =>
+      ({ availability, tokensIn, tokensOut, costUsd: null, costStatus: "unavailable" });
+    expect(sanitizeAttribution(attr({ usage: usage("complete", 1, null) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage("partial", 1, null) }))).not.toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage("partial", 1, 1) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: usage("unavailable", 1, null) }))).toBeNull();
+  });
+
+  it("rejects oversized, unknown-key, negative, non-finite and credential-shaped input", () => {
+    expect(sanitizeAttribution(attr({ model: "m".repeat(200) }))).toBeNull();
+    expect(sanitizeAttribution(attr({ extra: 1 }))).toBeNull();
+    expect(sanitizeAttribution(attr({ token: "x" }))).toBeNull();
+    expect(sanitizeAttribution(attr({ limit: { kind: "timeout_ms", value: -1 } }))).toBeNull();
+    expect(sanitizeAttribution(attr({ usage: { availability: "partial", tokensIn: Infinity, tokensOut: null, costUsd: null, costStatus: "unavailable" } }))).toBeNull();
+    expect(sanitizeAttribution(attr({ model: "sk-SYNTHETICSECRET123456" }))).toBeNull();
+    expect(sanitizeAttribution(attr({ model: "claude-opus-4[1m]" }))?.model).toBe("claude-opus-4[1m]");
+    expect(sanitizeAttribution(attr({ version: 2 }))).toBeNull();
+    expect(sanitizeAttribution(attr({ outcome: "timeout" }))).toBeNull();
+    expect(sanitizeAttribution(undefined)).toBeNull();
+  });
+
+  it("strips a bad attribution from a cycle summary without dropping the summary", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const base = { ...baseInput(), completedAt: 1, truncated: false, limitReached: false, usage: { tokensIn: null, tokensOut: null, costUsd: null } };
+    expect(isCycleSummary({ ...base, attribution: { bogus: 1 } })).toBe(false);
+    const { valid, dropped } = sanitizeCycleSummaries([{ ...base, attribution: { bogus: 1 } }, { ...base, id: "feedback-loop.2", attribution: attr() }]);
+    expect(dropped).toBe(0);
+    expect(valid).toHaveLength(2);
+    expect(valid[0]).not.toHaveProperty("attribution");
+    expect((valid[1].attribution as InvocationAttributionV1).invocationId).toBe("inv-1");
+  });
+
+  it("projects a cycle attribution identically to the shared sanitizer and leaves attribution-free summaries untouched (AII-971)", () => {
+    const base = { ...baseInput(), completedAt: 1, truncated: false, limitReached: false, usage: { tokensIn: null, tokensOut: null, costUsd: null } };
+    const legacy = stripCycleAttribution(base);
+    expect(legacy).toEqual({ value: base, stripped: false });
+    const withExtra = stripCycleAttribution({ ...base, attribution: { ...attr(), usage: null } });
+    expect((withExtra.value as { attribution: unknown }).attribution).toEqual(sanitizeAttribution({ ...attr(), usage: null }));
+  });
+});
+
+describe("buildPublicationCycleSummary", () => {
+  const dir = () => testDir("pub-cycle");
+  it("copies tests/verdict from the last approving feedback-loop cycle, carries null usage and the pushed commit", () => {
+    const d = dir();
+    writeCycleSummary(d, baseInput({ tests: [{ name: "test execution", status: "missing" }], usage: { tokensIn: null, tokensOut: null, costUsd: null } }));
+    const second = writeCycleSummary(d, baseInput({ id: "feedback-loop.2", cycle: 2, tests: [{ name: "test execution", status: "missing" }],
+      verdict: { approved: true, reason: "approved" }, usage: { tokensIn: 100, tokensOut: 50, costUsd: 0.25 } }));
+    const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "success");
+    expect(pub).toMatchObject({ id: "publication.1", stage: "publication", outputCommit: "e".repeat(40), outputCommitStatus: "committed",
+      tests: [{ name: "test execution", status: "missing" }], verdict: { approved: true, reason: "approved" },
+      usage: { tokensIn: null, tokensOut: null, costUsd: null }, completedAt: second.completedAt, dispositions: [{ key: "k", disposition: "fixed" }] });
+    expect(readCycleSummaries(d).every((s) => s.outputCommit === null)).toBe(true);
+  });
+  it("sheds test evidence before dispositions when the record overflows the byte cap", () => {
+    const d = dir();
+    const tests = Array.from({ length: 50 }, (_, i) => ({ name: `t${i}-${"x".repeat(190)}`, status: "passed" as const }));
+    writeCycleSummary(d, baseInput({ tests }));
+    const dispositions = Array.from({ length: 60 }, (_, i) => ({ key: `${i}`.padStart(64, "a"), disposition: "fixed" }));
+    const pub = buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), dispositions, "success");
+    expect(pub).not.toBeNull();
+    expect(pub!.dispositions).toHaveLength(60);
+    expect(pub!.limitReached).toBe(true);
+    expect(isCycleSummary(pub)).toBe(true);
+  });
+  it("returns null without a pushed commit or a feedback-loop source", () => {
+    const d = dir();
+    expect(buildPublicationCycleSummary([], "e".repeat(40), [], "success")).toBeNull();
+    writeCycleSummary(d, baseInput());
+    expect(buildPublicationCycleSummary(readCycleSummaries(d), null, [], "success")).toBeNull();
+  });
+  it("withholds approval coverage for a failed result or a non-approving verdict", () => {
+    const d = dir();
+    writeCycleSummary(d, baseInput({ verdict: { approved: true, reason: "approved" } }));
+    expect(buildPublicationCycleSummary(readCycleSummaries(d), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "failure")).toBeNull();
+    for (const approved of [false, null]) {
+      const d2 = dir();
+      writeCycleSummary(d2, baseInput({ verdict: { approved, reason: "rejected" } }));
+      expect(buildPublicationCycleSummary(readCycleSummaries(d2), "e".repeat(40), [{ key: "k", disposition: "fixed" }], "success")).toBeNull();
+    }
   });
 });

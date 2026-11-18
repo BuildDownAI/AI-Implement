@@ -12,7 +12,7 @@ export interface InstallationDetails {
 // Cache the installation identity with the token so admission and dispatch use the same install.
 const tokenCache = new Map<string, { token: string; expiresAt: number; installationId: number }>();
 // Cache: scopedCacheKey(owner, options) → { token, real expiresAt (ISO), staleAt (cache cutoff, ms) }
-const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number }>();
+const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number; installationId: number }>();
 let cachedAppSlug: string | null = null;
 const TOKEN_CACHE_TTL_MS = 50 * 60 * 1000;
 
@@ -67,6 +67,11 @@ function parsePrivateKey(pem: string): crypto.KeyObject {
   return crypto.createPrivateKey(normalized);
 }
 
+/** The App key as configured: literal `\n` sequences unescaped, then parsed. Throws when it is not a private key. */
+export function parseAppPrivateKey(raw: string): crypto.KeyObject {
+  return parsePrivateKey(raw.replace(/\\n/g, "\n"));
+}
+
 // exp is minted this many seconds below GitHub's 600s cap (and iat backdated the same)
 // so a host clock running ahead of GitHub still validates. Larger drift needs a clock resync (NTP).
 const CLOCK_SKEW_TOLERANCE_S = 300;
@@ -88,12 +93,12 @@ export function createAppJwt(appId: string, privateKey: string): string {
   const signing = `${header}.${payload}`;
   const sign = crypto.createSign("RSA-SHA256");
   sign.update(signing);
-  const keyObject = parsePrivateKey(privateKey);
+  const keyObject = parseAppPrivateKey(privateKey);
   const sig = sign.sign(keyObject, "base64url");
   return `${signing}.${sig}`;
 }
 
-function githubAppHeaders(authValue: string): Record<string, string> {
+export function githubAppHeaders(authValue: string): Record<string, string> {
   return {
     Authorization: `Bearer ${authValue}`,
     Accept: "application/vnd.github+json",
@@ -187,6 +192,8 @@ export interface ScopedInstallationToken {
   token: string;
   /** GitHub's actual expiry for this token (ISO 8601), passed through verbatim. */
   expiresAt: string;
+  /** The GitHub App installation the token was minted from. */
+  installationId: number;
 }
 
 function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
@@ -221,7 +228,7 @@ export async function getScopedInstallationToken(
   const cacheKey = scopedCacheKey(owner, options);
   const cached = scopedTokenCache.get(cacheKey);
   if (!options?.forceRefresh && cached && Date.now() < cached.staleAt) {
-    return { token: cached.token, expiresAt: cached.expiresAt };
+    return { token: cached.token, expiresAt: cached.expiresAt, installationId: cached.installationId };
   }
 
   const normalizedKey = privateKey.replace(/\\n/g, "\n");
@@ -261,8 +268,8 @@ export async function getScopedInstallationToken(
     ? tokenData.expires_at
     : new Date(Date.now() + 55 * 60 * 1000).toISOString();
   const staleAt = Number.isFinite(expMs) ? expMs - 5 * 60 * 1000 : Date.now() + 50 * 60 * 1000;
-  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt });
-  return { token: tokenData.token, expiresAt };
+  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt, installationId: install.id });
+  return { token: tokenData.token, expiresAt, installationId: install.id };
 }
 
 /**

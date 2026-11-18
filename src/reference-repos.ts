@@ -24,7 +24,7 @@ export interface ReferenceRepoResult extends ReferenceRepo {
   cause?: ReferenceRepoResultCause;
 }
 
-const REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+export const REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const MAX_ENTRIES = 10;
 const MAX_PATH_LENGTH = 256;
 

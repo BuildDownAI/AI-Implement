@@ -1,0 +1,401 @@
+import type { FailureRecord } from "./failure-classification.js";
+import { randomUUID } from "node:crypto";
+import { STAGE_NAMES, type StageName, type StageSelection, type StageAccount } from "../agent-config.js";
+import type { AccountFallbacks, ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { ModelAuthClientError, type ModelAuthClient } from "../model-auth-client.js";
+import {
+  ClaudeCliExecutor,
+  type ActivityReportingConfig,
+  isPossiblyLiveChild,
+  type ClaudeInvokeOptions,
+} from "./executor.js";
+import { CodexExecutor, CodexRecoveryRequiredError, type CodexExecutorOptions } from "./codex-executor.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { CODEX_SKILLS_SUBDIR } from "./steps/install-skills.js";
+import { recordInvocation } from "./job-accounting.js";
+import { createCodexPlanningDriver, createCodexReviewDriver } from "./codex-planning-adapter.js";
+import {
+  sanitizeAttribution,
+  type InvocationAttributionV1,
+  type InvokeParams,
+  type LLMExecutor,
+  type LLMResult,
+  type LogLevel,
+  type RunTelemetry,
+} from "./types.js";
+
+/**
+ * Stage map (AII-959). Callers pass the explicit `agentStage`; the diagnostic `stage` label
+ * (e.g. "implement", "review", "plan-probe") is never parsed.
+ *   planning probes and planning generation -> planning
+ *   code changes and post-push fixes        -> implementation
+ *   verdicts, internal/advisory reviewers, read-only post-mortems -> review
+ */
+export class AgentStageError extends Error {
+  readonly code = "AGENT_STAGE_INVALID";
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentStageError";
+  }
+}
+
+/**
+ * A shared profile or the workspace may still have a live child, or its credential checkpoint is uncertain.
+ * Until a human or the recovery path clears it, no stage may start another invocation on that profile.
+ */
+export class AgentRecoveryRequiredError extends Error {
+  readonly code = "AGENT_RECOVERY_REQUIRED";
+  readonly reason: "child_possibly_live" | "held";
+  readonly profileId: string;
+  constructor(reason: AgentRecoveryRequiredError["reason"], profileId: string) {
+    super(`Agent invocation requires recovery: ${reason}`);
+    this.name = "AgentRecoveryRequiredError";
+    this.reason = reason;
+    this.profileId = profileId;
+  }
+}
+
+type ClaudeLike = { invoke(params: InvokeParams, options?: ClaudeInvokeOptions): Promise<LLMResult> };
+
+export interface StageExecutorOptions {
+  accountFallbacks?: AccountFallbacks;
+  fallbackModels?: Partial<Record<StageName, string>>;
+  workspaceDir: string;
+  /** The injected legacy executor, returned untouched when no snapshot is supplied. */
+  legacy: LLMExecutor;
+  /** Validated immutable snapshot (`RunConfigV1.agentConfig`). Absent = legacy run. */
+  snapshot?: ResolvedAgentSnapshotV1;
+  /** Selected-credential client. Required when a snapshot is supplied. */
+  auth?: Pick<ModelAuthClient, "invoke">;
+  logLevel?: LogLevel;
+  allowRepositoryWrites?: boolean;
+  activityReporting?: ActivityReportingConfig;
+  cancelSignal?: AbortSignal;
+  /** Extra Codex executor options (spawn/sleep seams); `auth`/`profileId` are always the selected ones. */
+  codexOptions?: Omit<CodexExecutorOptions, "auth" | "profileId" | "allowRepositoryWrites" | "cancelSignal" | "implementationFullAccess">;
+  /** Validated operator-approved ephemeral full-access policy (AII-1437). Reaches only the `exec` Codex executor, which
+   *  applies it to `agentStage === "implementation"`; the planning app-server executor never receives it. */
+  implementationFullAccess?: true;
+  /** Construction seams, mainly for tests. Each is called at most once per executor (Codex: per profile). */
+  createClaude?: () => ClaudeLike;
+  createCodex?: (profileId: string) => LLMExecutor;
+}
+
+/** Provider failures that permit trying the next configured account. Planning uses model fallback only. */
+export const ACCOUNT_FALLBACK_CODES: ReadonlySet<string> = new Set([
+  "ACCOUNT_USAGE_LIMIT", "PROVIDER_AUTH", "PROVIDER_CONFIG",
+]);
+
+/** Decide account rotation from public metadata only. Used profiles retain insertion order. */
+export function nextAccount(fallbacks: readonly StageAccount[] | undefined, used: ReadonlySet<string>, failure?: Pick<FailureRecord, "code">):
+  | { kind: "switch"; to: StageAccount }
+  | { kind: "exhausted"; profiles: string[] }
+  | { kind: "none" } {
+  if (!failure || !ACCOUNT_FALLBACK_CODES.has(failure.code)) return { kind: "none" };
+  const to = fallbacks?.find(entry => !used.has(entry.accountProfileId));
+  return to ? { kind: "switch", to } : { kind: "exhausted", profiles: [...used] };
+}
+
+/**
+ * Returns `legacy` itself for a legacy run, or a decorator that selects the Claude or Codex
+ * executor per call from the snapshot's stage selection. One executor instance is cached per
+ * agent/profile so invocation sequences and activity producer ids persist across calls. The
+ * selector never finishes or disposes a profile; that is a runner lifecycle responsibility.
+ */
+export function createStageExecutor(options: StageExecutorOptions): LLMExecutor {
+  const { snapshot } = options;
+  if (!snapshot) return options.legacy;
+  if (!options.auth) throw new AgentStageError("A stage snapshot requires a model auth client");
+  const auth = options.auth;
+
+  const effectiveAccounts = new Map<StageName, StageAccount>();
+  const usedAccounts = new Map<StageName, Set<string>>();
+  const switchOnFailure = (stage: StageName, failure?: FailureRecord) => {
+    if (stage === "planning") {
+      switchOnOverload(stage, failure);
+      return;
+    }
+    const current = effectiveAccounts.get(stage)?.accountProfileId ?? snapshot.stages[stage].accountProfileId;
+    const used = usedAccounts.get(stage) ?? new Set([current]);
+    usedAccounts.set(stage, used);
+    const decision = nextAccount(options.accountFallbacks?.[stage], used, failure);
+    if (!failure) return;
+    if (decision.kind === "switch") {
+      // Validate the next public projection before it can enter a marker, notice or log.
+      const to = decision.to;
+      const selection = { ...snapshot.stages[stage], ...to };
+      const profile = { ...snapshot.profiles[stage], ...to, id: to.accountProfileId, revision: to.profileRevision };
+      if (!sanitizeAttribution(staticAttribution(snapshot, stage, selection, profile, "account-switch", null))) {
+        throw new AgentStageError("The fallback selection cannot be attributed safely; refusing to run it");
+      }
+      used.add(decision.to.accountProfileId);
+      effectiveAccounts.set(stage, decision.to);
+      effectiveModels.delete(stage);
+      failure.accountFallback = { stage, from: current, to: decision.to.accountProfileId };
+      console.log(`[account-fallback] stage=${stage} from=${current} to=${decision.to.accountProfileId} after=${failure.code}`);
+    } else if (decision.kind === "exhausted" && failure.code === "ACCOUNT_USAGE_LIMIT") {
+      failure.message = `Usage limit reached on every account: ${decision.profiles.join(", ")}`;
+      failure.evidence.llmErrorMessage = failure.message;
+    }
+    switchOnOverload(stage, failure);
+  };
+  const effectiveModels = new Map<StageName, string>();
+  const switchOnOverload = (stage: StageName, failure?: FailureRecord) => {
+    const account = effectiveAccounts.get(stage);
+    if (account && (account.agent !== snapshot.stages[stage].agent || account.provider !== snapshot.stages[stage].provider)) return;
+    const from = account?.model ?? snapshot.stages[stage].model;
+    const to = options.fallbackModels?.[stage];
+    if (failure?.code !== "PROVIDER_OVERLOADED" || !to || to === from || effectiveModels.has(stage)) return;
+    effectiveModels.set(stage, to);
+    failure.modelFallback = { stage, from, to };
+    const safeModel = (model: string) => SAFE_LABEL_RE.test(model) && !SECRET_SHAPE_RE.test(model) ? model : "unknown-model";
+    console.log(`[model-fallback] stage=${stage} from=${safeModel(from)} to=${safeModel(to)} after=PROVIDER_OVERLOADED`);
+  };
+
+  let claude: ClaudeLike | undefined;
+  // Profiles held for recovery, shared by every stage (and agent) that selects them. The Claude child runs in
+  // the one workspace, so a possibly-live Claude child also blocks every later Claude invocation.
+  const heldProfiles = new Map<string, Error>();
+  let claudeHeld: AgentRecoveryRequiredError | null = null;
+  const codexByProfile = new Map<string, LLMExecutor>();
+
+  const getClaude = (): ClaudeLike =>
+    (claude ??=
+      options.createClaude?.() ??
+      new ClaudeCliExecutor(
+        options.workspaceDir,
+        options.logLevel ?? "summary",
+        options.allowRepositoryWrites ?? false,
+        undefined,
+        undefined,
+        options.activityReporting,
+      ));
+  // Planning and review have their own Codex executors and argv: the native app-server path (read-only sandbox,
+  // shell and unified exec disabled). Planning's host tools are repo_read/repo_search/comments_write (confined to
+  // ai-output/comments); review's are repo_read/repo_search only. Implementation keeps the `codex exec` path with
+  // its own sandbox. Cached per profile and kind, so no stage reuses another's transport or policy.
+  const getCodex = (profileId: string, stage: StageName): LLMExecutor => {
+    const kind = stage === "planning" || stage === "review" ? stage : "exec";
+    const key = `${kind}:${profileId}`;
+    let ex = codexByProfile.get(key);
+    if (!ex) {
+      ex =
+        options.createCodex?.(profileId) ??
+        new CodexExecutor(options.workspaceDir, {
+          ...options.codexOptions,
+          ...(kind !== "exec"
+            ? {
+                // A supplied driver is honoured only when its policy matches the stage.
+                protocolDriver:
+                  options.codexOptions?.protocolDriver &&
+                  (options.codexOptions.protocolDriver.policy === kind ||
+                    (kind === "planning" && options.codexOptions.protocolDriver.policy === undefined))
+                    ? options.codexOptions.protocolDriver
+                    : kind === "planning"
+                      ? createCodexPlanningDriver()
+                      : createCodexReviewDriver(),
+                trustedSkillsDir: options.codexOptions?.trustedSkillsDir ?? join(homedir(), CODEX_SKILLS_SUBDIR),
+                implementationFullAccess: undefined,
+              }
+            : {
+                protocolDriver: undefined,
+                trustedSkillsDir: undefined,
+                ...(options.implementationFullAccess === true ? { implementationFullAccess: true as const } : {}),
+              }),
+          auth,
+          profileId,
+          allowRepositoryWrites: options.allowRepositoryWrites,
+          cancelSignal: options.cancelSignal,
+        });
+      codexByProfile.set(key, ex);
+    }
+    return ex;
+  };
+
+  return {
+    async invoke(params: InvokeParams): Promise<LLMResult> {
+      const stage = requireStage(params.agentStage);
+      const account = effectiveAccounts.get(stage);
+      const selection = { ...snapshot.stages[stage], ...account, model: effectiveModels.get(stage) ?? account?.model ?? snapshot.stages[stage].model };
+      const profile = account ? { ...snapshot.profiles[stage], ...account, id: account.accountProfileId, revision: account.profileRevision } : snapshot.profiles[stage];
+      const invocationId = `${stage}-${randomUUID()}`;
+      // Validate the static projection before any auth acquisition or spawn: a rejected model, id or limit
+      // fails closed with a fixed message and never reaches a child or a result.
+      const base = sanitizeAttribution(staticAttribution(snapshot, stage, selection, profile, invocationId, limitFor(selection, params)));
+      if (!base) throw new AgentStageError("The stage selection cannot be attributed safely; refusing to run it");
+      const attribute = (outcomeHint: InvocationAttributionV1["outcome"], telemetry?: RunTelemetry): InvocationAttributionV1 =>
+        withOutcome(base, outcomeHint, telemetry);
+
+      // Snapshot values always win; caller and repository model/timeout values are discarded.
+      const call: InvokeParams = { ...params, model: selection.model, invocationTimeoutMs: selection.invocationTimeoutMs };
+      // Codex has a timeout, not a native turn cap: never forward one.
+      if (selection.agent === "codex") delete call.maxTurns;
+
+      // False until the guards pass: a hold rejection never reached an executor, so it is not a model call.
+      let reachedExecutor = false;
+      try {
+        const profileId = selection.accountProfileId;
+        const heldBy = heldProfiles.get(profileId);
+        if (heldBy) {
+          throw selection.agent === "codex"
+            ? new CodexRecoveryRequiredError("held")
+            : new AgentRecoveryRequiredError("held", profileId);
+        }
+        if (selection.agent === "claude" && claudeHeld) throw claudeHeld;
+        reachedExecutor = true;
+        let result: LLMResult;
+        if (selection.agent === "claude") {
+          // If the child cannot be proven dead the callback must never settle: the client checkpoints on both
+          // return and throw, which would persist stale session state, release the profile and let another
+          // child start beside a live one. The pending invoke keeps the profile "invoking"; the race below
+          // gives the caller a bounded recovery-required error instead of waiting on it.
+          let signalRecovery: (err: Error) => void = () => {};
+          const recovery = new Promise<never>((_, reject) => (signalRecovery = reject));
+          const invocation = auth.invoke(profileId, async (selected) => {
+            try {
+              return await getClaude().invoke(call, { env: selected.env });
+            } catch (err) {
+              if (isPossiblyLiveChild(err)) {
+                const held = new AgentRecoveryRequiredError("child_possibly_live", profileId);
+                heldProfiles.set(profileId, held);
+                claudeHeld = held;
+                signalRecovery(Object.assign(held, { cause: err }));
+                return new Promise<LLMResult>(() => {});
+              }
+              throw err;
+            }
+          });
+          invocation.catch(() => {});
+          result = await Promise.race([invocation, recovery]);
+        } else {
+          result = await getCodex(profileId, stage).invoke(call);
+        }
+        switchOnFailure(stage, result.failure);
+        const attribution = attribute(result.failure ? "error" : "success", result.telemetry);
+        recordInvocationOf(attribution, result.telemetry, result.attempts);
+        return withAttribution(result, attribution);
+      } catch (err) {
+        // A Codex executor that holds (child not terminated, auth sync or checkpoint uncertain) holds the
+        // profile for every stage; the error itself propagates unchanged.
+        if (err instanceof CodexRecoveryRequiredError) heldProfiles.set(selection.accountProfileId, err);
+        const category = (err as { category?: unknown } | null)?.category;
+        if (category === "checkpoint_uncertain" || category === "checkpoint_rejected") {
+          heldProfiles.set(selection.accountProfileId, err as Error);
+        }
+        if (account && err instanceof ModelAuthClientError) {
+          // Checkout errors have fixed, public categories, never credential-bearing messages.
+          Object.assign(err, { failure: {
+            category: "auth", code: `MODEL_AUTH_${err.category.toUpperCase()}`,
+            stage, attempt: 1, retryable: false, message: err.message,
+            evidence: { truncated: false },
+          } satisfies FailureRecord });
+        }
+        if (err instanceof Error || (typeof err === "object" && err !== null)) {
+          if (reachedExecutor) switchOnFailure(stage, (err as { failure?: FailureRecord }).failure);
+          const carried = (err as { telemetry?: RunTelemetry }).telemetry;
+          const attribution = attribute("error", carried);
+          Object.assign(err, { attribution });
+          if (carried) carried.attribution = attribution;
+          if (reachedExecutor) recordInvocationOf(attribution, carried, (err as { attempts?: number }).attempts);
+        }
+        throw err;
+      }
+    },
+  };
+}
+
+/** Adds one finished (or failed) invocation to the job's accounting list; missing usage stays null, never 0. */
+function recordInvocationOf(attribution: InvocationAttributionV1, telemetry: RunTelemetry | undefined, attempts: number | undefined): void {
+  const count = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
+  recordInvocation({
+    attribution,
+    cacheReadTokens: count(telemetry?.cacheReadTokens),
+    cacheCreationTokens: count(telemetry?.cacheCreationTokens),
+    attempts: Number.isSafeInteger(attempts) && (attempts as number) >= 1 ? (attempts as number) : 1,
+  });
+}
+
+function requireStage(value: unknown): StageName {
+  if (typeof value === "string" && (STAGE_NAMES as readonly string[]).includes(value)) return value as StageName;
+  throw new AgentStageError("A configured run requires an explicit known agentStage (planning, implementation or review)");
+}
+
+function limitFor(selection: StageSelection, params: InvokeParams): InvocationAttributionV1["limit"] {
+  if (selection.agent === "codex") return { kind: "timeout_ms", value: selection.invocationTimeoutMs };
+  return params.maxTurns != null ? { kind: "max_turns", value: params.maxTurns } : null;
+}
+
+function staticAttribution(
+  snapshot: ResolvedAgentSnapshotV1,
+  stage: StageName,
+  selection: StageSelection,
+  profile: ResolvedAgentSnapshotV1["profiles"][StageName],
+  invocationId: string,
+  limit: InvocationAttributionV1["limit"],
+): InvocationAttributionV1 {
+  return {
+    version: 1,
+    invocationId,
+    stage,
+    snapshotId: snapshot.snapshotId,
+    agent: selection.agent,
+    provider: selection.provider,
+    model: selection.model,
+    profileId: profile.id,
+    authMode: profile.authMode,
+    limit,
+    outcome: "unknown",
+    usage: null,
+  };
+}
+
+/** Adds outcome and usage to an already-validated static projection; unusable usage is stripped, nothing else changes. */
+function withOutcome(
+  base: InvocationAttributionV1,
+  outcomeHint: InvocationAttributionV1["outcome"],
+  telemetry?: RunTelemetry,
+): InvocationAttributionV1 {
+  const tokensIn = telemetry?.tokensIn ?? null;
+  const tokensOut = telemetry?.tokensOut ?? null;
+  const costUsd = telemetry?.costUsd ?? null;
+  const present = (tokensIn !== null ? 1 : 0) + (tokensOut !== null ? 1 : 0);
+  const full: InvocationAttributionV1 = {
+    ...base,
+    outcome: telemetry && !(outcomeHint === "error" && telemetry.outcome === "success") ? telemetry.outcome : outcomeHint,
+    usage: telemetry
+      ? {
+          availability: present === 2 ? "complete" : present === 1 ? "partial" : "unavailable",
+          tokensIn,
+          tokensOut,
+          costUsd,
+          costStatus: costUsd === null ? "unavailable" : "reported",
+        }
+      : null,
+  };
+  return sanitizeAttribution(full) ?? { ...base, outcome: outcomeHint, usage: null };
+}
+
+function withAttribution(result: LLMResult, attribution: InvocationAttributionV1): LLMResult {
+  return {
+    ...result,
+    attribution,
+    ...(result.telemetry ? { telemetry: { ...result.telemetry, attribution } } : {}),
+  };
+}
+
+const SAFE_LABEL_RE = /^[\x21-\x7e]{1,128}$/;
+const SECRET_SHAPE_RE = /(sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}|ghp_|gho_|ghs_|xox[bp]-)/i;
+
+/** Displayable `agent/model` label from an attribution or selection; never includes credential or session data. */
+export function safeModelLabel(source: Pick<InvocationAttributionV1, "agent" | "model">): string {
+  const model = SAFE_LABEL_RE.test(source.model) && !SECRET_SHAPE_RE.test(source.model) ? source.model : "unknown-model";
+  return `${source.agent}/${model}`;
+}
+
+/** Displayable limit label: Codex has an elapsed-time limit, Claude a native turn cap. Null limit is "no limit". */
+export function safeLimitLabel(limit: InvocationAttributionV1["limit"]): string {
+  if (!limit || !Number.isFinite(limit.value) || limit.value <= 0) return "no limit";
+  if (limit.kind === "timeout_ms") return `timeout ${Math.round(limit.value / 1000)}s`;
+  return `${Math.floor(limit.value)} turns`;
+}

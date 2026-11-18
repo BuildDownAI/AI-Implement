@@ -19,10 +19,12 @@ import { pipelinesAndStepsScript } from "../pages/pipelines-and-steps.js";
 import { modelsAndProvidersScript } from "../pages/models-and-providers.js";
 import { runnersScript } from "../pages/runners.js";
 import { reportsScript } from "../pages/reports.js";
+import { kgPipelinesScript } from "../pages/kg-pipelines.js";
 import { deploymentsScript } from "../pages/deployments.js";
 import { accessScript } from "../pages/access.js";
 import { drawerScript } from "../drawer.js";
 import { stepperScript } from "../stepper.js";
+import { SIDEBAR_ROUTES, sidebarHtml } from "../sidebar.js";
 
 /**
  * Defence in depth against the 2026-09-05 lockout (AII-535):
@@ -81,6 +83,7 @@ describe("per-module script parse", () => {
     ["models-and-providers", modelsAndProvidersScript],
     ["runners", runnersScript],
     ["reports", reportsScript],
+    ["kg-pipelines", kgPipelinesScript],
     ["deployments", deploymentsScript],
     ["access", accessScript],
     ["drawer", drawerScript],
@@ -206,5 +209,17 @@ describe("runtime error containment", () => {
     new vm.Script(`window.registerPage("throwing-page", function(){ throw new Error("init boom"); });`).runInContext(ctx);
     // startRouting triggers show("throwing-page") which calls the wrapped init — must not throw
     expect(() => new vm.Script(`window.startRouting();`).runInContext(ctx)).not.toThrow();
+  });
+});
+
+describe("journal removal (AII-1262)", () => {
+  it("the admin bundle has no journal page, sidebar entry, or renderRestateJournal", () => {
+    const html = adminHtml;
+    expect(html).not.toContain('data-page="journal"');
+    expect(html).not.toContain("registerPage('journal'");
+    expect(html).not.toContain('registerPage("journal"');
+    expect(html).not.toContain("renderRestateJournal");
+    expect(sidebarHtml()).not.toContain("journal");
+    expect(SIDEBAR_ROUTES).not.toContain("journal");
   });
 });

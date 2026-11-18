@@ -1,33 +1,26 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
+import type * as LogModule from "../log.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let queue: typeof CommentGapfillQueueModule;
+let log: typeof LogModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `comment-gapfill-queue-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  queue = await import("../comment-gapfill-queue.js");
-  dedup.getDb();
+  ({ dedup, queue, log } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        queue: () => import("../comment-gapfill-queue.js"),
+        log: () => import("../log.js"),
+      },
+    })
+  ).modules);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
   vi.restoreAllMocks();
 });
 
@@ -196,6 +189,16 @@ describe("conflict resolution helpers", () => {
     expect(queue.countConflictAttempts("org", "repo", 2)).toBe(1);
   });
 
+  it("a push-retry row does not count as a conflict attempt or a pending conflict resolution", () => {
+    queue.enqueueCommentGapfill({
+      owner: "org", repo: "repo", prNumber: 42, commentId: -777,
+      commenter: queue.PUSH_RETRY_COMMENTER, instruction: "retry",
+    });
+
+    expect(queue.countConflictAttempts("org", "repo", 42)).toBe(0);
+    expect(queue.hasPendingConflictResolution("org", "repo", 42)).toBe(false);
+  });
+
   it("hasPendingConflictResolution returns false when no synthetic rows exist", () => {
     expect(queue.hasPendingConflictResolution("org", "repo", 42)).toBe(false);
   });
@@ -249,8 +252,6 @@ describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
   });
 
   it("updateJobStatus terminal transition on a comment-triggered job terminalizes the queue row (all-paths choke point)", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     const rowId = queue.enqueueConflictResolution({ owner: "o", repo: "r2", prNumber: 12, featureBranch: "ai-implement/feature/p-2" });
     queue.markCommentGapfillProcessed(rowId, "dispatched");
     const jobId = log.appendLog({
@@ -268,8 +269,6 @@ describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
   });
 
   it("failed run marks the row failed; non-comment jobs never touch queue rows", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     const rowId = queue.enqueueConflictResolution({ owner: "o", repo: "r3", prNumber: 5, featureBranch: "ai-implement/feature/p-3" });
     queue.markCommentGapfillProcessed(rowId, "dispatched");
     const jobId = log.appendLog({
@@ -296,8 +295,6 @@ describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
 
 describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
   it("terminalizes dispatched rows whose linked comment job is already terminal", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     const id = queue.enqueueConflictResolution({ owner: "o", repo: "rs", prNumber: 33, featureBranch: "ai-implement/feature/p" });
     queue.markCommentGapfillProcessed(id, "dispatched");
     // job terminalized BEFORE the AII-277 hook existed (simulated: direct SQL, no hook side-effects)
@@ -315,8 +312,6 @@ describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
   });
 
   it("leaves rows with in-flight jobs untouched; absent-job rows go failed", async () => {
-    const log = await import("../log.js");
-    log.initLogTable();
     // in-flight
     const a = queue.enqueueConflictResolution({ owner: "o", repo: "ra", prNumber: 1, featureBranch: "ai-implement/feature/p" });
     queue.markCommentGapfillProcessed(a, "dispatched");
@@ -335,4 +330,115 @@ describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
     expect(queue.hasPendingConflictResolution("o", "ra", 1)).toBe(true);   // untouched
     expect(queue.hasPendingConflictResolution("o", "rb", 2)).toBe(false);  // failed
   });
+
+  describe("requeueGapfillAfterPushFailure (AII-922)", () => {
+    const seed = () => {
+      const id = queue.enqueueCommentGapfill({
+        owner: "org", repo: "repo", prNumber: 7, commentId: 2001, commenter: "alice", instruction: "fix it",
+      });
+      queue.markCommentGapfillProcessed(id, "dispatched");
+    };
+
+    it("re-enqueues the dispatched instruction exactly once", () => {
+      seed();
+      expect(queue.requeueGapfillAfterPushFailure("org/repo", 7)).toBe(true);
+      queue.markCommentGapfillRunTerminal("org/repo", 7, "failed");
+      const [retry] = queue.claimPendingCommentGapfills();
+      expect(retry.instruction).toBe("fix it");
+      expect(retry.commenter).toBe(queue.PUSH_RETRY_COMMENTER);
+
+      // The retry runs and fails at push too: it is not retried again.
+      queue.markCommentGapfillProcessed(retry.id, "dispatched");
+      expect(queue.requeueGapfillAfterPushFailure("org/repo", 7)).toBe(false);
+      queue.markCommentGapfillRunTerminal("org/repo", 7, "failed");
+      expect(queue.claimPendingCommentGapfills()).toHaveLength(0);
+    });
+
+    it("does nothing without a dispatched row and does not count as a conflict attempt", () => {
+      expect(queue.requeueGapfillAfterPushFailure("org/repo", 7)).toBe(false);
+      seed();
+      queue.requeueGapfillAfterPushFailure("org/repo", 7);
+      expect(queue.countConflictAttempts("org", "repo", 7)).toBe(0);
+      expect(queue.hasPendingConflictResolution("org", "repo", 7)).toBe(false);
+    });
+  });
+});
+
+
+describe("roll-up reviews", () => {
+  it("preserves the legacy key and gives only one retry its own durable key", () => {
+    const input = { owner: "org", repo: "repo", prNumber: 42, headSha: "head-a" };
+    expect(queue.enqueueRollupReview(input)).toBe(true);
+    const [initial] = queue.claimPendingCommentGapfills();
+    expect(initial.commentId).toBe(-153033412971482);
+    expect(queue.enqueueRollupReview({ ...input, attempt: 0 })).toBe(false);
+    expect(queue.enqueueRollupReview({ ...input, attempt: 1 })).toBe(true);
+    const retry = queue.claimPendingCommentGapfills()[1];
+    expect(retry.commentId).toBeLessThan(-2_000_000_000);
+    expect(retry.commentId).not.toBe(initial.commentId);
+    expect(retry.commenter).toBe(queue.ROLLUP_REVIEW_COMMENTER);
+    expect(retry.instruction).toContain(input.headSha);
+    for (const status of ["pending", "dispatched", "completed", "failed", "skipped"] as const) {
+      queue.markCommentGapfillProcessed(retry.id, status);
+      expect(queue.enqueueRollupReview({ ...input, attempt: 1 })).toBe(false);
+    }
+    expect(queue.enqueueRollupReview({ ...input, attempt: 2 })).toBe(false);
+  });
+
+  it("deduplicates each head even after completion and isolates all key components", () => {
+    const input = { owner: "org", repo: "repo", prNumber: 42, headSha: "head-a" };
+    expect(queue.enqueueRollupReview(input)).toBe(true);
+    expect(queue.enqueueRollupReview(input)).toBe(false);
+    const [row] = queue.claimPendingCommentGapfills();
+    expect(row.commenter).toBe(queue.ROLLUP_REVIEW_COMMENTER);
+    expect(Number.isSafeInteger(row.commentId)).toBe(true);
+    expect(row.commentId).toBeLessThan(-2_000_000_000);
+    queue.markCommentGapfillProcessed(row.id, "completed");
+    expect(queue.enqueueRollupReview(input)).toBe(false);
+    for (const change of [{ owner: "other" }, { repo: "other" }, { prNumber: 43 }, { headSha: "head-b" }]) {
+      expect(queue.enqueueRollupReview({ ...input, ...change })).toBe(true);
+    }
+    const rows = dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all();
+    expect(rows).toHaveLength(5);
+    expect(queue.countConflictAttempts("org", "repo", 42)).toBe(0);
+  });
+});
+
+it("counts distinct refusals, replaces the reason, and protects skipped from stale acceptance", () => {
+  const id = queue.enqueueCommentGapfill({ owner: "org", repo: "repo", prNumber: 42, commentId: 1999, commenter: "alice", instruction: "fix" });
+  const stale = queue.getCommentGapfillItem(id)!;
+  for (const [index, reason] of ["occupied", "parked", "at_capacity"].entries()) {
+    queue.recordCommentGapfillRefusal(id, reason, `dispatch-${index}`);
+    queue.recordCommentGapfillRefusal(id, reason, `dispatch-${index}`);
+    expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ refusalCount: index + 1, lastRefusalReason: reason, status: index === 2 ? "skipped" : "pending" }));
+  }
+  queue.markCommentGapfillSubmitted(stale);
+  queue.recordCommentGapfillRefusal(id, "occupied", "fourth");
+  expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity" }));
+});
+
+it("upgrades an old queue twice without losing its rows", async () => {
+  const fixture = await testDb({ tables: "none", modules: { dedup: () => import("../dedup.js"), queue: () => import("../comment-gapfill-queue.js") } });
+  const { default: Database } = await import("better-sqlite3");
+  const old = new Database(fixture.path);
+  old.exec(`CREATE TABLE comment_gapfill_queue (
+    id INTEGER PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL, pr_number INTEGER NOT NULL,
+    comment_id INTEGER NOT NULL UNIQUE, commenter TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, processed_at INTEGER);
+    INSERT INTO comment_gapfill_queue VALUES (1, 'org', 'repo', 42, 123, 'alice', 'fix', 'pending', 1, NULL)`);
+  old.close();
+  for (let boot = 0; boot < 2; boot++) {
+    const loaded = await fixture.reopen();
+    expect(loaded.queue.getCommentGapfillItem(1)).toEqual(expect.objectContaining({ instruction: "fix", status: "pending", refusalCount: 0, lastRefusalReason: null }));
+  }
+});
+
+it("deduplicates interleaved A/B/A refusals", () => {
+  const id = queue.enqueueCommentGapfill({ owner: "org", repo: "repo", prNumber: 42, commentId: 2999, commenter: "alice", instruction: "fix" });
+  queue.recordCommentGapfillRefusal(id, "occupied", "A");
+  queue.recordCommentGapfillRefusal(id, "at_capacity", "B");
+  queue.recordCommentGapfillRefusal(id, "occupied", "A");
+  expect(queue.getCommentGapfillRefusal(id, "A")).toBe("occupied");
+  expect(queue.getCommentGapfillRefusal(id, "B")).toBe("at_capacity");
+  expect(queue.getCommentGapfillItem(id)).toMatchObject({ refusalCount: 2, status: "pending", lastRefusalReason: "at_capacity" });
 });

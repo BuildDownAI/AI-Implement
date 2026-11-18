@@ -29,7 +29,7 @@ write is the `CASE` guard in `updateJobStatus` (`src/log.ts`), added by AII-453 
 ## Decision
 
 The runner's result callback writes the conclusion `runner_approved` on the dispatch row when a
-successful implementation run reports a PR, and the `CASE` guard preserves that value. The
+successful implementation run reports a PR, and the `CASE` guard preserves that value. A gap-fill's mark comes from `LateExternalReview` instead; when Restate was not ready at callback time, the poll sweep submits it later (AII-1304), and the `CASE` guard also preserves the interim `external_review_pending`. The
 auto-merge gate merges a child PR only when the run record allows it: no run for the child issue
 is non-terminal, and the latest run for the issue is terminal with the approval mark. A PR with
 no run record is held. The gate keys on the issue identifier, which exists on the row from

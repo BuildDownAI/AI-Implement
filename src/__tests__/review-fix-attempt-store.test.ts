@@ -1,20 +1,16 @@
 /**
  * Behavioral tests for `src/review-fix-attempt-store.ts` (AII-785) against real
- * SQLite, matching `dispatch-admission.test.ts`'s temp-file harness. `npm run
- * typecheck` excludes `src/__tests__`, and vitest strips types without checking
- * them, so the direct `ReviewFixAttemptStorePort` assignment below (acceptance
- * criterion: "no unsafe adapter casts") is additionally type-checked via
- * `npx tsc --noEmit -p tsconfig.review-fix-attempt-store-tests.json`.
+ * SQLite, matching `dispatch-admission.test.ts`'s temp-file harness. Vitest
+ * strips types without checking them, so the direct `ReviewFixAttemptStorePort`
+ * assignment below (acceptance criterion: "no unsafe adapter casts") is
+ * type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  *
  * `better-sqlite3` is single-connection and synchronous, so "concurrent
  * preparation" here means back-to-back same-content calls within one process —
  * the same scope documented in `review-fix-ports.test.ts`, not a real
  * cross-process race.
  */
-import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import { afterEach, describe, expect, it, beforeEach, onTestFinished, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as StoreModule from "../review-fix-attempt-store.js";
@@ -24,11 +20,15 @@ import type * as PendingModule from "../review-fix-pending.js";
 import type * as CloseModule from "../review-fix-close.js";
 import type * as AdminFacadeModule from "../review-fix-admin-facade.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
+import type * as DeployHoldModule from "../deploy-hold.js";
+import type * as EvidenceModule from "../review-fix-evidence.js";
 import type { ReviewFixAdmissionRequest, ReviewFixAttemptStorePort } from "../review-fix-ports.js";
 import type { ReviewFixResultMetadataV1, ScopedPrIdentity } from "../review-fix-contract.js";
 import type { RepoMapping } from "../config.js";
+import { makeAppConfig, makeMapping, makeRegistry, makeReviewFixResult, makeScopedPrIdentity } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let storeModule: typeof StoreModule;
@@ -38,71 +38,32 @@ let pending: typeof PendingModule;
 let close: typeof CloseModule;
 let adminFacade: typeof AdminFacadeModule;
 let breaker: typeof BreakerModule;
+let deployHold: typeof DeployHoldModule;
+let evidence: typeof EvidenceModule;
 
+// The restart tests close the database and rely on the next getDb() reopening the same file lazily.
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `review-fix-attempt-store-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  config = await import("../config.js");
-  storeModule = await import("../review-fix-attempt-store.js");
-  ledger = await import("../review-ledger-store.js");
-  queue = await import("../review-fix-queue.js");
-  pending = await import("../review-fix-pending.js");
-  close = await import("../review-fix-close.js");
-  adminFacade = await import("../review-fix-admin-facade.js");
-  breaker = await import("../dispatch-breaker.js");
-  breaker.initDispatchBreakerTable();
+  ({ dedup, config, storeModule, ledger, queue, pending, close, adminFacade, breaker, deployHold, evidence } = (await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      config: () => import("../config.js"),
+      storeModule: () => import("../review-fix-attempt-store.js"),
+      ledger: () => import("../review-ledger-store.js"),
+      queue: () => import("../review-fix-queue.js"),
+      pending: () => import("../review-fix-pending.js"),
+      close: () => import("../review-fix-close.js"),
+      adminFacade: () => import("../review-fix-admin-facade.js"),
+      breaker: () => import("../dispatch-breaker.js"),
+      deployHold: () => import("../deploy-hold.js"),
+      evidence: () => import("../review-fix-evidence.js"),
+    },
+  })).modules);
 });
 
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
-});
-
-const SCOPE: ScopedPrIdentity = { installationId: 1, repository: "eudoxus/ai-implement", prNumber: 42 };
-
-function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "repo">): RepoMapping {
-  return {
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "github-actions",
-    sessionMode: "autonomous",
-    machineCpus: 2,
-    machineMemoryMb: 4096,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    autoMerge: false,
-    extraEnv: {},
-    provider: "anthropic",
-    ticketingProvider: "linear",
-    ticketingConfig: { kind: "linear" },
-    awsRegion: null,
-    paused: false,
-    maxTurns: null,
-    maxIterations: null,
-    maxJobMinutes: null,
-    branchPrefix: null,
-    skillsRepo: null,
-    sensitiveAddPatterns: null,
-    sensitiveAllowPatterns: null,
-    dependencyTokenScope: null,
-    memoryProviderId: null,
-    referenceRepos: null,
-    reviewers: null,
-    reviewFixLifecycle: null,
-    ...overrides,
-  };
-}
+const SCOPE = makeScopedPrIdentity({ repository: "eudoxus/ai-implement" });
 
 function seedMapping(overrides: Partial<RepoMapping> = {}): void {
-  config.initMappingsTable();
-  config.upsertMapping("AII", mapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
+  config.upsertMapping("AII", makeMapping({ owner: "eudoxus", repo: "ai-implement", ...overrides }));
 }
 
 function admissionRequest(overrides: Partial<ReviewFixAdmissionRequest> = {}): ReviewFixAdmissionRequest {
@@ -114,12 +75,56 @@ function admissionRequest(overrides: Partial<ReviewFixAdmissionRequest> = {}): R
   };
 }
 
+describe("execution backend admission", () => {
+  it.each([
+    ["default", "github-actions", "github-actions"],
+    ["default", "fly-machines", "fly-machines"],
+    ["gha", "fly-machines", "github-actions"],
+    ["fly", "github-actions", "fly-machines"],
+    ["local", "github-actions", "local-docker"],
+    ["shadow", "fly-machines", "github-actions"],
+  ] as const)("resolves %s with mapping %s to %s", async (mode, executionMode, backend) => {
+    const previousMode = process.env.RUNNER_MODE;
+    onTestFinished(() => {
+      if (previousMode === undefined) delete process.env.RUNNER_MODE;
+      else process.env.RUNNER_MODE = previousMode;
+    });
+    process.env.RUNNER_MODE = mode;
+    seedMapping({ executionMode });
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    expect(admitted.attempt).toHaveProperty("executionBackend", backend);
+    const db = dedup.getDb();
+    expect(db.prepare("SELECT execution_backend FROM review_fix_attempts WHERE attempt_id = ?")
+      .get(admitted.attempt.attemptId)).toEqual({ execution_backend: backend });
+    expect(db.prepare("SELECT backend FROM dispatch_admissions WHERE dispatch_id = ?")
+      .get(admitted.attempt.attemptId)).toEqual({ backend });
+
+    dedup.closeDb();
+    const restarted = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await restarted.getPreparedAttempt(admitted.attempt.attemptId)).toEqual(admitted.attempt);
+    process.env.RUNNER_MODE = mode === "fly" ? "gha" : "fly";
+    seedMapping({ executionMode: executionMode === "github-actions" ? "fly-machines" : "github-actions" });
+    expect(await restarted.admit(admissionRequest())).toEqual(admitted);
+    expect(dedup.getDb().prepare("SELECT COUNT(*) AS count FROM dispatch_admissions").get()).toEqual({ count: 1 });
+  });
+
+  it("loads a legacy row that omitted the backend as GitHub Actions", async () => {
+    dedup.getDb().prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at, task_snapshot_json, finding_versions_json)
+      VALUES ('legacy', 'legacy', 'AII', ?, ?, ?, 'pr', 'legacy', 'legacy', 'prepared', 1, 2, ?, '[]')`)
+      .run(String(SCOPE.installationId), SCOPE.repository, SCOPE.prNumber, JSON.stringify({ taskText: "legacy" }));
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    expect(await store.getPreparedAttempt("legacy")).toHaveProperty("executionBackend", "github-actions");
+  });
+});
+
 describe("deploy drain admission barrier", () => {
   it("defers new attempts under the hold while preserving idempotent prepared replays", async () => {
     seedMapping();
-    const { initSettingsTable } = await import("../runner-mode.js");
-    const { setDeployHold, clearDeployHold } = await import("../deploy-hold.js");
-    initSettingsTable();
+    const { setDeployHold, clearDeployHold } = deployHold;
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const request = admissionRequest();
     setDeployHold();
@@ -141,19 +146,8 @@ describe("deploy drain admission barrier", () => {
   });
 });
 
-function result(overrides: Partial<ReviewFixResultMetadataV1> = {}): ReviewFixResultMetadataV1 {
-  return {
-    version: 1,
-    attemptId: "",
-    installationId: SCOPE.installationId,
-    repository: SCOPE.repository,
-    prNumber: SCOPE.prNumber,
-    deadlineAt: Date.now() + 3_600_000,
-    githubRunId: 1000,
-    githubRunAttempt: 1,
-    outputCommit: "a".repeat(40),
-    ...overrides,
-  };
+function result(overrides: Partial<Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }>> = {}): Extract<ReviewFixResultMetadataV1, { executionBackend?: undefined }> {
+  return makeReviewFixResult({ ...SCOPE, ...overrides });
 }
 
 describe("SqliteReviewFixAttemptStore: satisfies the port without unsafe casts", () => {
@@ -169,9 +163,10 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const cancels: Array<{ attemptId: string; key: string }> = [];
     const facade = adminFacade.createReviewFixAdminFacade(store, {
       reconcile: async () => ({ status: "unknown" }),
-    });
+    }, { cancel: async (attemptId, opts) => { cancels.push({ attemptId, key: opts.idempotencyKey }); return { status: "accepted" }; } });
     const user = { role: "user" as const, email: "reader@example.com" };
     const admin = { role: "admin" as const, email: "operator@example.com" };
     expect(await facade.getAttempt(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
@@ -186,7 +181,7 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(await facade.revokeAuthority(admitted.attempt.attemptId, user)).toEqual({ status: "not_found" });
     expect(await facade.revokeAuthority(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
     expect(await facade.requestCancellation(admitted.attempt.attemptId, admin)).toEqual({ status: "accepted" });
-    expect((dedup.getDb().prepare("SELECT kind FROM review_fix_inbox").get() as { kind: string }).kind).toBe("cancellation");
+    expect(cancels).toEqual([{ attemptId: admitted.attempt.attemptId, key: `${admitted.attempt.attemptId}.cancel` }]);
     expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
   });
@@ -196,10 +191,10 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
-    const execution = { githubRunId: 9001, githubRunAttempt: 2 };
+    const execution = { backend: "github-actions" as const, githubRunId: 9001, githubRunAttempt: 2 };
     const facade = adminFacade.createReviewFixAdminFacade(store, {
       reconcile: async () => ({ status: "found", execution }),
-    });
+    }, { cancel: async () => ({ status: "accepted" }) });
     const admin = { role: "admin" as const, email: "operator@example.com" };
     expect(await facade.adopt(admitted.attempt.attemptId,
       { githubRunId: "9002", githubRunAttempt: 2 }, admin)).toEqual({ status: "unverified" });
@@ -215,25 +210,29 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     const admitted = await store.admit(admissionRequest());
     if (admitted.status !== "prepared") throw new Error("expected prepared");
     expect(close.listActiveRestateReviewFixPrs()).toEqual([{ repository: SCOPE.repository, prNumber: SCOPE.prNumber }]);
-    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
+    const keys: string[] = [];
+    const ingress = { cancel: async (_id: string, opts: { idempotencyKey: string }) => { keys.push(opts.idempotencyKey); return { status: "accepted" as const }; } };
+    expect(await close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber, ingress)).toBe(true);
     expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
-    expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber)).toBe(true);
-    const rows = dedup.getDb().prepare("SELECT kind, delivery_state FROM review_fix_inbox").all() as
-      Array<{ kind: string; delivery_state: string }>;
-    expect(rows).toEqual([{ kind: "cancellation", delivery_state: "pending" }]);
+    expect(await close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber, ingress)).toBe(true);
+    expect(keys).toEqual([`${admitted.attempt.attemptId}.closed`, `${admitted.attempt.attemptId}.closed`]);
+    // Restate unavailable: the revocation stays and the caller sees the failure so the webhook answers 503.
+    await expect(close.queueReviewFixCancellationForClosedPr(SCOPE.repository, SCOPE.prNumber,
+      { cancel: async () => ({ status: "unavailable" }) })).rejects.toThrow("unavailable");
+    expect(await store.hasCurrentAuthority(admitted.attempt.attemptId)).toBe(false);
     expect(dedup.getDb().prepare("SELECT released_at FROM dispatch_admissions WHERE dispatch_id = ?")
       .get(admitted.attempt.attemptId)).toMatchObject({ released_at: null });
     await store.releaseOwner(admitted.attempt.owner, "cancelled");
     expect(close.listActiveRestateReviewFixPrs()).toEqual([]);
   });
 
-  it("consumes exactly one queue snapshot while preserving overflow and new finding revisions", async () => {
+  it("consumes exactly one queue snapshot while preserving new finding revisions", async () => {
     seedMapping();
     const queueId = queue.enqueueReviewFix({
       issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
-      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1",
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1",
     });
-    const records = Array.from({ length: 35 }, (_, i) => ({
+    const records = Array.from({ length: 30 }, (_, i) => ({
       repo: SCOPE.repository, prNumber: SCOPE.prNumber,
       source: "github-review-thread" as const, severity: "medium" as const,
       body: `finding ${i}`, path: `file${i}.ts`, line: i,
@@ -244,14 +243,16 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(firstFeedback?.findings).toHaveLength(30);
     const first = await store.admit(admissionRequest({ feedback: firstFeedback! }));
     if (first.status !== "prepared") throw new Error("expected prepared");
-    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).not.toContain(queueId);
 
-    // Re-reporting an included finding increments its version. It must join
-    // the five overflow findings in the next attempt after exact-owner release.
+    // Re-reporting an included finding increments its version; only that new
+    // version is offered in the next attempt after exact-owner release.
     ledger.upsertReviewFinding(records[0]);
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-2" });
     await store.releaseOwner(first.attempt.owner, "finalized");
     const secondFeedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text");
-    expect(secondFeedback?.findings).toHaveLength(6);
+    expect(secondFeedback?.findings).toHaveLength(1);
     expect(secondFeedback?.findings).toContainEqual({
       findingKey: first.attempt.findings[0].findingKey, version: 2,
     });
@@ -260,10 +261,108 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
     expect(queue.getPendingReviewFixes().map((item) => item.id)).not.toContain(queueId);
   });
 
+  const queueModuleError = () => queue.ReviewFixFeedbackIncompleteError;
+
+  it("delivers a 4,387-character four-finding review in full with exact finding versions", () => {
+    seedMapping();
+    queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
+    const bodies = [1, 2, 3, 4].map((n) => `Finding ${n}.\n\n${"detail ".repeat(150)}\n\nRequired test ${n}: assert-end-${n}`);
+    expect(bodies.join("").length).toBeGreaterThan(3500);
+    bodies.forEach((body, i) => ledger.upsertReviewFinding({
+      repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body, path: `f${i}.ts`, line: i + 1,
+    }));
+    const feedback = pending.loadPendingReviewFixFeedback(SCOPE, "issue text")!;
+    expect(feedback.findings).toHaveLength(4);
+    expect(feedback.taskText).toContain("Required test 4: assert-end-4");
+    expect(feedback.taskText).not.toContain("…");
+  });
+
+  it.each([
+    ["count", () => Array.from({ length: 31 }, (_, i) => `finding ${i}`)],
+    ["body", () => ["x".repeat(8001)]],
+    ["aggregate", () => Array.from({ length: 4 }, () => "y".repeat(7000))],
+  ])("rejects over-%s feedback before admission and leaves everything pending", (category, makeBodies) => {
+    seedMapping();
+    const queueId = queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
+    makeBodies().forEach((body, i) => ledger.upsertReviewFinding({
+      repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body, path: `f${i}.ts`, line: i + 1,
+    }));
+    const openBefore = ledger.listOpenReviewFindings(SCOPE.repository, SCOPE.prNumber).length;
+    let error: unknown;
+    try { pending.loadPendingReviewFixFeedback(SCOPE, "issue text"); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(queueModuleError());
+    expect((error as { category: string }).category).toBe(category);
+    expect((error as Error).message).not.toContain("xxxx");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(ledger.listOpenReviewFindings(SCOPE.repository, SCOPE.prNumber)).toHaveLength(openBefore);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
+  });
+
+  it("keeps over-budget feedback pending and visible without throwing on the non-launch reads", async () => {
+    seedMapping();
+    const queueId = queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
+    ledger.upsertReviewFinding({ repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body: "x".repeat(8001), path: "f.ts", line: 1 });
+    // Non-throwing inspection used by the dashboard and the durable load.
+    const inspected = pending.inspectPendingReviewFixFeedback(SCOPE, "issue text");
+    expect(inspected).toMatchObject({ status: "incomplete", category: "body" });
+    expect(JSON.stringify(inspected)).not.toContain("xxxx");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect(ledger.listOpenReviewFindings(SCOPE.repository, SCOPE.prNumber)).toHaveLength(1);
+
+    // Admin facade: an attempt on a PR whose newer feedback is over budget still reads, pendingFeedback true.
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest({ feedback: { taskText: "t", findings: [{ findingKey: "f1", version: 1 }] } }));
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const facade = adminFacade.createReviewFixAdminFacade(store, { reconcile: async () => ({ status: "unknown" }) },
+      { cancel: async () => ({ status: "accepted" }) });
+    const detail = await facade.getAttempt(admitted.attempt.attemptId, { role: "admin", email: "operator@example.com" });
+    expect(detail.status).toBe("ok");
+    if (detail.status === "ok") expect(detail.attempt.pendingFeedback).toBe(true);
+  });
+
+  it("production load() leaves over-budget feedback pending, admits nothing and logs only the category", async () => {
+    seedMapping({ reviewFixLifecycle: "restate" });
+    const queueId = queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
+    ledger.upsertReviewFinding({ repo: SCOPE.repository, prNumber: SCOPE.prNumber, source: "github-review-thread",
+      severity: "medium", body: "x".repeat(8001), path: "f.ts", line: 1 });
+    let deps: { load(scope: ScopedPrIdentity): Promise<{ closed: boolean; pending: unknown }> } | undefined;
+    onTestFinished(() => {
+      vi.doUnmock("../restate/review-fix-pr.js");
+      vi.doUnmock("../restate/review-fix-attempt.js");
+      vi.doUnmock("../github-app-auth.js");
+    });
+    vi.doMock("../restate/review-fix-pr.js", () => ({ createReviewFixPR: (d: typeof deps) => { deps = d; return {}; } }));
+    vi.doMock("../restate/review-fix-attempt.js", () => ({ createReviewFixAttempt: () => ({}) }));
+    vi.doMock("../github-app-auth.js", async (orig) => ({ ...(await orig<Record<string, unknown>>()),
+      getInstallationToken: async () => "ghs_installation" }));
+    fakeFetch({ [`GET /repos/${SCOPE.repository}/pulls/${SCOPE.prNumber}`]: { json: {
+      number: SCOPE.prNumber, state: "open", merged: false, head: { ref: "ai-implement/aii-42-x", sha: "a".repeat(40) },
+    } } }).install();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    onTestFinished(() => warn.mockRestore());
+    const production = await import("../restate/review-fix-production.js");
+    production.createProductionReviewFixServices(makeAppConfig(), makeRegistry());
+    const snapshot = await deps!.load(SCOPE);
+    expect(snapshot.closed).toBe(false);
+    expect(snapshot.pending).toBeNull(); // resolves, so no Restate retry of the journaled step
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("incomplete (body)");
+    expect(String(warn.mock.calls[0][0])).not.toContain("xxxx");
+    expect(queue.getPendingReviewFixes().map((item) => item.id)).toContain(queueId);
+    expect((dedup.getDb().prepare("SELECT COUNT(*) AS n FROM review_fix_attempts").get() as { n: number }).n).toBe(0);
+  });
+
   it("defers a stale queue snapshot after a finding revision changes before admission", async () => {
     seedMapping();
     queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
-      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
     const finding = { repo: SCOPE.repository, prNumber: SCOPE.prNumber,
       source: "github-review-thread" as const, severity: "medium" as const,
       body: "changed finding", path: "file.ts", line: 1 };
@@ -279,10 +378,10 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
   it("keeps a newer queue event pending when it arrives after the snapshot but before admission", async () => {
     seedMapping();
     queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
-      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
     const firstFeedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
     queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
-      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-2" });
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-2" });
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const first = await store.admit(admissionRequest({ feedback: firstFeedback }));
     if (first.status !== "prepared") throw new Error("expected prepared");
@@ -297,7 +396,7 @@ describe("SqliteReviewFixAttemptStore: admission", () => {
   it("defers parked automatic feedback without spending a reservation or budget entry", async () => {
     seedMapping();
     queue.enqueueReviewFix({ issueId: "issue-42", issueIdentifier: "AII-42", repo: SCOPE.repository,
-      prNumber: SCOPE.prNumber, reason: "review_feedback", sourceEventId: "event-1" });
+      prNumber: SCOPE.prNumber, reason: "changes_requested", sourceEventId: "event-1" });
     breaker.parkIssue("issue-42", "gap-analysis", "pr_budget");
     const feedback = pending.loadPendingReviewFixFeedback(SCOPE, null)!;
     const store = new storeModule.SqliteReviewFixAttemptStore();
@@ -467,16 +566,16 @@ describe("SqliteReviewFixAttemptStore: launch intent and execution binding", () 
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
-    const execution = { githubRunId: 123, githubRunAttempt: 1 };
+    const execution = { backend: "github-actions" as const, githubRunId: 123, githubRunAttempt: 1 };
 
-    expect((await store.bindExecution("unknown-attempt", execution)).status).toBe("not_owner");
+    expect((await store.bindExecution("unknown-attempt", execution, Date.now())).status).toBe("not_owner");
 
-    const bound = await store.bindExecution(outcome.attempt.attemptId, execution);
+    const bound = await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     expect(bound.status).toBe("bound");
-    const rebind = await store.bindExecution(outcome.attempt.attemptId, execution);
+    const rebind = await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     expect(rebind).toEqual({ status: "already_bound", execution });
 
-    const different = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 999, githubRunAttempt: 1 });
+    const different = await store.bindExecution(outcome.attempt.attemptId, { backend: "github-actions" as const, githubRunId: 999, githubRunAttempt: 1 }, Date.now());
     expect(different).toEqual({ status: "already_bound", execution });
   });
 
@@ -486,7 +585,7 @@ describe("SqliteReviewFixAttemptStore: launch intent and execution binding", () 
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     await store.releaseOwner(outcome.attempt.owner, "finalized");
-    const bind = await store.bindExecution(outcome.attempt.attemptId, { githubRunId: 1, githubRunAttempt: 1 });
+    const bind = await store.bindExecution(outcome.attempt.attemptId, { backend: "github-actions" as const, githubRunId: 1, githubRunAttempt: 1 }, Date.now());
     expect(bind).toEqual({ status: "not_owner" });
   });
 });
@@ -498,8 +597,8 @@ describe("SqliteReviewFixAttemptStore: authority", () => {
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     expect(await store.hasCurrentAuthority(outcome.attempt.attemptId)).toBe(true);
-    await store.revokeAuthority(outcome.attempt.attemptId);
-    await store.revokeAuthority(outcome.attempt.attemptId);
+    await store.revokeAuthority(outcome.attempt.attemptId, Date.now());
+    await store.revokeAuthority(outcome.attempt.attemptId, Date.now());
     expect(await store.hasCurrentAuthority(outcome.attempt.attemptId)).toBe(false);
     expect(await store.hasCurrentAuthority("unknown-attempt")).toBe(false);
   });
@@ -542,65 +641,34 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
-    const execution = { githubRunId: 555, githubRunAttempt: 1 };
-    await store.bindExecution(outcome.attempt.attemptId, execution);
+    const execution = { backend: "github-actions" as const, githubRunId: 555, githubRunAttempt: 1 };
+    await store.bindExecution(outcome.attempt.attemptId, execution, Date.now());
     return { store, attemptId: outcome.attempt.attemptId, deadlineAt: outcome.attempt.deadlineAt, execution };
   }
 
   it("stores a fresh result and returns duplicate on an identical retry", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
     const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    const first = await store.recordResult(attemptId, r);
+    const first = await store.recordResult(attemptId, r, Date.now());
     expect(first).toEqual({ status: "stored", result: r });
-    const second = await store.recordResult(attemptId, r);
+    const second = await store.recordResult(attemptId, r, Date.now());
     expect(second).toEqual({ status: "duplicate", attemptId });
   });
 
-  it("commits the canonical result and its delivery together, and repairs an identical retry", async () => {
+  it("runs the in-transaction hook with the canonical result, rolls back when it throws, and re-runs it on an identical retry", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const inbox = await import("../review-fix-inbox.js");
     const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    const queue = () => {
-      const accepted = inbox.acceptDelivery({
-        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
-        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
-        payload: r,
-      });
-      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
-    };
+    const hook = vi.fn();
 
-    await expect(store.recordResult(attemptId, r, () => { throw new Error("inbox write failed"); }))
-      .rejects.toThrow("inbox write failed");
+    await expect(store.recordResult(attemptId, r, Date.now(), () => { throw new Error("hook failed"); }))
+      .rejects.toThrow("hook failed");
     expect((await store.getAcceptedResult(attemptId))?.result).toBeNull();
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
 
-    expect((await store.recordResult(attemptId, r, queue)).status).toBe("stored");
-    const first = inbox.getDelivery("runner-callback", `${attemptId}.result`);
-    expect(first?.deliveryState).toBe("pending");
-
+    expect((await store.recordResult(attemptId, r, Date.now(), hook)).status).toBe("stored");
     // A lost HTTP ACK repeats the same credential and payload after a restart.
     const restarted = new storeModule.SqliteReviewFixAttemptStore();
-    expect((await restarted.recordResult(attemptId, r, queue)).status).toBe("duplicate");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.payloadHash).toBe(first?.payloadHash);
-  });
-
-  it("repairs a previously accepted result whose delivery row is missing", async () => {
-    const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const inbox = await import("../review-fix-inbox.js");
-    const r = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
-    expect((await store.recordResult(attemptId, r)).status).toBe("stored");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)).toBeNull();
-
-    const retried = await store.recordResult(attemptId, r, () => {
-      const accepted = inbox.acceptDelivery({
-        authenticatedSource: "runner-callback", deliveryId: `${attemptId}.result`, kind: "result",
-        destination: { installationId: r.installationId, repository: r.repository, prNumber: r.prNumber },
-        payload: r,
-      });
-      if (accepted.status !== "accepted") throw new Error(`delivery ${accepted.status}`);
-    });
-    expect(retried.status).toBe("duplicate");
-    expect(inbox.getDelivery("runner-callback", `${attemptId}.result`)?.deliveryState).toBe("pending");
+    expect((await restarted.recordResult(attemptId, r, Date.now(), hook)).status).toBe("duplicate");
+    expect(hook).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a result whose scope or deadline does not match the prepared attempt, including an early result before binding", async () => {
@@ -612,15 +680,15 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const deadlineAt = outcome.attempt.deadlineAt;
 
     const wrongPr = result({ attemptId, deadlineAt, prNumber: SCOPE.prNumber + 1 });
-    expect(await store.recordResult(attemptId, wrongPr)).toEqual({
+    expect(await store.recordResult(attemptId, wrongPr, Date.now())).toEqual({
       status: "stale", attemptId, reason: "result scope or deadline does not match the prepared attempt",
     });
 
     const wrongRepository = result({ attemptId, deadlineAt, repository: "eudoxus/some-other-repo" });
-    expect((await store.recordResult(attemptId, wrongRepository)).status).toBe("stale");
+    expect((await store.recordResult(attemptId, wrongRepository, Date.now())).status).toBe("stale");
 
     const wrongDeadline = result({ attemptId, deadlineAt: deadlineAt + 1 });
-    expect((await store.recordResult(attemptId, wrongDeadline)).status).toBe("stale");
+    expect((await store.recordResult(attemptId, wrongDeadline, Date.now())).status).toBe("stale");
 
     // None of the rejected results became the first accepted result.
     const row = dedup.getDb().prepare("SELECT accepted_result_json FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
@@ -629,7 +697,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
 
     // The matching-scope result is still accepted, before binding.
     const valid = result({ attemptId, deadlineAt, githubRunId: 777, githubRunAttempt: 1 });
-    expect((await store.recordResult(attemptId, valid)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, valid, Date.now())).status).toBe("stored");
   });
 
   it("accepts an early result before binding, then treats a later bind for a genuinely different execution as a conflict", async () => {
@@ -639,16 +707,16 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     const attemptId = outcome.attempt.attemptId;
     const deadlineAt = outcome.attempt.deadlineAt;
-    const early = { githubRunId: 777, githubRunAttempt: 1 };
+    const early = { backend: "github-actions" as const, githubRunId: 777, githubRunAttempt: 1 };
     const r = result({ attemptId, deadlineAt, githubRunId: early.githubRunId, githubRunAttempt: early.githubRunAttempt });
-    expect((await store.recordResult(attemptId, r)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, r, Date.now())).status).toBe("stored");
 
     // A later bind for a different execution than the accepted early result
     // must not silently succeed — it must surface the original execution
     // identity (matching the already-bound-mismatch handling used post-launch)
     // and persist the conflict, not leave accepted_result_json and the bound
     // columns permanently inconsistent with nothing recorded.
-    const mismatched = await store.bindExecution(attemptId, { githubRunId: 888, githubRunAttempt: 1 });
+    const mismatched = await store.bindExecution(attemptId, { backend: "github-actions" as const, githubRunId: 888, githubRunAttempt: 1 }, Date.now());
     expect(mismatched).toEqual({ status: "already_bound", execution: early });
 
     const row = dedup.getDb().prepare("SELECT github_run_id, github_run_attempt, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
@@ -658,16 +726,16 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     expect(row.result_conflict_at).not.toBeNull();
 
     // A later bind matching the accepted early result's execution still succeeds.
-    expect(await store.bindExecution(attemptId, early)).toEqual({ status: "bound" });
+    expect(await store.bindExecution(attemptId, early, Date.now())).toEqual({ status: "bound" });
   });
 
   it("persists a conflict before finalization and never rewrites the finalized outcome afterward", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
     const stored = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt, outputCommit: "a".repeat(40) });
-    expect((await store.recordResult(attemptId, stored)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, stored, Date.now())).status).toBe("stored");
 
     const conflicting = { ...stored, outputCommit: "b".repeat(40) };
-    const conflictOutcome = await store.recordResult(attemptId, conflicting);
+    const conflictOutcome = await store.recordResult(attemptId, conflicting, Date.now());
     expect(conflictOutcome.status).toBe("conflict");
 
     const rowAfterConflict = dedup.getDb().prepare("SELECT accepted_result_json, result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as
@@ -675,9 +743,9 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     expect(JSON.parse(rowAfterConflict.accepted_result_json)).toEqual(stored);
     expect(rowAfterConflict.result_conflict_at).not.toBeNull();
 
-    const finalized = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } });
+    const finalized = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } }, Date.now());
     expect(finalized.status).toBe("recorded");
-    const secondFinalize = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "failed", reason: "should never apply" } });
+    const secondFinalize = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "failed", reason: "should never apply" } }, Date.now());
     expect(secondFinalize).toEqual({
       status: "already_recorded",
       outcome: { attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } },
@@ -686,7 +754,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     const rowBeforeSecondConflict = dedup.getDb().prepare("SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { terminal_outcome_json: string };
 
     const anotherConflict = { ...stored, outputCommit: "c".repeat(40) };
-    const postFinalOutcome = await store.recordResult(attemptId, anotherConflict);
+    const postFinalOutcome = await store.recordResult(attemptId, anotherConflict, Date.now());
     expect(postFinalOutcome.status).toBe("conflict");
 
     const rowAfterSecondConflict = dedup.getDb().prepare("SELECT terminal_outcome_json FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { terminal_outcome_json: string };
@@ -695,14 +763,14 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
 
   it("reports stale for an unknown attempt, a mismatched attemptId, and a released attempt", async () => {
     const { store, attemptId, deadlineAt, execution } = await prepareBound();
-    const unknown = await store.recordResult("nonexistent", result({ attemptId: "nonexistent", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }));
+    const unknown = await store.recordResult("nonexistent", result({ attemptId: "nonexistent", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }), Date.now());
     expect(unknown.status).toBe("stale");
 
-    const mismatched = await store.recordResult(attemptId, result({ attemptId: "different", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }));
+    const mismatched = await store.recordResult(attemptId, result({ attemptId: "different", deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }), Date.now());
     expect(mismatched.status).toBe("stale");
 
     await store.releaseOwner(attemptId, "finalized");
-    const afterRelease = await store.recordResult(attemptId, result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }));
+    const afterRelease = await store.recordResult(attemptId, result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt }), Date.now());
     expect(afterRelease).toEqual({ status: "stale", attemptId, reason: "attempt has been released or superseded" });
   });
 
@@ -715,7 +783,7 @@ describe("SqliteReviewFixAttemptStore: result intake", () => {
     // is durable rather than held only in an in-memory store instance.
     dedup.closeDb();
     const reopenedStore = new storeModule.SqliteReviewFixAttemptStore();
-    const outcome = await reopenedStore.recordResult(attemptId, wrongExecution);
+    const outcome = await reopenedStore.recordResult(attemptId, wrongExecution, Date.now());
     expect(outcome.status).toBe("conflict");
 
     dedup.closeDb();
@@ -741,29 +809,215 @@ describe("SqliteReviewFixAttemptStore: release", () => {
   });
 });
 
-describe("SqliteReviewFixAttemptStore: terminal effect outbox", () => {
-  it("records a terminal effect once and collapses a duplicate write", async () => {
+describe("SqliteReviewFixAttemptStore: journaled timestamps", () => {
+  const SENTINEL = 1_234_567_890_123;
+
+  /** Records the stack of every `Date.now()` read made by the store under test; restored by the file's `afterEach` via `vi.restoreAllMocks`. */
+  function spyOnClock(): string[] {
+    const reads: string[] = [];
+    const real = Date.now.bind(Date);
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      const stack = new Error().stack ?? "";
+      if (stack.includes("/src/review-fix-attempt-store.ts")) reads.push(stack);
+      return real();
+    });
+    return reads;
+  }
+
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("writes the now it receives and never reads the clock", async () => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const { attemptId, deadlineAt } = admitted.attempt;
+    const execution = { backend: "github-actions" as const, githubRunId: 555, githubRunAttempt: 1 };
+    await store.bindExecution(attemptId, execution, Date.now());
+    const clockReads = spyOnClock();
+    const read = (column: string) => (dedup.getDb().prepare(`SELECT ${column} AS v FROM review_fix_attempts WHERE attempt_id = ?`).get(attemptId) as { v: number | null }).v;
+
+    // recordResult: conflicting identity against the bound execution.
+    const stored = result({ attemptId, deadlineAt, githubRunId: execution.githubRunId, githubRunAttempt: execution.githubRunAttempt });
+    expect((await store.recordResult(attemptId, { ...stored, githubRunId: execution.githubRunId + 1 }, SENTINEL)).status).toBe("conflict");
+    expect(read("result_conflict_at")).toBe(SENTINEL);
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET result_conflict_at = NULL WHERE attempt_id = ?").run(attemptId);
+
+    // recordResult: a different result than the stored one.
+    expect((await store.recordResult(attemptId, stored, SENTINEL + 1)).status).toBe("stored");
+    expect((await store.recordResult(attemptId, { ...stored, outputCommit: "d".repeat(40) }, SENTINEL + 2)).status).toBe("conflict");
+    expect(read("result_conflict_at")).toBe(SENTINEL + 2);
+
+    await store.revokeAuthority(attemptId, SENTINEL + 3);
+    expect(read("authority_revoked_at")).toBe(SENTINEL + 3);
+
+    const recorded = await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "succeeded", outputCommit: stored.outputCommit } }, SENTINEL + 4);
+    expect(recorded).toEqual({ status: "recorded", completedAt: SENTINEL + 4 });
+    expect(read("completed_at")).toBe(SENTINEL + 4);
+    await store.recordOutcome({ attemptId, scope: SCOPE, terminal: { status: "failed", reason: "later" } }, SENTINEL + 5);
+    expect(read("completed_at")).toBe(SENTINEL + 4);
+
+    expect(clockReads).toEqual([]);
+  });
+
+  it("bindExecution writes the received now on an early-result mismatch", async () => {
     seedMapping();
     const store = new storeModule.SqliteReviewFixAttemptStore();
     const outcome = await store.admit(admissionRequest());
     if (outcome.status !== "prepared") throw new Error("expected prepared");
     const attemptId = outcome.attempt.attemptId;
+    await store.recordResult(attemptId, result({ attemptId, deadlineAt: outcome.attempt.deadlineAt, githubRunId: 777, githubRunAttempt: 1 }), Date.now());
+    const clockReads = spyOnClock();
+    await store.bindExecution(attemptId, { backend: "github-actions" as const, githubRunId: 888, githubRunAttempt: 1 }, SENTINEL);
+    const row = dedup.getDb().prepare("SELECT result_conflict_at FROM review_fix_attempts WHERE attempt_id = ?").get(attemptId) as { result_conflict_at: number };
+    expect(row.result_conflict_at).toBe(SENTINEL);
+    expect(clockReads).toEqual([]);
+  });
+});
 
-    const first = store.recordTerminalEffect(attemptId, "approval-1", { note: "approved" });
-    expect(first.status).toBe("accepted");
-    const duplicate = store.recordTerminalEffect(attemptId, "approval-1", { note: "approved" });
-    expect(duplicate.status).toBe("accepted");
-    if (duplicate.status === "accepted" && first.status === "accepted") {
-      expect(duplicate.delivery.deliveryId).toBe(first.delivery.deliveryId);
+describe("review-fix admin facade: cycle evidence projection", () => {
+  const admin = { role: "admin" as const, email: "operator@example.com" };
+
+  async function attemptWithFacade() {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const facade = adminFacade.createReviewFixAdminFacade(store, { reconcile: async () => ({ status: "unknown" }) },
+      { cancel: async () => ({ status: "accepted" }) });
+    return { attemptId: admitted.attempt.attemptId, facade };
+  }
+
+  /** Stored exactly as `recordOneCycleSummary` writes a runner summary (verdict is the JSON object). */
+  async function record(attemptId: string, cycle: number, fields: {
+    outputCommit: string | null; tests: unknown; verdict: string; usage: unknown; dispositions?: Array<{ findingKey: string; disposition: "addressed" }>;
+  }) {
+    expect(evidence.recordReviewFixCycleSummary({ attemptId, cycle, inputCommit: "a".repeat(40), outputCommit: fields.outputCommit,
+      dispositions: fields.dispositions ?? [], tests: fields.tests as never, verdict: fields.verdict, usage: fields.usage as never,
+      completedAt: 1000 + cycle }).status).toBe("recorded");
+  }
+
+  it("distinguishes the pending pre-push cycle from the published one and projects the structured verdict", async () => {
+    const { attemptId, facade } = await attemptWithFacade();
+    const verdict = JSON.stringify({ approved: true, reason: "approved" });
+    const tests = [{ name: "test execution", status: "missing" }];
+    const usage = { tokensIn: null, tokensOut: null, costUsd: null };
+    await record(attemptId, 1, { outputCommit: null, tests, verdict, usage });
+    await record(attemptId, 50_001, { outputCommit: "b".repeat(40), tests, verdict, usage,
+      dispositions: [{ findingKey: "k1", disposition: "addressed" }] });
+    const detail = await facade.getAttempt(attemptId as never, admin);
+    if (detail.status !== "ok") throw new Error("expected ok");
+    const [pending, published] = detail.attempt.cycles;
+    expect(pending).toMatchObject({ cycle: 1, outputCommit: null, dispositions: [] });
+    expect(published).toMatchObject({ cycle: 50_001, outputCommit: "b".repeat(40), dispositions: [{ key: "k1", disposition: "addressed" }] });
+    for (const cycle of [pending, published]) expect(cycle.verdict).toEqual({ approved: true, reason: "approved" });
+  });
+
+  it("keeps missing tests missing and null usage null instead of inventing success or zero cost", async () => {
+    const { attemptId, facade } = await attemptWithFacade();
+    await record(attemptId, 1, { outputCommit: null, tests: [{ name: "test execution", status: "missing" }],
+      verdict: JSON.stringify({ approved: null, reason: "x" }), usage: { tokensIn: null, tokensOut: null, costUsd: null } });
+    await record(attemptId, 2, { outputCommit: null, tests: null, verdict: "legacy text", usage: null });
+    await record(attemptId, 3, { outputCommit: null, tests: [{ name: "unit", status: "passed" }],
+      verdict: "{broken", usage: { tokensIn: 5, tokensOut: null, costUsd: 0.25 } });
+    const detail = await facade.getAttempt(attemptId as never, admin);
+    if (detail.status !== "ok") throw new Error("expected ok");
+    const [missing, noTests, observed] = detail.attempt.cycles;
+    expect(missing.tests).toEqual([{ name: "test execution", status: "missing" }]);
+    expect(missing.usage).toEqual({ tokensIn: null, tokensOut: null, costUsd: null });
+    expect(noTests.tests).toEqual([]);
+    expect(noTests.usage).toEqual({ tokensIn: null, tokensOut: null, costUsd: null });
+    expect(noTests.verdict).toEqual({ approved: null, reason: "legacy text" });
+    expect(observed.tests).toEqual([{ name: "unit", status: "passed" }]);
+    expect(observed.usage).toEqual({ tokensIn: 5, tokensOut: null, costUsd: 0.25 });
+    expect(observed.verdict).toEqual({ approved: null, reason: "{broken" });
+  });
+
+  it("reports missing invocation attribution explicitly without inventing a job or usage", async () => {
+    const { attemptId, facade } = await attemptWithFacade();
+    const detail = await facade.getAttempt(attemptId as never, admin);
+    if (detail.status !== "ok") throw new Error("expected ok");
+    expect(detail.attempt.attribution).toBeNull();
+  });
+});
+
+describe("backend execution ownership", () => {
+  it.each(["fly-machines", "local-docker"] as const)("accepts a bound %s result and preserves conflict detection", async (backend) => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const id = admitted.attempt.attemptId;
+    dedup.getDb().prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, id);
+    await store.bindExecution(id, { backend, runRef: "container" }, Date.now());
+    const { githubRunId: _id, githubRunAttempt: _attempt, ...base } = makeReviewFixResult({
+      attemptId: id, ...SCOPE, deadlineAt: admitted.attempt.deadlineAt,
+    });
+    const result = { ...base, executionBackend: backend };
+    expect((await store.recordResult(id, result, Date.now())).status).toBe("stored");
+    expect((await store.recordResult(id, result, Date.now())).status).toBe("duplicate");
+    expect((await store.recordResult(id, { ...result, outputCommit: "f".repeat(40) }, Date.now())).status).toBe("conflict");
+  });
+
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("keeps machine result intake disabled for %s attempts before binding", async (backend) => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const id = admitted.attempt.attemptId;
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, id);
+    const row = () => db.prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(id);
+    const before = row();
+    for (const executionBackend of ["fly-machines", "local-docker"] as const) {
+      const { githubRunId: _id, githubRunAttempt: _attempt, ...base } = makeReviewFixResult({
+        attemptId: id, ...SCOPE, deadlineAt: admitted.attempt.deadlineAt,
+      });
+      expect((await store.recordResult(id, { ...base, executionBackend }, Date.now())).status).toBe("stale");
+      expect(row()).toEqual(before);
     }
+  });
 
-    const rows = dedup.getDb().prepare("SELECT COUNT(*) as n FROM review_fix_inbox WHERE kind = 'terminal-effect'").get() as { n: number };
-    expect(rows.n).toBe(1);
-
-    const conflicting = store.recordTerminalEffect(attemptId, "approval-1", { note: "different payload" });
-    expect(conflicting.status).toBe("conflict");
-
-    const unknown = store.recordTerminalEffect("nonexistent-attempt", "approval-1", {});
-    expect(unknown).toEqual({ status: "rejected", reason: "unknown attempt nonexistent-attempt" });
+  it.each(["github-actions", "fly-machines", "local-docker"] as const)("binds only matching identities for %s", async (backend) => {
+    seedMapping();
+    const store = new storeModule.SqliteReviewFixAttemptStore();
+    const admitted = await store.admit(admissionRequest());
+    if (admitted.status !== "prepared") throw new Error("expected prepared");
+    const id = admitted.attempt.attemptId;
+    const db = dedup.getDb();
+    db.prepare("UPDATE review_fix_attempts SET execution_backend = ? WHERE attempt_id = ?").run(backend, id);
+    const identities = [
+      { backend: "github-actions" as const, githubRunId: 123, githubRunAttempt: 1 },
+      { backend: "fly-machines" as const, runRef: "same-ref" },
+      { backend: "local-docker" as const, runRef: "same-ref" },
+    ];
+    const row = () => dedup.getDb().prepare("SELECT * FROM review_fix_attempts WHERE attempt_id = ?").get(id);
+    for (const identity of identities.filter((item) => item.backend !== backend)) {
+      const before = row();
+      expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "not_owner" });
+      expect(row()).toEqual(before);
+    }
+    const identity = identities.find((item) => item.backend === backend)!;
+    expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "bound" });
+    expect(row()).toMatchObject(backend === "github-actions"
+      ? { github_run_id: 123, github_run_attempt: 1, execution_ref: null }
+      : { github_run_id: null, github_run_attempt: null, execution_ref: "same-ref" });
+    dedup.closeDb();
+    expect((await store.findPreparedAttemptByExecution(identity))?.attemptId).toBe(id);
+    for (const other of identities.filter((item) => item.backend !== backend)) {
+      expect(await store.findPreparedAttemptByExecution(other)).toBeNull();
+      const before = row();
+      expect(await store.bindExecution(id, other, Date.now())).toEqual({ status: "not_owner" });
+      expect(row()).toEqual(before);
+    }
+    expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "already_bound", execution: identity });
+    if (backend !== "github-actions") {
+      const before = row();
+      expect((await store.recordResult(id, makeReviewFixResult({ attemptId: id, ...SCOPE, deadlineAt: admitted.attempt.deadlineAt }), Date.now())).status).toBe("stale");
+      expect(row()).toEqual(before);
+      expect(await store.bindExecution(id, { backend, runRef: "different" }, Date.now())).toEqual({ status: "already_bound", execution: identity });
+    }
+    await store.releaseOwner(admitted.attempt.owner, "cancelled");
+    expect(await store.bindExecution(id, identity, Date.now())).toEqual({ status: "not_owner" });
   });
 });

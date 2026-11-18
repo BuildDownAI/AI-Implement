@@ -1,9 +1,45 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { collectedInvocations, collectedPushedCommits, recordInvocation, recordPushedCommits } from "../pipeline/job-accounting.js";
 import { runPlanning, runPlanningLocally } from "../run-planning.js";
-import { encodeRunConfig } from "../run-config.js";
+import { encodeRunConfig, encodeTrustedRunConfig, type ResolvedAgentSnapshotV1 } from "../run-config.js";
+import { fakeFetch, type FakeFetch, type FetchCall } from "./helpers/fake-fetch.js";
+import { resultAccepted } from "./helpers/replies/orchestrator.js";
+import { testDir } from "./helpers/test-dir.js";
+import { AgentRecoveryRequiredError } from "../pipeline/stage-executor.js";
+import { MODEL_AUTH_ROUTES } from "../model-auth-contract.js";
+import { EXPECTED, NOW, SENTINEL_BEARER, fakeClient, makeGrant } from "./helpers/fixtures/configured-run.js";
+import { GHA_CONTEXT, GHA_PLAN_WORKFLOWS, ghaGrant, ghaRunStepEnv, oldShapedRunEnv, stubRunEnv } from "./helpers/fixtures/gha-handoff.js";
+import { CODEX_CHILD_GLOBAL, S_AMBIENT, S_CHATGPT, S_OPENAI, codexLoopback, installCodexChild, installPlanningDriver, resetCodexChild } from "./helpers/fixtures/codex-composition.js";
+import { prepareConfiguredRun } from "../run-autonomous.js";
+import type { ModelAuthTransport } from "../model-auth-client.js";
+import type { InvokeParams, LLMResult } from "../pipeline/types.js";
+import { vi } from "vitest";
+import { EventEmitter } from "node:events";
+import type { spawn } from "node:child_process";
+
+vi.mock("../pipeline/steps/install-skills.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pipeline/steps/install-skills.js")>();
+  return { ...actual, installSkills: vi.fn(() => ({ skillsInstalled: 0, skillsRepoRef: null })) };
+});
+import { installSkills } from "../pipeline/steps/install-skills.js";
+
+// Passthrough except while a test installs the fake `codex` child / planning protocol driver (helpers/fixtures/codex-composition.ts).
+type CodexSlots = { spawn?: (...args: unknown[]) => unknown; driver?: unknown };
+const codexSlots = (): CodexSlots | undefined => (globalThis as unknown as Record<string, CodexSlots | undefined>)[CODEX_CHILD_GLOBAL];
+vi.mock("node:child_process", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:child_process")>();
+  const spawn = ((...a: Parameters<typeof real.spawn>) =>
+    a[0] === "codex" && codexSlots()?.spawn ? codexSlots()!.spawn!(...a) : real.spawn(...a)) as typeof real.spawn;
+  return { ...real, spawn };
+});
+vi.mock("../pipeline/codex-planning-adapter.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../pipeline/codex-planning-adapter.js")>();
+  return { ...real, createCodexPlanningDriver: () => (codexSlots()?.driver as ReturnType<typeof real.createCodexPlanningDriver> | undefined) ?? real.createCodexPlanningDriver() };
+});
 
 type RunnerResultPayload = {
   phase: "planning";
@@ -12,31 +48,32 @@ type RunnerResultPayload = {
   failureReason?: string;
 };
 
+/** The legacy runner environment a planning run starts with. */
 function setEnv() {
-  process.env.ISSUE_ID = "uuid-1";
-  process.env.ISSUE_IDENTIFIER = "ENG-42";
-  process.env.ISSUE_TITLE = "Add widget";
-  process.env.ISSUE_DESCRIPTION = "Build the widget.";
-  process.env.GITHUB_OWNER = "o";
-  process.env.GITHUB_REPO = "r";
-  process.env.PARENT = "None";
-  process.env.SIBLINGS = "None";
-  process.env.DEPENDENCIES = "None";
+  const env = {
+    ISSUE_ID: "uuid-1",
+    ISSUE_IDENTIFIER: "ENG-42",
+    ISSUE_TITLE: "Add widget",
+    ISSUE_DESCRIPTION: "Build the widget.",
+    GITHUB_OWNER: "o",
+    GITHUB_REPO: "r",
+    PARENT: "None",
+    SIBLINGS: "None",
+    DEPENDENCIES: "None",
+  };
+  for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
 }
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("runPlanning", () => {
   let ws: string;
   beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), "plan-"));
-    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
+    ws = testDir("plan");
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", undefined);
     setEnv();
-  });
-  afterEach(() => {
-    rmSync(ws, { recursive: true, force: true });
-    delete process.env.RUNNER_CALLBACK_URL;
-    delete process.env.RUN_TOKEN;
-    delete process.env.CLAUDE_MODEL;
-    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
   });
 
   it("renders PLANNING.md, runs the executor, collects comments, posts a planning callback", async () => {
@@ -54,18 +91,14 @@ describe("runPlanning", () => {
       );
       return { status: 0, stdout: "", stderr: "" };
     };
-    const posted: RunnerResultPayload[] = [];
-    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
-      posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
-      return { ok: true, text: async () => "" } as Response;
-    };
-    process.env.RUNNER_CALLBACK_URL = "http://orch";
-    process.env.RUN_TOKEN = "tok";
+    const orchestrator = fakeFetch({ "POST /runner/result": resultAccepted });
+    vi.stubEnv("RUNNER_CALLBACK_URL", "http://orch");
+    vi.stubEnv("RUN_TOKEN", "tok");
 
     const result = await runPlanning({
       workspaceDir: ws,
       executor: fakeExecutor,
-      fetchImpl: fakeFetch,
+      fetchImpl: orchestrator.fetch,
     });
 
     expect(result.exitCode).toBe(0);
@@ -73,26 +106,37 @@ describe("runPlanning", () => {
     expect(invoked!.args).toContain("--dangerously-skip-permissions");
     expect(invoked!.args.join(" ")).toContain("--model claude-x");
     expect(invoked!.args.join(" ")).not.toContain("push");
-    expect(posted[0]).toMatchObject({ phase: "planning", outcome: "success" });
-    expect(posted[0].comments).toHaveLength(1);
+    const posted = JSON.parse(orchestrator.calls[0].body) as RunnerResultPayload;
+    expect(posted).toMatchObject({ phase: "planning", outcome: "success" });
+    expect(posted.comments).toHaveLength(1);
   });
 
   it("posts outcome=failure with a reason when the executor exits non-zero", async () => {
     writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: m\n---\nbody");
-    const posted: RunnerResultPayload[] = [];
-    process.env.RUNNER_CALLBACK_URL = "http://orch";
-    process.env.RUN_TOKEN = "tok";
-    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
-      posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
-      return { ok: true, text: async () => "" } as Response;
-    };
+    vi.stubEnv("RUNNER_CALLBACK_URL", "http://orch");
+    vi.stubEnv("RUN_TOKEN", "tok");
+    const orchestrator = fakeFetch({ "POST /runner/result": resultAccepted });
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 1, stdout: "", stderr: "boom" }),
-      fetchImpl: fakeFetch,
+      fetchImpl: orchestrator.fetch,
     });
     expect(result.exitCode).toBe(1);
-    expect(posted[0]).toMatchObject({ phase: "planning", outcome: "failure" });
+    expect(JSON.parse(orchestrator.calls[0].body)).toMatchObject({ phase: "planning", outcome: "failure" });
+  });
+
+  it("starts with no invocations or pushed SHAs left by an earlier run in the process (AII-1566)", async () => {
+    recordInvocation({ attribution: { invocationId: "stale" } as never, cacheReadTokens: null, cacheCreationTokens: null, attempts: 1 });
+    recordPushedCommits(["a".repeat(40)]);
+    let seen: { invocations: number; shas: readonly string[] | null } | null = null;
+    await runPlanning({
+      workspaceDir: ws,
+      executor: () => {
+        seen = { invocations: collectedInvocations().length, shas: collectedPushedCommits() };
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(seen).toEqual({ invocations: 0, shas: null });
   });
 
   it("uses built-in prompt when PLANNING.md is absent", async () => {
@@ -108,15 +152,12 @@ describe("runPlanning", () => {
   });
 
   it("resolves issue fields and planning context from the AI_IMPLEMENT_RUN_CONFIG envelope, ignoring legacy env", async () => {
-    delete process.env.ISSUE_ID;
-    delete process.env.ISSUE_IDENTIFIER;
-    delete process.env.ISSUE_TITLE;
-    delete process.env.ISSUE_DESCRIPTION;
-    process.env.AI_IMPLEMENT_RUN_CONFIG = encodeRunConfig({
+    for (const name of ["ISSUE_ID", "ISSUE_IDENTIFIER", "ISSUE_TITLE", "ISSUE_DESCRIPTION"]) vi.stubEnv(name, undefined);
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig({
       v: 1,
       issue: { id: "e-1", identifier: "AII-9", title: "Envelope issue", description: "From envelope." },
       planningContext: { parent: "AII-1", siblings: "AII-2", dependencies: "AII-3" },
-    });
+    }));
     let capturedPrompt = "";
     const fakeExecutor = (prompt: string) => {
       capturedPrompt = prompt;
@@ -133,32 +174,28 @@ describe("runPlanning", () => {
   });
 
   it("posts the runner-callback result using the envelope's runnerCallbackUrl when RUNNER_CALLBACK_URL is unset (GHA envelope mode)", async () => {
-    delete process.env.RUNNER_CALLBACK_URL;
-    process.env.RUN_TOKEN = "tok";
-    process.env.AI_IMPLEMENT_RUN_CONFIG = encodeRunConfig({
+    vi.stubEnv("RUNNER_CALLBACK_URL", undefined);
+    vi.stubEnv("RUN_TOKEN", "tok");
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig({
       v: 1,
       issue: { id: "e-1", identifier: "AII-9", title: "Envelope issue", description: "From envelope." },
       runnerCallbackUrl: "https://orch.example/callback",
-    });
-    const posted: Array<{ url: string; body: unknown }> = [];
-    const fakeFetch = async (u: string, init: RequestInit = {}) => {
-      posted.push({ url: u, body: JSON.parse(String(init.body)) });
-      return { ok: true, text: async () => "" } as Response;
-    };
+    }));
+    const orchestrator = fakeFetch({ "POST /callback/runner/result": resultAccepted });
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 0, stdout: "", stderr: "" }),
-      fetchImpl: fakeFetch,
+      fetchImpl: orchestrator.fetch,
     });
     expect(result.exitCode).toBe(0);
-    expect(posted).toHaveLength(1);
-    expect(posted[0].url).toBe("https://orch.example/callback/runner/result");
-    expect(posted[0].body).toMatchObject({ phase: "planning", outcome: "success" });
+    expect(orchestrator.calls).toHaveLength(1);
+    expect(orchestrator.calls[0].url.href).toBe("https://orch.example/callback/runner/result");
+    expect(JSON.parse(orchestrator.calls[0].body)).toMatchObject({ phase: "planning", outcome: "success" });
   });
 
   it("CLAUDE_MODEL env overrides PLANNING.md model", async () => {
     writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: claude-x\n---\nbody");
-    process.env.CLAUDE_MODEL = "claude-override";
+    vi.stubEnv("CLAUDE_MODEL", "claude-override");
     let capturedArgs: string[] = [];
     const fakeExecutor = (_prompt: string, args: string[]) => {
       capturedArgs = args;
@@ -173,11 +210,7 @@ describe("runPlanningLocally", () => {
   let ws: string;
 
   beforeEach(() => {
-    ws = mkdtempSync(join(tmpdir(), "plan-local-"));
-  });
-
-  afterEach(() => {
-    rmSync(ws, { recursive: true, force: true });
+    ws = testDir("plan-local");
   });
 
   it("runs planning with explicit options and returns exitCode 0 on success", async () => {
@@ -311,5 +344,869 @@ describe("runPlanningLocally", () => {
     });
 
     expect(capturedArgs.join(" ")).toContain("--model claude-override");
+  });
+});
+
+describe("planning write policy wiring", () => {
+  const checkArgs = (args: string[], ws: string) => {
+    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write");
+    expect(args).not.toContain("--allowedTools");
+    expect(args).toContain("--strict-mcp-config");
+    expect(args).toContain("--dangerously-skip-permissions");
+    const denied = args[args.indexOf("--disallowed-tools") + 1].split(",");
+    expect(denied).toContain("Bash");
+    expect(denied).not.toContain("Write");
+    const settingsPath = args[args.indexOf("--settings") + 1];
+    expect(settingsPath.startsWith(ws)).toBe(false);
+    expect(existsSync(settingsPath)).toBe(true);
+    const i = args.indexOf("--setting-sources");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(args[i + 1]).toBe("");
+    const trusted = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(trusted.disableAllHooks).toBe(false);
+    const hook = trusted.hooks.PreToolUse[0];
+    expect(hook.matcher).toBe("Write");
+    expect(hook.hooks[0].command).toContain("guard.mjs");
+    return dirname(settingsPath);
+  };
+
+  it("runPlanning passes trusted args, keeps the repo prompt, and removes the policy dir afterwards", async () => {
+    const ws = testDir("plan-wire");
+    setEnv();
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", undefined);
+    writeFileSync(join(ws, "PLANNING.md"), "Custom plan ${ISSUE_IDENTIFIER}");
+    mkdirSync(join(ws, ".claude"));
+    const hostile = {
+      disableAllHooks: true,
+      permissions: { allow: ["Bash(*)"] },
+      hooks: { PreToolUse: [{ matcher: "Write", hooks: [{ type: "command", command: "true" }] }] },
+    };
+    writeFileSync(join(ws, ".claude", "settings.json"), JSON.stringify(hostile));
+    writeFileSync(join(ws, ".claude", "settings.local.json"), JSON.stringify(hostile));
+    let dir = "";
+    let prompt = "";
+    await runPlanning({
+      workspaceDir: ws,
+      executor: (p, args) => {
+        prompt = p;
+        dir = checkArgs(args, ws);
+        return { status: 0, stdout: "", stderr: "" };
+      },
+      // No callback is configured, so nothing is posted.
+      fetchImpl: fakeFetch({}).fetch,
+    });
+    expect(prompt).toBe("Custom plan ENG-42");
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("runPlanning removes the policy dir when the executor throws", async () => {
+    const ws = testDir("plan-wire");
+    setEnv();
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", undefined);
+    let dir = "";
+    await expect(
+      runPlanning({
+        workspaceDir: ws,
+        executor: (_p, args) => {
+          dir = checkArgs(args, ws);
+          throw new Error("boom");
+        },
+      }),
+    ).rejects.toThrow("boom");
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it("runPlanning posts a failure without running the executor when the workspace is unusable", async () => {
+    setEnv();
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", undefined);
+    let ran = false;
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example/callback");
+    vi.stubEnv("RUN_TOKEN", "t");
+    const orchestrator = fakeFetch({ "POST /callback/runner/result": resultAccepted });
+    const r = await runPlanning({
+      workspaceDir: join(testDir("plan-wire"), "does-not-exist"),
+      executor: () => {
+        ran = true;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+      fetchImpl: orchestrator.fetch,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(ran).toBe(false);
+    expect((JSON.parse(orchestrator.calls[0]!.body) as RunnerResultPayload).outcome).toBe("failure");
+  });
+
+  it("runPlanningLocally passes trusted args, cleans up, and fails closed on setup error", async () => {
+    const ws = testDir("plan-wire");
+    mkdirSync(join(ws, ".claude"));
+    writeFileSync(join(ws, ".claude", "settings.json"), JSON.stringify({ disableAllHooks: true }));
+    let dir = "";
+    const ok = await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "L-1",
+      issueTitle: "t",
+      issueDescription: "d",
+      executor: (_p, args) => {
+        dir = checkArgs(args, ws);
+        expect(args).not.toContain("--bare");
+        mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+        writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan");
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(ok.planFound).toBe(true);
+    expect(existsSync(dir)).toBe(false);
+
+    let ran = false;
+    const bad = await runPlanningLocally({
+      workspaceDir: join(ws, "missing"),
+      issueIdentifier: "L-1",
+      issueTitle: "t",
+      issueDescription: "d",
+      executor: () => {
+        ran = true;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(bad.exitCode).toBe(1);
+    expect(ran).toBe(false);
+  });
+});
+
+describe("configured planning (shared prepareConfiguredRun + selected stage executor)", () => {
+  const rev = { configRevisionId: "11111111-1111-4111-8111-111111111111", revision: 1 };
+  const stage = (agent: "claude" | "codex") => ({
+    agent,
+    provider: agent === "claude" ? "anthropic" : "openai",
+    model: agent === "claude" ? "claude-plan" : "gpt-plan",
+    accountProfileId: "p-plan",
+    invocationTimeoutMs: 4321,
+  });
+  const snapshotFor = (agent: "claude" | "codex"): ResolvedAgentSnapshotV1 => ({
+    version: 1,
+    snapshotId: "snap-1",
+    configRevisions: { orchestratorDefault: rev, project: rev },
+    stages: {
+      planning: stage(agent),
+      implementation: { ...stage("claude"), accountProfileId: "p-impl" },
+      review: { ...stage("codex"), accountProfileId: "p-rev" },
+    },
+    sources: Object.fromEntries(
+      ["planning", "implementation", "review"].map((n) => [
+        n,
+        { agent: "project", provider: "project", model: "project", accountProfileId: "project", invocationTimeoutMs: "job-deadline" },
+      ]),
+    ) as ResolvedAgentSnapshotV1["sources"],
+    profiles: {
+      planning: { id: "p-plan", identity: "a", revision: 1, agent, provider: stage(agent).provider, authMode: agent === "claude" ? "anthropic-api-key" : "openai-api-key" },
+      implementation: { id: "p-impl", identity: "b", revision: 1, agent: "claude", provider: "anthropic", authMode: "anthropic-api-key" },
+      review: { id: "p-rev", identity: "c", revision: 1, agent: "codex", provider: "openai", authMode: "codex-subscription" },
+    },
+  } as ResolvedAgentSnapshotV1);
+
+  const S_API = "sk-synthetic-planning-key-000000";
+  let ws: string;
+  let authRoot: string;
+  const posted: Array<{ outcome: string; failureReason?: string }> = [];
+  const urls: string[] = [];
+  /** The orchestrator's result route, at the envelope's callback URL and at the legacy RUNNER_CALLBACK_URL. */
+  let orchestrator: FakeFetch;
+  const recordResult = (call: FetchCall) => {
+    urls.push(call.url.href);
+    posted.push(JSON.parse(call.body));
+    return resultAccepted;
+  };
+  const legacy = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+  const okResult: LLMResult = { stdout: "done", exitCode: 0, tokensUsed: 1 };
+
+  /** Managed dispatch environment: trusted envelope (snapshot + protected grant) and the launcher's bootstrap context. */
+  function configure(agent: "claude" | "codex", opts: { grant?: boolean; snapshot?: boolean } = {}) {
+    const snapshot = snapshotFor(agent);
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeTrustedRunConfig({
+      v: 1,
+      issue: { id: "i1", identifier: "ENG-9", title: "T", description: "D" },
+      runnerPhase: "planning",
+      runnerCallbackUrl: "http://cb.test/cb",
+      planningContext: { parent: "PARENT-CTX", siblings: "SIB-CTX", dependencies: "DEP-CTX" },
+      ...(opts.snapshot === false ? {} : { agentConfig: snapshot }),
+      ...(opts.grant === false ? {} : { credentials: { version: 1, modelAuthGrant: makeGrant(snapshot) } }),
+    }));
+    vi.stubEnv("AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID", EXPECTED.dispatchId);
+    vi.stubEnv("AI_IMPLEMENT_MODEL_AUTH_PROJECT_KEY", EXPECTED.projectKey);
+    vi.stubEnv("AI_IMPLEMENT_MODEL_AUTH_BACKEND", EXPECTED.backend);
+    vi.stubEnv("AI_IMPLEMENT_MODEL_AUTH_URL", "https://orchestrator.invalid/model-auth");
+    vi.stubEnv("AI_IMPLEMENT_MODEL_AUTH_ROOT", authRoot);
+  }
+  const clearLegacyIssueEnv = () => {
+    for (const k of ["ISSUE_ID", "ISSUE_IDENTIFIER", "ISSUE_TITLE", "ISSUE_DESCRIPTION"]) vi.stubEnv(k, undefined);
+  };
+  const writePlan = () => {
+    mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+    writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan\n");
+  };
+
+  beforeEach(() => {
+    ws = testDir("plan-cfg");
+    authRoot = testDir("plan-auth");
+    posted.length = 0;
+    urls.length = 0;
+    orchestrator = fakeFetch({ "POST /cb/runner/result": recordResult, "POST /runner/result": recordResult });
+    legacy.mockClear();
+    setEnv();
+    // The synthetic grant expires relative to NOW; only Date is faked so timers and setImmediate stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    vi.stubEnv("CLAUDE_MODEL", "env-model");
+    vi.stubEnv("RUN_TOKEN", "tok");
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  type FakeSpawnOpts = { exitCode?: number; plan?: boolean; throwOnSpawn?: boolean };
+  const fakeSpawn = (opts: FakeSpawnOpts = {}) => {
+    const argv: string[][] = [];
+    const prompts: string[] = [];
+    const impl = ((_cmd: string, args: readonly string[]) => {
+      argv.push([...args]);
+      if (opts.throwOnSpawn) throw Object.assign(new Error("spawn boom"), { code: "ENOENT" });
+      const proc = new EventEmitter() as EventEmitter & Record<string, unknown>;
+      const stream = () => Object.assign(new EventEmitter(), { destroy: () => {}, end: () => {} });
+      proc.stdout = stream();
+      proc.stderr = stream();
+      // The prompt travels on stdin, never in argv.
+      proc.stdin = Object.assign(stream(), { write: (chunk: string | Buffer) => void prompts.push(String(chunk)), end: (chunk?: string | Buffer) => void (chunk !== undefined && prompts.push(String(chunk))) });
+      proc.pid = 0;
+      proc.kill = () => true;
+      setImmediate(() => {
+        if (opts.plan) writePlan();
+        const line = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ok", num_turns: 1 }) + "\n";
+        (proc.stdout as EventEmitter).emit("data", Buffer.from(line));
+        proc.emit("close", opts.exitCode ?? 0, null);
+      });
+      return proc;
+    }) as unknown as typeof spawn;
+    return { impl, argv, prompts };
+  };
+  const fakeCodex = (plan: boolean, result: LLMResult | Error = okResult) => {
+    const calls: InvokeParams[] = [];
+    const created: string[] = [];
+    const createCodex = (id: string) => {
+      created.push(id);
+      return {
+        invoke: async (p: InvokeParams) => {
+          calls.push(p);
+          if (plan) writePlan();
+          if (result instanceof Error) throw result;
+          return result;
+        },
+      };
+    };
+    return { createCodex, calls, created };
+  };
+  const policyDirOf = (args: string[]) => dirname(args[args.indexOf("--settings") + 1]);
+
+  // ---- Default managed entrypoint: no injected client, the grant comes from the envelope ----
+
+  /** The hosted model-auth service at the launch context's URL, answering checkout with the selected API key. */
+  function stubModelAuthService(): FakeFetch {
+    return fakeFetch({
+      [`POST /model-auth${MODEL_AUTH_ROUTES.checkout}`]: {
+        json: { version: 1, ok: true, profileId: "p-plan", authMode: "anthropic-api-key", secret: { kind: "api-key", apiKey: S_API } },
+      },
+      [`POST /model-auth${MODEL_AUTH_ROUTES.finish}`]: { json: { version: 1, ok: true, acknowledged: true } },
+    }).install();
+  }
+
+  it("default managed entrypoint (no options): bootstrap -> checkout -> guarded Claude child -> plan -> finish", async () => {
+    configure("claude");
+    writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: md-model\n---\nPlan ${ISSUE_IDENTIFIER} ${PARENT}/${SIBLINGS}/${DEPENDENCIES}");
+    const modelAuth = stubModelAuthService();
+    const { impl, argv, prompts } = fakeSpawn({ plan: true });
+    const r = await runPlanning({ workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: orchestrator.fetch });
+    expect(r.exitCode).toBe(0);
+    expect(legacy).not.toHaveBeenCalled();
+    expect(posted).toHaveLength(1);
+    expect(posted[0].outcome).toBe("success");
+    // Selected-credential lifecycle through the real hosted client: one checkout, one finish, bearer only to the service.
+    expect(modelAuth.calls.map((c) => c.url.href.replace("https://orchestrator.invalid/model-auth", ""))).toEqual([
+      MODEL_AUTH_ROUTES.checkout,
+      MODEL_AUTH_ROUTES.finish,
+    ]);
+    expect(modelAuth.calls.every((c) => c.headers.get("authorization") === `Bearer ${SENTINEL_BEARER}`)).toBe(true);
+    // Guarded Claude child: snapshot model, trusted policy args before -p, prompt carries the planning context.
+    expect(argv).toHaveLength(1);
+    const args = argv[0];
+    expect(args[args.indexOf("--model") + 1]).toBe("claude-plan");
+    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Write");
+    expect(args.indexOf("--settings")).toBeLessThan(args.lastIndexOf("-p"));
+    expect(prompts.join("")).toContain("Plan ENG-9 PARENT-CTX/SIB-CTX/DEP-CTX");
+    expect(existsSync(policyDirOf(args))).toBe(false);
+    expect(JSON.stringify(posted)).not.toContain(SENTINEL_BEARER);
+    expect(JSON.stringify(posted)).not.toContain(S_API);
+  });
+
+  // ---- AII-1427: the trusted launch context arrives from the real GHA bootstrap, never from the test ----
+
+  /** Loopback model-auth service: answers checkout/finish locally; records every route hit. */
+  function loopbackTransport() {
+    const hits: string[] = [];
+    const transport: ModelAuthTransport = {
+      post: vi.fn(async (route: string) => {
+        hits.push(route);
+        const body = route === MODEL_AUTH_ROUTES.checkout
+          ? { version: 1, ok: true, profileId: "p-plan", authMode: "anthropic-api-key", secret: { kind: "api-key", apiKey: S_API } }
+          : { version: 1, ok: true, acknowledged: true };
+        return { status: 200, body };
+      }),
+    };
+    return { transport, hits };
+  }
+
+  const planSnapshot = (agent: "claude" | "codex", authMode: "anthropic-api-key" | "openai-api-key" | "codex-subscription") => {
+    const snapshot = snapshotFor(agent);
+    snapshot.profiles.planning = { ...snapshot.profiles.planning, authMode } as never;
+    return snapshot;
+  };
+
+  for (const file of GHA_PLAN_WORKFLOWS) {
+    describe(`GHA bootstrap handoff via ${file}`, () => {
+      it("baseline: an old-shaped Run env (envelope present, no AI_IMPLEMENT_MODEL_AUTH_*) is rejected with bootstrap_context_missing", async () => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const input = { snapshot, grant: ghaGrant(snapshot) };
+        // The repaired bootstrap refuses a grant without context, so the OLD environment is constructed directly.
+        expect(ghaRunStepEnv(file, input).bootStatus).toBe(1);
+        // Old template: only the envelope reaches the Run step.
+        const oldEnv = oldShapedRunEnv(file, input);
+        await expect(
+          prepareConfiguredRun({ env: oldEnv, snapshot, workspaceDir: ws, options: { now: () => NOW } }),
+        ).rejects.toMatchObject({ code: "CONFIGURED_RUN_INVALID", reason: "bootstrap_context_missing" });
+        stubRunEnv(oldEnv);
+        const codex = fakeCodex(true);
+        const { impl, argv } = fakeSpawn({ plan: true });
+        const r = await runPlanning({ workspaceDir: ws, executor: legacy, spawnImpl: impl, configured: { createCodex: codex.createCodex }, fetchImpl: orchestrator.fetch });
+        expect(r.exitCode).toBe(1);
+        expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_context_missing)");
+        expect(codex.created).toEqual([]);
+        expect(argv).toEqual([]);
+        expect(legacy).not.toHaveBeenCalled();
+      });
+
+      it.each([["missing", undefined], ["null", null]])("a managed grant with %s context fails in the real bootstrap, so the Run step never starts", (_n, context) => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context });
+        expect(handoff.bootStatus).toBe(1);
+        expect(handoff.bootStderr).toBe("::error::Private run_config bootstrap failed\n");
+        expect(handoff.githubEnv).toBe("");
+        expect(handoff.runEnv).toEqual({});
+      });
+
+      for (const authMode of ["codex-subscription", "openai-api-key"] as const) {
+        it(`planning entrypoint, Codex ${authMode}: the real CodexExecutor checks out the selected profile and its child receives only that credential`, async () => {
+          const snapshot = planSnapshot("codex", authMode);
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT });
+          expect(handoff.bootStatus).toBe(0);
+          expect(handoff.githubEnv).toBe("");
+          stubRunEnv(handoff.runEnv);
+          for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY", "CHATGPT_PLAN_ACCESS_TOKEN"]) vi.stubEnv(k, S_AMBIENT);
+          const { transport, checkouts, routes } = codexLoopback({ "p-plan": authMode, "p-impl": authMode, "p-rev": "anthropic-api-key" });
+          const child = installCodexChild("hang");
+          const driverInputs = installPlanningDriver();
+          let r;
+          try {
+            r = await runPlanning({ workspaceDir: ws, executor: legacy, fetchImpl: orchestrator.fetch, configured: { modelAuthTransport: transport } });
+          } finally {
+            resetCodexChild();
+          }
+          expect(r.exitCode).toBe(0);
+          expect(posted[0].outcome).toBe("success");
+          expect(legacy).not.toHaveBeenCalled();
+          // Exactly one checkout, for the selected planning profile and auth mode, then finish/release.
+          expect(checkouts).toEqual([{ profileId: "p-plan", authMode }]);
+          expect(routes()[0]).toBe(MODEL_AUTH_ROUTES.checkout);
+          expect(routes().at(-1)).toBe(MODEL_AUTH_ROUTES.finish);
+          // The native planning driver ran against the real executor's child with the selected model.
+          expect(driverInputs).toHaveLength(1);
+          expect(driverInputs[0].model).toBe("gpt-plan");
+          expect(child).toHaveLength(1);
+          expect(child[0].cmd).toBe("codex");
+          const env = child[0].env;
+          const dump = JSON.stringify(env);
+          if (authMode === "codex-subscription") {
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBe(S_CHATGPT);
+            expect(env.CODEX_API_KEY).toBeUndefined();
+            expect(dump).not.toContain(S_OPENAI);
+            expect(driverInputs[0].modelProvider).toBe("chatgpt_plan");
+          } else {
+            expect(env.CODEX_API_KEY).toBe(S_OPENAI);
+            expect(env.CHATGPT_PLAN_ACCESS_TOKEN).toBeUndefined();
+            expect(dump).not.toContain(S_CHATGPT);
+            expect(driverInputs[0].modelProvider).toBe("openai_api_key");
+          }
+          expect(env.OPENAI_API_KEY).toBeUndefined();
+          expect(dump).not.toContain(S_AMBIENT);
+          expect(dump).not.toContain(SENTINEL_BEARER);
+          expect(Object.keys(env).filter((k) => k.startsWith("AI_IMPLEMENT_") || k.startsWith("RUN_"))).toEqual([]);
+        });
+      }
+
+      it("planning entrypoint, Claude API key: bootstrap-derived env drives checkout/finish through the loopback transport", async () => {
+        const snapshot = planSnapshot("claude", "anthropic-api-key");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: GHA_CONTEXT });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const { impl, argv } = fakeSpawn({ plan: true });
+        const r = await runPlanning({
+          workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: orchestrator.fetch,
+          configured: { modelAuthTransport: transport },
+        });
+        expect(r.exitCode).toBe(0);
+        expect(hits).toEqual([MODEL_AUTH_ROUTES.checkout, MODEL_AUTH_ROUTES.finish]);
+        expect(argv).toHaveLength(1);
+        expect(legacy).not.toHaveBeenCalled();
+        expect(JSON.stringify(posted)).not.toContain(SENTINEL_BEARER);
+      });
+
+      const forgeries: Array<[string, Parameters<typeof ghaGrant>[1]]> = [
+        ["dispatch", { dispatchId: "other-dispatch" }],
+        ["project", { projectKey: "other-project" }],
+        ["backend", { backend: "fly" }],
+        ["snapshot", { snapshotId: "other-snapshot" }],
+      ];
+      for (const [field, over] of forgeries) {
+        it(`a grant with an altered ${field} is rejected against the independent context with no side effects`, async () => {
+          const snapshot = planSnapshot("codex", "codex-subscription");
+          const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot, over), context: GHA_CONTEXT });
+          // Whether the workflow or the runner refuses, no checkout, child or model work may start.
+          if (handoff.bootStatus !== 0) {
+            expect(handoff.runEnv).toEqual({});
+            return;
+          }
+          stubRunEnv(handoff.runEnv);
+          const { transport, hits } = loopbackTransport();
+          const codex = fakeCodex(true);
+          const { impl, argv } = fakeSpawn({ plan: true });
+          const r = await runPlanning({
+            workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: orchestrator.fetch,
+            configured: { createCodex: codex.createCodex, modelAuthTransport: transport },
+          });
+          expect(r.exitCode).toBe(1);
+          expect(posted[0].failureReason).toMatch(/^Configured planning failed \(/);
+          expect(hits).toEqual([]);
+          expect(codex.created).toEqual([]);
+          expect(argv).toEqual([]);
+          expect(legacy).not.toHaveBeenCalled();
+        });
+      }
+
+      it("an altered launch context (grant unchanged) is rejected by the runner with no side effects", async () => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, dispatchId: "tampered-dispatch" } });
+        expect(handoff.bootStatus).toBe(0);
+        stubRunEnv(handoff.runEnv);
+        const { transport, hits } = loopbackTransport();
+        const codex = fakeCodex(true);
+        const { impl, argv } = fakeSpawn({ plan: true });
+        const r = await runPlanning({
+          workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: orchestrator.fetch,
+          configured: { createCodex: codex.createCodex, modelAuthTransport: transport },
+        });
+        expect(r.exitCode).toBe(1);
+        expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_invalid)");
+        expect(hits).toEqual([]);
+        expect(codex.created).toEqual([]);
+        expect(argv).toEqual([]);
+      });
+
+      it.each([
+        ["http", "http://orchestrator.invalid/model-auth"],
+        ["userinfo", "https://user:pw@orchestrator.invalid/model-auth"],
+        ["query", "https://orchestrator.invalid/model-auth?x=1"],
+        ["fragment", "https://orchestrator.invalid/model-auth#x"],
+      ])("an unsafe context URL (%s) is refused by the bootstrap, so the Run step never starts", (_n, modelAuthUrl) => {
+        const snapshot = planSnapshot("codex", "codex-subscription");
+        const handoff = ghaRunStepEnv(file, { snapshot, grant: ghaGrant(snapshot), context: { ...GHA_CONTEXT, modelAuthUrl } });
+        expect(handoff.bootStatus).not.toBe(0);
+        expect(handoff.runEnv).toEqual({});
+        expect(handoff.githubEnv).toBe("");
+      });
+    });
+  }
+
+  it("default managed entrypoint: an envelope snapshot without a protected grant fails closed (bootstrap_missing)", async () => {
+    configure("claude", { grant: false });
+    const modelAuth = stubModelAuthService();
+    const { impl, argv } = fakeSpawn({ plan: true });
+    const r = await runPlanning({ workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: orchestrator.fetch });
+    expect(r.exitCode).toBe(1);
+    expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_missing)");
+    expect(legacy).not.toHaveBeenCalled();
+    expect(argv).toEqual([]);
+    expect(modelAuth.calls).toEqual([]);
+  });
+
+  it("a protected grant without a snapshot fails closed with no model or auth work", async () => {
+    configure("claude", { snapshot: false });
+    const modelAuth = stubModelAuthService();
+    const { impl, argv } = fakeSpawn({ plan: true });
+    const r = await runPlanning({ workspaceDir: ws, executor: legacy, spawnImpl: impl, fetchImpl: orchestrator.fetch });
+    expect(r.exitCode).toBe(1);
+    expect(posted[0].failureReason).toBe("Configured planning failed (snapshot_incomplete)");
+    expect(legacy).not.toHaveBeenCalled();
+    expect(argv).toEqual([]);
+    expect(modelAuth.calls).toEqual([]);
+  });
+
+  it("a malformed configured envelope reports invalid_snapshot before any legacy issue env lookup", async () => {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["invalid agentConfig", { v: 1, issue: { id: "i", identifier: "E", title: "T", description: "D" }, agentConfig: { version: 1, snapshotId: "x" } }],
+      ["snapshot with missing issue field", { v: 1, issue: { id: "i", identifier: "E", title: "T" }, agentConfig: snapshotFor("claude") }],
+      [
+        "grant without a valid snapshot",
+        { v: 1, issue: { id: "i", identifier: "E", title: "T", description: "D" }, agentConfig: { nope: true }, credentials: { version: 1, modelAuthGrant: makeGrant(snapshotFor("claude")) } },
+      ],
+      ["malformed grant", { v: 1, issue: { id: "i", identifier: "E", title: "T", description: "D" }, credentials: { version: 1, modelAuthGrant: { bad: true } } }],
+    ];
+    for (const [label, cfg] of cases) {
+      posted.length = 0;
+      clearLegacyIssueEnv();
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", Buffer.from(JSON.stringify(cfg), "utf-8").toString("base64"));
+      vi.stubEnv("RUNNER_CALLBACK_URL", "http://orch");
+      const modelAuth = stubModelAuthService();
+      const { impl, argv } = fakeSpawn({ plan: true });
+      const codex = fakeCodex(true);
+      const r = await runPlanning({
+        workspaceDir: ws,
+        executor: legacy,
+        spawnImpl: impl,
+        configured: { createCodex: codex.createCodex, modelAuthClient: fakeClient() },
+        fetchImpl: orchestrator.fetch,
+      });
+      expect(r.exitCode, label).toBe(1);
+      expect(posted, label).toHaveLength(1);
+      expect(posted[0].outcome, label).toBe("failure");
+      expect(posted[0].failureReason, label).toBe("Configured planning failed (invalid_snapshot)");
+      expect(legacy, label).not.toHaveBeenCalled();
+      expect(argv, label).toEqual([]);
+      expect(codex.created, label).toEqual([]);
+      expect(modelAuth.calls, label).toEqual([]);
+    }
+  });
+
+  it("a malformed configured envelope delivers the failure to the envelope callback URL alone", async () => {
+    const bad = { v: 1, issue: { id: "i", identifier: "E", title: "T", description: "D" }, agentConfig: { version: 1, snapshotId: "x" } };
+    const cases: Array<[string, unknown, boolean]> = [
+      ["valid https", "https://orch.example/cb", true],
+      ["missing", undefined, false],
+      ["userinfo", "https://user:pw@orch.example/cb", false],
+      ["non-http scheme", "file:///etc/passwd", false],
+      ["not a url", "nope", false],
+      ["non-string", { x: 1 }, false],
+    ];
+    for (const [label, url, delivered] of cases) {
+      posted.length = 0;
+      clearLegacyIssueEnv();
+      vi.stubEnv("RUNNER_CALLBACK_URL", undefined);
+      vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", Buffer.from(JSON.stringify({ ...bad, runnerCallbackUrl: url }), "utf-8").toString("base64"));
+      const modelAuth = stubModelAuthService();
+      const { impl, argv } = fakeSpawn({ plan: true });
+      const codex = fakeCodex(true);
+      urls.length = 0;
+      const r = await runPlanning({
+        workspaceDir: ws,
+        executor: legacy,
+        spawnImpl: impl,
+        configured: { createCodex: codex.createCodex, modelAuthClient: fakeClient() },
+        fetchImpl: orchestrator.fetch,
+      });
+      expect(r.exitCode, label).toBe(1);
+      expect(posted, label).toHaveLength(delivered ? 1 : 0);
+      if (delivered) {
+        expect(posted[0].failureReason, label).toBe("Configured planning failed (invalid_snapshot)");
+        expect(urls[0], label).toContain("https://orch.example/cb");
+      } else {
+        expect(urls, label).toEqual([]);
+      }
+      expect(legacy, label).not.toHaveBeenCalled();
+      expect(argv, label).toEqual([]);
+      expect(codex.created, label).toEqual([]);
+      expect(modelAuth.calls, label).toEqual([]);
+    }
+  });
+
+  it("a malformed envelope without configured intent keeps the legacy env fallback", async () => {
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", "not-base64-json");
+    const r = await runPlanning({
+      workspaceDir: ws,
+      executor: () => {
+        writePlan();
+        return { status: 0, stdout: "", stderr: "" };
+      },
+      fetchImpl: orchestrator.fetch,
+    });
+    expect(r.exitCode).toBe(0);
+  });
+
+  // ---- Managed path with the shared client seam: assertions on selection, ownership and failures ----
+
+  for (const agent of ["claude", "codex"] as const) {
+    it(`${agent}: tags the planning stage; the snapshot wins over legacy model sources; the prompt keeps PLANNING.md and context`, async () => {
+      configure(agent);
+      writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: md-model\n---\nPlan ${ISSUE_IDENTIFIER} ${PARENT}/${SIBLINGS}/${DEPENDENCIES}");
+      const client = fakeClient();
+      const codex = fakeCodex(true);
+      const { impl, argv, prompts } = fakeSpawn({ plan: true });
+      const r = await runPlanning({
+        workspaceDir: ws,
+        executor: legacy,
+        spawnImpl: impl,
+        configured: { modelAuthClient: client, createCodex: codex.createCodex },
+        fetchImpl: orchestrator.fetch,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(legacy).not.toHaveBeenCalled();
+      if (agent === "codex") {
+        expect(argv).toEqual([]);
+        expect(codex.created).toEqual(["p-plan"]);
+        expect(codex.calls).toHaveLength(1);
+        expect(codex.calls[0]).toMatchObject({ agentStage: "planning", stage: "plan", model: "gpt-plan", invocationTimeoutMs: 4321 });
+        expect(codex.calls[0].prompt).toBe("Plan ENG-9 PARENT-CTX/SIB-CTX/DEP-CTX");
+      } else {
+        expect(codex.created).toEqual([]);
+        expect(argv).toHaveLength(1);
+        expect(argv[0][argv[0].indexOf("--model") + 1]).toBe("claude-plan");
+        expect(prompts.join("")).toContain("Plan ENG-9 PARENT-CTX/SIB-CTX/DEP-CTX");
+        expect(client.invoke).toHaveBeenCalledTimes(1);
+        expect(client.invoke.mock.calls[0][0]).toBe("p-plan");
+        expect(client.checkout.mock.calls.map((c) => c[0].profileId)).toEqual(["p-plan"]);
+        expect(client.finish).toHaveBeenCalledWith("p-plan", "completed");
+        expect(existsSync(policyDirOf(argv[0]))).toBe(false);
+      }
+      // The managed run owns the lifecycle and disposes the client; only the one frozen profile is ever checked out
+      // (the native Codex driver checks out through its own executor, which the fake replaces).
+      expect(client.dispose).toHaveBeenCalledTimes(1);
+      expect(posted[0].outcome).toBe("success");
+    });
+  }
+
+  it("fails when the executor succeeds but no readable Markdown plan exists, and finishes as failed", async () => {
+    configure("claude");
+    const client = fakeClient();
+    const { impl } = fakeSpawn({ plan: false });
+    const r = await runPlanning({ workspaceDir: ws, spawnImpl: impl, configured: { modelAuthClient: client }, fetchImpl: orchestrator.fetch });
+    expect(r.exitCode).toBe(1);
+    expect(posted[0].outcome).toBe("failure");
+    expect(posted[0].failureReason).toContain("no readable Markdown plan");
+    expect(client.finish).toHaveBeenCalledWith("p-plan", "failed");
+  });
+
+  it("claude: policy dir is removed when the child fails or spawn throws", async () => {
+    for (const mode of [{ exitCode: 1 }, { throwOnSpawn: true }] as FakeSpawnOpts[]) {
+      configure("claude");
+      posted.length = 0;
+      const { impl, argv } = fakeSpawn(mode);
+      const client = fakeClient();
+      const r = await runPlanning({ workspaceDir: ws, spawnImpl: impl, configured: { modelAuthClient: client }, fetchImpl: orchestrator.fetch });
+      expect(r.exitCode).toBe(1);
+      expect(posted[0].outcome).toBe("failure");
+      expect(client.invoke).toHaveBeenCalledTimes(1);
+      if (argv[0]) expect(existsSync(policyDirOf(argv[0]))).toBe(false);
+      expect(posted[0].failureReason).toMatch(/^Configured planning failed \([A-Za-z0-9_.-]+\)$/);
+      expect(JSON.stringify(posted)).not.toContain("spawn boom");
+    }
+  });
+
+  it("reports an auth failure by bounded category, once, with no secret text and no account switch", async () => {
+    configure("claude");
+    const client = fakeClient();
+    client.invoke.mockRejectedValue(Object.assign(new Error("boom sk-synthetic-secret-000000"), { category: "auth_rejected" }));
+    const { impl, argv } = fakeSpawn({ plan: true });
+    const r = await runPlanning({ workspaceDir: ws, executor: legacy, spawnImpl: impl, configured: { modelAuthClient: client }, fetchImpl: orchestrator.fetch });
+    expect(r.exitCode).toBe(1);
+    expect(client.invoke).toHaveBeenCalledTimes(1);
+    expect(client.checkout).toHaveBeenCalledTimes(1);
+    expect(argv).toEqual([]);
+    expect(legacy).not.toHaveBeenCalled();
+    expect(posted[0].failureReason).toBe("Configured planning failed (auth_rejected)");
+    expect(JSON.stringify(posted)).not.toContain("sk-synthetic");
+  });
+
+  it("codex: timeout and auth results report bounded categories, once", async () => {
+    for (const [result, expected] of [
+      [{ stdout: "x", exitCode: 1, tokensUsed: 0, failure: { code: "invocation_timeout" } }, "invocation_timeout"],
+      [{ stdout: "x", exitCode: 1, tokensUsed: 0, failure: { code: "auth_rejected" } }, "auth_rejected"],
+      [{ stdout: "secret-ish", exitCode: 1, tokensUsed: 0 }, "exit_1"],
+    ] as Array<[LLMResult, string]>) {
+      configure("codex");
+      posted.length = 0;
+      const codex = fakeCodex(false, result);
+      const r = await runPlanning({ workspaceDir: ws, executor: legacy, configured: { modelAuthClient: fakeClient(), createCodex: codex.createCodex }, fetchImpl: orchestrator.fetch });
+      expect(r.exitCode).toBe(1);
+      expect(codex.created).toEqual(["p-plan"]);
+      expect(codex.calls).toHaveLength(1);
+      expect(posted[0].failureReason).toBe(`Configured planning failed (${expected})`);
+      expect(legacy).not.toHaveBeenCalled();
+    }
+  });
+
+  it("a possibly-live child holds the auth lifecycle instead of finishing it", async () => {
+    configure("codex");
+    const client = fakeClient();
+    const codex = fakeCodex(false, new AgentRecoveryRequiredError("child_possibly_live", "p-plan"));
+    const r = await runPlanning({ workspaceDir: ws, configured: { modelAuthClient: client, createCodex: codex.createCodex }, fetchImpl: orchestrator.fetch });
+    expect(r.exitCode).toBe(1);
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+  });
+
+  it("an untrusted-repository or invalid-bootstrap configured run does no model work", async () => {
+    configure("codex");
+    vi.stubEnv("AI_IMPLEMENT_MODEL_AUTH_DISPATCH_ID", "other-dispatch");
+    const client = fakeClient();
+    const codex = fakeCodex(true);
+    const r = await runPlanning({ workspaceDir: ws, executor: legacy, configured: { modelAuthClient: client, createCodex: codex.createCodex, now: () => NOW }, fetchImpl: orchestrator.fetch });
+    expect(r.exitCode).toBe(1);
+    expect(posted[0].failureReason).toBe("Configured planning failed (bootstrap_invalid)");
+    expect(codex.created).toEqual([]);
+    expect(client.checkout).not.toHaveBeenCalled();
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  // ---- Local entrypoint ----
+
+  const localBase = () => ({ workspaceDir: ws, issueIdentifier: "L-1", issueTitle: "T", issueDescription: "D", executor: legacy });
+  const apiPort = () => ({
+    load: vi.fn(async ({ profileId, authMode }: { profileId: string; authMode: string }) => ({ kind: "api-key" as const, apiKey: S_API, profileId, authMode })),
+  });
+
+  it("runPlanningLocally with a caller-supplied client: same path, caller keeps the lifecycle", async () => {
+    const client = fakeClient();
+    const codex = fakeCodex(true);
+    const r = await runPlanningLocally({
+      ...localBase(),
+      model: "opts-model",
+      agentConfig: snapshotFor("codex"),
+      configured: { localCredentialPort: apiPort() as never, modelAuthClient: client, createCodex: codex.createCodex },
+    });
+    expect(r.diagnostics).toBe("");
+    expect(r).toMatchObject({ exitCode: 0, planFound: true });
+    expect(legacy).not.toHaveBeenCalled();
+    expect(codex.calls[0]).toMatchObject({ agentStage: "planning", model: "gpt-plan", invocationTimeoutMs: 4321 });
+    expect(client.finish).not.toHaveBeenCalled();
+    expect(client.dispose).not.toHaveBeenCalled();
+  });
+
+  it("runPlanningLocally with a protected credential port: Claude runs guarded, the port is read once, and the owned client is finished", async () => {
+    const port = apiPort();
+    const { impl, argv } = fakeSpawn({ plan: true });
+    const r = await runPlanningLocally({
+      ...localBase(),
+      agentConfig: snapshotFor("claude"),
+      spawnImpl: impl,
+      configured: { localCredentialPort: port as never, modelAuthRoot: authRoot },
+    });
+    expect(r.diagnostics).toBe("");
+    expect(r).toMatchObject({ exitCode: 0, planFound: true });
+    expect(port.load).toHaveBeenCalledTimes(1);
+    expect(port.load.mock.calls[0][0].profileId).toBe("p-plan");
+    expect(argv).toHaveLength(1);
+    expect(argv[0]).toContain("--setting-sources");
+    expect(argv[0][argv[0].indexOf("--model") + 1]).toBe("claude-plan");
+    expect(existsSync(policyDirOf(argv[0]))).toBe(false);
+    expect(JSON.stringify(r)).not.toContain(S_API);
+  });
+
+  it("runPlanningLocally: a snapshot with no credential source fails closed, never legacy", async () => {
+    const { impl, argv } = fakeSpawn({ plan: true });
+    const r = await runPlanningLocally({ ...localBase(), agentConfig: snapshotFor("claude"), spawnImpl: impl });
+    expect(r.exitCode).toBe(1);
+    expect(r.diagnostics).toBe("Configured planning failed (bootstrap_missing)");
+    expect(legacy).not.toHaveBeenCalled();
+    expect(argv).toEqual([]);
+  });
+
+  it("runPlanningLocally rejects a structurally forged borrowed configured run even without a snapshot option", async () => {
+    const forged = {
+      snapshot: snapshotFor("claude"),
+      provider: "anthropic",
+      createExecutor: vi.fn(),
+      finish: vi.fn(),
+    };
+    const r = await runPlanningLocally({
+      ...localBase(),
+      prebuiltConfiguredRun: forged as never,
+    });
+    expect(r).toMatchObject({ exitCode: 1, planFound: false, diagnostics: "Configured planning failed (bootstrap_invalid)" });
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("runPlanningLocally: a malformed snapshot fails closed with invalid-snapshot diagnostics", async () => {
+    const r = await runPlanningLocally({
+      ...localBase(),
+      agentConfig: { version: 1, snapshotId: "x" } as never,
+      configured: { modelAuthClient: fakeClient(), localCredentialPort: apiPort() as never },
+    });
+    expect(r).toMatchObject({ exitCode: 1, planFound: false, diagnostics: "Configured planning failed (snapshot_incomplete)" });
+    expect(legacy).not.toHaveBeenCalled();
+  });
+});
+
+describe("planning skills install", () => {
+  let ws: string;
+  const order: string[] = [];
+  beforeEach(() => {
+    ws = testDir("plan-skills");
+    order.length = 0;
+    vi.mocked(installSkills).mockClear();
+    vi.mocked(installSkills).mockImplementation(() => {
+      order.push("install");
+      return { skillsInstalled: 0, skillsRepoRef: null };
+    });
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", undefined);
+    setEnv();
+    vi.stubEnv("GITHUB_TOKEN", "synthetic-gh-token");
+  });
+  const executor = () => {
+    order.push("executor");
+    mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+    writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan");
+    return { status: 0, stdout: "", stderr: "" };
+  };
+
+  it("runPlanning installs Claude skills from the envelope before the legacy executor", async () => {
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", encodeRunConfig({
+      v: 1,
+      issue: { id: "e", identifier: "AII-9", title: "T", description: "D" },
+      skillsRepo: "org/skills",
+    }));
+    await runPlanning({ workspaceDir: ws, executor });
+    expect(order).toEqual(["install", "executor"]);
+    expect(installSkills).toHaveBeenCalledWith({
+      skillsRepoUrl: "org/skills",
+      githubToken: "synthetic-gh-token",
+      agents: ["claude"],
+    });
+  });
+
+  it("runPlanning skips the install when no skillsRepo is configured", async () => {
+    await runPlanning({ workspaceDir: ws, executor });
+    expect(installSkills).not.toHaveBeenCalled();
+  });
+
+  it("runPlanningLocally installs before the legacy executor and is skipped without skillsRepo", async () => {
+    const base = { workspaceDir: ws, issueIdentifier: "L-1", issueTitle: "T", issueDescription: "D", executor };
+    await runPlanningLocally({ ...base, skillsRepo: "org/skills" });
+    expect(order).toEqual(["install", "executor"]);
+    vi.mocked(installSkills).mockClear();
+    await runPlanningLocally(base);
+    expect(installSkills).not.toHaveBeenCalled();
+  });
+
+  it("planning proceeds when the install reports zero skills", async () => {
+    const result = await runPlanningLocally({
+      workspaceDir: ws, issueIdentifier: "L-1", issueTitle: "T", issueDescription: "D", executor, skillsRepo: "org/skills",
+    });
+    expect(result.exitCode).toBe(0);
   });
 });

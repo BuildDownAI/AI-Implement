@@ -80,6 +80,6 @@ A run kind is allowed its own **data-path** modules, because the runner never ho
 |---|---|---|
 | `workflows/claude-kg-refresh.yml` | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | AII-556 |
 | `resolveKgRefreshSessionImage` in `src/repo-image.ts` | `resolveRunnerImageForDispatch` in `src/repo-image.ts` | AII-557 |
-| `session/git-credential-helper-kg-push.sh`, `src/kg-push-token-vending.ts`, `POST /api/runner/kg-push-token` | the primary token in the origin URL, as `push.ts` pushes (`kg-snapshot-push.ts`) | AII-583 |
+| `session/git-credential-helper-kg-push.sh`, the push-token vending module, `POST /api/runner/kg-push-token` (all since removed) | the primary token in the origin URL, as `push.ts` pushes (`kg-snapshot-push.ts`) | AII-583 |
 | The kg-refresh report step (`feedback-loop` in `pipelines/kg-refresh.yml`, `workflows/KG-REFRESH.md`) | the ingest step's counters and `ai-output/kg-ingest.log`; `kg-snapshot-push` is the guard | AII-575 follow-up, 2026-09-08 |
 

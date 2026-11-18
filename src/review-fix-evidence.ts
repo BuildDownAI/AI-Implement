@@ -667,6 +667,7 @@ interface AttemptOwnershipRow {
   repository: string;
   prNumber: number;
   githubRunId: number | null;
+  executionRef: string | null;
   resultConflictAt: number | null;
 }
 
@@ -680,17 +681,12 @@ interface AttemptOwnershipRow {
  *    stuck row.
  *  - **result conflict** — `result_conflict_at` is set: a second, disagreeing result was
  *    seen for this attempt and nothing has resolved which one is authoritative.
- *  - **unknown execution** — `github_run_id` is still null. `bindExecution` never ran
+ *  - **unknown execution** — `github_run_id` and `execution_ref` are both still null. `bindExecution` never ran
  *    (or never landed) for this attempt, so the row that recorded activity/a terminal
- *    outcome cannot be tied to the GitHub Actions run that produced it. A `launch_rejected`
+ *    outcome cannot be tied to the execution that produced it. A `launch_rejected`
  *    attempt (never bound, by design — see `restate/review-fix-attempt.ts`) never reaches
  *    this check in practice: it never streams activity or a cycle summary, so it's never a
  *    sweep candidate to begin with.
- *  - **pending delivery** — `review_fix_inbox` still holds a non-`delivered` row for the
- *    same `(installationId, repository, prNumber)`. Inbox deliveries are scoped to the PR,
- *    not the attempt (an attempt doesn't exist yet when its admitting delivery arrives), so
- *    this is deliberately PR-scoped and can hold back an older attempt's cleanup while a
- *    newer delivery for the same PR is still in flight — retention erring wide, not narrow.
  */
 function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOwnershipRow): boolean {
   const activeReservation = db
@@ -700,12 +696,7 @@ function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOw
 
   if (attempt.resultConflictAt !== null) return true;
 
-  if (attempt.githubRunId === null) return true;
-
-  const pendingDelivery = db
-    .prepare(`SELECT 1 FROM review_fix_inbox WHERE installation_id = ? AND repository = ? AND pr_number = ? AND delivery_state != 'delivered'`)
-    .get(attempt.installationId, attempt.repository, attempt.prNumber) !== undefined;
-  if (pendingDelivery) return true;
+  if (attempt.githubRunId === null && attempt.executionRef === null) return true;
 
   return false;
 }
@@ -718,7 +709,7 @@ function hasUnresolvedOwnership(db: ReturnType<typeof getDb>, attempt: AttemptOw
  * silently starting a fresh record. An attempt with no row in `review_fix_attempts`,
  * or with `completed_at` still null, is never purged — unresolved/unknown status
  * fails closed toward retention, not deletion. Past the retention floor, `hasUnresolvedOwnership`
- * still holds the row back when pending delivery, active reservation, result conflict, or
+ * still holds the row back when active reservation, result conflict, or
  * unknown execution evidence would be needed to resolve ownership.
  *
  * After a purge, `listReviewFixActivity`/`getReviewFixCycleSummary`/`listReviewFixCycleSummaries`
@@ -752,7 +743,7 @@ export function sweepExpiredReviewFixEvidence(now: number = Date.now()): ReviewF
     const attempt = db
       .prepare(`
         SELECT completed_at as completedAt, dispatch_id as dispatchId, installation_id as installationId,
-               repository, pr_number as prNumber, github_run_id as githubRunId, result_conflict_at as resultConflictAt
+               repository, pr_number as prNumber, github_run_id as githubRunId, execution_ref as executionRef, result_conflict_at as resultConflictAt
         FROM review_fix_attempts WHERE attempt_id = ?
       `)
       .get(attemptId) as AttemptOwnershipRow | undefined;

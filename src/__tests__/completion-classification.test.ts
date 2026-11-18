@@ -6,6 +6,7 @@ import {
   deriveLastSuccessfulStage,
   monitorFailureCommentPrefix,
   renderClassification,
+  renderFailureRecord,
   sensitiveFilesGuardrailClassification,
   shouldPostMonitorClassificationComment,
   TROUBLESHOOTING_URL,
@@ -16,32 +17,64 @@ import { GUARDRAIL_REASON_MAX_CHARS, redactAndCap } from "../pipeline/failure-cl
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { formatSensitiveFilesError } from "../pipeline/sensitive-files.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
+import { makeJob } from "./helpers/builders.js";
 
 const PR = "https://github.com/org/repo/pull/1";
 
-// classifyCompletion only reads status/phase/conclusion/prUrl/failure — build a minimal Job around those.
-function makeJob(
+describe("classificationForFailure — code-specific next steps", () => {
+  const failure: FailureRecord = {
+    category: "config",
+    code: "PLAN_STATUS_WRITE_FAILED",
+    stage: "planning",
+    attempt: 1,
+    retryable: false,
+    message: "The tracker refused the Plan-Complete write. Grant the tracker permission to update issue status.",
+    evidence: { truncated: false },
+  };
+  const nextStep = "The tracker refused a write the plan needs. Fix the tracker setup that the message above names, then use Unpark at /admin#runners.";
+
+  it("gives plan status write failures tracker remediation", () => {
+    const classification = classificationForFailure(failure);
+    expect(classification.remediation).toBe(nextStep);
+    expect(classification.remediation).not.toMatch(/model id|env|config\.yml/i);
+  });
+
+  it("keeps the category remediation for other config failures", () => {
+    expect(classificationForFailure({ ...failure, code: "PROVIDER_CONFIG" }).remediation).toBe(
+      "The run configuration is invalid (model id, env). Fix the mapping or config.yml, then run it again.",
+    );
+  });
+
+  it("renders the tracker message and the code-specific next step", () => {
+    const rendered = renderFailureRecord(failure);
+    expect(rendered).toContain("```\n" + failure.message + "\n```");
+    expect(rendered).toContain(`**Next step:** ${nextStep}`);
+  });
+});
+
+// classifyCompletion only reads status/phase/conclusion/prUrl/failure, so those are the arguments.
+function jobOf(
   status: JobStatus,
-  phase: string,
+  phase: Job["phase"],
   conclusion: string | null = null,
   prUrl: string | null = null,
   failure: FailureRecord | null = null,
 ): Job {
-  return { status, phase, conclusion, prUrl, failure } as unknown as Job;
+  return makeJob({ status, phase, conclusion, prUrl, failure });
 }
 
 describe("classifyCompletion", () => {
   it("returns null for a clean success (no noise on the happy path)", () => {
-    expect(classifyCompletion(makeJob("completed", "implementation", "exit_0", PR))).toBeNull();
-    expect(classifyCompletion(makeJob("completed", "planning", "exit_0"))).toBeNull();
+    expect(classifyCompletion(jobOf("completed", "implementation", "exit_0", PR))).toBeNull();
+    expect(classifyCompletion(jobOf("completed", "planning", "exit_0"))).toBeNull();
   });
 
   it("returns null for a benign issue-completed sweep", () => {
-    expect(classifyCompletion(makeJob("timed_out", "implementation", "issue_completed_sweep"))).toBeNull();
+    expect(classifyCompletion(jobOf("timed_out", "implementation", "issue_completed_sweep"))).toBeNull();
   });
 
   it("classifies a review failure with remediation + docs link", () => {
-    const c = classifyCompletion(makeJob("review_failed", "implementation", "exit_0", PR));
+    const c = classifyCompletion(jobOf("review_failed", "implementation", "exit_0", PR));
     expect(c?.summary).toContain("Implementation");
     expect(c?.summary).toContain("review");
     expect(c?.remediation).toBeTruthy();
@@ -49,44 +82,44 @@ describe("classifyCompletion", () => {
   });
 
   it("classifies a timeout as over-scoped", () => {
-    const c = classifyCompletion(makeJob("timed_out", "implementation", "container_timeout"));
+    const c = classifyCompletion(jobOf("timed_out", "implementation", "container_timeout"));
     expect(c?.summary).toContain("time limit");
     expect(c?.remediation).toContain("over-scoped");
     expect(c?.docsUrl).toBe(TROUBLESHOOTING_URL);
   });
 
   it("notes max session age for a sweep timeout", () => {
-    expect(classifyCompletion(makeJob("timed_out", "planning", "machine_max_age_sweep"))?.summary).toContain(
+    expect(classifyCompletion(jobOf("timed_out", "planning", "machine_max_age_sweep"))?.summary).toContain(
       "max session age",
     );
   });
 
   it("returns null for an operator-cancelled run (benign terminal — no tracker comment noise)", () => {
-    expect(classifyCompletion(makeJob("failed", "implementation", "operator_cancelled"))).toBeNull();
-    expect(classifyCompletion(makeJob("failed", "planning", "operator_cancelled"))).toBeNull();
+    expect(classifyCompletion(jobOf("failed", "implementation", "operator_cancelled"))).toBeNull();
+    expect(classifyCompletion(jobOf("failed", "planning", "operator_cancelled"))).toBeNull();
   });
 
   it("still classifies a real failure even when a PR was later closed (close does not flip conclusion)", () => {
     // The operator_cancelled conclusion is only written by handleRunnerResult when the runner
     // explicitly reports it. A job whose conclusion is exit_1 stays exit_1 regardless of
     // whether the PR was subsequently closed — the DB invariant guarantees this.
-    const c = classifyCompletion(makeJob("failed", "implementation", "exit_1"));
+    const c = classifyCompletion(jobOf("failed", "implementation", "exit_1"));
     expect(c).not.toBeNull();
     expect(c?.summary).toBe("The run did not complete.");
   });
 
   it("has a phase-free summary on failure with no persisted FailureRecord — reportJobCompletion supplies the phase via monitorFailureCommentPrefix, and doubling it here would state it twice (BAC-27112 follow-up)", () => {
-    expect(classifyCompletion(makeJob("failed", "planning", "exit_1"))?.summary).not.toMatch(/Planning|Implementation/);
-    expect(classifyCompletion(makeJob("failed", "implementation", "exit_1"))?.summary).not.toMatch(/Planning|Implementation/);
+    expect(classifyCompletion(jobOf("failed", "planning", "exit_1"))?.summary).not.toMatch(/Planning|Implementation/);
+    expect(classifyCompletion(jobOf("failed", "implementation", "exit_1"))?.summary).not.toMatch(/Planning|Implementation/);
   });
 
   it("still varies remediation by phase even though the summary is phase-free", () => {
-    expect(classifyCompletion(makeJob("failed", "planning", "exit_1"))?.remediation).toContain("planning failure");
-    expect(classifyCompletion(makeJob("failed", "implementation", "exit_1"))?.remediation).toContain("errored before pushing");
+    expect(classifyCompletion(jobOf("failed", "planning", "exit_1"))?.remediation).toContain("planning failure");
+    expect(classifyCompletion(jobOf("failed", "implementation", "exit_1"))?.remediation).toContain("errored before pushing");
   });
 
   it("states the phase exactly once, and reads correctly, when the monitor's prefix is layered onto a no-FailureRecord classification (BAC-27112 follow-up)", () => {
-    const job = makeJob("failed", "implementation", "exit_1");
+    const job = jobOf("failed", "implementation", "exit_1");
     const classification = classifyCompletion(job);
     const rendered = renderClassification(classification!);
     const body = monitorFailureCommentPrefix(job.phase) + rendered;
@@ -97,11 +130,11 @@ describe("classifyCompletion", () => {
   });
 
   it("surfaces the exit code in the failure detail", () => {
-    expect(classifyCompletion(makeJob("failed", "implementation", "exit_137"))?.detail).toContain("137");
+    expect(classifyCompletion(jobOf("failed", "implementation", "exit_137"))?.detail).toContain("137");
   });
 
   it("notes a missing PR when an implementation fails without one (fly conclusion has no exit code)", () => {
-    expect(classifyCompletion(makeJob("failed", "implementation", "stopped", null))?.detail).toContain(
+    expect(classifyCompletion(jobOf("failed", "implementation", "stopped", null))?.detail).toContain(
       "without opening a PR",
     );
   });
@@ -120,12 +153,12 @@ describe("classifyCompletion", () => {
     // "existing PR unchanged" test below) and keeps this a pure byte-identity check.
     // executionMode/runId/repo are set so runUrl is populated on both sides too —
     // otherwise this test would pass even if the two sides disagreed on rendering it.
-    const job = {
-      ...makeJob("failed", "implementation", "exit_1", null, failure),
+    const job: Job = {
+      ...jobOf("failed", "implementation", "exit_1", null, failure),
       executionMode: "github-actions",
       runId: 42,
       repo: "org/repo",
-    } as unknown as Job;
+    };
     const classification = classifyCompletion(job);
     expect(classification).not.toBeNull();
     // The monitor's own body (renderClassification output) — phase-free, no prefix.
@@ -153,7 +186,7 @@ describe("classifyCompletion", () => {
       message: "bad model id",
       evidence: { truncated: false },
     };
-    const job = makeJob("failed", "planning", "exit_1", null, failure);
+    const job = jobOf("failed", "planning", "exit_1", null, failure);
     const summary = classifyCompletion(job)?.summary;
     expect(summary).toContain("Failed at stage `setup`");
     expect(summary).not.toContain("Planning");
@@ -161,7 +194,7 @@ describe("classifyCompletion", () => {
   });
 
   it("stays phase-free even with no persisted failure record — the provider/monitor prefix supplies the phase (BAC-27112 follow-up)", () => {
-    expect(classifyCompletion(makeJob("failed", "planning", "exit_1"))?.summary).not.toContain("Planning");
+    expect(classifyCompletion(jobOf("failed", "planning", "exit_1"))?.summary).not.toContain("Planning");
   });
 
   it("renders the last successful stage alongside the failing stage's own duration when supplied (BAC-27112)", () => {
@@ -175,7 +208,7 @@ describe("classifyCompletion", () => {
       message: "overloaded_error",
       evidence: { stderrTail: "line one", truncated: false },
     };
-    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const job = jobOf("failed", "implementation", "exit_1", PR, failure);
     const c = classifyCompletion(job, "install");
     expect(c?.detail).toContain("Last successful stage: `install`.");
     expect(c?.detail).toContain("Failing stage ran for 1m 5s.");
@@ -192,7 +225,7 @@ describe("classifyCompletion", () => {
       message: "overloaded_error",
       evidence: { truncated: false },
     };
-    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const job = jobOf("failed", "implementation", "exit_1", PR, failure);
     expect(classifyCompletion(job)?.detail).not.toContain("Last successful stage");
   });
 
@@ -206,7 +239,7 @@ describe("classifyCompletion", () => {
       message: "Push blocked: 1 sensitive file(s):\n  .env  (.env file)",
       evidence: { truncated: false },
     };
-    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const job = jobOf("failed", "implementation", "exit_1", PR, failure);
     const rendered = renderClassification(classifyCompletion(job)!);
     expect(rendered).toContain("Blocked by security guardrail");
     expect(rendered).not.toContain("push/SENSITIVE_FILES_BLOCKED");
@@ -270,7 +303,7 @@ describe("SENSITIVE_FILES_BLOCKED guardrail parity between the callback's raw fa
       message: blank,
       evidence: { truncated: false },
     };
-    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const job = jobOf("failed", "implementation", "exit_1", PR, failure);
     const monitorRendered = renderClassification(classifyCompletion(job)!);
     const callbackRendered = formatFailureComment("SENSITIVE_FILES_BLOCKED", blank);
     expect(monitorRendered).toContain("Sensitive files detected in staged changes.");
@@ -293,9 +326,9 @@ describe("monitorFailureCommentPrefix", () => {
     expect(monitorFailureCommentPrefix("kg-refresh")).toBe("⚠️ KG refresh failed: ");
   });
 
-  it("uses the implementation phrase for a gap-analysis job — gap-analysis is implementation's retry path and has no comment shape of its own, and it's the only phase where the monitor is ever the sole commenter (BAC-27112 follow-up)", () => {
+  it("names a failed gap-fill in the monitor comment", () => {
     const prefix = monitorFailureCommentPrefix("gap-analysis");
-    expect(prefix.startsWith("⚠️ Implementation failed: ")).toBe(true);
+    expect(prefix.startsWith("⚠️ Gap-fill failed: ")).toBe(true);
   });
 });
 
@@ -309,7 +342,7 @@ describe("shouldPostMonitorClassificationComment", () => {
   });
 
   it("is false for a review_failed job whose callback already posted the coded-unapproved 🟡 comment, even though classifyCompletion still classifies it — reportJobCompletion's willPostMonitorComment gate is what actually suppresses the second, less useful comment (BAC-27112 follow-up)", () => {
-    const job = { ...makeJob("review_failed", "implementation", "exit_0", PR), failureCommentedAt: Date.now() } as unknown as Job;
+    const job: Job = { ...jobOf("review_failed", "implementation", "exit_0", PR), failureCommentedAt: Date.now() };
     expect(classifyCompletion(job)).not.toBeNull();
     expect(shouldPostMonitorClassificationComment(job)).toBe(false);
   });
@@ -331,7 +364,7 @@ describe("classificationForFailure — PR phrasing", () => {
     expect(c.detail).toContain(`The work so far is preserved in a draft PR: ${PR}`);
   });
 
-  it("says the existing PR is unchanged when isInitialRun is explicitly false (gap-fill / re-dispatch)", () => {
+  it("says the existing PR is unchanged when isInitialRun is explicitly false (gap-fill / repeat run)", () => {
     const c = classificationForFailure(failure, PR, null, null, false);
     expect(c.detail).toContain("The existing PR is unchanged by this run.");
     expect(c.detail).not.toContain("preserved in a draft PR");
@@ -349,7 +382,7 @@ describe("classificationForFailure — PR phrasing", () => {
   });
 
   it("classifyCompletion drives classificationForFailure with isInitialRun=null for a persisted FailureRecord, so the monitor's own comment never asserts the PR's provenance (BAC-27112 follow-up)", () => {
-    const c = classifyCompletion(makeJob("failed", "implementation", "exit_1", PR, failure));
+    const c = classifyCompletion(jobOf("failed", "implementation", "exit_1", PR, failure));
     expect(c?.detail).toContain(`PR: ${PR}`);
     expect(c?.detail).not.toContain("preserved in a draft PR");
     expect(c?.detail).not.toContain("existing PR is unchanged");
@@ -373,8 +406,8 @@ describe("classificationForFailure — PROVIDER_UNAVAILABLE", () => {
     const c = classificationForFailure(providerUnavailableFailure("implement"), PR);
     expect(c.summary).toContain("partially implemented");
     expect(c.detail).toContain(`The work so far is preserved in a draft PR: ${PR}`);
-    expect(c.remediation).toContain("re-trigger the run once the provider recovers");
-    // Never the generic branch's transient wording — this is not a re-dispatch-after-fixing-nothing.
+    expect(c.remediation).toContain("reset the AI-Implement status or label on the ticket once the provider recovers");
+    // Never the generic branch's transient wording — this is not a new run after fixing nothing.
     expect(c.remediation).not.toContain("retry budget was exhausted");
     expect(c.summary).not.toContain("Failed at stage");
   });
@@ -389,6 +422,16 @@ describe("classificationForFailure — PROVIDER_UNAVAILABLE", () => {
     const c = classificationForFailure(providerUnavailableFailure("post-push-review"), PR);
     expect(c.summary).toContain("not reviewed");
     expect(c.summary).not.toContain("implemented");
+  });
+
+  it("renders the provider outage in plain words, with the code at the end", () => {
+    expect(classificationForFailure(providerUnavailableFailure("post-push-review"), PR).summary).toBe(
+      "🟠 The AI service was not available during the second review. The code was not reviewed. (Code: `provider_unavailable`)",
+    );
+    expect(classificationForFailure(providerUnavailableFailure("implement"), undefined).summary).toBe(
+      "🟠 The AI service was not available during implementation. The code was not implemented. (Code: `provider_unavailable`)",
+    );
+    expect(classificationForFailure(providerUnavailableFailure("review"), PR).summary).not.toMatch(/post-push|model provider/i);
   });
 
   it("says the PR is open and ready for human review for the post-push-review stage, not that a draft PR preserved the work — the PR predates this failure (BAC-27134 follow-up)", () => {
@@ -434,6 +477,13 @@ describe("classificationForFailure — REVIEWER_TURNS_EXHAUSTED", () => {
   it("falls back to DEFAULT_RETRY_POLICY.reviewMaxTurns when the field is absent (a record from before this change)", () => {
     const c = classificationForFailure(reviewerTurnsExhaustedFailure(undefined), PR);
     expect(c.summary).toContain(`(${DEFAULT_RETRY_POLICY.reviewMaxTurns})`);
+  });
+
+  it("uses the autopsy's wording and never says post-push or that the change was rejected", () => {
+    const c = classificationForFailure(reviewerTurnsExhaustedFailure(30), PR);
+    expect(c.summary).toContain("The second review (on the pull request) did not finish. A reviewer used all of its permitted steps (30)");
+    expect(c.summary).not.toMatch(/post-push/i);
+    expect(c.summary).not.toContain("did not approve");
   });
 
   it("links the PR when present, and says no PR was opened when absent", () => {
@@ -499,7 +549,7 @@ describe("PROVIDER_UNAVAILABLE / REVIEWER_TURNS_EXHAUSTED — callback path equa
       message: "overloaded_error",
       evidence: { stderrTail: "line one", truncated: false },
     };
-    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const job = jobOf("failed", "implementation", "exit_1", PR, failure);
     const monitorRendered = renderClassification(classifyCompletion(job)!);
     const callbackRendered = formatFailureComment("PROVIDER_UNAVAILABLE", "unused", { prUrl: PR, failure });
     expect(monitorRendered).toContain("partially implemented");
@@ -516,7 +566,7 @@ describe("PROVIDER_UNAVAILABLE / REVIEWER_TURNS_EXHAUSTED — callback path equa
       message: "overloaded_error",
       evidence: { truncated: false },
     };
-    const job = makeJob("failed", "implementation", "exit_1", null, failure);
+    const job = jobOf("failed", "implementation", "exit_1", null, failure);
     const monitorRendered = renderClassification(classifyCompletion(job)!);
     const callbackRendered = formatFailureComment("PROVIDER_UNAVAILABLE", "unused", { failure });
     expect(monitorRendered).toContain("not implemented");
@@ -534,7 +584,7 @@ describe("PROVIDER_UNAVAILABLE / REVIEWER_TURNS_EXHAUSTED — callback path equa
       evidence: { truncated: false },
       reviewMaxTurns: 45,
     };
-    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const job = jobOf("failed", "implementation", "exit_1", PR, failure);
     const monitorRendered = renderClassification(classifyCompletion(job)!);
     const callbackRendered = formatFailureComment("REVIEWER_TURNS_EXHAUSTED", "unused", { prUrl: PR, failure });
     expect(monitorRendered).toContain("(45)");
@@ -665,35 +715,35 @@ describe("buildRunUrl", () => {
 
 describe("kg-refresh phase", () => {
   it("returns null for a completed kg-refresh run", () => {
-    expect(classifyCompletion(makeJob("completed", "kg-refresh", "exit_0"))).toBeNull();
+    expect(classifyCompletion(jobOf("completed", "kg-refresh", "exit_0"))).toBeNull();
   });
 
   it("returns null for KG_SNAPSHOT_STALE — graph is current, benign no-new-data (mirrors operator_cancelled precedent)", () => {
-    expect(classifyCompletion(makeJob("failed", "kg-refresh", "KG_SNAPSHOT_STALE"))).toBeNull();
+    expect(classifyCompletion(jobOf("failed", "kg-refresh", "KG_SNAPSHOT_STALE"))).toBeNull();
   });
 
   it("classifies a runner failure with a KG Refresh label", () => {
-    const c = classifyCompletion(makeJob("failed", "kg-refresh", "exit_1"));
+    const c = classifyCompletion(jobOf("failed", "kg-refresh", "exit_1"));
     expect(c).not.toBeNull();
     expect(c?.summary).toContain("KG Refresh");
   });
 
   it("surfaces the exit code in the failure detail", () => {
-    expect(classifyCompletion(makeJob("failed", "kg-refresh", "exit_137"))?.detail).toContain("137");
+    expect(classifyCompletion(jobOf("failed", "kg-refresh", "exit_137"))?.detail).toContain("137");
   });
 
   it("classifies a kg-refresh timeout as hitting the time limit", () => {
-    const c = classifyCompletion(makeJob("timed_out", "kg-refresh", "container_timeout"));
+    const c = classifyCompletion(jobOf("timed_out", "kg-refresh", "container_timeout"));
     expect(c?.summary).toContain("KG Refresh");
     expect(c?.summary).toContain("time limit");
   });
 
   it("returns null for a benign issue_completed_sweep on kg-refresh", () => {
-    expect(classifyCompletion(makeJob("timed_out", "kg-refresh", "issue_completed_sweep"))).toBeNull();
+    expect(classifyCompletion(jobOf("timed_out", "kg-refresh", "issue_completed_sweep"))).toBeNull();
   });
 
   it("classifies KG_SNAPSHOT_MISSING as a failure, not no-new-data", () => {
-    const c = classifyCompletion(makeJob("failed", "kg-refresh", "KG_SNAPSHOT_MISSING"));
+    const c = classifyCompletion(jobOf("failed", "kg-refresh", "KG_SNAPSHOT_MISSING"));
     expect(c).not.toBeNull();
     expect(c?.summary).toContain("KG Refresh");
   });
@@ -733,5 +783,87 @@ describe("renderClassification", () => {
     });
     expect(md).toBe("Implementation failed.\n\n[View run](https://github.com/org/repo/actions/runs/1)");
     expect(md).not.toContain("troubleshooting");
+  });
+});
+
+
+describe("classificationForFailure — terminal error evidence", () => {
+  const failure: FailureRecord = {
+    category: "transient", code: "PROVIDER_OVERLOADED", stage: "implement", attempt: 1,
+    retryable: true, message: "fallback message",
+    evidence: { stderrTail: "PATH-alias warning", stdoutTail: "model prose", truncated: false },
+  };
+
+  it("prefers the terminal error over stderr and stdout in the evidence block", () => {
+    const errorMessage = "Selected model is at capacity. Please try a different model.";
+    const result = classificationForFailure({
+      ...failure, evidence: { ...failure.evidence, llmErrorMessage: errorMessage },
+    });
+    expect(result.detail).toContain("```\n" + errorMessage + "\n```");
+    expect(result.detail).not.toContain("PATH-alias warning");
+  });
+
+  it.each([
+    [{ stderrTail: "stderr", stdoutTail: "stdout", truncated: false }, "stderr"],
+    [{ stdoutTail: "stdout", truncated: false }, "stdout"],
+    [{ truncated: false }, "fallback message"],
+  ] as const)("preserves the evidence fallback for %j", (evidence, expected) => {
+    const detail = classificationForFailure({ ...failure, evidence }).detail;
+    const baseline = classificationForFailure({ ...failure, evidence: { ...evidence, llmErrorMessage: "" } }).detail;
+    expect(detail).toBe(baseline);
+    expect(detail).toContain("```\n" + expected + "\n```");
+  });
+});
+
+
+describe("ACCOUNT_USAGE_LIMIT notice", () => {
+  it.each(["implement", "feedback-loop/review-2", "planning"])("renders usage-limit advice for %s", (stage) => {
+    const failure: FailureRecord = {
+      category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage, attempt: 1, retryable: false,
+      message: "usage limit reached",
+      evidence: { truncated: false, llmErrorMessage: "hit your usage limit", stderrTail: "unrelated warning" },
+    };
+    const rendered = renderFailureRecord(failure);
+    expect(rendered).toContain(`🟠 The model account reached its usage limit during ${stage}.`);
+    expect(rendered).toContain("The account reached its usage limit. Add a fallback account for this stage on Models & providers, or run it again after the limit resets.");
+    expect(rendered).toContain("```\nhit your usage limit\n```");
+    expect(rendered).not.toContain("unrelated warning");
+    expect(rendered).not.toContain("A credential expired or was rejected");
+    expect(rendered).not.toContain("Check the GitHub App and provider keys");
+  });
+});
+
+it("renders all exhausted account profiles from terminal error evidence", () => {
+  const message = "Usage limit reached on every account: A, B, C";
+  expect(renderFailureRecord({ category: "auth", code: "ACCOUNT_USAGE_LIMIT", stage: "implement", attempt: 1, retryable: false, message, evidence: { truncated: false, llmErrorMessage: message } })).toContain("A, B, C");
+});
+
+it("explains a Fly machine removed before start, including when no PR exists", () => {
+  expect(classifyCompletion(jobOf("failed", "implementation", "fly_machine_never_started"))).toMatchObject({
+    detail: "Fly removed the machine before it started.",
+    remediation: "Check the project's Fly secrets and the runner image, then run it again. See docs/deployment.md § Per-project secrets (Fly).",
+  });
+});
+
+it("keeps structured failure detail and remediation authoritative over the Fly never-started conclusion", () => {
+  const failure: FailureRecord = {
+    category: "transient",
+    code: "PROVIDER_OVERLOADED",
+    stage: "implement",
+    attempt: 3,
+    retryable: true,
+    message: "The model provider was overloaded.",
+    evidence: { truncated: false },
+  };
+  const expected = classificationForFailure(failure);
+  expect(expected.detail).toContain(failure.message);
+  expect(expected.remediation).toBeTruthy();
+
+  const classification = classifyCompletion(
+    jobOf("failed", "implementation", "fly_machine_never_started", null, failure),
+  );
+  expect(classification).toMatchObject({
+    detail: expected.detail,
+    remediation: expected.remediation,
   });
 });

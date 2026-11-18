@@ -1,72 +1,68 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { buildPlanningContextInputs } from "../planning-context.js";
 import { configureLinearAuth, __setLinearTokenForTest } from "../linear-app-auth.js";
-import type { TicketIssue } from "../providers/types.js";
+import { makeIssue } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 beforeEach(() => {
   configureLinearAuth("client-id", "client-secret");
   __setLinearTokenForTest("test-token");
 });
 
-const ISSUE: TicketIssue = {
-  id: "issue-123",
-  identifier: "ENG-123",
-  title: "Example issue",
-  description: "Example description",
-  scopeKey: "ENG",
-  nativeStatus: "Todo",
-};
+// The id and identifier are the current ticket's entry among the parent's children below.
+const ISSUE = makeIssue({ id: "issue-123", identifier: "ENG-123" });
 
 describe("buildPlanningContextInputs", () => {
   it("returns None defaults for non-linear providers", async () => {
-    const fetchImpl = vi.fn();
+    const fake = fakeFetch({});
     const result = await buildPlanningContextInputs({
       issue: ISSUE,
       ticketingProviderId: "jira",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({
       parent: "None",
       siblings: "None",
       dependencies: "None",
     });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fake.calls).toHaveLength(0);
   });
 
   it("returns formatted parent, sibling, and dependency context from Linear", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: {
-          issue: {
-            parent: {
-              id: "parent-1",
-              identifier: "ENG-100",
-              title: "Parent ticket",
-              children: {
+    const fake = fakeFetch({
+      "POST /graphql": {
+        json: {
+          data: {
+            issue: {
+              parent: {
+                id: "parent-1",
+                identifier: "ENG-100",
+                title: "Parent ticket",
+                children: {
+                  nodes: [
+                    { id: "issue-123", identifier: "ENG-123", title: "Current ticket" },
+                    { id: "sibling-1", identifier: "ENG-124", title: "Sibling ticket" },
+                  ],
+                },
+              },
+              relations: {
                 nodes: [
-                  { id: "issue-123", identifier: "ENG-123", title: "Current ticket" },
-                  { id: "sibling-1", identifier: "ENG-124", title: "Sibling ticket" },
+                  {
+                    type: "blocks",
+                    relatedIssue: { identifier: "ENG-200", title: "Dependency ticket" },
+                  },
                 ],
               },
             },
-            relations: {
-              nodes: [
-                {
-                  type: "blocks",
-                  relatedIssue: { identifier: "ENG-200", title: "Dependency ticket" },
-                },
-              ],
-            },
           },
         },
-      }),
+      },
     });
 
     const result = await buildPlanningContextInputs({
       issue: ISSUE,
       ticketingProviderId: "linear",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
 
     expect(result).toEqual({
@@ -74,15 +70,19 @@ describe("buildPlanningContextInputs", () => {
       siblings: "- ENG-124: Sibling ticket",
       dependencies: "- [blocks] ENG-200: Dependency ticket",
     });
-    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(fake.calls).toHaveLength(1);
   });
 
   it("returns None defaults when Linear request fails", async () => {
-    const fetchImpl = vi.fn().mockRejectedValue(new Error("network down"));
+    const fake = fakeFetch({
+      "POST /graphql": () => {
+        throw new Error("network down");
+      },
+    });
     const result = await buildPlanningContextInputs({
       issue: ISSUE,
       ticketingProviderId: "linear",
-      fetchImpl,
+      fetchImpl: fake.fetch,
     });
     expect(result).toEqual({
       parent: "None",

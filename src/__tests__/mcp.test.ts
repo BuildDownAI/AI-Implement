@@ -2,37 +2,55 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as restate from "@restatedev/restate-sdk";
-import { handleMcpRequest } from "../mcp.js";
+import { RESTATE_WRITE_TOOL_NAMES, handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
-import { setActiveKgRefresh } from "../kg-refresh.js";
-import { getIssueReportCard, getFleetReport } from "../report-card.js";
-import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
+import { setKgRefreshToolDeps } from "../restate/tools.js";
+import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
+import { refreshRunnerBackendCache } from "../orchestrator-settings.js";
+import type { PreflightCheckResult } from "../kg-refresh.js";
 import type { Caller } from "../mcp-identity.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch, type Reply } from "./helpers/fake-fetch.js";
 import {
   GET_TENANT_HEALTH_DESCRIPTION,
   getTenantHealth,
   getRunnerModeTool,
   listProjects,
   listInFlightJobs,
+  getSessionMachine,
+  listSessionMachines,
+  getFlySetup,
   getIssueDispatchStatus,
   getIssueReportCardTool,
   getFleetReportTool,
+  getReviewerScorecardTool,
   getDeployPostureTool,
   getKgStatusTool,
+  getReviewFixAttemptTool,
+  getReviewFixActivityTool,
+  listJobAccountingTool,
+  listOpenPullsTool,
+  listIssueStatusesTool,
+  setReviewFixAttemptsFacade,
   kgHybridSearch,
   kgSearch,
   kgSemanticSearch,
   kgNeighbors,
   kgPath,
   kgProvenance,
+  kgRepoHistory,
   triggerKgRefreshTool,
   setRunnerModeTool,
+  setFlyMachineProfileTool,
+  setRunProfileTool,
   pauseProjectTool,
+  importEnvironmentCredentialTool,
   addProjectTool,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
-  tool,
+  listDispatchReservationsTool,
+  releaseDispatchReservationTool,
   type ToolResponse,
 } from "../restate/tools.js";
 import {
@@ -46,6 +64,11 @@ import {
 // The five non-kg-refresh writes call these action functions verbatim (AII-713) — mocked
 // wholesale, same as tools.test.ts, since src/restate/tools.ts only imports these five names
 // from admin.ts.
+vi.mock("../agent-config-store.js", () => ({
+  getOrchestratorDefaults: vi.fn(() => null),
+  isProjectConfigured: vi.fn(() => false),
+}));
+
 vi.mock("../admin.js", () => ({
   setRunnerModeAction: vi.fn(),
   pauseProjectAction: vi.fn(),
@@ -64,57 +87,90 @@ vi.mock("../admin.js", () => ({
  * real handler bodies too — calling one here exercises the real tool() wrapper's role check
  * and audit line, not just a stub.
  */
-const TOOL_HANDLERS: Record<
-  string,
-  (ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }) => Promise<ToolResponse>
-> = {
+// The transport fixture erases individual argument shapes, as the ingress does before
+// each handler's serde validation. Method variance permits that heterogeneous catalog.
+type FixtureToolHandler = {
+  invoke(ctx: restate.Context, input: { caller: Caller; args: Record<string, unknown> }): Promise<ToolResponse>;
+}["invoke"];
+const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   get_tenant_health: getTenantHealth,
   get_runner_mode: getRunnerModeTool,
   list_projects: listProjects,
   list_in_flight_jobs: listInFlightJobs,
+  get_session_machine: getSessionMachine,
+  list_session_machines: listSessionMachines,
+  get_fly_setup: getFlySetup,
   get_issue_dispatch_status: getIssueDispatchStatus,
   get_issue_report_card: getIssueReportCardTool,
   get_fleet_report: getFleetReportTool,
+  get_reviewer_scorecard: getReviewerScorecardTool,
   get_deploy_posture: getDeployPostureTool,
   get_kg_status: getKgStatusTool,
+  get_review_fix_attempt: getReviewFixAttemptTool,
+  get_review_fix_activity: getReviewFixActivityTool,
+  list_job_accounting: listJobAccountingTool,
+  list_open_pulls: listOpenPullsTool,
+  list_issue_statuses: listIssueStatusesTool,
   kg_hybrid_search: kgHybridSearch,
   kg_search: kgSearch,
   kg_semantic_search: kgSemanticSearch,
   kg_neighbors: kgNeighbors,
   kg_path: kgPath,
   kg_provenance: kgProvenance,
+  kg_repo_history: kgRepoHistory,
   trigger_kg_refresh: triggerKgRefreshTool,
   set_runner_mode: setRunnerModeTool,
+  set_fly_machine_profile: setFlyMachineProfileTool,
+  set_run_profile: setRunProfileTool,
   pause_project: pauseProjectTool,
+  import_environment_credential: importEnvironmentCredentialTool,
   add_project: addProjectTool,
   trigger_workflow_sync: triggerWorkflowSyncTool,
   clear_dispatch_dedup: clearDispatchDedupTool,
+  list_dispatch_reservations: listDispatchReservationsTool,
+  release_dispatch_reservation: releaseDispatchReservationTool,
 };
 
-/** The six writes declare role: "admin" (src/restate/tools.ts); every other discoverable tool is "user". */
+/** The seven writes plus two privileged review-fix reads declare role: "admin"; every other discoverable tool is "user". */
 const WRITE_TOOL_NAMES = new Set([
   "trigger_kg_refresh",
   "set_runner_mode",
+  "set_fly_machine_profile",
+  "set_run_profile",
   "pause_project",
+  "import_environment_credential",
   "add_project",
   "trigger_workflow_sync",
   "clear_dispatch_dedup",
+  "release_dispatch_reservation",
 ]);
+const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]);
 
 const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   name,
   description: name === "get_tenant_health" ? GET_TENANT_HEALTH_DESCRIPTION : name,
   inputSchema: { type: "object", properties: {} },
-  role: (WRITE_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
+  role: (WRITE_TOOL_NAMES.has(name) || ADMIN_READ_TOOL_NAMES.has(name) ? "admin" : "user") as "admin" | "user",
 }));
 
 // AII-717: every write handler now runs its side effect through ctx.run — this fake just
 // invokes the closure immediately and returns its result, the same first-attempt behaviour a
 // real (non-replayed) Restate invocation has. Replay-specific behaviour is exercised only at
 // the Restate tier (tools.restate.test.ts's alwaysReplay counter fixture).
+// AII-683: the kg-refresh handlers call the KgRepo object / KgRefresh workflow natively; these
+// fakes stand in for both clients. Reset in beforeEach.
+let kgTriggerFake: ((opts: { actorEmail?: string }) => Promise<unknown>) | null = null;
+
 function fakeRestateContext(handlerName: string): restate.Context {
   return {
     request: () => ({ target: { handler: handlerName } }),
+    // SetupChecks has its own client: get_tenant_health reads the stored run, and none has run yet.
+    objectClient: (definition: { name: string }) => (definition.name === "SetupChecks" ? { get: async () => null } : {
+      current: async () => ({ prices: [] }),
+      trigger: (opts: { actorEmail?: string }) => kgTriggerFake!(opts),
+      status: async () => null,
+      get: async () => ({ config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" }),
+    }),
     run: async (name: unknown, action?: unknown) => {
       const fn = typeof name === "function" ? (name as () => unknown) : (action as () => unknown);
       return fn();
@@ -136,17 +192,21 @@ vi.mock("../access-entries.js", () => ({
   recheckIdentity: vi.fn(),
 }));
 
-vi.mock("../runner-mode.js", () => ({
-  VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
+vi.mock("../runner-mode.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runner-mode.js")>()),
   getRunnerMode: vi.fn(),
+  getKgMaterializeDirect: vi.fn(() => ({ enabled: true, source: "db" as const })),
+  getKgExecutionMode: vi.fn(() => ({ mode: "github-actions" as const, source: "db" as const })),
 }));
 
-vi.mock("../config.js", () => ({
-  getMappings: vi.fn(),
+vi.mock("../config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config.js")>()),
+  getMappings: vi.fn(() => ({})),
 }));
 
-vi.mock("../log.js", () => ({
+vi.mock("../log.js", async (importOriginal) => ({
   getInFlightJobs: vi.fn(),
+  parseFailureJson: (await importOriginal<typeof import("../log.js")>()).parseFailureJson,
 }));
 
 vi.mock("../dedup.js", () => ({
@@ -164,12 +224,23 @@ vi.mock("../deploy-posture.js", () => ({
 vi.mock("../report-card.js", () => ({
   getIssueReportCard: vi.fn(),
   getFleetReport: vi.fn(),
+  getReviewerScorecard: vi.fn(),
 }));
 
-vi.mock("../restate/tools-client.js", () => ({
+vi.mock("../deploy-hold.js", () => ({
+  getDeployStartedAt: vi.fn(() => null),
+  isDeployHeld: vi.fn(() => false),
+}));
+
+vi.mock("../orchestrator-settings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../orchestrator-settings.js")>()),
+  refreshRunnerBackendCache: vi.fn(async () => {}),
+}));
+
+vi.mock("../restate/tools-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../restate/tools-client.js")>()),
   discoverTools: vi.fn(),
   callTool: vi.fn(),
-  IDEMPOTENCY_KEY_SHAPE: /^[A-Za-z0-9._:-]{1,128}$/,
 }));
 
 const BASE_URL = "https://orchestrator.example.com";
@@ -335,7 +406,8 @@ beforeEach(async () => {
     },
   );
   setKgMemoryProvider(null);
-  setActiveKgRefresh(null);
+  setKgRefreshToolDeps(null);
+  kgTriggerFake = null;
 
   (mcpOauth.resolveClientPath as ReturnType<typeof vi.fn>).mockReturnValue("unknown");
   (mcpOauth.getRefreshExpiry as ReturnType<typeof vi.fn>).mockResolvedValue(null);
@@ -357,46 +429,8 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  setReviewFixAttemptsFacade(null);
 });
-
-/** Set up a successful proxy response mock. */
-function setupProxyMock(opts: {
-  statusCode?: number;
-  responseHeaders?: Record<string, string>;
-  chunks?: string[];
-}): { mockProxyReq: PassThrough; capturedOpts: { value: http.RequestOptions | null } } {
-  const capturedOpts: { value: http.RequestOptions | null } = { value: null };
-  const mockProxyReq = new PassThrough();
-  const mockProxyRes = new PassThrough();
-  Object.assign(mockProxyRes, {
-    statusCode: opts.statusCode ?? 200,
-    headers: opts.responseHeaders ?? { "content-type": "application/json" },
-  });
-
-  mockHttpRequest.mockImplementationOnce((options: http.RequestOptions, cb: (res: unknown) => void) => {
-    capturedOpts.value = options;
-    process.nextTick(() => {
-      cb(mockProxyRes);
-      for (const chunk of opts.chunks ?? []) mockProxyRes.push(chunk);
-      mockProxyRes.push(null);
-    });
-    return mockProxyReq;
-  });
-
-  return { mockProxyReq, capturedOpts };
-}
-
-/** Set up a proxy socket error mock. */
-function setupProxyError(errorCode: string): void {
-  const mockProxyReq = new PassThrough();
-  mockHttpRequest.mockImplementationOnce((_options: http.RequestOptions, _cb: unknown) => {
-    process.nextTick(() => {
-      const err = Object.assign(new Error(errorCode), { code: errorCode });
-      mockProxyReq.emit("error", err);
-    });
-    return mockProxyReq;
-  });
-}
 
 async function callMcp(
   headers: Record<string, string>,
@@ -408,7 +442,7 @@ async function callMcp(
   providerDiagnostic?: string | null,
   _legacyRunKgRefreshPreflight?: unknown,
   _legacyGetKgStatus?: unknown,
-  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
+  triggerKgRefresh?: (actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
   writeContext?: {
     setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
     pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
@@ -422,11 +456,21 @@ async function callMcp(
   // cases below still hand their fakes in positionally, so translate them into the module
   // mocks the handlers actually read. The two `_legacy*` slots keep older call sites aligned.
   if (triggerKgRefresh) {
-    setActiveKgRefresh({
-      trigger: ({ dryRun, acceptNewBaseline, actorEmail }: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }) =>
-        triggerKgRefresh(dryRun, acceptNewBaseline, actorEmail),
-      status: async () => ({}),
-    } as never);
+    setKgRefreshToolDeps({
+      kgSourceRepo: "org/kg",
+      isDeployHeld: () => false,
+      callbackConfigured: () => true,
+      mappingExists: () => true,
+      freeBytes: () => Number.MAX_SAFE_INTEGER,
+      runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
+      persistPreflightFailure: () => {},
+      readStatusRecord: () => null,
+      readServedStamp: async () => null,
+    });
+    kgTriggerFake = async ({ actorEmail }) => {
+      await triggerKgRefresh(actorEmail);
+      return { triggerId: "trig-1" };
+    };
   }
   if (writeContext?.setRunnerMode) (setRunnerModeAction as ReturnType<typeof vi.fn>).mockImplementation((_cfg: unknown, patch: { mode?: string }) => writeContext.setRunnerMode!(patch));
   if (writeContext?.pauseProject) (pauseProjectAction as ReturnType<typeof vi.fn>).mockImplementation((teamKey: string, paused: boolean) => writeContext.pauseProject!(teamKey, paused));
@@ -919,6 +963,54 @@ describe("handleMcpRequest", () => {
       expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
     });
 
+    it("returns 409 deploy-in-progress with deployStartedAt and never contacts the ingress during a hold", async () => {
+      const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+      const deployHold = await import("../deploy-hold.js");
+      (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(1_700_000_000_000);
+      const fake = fakeFetch({});
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (name: string, args: Record<string, unknown>, caller: Caller) =>
+          realCallTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => false }),
+      );
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 18, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(409);
+      expect(JSON.parse(result.body)).toEqual({ error: "deploy-in-progress", deployStartedAt: 1_700_000_000_000 });
+      expect(fake.calls).toHaveLength(0);
+      (deployHold.getDeployStartedAt as ReturnType<typeof vi.fn>).mockReturnValue(null);
+    });
+
+    it.each<[string, Reply]>([
+      ["a refused connection", () => {
+        throw new Error("ECONNREFUSED");
+      }],
+      ["a 5xx answer", { status: 502, text: "boom" }],
+    ])("keeps 503 restate-unavailable with no hold and %s", async (_label, ingressReply) => {
+      const { callTool: realCallTool } = await vi.importActual<typeof import("../restate/tools-client.js")>("../restate/tools-client.js");
+      const fake = fakeFetch({ "POST /orchestratorTools/get_tenant_health": [ingressReply] });
+      (toolsClientMock.callTool as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (name: string, args: Record<string, unknown>, caller: Caller) =>
+          realCallTool(name, args, caller, { fetchImpl: fake.fetch, permitsExternalCall: () => true, restateReady: () => true }),
+      );
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 19, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+      expect(fake.calls).toHaveLength(1);
+      expect(result.statusCode).toBe(503);
+      expect(JSON.parse(result.body)).toEqual({ error: "restate-unavailable" });
+    });
+
     it("handles get_runner_mode", async () => {
       (runnerModeMock.getRunnerMode as ReturnType<typeof vi.fn>).mockReturnValue({ mode: "fly", source: "env" });
 
@@ -937,34 +1029,15 @@ describe("handleMcpRequest", () => {
     });
 
     it("handles list_projects — existing seven fields preserved", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
+      vi.mocked(configMock.getMappings).mockReturnValue({
+        "AII": makeMapping({
           owner: "BuildDownAI",
           repo: "AI-Implement",
-          executionMode: "github-actions",
-          provider: "anthropic",
-          paused: false,
+          paused: true,
+          executionMode: "fly-machines",
           planningEnabled: true,
-          maxInProgressAiIssues: 3,
-          defaultBranch: "main",
-          workflowFile: "claude-implement.yml",
-          sessionMode: "autonomous",
-          autoMerge: false,
-          maxTurns: null,
-          maxIterations: null,
-          maxJobMinutes: null,
-          branchPrefix: null,
-          skillsRepo: null,
-          dependencyTokenScope: null,
-          sensitiveAddPatterns: null,
-          sensitiveAllowPatterns: null,
-          machineCpus: 2,
-          machineMemoryMb: 4096,
-          awsRegion: null,
-          planningWorkflowFile: "claude-plan.yml",
-          autoApprovePlans: true,
-          extraEnv: { SECRET_KEY: "secret-value" },
-        },
+          maxInProgressAiIssues: 5,
+        }),
       });
 
       const result = await callMcp(
@@ -981,23 +1054,16 @@ describe("handleMcpRequest", () => {
       expect(data).toHaveLength(1);
       expect(data[0].teamKey).toBe("AII");
       expect(data[0].repo).toBe("BuildDownAI/AI-Implement");
-      expect(data[0].paused).toBe(false);
-      expect(data[0].executionMode).toBe("github-actions");
+      expect(data[0].paused).toBe(true);
+      expect(data[0].executionMode).toBe("fly-machines");
       expect(data[0].provider).toBe("anthropic");
       expect(data[0].planningEnabled).toBe(true);
-      expect(data[0].maxInProgressAiIssues).toBe(3);
+      expect(data[0].maxInProgressAiIssues).toBe(5);
     });
 
     it("handles list_projects — extended per-project settings", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
-          owner: "BuildDownAI",
-          repo: "AI-Implement",
-          executionMode: "fly-machines",
-          provider: "bedrock",
-          paused: true,
-          planningEnabled: false,
-          maxInProgressAiIssues: 5,
+      vi.mocked(configMock.getMappings).mockReturnValue({
+        "AII": makeMapping({
           defaultBranch: "develop",
           workflowFile: "custom-implement.yml",
           sessionMode: "hybrid",
@@ -1014,10 +1080,9 @@ describe("handleMcpRequest", () => {
           machineCpus: 4,
           machineMemoryMb: 8192,
           awsRegion: "us-east-1",
-          planningWorkflowFile: "claude-plan.yml",
+          planningWorkflowFile: "custom-plan.yml",
           autoApprovePlans: false,
-          extraEnv: { SHOULD_NOT_APPEAR: "hidden" },
-        },
+        }),
       });
 
       const result = await callMcp(
@@ -1052,40 +1117,12 @@ describe("handleMcpRequest", () => {
       expect(p.machineCpus).toBe(4);
       expect(p.machineMemoryMb).toBe(8192);
       expect(p.awsRegion).toBe("us-east-1");
-      expect(p.planningWorkflowFile).toBe("claude-plan.yml");
+      expect(p.planningWorkflowFile).toBe("custom-plan.yml");
       expect(p.autoApprovePlans).toBe(false);
     });
 
     it("handles list_projects — null-able caps return null, not fabricated defaults", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
-          owner: "BuildDownAI",
-          repo: "AI-Implement",
-          executionMode: "github-actions",
-          provider: "anthropic",
-          paused: false,
-          planningEnabled: true,
-          maxInProgressAiIssues: 3,
-          defaultBranch: "main",
-          workflowFile: "claude-implement.yml",
-          sessionMode: "autonomous",
-          autoMerge: false,
-          maxTurns: null,
-          maxIterations: null,
-          maxJobMinutes: null,
-          branchPrefix: null,
-          skillsRepo: null,
-          dependencyTokenScope: null,
-          sensitiveAddPatterns: null,
-          sensitiveAllowPatterns: null,
-          machineCpus: 2,
-          machineMemoryMb: 4096,
-          awsRegion: null,
-          planningWorkflowFile: "claude-plan.yml",
-          autoApprovePlans: true,
-          extraEnv: {},
-        },
-      });
+      vi.mocked(configMock.getMappings).mockReturnValue({ "AII": makeMapping() });
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1111,34 +1148,8 @@ describe("handleMcpRequest", () => {
     });
 
     it("handles list_projects — extraEnv is absent from output", async () => {
-      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
-        "AII": {
-          owner: "BuildDownAI",
-          repo: "AI-Implement",
-          executionMode: "github-actions",
-          provider: "anthropic",
-          paused: false,
-          planningEnabled: true,
-          maxInProgressAiIssues: 3,
-          defaultBranch: "main",
-          workflowFile: "claude-implement.yml",
-          sessionMode: "autonomous",
-          autoMerge: false,
-          maxTurns: null,
-          maxIterations: null,
-          maxJobMinutes: null,
-          branchPrefix: null,
-          skillsRepo: null,
-          dependencyTokenScope: null,
-          sensitiveAddPatterns: null,
-          sensitiveAllowPatterns: null,
-          machineCpus: 2,
-          machineMemoryMb: 4096,
-          awsRegion: null,
-          planningWorkflowFile: "claude-plan.yml",
-          autoApprovePlans: true,
-          extraEnv: { API_KEY: "do-not-expose", DB_PASS: "also-secret" },
-        },
+      vi.mocked(configMock.getMappings).mockReturnValue({
+        "AII": makeMapping({ extraEnv: { API_KEY: "do-not-expose", DB_PASS: "also-secret" } }),
       });
 
       const result = await callMcp(
@@ -1256,6 +1267,41 @@ describe("handleMcpRequest", () => {
       expect(data.recentDispatches).toHaveLength(1);
     });
 
+    it("get_issue_dispatch_status returns failureMessage for a failed row, null otherwise", async () => {
+      const now = Date.now();
+      const failure = {
+        category: "config", code: "PLAN_STATUS_WRITE_FAILED", stage: "planning-callback", attempt: 1,
+        retryable: false, message: "Jira answered 400: bad option", evidence: { truncated: false },
+      };
+      (dedupMock.getDb as ReturnType<typeof vi.fn>).mockReturnValue({
+        prepare: (sql: string) => {
+          if (sql.includes("dispatch_log")) {
+            const base = { dispatched_at: now, repo: "org/repo", phase: "planning", pr_url: null };
+            return {
+              all: vi.fn(() => [
+                { ...base, id: 12, status: "failed", conclusion: "plan_status_write_failed", failure_json: JSON.stringify(failure) },
+                { ...base, id: 11, status: "failed", conclusion: "x", failure_json: "{not json" },
+                { ...base, id: 10, status: "completed", conclusion: null, failure_json: null },
+              ]),
+            };
+          }
+          return { get: vi.fn(() => undefined) };
+        },
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({
+          jsonrpc: "2.0", id: 7, method: "tools/call",
+          params: { name: "get_issue_dispatch_status", arguments: { identifier: "AII-98" } },
+        }),
+      );
+      const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
+      expect(data.recentDispatches.map((d: { failureMessage: string | null }) => d.failureMessage)).toEqual([
+        "Jira answered 400: bad option", null, null,
+      ]);
+    });
+
     it("handles get_issue_dispatch_status for an unknown issue", async () => {
       (dedupMock.getDb as ReturnType<typeof vi.fn>).mockReturnValue({
         prepare: (_sql: string) => ({
@@ -1363,22 +1409,35 @@ describe("handleMcpRequest", () => {
       expect(result.statusCode).toBe(401);
     });
 
-    it("handles get_kg_status — returns the active kg-refresh handle's status verbatim", async () => {
-      const status: KgRefreshStatus = {
-        running: true,
+    it("handles get_kg_status — composes the status from the KgRepo marker and the last-refresh record", async () => {
+      const lastRefresh = { ok: true as const, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" };
+      // AII-683: get_kg_status reads the boot-time tool deps and the KgRepo object, not a handle.
+      setKgRefreshToolDeps({
+        kgSourceRepo: "org/kg",
+        isDeployHeld: () => false,
+        callbackConfigured: () => true,
+        mappingExists: () => true,
+        freeBytes: () => Number.MAX_SAFE_INTEGER,
+        runPreflight: async () => ({ ok: true, checkedAt: 0, results: [] }) as PreflightCheckResult,
+        persistPreflightFailure: () => {},
+        readStatusRecord: () => lastRefresh,
+        readServedStamp: async () => null,
+      });
+      const status = {
+        running: false,
         deployHeld: false,
         kgDegraded: false,
-        servedStamp: "2026-09-01T00:00:00Z",
-        lastRefresh: { ok: true, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" },
-        stage: "ingest-running",
+        ...sidecarHealthFields(),
+        servedStamp: "b",
+        lastRefresh,
+        stage: "serving",
         materialize: "direct",
-        kgUnavailable: false,
-        sidecar: { reachable: false, toolsListed: false, lastError: null, checkedAt: null },
+        executionMode: { effective: "github-actions", source: "kg-setting", setting: "github-actions" },
+        runProfile: { backend: "github-actions", config: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000 }, source: "default" },
+        flyMachine: { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: 604800000, source: "default" },
+        restate: null,
+        currentRun: null,
       };
-      const statusMock = vi.fn(async () => status);
-      // AII-711: get_kg_status is a Restate handler that reads the boot-time singleton, not a
-      // per-request callback threaded through handleMcpRequest.
-      setActiveKgRefresh({ status: statusMock } as never);
 
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1392,7 +1451,6 @@ describe("handleMcpRequest", () => {
       expect(mockHttpRequest).not.toHaveBeenCalled();
       expect(result.statusCode).toBe(200);
       expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_kg_status", {}, expect.objectContaining({ kind: "human" }), undefined);
-      expect(statusMock).toHaveBeenCalledOnce();
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data).toEqual(status);
@@ -1570,9 +1628,11 @@ describe("handleMcpRequest", () => {
         "trigger_kg_refresh",
         "set_runner_mode",
         "pause_project",
+        "import_environment_credential",
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
+        "release_dispatch_reservation",
       ]));
     });
 
@@ -1591,9 +1651,11 @@ describe("handleMcpRequest", () => {
         "trigger_kg_refresh",
         "set_runner_mode",
         "pause_project",
+        "import_environment_credential",
         "add_project",
         "trigger_workflow_sync",
         "clear_dispatch_dedup",
+        "release_dispatch_reservation",
       ]) {
         expect(names).not.toContain(writeTool);
       }
@@ -1605,9 +1667,12 @@ describe("handleMcpRequest", () => {
         "get_runner_mode",
         "list_projects",
         "list_in_flight_jobs",
+        "get_session_machine",
+        "list_session_machines",
         "get_issue_dispatch_status",
         "get_issue_report_card",
         "get_fleet_report",
+        "get_reviewer_scorecard",
         "get_deploy_posture",
         "get_kg_status",
         "get_session_identity",
@@ -1639,6 +1704,136 @@ describe("handleMcpRequest", () => {
         expect(adminNames).toContain(name);
         expect(userNames).toContain(name);
       }
+    });
+
+    it("lists privileged read tools for admins only", async () => {
+      mockRole("admin");
+      const adminResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const adminNames = JSON.parse(adminResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      mockRole("user");
+      const userResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const userNames = JSON.parse(userResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      expect(adminNames).toEqual(expect.arrayContaining(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]));
+      expect(userNames).not.toContain("get_review_fix_attempt");
+      expect(userNames).not.toContain("get_review_fix_activity");
+      expect(userNames).not.toContain("get_fly_setup");
+    });
+  });
+
+  describe("tools/call — review-fix read tools", () => {
+    afterEach(() => {
+      setReviewFixAttemptsFacade(null);
+    });
+
+    it("routes get_fly_setup for an admin", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_fly_setup", arguments: {} } }),
+      );
+      const reply = JSON.parse(result.body).result;
+      expect(reply.isError).toBeFalsy();
+      expect(JSON.parse(reply.content[0].text)).toHaveProperty("reachable", null);
+    });
+
+    it("as admin, calls get_review_fix_attempt and returns the status envelope", async () => {
+      mockRole("admin");
+      setReviewFixAttemptsFacade({
+        getAttempt: vi.fn(async () => ({
+          status: "ok" as const,
+          attempt: {
+            attemptId: "attempt-1",
+            owner: { kind: "restate", attemptId: "attempt-1" },
+            execution: null,
+            deadlineAt: 1,
+            pendingFeedback: false,
+            snapshot: null,
+            state: "running",
+            evidenceComplete: false,
+            terminationConfirmed: false,
+            cycles: [],
+          },
+        })),
+        getActivity: vi.fn(),
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 80,
+          method: "tools/call",
+          params: {
+            name: "get_review_fix_attempt",
+            arguments: { attemptId: "attempt-1" },
+            _meta: { idempotencyKey: "not-validated-for-reads!" },
+          },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({
+        status: "ok",
+        attempt: expect.objectContaining({
+          attemptId: "attempt-1",
+          evidenceComplete: false,
+          terminationConfirmed: false,
+        }),
+      });
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "get_review_fix_attempt",
+        { attemptId: "attempt-1" },
+        { kind: "human", email: "user@example.com", role: "admin", grants: [] },
+        undefined,
+      );
+    });
+
+    it("as user, refuses get_review_fix_activity before the facade runs", async () => {
+      mockRole("user");
+      const getActivity = vi.fn();
+      setReviewFixAttemptsFacade({ getAttempt: vi.fn(), getActivity });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 81,
+          method: "tools/call",
+          params: { name: "get_review_fix_activity", arguments: { attemptId: "attempt-1" } },
+        }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("forbidden: get_review_fix_activity requires the admin role");
+      expect(getActivity).not.toHaveBeenCalled();
     });
   });
 
@@ -1680,7 +1875,7 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
       const data = JSON.parse(parsed.result.content[0].text);
-      expect(data).toEqual({ status: 202, body: { accepted: true } });
+      expect(data).toEqual({ status: 202, body: { refreshing: true, triggerId: "trig-1" } });
       expect(triggerMock).toHaveBeenCalledOnce();
       expect(logSpy).toHaveBeenCalledWith(
         expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=ok/),
@@ -1718,7 +1913,7 @@ describe("handleMcpRequest", () => {
 
 
 
-    it("as admin, dryRun:true is passed through to triggerKgRefresh (AII-632)", async () => {
+    it.each(["dryRun", "acceptNewBaseline"])("as admin, %s:true is refused with option-removed and triggerKgRefresh is never called (AII-1263)", async (option) => {
       mockRole("admin");
       const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
@@ -1728,7 +1923,7 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 45, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { dryRun: true } } }),
+        JSON.stringify({ jsonrpc: "2.0", id: 45, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { [option]: true } } }),
         undefined,
         undefined,
         undefined,
@@ -1737,11 +1932,11 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).not.toBe(true);
-      expect(triggerMock).toHaveBeenCalledWith(true, false, "user@example.com");
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 400, body: { error: "option-removed", option } });
+      expect(triggerMock).not.toHaveBeenCalled();
     });
 
-    it("as admin, omitting dryRun passes false through to triggerKgRefresh", async () => {
+    it.each([{}, { dryRun: false, acceptNewBaseline: false }])("as admin, %j runs a real refresh with the actor's email", async (args) => {
       mockRole("admin");
       const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
 
@@ -1751,59 +1946,14 @@ describe("handleMcpRequest", () => {
         null,
         BASE_URL,
         "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 46, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        JSON.stringify({ jsonrpc: "2.0", id: 46, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: args } }),
         undefined,
         undefined,
         undefined,
         triggerMock,
       );
 
-      expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
-    });
-
-
-
-    it("as admin, acceptNewBaseline:true is passed through to triggerKgRefresh with the actor's email (AII-628)", async () => {
-      mockRole("admin");
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
-
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 49, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { acceptNewBaseline: true } } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
-
-      expect(result.statusCode).toBe(200);
-      const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).not.toBe(true);
-      expect(triggerMock).toHaveBeenCalledWith(false, true, "user@example.com");
-    });
-
-    it("as admin, omitting acceptNewBaseline passes false through to triggerKgRefresh", async () => {
-      mockRole("admin");
-      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
-
-      await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
-        undefined,
-        undefined,
-        undefined,
-        triggerMock,
-      );
-
-      expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
+      expect(triggerMock).toHaveBeenCalledWith("user@example.com");
     });
 
     it("as user, acceptNewBaseline:true is refused and triggerKgRefresh is never called (AII-628)", async () => {
@@ -1830,7 +1980,7 @@ describe("handleMcpRequest", () => {
       expect(triggerMock).not.toHaveBeenCalled();
     });
 
-    it("when triggerKgRefresh is not wired, returns isError with 'KG refresh is not configured'", async () => {
+    it("when the kg-refresh tool deps are not set, answers 501 kg-source-repo-not-configured", async () => {
       mockRole("admin");
       const result = await callMcp(
         { authorization: "Bearer tok" },
@@ -1843,8 +1993,8 @@ describe("handleMcpRequest", () => {
 
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
-      expect(parsed.result.isError).toBe(true);
-      expect(parsed.result.content[0].text).toContain("KG refresh is not configured");
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 501, body: { error: "kg-source-repo-not-configured" } });
     });
 
     it("unauthenticated request returns 401 before any tool dispatch", async () => {
@@ -2458,10 +2608,7 @@ describe("handleMcpRequest", () => {
           stalenessStamp: false,
         },
         listTools: async () => [],
-        proxyCall: (_req, res) => {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ jsonrpc: "2.0", id: 9, result: { content: [] } }));
-        },
+        callKgTool: async () => ({ ok: true, result: {} }),
       };
 
       const result = await callMcp(
@@ -2566,10 +2713,22 @@ describe("handleMcpRequest", () => {
         JSON.stringify({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "get_issue_report_card", arguments: { issue: "AII-1" } } }),
       );
       expect(result.statusCode).toBe(200);
-      expect(getIssueReportCard).toHaveBeenCalledWith("AII-1");
+      expect(getIssueReportCard).toHaveBeenCalledWith("AII-1", []);
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).toBeUndefined();
       expect(JSON.parse(parsed.result.content[0].text)).toEqual({ issue: "AII-1", dispatches: 2, passes: 3, costUsd: 1.5, merged: true });
+    });
+
+    it("get_reviewer_scorecard forwards days and repo for a user", async () => {
+      mockRole("user");
+      const scores = [{ source: "github-review", total: 1, fixed: 1, rejected: 0, deferred: 0, ignored: 0, rejectedRate: 0 }];
+      vi.mocked(getReviewerScorecard).mockReturnValue(scores);
+      const result = await callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 33, method: "tools/call", params: { name: "get_reviewer_scorecard", arguments: { days: 7, repo: "org/repo" } } }),
+      );
+      expect(getReviewerScorecard).toHaveBeenCalledWith({ days: 7, repo: "org/repo" });
+      expect(JSON.parse(JSON.parse(result.body).result.content[0].text)).toEqual(scores);
     });
 
     it("get_fleet_report threads `days` through /mcp and returns the report verbatim", async () => {
@@ -2590,7 +2749,7 @@ describe("handleMcpRequest", () => {
   });
 
   describe("kg_* reads through the tools service (AII-711)", () => {
-    const KG_TOOLS = ["kg_hybrid_search", "kg_search", "kg_semantic_search", "kg_neighbors", "kg_path", "kg_provenance"];
+    const KG_TOOLS = ["kg_hybrid_search", "kg_search", "kg_semantic_search", "kg_neighbors", "kg_path", "kg_provenance", "kg_repo_history"];
 
     it.each(KG_TOOLS)("%s returns the sidecar's result verbatim through /mcp, degraded flag intact", async (name) => {
       const callKgTool = vi.fn(async (): Promise<KgToolResult> => ({ ok: true, result: { degraded: true, tool: name } }));
@@ -2619,6 +2778,107 @@ describe("handleMcpRequest", () => {
       expect(toolsClientMock.callTool).toHaveBeenCalledWith(name, { q: "x" }, expect.objectContaining({ kind: "human" }), undefined);
       expect(mockHttpRequest).not.toHaveBeenCalled();
       setKgMemoryProvider(null);
+    });
+  });
+
+  describe("list_open_pulls through /mcp (AII-1964)", () => {
+    it("stays discoverable for users after failure and routes empty arguments as a read", async () => {
+      mockRole("user");
+      const api = await import("../open-pulls.js");
+      const reader = vi.spyOn(api, "listOpenPulls").mockRejectedValueOnce(new Error("GitHub unavailable"));
+      const request = (method: string, params: Record<string, unknown>) => callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      );
+      const listed = async () => {
+        const response = await request("tools/list", {});
+        expect(JSON.parse(response.body).result.tools.map((t: { name: string }) => t.name)).toContain("list_open_pulls");
+      };
+      await listed();
+      expect(reader).not.toHaveBeenCalled();
+      const failed = JSON.parse((await request("tools/call", { name: "list_open_pulls", arguments: {} })).body).result;
+      expect(failed.isError).toBe(true);
+      expect(failed.content[0].text).toContain("list_open_pulls");
+      await listed();
+      expect(reader).toHaveBeenCalledTimes(1);
+      reader.mockResolvedValue([]);
+      const result = JSON.parse((await request("tools/call", {
+        name: "list_open_pulls", arguments: {}, _meta: { idempotencyKey: "invalid key!" },
+      })).body).result;
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content[0].text)).toEqual([]);
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "list_open_pulls", {}, expect.objectContaining({ role: "user" }), undefined,
+      );
+      expect(RESTATE_WRITE_TOOL_NAMES.has("list_open_pulls")).toBe(false);
+    });
+  });
+
+  describe("list_issue_statuses through /mcp (AII-1966)", () => {
+    it("stays discoverable for users after failure and routes empty arguments as a read", async () => {
+      mockRole("user");
+      const api = await import("../issue-statuses.js");
+      const reader = vi.spyOn(api, "listIssueStatuses").mockRejectedValueOnce(new Error("tracker unavailable"));
+      const request = (method: string, params: Record<string, unknown>) => callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      );
+      const listed = async () => {
+        const response = await request("tools/list", {});
+        expect(JSON.parse(response.body).result.tools.map((t: { name: string }) => t.name)).toContain("list_issue_statuses");
+      };
+      await listed();
+      expect(reader).not.toHaveBeenCalled();
+      const failed = JSON.parse((await request("tools/call", { name: "list_issue_statuses", arguments: {} })).body).result;
+      expect(failed.isError).toBe(true);
+      expect(failed.content[0].text).toContain("list_issue_statuses");
+      await listed();
+      expect(reader).toHaveBeenCalledTimes(1);
+      reader.mockResolvedValue([]);
+      const result = JSON.parse((await request("tools/call", {
+        name: "list_issue_statuses", arguments: {}, _meta: { idempotencyKey: "invalid key!" },
+      })).body).result;
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content[0].text)).toEqual([]);
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "list_issue_statuses", {}, expect.objectContaining({ role: "user" }), undefined,
+      );
+      expect(RESTATE_WRITE_TOOL_NAMES.has("list_issue_statuses")).toBe(false);
+    });
+  });
+
+  describe("list_job_accounting through /mcp (AII-1564)", () => {
+    it("is listed for a user and a call reaches the tools service as a read", async () => {
+      mockRole("user");
+      const list = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const names = JSON.parse(list.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).toContain("list_job_accounting");
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_job_accounting", arguments: { pageSize: 5 } } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.error).toBeUndefined();
+      expect(parsed.result.isError).not.toBe(true);
+      expect(toolsClientMock.callTool).toHaveBeenCalledWith(
+        "list_job_accounting",
+        { pageSize: 5 },
+        expect.objectContaining({ kind: "human", role: "user" }),
+        undefined,
+      );
     });
   });
 
@@ -2785,5 +3045,69 @@ describe("write idempotency key names one request, not one JSON-RPC id (AII-719,
     expect(result.statusCode).toBe(200);
     expect(JSON.parse(result.body).error).toBeUndefined();
     expect(toolsClientMock.callTool).toHaveBeenCalledWith("get_runner_mode", {}, expect.objectContaining({ kind: "human" }), undefined);
+  });
+});
+
+describe("/mcp runner-backend writes (AII-1271)", () => {
+  const callNamed = (name: string, args: Record<string, unknown>) =>
+    callMcp(
+      { authorization: "Bearer tok" },
+      true,
+      null,
+      BASE_URL,
+      "POST",
+      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    );
+  let callToolMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    callToolMock = toolsClientMock.callTool as ReturnType<typeof vi.fn>;
+    mockRole("admin");
+    (refreshRunnerBackendCache as ReturnType<typeof vi.fn>).mockClear();
+  });
+
+  it("set_run_profile reaches the tools service for an admin", async () => {
+    callToolMock.mockResolvedValueOnce({ status: "ok", content: [{ type: "text", text: "{}" }] });
+    const result = await callNamed("set_run_profile", { pipeline: "kg-refresh", backend: "github-actions", patch: {} });
+    expect(JSON.parse(result.body).error).toBeUndefined();
+    expect(callToolMock).toHaveBeenCalledWith("set_run_profile", expect.any(Object), expect.objectContaining({ kind: "human" }), undefined);
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
+  });
+
+  it("set_run_profile is refused for a user role by the tool wrapper", async () => {
+    mockRole("user");
+    const result = await callNamed("set_run_profile", { pipeline: "kg-refresh", backend: "github-actions", patch: {} });
+    expect(JSON.parse(result.body).result.isError).toBe(true);
+  });
+
+  it("set_runner_backend refreshes the cache after callTool resolves and before the response", async () => {
+    const log: string[] = [];
+    callToolMock.mockImplementationOnce(async () => {
+      log.push("callTool");
+      return { status: "ok", content: [{ type: "text", text: "{}" }] };
+    });
+    (refreshRunnerBackendCache as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      log.push("refresh");
+    });
+    const result = await callNamed("set_runner_backend", { backend: "fly-machines", patch: { app: "x" } });
+    log.push("response");
+    expect(result.statusCode).toBe(200);
+    expect(log).toEqual(["callTool", "refresh", "response"]);
+  });
+
+  it.each([
+    ["deploy-held", { status: "deploy-held" }],
+    ["unavailable", { status: "unavailable" }],
+    ["isError", { status: "ok", content: [], isError: true }],
+  ])("set_runner_backend skips the refresh on %s", async (_label, outcome) => {
+    callToolMock.mockResolvedValueOnce(outcome);
+    await callNamed("set_runner_backend", { backend: "fly-machines", patch: {} });
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
+  });
+
+  it("another write does not trigger the refresh", async () => {
+    callToolMock.mockResolvedValueOnce({ status: "ok", content: [{ type: "text", text: "{}" }] });
+    await callNamed("set_runner_mode", { mode: "fly" });
+    expect(refreshRunnerBackendCache).not.toHaveBeenCalled();
   });
 });

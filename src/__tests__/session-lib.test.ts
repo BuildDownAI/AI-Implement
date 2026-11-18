@@ -1,10 +1,10 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { describe, it, expect } from "vitest";
 
 const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { testDir } from "./helpers/test-dir.js";
 
 function runBash(script: string) {
   return spawnSync("bash", ["-lc", script], {
@@ -19,7 +19,7 @@ describe.skipIf(isWindows)("session/lib.sh", () => {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    if (result.error?.code === "ENOENT") return;
+    if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return;
     expect(result.status).toBe(0);
   });
 
@@ -79,6 +79,24 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
   // only inherits exported variables — an unexported assignment is invisible
   // to it even though it is visible to later commands in the same shell.
   const RESET = "unset AI_IMPLEMENT_RUN_CONFIG RUNNER_PHASE RUNNER_CALLBACK_URL";
+
+  it.each([
+    ["legacy", "kg-refresh", "planning", "kg-refresh", "env"],
+    ["legacy", "", "planning", "planning", "envelope"],
+    ["legacy", "", "", "implementation", "default"],
+    ["configured", "kg-refresh", "planning", "review-fix", "env"],
+  ])("resolves %s phase aliases before remapping (alias=%s envelope=%s)", (mode, alias, envelopePhase, phase, source) => {
+    const envelope = encodeEnvelope({ runnerPhase: envelopePhase });
+    const result = runBash(
+      `${RESET}; source session/lib.sh; CONFIGURED=${mode === "configured" ? 1 : 0};
+export AI_IMPLEMENT_TEAM_SECRET_PREFIX=SAN_ SAN_RUNNER_PHASE='${alias}' RUNNER_PHASE=review-fix AI_IMPLEMENT_RUN_CONFIG='${envelope}';
+resolve_runner_phase; remap_team_secrets;
+echo "FINAL=$RUNNER_PHASE:$RUNNER_PHASE_SOURCE"; echo "ALIAS=\${SAN_RUNNER_PHASE-unset}"`,
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`FINAL=${phase}:${source}`);
+    expect(result.stdout).toContain("ALIAS=unset");
+  });
 
   it("env wins over the envelope (dev-harness guard: RUNNER_PHASE=full survives runnerPhase:implementation)", () => {
     const envelope = encodeEnvelope({ runnerPhase: "implementation" });
@@ -164,15 +182,8 @@ describe.skipIf(isWindows)("resolve_envelope_field / select_runner_entry", () =>
 });
 
 describe.skipIf(isWindows)("verify_workspace_writable", () => {
-  const cleanupDirs: string[] = [];
-
-  afterEach(() => {
-    for (const dir of cleanupDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  });
-
   function makeEnv(): { binDir: string; workspace: string } {
-    const root = mkdtempSync(join(tmpdir(), "lib-ws-test-"));
-    cleanupDirs.push(root);
+    const root = testDir("lib-ws");
     const binDir = join(root, "bin");
     const workspace = join(root, "workspace");
     mkdirSync(binDir);
@@ -251,12 +262,10 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
     // cannot contain /), so we reference it via $PROBE_SENTINEL and pass the real
     // path as an env var.  If the trap were to eval the probe path, it would run
     // `touch $PROBE_SENTINEL` and create the sentinel file.
-    const sentinelRoot = mkdtempSync(join(tmpdir(), "sentinel-test-"));
-    cleanupDirs.push(sentinelRoot);
+    const sentinelRoot = testDir("sentinel");
     const sentinel = join(sentinelRoot, "PWNED");
 
-    const wsRoot = mkdtempSync(join(tmpdir(), "hostile-ws-"));
-    cleanupDirs.push(wsRoot);
+    const wsRoot = testDir("hostile-ws");
     // $, (, ), and space are valid filename characters on Linux.
     const hostileWs = join(wsRoot, "ws-$(touch $PROBE_SENTINEL)");
     mkdirSync(hostileWs);
@@ -279,12 +288,10 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
   });
 
   it("does not execute backtick syntax embedded in the workspace path during cleanup", () => {
-    const sentinelRoot = mkdtempSync(join(tmpdir(), "sentinel-test-"));
-    cleanupDirs.push(sentinelRoot);
+    const sentinelRoot = testDir("sentinel");
     const sentinel = join(sentinelRoot, "PWNED");
 
-    const wsRoot = mkdtempSync(join(tmpdir(), "hostile-ws-"));
-    cleanupDirs.push(wsRoot);
+    const wsRoot = testDir("hostile-ws");
     // Backtick is a valid filename character on Linux.
     const hostileWs = join(wsRoot, "ws-`touch $PROBE_SENTINEL`");
     mkdirSync(hostileWs);
@@ -304,5 +311,289 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
     expect(probes).toHaveLength(0);
     // Command embedded in the path must not have executed
     expect(existsSync(sentinel)).toBe(false);
+  });
+});
+
+describe.skipIf(isWindows)("local auth bootstrap ownership handoff", () => {
+  function makeEnv(): { root: string; binDir: string; bootstrapDir: string; bootstrapFile: string; log: string } {
+    const root = testDir("bootstrap-owner-test");
+    const binDir = join(root, "bin");
+    const bootstrapDir = join(root, "ai-implement-local-auth-abc");
+    const bootstrapFile = join(bootstrapDir, "bootstrap.json");
+    const log = join(root, "commands.log");
+    mkdirSync(binDir);
+    mkdirSync(bootstrapDir, 0o700);
+    writeFileSync(bootstrapFile, "{}");
+    chmodSync(bootstrapDir, 0o700);
+    chmodSync(bootstrapFile, 0o600);
+    return { root, binDir, bootstrapDir, bootstrapFile, log };
+  }
+
+  function writeShim(binDir: string, name: string, body: string): void {
+    const p = join(binDir, name);
+    writeFileSync(p, `#!/usr/bin/env bash\n${body}\n`);
+    chmodSync(p, 0o755);
+  }
+
+  function runWithBootstrap(script: string, env: { binDir: string; bootstrapFile: string; log: string }) {
+    writeShim(env.binDir, "id", `if [ "\${1:-}" = "-gn" ]; then echo codergroup; else /usr/bin/id "$@"; fi`);
+    writeShim(env.binDir, "stat", `target="\${@: -1}"
+if [ "$target" = '${env.bootstrapFile}' ]; then echo 600; else echo 700; fi`);
+    writeShim(env.binDir, "chown", `{ printf 'chown'; printf ' <%s>' "$@"; printf '\\n'; } >> '${env.log}'`);
+    writeShim(env.binDir, "chmod", `{ printf 'chmod'; printf ' <%s>' "$@"; printf '\\n'; } >> '${env.log}'`);
+    return spawnSync("bash", ["-c", `export PATH="${env.binDir}:$PATH"; source session/lib.sh; ${script}`], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: env.bootstrapFile,
+        AI_IMPLEMENT_MODE: "local",
+      },
+    });
+  }
+
+  it("chowns only the validated bootstrap temp directory and file", () => {
+    const env = makeEnv();
+    const workspace = join(env.root, "workspace");
+    mkdirSync(workspace);
+
+    const result = runWithBootstrap("prepare_local_auth_bootstrap_owner", env);
+
+    expect(result.status, result.stderr).toBe(0);
+    const log = readFileSync(env.log, "utf-8");
+    expect(log).toContain(`chown <coder:codergroup> <--> <${env.bootstrapDir}> <${env.bootstrapFile}>`);
+    expect(log).toContain(`chmod <700> <--> <${env.bootstrapDir}>`);
+    expect(log).toContain(`chmod <600> <--> <${env.bootstrapFile}>`);
+    expect(log).not.toContain(workspace);
+  });
+
+  it("rejects bootstrap symlinks before ownership handoff", () => {
+    const env = makeEnv();
+    rmSync(env.bootstrapFile);
+    symlinkSync("/tmp/not-the-bootstrap", env.bootstrapFile);
+
+    const result = runWithBootstrap("prepare_local_auth_bootstrap_owner", env);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Local auth bootstrap file must not be a symlink");
+    expect(existsSync(env.log)).toBe(false);
+  });
+
+  it("requires an absolute bootstrap pointer for local handoff", () => {
+    const env = makeEnv();
+    const result = spawnSync("bash", ["-c", `export PATH="${env.binDir}:$PATH"; source session/lib.sh; prepare_local_auth_bootstrap_owner`], {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: "relative/bootstrap.json",
+        AI_IMPLEMENT_MODE: "local",
+      },
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Local auth bootstrap path must be absolute");
+  });
+});
+
+describe.skipIf(isWindows)("session/lib.sh configured-run helpers (AII-951)", () => {
+  const run = (script: string, env: Record<string, string> = {}) =>
+    spawnSync("bash", ["-c", `source session/lib.sh\n${script}`], {
+      encoding: "utf-8",
+      env: { PATH: process.env.PATH ?? "", ...env },
+    });
+
+  it("run_scoped passes the environment through unchanged for legacy runs", () => {
+    const r = run('run_scoped "" bash -c \'echo "$OPENAI_API_KEY"\'', { OPENAI_API_KEY: "legacy-value" });
+    expect(r.stdout.trim()).toBe("legacy-value");
+  });
+
+  it("run_scoped hands configured children only minimal context plus named extras", () => {
+    const r = run('CONFIGURED=1; run_scoped "GH_TOKEN" env', {
+      HOME: "/h", GH_TOKEN: "gh", GITHUB_TOKEN: "ghp", OPENAI_API_KEY: "o", CODEX_HOME: "/c",
+      AI_IMPLEMENT_RUN_CONFIG: "enc", AI_IMPLEMENT_MODEL_AUTH_BEARER: "b", FWD: "f", AI_IMPLEMENT_FORWARDED_SECRETS: "FWD",
+    });
+    expect(r.status, r.stderr).toBe(0);
+    const names = r.stdout.trim().split("\n").map((l) => l.split("=")[0]).filter((n) => !["_", "PWD", "SHLVL", "OLDPWD", "SHELL", "TERM"].includes(n));
+    expect(names.sort()).toEqual(["GH_TOKEN", "HOME", "PATH"]);
+  });
+
+  it("run_scoped preserves the child's exit status", () => {
+    expect(run('CONFIGURED=1; run_scoped "" false').status).not.toBe(0);
+    expect(run('run_scoped "" false').status).not.toBe(0);
+  });
+
+  it("on_err includes the command for legacy and omits it for configured runs", () => {
+    expect(run('on_err 1 9 "git clone https://x:SECRET@h"').stdout).toContain("git clone");
+    const r = run('CONFIGURED=1; on_err 1 9 "git clone https://x:SECRET@h"');
+    expect(r.stdout).toContain("line 9 failed (exit 1)");
+    expect(r.stdout).not.toContain("SECRET");
+  });
+
+  describe("scoped git credential helper", () => {
+    const fill = (env: Record<string, string>) =>
+      run('git -c credential.helper= -c "credential.helper=$SCOPED_GIT_HELPER" credential fill <<< $\'protocol=https\\nhost=github.com\\n\\n\'', { HOME: "/tmp", GIT_TERMINAL_PROMPT: "0", ...env });
+
+    it("answers from the operation-scoped GIT_PASSWORD only", () => {
+      const withToken = fill({ GIT_PASSWORD: "SYNTHETIC-token" });
+      expect(withToken.status, withToken.stderr).toBe(0);
+      expect(withToken.stdout).toContain("username=x-access-token");
+      expect(withToken.stdout).toContain("password=SYNTHETIC-token");
+      const without = fill({});
+      expect(without.status).not.toBe(0);
+      expect(without.stdout).not.toContain("password=");
+    });
+
+    it("git_authed puts the token only in the git child's environment, never in argv", () => {
+      const dir = testDir("git-authed");
+      const log = join(dir, "log");
+      writeFileSync(join(dir, "git"), `#!/bin/sh\n{ echo "argv: $*"; env; } > '${log}'\n`);
+      chmodSync(join(dir, "git"), 0o755);
+      const r = run('CONFIGURED=1; git_authed clone https://github.com/o/r.git /w', {
+        PATH: `${dir}:${process.env.PATH}`, HOME: "/h", GITHUB_TOKEN: "SYNTHETIC-token", OPENAI_API_KEY: "SENTINEL-openai",
+      });
+      expect(r.status, r.stderr).toBe(0);
+      const seen = readFileSync(log, "utf-8");
+      expect(seen).toContain("argv: clone https://github.com/o/r.git /w");
+      expect(seen.split("\n")[0]).not.toContain("SYNTHETIC-token");
+      expect(seen).toContain("GIT_PASSWORD=SYNTHETIC-token");
+      expect(seen).not.toContain("GITHUB_TOKEN");
+      expect(seen).not.toContain("SENTINEL-openai");
+    });
+  });
+
+  describe("remap_team_secrets reservation", () => {
+    const MODEL_NAMES = [
+      "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+      "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AI_IMPLEMENT_MODEL_AUTH_BEARER", "AI_IMPLEMENT_RUN_CONFIG",
+    ];
+    const secrets = (): Record<string, string> => ({
+      AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+      SAN_DB_URL: "safe-value",
+      ...Object.fromEntries(MODEL_NAMES.map((n) => [`SAN_${n}`, `SENTINEL-${n}`])),
+    });
+    const probe = (configured: boolean) =>
+      run(
+        `${configured ? "CONFIGURED=1\n" : ""}remap_team_secrets\n` +
+          `echo "FORWARDED=$AI_IMPLEMENT_FORWARDED_SECRETS"\n` +
+          MODEL_NAMES.map((n) => `echo "${n}=\${${n}:-UNSET}"`).join("\n"),
+        secrets(),
+      );
+
+    it("configured runs reject every model, session and provider-routing alias but forward a normal secret", () => {
+      const r = probe(true);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toContain("FORWARDED=DB_URL\n");
+      for (const n of MODEL_NAMES) expect(r.stdout).toContain(`${n}=UNSET`);
+      expect(r.stdout).not.toContain("SENTINEL-");
+    });
+
+    it("legacy runs keep the narrower reserved list: non-reserved model-looking names still forward", () => {
+      const r = probe(false);
+      expect(r.stdout).toContain("OPENAI_API_KEY=SENTINEL-OPENAI_API_KEY");
+      expect(r.stdout).toContain("CLAUDE_CONFIG_DIR=SENTINEL-CLAUDE_CONFIG_DIR");
+      // AI_IMPLEMENT_* stays reserved in every mode.
+      expect(r.stdout).toContain("AI_IMPLEMENT_MODEL_AUTH_BEARER=UNSET");
+      expect(r.stdout).toContain("AI_IMPLEMENT_RUN_CONFIG=UNSET");
+    });
+
+    it("configured runs reserve NODE_OPTIONS/NODE_PATH aliases; legacy runs keep forwarding them", () => {
+      const env = {
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        SAN_NODE_OPTIONS: "--require=/sentinel/preload.cjs",
+        SAN_NODE_PATH: "/sentinel/modules",
+        SAN_DB_URL: "safe-value",
+      };
+      const script = (c: boolean) =>
+        `${c ? "CONFIGURED=1\n" : ""}remap_team_secrets\necho "F=$AI_IMPLEMENT_FORWARDED_SECRETS"\necho "NO=\${NODE_OPTIONS:-UNSET}"\necho "NP=\${NODE_PATH:-UNSET}"\necho "DB=$DB_URL"`;
+      const configured = run(script(true), env);
+      expect(configured.stdout).toContain("F=DB_URL\n");
+      expect(configured.stdout).toContain("NO=UNSET");
+      expect(configured.stdout).toContain("NP=UNSET");
+      expect(configured.stdout).toContain("DB=safe-value");
+      const legacy = run(script(false), env);
+      expect(legacy.stdout).toContain("NO=--require=/sentinel/preload.cjs");
+      expect(legacy.stdout).toContain("NP=/sentinel/modules");
+    });
+  });
+
+  describe("node decoders never start with ambient preload controls", () => {
+    const withFixture = (fn: (fx: { dist: string; preload: string; marker: string }) => void) => {
+      const dir = testDir("session-node");
+      const dist = join(dir, "dist");
+      mkdirSync(dist);
+      const marker = join(dir, "marker");
+      const preload = join(dir, "preload.cjs");
+      writeFileSync(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(Boolean(process.env.AI_IMPLEMENT_RUN_CONFIG)));\n`);
+      // Stand-in trusted decoder: this suite probes launch hygiene, not decoding.
+      writeFileSync(join(dist, "run-config.js"),
+        'export function decodeTrustedRunConfig(e){ if (e === "BAD") throw new Error("bad"); return { agentConfig: {}, credentials: { modelAuthGrant: {} } }; }\n');
+      fn({ dist, preload, marker });
+    };
+    const run = (script: string, env: Record<string, string>) =>
+      spawnSync("bash", ["-c", `source session/lib.sh\n${script}`], { encoding: "utf-8", env: { PATH: process.env.PATH ?? "", ...env } });
+
+    it("control: the preload does execute when node is launched bare", () => {
+      withFixture(({ preload, marker }) => {
+        spawnSync("node", ["-e", ""], { env: { PATH: process.env.PATH ?? "", NODE_OPTIONS: `--require=${preload}`, AI_IMPLEMENT_RUN_CONFIG: "X" } });
+        expect(existsSync(marker)).toBe(true);
+      });
+    });
+
+    it.each([["valid configured", "OK", "configured"], ["malformed", "BAD", "invalid"]])(
+      "classify_run_config (%s) runs no NODE_OPTIONS preload and ignores NODE_PATH",
+      (_n, envelope, expected) => {
+        withFixture(({ dist, preload, marker }) => {
+          const r = run("classify_run_config", {
+            AI_IMPLEMENT_DIST_DIR: dist, AI_IMPLEMENT_RUN_CONFIG: envelope,
+            NODE_OPTIONS: `--require=${preload}`, NODE_PATH: "/sentinel/modules",
+          });
+          expect(r.stdout.trim()).toBe(expected);
+          expect(existsSync(marker)).toBe(false);
+        });
+      },
+    );
+
+    it("resolve_envelope_field runs no NODE_OPTIONS preload", () => {
+      withFixture(({ preload, marker }) => {
+        const envelope = Buffer.from(JSON.stringify({ v: 1, runnerPhase: "planning" })).toString("base64");
+        const r = run("resolve_envelope_field RUNNER_PHASE runnerPhase\necho \"P=$RUNNER_PHASE\"", {
+          AI_IMPLEMENT_RUN_CONFIG: envelope, NODE_OPTIONS: `--require=${preload}`,
+        });
+        expect(r.stdout).toContain("P=planning");
+        expect(existsSync(marker)).toBe(false);
+      });
+    });
+  });
+});
+
+describe.skipIf(isWindows)("local configured bootstrap classification", () => {
+  const classify = (envelope: string | undefined, pointer: string | undefined, grant = false) => {
+    const dir = testDir("local-classify");
+    mkdirSync(join(dir, "local"));
+    writeFileSync(join(dir, "run-config.js"), `export function decodeTrustedRunConfig(e) { if(e === "bad") throw Error(); return {agentConfig:e === "snapshot" ? {} : undefined, credentials:${grant ? '{modelAuthGrant:{}}' : '{}'}}; }`);
+    writeFileSync(join(dir, "local/session.js"), 'export function validateLocalSessionBootstrap(p) { if (p !== "/private/valid") throw Error("private error"); }');
+    return spawnSync("bash", ["-c", "source session/lib.sh; classify_run_config"], {
+      encoding: "utf-8",
+      env: { PATH: process.env.PATH ?? "", AI_IMPLEMENT_DIST_DIR: dir,
+        ...(envelope ? { AI_IMPLEMENT_RUN_CONFIG: envelope } : {}),
+        ...(pointer ? { AI_IMPLEMENT_LOCAL_AUTH_BOOTSTRAP_FILE: pointer } : {}) },
+    });
+  };
+
+  it("accepts snapshot plus validated local bootstrap without a hosted grant", () => {
+    expect(classify("snapshot", "/private/valid").stdout).toBe("configured");
+  });
+  it.each([[undefined, "/private/valid"], ["legacy", "/private/valid"], ["snapshot", "/private/invalid"], ["bad", "/private/valid"], ["snapshot", undefined]])(
+    "fails closed for incomplete or invalid local intent (%s, %s)", (envelope, pointer) => {
+      const result = classify(envelope, pointer);
+      expect(result.stdout.trim()).toBe("invalid");
+      expect(result.stderr).not.toContain("private error");
+    },
+  );
+  it("rejects mixing local bootstrap with a hosted grant", () => {
+    expect(classify("snapshot", "/private/valid", true).stdout).toBe("invalid");
+  });
+  it("preserves the envelope-free legacy path", () => {
+    expect(classify(undefined, undefined).stdout.trim()).toBe("legacy");
   });
 });

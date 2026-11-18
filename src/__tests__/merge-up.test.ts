@@ -1,13 +1,33 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { findLinkByPr, deleteLinksForMapping } from "../pr-links.js";
+import { getDb } from "../dedup.js";
+import { describe, it, expect, vi, beforeEach, onTestFinished } from "vitest";
 import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
+import { LinearProvider } from "../providers/linear.js";
+import { JiraProvider } from "../providers/jira.js";
+import { JiraClient } from "../providers/jira-client.js";
+import { configureLinearAuth, clearLinearTokenCache, __resetLinearAuthForTest, __setLinearTokenForTest } from "../linear-app-auth.js";
+import { makeMapping } from "./helpers/builders.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
+import { linearData, linearGraphql } from "./helpers/replies/linear.js";
 
 vi.mock("../dedup.js", async () => {
   const Database = (await import("better-sqlite3")).default;
   const db = new Database(":memory:");
   return { getDb: () => db };
 });
+const reviewHeads = vi.hoisted(() => new Set<string>());
+vi.mock("../comment-gapfill-queue.js", () => ({
+  enqueueRollupReview: vi.fn((input) => {
+    const key = JSON.stringify(input);
+    if (reviewHeads.has(key)) return false;
+    reviewHeads.add(key);
+    return true;
+  }),
+}));
+import { enqueueRollupReview } from "../comment-gapfill-queue.js";
+
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "tok"),
 }));
@@ -19,22 +39,14 @@ vi.mock("../github.js", () => ({
   createPullRequest: vi.fn(async () => ({ number: 7, url: "https://gh/pr/7" })),
   mergeBranch: vi.fn(async () => "merged"),
   deleteBranch: vi.fn(async () => true),
+  getPullRequestState: vi.fn(),
+  defaultFetchSignal: () => new AbortController().signal,
 }));
 
-import { compareBranches, createPullRequest, mergeBranch, findOpenPullRequest, findPullRequestByBranches, getBranchSha, deleteBranch } from "../github.js";
+import { getPullRequestState, compareBranches, createPullRequest, mergeBranch, findOpenPullRequest, findPullRequestByBranches, getBranchSha, deleteBranch } from "../github.js";
 
-function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
-  return {
-    owner: "jodwyer", repo: "alpacaWheel", workflowFile: "claude-implement.yml",
-    defaultBranch: "testing", maxInProgressAiIssues: 3, executionMode: "github-actions",
-    sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
-    planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
-    ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
-    autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
-    branchPrefix: null, skillsRepo: null,
-    ...overrides,
-  };
-}
+const mapping = (overrides: Partial<RepoMapping> = {}) =>
+  makeMapping({ owner: "jodwyer", repo: "alpacaWheel", defaultBranch: "testing", ...overrides });
 
 const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn(async () => {})) => ({
   githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve, finalizeMerged,
@@ -47,7 +59,10 @@ const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  reviewHeads.clear();
   resetRollUpHandledMarkers();
+  deleteLinksForMapping("OOL");
+  getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:%");
   resetClosedVetoLogGuard();
   vi.mocked(findOpenPullRequest).mockResolvedValue(null);
   vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
@@ -71,6 +86,7 @@ describe("runMergeUps", () => {
     // The roll-up commit message must NOT contain an issue identifier (Linear would link it).
     const commitMsg = vi.mocked(mergeBranch).mock.calls[0][5];
     expect(commitMsg).not.toMatch(/OOL-\d+/i);
+    expect(enqueueRollupReview).not.toHaveBeenCalled();
     // Internal roll-up never opens a PR and never calls top-of-tree helpers.
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(findPullRequestByBranches)).not.toHaveBeenCalled();
@@ -93,6 +109,7 @@ describe("runMergeUps", () => {
   it("opens a human PR (no direct merge) for the top-level feature→base roll-up", async () => {
     vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
     vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(getBranchSha).mockResolvedValue("new-head");
     await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping()));
 
     expect(vi.mocked(createPullRequest)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", expect.objectContaining({
@@ -100,9 +117,38 @@ describe("runMergeUps", () => {
       base: "testing",
     }));
     expect(vi.mocked(mergeBranch)).not.toHaveBeenCalled();
+    expect(enqueueRollupReview).toHaveBeenCalledExactlyOnceWith({ owner: "jodwyer", repo: "alpacaWheel", prNumber: 7, headSha: "new-head" });
     // PR title/body carry no issue identifier.
     const arg = vi.mocked(createPullRequest).mock.calls[0][3];
     expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
+  });
+
+  it("stores the roll-up link before a subsequent GitHub failure", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(getBranchSha).mockRejectedValueOnce(new Error("GitHub unavailable"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+      expect(findLinkByPr("jodwyer/alpacaWheel", 7)).toMatchObject({
+        role: "roll-up", source: "result", outcome: "open",
+        headRef: "ai-implement/feature/ool-107", baseRef: "testing",
+        issue: { trackerKind: "linear", mappingKey: "OOL",
+          trackerIssueId: "issue-uuid-1", identifier: "OOL-107" },
+      });
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("recovers a missing creation head on the next open poll", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(enqueueRollupReview).not.toHaveBeenCalled();
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 7, url: "https://gh/pr/7", state: "open", merged: false, headSha: "recovered",
+    });
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(enqueueRollupReview).toHaveBeenCalledTimes(1);
   });
 
   it("lists the grouped issues in the top-of-tree PR body", async () => {
@@ -160,6 +206,20 @@ describe("runMergeUps", () => {
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
     expect(finalizeMerged).not.toHaveBeenCalled();
+    expect(compareBranches).not.toHaveBeenCalled();
+    expect(mergeBranch).not.toHaveBeenCalled();
+    expect(getBranchSha).not.toHaveBeenCalled();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    onTestFinished(() => logSpy.mockRestore());
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(reviewHeads.size).toBe(1);
+    expect(logSpy).not.toHaveBeenCalled();
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 42, url: "https://gh/pr/42", state: "open", merged: false, headSha: "changed-head",
+    });
+    await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+    expect(reviewHeads.size).toBe(2);
+    expect(logSpy).toHaveBeenCalledTimes(1);
   });
 
   it("detects a merged top-of-tree PR, deletes the branch, and finalizes the issue (tip == pr.head.sha)", async () => {
@@ -178,6 +238,7 @@ describe("runMergeUps", () => {
     expect(finalizeMerged).toHaveBeenCalledWith("uuid-parent", "OOL");
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(getBranchSha)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
+    expect(enqueueRollupReview).not.toHaveBeenCalled();
     // SHA equality alone is sufficient — no need to fall back to the ancestry check.
     expect(vi.mocked(compareBranches)).not.toHaveBeenCalled();
   });
@@ -208,6 +269,7 @@ describe("runMergeUps", () => {
       const arg = vi.mocked(createPullRequest).mock.calls[0][3];
       expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
 
+      expect(enqueueRollupReview).toHaveBeenCalledExactlyOnceWith({ owner: "jodwyer", repo: "alpacaWheel", prNumber: 7, headSha: "sha-late-commit" });
       const lines = logSpy.mock.calls.map((c) => String(c[0]));
       expect(lines.some((l) => l.includes("commits ahead of its merged roll-up"))).toBe(true);
       expect(isRollUpHandled("jodwyer", "alpacaWheel", "ai-implement/feature/ool-106")).toBe(false);
@@ -293,6 +355,7 @@ describe("runMergeUps", () => {
       }
       const vetoLines = logSpy.mock.calls.filter((c) => String(c[0]).includes("closed without merging"));
       expect(vetoLines).toHaveLength(1);
+      expect(enqueueRollupReview).not.toHaveBeenCalled();
       // the veto is still respected on every cycle — no PR ever re-opened
       expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     } finally {
@@ -397,5 +460,133 @@ describe("clearRollUpHandledMarkersByIdentifier (AII-349 reopen re-arm)", () => 
 
     expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(false);
     expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-79")).toBe(true);
+  });
+});
+
+// AII-1294: the merge poll marks a grouping parent Done without checking its children, so
+// the roll-up gates must keep re-checking designated children live.
+describe("fetchFeatureNodeRollUps — Done parent with a non-terminal designated child", () => {
+  it("Linear returns no roll-up", async () => {
+    configureLinearAuth("client-id", "client-secret");
+    __setLinearTokenForTest("test-token");
+    onTestFinished(() => { __resetLinearAuthForTest(); clearLinearTokenCache(); });
+    const labels = { nodes: [{ name: "AI-Implement" }] };
+    linearGraphql(linearData({ issues: { nodes: [
+      { identifier: "AII-1", team: { key: "AII" }, parent: null, children: { nodes: [
+        { identifier: "AII-2", state: { type: "completed" }, labels },
+        { identifier: "AII-3", state: { type: "started" }, labels },
+      ] } },
+    ] } })).install();
+    expect(await new LinearProvider({}).fetchFeatureNodeRollUps()).toEqual([]);
+  });
+
+  it("Jira returns no roll-up", async () => {
+    const issue = (n: number, status: string, parentKey: string | null) => ({
+      id: String(10000 + n), key: `OOL-${n}`,
+      fields: {
+        parent: parentKey ? { key: parentKey } : null,
+        customfield_10100: { value: status },
+        customfield_10101: { value: "acme/x" },
+      },
+    });
+    const routes: Array<{ when: RegExp; issues: unknown[] }> = [
+      { when: /statusCategory = Done/, issues: [issue(1, "Merged", null)] },
+      { when: /parent in/, issues: [issue(2, "Merged", "OOL-1"), issue(3, "Implementing", "OOL-1")] },
+    ];
+    // Jira's JQL search, answered by the JQL each request carries; a search no route names fails the test.
+    fakeFetch({
+      "POST /ex/jira/c/rest/api/3/search/jql": (call) => {
+        const { jql } = JSON.parse(call.body) as { jql: string };
+        const route = routes.find((r) => r.when.test(jql));
+        if (!route) throw new Error(`no route for ${jql}`);
+        return { json: { issues: route.issues, isLast: true } };
+      },
+    }).install();
+    const provider = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c" }), cacheScope: "c", siteUrl: "https://x",
+      getMappings: () => ({
+        m1: makeMapping({
+          owner: "acme",
+          repo: "x",
+          ticketingProvider: "jira",
+          ticketingConfig: {
+            kind: "jira", jql: "project = OOL", repoFieldValue: "acme/x",
+            statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101",
+            profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300",
+          },
+        }),
+      }),
+    });
+    expect(await provider.fetchFeatureNodeRollUps()).toEqual([]);
+  });
+});
+
+describe("roll-up review child cleanup", () => {
+  it.each([true, false])("parks active children of a closed roll-up (merged=%s), even with a handled parent", async merged => {
+    const { reconcileRollupReviewChildren } = await import("../merge-up.js");
+    const { FakeProvider } = await import("./providers/fake.js");
+    const { makeIssue } = await import("./helpers/builders.js");
+    const provider = new FakeProvider({ recordCalls: true, initialIssues: [makeIssue({ id: "child", identifier: "OOL-108" })] });
+    const child: import("../providers/types.js").TrackerIssueRecord = {
+      id: "child", identifier: "OOL-108", title: `[roll-up-review] jodwyer/alpacaWheel#7 ${"a".repeat(40)} Fix blockers`,
+      description: "body", parent: { identifier: "OOL-106" }, state: { name: "Ready", type: "unstarted" },
+      labels: { nodes: [] }, project: null, comments: { nodes: [] }, relations: { nodes: [] },
+    };
+    Object.assign(provider, { listIssuesPage: vi.fn(async () => ({ issues: [child], pageInfo: { hasNextPage: false, endCursor: null } })) });
+    const comment = vi.spyOn(provider, "postComment").mockImplementation(async (_id, body) => {
+      child.comments.nodes.push({ body, user: null, createdAt: "now" });
+    });
+    vi.mocked(getPullRequestState).mockResolvedValue({ merged, state: "closed", headRef: null, headSha: null });
+    markRollUpHandled("jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
+    // No roll-up candidates: the parent can be excluded because this child is active.
+    await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
+    await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
+    expect(provider.recordedCalls().filter(c => c.method === "parkForHuman")).toHaveLength(1);
+    expect((provider as import("../providers/types.js").TicketingProvider).listIssuesPage).toHaveBeenCalledWith(mapping(), null, { titlePrefix: "[roll-up-review]" });
+    expect(comment).toHaveBeenCalledOnce();
+    expect(comment.mock.calls[0][1]).toContain("tree merged first");
+    expect(comment.mock.calls[0][1]).toContain("base branch `testing`");
+    provider.setLifecycle("child", "completed");
+    await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
+    expect(comment).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])("parks an active child beyond Linear's 250-result limit (merged=%s)", async merged => {
+    const { reconcileRollupReviewChildren } = await import("../merge-up.js");
+    const { FakeProvider } = await import("./providers/fake.js");
+    const children: import("../providers/types.js").TrackerIssueRecord[] = Array.from({ length: 251 }, (_, index) => ({
+      id: `child-${index}`, identifier: `OOL-${index + 200}`,
+      title: `[roll-up-review] jodwyer/alpacaWheel#7 ${"a".repeat(40)} Fix blockers`,
+      description: "body", parent: { identifier: "OOL-106" },
+      state: index < 250 ? { name: "Done", type: "completed" } : { name: "Ready", type: "unstarted" },
+      labels: { nodes: [] }, project: null, comments: { nodes: [] }, relations: { nodes: [] },
+    }));
+    const provider = new FakeProvider();
+    Object.assign(provider, { listIssuesPage: vi.fn(async () => ({
+      issues: children, pageInfo: { hasNextPage: false, endCursor: null },
+    })) });
+    // Model Linear's unpaginated first: 250 response, including historical terminal children.
+    const lifecycle = vi.spyOn(provider, "fetchLifecycleStates").mockImplementation(async ids =>
+      new Map(ids.slice(0, 250).map(id => [id, id === "child-250" ? "active" : "completed"] as const)));
+    const park = vi.spyOn(provider, "parkForHuman").mockResolvedValue(true);
+    const comment = vi.spyOn(provider, "postComment").mockResolvedValue(undefined);
+    vi.mocked(getPullRequestState).mockResolvedValue({ merged, state: "closed", headRef: null, headSha: null });
+
+    await reconcileRollupReviewChildren(provider, mapping(), "OOL", deps(() => mapping()));
+
+    expect(park).toHaveBeenCalledExactlyOnceWith("child-250", "OOL", "implementation");
+    expect(comment).toHaveBeenCalledExactlyOnceWith("child-250", expect.stringContaining("base branch `testing`"));
+    expect(lifecycle.mock.calls.map(([ids]) => ids.length)).toEqual([250, 1]);
+  });
+
+  it("pages to completion and refuses partial tracker reads", async () => {
+    const { listRollupReviewChildren } = await import("../merge-up.js");
+    const { FakeProvider } = await import("./providers/fake.js");
+    const provider = new FakeProvider();
+    const listing = vi.fn().mockResolvedValueOnce({ issues: [], pageInfo: { hasNextPage: true, endCursor: "next" } })
+      .mockRejectedValueOnce(new Error("page two unavailable"));
+    Object.assign(provider, { listIssuesPage: listing });
+    await expect(listRollupReviewChildren(provider, mapping())).rejects.toThrow("page two unavailable");
+    expect(listing.mock.calls.map(c => c[1])).toEqual([null, "next"]);
   });
 });

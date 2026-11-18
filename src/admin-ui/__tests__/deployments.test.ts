@@ -1,3 +1,4 @@
+import { JSDOM } from "jsdom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deploymentsHtml, deploymentsScript } from "../pages/deployments.js";
 
@@ -157,9 +158,9 @@ describe("deployments page", () => {
     for (const gone of ["Deployed OK", "Not serving", "Build failed"]) {
       expect(deploymentsScript).not.toContain(gone);
     }
-    // One write per outcome state: the empty state plus the three kinds.
+    // One write per outcome state: the empty state plus the four badge treatments.
     const outcomeWrites = deploymentsScript.match(/setBadge\(outcomeBadge,/g) ?? [];
-    expect(outcomeWrites).toHaveLength(4);
+    expect(outcomeWrites).toHaveLength(5);
   });
 
   it("keeps the commit links at value size rather than using .mono", () => {
@@ -515,157 +516,6 @@ describe("deployments page", () => {
   });
 });
 
-describe("kg refresh card", () => {
-  it("declares the kg-refresh element ids", () => {
-    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-refresh-btn", "kg-sidecar-status"]) {
-      expect(deploymentsHtml).toContain(`id="${id}"`);
-    }
-  });
-
-  it("renders the sidecar liveness state beside the stage badge and hides it before the first probe (AII-650)", () => {
-    // The element ships hidden; the script shows the warning with the probe's lastError when the
-    // sidecar is unavailable, a one-line "reachable" when a probe has run, and hides it otherwise.
-    expect(deploymentsHtml).toContain('id="kg-sidecar-status" hidden');
-    expect(deploymentsScript).toContain("const sidecarEl = document.getElementById('kg-sidecar-status')");
-    expect(deploymentsScript).toContain("if (data.kgUnavailable) {");
-    expect(deploymentsScript).toContain("'⚠️ KG sidecar not serving — ' + ((data.sidecar && data.sidecar.lastError) || 'unknown error')");
-    expect(deploymentsScript).toContain("} else if (data.sidecar && data.sidecar.checkedAt) {");
-    expect(deploymentsScript).toContain("sidecarEl.textContent = 'KG sidecar: reachable'");
-    expect(deploymentsScript).toContain("sidecarEl.hidden = true");
-  });
-
-  it("calls /api/kg/status for status", () => {
-    expect(deploymentsScript).toContain("/api/kg/status");
-  });
-
-  it("exposes triggerKgRefresh", () => {
-    expect(deploymentsScript).toContain("window.triggerKgRefresh");
-  });
-
-  it("declares the dry-run element ids (AII-635)", () => {
-    for (const id of ["kg-dry-run-btn", "kg-dry-run-last"]) {
-      expect(deploymentsHtml).toContain(`id="${id}"`);
-    }
-    expect(deploymentsHtml).toContain('onclick="window.triggerKgRefresh(true)"');
-  });
-
-  it("posts { dryRun: true } for the dry-run trigger and renders the part table (AII-635)", () => {
-    expect(deploymentsScript).toContain("window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })");
-    expect(deploymentsScript).toContain("function renderKgDryRun(");
-    expect(deploymentsScript).toContain("['part', 'previous', 'new', 'delta']");
-    expect(deploymentsScript).toContain("document.getElementById('kg-dry-run-btn').disabled = busy");
-  });
-
-  it("declares the accept-baseline button and gates it behind confirm() (AII-628)", () => {
-    expect(deploymentsHtml).toContain('id="kg-accept-baseline-btn"');
-    expect(deploymentsHtml).toContain('onclick="window.triggerKgAcceptBaseline()"');
-    expect(deploymentsScript).toContain("window.triggerKgAcceptBaseline = ");
-    expect(deploymentsScript).toContain("if (!confirm(");
-    expect(deploymentsScript).toContain("JSON.stringify({ acceptNewBaseline: true })");
-    expect(deploymentsScript).toContain("document.getElementById('kg-accept-baseline-btn').disabled = busy");
-    // All three buttons share one refusal-to-message mapping and disable each other while a request is in flight.
-    expect(deploymentsScript).toContain("function showKgRefreshRefusal(res, body)");
-    expect((deploymentsScript.match(/showKgRefreshRefusal\(res, await/g) || []).length).toBe(2);
-  });
-
-  it("posts to /api/kg/refresh for the refresh trigger", () => {
-    expect(deploymentsScript).toContain("window.api('/api/kg/refresh', { method: 'POST' })");
-  });
-
-  it("maps every stage to a badge via setBadge", () => {
-    // Each new stage must pass through setBadge — a textContent write drops the dot span.
-    for (const [kind, label] of [
-      ["running", "checking"],
-      ["running", "running"],   // ingest-running
-      ["running", "landing"],   // snapshot-landed
-      ["running", "staging"],
-      ["ok", "serving"],
-      ["warn", "reverted"],
-      ["fail", "failed"],
-      ["warn", "degraded"],     // kgDegraded fallback
-      ["neutral", "stale"],     // ingest-needed fallback
-    ] as const) {
-      expect(deploymentsScript).toContain(`, '${kind}', '${label}')`);
-    }
-  });
-
-  it("emits stage-specific progress text for each in-progress stage", () => {
-    expect(deploymentsScript).toContain("Checking KG source repo for a newer snapshot");
-    expect(deploymentsScript).toContain("Runner job dispatched");
-    expect(deploymentsScript).toContain("waiting for snapshot commit");
-    expect(deploymentsScript).toContain("Snapshot commit confirmed");
-    expect(deploymentsScript).toContain("starting local staging");
-    expect(deploymentsScript).toContain("Staging new graph overlay");
-  });
-
-  it("falls back to running:true for older responses without a stage field", () => {
-    // Older orchestrators omit stage; the UI must not crash or show an empty badge.
-    expect(deploymentsScript).toContain("data.stage || (data.running ? 'checking' : 'idle')");
-  });
-
-  it("disables the refresh button while running or deploy-held", () => {
-    expect(deploymentsScript).toContain("!!data.running || !!data.deployHeld");
-  });
-
-  it("shows the 422 callback-unconfigured message as a warning, not an error", () => {
-    // The 422 is an expected configuration gap, not a server fault.
-    expect(deploymentsScript).toContain("res.status === 422 && body.precondition === 'callback-unconfigured'");
-    expect(deploymentsScript).toContain("RUNNER_CALLBACK_BASE_URL");
-    expect(deploymentsScript).toContain("RUNNER_TOKEN_SECRET");
-  });
-
-  it("shows a 409 deploy-held warning distinct from refresh-in-progress", () => {
-    expect(deploymentsScript).toContain("body.error === 'deploy-in-progress'");
-    expect(deploymentsScript).toContain("A deploy is in progress");
-    expect(deploymentsScript).toContain("A refresh is already in progress.");
-  });
-});
-
-describe("kg materialize-mode control (AII-602)", () => {
-  it("declares the materialize control element ids", () => {
-    for (const id of [
-      "kg-materialize-env-warning",
-      "kg-materialize-controls",
-      "btn-kg-materialize-rdflib",
-      "btn-kg-materialize-direct",
-      "kg-materialize-source",
-    ]) {
-      expect(deploymentsHtml).toContain(`id="${id}"`);
-    }
-  });
-
-  it("shows the env-pinned warning with the standard house wording", () => {
-    expect(deploymentsHtml).toContain('class="warning hidden"');
-    expect(deploymentsHtml).toContain("KG_MATERIALIZE_DIRECT env var is set");
-    expect(deploymentsHtml).toContain("UI toggle has no effect until it is unset.");
-  });
-
-  it("fetches /api/kg/materialize-mode for the current mode", () => {
-    expect(deploymentsScript).toContain("/api/kg/materialize-mode");
-  });
-
-  it("posts direct: true/false to /api/kg/materialize-mode when toggled", () => {
-    expect(deploymentsScript).toContain("window.setKgMaterializeDirect");
-    expect(deploymentsScript).toContain("{ method: 'POST', body: JSON.stringify({ direct: direct }) }");
-  });
-
-  it("wires the rdflib and direct buttons to setKgMaterializeDirect with the right argument", () => {
-    expect(deploymentsHtml).toContain("onclick=\"window.setKgMaterializeDirect(false)\"");
-    expect(deploymentsHtml).toContain("onclick=\"window.setKgMaterializeDirect(true)\"");
-  });
-
-  it("disables both buttons and shows the warning when source is env", () => {
-    expect(deploymentsScript).toContain("envPinned = data.source === 'env'");
-    expect(deploymentsScript).toContain("btn-kg-materialize-rdflib').disabled = envPinned");
-    expect(deploymentsScript).toContain("btn-kg-materialize-direct').disabled = envPinned");
-  });
-
-  it("registers loadKgMaterializeMode on page load and on a poll interval", () => {
-    expect(deploymentsScript).toContain("loadKgMaterializeMode();");
-    expect(deploymentsScript).toContain("setInterval(loadKgMaterializeMode, 15000)");
-  });
-});
-
 describe("fmtElapsed", () => {
   // The page ships as one concatenated script string, so its helpers are only reachable
   // by extraction. Worth the reach here: the interesting behaviour is the 60s and 60m
@@ -773,5 +623,251 @@ describe("fmtAgo", () => {
     expect(fmtAgo(ago(24, HOUR))).toBe("1d ago");
     expect(fmtAgo(ago(21, DAY))).toBe("21d ago");
     expect(fmtAgo(ago(400, DAY))).toBe("400d ago");
+  });
+});
+
+describe("Retention card", () => {
+  let appliesAt = "next deploy or restart";
+  const retentionBody = (restate: number, volume: number) => ({
+    restate: { days: restate, appliesAt },
+    volume: { days: volume, lastApplied: null },
+    default: 14,
+    min: 1,
+    max: 60,
+  });
+
+  function mount() {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${deploymentsHtml}</body>`, {
+      runScripts: "dangerously",
+      url: "http://localhost/admin#deployments",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const posts: Array<{ url: string; body: unknown }> = [];
+    win.registerPage = () => {};
+    win.esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      if (url === "/api/retention" && init?.method === "POST") {
+        posts.push({ url, body: JSON.parse(init.body as string) });
+        return { ok: true, status: 200, json: async () => retentionBody(10, 20) };
+      }
+      if (url === "/api/retention") return { ok: true, status: 200, json: async () => retentionBody(14, 20) };
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = deploymentsScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement & HTMLButtonElement;
+    return { win, doc, el, posts };
+  }
+
+  it("sits after the policy card", () => {
+    expect(deploymentsHtml.indexOf('id="deployments-retention"')).toBeGreaterThan(deploymentsHtml.indexOf('id="deployments-policy"'));
+  });
+
+  it("renders when the Restate value applies from the API's appliesAt", async () => {
+    const { win, doc } = mount();
+    await win.loadRetention();
+    expect(doc.getElementById("deployments-retention-applies")?.textContent)
+      .toBe("Restate retention applies at the next deploy or restart");
+
+    appliesAt = "next registration";
+    const second = mount();
+    await second.win.loadRetention();
+    expect(second.doc.getElementById("deployments-retention-applies")?.textContent)
+      .toBe("Restate retention applies at the next registration");
+    appliesAt = "next deploy or restart";
+  });
+
+  it("renders both values, keeps Save disabled until a change, and posts only the changed field", async () => {
+    const { win, el, posts } = mount();
+    await win.loadRetention();
+    expect(el("deployments-retention-restate").value).toBe("14");
+    expect(el("deployments-retention-volume").value).toBe("20");
+    expect(el("deployments-retention-save").disabled).toBe(true);
+
+    el("deployments-retention-restate").value = "10";
+    win.refreshRetentionDirty();
+    expect(el("deployments-retention-save").disabled).toBe(false);
+
+    await win.saveRetention();
+    expect(posts).toEqual([{ url: "/api/retention", body: { restate: 10 } }]);
+    expect(el("deployments-retention-restate").value).toBe("10");
+    expect(el("deployments-retention-save").disabled).toBe(true);
+  });
+});
+
+describe("self-deploy panel", () => {
+  type Deploy = Record<string, unknown> | null;
+  const record = (phase: string, extra: Record<string, unknown> = {}) => ({
+    deployId: "d1",
+    phase,
+    target: { branch: "testing", commit: "abcdef1234567890", image: "registry.fly.io/app:deployment-1", source: "published" },
+    requestedBy: "ops@example.com",
+    startedAt: Date.UTC(2026, 0, 2, 3, 4, 5),
+    finishedAt: null,
+    reason: null,
+    ...extra,
+  });
+
+  function mount(status: { deploy: Deploy; flyAllowed?: boolean; flyToml?: boolean; outcome?: unknown }, cancelBody: unknown = { cancelled: true }) {
+    const dom = new JSDOM(`<!DOCTYPE html><body>${deploymentsHtml}</body>`, {
+      runScripts: "dangerously",
+      url: "http://localhost/admin#deployments",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = dom.window as any;
+    const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+    const esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    win.registerPage = () => {};
+    win.esc = esc;
+    win.escAttr = (s: unknown) => esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    win.confirm = () => true;
+    win.api = async (url: string, init?: { method?: string; body?: string }) => {
+      calls.push({ url, method: init?.method, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (url === "/api/deployment-status") {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            configured: true,
+            available: true,
+            held: false,
+            inFlight: [],
+            repo: "o/r",
+            branch: "testing",
+            autoDeploy: false,
+            notifyConfigured: false,
+            lastDeployOutcome: status.outcome ?? null,
+            selfDeploy: { deploy: status.deploy, options: { applyFlyToml: status.flyToml ?? false } },
+            applyFlyTomlAllowed: status.flyAllowed ?? true,
+          }),
+        };
+      }
+      if (url === "/api/deploy-cancel") return { ok: true, status: 200, json: async () => cancelBody };
+      if (url === "/api/deploy-policy") return { ok: true, status: 200, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => ({ reservations: [] }) };
+    };
+    const script = dom.window.document.createElement("script");
+    script.textContent = deploymentsScript;
+    dom.window.document.head.appendChild(script);
+    const doc = dom.window.document;
+    const el = (id: string) => doc.getElementById(id) as HTMLInputElement & HTMLButtonElement;
+    return { win, doc, el, calls };
+  }
+
+  const rows: Array<{ phase: string | null; deployDisabled: boolean; cancel: boolean; panel: "none" | "active" | "last" }> = [
+    { phase: null, deployDisabled: false, cancel: false, panel: "none" },
+    { phase: "draining", deployDisabled: true, cancel: true, panel: "active" },
+    { phase: "applying", deployDisabled: true, cancel: false, panel: "active" },
+    { phase: "verifying", deployDisabled: true, cancel: false, panel: "active" },
+    { phase: "succeeded", deployDisabled: false, cancel: false, panel: "last" },
+    { phase: "failed", deployDisabled: false, cancel: false, panel: "last" },
+    { phase: "cancelled", deployDisabled: false, cancel: false, panel: "last" },
+  ];
+
+  for (const row of rows) {
+    it(`state table: selfDeploy ${row.phase ?? "null"}`, async () => {
+      const finished = row.panel === "last" ? { finishedAt: Date.UTC(2026, 0, 2, 4, 0, 0), reason: row.phase === "failed" ? "drain-timeout" : null } : {};
+      const { win, el } = mount({ deploy: row.phase ? record(row.phase, finished) : null });
+      await win.loadDeployments();
+      expect(el("deployments-deploy-btn").disabled).toBe(row.deployDisabled);
+      expect(el("deployments-cancel-btn").hidden).toBe(!row.cancel);
+      expect(el("deployments-active").hidden).toBe(row.panel !== "active");
+      expect(el("deployments-last-result").hidden).toBe(row.panel !== "last");
+    });
+  }
+
+  it("active panel shows phase, branch, 7-char commit, image, requester and start time", async () => {
+    const { win, doc } = mount({ deploy: record("applying") });
+    await win.loadDeployments();
+    const text = (doc.getElementById("deployments-active") as HTMLElement).textContent ?? "";
+    expect(text).toContain("applying");
+    expect(text).toContain("testing");
+    expect(text).toContain("abcdef1");
+    expect(text).not.toContain("abcdef12");
+    expect(text).toContain("registry.fly.io/app:deployment-1");
+    expect(text).toContain("ops@example.com");
+    expect(text).toContain(new Date(Date.UTC(2026, 0, 2, 3, 4, 5)).toLocaleString());
+  });
+
+  it("last result shows reason and finish time, and never the text null", async () => {
+    const finishedAt = Date.UTC(2026, 0, 2, 4, 0, 0);
+    const failed = mount({ deploy: record("failed", { finishedAt, reason: "drain-timeout" }) });
+    await failed.win.loadDeployments();
+    const failedText = failed.el("deployments-last-result").textContent ?? "";
+    expect(failedText).toContain("failed");
+    expect(failedText).toContain("drain-timeout");
+    expect(failedText).toContain(new Date(finishedAt).toLocaleString());
+
+    const ok = mount({ deploy: record("succeeded", { finishedAt }) });
+    await ok.win.loadDeployments();
+    expect(ok.el("deployments-last-result").textContent).not.toContain("null");
+  });
+
+  it("cancel posts, then re-fetches status", async () => {
+    const { win, calls } = mount({ deploy: record("draining") });
+    await win.loadDeployments();
+    calls.length = 0;
+    await win.cancelDeploy();
+    const urls = calls.map((c) => `${c.method ?? "GET"} ${c.url}`);
+    expect(urls.indexOf("POST /api/deploy-cancel")).toBeGreaterThanOrEqual(0);
+    expect(urls.indexOf("GET /api/deployment-status")).toBeGreaterThan(urls.indexOf("POST /api/deploy-cancel"));
+  });
+
+  it("cancel says so when the deploy is past the drain", async () => {
+    const { win, el } = mount({ deploy: record("draining") }, { cancelled: false, reason: "too-late" });
+    await win.loadDeployments();
+    await win.cancelDeploy();
+    expect(el("deployments-error").hidden).toBe(false);
+    expect(el("deployments-error").textContent).toBe("The deploy is past the drain and cannot be cancelled.");
+  });
+
+  it("fly.toml toggle is enabled and its saved value is sent when allowed", async () => {
+    const { win, el, calls } = mount({ deploy: null, flyToml: false });
+    await win.loadDeployments();
+    expect(el("deployments-fly-toml").disabled).toBe(false);
+    expect(el("deployments-fly-toml-hint").textContent).not.toContain("owns its config");
+    el("deployments-fly-toml").checked = true;
+    win.refreshPolicyDirty();
+    expect(el("deployments-policy-save").disabled).toBe(false);
+    await win.saveDeployPolicy();
+    const post = calls.find((c) => c.url === "/api/deploy-policy");
+    expect((post?.body as Record<string, unknown>).applyFlyToml).toBe(true);
+  });
+
+  it("fly.toml toggle is disabled with the explanation when the control plane owns the config", async () => {
+    const { win, el, calls } = mount({ deploy: null, flyAllowed: false, flyToml: true });
+    await win.loadDeployments();
+    expect(el("deployments-fly-toml").disabled).toBe(true);
+    expect(el("deployments-fly-toml-hint").textContent).toBe("The control plane created this machine and owns its config.");
+    expect(el("deployments-policy-save").disabled).toBe(true);
+    await win.saveDeployPolicy();
+    const post = calls.find((c) => c.url === "/api/deploy-policy");
+    expect(post?.body).not.toHaveProperty("applyFlyToml");
+  });
+
+  it("a dirty fly.toml toggle survives a poll", async () => {
+    const { win, el } = mount({ deploy: null });
+    await win.loadDeployments();
+    el("deployments-fly-toml").checked = true;
+    win.refreshPolicyDirty();
+    await win.loadDeployments();
+    expect(el("deployments-fly-toml").checked).toBe(true);
+    expect(el("deployments-policy-save").disabled).toBe(false);
+  });
+
+  it("renders deploy-failed and deploy-cancelled outcomes", async () => {
+    const failed = mount({ deploy: null, outcome: { kind: "deploy-failed", commit: "abcdef1234567", timestamp: 1, detail: "apply-failed" } });
+    await failed.win.loadDeployments();
+    expect(failed.el("deployments-outcome-alert").textContent).toContain("apply-failed");
+    expect(failed.el("deployments-outcome-alert").className).toContain("fail");
+
+    const cancelled = mount({ deploy: null, outcome: { kind: "deploy-cancelled", commit: "abcdef1234567", timestamp: 1 } });
+    await cancelled.win.loadDeployments();
+    expect(cancelled.el("kpi-deploy-outcome-badge").textContent).toContain("Cancelled");
+    expect(cancelled.el("deployments-outcome-alert").className).not.toContain("fail");
+    expect(cancelled.el("deployments-outcome-alert").textContent).toContain("cancelled");
   });
 });

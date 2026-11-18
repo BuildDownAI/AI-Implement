@@ -13,7 +13,7 @@ import {
   sidecarHealth,
   sidecarHealthFields,
 } from "../kg-provider.js";
-import type { MemoryProvider, MemoryProviderCapabilities, SidecarHealth } from "../kg-provider.js";
+import type { KgToolResult, MemoryProvider, MemoryProviderCapabilities, SidecarHealth } from "../kg-provider.js";
 
 // ---- parseSidecarRpcResponse ----
 
@@ -94,6 +94,10 @@ describe("KG_TOOL_CAPABILITY", () => {
 
   it("maps kg_provenance → provenance", () => {
     expect(KG_TOOL_CAPABILITY.kg_provenance).toBe("provenance");
+  });
+
+  it("maps kg_repo_history → provenance", () => {
+    expect(KG_TOOL_CAPABILITY.kg_repo_history).toBe("provenance");
   });
 });
 
@@ -267,47 +271,6 @@ describe("SidecarMemoryProvider session handling", () => {
     });
   }
 
-  function fakeReq(headers: http.IncomingHttpHeaders = {}, method = "POST"): http.IncomingMessage {
-    return { headers, method } as unknown as http.IncomingMessage;
-  }
-
-  interface FakeRes {
-    headersSent: boolean;
-    statusCode?: number;
-    headers?: http.OutgoingHttpHeaders;
-    body?: Buffer;
-  }
-
-  function fakeRes(): http.ServerResponse & FakeRes {
-    const res: FakeRes & { writeHead: unknown; end: unknown; destroy: unknown } = {
-      headersSent: false,
-      writeHead(status: number, headers: http.OutgoingHttpHeaders) {
-        res.headersSent = true;
-        res.statusCode = status;
-        res.headers = headers;
-      },
-      write(chunk: Buffer) {
-        res.body = res.body ? Buffer.concat([res.body, chunk]) : Buffer.from(chunk);
-        return true;
-      },
-      end(chunk?: Buffer) {
-        if (chunk) res.body = res.body ? Buffer.concat([res.body, chunk]) : Buffer.from(chunk);
-      },
-      destroy() {
-        // no-op
-      },
-    };
-    return res as unknown as http.ServerResponse & FakeRes;
-  }
-
-  async function waitUntil(cond: () => boolean, timeoutMs = 1000): Promise<void> {
-    const start = Date.now();
-    while (!cond()) {
-      if (Date.now() - start > timeoutMs) throw new Error("waitUntil timed out");
-      await new Promise((r) => setTimeout(r, 0));
-    }
-  }
-
   const MISSING_SESSION_BODY = JSON.stringify({
     jsonrpc: "2.0",
     id: 1,
@@ -324,18 +287,6 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(result).toEqual([{ name: "kg_search" }]);
     expect(mockHttpRequest).toHaveBeenCalledTimes(1);
     expect(consoleErrorSpy).not.toHaveBeenCalled();
-  });
-
-  it("stateless sidecar: proxyCall forwards the response in a single request", async () => {
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [] } }));
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    const req = fakeReq();
-    const res = fakeRes();
-    p.proxyCall(req, res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
-    expect(res.statusCode).toBe(200);
-    expect(res.body?.toString()).toContain('"content":[]');
   });
 
   // (b) 400 Missing session ID → initialize → retry with header → 200 tools listed
@@ -372,79 +323,21 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(notifyOpts.headers.authorization).toBeUndefined();
   });
 
-  it("proxyCall: strips authorization and cookie from the initialize request", async () => {
-    queueResponse(400, MISSING_SESSION_BODY);
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-10" });
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [] } }));
-
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    const req = fakeReq({ authorization: "Bearer secret", cookie: "sid=abc" });
-    const res = fakeRes();
-    p.proxyCall(req, res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-
-    const initOpts = mockHttpRequest.mock.calls[1][0] as { headers: Record<string, unknown> };
-    expect(initOpts.headers.authorization).toBeUndefined();
-    expect(initOpts.headers.cookie).toBeUndefined();
-  });
-
-  // (c) proxyCall reuses the stored session id
-  it("proxyCall reuses a session id already stored on the provider (no initialize)", async () => {
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    (p as unknown as { sessionId: string | null }).sessionId = "existing-session";
-
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [] } }));
-    const req = fakeReq();
-    const res = fakeRes();
-    p.proxyCall(req, res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-
-    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
-    const opts = mockHttpRequest.mock.calls[0][0] as { headers: Record<string, unknown> };
-    expect(opts.headers["mcp-session-id"]).toBe("existing-session");
-  });
-
-  it("a session established via listTools is reused by a subsequent proxyCall", async () => {
+  it("a session established via listTools is reused by a subsequent listTools call", async () => {
     queueResponse(400, MISSING_SESSION_BODY);
     queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-2" });
     queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
     queueResponse(200, toolsResult([{ name: "kg_search" }]));
 
     const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    await p.listTools(Buffer.from("{}"), {});
+    expect(await p.listTools(Buffer.from("{}"), {})).toEqual([{ name: "kg_search" }]);
     expect(mockHttpRequest).toHaveBeenCalledTimes(4);
 
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [] } }));
-    const req = fakeReq();
-    const res = fakeRes();
-    p.proxyCall(req, res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-
+    queueResponse(200, toolsResult([{ name: "kg_neighbors" }]));
+    expect(await p.listTools(Buffer.from("{}"), {})).toEqual([{ name: "kg_neighbors" }]);
     expect(mockHttpRequest).toHaveBeenCalledTimes(5);
     const opts = mockHttpRequest.mock.calls[4][0] as { headers: Record<string, unknown> };
     expect(opts.headers["mcp-session-id"]).toBe("sess-2");
-  });
-
-  it("a session established via proxyCall is reused by a subsequent listTools call", async () => {
-    queueResponse(400, MISSING_SESSION_BODY);
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "sess-3" });
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [] } }));
-
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    const req = fakeReq();
-    const res = fakeRes();
-    p.proxyCall(req, res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
-
-    queueResponse(200, toolsResult([{ name: "kg_search" }]));
-    const result = await p.listTools(Buffer.from("{}"), {});
-    expect(result).toEqual([{ name: "kg_search" }]);
-    expect(mockHttpRequest).toHaveBeenCalledTimes(5);
-    const opts = mockHttpRequest.mock.calls[4][0] as { headers: Record<string, unknown> };
-    expect(opts.headers["mcp-session-id"]).toBe("sess-3");
   });
 
   // (d) 404 on a stale session → one re-initialize → success
@@ -469,72 +362,6 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(retryOpts.headers["mcp-session-id"]).toBe("fresh-id");
   });
 
-  it("proxyCall: 404 on a stale session re-initializes once and relays the retried response", async () => {
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    (p as unknown as { sessionId: string | null }).sessionId = "stale-id";
-    queueResponse(404, JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32001, message: "session not found" } }));
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }), { "mcp-session-id": "fresh-id" });
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", result: {} }));
-    queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [{ type: "text", text: "ok" }] } }));
-
-    const res = fakeRes();
-    p.proxyCall(fakeReq(), res, Buffer.from("{}"));
-    await waitUntil(() => res.body !== undefined && res.body.length > 0);
-
-    expect(mockHttpRequest).toHaveBeenCalledTimes(4);
-    expect((p as unknown as { sessionId: string | null }).sessionId).toBe("fresh-id");
-    expect(res.statusCode).toBe(200);
-    expect(res.body?.toString()).toContain('"text":"ok"');
-    const retryOpts = mockHttpRequest.mock.calls[3][0] as { headers: Record<string, unknown> };
-    expect(retryOpts.headers["mcp-session-id"]).toBe("fresh-id");
-  });
-
-  it("proxyCall streams a success response chunk by chunk instead of buffering it", async () => {
-    const proxyReq = new PassThrough();
-    const proxyRes = new PassThrough();
-    Object.assign(proxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
-    mockHttpRequest.mockImplementationOnce((_opts: unknown, cb: (r: unknown) => void) => {
-      process.nextTick(() => cb(proxyRes));
-      return proxyReq;
-    });
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    const res = fakeRes();
-    p.proxyCall(fakeReq({}, "GET"), res, Buffer.alloc(0));
-
-    await waitUntil(() => res.headersSent);
-    expect(res.statusCode).toBe(200); // headers relayed before the body ends
-    proxyRes.push("event: message\ndata: {\"a\":1}\n\n");
-    await waitUntil(() => (res.body?.length ?? 0) > 0);
-    expect(res.body?.toString()).toContain('"a":1');
-    proxyRes.push("event: message\ndata: {\"b\":2}\n\n");
-    proxyRes.push(null);
-    await waitUntil(() => (res.body?.toString() ?? "").includes('"b":2'));
-    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
-  });
-
-  it("proxyCall: when the handshake fails, the sidecar's original rejection is forwarded, not a synthetic 502", async () => {
-    queueResponse(400, MISSING_SESSION_BODY);
-    queueConnectionError("ECONNREFUSED");
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    const res = fakeRes();
-    p.proxyCall(fakeReq(), res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
-    expect(res.statusCode).toBe(400);
-    expect(res.body?.toString()).toContain("Missing session ID");
-  });
-
-  it("proxyCall: a 400 that is not a session signal is forwarded once, with no handshake", async () => {
-    queueResponse(400, JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32600, message: "Bad Request: invalid params" } }));
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    const res = fakeRes();
-    p.proxyCall(fakeReq(), res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-    expect(mockHttpRequest).toHaveBeenCalledTimes(1);
-    expect(res.statusCode).toBe(400);
-    expect(res.body?.toString()).toContain("invalid params");
-  });
-
   // (e) initialize itself fails → the original error is surfaced once, no loop
   it("listTools: a failed initialize resolves to [] with no third attempt", async () => {
     queueResponse(400, MISSING_SESSION_BODY);
@@ -544,21 +371,6 @@ describe("SidecarMemoryProvider session handling", () => {
     const result = await p.listTools(Buffer.from("{}"), {});
     expect(result).toEqual([]);
     expect(mockHttpRequest).toHaveBeenCalledTimes(2);
-  });
-
-  it("proxyCall: a failed initialize forwards the original rejection with no third attempt", async () => {
-    queueResponse(400, MISSING_SESSION_BODY);
-    queueConnectionError("ECONNREFUSED");
-
-    const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
-    const req = fakeReq();
-    const res = fakeRes();
-    p.proxyCall(req, res, Buffer.from("{}"));
-    await waitUntil(() => res.headersSent);
-
-    expect(mockHttpRequest).toHaveBeenCalledTimes(2);
-    expect(res.statusCode).toBe(400);
-    expect(res.body?.toString()).toContain("Missing session ID");
   });
 
   // Defensive: a pathological sidecar that still rejects after the handshake must not loop
@@ -574,8 +386,7 @@ describe("SidecarMemoryProvider session handling", () => {
     expect(result).toEqual([]);
     expect(mockHttpRequest).toHaveBeenCalledTimes(4);
   });
-  // ---- callKgTool (AII-711): the non-streaming counterpart to proxyCall that a Restate
-  // tool handler calls. Same session dance, same wording; never writes to a response.
+  // ---- callKgTool (AII-711): parsed tool calls for Restate handlers. ----
   describe("callKgTool", () => {
     beforeEach(() => {
       // The re-probe a failure kicks off is fire-and-forget (AII-650); keep it out of these
@@ -600,7 +411,7 @@ describe("SidecarMemoryProvider session handling", () => {
       expect(await p.callKgTool("kg_neighbors", { iri: "x" })).toEqual({ ok: false, error: "bad iri" });
     });
 
-    it("maps a refused connection to the same wording proxyCall wrote into its 502", async () => {
+    it("maps a refused connection to a human-readable error", async () => {
       queueConnectionError("ECONNREFUSED");
       const p = new SidecarMemoryProvider("http://127.0.0.1:8765/mcp");
       expect(await p.callKgTool("kg_search", { query: "x" })).toEqual({ ok: false, error: "KG sidecar unavailable: connection refused" });
@@ -705,6 +516,155 @@ describe("SidecarMemoryProvider probe", () => {
     return new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => namespace);
   }
 
+  it("keeps local isError results healthy and passes them through", async () => {
+    vi.stubEnv("KG_BACKEND", "local");
+    try {
+      const p = makeProvider();
+      const result = { isError: true, content: [{ type: "text", text: "bad token" }] };
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ result }));
+      expect((await p.probe()).lastError).toBeNull();
+      queueResponse(200, JSON.stringify({ result }));
+      expect(await p.callKgTool("kg_neighbors", {})).toEqual({ ok: true, result });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  describe("remote store", () => {
+    beforeEach(() => vi.stubEnv("KG_BACKEND", "stardog_run"));
+    afterEach(() => vi.unstubAllEnvs());
+
+    it("keeps a failed tools/list unavailable", async () => {
+      queueConnectionError("ECONNREFUSED");
+      expect((await makeProvider().probe()).lastError).toContain("ECONNREFUSED");
+      expect(sidecarHealth.toolsListed).toBe(false);
+    });
+
+    it("still requires all core tools", async () => {
+      queueResponse(200, toolsListResult([]));
+      expect((await makeProvider().probe()).lastError).toContain("missing");
+      expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it("records a successful boot query as healthy", async () => {
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, neighborsOk());
+      expect(await makeProvider().probe()).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+    });
+
+    it("accepts a boot query timeout and logs the wake-up explanation", async () => {
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueHang();
+      expect(await makeProvider().probe()).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+      expect(log).toHaveBeenCalledWith("[kg] remote store did not answer in 10 s; it is possibly starting");
+    });
+
+    it("preserves a boot store error across list failures and recovery until a user query succeeds", async () => {
+      const p = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }));
+      expect((await p.probe()).lastError).toBe("Error executing tool kg_neighbors: bad token");
+      queueConnectionError("ECONNREFUSED");
+      await p.probe("list-only");
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBe("Error executing tool kg_neighbors: bad token");
+      queueResponse(200, neighborsOk());
+      expect((await p.callKgTool("kg_neighbors", {})).ok).toBe(true);
+      expect(sidecarHealth).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBeNull();
+    });
+
+    it.each([{}, { result: null }, { result: false }, { result: [] }, { result: "invalid" }])(
+      "preserves the boot store error after a malformed tool response %j",
+      async (response) => {
+        const p = makeProvider();
+        queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+        queueResponse(200, JSON.stringify({ result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }));
+        expect((await p.probe()).lastError).toBe("Error executing tool kg_neighbors: bad token");
+        const before = { ...sidecarHealth };
+
+        queueResponse(200, JSON.stringify(response));
+        expect(await p.callKgTool("kg_search", {})).toEqual({ ok: false, error: "KG sidecar error" });
+        expect(sidecarHealth).toEqual(before);
+
+        queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+        expect((await p.probe("list-only")).lastError).toBe("Error executing tool kg_neighbors: bad token");
+        expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+      },
+    );
+
+    it.each([
+      [{ result: { isError: true, content: [{ type: "text", text: "" }, { type: "text", text: "ignored" }] } }, ""],
+      [{ result: { isError: true, content: [{ type: "image" }, { type: "text", text: "x".repeat(250) }, { type: "text", text: "ignored" }] } }, "x".repeat(200)],
+      [{ result: { isError: true, content: [] } }, "store call failed"],
+      [{ error: { message: "x".repeat(250) } }, "x".repeat(200)],
+    ])("records bounded store failures %j", async (response, message) => {
+      const p = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify(response));
+      expect((await p.probe()).lastError).toBe(message);
+      expect(isKgUnavailable()).toBe(true);
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBe(message);
+      expect(isKgUnavailable()).toBe(true);
+    });
+
+    it.each(["handshake", "unparseable"])("clears a transient %s failure after list-only recovery", async (failure) => {
+      const p = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      if (failure === "handshake") {
+        queueResponse(400, MISSING_SESSION_BODY);
+        queueResponse(500, "failed initialization");
+      } else queueResponse(200, "not json");
+      expect((await p.probe()).lastError).toContain(failure === "handshake" ? "session handshake failed" : "unparseable response");
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBeNull();
+    });
+
+    it("passes through failed tool results without clearing health or re-probing", async () => {
+      const p = makeProvider();
+      const result = { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] };
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ result }));
+      await p.probe();
+      const before = { ...sidecarHealth };
+      queueResponse(200, JSON.stringify({ result }));
+      expect(await p.callKgTool("kg_neighbors", {})).toEqual({ ok: true, result });
+      expect(sidecarHealth).toEqual(before);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(3);
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBe(result.content[0].text);
+    });
+
+    it("answers a user timeout without changing health or re-probing", async () => {
+      Object.assign(sidecarHealth, { reachable: true, toolsListed: true, lastError: "bad token", checkedAt: 1 });
+      const before = { ...sidecarHealth };
+      queueHang();
+      expect(await makeProvider().callKgTool("kg_search", {})).toEqual({
+        ok: false, error: "The knowledge graph store is starting. Try again in one minute.",
+      });
+      expect(sidecarHealth).toEqual(before);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns the sidecar's JSON-RPC error to a caller", async () => {
+      queueResponse(200, JSON.stringify({ error: { message: "bad query" } }));
+      expect(await makeProvider().callKgTool("kg_search", {})).toEqual({ ok: false, error: "bad query" });
+    });
+
+    it("re-probes after a failed call using tools/list only", async () => {
+      const p = makeProvider();
+      queueConnectionError("ECONNREFUSED");
+      const list = queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      const completed = new Promise<void>((resolve) => list.on("finish", resolve));
+      await p.callKgTool("kg_search", {});
+      await completed;
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(list.read().toString()).method).toBe("tools/list");
+    });
+  });
+
   it("probe requests carry Accept: application/json, text/event-stream (the transport answers 406 without it)", async () => {
 
     queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", result: { tools: Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name })) } }));
@@ -743,6 +703,17 @@ describe("SidecarMemoryProvider probe", () => {
     const sentBody = (writeSpy.mock.calls[0][0] as Buffer).toString();
     expect(sentBody).toContain(SPINE_IRI);
     expect(sentBody).toContain("kg_neighbors");
+  });
+
+  it("stays healthy when an older sidecar's tools/list lacks kg_repo_history", async () => {
+    queueResponse(200, toolsListResult(ALL_SIX_TOOLS.filter((t) => t.name !== "kg_repo_history")));
+    queueResponse(200, neighborsOk());
+
+    const health = await makeProvider().probe();
+
+    expect(health.toolsListed).toBe(true);
+    expect(health.lastError).toBeNull();
+    expect(isKgUnavailable()).toBe(false);
   });
 
   it("fails when tools/list is missing a required tool", async () => {
@@ -899,7 +870,7 @@ describe("SidecarMemoryProvider probe", () => {
     });
   });
 
-  describe("re-probe throttle on listTools/proxyCall failure", () => {
+  describe("re-probe throttle on listTools failure", () => {
     it("a failed listTools call re-probes exactly once, and updates sidecarHealth", async () => {
       queueConnectionError("ECONNREFUSED"); // the listTools attempt itself
       queueConnectionError("ECONNREFUSED"); // the triggered re-probe's tools/list attempt
@@ -943,34 +914,6 @@ describe("SidecarMemoryProvider probe", () => {
       expect(sidecarHealth.checkedAt).toBe(checkedAtAfterFirst);
     });
 
-    it("a failed proxyCall re-probes exactly once, respecting the same throttle", async () => {
-      queueConnectionError("ECONNREFUSED"); // the proxyCall attempt itself
-      queueConnectionError("ECONNREFUSED"); // the triggered re-probe
-
-      const p = makeProvider();
-      const res = {
-        headersSent: false,
-        writeHead() {
-          res.headersSent = true;
-        },
-        end() {
-          /* no-op */
-        },
-        destroy() {
-          /* no-op */
-        },
-      } as unknown as http.ServerResponse & { headersSent: boolean };
-      const req = { headers: {}, method: "POST" } as unknown as http.IncomingMessage;
-
-      p.proxyCall(req, res, Buffer.from("{}"));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
-      expect(sidecarHealth.checkedAt).not.toBeNull();
-    });
-
     // AII-650 refinement #2: maybeReprobe() must be fired and forgotten, not awaited — the
     // triggering call should not pay for the re-probe's round trip before returning its own result.
     it("listTools returns without waiting for the triggered re-probe to finish", async () => {
@@ -984,34 +927,6 @@ describe("SidecarMemoryProvider probe", () => {
 
       expect(result).toEqual([]);
       expect(mockHttpRequest).toHaveBeenCalledTimes(2); // the attempt itself, plus the kicked-off re-probe
-    });
-
-    it("proxyCall responds without waiting for the triggered re-probe to finish", async () => {
-      queueConnectionError("ECONNREFUSED"); // the proxyCall attempt itself
-      mockHttpRequest.mockImplementationOnce(() => new PassThrough()); // re-probe hangs forever
-
-      const p = makeProvider();
-      const res = {
-        headersSent: false,
-        writeHead() {
-          res.headersSent = true;
-        },
-        end() {
-          /* no-op */
-        },
-        destroy() {
-          /* no-op */
-        },
-      } as unknown as http.ServerResponse & { headersSent: boolean };
-      const req = { headers: {}, method: "POST" } as unknown as http.IncomingMessage;
-
-      p.proxyCall(req, res, Buffer.from("{}"));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      expect(res.headersSent).toBe(true);
-      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
     });
   });
 });
@@ -1144,9 +1059,8 @@ class StubMemoryProvider implements MemoryProvider {
     ]);
   }
 
-  proxyCall(_req: http.IncomingMessage, res: http.ServerResponse, _body: Buffer): void {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ jsonrpc: "2.0", id: null, result: { content: [] } }));
+  callKgTool(_name: string, _args: Record<string, unknown>): Promise<KgToolResult> {
+    return Promise.resolve({ ok: true, result: { content: [] } });
   }
 }
 

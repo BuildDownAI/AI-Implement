@@ -1,0 +1,15 @@
+{
+  "request": {
+    "args": {}
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "list_open_pulls failed: Cannot list open pull requests for acme/app: HTTP 502"
+      }
+    ],
+    "isError": true
+  }
+}

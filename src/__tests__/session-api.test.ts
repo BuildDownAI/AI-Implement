@@ -1,52 +1,18 @@
 import { EventEmitter } from "node:events";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SessionApiModule from "../session-api.js";
 import type * as LogModule from "../log.js";
-import type * as DedupModule from "../dedup.js";
+import type * as StepLogModule from "../step-log.js";
+import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../status-events.js", () => ({
   postStatusComment: vi.fn(),
 }));
 
-import { FakeProvider } from "./providers/fake.js";
-import type { ProviderRegistry } from "../providers/registry.js";
-import type { RepoMapping } from "../config.js";
-
-function makeFakeRegistry(): ProviderRegistry {
-  const fake = new FakeProvider();
-  return {
-    forMapping: async () => fake,
-    forAllMappings: async () => [fake],
-    invalidate: () => {},
-  } as unknown as ProviderRegistry;
-}
-
-function makeMappingsFn(teamKey: string): () => Record<string, RepoMapping> {
-  const mapping = {
-    owner: "acme",
-    repo: "repo",
-    workflowFile: "claude-implement.yml",
-    defaultBranch: "main",
-    maxInProgressAiIssues: 3,
-    executionMode: "fly-machines" as const,
-    sessionMode: "autonomous" as const,
-    machineCpus: 1,
-    machineMemoryMb: 512,
-    planningEnabled: false,
-    planningWorkflowFile: "",
-    autoApprovePlans: true,
-    extraEnv: {},
-    provider: "anthropic" as const,
-    ticketingProvider: "linear" as const,
-    ticketingConfig: { kind: "linear" as const },
-    awsRegion: null,
-    paused: false,
-  };
-  return () => ({ [teamKey]: mapping });
-}
+const mappingsFor = (teamKey: string) => () => ({
+  [teamKey]: makeMapping({ owner: "acme", repo: "repo", executionMode: "fly-machines" }),
+});
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -84,28 +50,30 @@ class MockResponse {
   }
 }
 
-let dbPath: string;
 let sessionApi: typeof SessionApiModule;
 let log: typeof LogModule;
-let dedup: typeof DedupModule;
+let stepLog: typeof StepLogModule;
+let links: typeof import("../pr-links.js");
+let config: typeof import("../config.js");
 let mockPostStatusComment: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `session-api-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  sessionApi = await import("../session-api.js");
-  const statusEvents = await import("../status-events.js");
-  mockPostStatusComment = vi.mocked(statusEvents.postStatusComment);
-  log.initLogTable();
+  const { modules } = await testDb({
+    modules: {
+      links: () => import("../pr-links.js"),
+      config: () => import("../config.js"),
+      log: () => import("../log.js"),
+      stepLog: () => import("../step-log.js"),
+      sessionApi: () => import("../session-api.js"),
+      statusEvents: () => import("../status-events.js"),
+    },
+  });
+  ({ log, stepLog, sessionApi, links, config } = modules);
+  mockPostStatusComment = vi.mocked(modules.statusEvents.postStatusComment);
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
 async function callStatusEndpoint(
@@ -114,7 +82,7 @@ async function callStatusEndpoint(
 ): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest("/api/status", "POST", {}, JSON.stringify(body));
   const res = new MockResponse();
-  sessionApi.handleStatusUpdate(req as never, res as never, makeFakeRegistry(), makeMappingsFn("ENG"), flyAppName);
+  sessionApi.handleStatusUpdate(req as never, res as never, makeRegistry(), mappingsFor("ENG"), flyAppName);
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -124,7 +92,7 @@ describe("handleStatusUpdate", () => {
     it("returns 400 for invalid JSON", async () => {
       const req = new MockRequest("/api/status", "POST", {}, "not-json");
       const res = new MockResponse();
-      sessionApi.handleStatusUpdate(req as never, res as never, makeFakeRegistry(), makeMappingsFn("ENG"));
+      sessionApi.handleStatusUpdate(req as never, res as never, makeRegistry(), mappingsFor("ENG"));
       await res.done;
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).error).toContain("Invalid JSON");
@@ -317,12 +285,11 @@ function validStep() {
 describe("handleStepReport", () => {
   let reportJobNonce: string;
 
-  beforeEach(async () => {
-    const stepLog = await import("../step-log.js");
-    stepLog.initStepLogTable();
-
+  beforeEach(() => {
+    config.upsertMapping("ENG", makeMapping());
     reportJobNonce = `report-nonce-${Math.random().toString(36).slice(2)}`;
     log.appendLog({
+      teamKey: "ENG",
       issueId: "issue-300",
       issueIdentifier: "ENG-300",
       repo: "acme/repo",
@@ -330,6 +297,56 @@ describe("handleStepReport", () => {
       machineId: "machine-report",
       executionMode: "fly-machines",
     });
+  });
+
+  it("links push reports before the result URL and preserves the first source on repeats", async () => {
+    const job = log.getJobByNonce(reportJobNonce)!;
+    const step = { ...validStep(), id: "push", outputs: { prUrl: "https://github.com/acme/repo/pull/42" } };
+    for (let i = 0; i < 2; i++) {
+      const res = await callStepReportEndpoint({ nonce: reportJobNonce, step });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true });
+    }
+    expect(log.getJobById(job.id)?.prUrl).toBeNull();
+    expect(links.findLinkByPr("acme/repo", 42)).toMatchObject({
+      source: "step-report", role: "implementation",
+      issue: { trackerIssueId: "issue-300", identifier: "ENG-300", mappingKey: "ENG" },
+    });
+    log.updateJobPrUrl(job.id, step.outputs.prUrl);
+    expect(links.listLinksByOutcome("open")).toHaveLength(1);
+    expect(links.findLinkByPr("acme/repo", 42)?.source).toBe("step-report");
+  });
+
+  it.each([
+    ["clone", { prUrl: "https://github.com/acme/repo/pull/42" }],
+    ["push", {}], ["push", { prUrl: "" }], ["push", { prUrl: 42 }],
+    ["push", { prUrl: null, prNumber: 42 }], ["push", null], ["push", "bad outputs"],
+  ])("does not link step %s with outputs %j", async (id, outputs) => {
+    const res = await callStepReportEndpoint({ nonce: reportJobNonce, step: { ...validStep(), id, outputs } });
+    expect(res.statusCode).toBe(200);
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+  });
+
+  it("rejects a push report after the nonce is cleared", async () => {
+    const job = log.getJobByNonce(reportJobNonce)!;
+    log.updateJobStatus(job.id, "completed");
+    const res = await callStepReportEndpoint({ nonce: reportJobNonce,
+      step: { ...validStep(), id: "push", outputs: { prUrl: "https://github.com/acme/repo/pull/42" } } });
+    expect(res.statusCode).toBe(403);
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+    expect(stepLog.getStepsByJobId(job.id)).toEqual([]);
+  });
+
+  it("retains HTTP success and the step record when linking fails", async () => {
+    const job = log.getJobByNonce(reportJobNonce)!;
+    vi.spyOn(links, "linkPullRequest").mockImplementation(() => { throw new Error("link fault"); });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await callStepReportEndpoint({ nonce: reportJobNonce,
+      step: { ...validStep(), id: "push", outputs: { prUrl: "https://github.com/acme/repo/pull/42" } } });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(stepLog.getStepRecord(job.id, "push")?.status).toBe("passed");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed to link"), expect.any(Error));
   });
 
   describe("validation", () => {
@@ -395,7 +412,6 @@ describe("handleStepReport", () => {
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body).ok).toBe(true);
 
-      const stepLog = await import("../step-log.js");
       const job = log.getJobByNonce(reportJobNonce)!;
       const records = stepLog.getStepsByJobId(job.id);
       expect(records).toHaveLength(1);
@@ -404,7 +420,6 @@ describe("handleStepReport", () => {
     });
 
     it("updates an existing step record on conflict (running → passed)", async () => {
-      const stepLog = await import("../step-log.js");
       const job = log.getJobByNonce(reportJobNonce)!;
 
       // First report: running

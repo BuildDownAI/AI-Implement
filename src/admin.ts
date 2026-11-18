@@ -1,4 +1,9 @@
+import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "./fly-machine-sizing.js";
+import { readKeyBinding } from "./key-bindings.js";
+import type { KeyBindOutcome } from "./restate/key-binding.js";
+import { MODEL_AUTH_ENV, hasEphemeralFullAccessOptIn, EPHEMERAL_FULL_ACCESS_ASSERTION, EPHEMERAL_FULL_ACCESS_EXTRA_ENV, EXECUTION_POLICY_ENV, isEphemeralPolicyEnvName } from "./model-auth-contract.js";
 import http from "node:http";
+import type { InvocationAttributionV1 } from "./pipeline/types.js";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,6 +26,7 @@ import {
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
+import { isReviewProcessId, type ReviewProcessId } from "./review-process.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, ReviewerSelection } from "./config.js";
 import {
   getRunnerMode,
@@ -32,16 +38,53 @@ import {
   getFlyProcessLevelSecrets,
   setFlyProcessLevelSecrets,
   getKgMaterializeDirect,
+  getKgExecutionMode,
+  setKgExecutionMode,
+  parseKgExecutionModeEnv,
   setKgMaterializeDirect,
+  resolveExecutionPath,
   type RunnerMode,
 } from "./runner-mode.js";
-import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import {
+  STAGE_AGENT_CONFIG_VERSION,
+  STAGE_NAMES,
+  STORED_STAGE_SELECTION_FIELDS,
+  validateAccounts,
+  type StageAgentConfigurationV1,
+  type StageName,
+  type StageAccount,
+  type AccountFailure,
+} from "./agent-config.js";
+import {
+  getAccountProfile,
+  getOrchestratorDefaults,
+  getProjectStageConfig,
+  listAccountProfiles,
+  lookupCredentialReference,
+  readStageInputsFingerprint,
+  resolveCandidateProjectStageConfig,
+  resolveProjectStageConfig,
+  inspectProjectStageAccounts,
+  saveAccountProfileRevision,
+  setOrchestratorDefaults,
+  setProjectStageConfig,
+  setProjectConfigured,
+  StaleStageInputsError,
+  type AccountProfileProjection,
+} from "./agent-config-store.js";
+import type { AgentReadiness, AgentRunRequest } from "./agent-run-preparation.js";
+import { getCredentialStatus, MODEL_ACCOUNT_REF_PATTERN, type ModelCredentialDeps } from "./model-credentials.js";
+import { createModelProtectedSecrets, type ProtectedSecretFailure } from "./model-protected-secrets.js";
+import { mintPairingCode, readPairingStatus, PAIRING_OPERATOR } from "./chatgpt-pairing.js";
+import { createModelSessionStore } from "./model-session-store.js";
+import { createModelSessionKeyProvider } from "./model-session-keys.js";
+import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
 import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries, type AccessRole } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
-import type { DeployStart } from "./deploy.js";
+import type { SelfDeployClient } from "./restate/self-deploy.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
@@ -50,14 +93,15 @@ import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getPulls, getIssueEnrichment } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getJobByMachineId, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
-import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
+import { destroyMachineRecorded } from "./backend-run.js";
+import { classifyFlySecretNames, listMachines, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { resolveInFlightSiblings, selectBlockers, mergeProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, fetchProviderSnapshots, selectForeignTrackerBlockers, type ForeignTrackerIssue, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { count as countReservedCapacity } from "./dispatch-admission.js";
-import { read as readDispatchAdmission } from "./dispatch-admission.js";
+import { listHeldReservations } from "./dispatch-admission.js";
 import { RESTATE_WRITE_TOOL_NAMES, IDEMPOTENCY_KEY_SHAPE, scopeIdempotencyKey } from "./mcp.js";
 import { adminHtml } from "./admin-html.js";
 import {
@@ -67,15 +111,20 @@ import {
   setRetryPolicy,
   getLinearPickupLabel,
   DEFAULT_LINEAR_PICKUP_LABEL,
+  getRunnerImageAllowedPrefixes,
+  validateRunnerImagePrefixes,
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
+  getFlySessionsConfig,
+  getRunnerBackendSource,
+  refreshRunnerBackendCache,
 } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
-import { listRepoBranchesAndTags, getRepoDefaultBranch, cancelWorkflowRun, fetchRepoTarball } from "./github.js";
+import { listRepoBranchesAndTags, getRepoDefaultBranch, fetchRepoTarball } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
-import { getFleetReport } from "./report-card.js";
+import { getFleetReport, restateRefForJob } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { FilesystemProvider } from "./providers/filesystem.js";
@@ -84,15 +133,14 @@ import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js"
 import { readLocalJobLogs } from "./local-job-logs.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { isBareWorkflowFileName, workflowFileNamesCollide } from "./workflow-sync.js";
-import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
-import { fetchTrackerIssuesPage } from "./runner-callback.js";
-import { isLinearAuthConfigured } from "./linear-app-auth.js";
-import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 import type { callTool } from "./restate/tools-client.js";
-import type { RestateStatus } from "./restate/status.js";
+import type { TrackerExportIngressClient } from "./restate/tracker-export.js";
+import type { SetupChecksIngressResult } from "./restate/setup-checks.js";
+import type { SetupCheckRun } from "./setup-checks/index.js";
 import type { Caller } from "./mcp-identity.js";
+import { controlPlaneTokenActive, verifyControlPlaneToken } from "./control-plane-token.js";
 import picomatch from "picomatch";
 
 function normalizeSkillsRepo(raw: unknown): string | null {
@@ -171,65 +219,36 @@ function validReviewerMaxTurns(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 200;
 }
 
-/**
- * Returns the reason enabling reviewFixLifecycle="restate" is refused, or null when it may
- * proceed. Only automatic GitHub Actions review-fix runs ever move to Restate — local
- * review-fix and human comment-triggered runs stay on Legacy admission regardless.
- *
- * Checks both real prerequisites and fails closed whenever either signal is unavailable or
- * ambiguous (AII-804) — this never guesses:
- *  - "registered, healthy Restate endpoint": `deps.getRestateStatus()` (src/restate/status.ts,
- *    injected — see AdminDeps.getRestateStatus for why this file can't import it directly)
- *    must report the sidecar ready and the endpoint registered. AII-773/AII-724/AII-807 own
- *    when that state actually becomes reachable in production; until then this reports the
- *    endpoint unavailable rather than accepting on a hardcoded assumption.
- *  - "installed template/runner capability on the dispatch ref": a live probe of the target
- *    workflow file at `ref` (src/workflow-probe.ts's resolveWorkflowCapabilities, the same
- *    call the review-fix dispatcher itself makes) must show it declares `run_attempt_token`
- *    (AII-778's attempt-correlation contract) — the capability the Restate pilot actually
- *    depends on to correlate a dispatch back to its attempt.
- */
-async function reviewFixLifecycleEnablementError(
-  params: { executionMode: ExecutionMode; owner: string; repo: string; workflowFile: string; ref: string },
-  config: AdminConfig,
-  deps: AdminDeps,
-): Promise<string | null> {
-  const { executionMode, owner, repo, workflowFile, ref } = params;
-  if (executionMode !== "github-actions") {
-    return `reviewFixLifecycle "restate" requires executionMode "github-actions"`;
-  }
+const TRUSTED_REVIEW_AUTHOR_RE = /^[a-z0-9][a-z0-9-]*(\[bot\])?$/;
 
-  const restateStatus = deps.getRestateStatus?.();
-  if (!restateStatus || restateStatus.sidecar.state !== "ready" || restateStatus.registration.state !== "registered") {
-    return `reviewFixLifecycle "restate" requires a registered, healthy Restate endpoint, which is not currently available`;
+function normalizeTrustedReviewAuthors(raw: unknown): string[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw)) {
+    throw new Error("must be an array of strings or null");
   }
-
-  // The reservation ledger was introduced after some Legacy jobs were launched.
-  // Those jobs do not occupy a ledger slot, so admitting Restate work while one
-  // remains active could exceed the shared cap or let both owners work on a PR.
-  // Initial activation waits for the whole unreserved Legacy fleet to drain.
-  const unreservedLegacyJob = getInFlightJobs().find((job) => {
-    if (job.phase === "kg-refresh") return false;
-    const admission = job.dispatchId ? readDispatchAdmission(job.dispatchId) : null;
-    return !admission || admission.releasedAt !== null;
+  if (raw.length > 20) {
+    throw new Error(`too many entries (${raw.length}); maximum is 20`);
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  raw.forEach((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new Error(`[${index}] must be a string`);
+    }
+    const normalized = entry.trim().toLowerCase();
+    if (normalized.length === 0) {
+      throw new Error(`[${index}] must not be empty`);
+    }
+    if (!TRUSTED_REVIEW_AUTHOR_RE.test(normalized)) {
+      throw new Error(`[${index}] "${entry}" is not a valid GitHub login`);
+    }
+    if (seen.has(normalized)) {
+      throw new Error(`duplicate entry "${normalized}"`);
+    }
+    seen.add(normalized);
+    result.push(normalized);
   });
-  if (unreservedLegacyJob) {
-    return `reviewFixLifecycle "restate" requires active unreserved Legacy workers to drain before activation`;
-  }
-
-  let capabilities: Awaited<ReturnType<typeof resolveWorkflowCapabilities>>;
-  try {
-    const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-    capabilities = await resolveWorkflowCapabilities({ owner, repo, workflowFile, token, ref });
-  } catch {
-    return `reviewFixLifecycle "restate" could not verify the dispatch-ref workflow's capability`;
-  }
-
-  if (capabilities.contract !== "envelope" || !capabilities.supportsAttemptCorrelation || !capabilities.supportsRunPublicationToken) {
-    return `reviewFixLifecycle "restate" requires "${workflowFile}" on "${ref}" to declare run_attempt_token and run_publication_token (installed template/runner capability)`;
-  }
-
-  return null;
+  return result.length > 0 ? result : null;
 }
 
 let _adminJiraClient: JiraClient | null = null;
@@ -248,7 +267,15 @@ function getAdminJiraClient(): JiraClient | null {
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (req.destroyed || req.aborted) {
+      reject(new Error("request aborted"));
+      return;
+    }
     const chunks: Buffer[] = [];
+    req.once("aborted", () => reject(new Error("request aborted")));
+    req.once("close", () => {
+      if (!req.complete) reject(new Error("request closed before body completed"));
+    });
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => resolve(Buffer.concat(chunks).toString()));
     req.on("error", reject);
@@ -266,28 +293,22 @@ export function clearDedupEntryAction(issueId: string): { status: number; body: 
 }
 
 /**
- * Loops fetchTrackerIssuesPage across every page for a team, returning the flat
+ * Loops `TrackerExport.page` across every page for a team, returning the flat
  * issue array the kg-refresh dev harness's `--tracker-data` file expects
  * (`Array.isArray(parsed) ? parsed.length : 0` in kg-tracker-data.ts). A
- * non-200 page short-circuits and its status/error propagate to the caller.
+ * non-OK page short-circuits and its code propagates to the caller.
  */
 async function fetchAllTrackerIssuesForTeam(
+  trackerExport: TrackerExportIngressClient,
   teamKey: string,
-): Promise<{ ok: true; issues: unknown[] } | { ok: false; status: number; error: string }> {
+): Promise<{ ok: true; issues: unknown[] } | { ok: false; code: string }> {
   const issues: unknown[] = [];
   let cursor: string | null = null;
   do {
-    const page = await fetchTrackerIssuesPage(teamKey, cursor);
-    if (page.status !== 200) {
-      const error = (page.body as { error?: string }).error ?? "Upstream tracker error";
-      return { ok: false, status: page.status, error };
-    }
-    const body = page.body as {
-      issues: unknown[];
-      pageInfo: { hasNextPage: boolean; endCursor: string | null };
-    };
-    issues.push(...body.issues);
-    cursor = body.pageInfo.hasNextPage ? body.pageInfo.endCursor : null;
+    const result = await trackerExport.page({ team: teamKey, cursor });
+    if (!result.ok) return { ok: false, code: result.code };
+    issues.push(...result.page.issues);
+    cursor = result.page.pageInfo.hasNextPage ? result.page.pageInfo.endCursor : null;
   } while (cursor !== null);
   return { ok: true, issues };
 }
@@ -373,9 +394,8 @@ async function resolveKgManifestTeams(
 
 /**
  * Union of every team currently in scope for the KG: the KG repo's sources.yml
- * trackers: manifest, plus every mapped team with a Linear ticketing provider (the
- * only provider fetchAllTrackerIssuesForTeam supports). Jira-mapped teams are
- * silently excluded rather than attempted and failed.
+ * trackers: manifest, plus every mapped team whose tracker `TrackerExport` can read
+ * (Linear and Jira; a filesystem mapping has no tracker).
  */
 async function resolveKgScopeTeams(
   kgSourceRepo: string | null | undefined,
@@ -383,10 +403,18 @@ async function resolveKgScopeTeams(
   githubAppPrivateKey: string,
 ): Promise<string[]> {
   const manifestTeams = await resolveKgManifestTeams(kgSourceRepo, githubAppId, githubAppPrivateKey);
-  const linearMappedTeams = Object.entries(getMappings())
-    .filter(([, m]) => m.ticketingProvider === "linear")
+  const mappings = getMappings();
+  const mappedManifestTeams = manifestTeams.filter((t) => Object.hasOwn(mappings, t));
+  const skippedTeams = manifestTeams.filter((t) => !Object.hasOwn(mappings, t));
+  if (skippedTeams.length > 0) {
+    console.warn(
+      `[admin] KG scope: skipping manifest teams with no orchestrator mapping (no tracker to read): ${skippedTeams.join(", ")}`,
+    );
+  }
+  const trackerMappedTeams = Object.entries(mappings)
+    .filter(([, m]) => m.ticketingProvider === "linear" || m.ticketingProvider === "jira")
     .map(([key]) => key);
-  return [...new Set([...manifestTeams, ...linearMappedTeams])];
+  return [...new Set([...mappedManifestTeams, ...trackerMappedTeams])];
 }
 
 function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
@@ -450,38 +478,80 @@ export interface AdminConfig {
   kgSourceRepo?: string | null;
 }
 
+/**
+ * The two retention settings (AII-1137). Injected rather than imported because
+ * src/restate/retention.ts is off this file's runtime-import allowlist; bound in src/index.ts.
+ * The setters throw on an out-of-range value.
+ */
+export interface RetentionDeps {
+  getRestateDays: () => number;
+  setRestateDays: (days: number) => void;
+  getVolumeDays: () => number;
+  setVolumeDays: (days: number) => void;
+  /** Applies the volume value to the orchestrator's Fly volumes. Never throws; a failure comes back as `skipped`. */
+  applyVolume: (days: number) => Promise<{ applied: string[]; skipped: string }>;
+  default: number;
+  min: number;
+  max: number;
+}
+
 export interface AdminDeps {
-  /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
-  startDeploy?: (targetOverride?: SelfDeployTarget) => Promise<DeployStart>;
+  retention?: RetentionDeps;
+  /** The `SelfDeploy` object's ingress client. Absent when the orchestrator is not configured to deploy itself. */
+  selfDeploy?: SelfDeployClient;
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(opts?: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
-    status(): Promise<KgRefreshStatus>;
-    /** Called by the operator-cancel path to close the ingest chain cleanly. */
-    onMachineLost(opts?: { failureCode?: string }): void;
+    trigger(opts?: { ref?: string; actorEmail?: string }, caller?: Caller): Promise<{ status: number; body: Record<string, unknown> }>;
+    status(): Promise<{ status: number; body: unknown }>;
+    /** The operator-cancel path: asks the KgRefresh workflow to cancel and confirm termination (AII-901). */
+    cancel(opts: { jobId: number; dispatchId?: string | null; reason: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   };
   /** The tools-service ingress caller (src/restate/tools-client.ts, AII-710). Absent only in tests that don't exercise POST /api/tools/<name>. */
   callTool?: typeof callTool;
+  /** The `TrackerExport` ingress client (AII-1463), bound in src/index.ts. Absent only in tests that don't exercise GET /api/kg/tracker-data; the route answers 503 `unavailable` then. */
+  trackerExport?: TrackerExportIngressClient;
+  /** Re-reads `RunnerBackend/fly-machines` into the cache after a Settings write. Defaults to `refreshRunnerBackendCache`; a test seam. */
+  refreshRunnerBackendCache?: () => Promise<void>;
   /**
-   * Reads the Restate sidecar/endpoint status (src/restate/status.ts's getRestateStatus,
-   * AII-773/AII-804). Injected rather than imported at runtime because this file may only
-   * import src/restate/* as types (src/__tests__/restate-boundary.test.ts) — the real
-   * function is bound in src/index.ts, which sits on that test's runtime-import allowlist.
-   * Absent only in tests that don't exercise reviewFixLifecycle="restate" enablement.
+   * Clears an address's bindings through the `AccessBinding` object (src/restate/access-binding.ts), which is the only
+   * writer of bindings. Injected to keep runtime Restate imports outside admin.ts; bound in src/index.ts. Absent in tests that
+   * don't exercise the route, where it answers 503. There is no direct-delete fallback.
    */
-  getRestateStatus?: () => RestateStatus;
+  clearAccessBindings?: (address: string, actor: string | null) => Promise<number>;
+  /** Secret-free KeyBinding ingress helpers, wired by index.ts. Missing services fail closed. */
+  bindKey?: (keyRef: string, destination: string) => Promise<KeyBindOutcome>;
+  clearKeyBinding?: (keyRef: string) => Promise<number>;
+  /** Reads a profile's ChatGPT refresh state (src/restate/chatgpt-plan-account.ts). Injected to keep runtime Restate imports outside admin.ts; absent in tests, where the status reports `unknown`. */
+  readChatGptPlanState?: (profileId: string) => Promise<{ lastOutcome: string } | null>;
   /**
    * The review-fix attempt lifecycle facade (AII-806) — attempt detail/activity reads
    * and the reconcile/adopt/cancel recovery actions. A narrow injected interface
    * mirroring `deps.kgRefresh`: its concrete implementation composes the storage
-   * (AII-786), delivery (AII-802/803), and lifecycle-setting (AII-804) contract work,
+   * (AII-786) and delivery (AII-802/803) contracts,
    * plus a real call into the Restate `ReviewFixAttempt` workflow — this file cannot
    * make that last call itself, since it may only import `src/restate/*` as types
    * (src/__tests__/restate-boundary.test.ts). Absent only in tests/deployments that
    * don't exercise the five `/api/review-fix/attempts/*` routes, which then answer 501.
    */
   reviewFixAttempts?: ReviewFixAttemptsFacade;
+  /**
+   * Model-account and stage-configuration seam (AII-962). Injected because admin.ts only imports Restate types: the concrete readiness inspection composes `model-auth-runtime`
+   * (GitHub App tokens, session store), bound in src/index.ts. Absent means readiness is
+   * unknown: profile statuses read `unknown` and opting a project in is refused with 501.
+   */
+  agentConfig?: AgentConfigAdminDeps;
+  /** Reads the stored setup-check run from the `SetupChecks` object (AII-1538). Injected to keep runtime Restate imports outside admin.ts; absent in tests that don't exercise the route, where it answers 503. */
+  readSetupChecks?: () => Promise<SetupChecksIngressResult<SetupCheckRun | null>>;
+  /** Runs the setup checks through `SetupChecks.run` and answers the new run. Same injection as `readSetupChecks`. */
+  runSetupChecks?: () => Promise<SetupChecksIngressResult<SetupCheckRun>>;
+}
+
+export interface AgentConfigAdminDeps {
+  /** Read-only readiness (`inspectAgentReadiness`) for one project on one backend. Never writes, reserves or mints. */
+  inspectReadiness(request: Omit<AgentRunRequest, "dispatchId">, candidate?: StageAgentConfigurationV1): Promise<AgentReadiness>;
+  /** Safe credential status inputs; no secret is read through them. */
+  credentials: ModelCredentialDeps;
 }
 
 /** Caller identity passed into every `reviewFixAttempts` facade call, so scope and
@@ -492,7 +562,12 @@ export interface ReviewFixAttemptCaller {
   email: string | null;
 }
 
-export interface ReviewFixAttemptExecutionRef {
+export type ReviewFixAttemptExecutionRef =
+  | ({ backend: "github-actions" } & ReviewFixAttemptAdoptInput)
+  | { backend: "fly-machines" | "local-docker"; runRef: string };
+
+/** GitHub-only operator adoption body; independent of the read projection. */
+export interface ReviewFixAttemptAdoptInput {
   githubRunId: string;
   githubRunAttempt: number;
 }
@@ -524,6 +599,8 @@ export interface ReviewFixAttemptDetail {
   /** False whenever a requested cancellation or deadline has not yet been confirmed
    *  stopped on GitHub's side — explicit, never inferred from an absent field. */
   terminationConfirmed: boolean;
+  /** Latest snapshot-validated invocation for this attempt's own dispatch; absent on older servers. */
+  attribution?: InvocationAttributionV1 | null;
   cycles: ReviewFixAttemptCycleSummary[];
 }
 
@@ -590,7 +667,7 @@ export interface ReviewFixAttemptsFacade {
   reconcile(attemptId: string, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
   /** Succeeds only when `execution` verifies as a genuine match for this attempt — an
    *  unverified reference must never flip ownership. */
-  adopt(attemptId: string, execution: ReviewFixAttemptExecutionRef, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
+  adopt(attemptId: string, execution: ReviewFixAttemptAdoptInput, caller: ReviewFixAttemptCaller): Promise<ReviewFixActionOutcome>;
   /**
    * Cancel is two explicit steps, called by the route handler in this order and never
    * collapsed into one call: authority is revoked before termination is even requested,
@@ -615,6 +692,15 @@ function grantedRouteAllows(url: string, method: string, grantedPages: string[])
 
 /** Matches POST /api/tools/<name> — the tools-service entry point (AII-712). */
 const TOOL_CALL_ROUTE = /^\/api\/tools\/([^/]+)$/;
+
+/** decodeURIComponent that answers null on malformed percent-encoding instead of throwing. */
+function safeDecode(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
 
 /** Review-fix attempt routes (AII-806). Matched against the path with any query string
  *  stripped — the activity route takes cursor/pageSize as query params. */
@@ -700,6 +786,31 @@ export function handleAdminRequest(
     return true;
   }
 
+  // The BuildDown control plane's token is accepted on the tools route only (AII-1514): every
+  // other /api route assumes a human admin session. A token that does not verify falls through
+  // to the admin gate, so an admin session sent as a Bearer still works.
+  if (
+    method === "POST" &&
+    TOOL_CALL_ROUTE.test(url) &&
+    req.headers.authorization?.startsWith("Bearer ") &&
+    controlPlaneTokenActive() &&
+    safeDecode(TOOL_CALL_ROUTE.exec(url)![1]) !== null
+  ) {
+    const toolName = safeDecode(TOOL_CALL_ROUTE.exec(url)![1])!;
+    void verifyControlPlaneToken(req.headers.authorization)
+      .then((caller) => {
+        if (caller) return handleToolCall(req, res, caller, "control-plane", toolName, deps);
+        const gate = authorizeApiRequest(req, res, url, method);
+        if (!gate) return;
+        return handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }, gate.identity?.email ?? "session", toolName, deps);
+      })
+      .catch((err) => {
+        console.error("[admin] tool call failed:", err);
+        if (!res.headersSent) json(res, 500, { error: "Internal server error" });
+      });
+    return true;
+  }
+
   // All other /api routes require auth
   if (url.startsWith("/api/")) {
     const gate = authorizeApiRequest(req, res, url, method);
@@ -716,13 +827,18 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/deploy" && method === "POST") {
-      handleDeployTrigger(res, deps);
+      runAsync(res, handleDeployTrigger(res, deps, gate.identity?.email ?? "access-code"));
+      return true;
+    }
+
+    if (url === "/api/deploy-cancel" && method === "POST") {
+      runAsync(res, handleDeployCancel(res, deps, gate.identity?.email ?? "access-code"));
       return true;
     }
 
     const toolCallMatch = TOOL_CALL_ROUTE.exec(url);
     if (toolCallMatch && method === "POST") {
-      handleToolCall(req, res, gate, decodeURIComponent(toolCallMatch[1]), deps);
+      handleToolCall(req, res, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }, gate.identity?.email ?? "session", decodeURIComponent(toolCallMatch[1]), deps);
       return true;
     }
 
@@ -731,39 +847,29 @@ export function handleAdminRequest(
         json(res, 501, { error: "KG refresh is not configured" });
         return true;
       }
-      // AII-635: an optional JSON body `{ dryRun?: boolean }` selects the dry-run mode
-      // (AII-632): same runner job, push skipped, guard table on the status. No body,
-      // or `dryRun: false`, is the unchanged real refresh. The response echoes `dryRun`
-      // beside the trigger's own fields so the caller can tell which mode ran.
-      // AII-628: `{ acceptNewBaseline?: boolean }` carries the one-shot content-guard
-      // override through to the dispatched runner, tagged with this session's identity
-      // for the guard-override log line and the refresh PR's ### Baseline section.
+      // The admin dry-run and the trigger-time accept are gone (a held run is the preview, and
+      // accepting is a decision on that run). A body asking for either is refused: ignoring the
+      // key would run a real refresh that pushes to the KG repo for a caller who asked for a dry-run.
       const kgRefresh = deps.kgRefresh;
       readBody(req).then(
         (raw) => {
-          let dryRun = false;
-          let acceptNewBaseline = false;
           if (raw.trim()) {
+            let parsed: { dryRun?: unknown; acceptNewBaseline?: unknown } | null;
             try {
-              const parsed = JSON.parse(raw) as { dryRun?: unknown; acceptNewBaseline?: unknown };
-              dryRun = parsed.dryRun === true;
-              acceptNewBaseline = parsed.acceptNewBaseline === true;
+              parsed = JSON.parse(raw) as { dryRun?: unknown; acceptNewBaseline?: unknown } | null;
             } catch {
               json(res, 400, { error: "Invalid JSON body" });
               return;
             }
+            for (const option of ["dryRun", "acceptNewBaseline"] as const) {
+              if (parsed && typeof parsed === "object" && parsed[option] === true) {
+                json(res, 400, { error: "option-removed", option });
+                return;
+              }
+            }
           }
-          const opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string } = {};
-          if (dryRun) opts.dryRun = true;
-          if (acceptNewBaseline) {
-            opts.acceptNewBaseline = true;
-            // An access-code session has no email; name it so the log line and the
-            // ### Baseline section never read "unknown" for a real press.
-            opts.actorEmail = gate.identity?.email ?? "access-code session";
-          }
-          const pending = (dryRun || acceptNewBaseline) ? kgRefresh.trigger(opts) : kgRefresh.trigger();
-          return pending.then(
-            (r) => json(res, r.status, { ...r.body, dryRun, acceptNewBaseline }),
+          return kgRefresh.trigger(undefined, { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] }).then(
+            (r) => json(res, r.status, r.body),
             (err) => json(res, 500, { error: String(err) }),
           );
         },
@@ -778,7 +884,7 @@ export function handleAdminRequest(
         return true;
       }
       deps.kgRefresh.status().then(
-        (body) => json(res, 200, body),
+        (r) => json(res, r.status, r.body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
@@ -803,11 +909,31 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/kg/execution-mode" && method === "GET") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      const status = getKgExecutionMode(!!(config.flySessionsToken && config.flySessionsApp));
+      json(res, 200, { mode: status.mode, source: status.source });
+      return true;
+    }
+
+    if (url === "/api/kg/execution-mode" && method === "POST") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      handleSetKgExecutionMode(req, res, config);
+      return true;
+    }
+
     // Admin-authenticated export of tracker data for the kg-refresh dev harness's
-    // --tracker-data flag — same underlying Linear read as the runner-only
-    // POST /api/runner/kg-tracker-data, aggregated across pages for one team.
+    // --tracker-data flag — both this route and the runner-only
+    // POST /api/runner/kg-tracker-data call TrackerExport through one ingress client;
+    // this one aggregates the pages for a team.
     // With no ?team=, exports the union of every team in scope (the KG repo's
-    // sources.yml manifest plus every Linear-mapped team), deduplicated by issue id —
+    // sources.yml manifest plus every Linear- or Jira-mapped team), deduplicated by issue id —
     // the harness's default fetch when no --tracker-data file is given (AII-608).
     if (url.startsWith("/api/kg/tracker-data") && method === "GET") {
       const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
@@ -819,14 +945,14 @@ export function handleAdminRequest(
           json(res, 403, { error: "Unauthorized" });
           return true;
         }
-        if (!isLinearAuthConfigured()) {
-          json(res, 503, { error: "Tracker not configured" });
+        if (!deps.trackerExport) {
+          json(res, 503, { error: "unavailable" });
           return true;
         }
-        fetchAllTrackerIssuesForTeam(team).then(
+        fetchAllTrackerIssuesForTeam(deps.trackerExport, team).then(
           (result) => {
             if (!result.ok) {
-              json(res, result.status, { error: result.error });
+              json(res, 503, { error: result.code });
             } else {
               json(res, 200, result.issues);
             }
@@ -836,8 +962,9 @@ export function handleAdminRequest(
         return true;
       }
 
-      if (!isLinearAuthConfigured()) {
-        json(res, 503, { error: "Tracker not configured" });
+      const trackerExport = deps.trackerExport;
+      if (!trackerExport) {
+        json(res, 503, { error: "unavailable" });
         return true;
       }
       (async () => {
@@ -845,9 +972,9 @@ export function handleAdminRequest(
           const scopeTeams = await resolveKgScopeTeams(config.kgSourceRepo, config.githubAppId, config.githubAppPrivateKey);
           const byId = new Map<string, unknown>();
           for (const scopeTeam of scopeTeams) {
-            const result = await fetchAllTrackerIssuesForTeam(scopeTeam);
+            const result = await fetchAllTrackerIssuesForTeam(trackerExport, scopeTeam);
             if (!result.ok) {
-              json(res, result.status, { error: result.error });
+              json(res, 503, { error: result.code });
               return;
             }
             for (const issue of result.issues) {
@@ -863,33 +990,32 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/dispatch-reservations" && method === "GET") {
+      json(res, 200, { reservations: listHeldReservations() });
+      return true;
+    }
+
     if (url === "/api/deployment-status" && method === "GET") {
-      const availability = getAvailability();
-      const policy = getDeployPolicy();
-      const target = resolveDeployTarget(deps.selfDeployTarget ?? null, policy);
-      json(res, 200, {
-        configured: !!deps.startDeploy,
-        available: availability?.available ?? null,
-        held: isDeployHeld(),
-        deployStartedAt: getDeployStartedAt(),
-        inFlight: getInFlightWork(),
-        checkedAt: availability?.checkedAt ?? null,
-        runningCommit: availability?.runningCommit ?? null,
-        headCommit: availability?.headCommit ?? null,
-        isDowngrade: availability?.isDowngrade ?? null,
-        repo: target ? `${target.owner}/${target.repo}` : null,
-        branch: target?.branch ?? null,
-        ...policy,
-        // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
-        notifyConfigured: Boolean(config.notifyWebhookUrl),
-        lastActedCommit: getLastActedCommit(),
-        lastDeployOutcome: getDeployOutcome(),
-      });
+      runAsync(res, handleDeploymentStatus(res, deps, config));
       return true;
     }
 
     if (url === "/api/deploy-policy" && method === "POST") {
-      handleSetDeployPolicy(req, res);
+      handleSetDeployPolicy(req, res, deps);
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "GET") {
+      if (!deps.retention) {
+        json(res, 501, { error: "Retention settings are not available" });
+        return true;
+      }
+      json(res, 200, retentionView(deps.retention));
+      return true;
+    }
+
+    if (url === "/api/retention" && method === "POST") {
+      handleSetRetention(req, res, deps);
       return true;
     }
 
@@ -920,6 +1046,63 @@ export function handleAdminRequest(
       if (!job || job.teamKey !== teamKey) { json(res, 404, { error: "sync job not found" }); return true; }
       json(res, 200, { id: job.id, status: job.status, result: job.result, error: job.error });
       return true;
+    }
+
+    // Model accounts and stage configuration (AII-962). Admin-only: none of these paths is in PAGE_ROUTES,
+    // and a granted page never reaches a non-GET. Matched exactly, and before the generic mapping handlers.
+    if (url === "/api/model-accounts" && method === "GET") {
+      handleListModelAccounts(res, deps);
+      return true;
+    }
+    if (url === "/api/model-accounts" && method === "POST") {
+      runAsync(res, handleCreateModelAccount(req, res, deps));
+      return true;
+    }
+    const modelAccountMatch = url.match(/^\/api\/model-accounts\/([^/]+)$/);
+    if (modelAccountMatch && method === "PATCH") {
+      runAsync(res, handlePatchModelAccount(req, res, decodeURIComponent(modelAccountMatch[1]), deps));
+      return true;
+    }
+    const credentialMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/credential$/);
+    if (credentialMatch && (method === "PUT" || method === "DELETE")) {
+      const actor = gate.identity?.email ?? "access-code";
+      runAsync(res, handleModelAccountCredential(req, res, decodeURIComponent(credentialMatch[1]), method, actor, deps));
+      return true;
+    }
+    const pairingMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-pairing$/);
+    if (pairingMatch && method === "POST") {
+      handleChatGptPairingMint(req, res, decodeURIComponent(pairingMatch[1]), gate.identity?.email ?? "access-code");
+      return true;
+    }
+    const pairingStatusMatch = url.match(/^\/api\/model-accounts\/([^/]+)\/chatgpt-status$/);
+    if (pairingStatusMatch && method === "GET") {
+      runAsync(res, handleChatGptStatus(res, decodeURIComponent(pairingStatusMatch[1]), deps));
+      return true;
+    }
+    if (url === "/api/agent-defaults" && method === "GET") {
+      const stored = getOrchestratorDefaults();
+      json(res, 200, stored ? { configured: true, ...storedConfigView(stored) } : { configured: false, mode: "legacy", stages: {} });
+      return true;
+    }
+    if (url === "/api/agent-defaults" && method === "PUT") {
+      runAsync(res, handlePutAgentDefaults(req, res, gate.identity?.email ?? null));
+      return true;
+    }
+    const agentConfigMatch = url.match(/^\/api\/mappings\/([^/]+)\/agent-config(\/resolved)?$/);
+    if (agentConfigMatch) {
+      const projectKey = decodeURIComponent(agentConfigMatch[1]);
+      if (agentConfigMatch[2] && method === "GET") {
+        handleGetResolvedAgentConfig(res, projectKey, deps);
+        return true;
+      }
+      if (!agentConfigMatch[2] && method === "GET") {
+        handleGetProjectAgentConfig(res, projectKey);
+        return true;
+      }
+      if (!agentConfigMatch[2] && method === "PUT") {
+        runAsync(res, handlePutProjectAgentConfig(req, res, projectKey, deps, gate.identity?.email ?? null));
+        return true;
+      }
     }
 
     // Secrets management: /api/mappings/:teamKey/secrets or /api/mappings/:teamKey/secrets/:name
@@ -1089,6 +1272,16 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/setup-checks" && method === "GET") {
+      answerSetupChecks(res, deps.readSetupChecks);
+      return true;
+    }
+
+    if (url === "/api/setup-checks/run" && method === "POST") {
+      answerSetupChecks(res, deps.runSetupChecks);
+      return true;
+    }
+
     if (url === "/api/sessions" && method === "GET") {
       handleListSessions(req, res, config, registry);
       return true;
@@ -1113,7 +1306,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/settings" && method === "POST") {
-      handlePostSettings(req, res, config);
+      handlePostSettings(req, res, config, gate, deps);
       return true;
     }
 
@@ -1124,6 +1317,11 @@ export function handleAdminRequest(
 
     if (url === "/api/access" && method === "POST") {
       handlePostAccess(req, res, gate.identity);
+      return true;
+    }
+
+    if (url === "/api/access/clear-bindings" && method === "POST") {
+      handleClearAccessBindings(req, res, gate.identity, deps);
       return true;
     }
 
@@ -1261,6 +1459,13 @@ export function handleAdminRequest(
   return false;
 }
 
+/** Answers a `SetupChecks` call, or 503 `restate-unavailable` when it is not wired or Restate could not take it (AII-1538). */
+async function answerSetupChecks<T>(res: http.ServerResponse, call: (() => Promise<SetupChecksIngressResult<T>>) | undefined): Promise<void> {
+  const result = call ? await call() : { status: "unavailable" as const };
+  if (result.status === "ok") json(res, 200, result.value);
+  else json(res, 503, { error: "restate-unavailable" });
+}
+
 async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   try {
     const body = JSON.parse(await readBody(req)) as { issueId?: string };
@@ -1277,20 +1482,14 @@ async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResp
 
 async function fetchMergedSnapshot(
   registry: ProviderRegistry,
-): Promise<{ snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[] }> {
-  const allMappings = Object.values(getMappings());
-  const providers = await registry.forAllMappings(allMappings);
-  if (providers.length === 0) {
-    return {
-      snapshot: { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] },
-      foreign: [],
-    };
-  }
-  const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
-  return mergeProviderSnapshots(
-    providers.map((p, i) => ({ providerId: p.id, snapshot: snapshots[i] })),
-    getMappings(),
-  );
+): Promise<{ snapshot: AIImplementSnapshot; foreign: ForeignTrackerIssue[]; failedTrackers: Array<{ provider: string; error: string }> }> {
+  const providers = await registry.forAllMappings(Object.values(getMappings()));
+  const { snapshot, foreign, failed } = await fetchProviderSnapshots(providers, getMappings());
+  const failedTrackers = failed.map(({ providerId, error }) => ({
+    provider: providerId,
+    error: error instanceof Error ? error.message : String(error),
+  }));
+  return { snapshot, foreign, failedTrackers };
 }
 
 async function resolveIssueUrl(
@@ -1300,7 +1499,7 @@ async function resolveIssueUrl(
   identifier: string | null,
 ): Promise<string | null> {
   if (!teamKey || !identifier) return null;
-  const mapping = getMappings()[teamKey];
+  const mapping = getOwnMapping(teamKey);
   if (!mapping) return null;
   try {
     const provider = await registry.forMapping(mapping);
@@ -1336,7 +1535,7 @@ async function handleGetJobSteps(
   const job = getJobById(jobId);
   if (!job) { json(res, 404, { error: "job not found" }); return; }
   const issueUrl = await resolveIssueUrl(registry, job.teamKey, job.issueId, job.issueIdentifier);
-  json(res, 200, { job: { ...job, issueUrl }, steps: getStepsByJobId(jobId) });
+  json(res, 200, { job: { ...job, issueUrl, restate: restateRefForJob(job.dispatchId, job.phase) }, steps: getStepsByJobId(jobId) });
 }
 
 async function handleGetLocalJobLogs(
@@ -1404,7 +1603,7 @@ async function handleListBlockers(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const { snapshot, foreign } = await fetchMergedSnapshot(registry);
+    const { snapshot, foreign, failedTrackers } = await fetchMergedSnapshot(registry);
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
@@ -1413,17 +1612,25 @@ async function handleListBlockers(
     const reservedCountsByTeam = Object.fromEntries(
       Object.entries(capacityByMapping).map(([teamKey, capacity]) => [teamKey, capacity.used]),
     );
+    // Park state per (issue, phase), read once; the phase split matches the poll's.
+    const parkedByKey = new Map(listParked().map((p) => [`${p.issueId}:${p.phase}`, p.failures]));
+    const planningIds = new Set(snapshot.needsPlanning.map((i) => i.id));
+    const parkedFor = (issue: TicketIssue) => {
+      const failures = parkedByKey.get(`${issue.id}:${planningIds.has(issue.id) ? "planning" : "implementation"}`);
+      return failures === undefined ? null : { failures };
+    };
     const baseBlockers = selectBlockers(
       allIssues,
       teamRepoMap,
       reservedCountsByTeam,
       (id) => dispatchedSet.has(id),
+      parkedFor,
     );
     // In-flight issues drop out of the snapshot (AI-Working), so resolve them through the
     // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
     const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
     const fileOverlapCandidates = allIssues.filter(
-      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && teamRepoMap[i.scopeKey],
+      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && !parkedFor(i) && Object.hasOwn(teamRepoMap, i.scopeKey),
     );
     const planningContexts = await getOrFetchPlanningContexts(
       [...fileOverlapCandidates, ...inFlightSiblings],
@@ -1455,6 +1662,7 @@ async function handleListBlockers(
       blockers,
       totals: { teams: teams.size, issues: blockers.length, byReason },
       capacityByMapping,
+      failedTrackers,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
@@ -1466,7 +1674,7 @@ async function handleListIssues(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const { snapshot } = await fetchMergedSnapshot(registry);
+    const { snapshot, failedTrackers } = await fetchMergedSnapshot(registry);
     const allIssues: { issue: TicketIssue; bucket: "ready" | "needs-planning" }[] = [
       ...snapshot.readyForImplementation.map((i) => ({ issue: i, bucket: "ready" as const })),
       ...snapshot.needsPlanning.map((i) => ({ issue: i, bucket: "needs-planning" as const })),
@@ -1481,6 +1689,7 @@ async function handleListIssues(
     json(res, 200, {
       issues,
       inProgressCountsByTeam: snapshot.inProgressCountsByScope,
+      failedTrackers,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
@@ -1505,7 +1714,7 @@ async function handleFilesystemIssueDetails(
   }
 
   const [, scopeKey] = match;
-  const mapping = getMappings()[scopeKey];
+  const mapping = getOwnMapping(scopeKey);
   if (!mapping || mapping.ticketingProvider !== "filesystem") {
     json(res, 404, { error: "filesystem issue not found" });
     return;
@@ -1548,7 +1757,7 @@ async function handleRetryFilesystemIssue(req: http.IncomingMessage, res: http.S
   const match = typeof issueId === "string" ? /^filesystem:([A-Za-z0-9_.-]+):([A-Z][A-Z0-9_]*-\d+)$/.exec(issueId) : null;
   if (!match) { json(res, 400, { error: "issueId must be a filesystem issue id" }); return; }
   if (getRunnerMode().mode !== "local") { json(res, 409, { error: "Filesystem retry requires local runner mode" }); return; }
-  const mapping = getMappings()[match[1]];
+  const mapping = getOwnMapping(match[1]);
   if (!mapping || mapping.ticketingProvider !== "filesystem") { json(res, 404, { error: "Filesystem ticket not found" }); return; }
   try {
     const provider = await registry.forMapping(mapping);
@@ -1659,19 +1868,29 @@ async function handleSetKgMaterializeMode(
     setKgMaterializeDirect(body.direct);
     const status = getKgMaterializeDirect();
 
-    // The DB write succeeded but an env var still wins at runtime. Return 409
-    // so direct API callers can tell their write was overridden.
-    if (status.source === "env") {
-      json(res, 409, {
-        error: "KG_MATERIALIZE_DIRECT env var is set; persisted to DB but has no effect at runtime until the env var is unset",
-        persisted: body.direct,
-        direct: status.enabled,
-        source: status.source,
-      });
+    json(res, 200, { direct: status.enabled, source: status.source });
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+  }
+}
+
+async function handleSetKgExecutionMode(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { mode?: unknown };
+    const mode = typeof body.mode === "string" ? parseKgExecutionModeEnv(body.mode) : undefined;
+    if (!mode) {
+      json(res, 400, { error: "mode must be github-actions or fly-machines" });
       return;
     }
 
-    json(res, 200, { direct: status.enabled, source: status.source });
+    setKgExecutionMode(mode);
+    const status = getKgExecutionMode(!!(config.flySessionsToken && config.flySessionsApp));
+
+    json(res, 200, { mode: status.mode, source: status.source });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
@@ -1733,57 +1952,59 @@ async function handleDestroySession(
 ): Promise<void> {
   // Find the job. For Fly jobs, match by machineId. For GHA jobs (no machineId),
   // fall back to looking up by numeric dispatch_log id passed as the identifier.
+  const closedKgRefresh = () => {
+    const closed = getJobByMachineId(machineId);
+    return closed?.phase === "kg-refresh" ? closed : null;
+  };
   const job =
     getInFlightJobs().find((j) => j.machineId === machineId) ??
-    (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null);
+    (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null) ??
+    closedKgRefresh();
 
-  // Kg-refresh cancel: issue-less run, shared close path via onMachineLost (AII-522).
+  // Kg-refresh stop: issue-less run. The KgRefresh workflow owns the row and the machine (AII-901), so the
+  // route sends its `cancel` and returns its answer. It writes the row only when no workflow will close it.
   if (job?.phase === "kg-refresh") {
-    if (job.executionMode === "github-actions") {
-      if (!job.runId || !job.repo) {
-        json(res, 422, { error: "GHA run ID or repo missing on kg-refresh job" });
-        return;
-      }
-      const [owner, repoName] = job.repo.split("/");
-      try {
-        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-        const cancelled = await cancelWorkflowRun(ghToken, owner, repoName, job.runId);
-        if (!cancelled) {
-          console.error(`[admin] GHA did not accept cancellation for run ${job.runId}`);
-          json(res, 502, { error: "GHA did not accept cancellation" });
-          return;
-        }
-      } catch (err) {
-        console.error(`[admin] Failed to cancel GHA workflow run ${job.runId}:`, err);
-        json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-        return;
-      }
-    } else {
-      if (!config.flySessionsToken || !config.flySessionsApp) {
-        json(res, 503, { error: "Fly sessions config not set" });
-        return;
-      }
-      try {
-        await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
-      } catch (err) {
-        // 404 is fine — machine was already gone
-        if (!(err instanceof Error && err.message.includes("404"))) {
-          console.error(`[admin] Failed to destroy kg-refresh machine ${machineId}:`, err);
-          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-          return;
-        }
-      }
+    if (!deps.kgRefresh) {
+      json(res, 501, { error: "KG refresh is not configured" });
+      return;
+    }
+    let r: { status: number; body: unknown };
+    try {
+      r = await deps.kgRefresh.cancel({ jobId: job.id, dispatchId: job.dispatchId, reason: "operator_cancelled" });
+    } catch (err) {
+      console.error(`[admin] Failed to cancel kg-refresh job ${job.id}:`, err);
+      json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      return;
     }
 
-    // Stamp operator_cancelled before closing the chain. The updateJobStatus guard
-    // (CASE WHEN conclusion IN ('operator_cancelled') THEN conclusion ELSE ?) preserves
-    // this conclusion when onMachineLost() later calls closeJobLog with "timed_out".
+    if (r.status === 200) {
+      // A 200 means the stop was requested, not that the run stopped: the workflow closes the row.
+      if (config.notifyWebhookUrl) {
+        notifyText(config.notifyWebhookUrl, `ℹ️ KG-refresh stop requested by operator — the run will stop if it has not passed the merge.`)
+          .catch((err) => console.error("[admin] kg-refresh stop notify failed:", err));
+      }
+      console.log(`[admin] kg-refresh job ${job.id} stop requested by operator`);
+      json(res, 200, { requested: true });
+      return;
+    }
+
+    const refusal = (r.body as { error?: unknown } | null)?.error;
+    if (r.status !== 409 || refusal !== "no-refresh-in-flight") {
+      // past-merge, restate-unavailable, ...: the run may still be going, so change nothing.
+      json(res, r.status, r.body);
+      return;
+    }
+
+    // Re-read after the await: the run may have finished meanwhile, and a Stop must not
+    // overwrite a closed row's result. Stamp only a row that is still open.
+    const current = getJobById(job.id);
+    if (!current || (current.status !== "dispatched" && current.status !== "running")) {
+      json(res, 409, r.body);
+      return;
+    }
+
+    // No workflow will close this row (unknown dispatch): stamp it once.
     updateJobStatus(job.id, "failed", "operator_cancelled");
-
-    // Close the ingest chain via the shared reaper path (AII-522).
-    deps.kgRefresh?.onMachineLost({ failureCode: "operator_cancelled" });
-
-    // One operator-cancel notification; mark notified to prevent the poll loop duplicate.
     if (config.notifyWebhookUrl) {
       notifyText(
         config.notifyWebhookUrl,
@@ -1804,7 +2025,7 @@ async function handleDestroySession(
   }
 
   try {
-    await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+    await destroyMachineRecorded(config, machineId, "admin-stop");
   } catch (err) {
     // 404 is fine — machine was already gone
     if (!(err instanceof Error && err.message.includes("404"))) {
@@ -1816,12 +2037,13 @@ async function handleDestroySession(
 
   if (job) {
     updateJobStatus(job.id, "failed", "destroyed-by-admin");
-    if (job.issueId) {
+    // A gap-analysis job's ticket already has a PR; a reset would start a new implementation run.
+    if (job.issueId && job.phase !== "gap-analysis") {
       try {
-        const mapping = job.teamKey ? getMappings()[job.teamKey] : undefined;
+        const mapping = job.teamKey ? getOwnMapping(job.teamKey) : undefined;
         if (mapping) {
           const provider = await registry.forMapping(mapping);
-          await provider.clearWorkingState(job.issueId, job.teamKey!);
+          await provider.clearWorkingState(job.issueId, job.teamKey!, job.phase === "planning" ? "planning" : "implementation");
           deleteDispatched(job.issueId);
         } else {
           console.warn(
@@ -1855,6 +2077,9 @@ async function handleGetMachineLogs(
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("(404)")) {
       json(res, 404, { error: "Logs no longer available" });
+    } else if (msg.includes("(401)") || msg.includes("(403)")) {
+      // 502, not 401: the SPA logs out on 401.
+      json(res, 502, { error: "Fly rejected the sessions token for log access (permission or credential problem)" });
     } else {
       json(res, 500, { error: msg });
     }
@@ -1882,6 +2107,23 @@ async function handleAuth(
     }
   } catch {
     json(res, 400, { error: "Invalid request body" });
+  }
+}
+
+export function setProjectAgentModeAction(
+  projectKey: string,
+  mode: "configured" | "legacy",
+  actor: string | null,
+): { ok: true; teamKey: string; agentMode: "configured" | "legacy" } | { ok: false; code: "mapping-not-found" | "resolution-failed" } {
+  if (!Object.hasOwn(getMappings(), projectKey)) {
+    return { ok: false, code: "mapping-not-found" };
+  }
+  try {
+    setProjectConfigured(projectKey, mode === "configured", actor);
+    return { ok: true, teamKey: projectKey, agentMode: mode };
+  } catch (err) {
+    console.error("[admin] set project agent mode failed:", err);
+    return { ok: false, code: "resolution-failed" };
   }
 }
 
@@ -1933,8 +2175,7 @@ export function triggerWorkflowSyncAction(
   config: AdminConfig,
   teamKey: string,
 ): { status: number; body: Record<string, unknown> } {
-  const mappings = getMappings();
-  const mapping = mappings[teamKey];
+  const mapping = getOwnMapping(teamKey);
   if (!mapping) {
     return { status: 404, body: { error: "Team not found" } };
   }
@@ -1957,23 +2198,88 @@ function handleSyncWorkflows(
 async function handleDeployTrigger(
   res: http.ServerResponse,
   deps: AdminDeps,
+  requestedBy: string,
 ): Promise<void> {
-  if (!deps.startDeploy) {
+  if (!deps.selfDeploy) {
     json(res, 501, { error: "Self-deploy is not configured" });
     return;
   }
   try {
-    const resolvedTarget = resolveDeployTarget(deps.selfDeployTarget ?? null, getDeployPolicy());
-    const result = await deps.startDeploy(resolvedTarget ?? undefined);
-    if (!result.started) {
-      json(res, result.reason === "deploy-in-progress" ? 409 : 503, { error: result.reason });
+    const target = resolveDeployTarget(deps.selfDeployTarget ?? null, getDeployPolicy());
+    // SelfDeploy builds its image tag from the branch, and only these two have published images.
+    if (target?.branch !== "testing" && target?.branch !== "main") {
+      json(res, 400, { error: "unsupported-branch" });
       return;
     }
-    json(res, 202, { deploying: result.commit });
+    const result = await deps.selfDeploy.start({ branch: target.branch, requestedBy });
+    if ("reason" in result) {
+      if (result.reason === "head-unknown") json(res, 503, { error: result.reason });
+      else if (result.reason === "image-not-published") json(res, 409, { error: result.reason });
+      else json(res, 501, { error: result.reason });
+      return;
+    }
+    json(res, 202, { deployId: result.deployId, commit: result.commit, image: result.image, alreadyActive: result.alreadyActive });
   } catch (err) {
     console.error("[admin] deploy trigger failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
+}
+
+async function handleDeployCancel(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+  requestedBy: string,
+): Promise<void> {
+  if (!deps.selfDeploy) {
+    json(res, 501, { error: "Self-deploy is not configured" });
+    return;
+  }
+  try {
+    json(res, 200, await deps.selfDeploy.cancel({ requestedBy }));
+  } catch (err) {
+    console.error("[admin] deploy cancel failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+async function handleDeploymentStatus(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+  config: AdminConfig,
+): Promise<void> {
+  const availability = getAvailability();
+  const policy = getDeployPolicy();
+  const target = resolveDeployTarget(deps.selfDeployTarget ?? null, policy);
+  // A Restate fault must not take the whole page down: the rest of the status is local.
+  let selfDeploy: unknown = null;
+  if (deps.selfDeploy) {
+    try {
+      selfDeploy = await deps.selfDeploy.status();
+    } catch (err) {
+      console.error("[admin] self-deploy status failed:", err);
+    }
+  }
+  json(res, 200, {
+    configured: !!deps.selfDeploy,
+    available: availability?.available ?? null,
+    held: isDeployHeld(),
+    deployStartedAt: getDeployStartedAt(),
+    inFlight: getInFlightWork(),
+    checkedAt: availability?.checkedAt ?? null,
+    runningCommit: availability?.runningCommit ?? null,
+    headCommit: availability?.headCommit ?? null,
+    isDowngrade: availability?.isDowngrade ?? null,
+    repo: target ? `${target.owner}/${target.repo}` : null,
+    branch: target?.branch ?? null,
+    ...policy,
+    // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
+    notifyConfigured: Boolean(config.notifyWebhookUrl),
+    lastActedCommit: getLastActedCommit(),
+    lastDeployOutcome: getDeployOutcome(),
+    selfDeploy,
+    // FLY_IMAGE_APP set means the control plane owns this machine's config, so fly.toml must not be applied.
+    applyFlyTomlAllowed: !process.env.FLY_IMAGE_APP,
+  });
 }
 
 /** Every tool name is snake_case ASCII (src/restate/tools.ts's `tool()` registrations). */
@@ -2007,7 +2313,8 @@ const TOOL_NAME_SHAPE = /^[a-z][a-z0-9_]{0,63}$/;
 async function handleToolCall(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  gate: Extract<AdminGate, { ok: true }>,
+  caller: Caller,
+  idempotencyScope: string,
   toolName: string,
   deps: AdminDeps,
 ): Promise<void> {
@@ -2032,7 +2339,7 @@ async function handleToolCall(
         json(res, 400, { error: "Idempotency-Key must match ^[A-Za-z0-9._:-]{1,128}$" });
         return;
       }
-      idempotencyKey = scopeIdempotencyKey(gate.identity?.email ?? "session", supplied);
+      idempotencyKey = scopeIdempotencyKey(idempotencyScope, supplied);
     }
   }
   const raw = await readBody(req);
@@ -2048,9 +2355,12 @@ async function handleToolCall(
       return;
     }
   }
-  const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role };
   try {
     const result = await deps.callTool(toolName, args, caller, idempotencyKey ? { idempotencyKey } : undefined);
+    if (result.status === "deploy-held") {
+      json(res, 409, { error: "deploy-in-progress", deployStartedAt: getDeployStartedAt() });
+      return;
+    }
     if (result.status === "unavailable") {
       json(res, 503, { error: "restate-unavailable" });
       return;
@@ -2194,7 +2504,7 @@ async function handleReviewFixAdopt(
     json(res, 400, { error: "Could not read request body" });
     return;
   }
-  let execution: ReviewFixAttemptExecutionRef;
+  let execution: ReviewFixAttemptAdoptInput;
   try {
     const parsed = JSON.parse(raw) as { githubRunId?: unknown; githubRunAttempt?: unknown };
     if (typeof parsed.githubRunId !== "string" || !parsed.githubRunId || typeof parsed.githubRunAttempt !== "number" || !Number.isSafeInteger(parsed.githubRunAttempt) || parsed.githubRunAttempt < 1) {
@@ -2268,12 +2578,64 @@ async function handleReviewFixCancel(
   }
 }
 
+/** In-memory: null after a restart even when the boot step applied the value (it only logs). */
+let lastVolumeRetentionApply: { at: number; applied: string[]; skipped: string } | null = null;
+
+function retentionView(r: RetentionDeps) {
+  return {
+    restate: { days: r.getRestateDays(), appliesAt: "next deploy or restart" },
+    volume: { days: r.getVolumeDays(), lastApplied: lastVolumeRetentionApply },
+    default: r.default,
+    min: r.min,
+    max: r.max,
+  };
+}
+
+async function handleSetRetention(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  deps: AdminDeps,
+): Promise<void> {
+  const r = deps.retention;
+  if (!r) {
+    json(res, 501, { error: "Retention settings are not available" });
+    return;
+  }
+  try {
+    const body = JSON.parse(await readBody(req)) as { restate?: unknown; volume?: unknown };
+    const fields = [
+      ["restate", "restate_retention_days"],
+      ["volume", "volume_snapshot_retention_days"],
+    ] as const;
+    // Validate both before storing either, so a bad field stores nothing.
+    for (const [key, setting] of fields) {
+      const v = body[key];
+      if (v === undefined) continue;
+      if (typeof v !== "number" || !Number.isInteger(v) || v < r.min || v > r.max) {
+        json(res, 400, { error: `${setting} must be an integer from ${r.min} to ${r.max}` });
+        return;
+      }
+    }
+    if (typeof body.restate === "number") r.setRestateDays(body.restate);
+    if (typeof body.volume === "number") {
+      r.setVolumeDays(body.volume);
+      const result = await r.applyVolume(body.volume);
+      lastVolumeRetentionApply = { at: Date.now(), applied: result.applied, skipped: result.skipped };
+    }
+    json(res, 200, retentionView(r));
+  } catch (err) {
+    console.error("[admin] retention update failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
 async function handleSetDeployPolicy(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  deps: AdminDeps,
 ): Promise<void> {
   try {
-    const body = JSON.parse(await readBody(req)) as Partial<Record<keyof DeployPolicy, unknown>>;
+    const body = JSON.parse(await readBody(req)) as Partial<Record<keyof DeployPolicy | "applyFlyToml", unknown>>;
     const patch: Partial<DeployPolicy> = {};
     for (const key of ["autoDeploy", "notifyAvailable"] as const) {
       if (body[key] === undefined) continue;
@@ -2292,6 +2654,24 @@ async function handleSetDeployPolicy(
         return;
       }
       patch[key] = body[key] as string | null;
+    }
+    const applyFlyToml = (body as Record<string, unknown>).applyFlyToml;
+    if (applyFlyToml !== undefined && typeof applyFlyToml !== "boolean") {
+      json(res, 400, { error: "applyFlyToml must be a boolean" });
+      return;
+    }
+    // The option lives in the SelfDeploy object, not SQLite: two stores for one setting would drift.
+    // Set it first so a refusal leaves the rest of the policy unchanged.
+    if (applyFlyToml !== undefined) {
+      if (!deps.selfDeploy) {
+        json(res, 501, { error: "Self-deploy is not configured" });
+        return;
+      }
+      const result = await deps.selfDeploy.setOptions({ applyFlyToml });
+      if (!result.ok) {
+        json(res, 409, { error: result.reason });
+        return;
+      }
     }
     setDeployPolicy(patch);
     json(res, 200, getDeployPolicy());
@@ -2379,8 +2759,7 @@ async function handleListSecrets(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -2407,8 +2786,7 @@ async function handleSetSecret(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -2463,8 +2841,7 @@ async function handleUnsetSecret(
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-  const mappings = getMappings();
-  if (!mappings[teamKey]) {
+  if (!getOwnMapping(teamKey)) {
     json(res, 404, { error: "Team not found" });
     return;
   }
@@ -2492,28 +2869,47 @@ async function handleUnsetSecret(
   }
 }
 
+function flySettingsView(): Record<string, unknown> {
+  const dbSettings = getOrchestratorSettings();
+  const fly = getFlySessionsConfig();
+  const envApp = process.env.FLY_SESSIONS_APP || null;
+  const envRegion = process.env.FLY_SESSIONS_REGION || null;
+  // Once RunnerBackend/fly-machines has been read, the env vars and rows are inert for these values.
+  const source = getRunnerBackendSource();
+  return {
+    runnerBackendSource: source,
+    flySessionsApp: {
+      runtimeValue: fly.app,
+      dbValue: dbSettings.flySessionsApp,
+      envValue: envApp,
+      source,
+    },
+    flySessionsRegion: {
+      runtimeValue: fly.region,
+      dbValue: dbSettings.flySessionsRegion,
+      envValue: envRegion,
+      source,
+    },
+  };
+}
+
+/** Display text only; `<owner>` is literal. */
+const RUNNER_IMAGE_BUILT_IN_PREFIXES = ["ghcr.io/builddownai/", "ghcr.io/<owner>/"];
+
+/** Validates a runnerImageAllowedPrefixes POST value; returns the stored string (null = delete) or an error. */
+function parseRunnerImagePrefixes(raw: unknown): { value: string | null } | { error: string } {
+  return validateRunnerImagePrefixes(raw);
+}
+
 function handleGetSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
-  config: AdminConfig,
+  _config: AdminConfig,
 ): void {
   const dbSettings = getOrchestratorSettings();
-  const envApp = process.env.FLY_SESSIONS_APP || null;
-  const envRegion = process.env.FLY_SESSIONS_REGION || null;
 
   json(res, 200, {
-    flySessionsApp: {
-      runtimeValue: config.flySessionsApp,
-      dbValue: dbSettings.flySessionsApp,
-      envValue: envApp,
-      overriddenByEnv: envApp !== null,
-    },
-    flySessionsRegion: {
-      runtimeValue: config.flySessionsRegion,
-      dbValue: dbSettings.flySessionsRegion,
-      envValue: envRegion,
-      overriddenByEnv: envRegion !== null,
-    },
+    ...flySettingsView(),
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
     },
@@ -2525,6 +2921,11 @@ function handleGetSettings(
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
     },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
+    },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
   });
@@ -2533,7 +2934,9 @@ function handleGetSettings(
 async function handlePostSettings(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  config: AdminConfig,
+  _config: AdminConfig,
+  gate: Extract<AdminGate, { ok: true }>,
+  deps: AdminDeps,
 ): Promise<void> {
   let body: {
     flySessionsApp?: string | null;
@@ -2541,6 +2944,7 @@ async function handlePostSettings(
     kgRefreshReportIssue?: string | null;
     kgBaseRepo?: string | null;
     linearPickupLabel?: string | null;
+    runnerImageAllowedPrefixes?: string | null;
     retryPolicy?: Partial<RetryPolicy> | null;
   };
   try {
@@ -2553,6 +2957,16 @@ async function handlePostSettings(
   } catch {
     json(res, 400, { error: "Invalid request body" });
     return;
+  }
+
+  let runnerImagePrefixes: string | null | undefined;
+  if ("runnerImageAllowedPrefixes" in body) {
+    const parsed = parseRunnerImagePrefixes(body.runnerImageAllowedPrefixes);
+    if ("error" in parsed) {
+      json(res, 400, { error: parsed.error });
+      return;
+    }
+    runnerImagePrefixes = parsed.value;
   }
 
   if ("retryPolicy" in body) {
@@ -2584,18 +2998,51 @@ async function handlePostSettings(
     }
     setOrchestratorSetting("linearPickupLabel", trimmed ? trimmed : null);
   }
-
-  if ("flySessionsApp" in body) {
-    const val = typeof body.flySessionsApp === "string" && body.flySessionsApp.trim()
-      ? body.flySessionsApp.trim()
-      : null;
-    setOrchestratorSetting("flySessionsApp", val);
+  if (runnerImagePrefixes !== undefined) {
+    setOrchestratorSetting("runnerImageAllowedPrefixes", runnerImagePrefixes);
   }
-  if ("flySessionsRegion" in body) {
-    const val = typeof body.flySessionsRegion === "string" && body.flySessionsRegion.trim()
-      ? body.flySessionsRegion.trim()
-      : null;
-    setOrchestratorSetting("flySessionsRegion", val);
+
+  const flyPatch: Record<string, string | null> = {};
+  for (const [field, key] of [["flySessionsApp", "app"], ["flySessionsRegion", "region"]] as const) {
+    if (field in body) {
+      const raw = body[field];
+      flyPatch[key] = typeof raw === "string" && raw.trim() ? raw.trim() : null;
+    }
+  }
+  if (Object.keys(flyPatch).length > 0) {
+    // The Restate object owns these values; a failure answers 503 rather than writing a row it would ignore.
+    if (!deps.callTool) {
+      json(res, 503, { error: "restate-unavailable" });
+      return;
+    }
+    const caller: Caller = { kind: "human", email: gate.identity?.email ?? null, role: gate.role, grants: [] };
+    let result: Awaited<ReturnType<NonNullable<AdminDeps["callTool"]>>>;
+    try {
+      result = await deps.callTool("set_runner_backend", { backend: "fly-machines", patch: flyPatch }, caller);
+    } catch (err) {
+      console.error("[admin] set_runner_backend failed:", err);
+      json(res, 503, { error: "restate-unavailable" });
+      return;
+    }
+    if (result.status !== "ok") {
+      json(res, result.status === "deploy-held" ? 409 : 503, { error: result.status === "deploy-held" ? "deploy-in-progress" : "restate-unavailable" });
+      return;
+    }
+    const text = result.content?.[0]?.text ?? "";
+    if (result.isError) {
+      json(res, 502, { error: text || "set_runner_backend failed" });
+      return;
+    }
+    try {
+      const parsed = JSON.parse(text) as { status?: number; body?: { error?: string } };
+      if (parsed.status === 400) {
+        json(res, 400, { error: parsed.body?.error ?? "invalid runner backend settings" });
+        return;
+      }
+    } catch {
+      /* a non-JSON reply is the stored state's absence; the refresh below settles it */
+    }
+    await (deps.refreshRunnerBackendCache ?? refreshRunnerBackendCache)();
   }
   if ("kgRefreshReportIssue" in body) {
     const val = typeof body.kgRefreshReportIssue === "string" && body.kgRefreshReportIssue.trim()
@@ -2611,26 +3058,9 @@ async function handlePostSettings(
   }
 
   const dbSettings = getOrchestratorSettings();
-  const envApp = process.env.FLY_SESSIONS_APP || null;
-  const envRegion = process.env.FLY_SESSIONS_REGION || null;
-
-  const nextApp = envApp ?? dbSettings.flySessionsApp;
-  const nextRegion = envRegion ?? dbSettings.flySessionsRegion;
-  const restartRequired = nextApp !== config.flySessionsApp || nextRegion !== config.flySessionsRegion;
 
   json(res, 200, {
-    flySessionsApp: {
-      runtimeValue: config.flySessionsApp,
-      dbValue: dbSettings.flySessionsApp,
-      envValue: envApp,
-      overriddenByEnv: envApp !== null,
-    },
-    flySessionsRegion: {
-      runtimeValue: config.flySessionsRegion,
-      dbValue: dbSettings.flySessionsRegion,
-      envValue: envRegion,
-      overriddenByEnv: envRegion !== null,
-    },
+    ...flySettingsView(),
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
     },
@@ -2642,9 +3072,13 @@ async function handlePostSettings(
       effective: getLinearPickupLabel(),
       default: DEFAULT_LINEAR_PICKUP_LABEL,
     },
+    runnerImageAllowedPrefixes: {
+      value: dbSettings.runnerImageAllowedPrefixes,
+      effective: getRunnerImageAllowedPrefixes(),
+      builtIn: RUNNER_IMAGE_BUILT_IN_PREFIXES,
+    },
     retryPolicy: getRetryPolicy(),
     retryPolicyDefaults: DEFAULT_RETRY_POLICY,
-    restartRequired,
   });
 }
 
@@ -2708,6 +3142,37 @@ async function handlePostAccess(
   handleGetAccess(res, identity);
 }
 
+async function handleClearAccessBindings(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: SessionIdentity | null,
+  deps: AdminDeps,
+): Promise<void> {
+  if (!identity) {
+    json(res, 403, { error: "Clearing bindings requires a signed-in identity" });
+    return;
+  }
+  let address: unknown;
+  try {
+    address = (JSON.parse(await readBody(req)) as { value?: unknown } | null)?.value;
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+  if (typeof address !== "string" || !address.trim()) {
+    json(res, 400, { error: "value must be an email address" });
+    return;
+  }
+  try {
+    if (!deps.clearAccessBindings) throw new Error("the binding service is not available");
+    await deps.clearAccessBindings(address, identity.email);
+  } catch (err) {
+    json(res, 500, { error: err instanceof Error ? `the bindings could not be cleared: ${err.message}` : "the bindings could not be cleared" });
+    return;
+  }
+  handleGetAccess(res, identity);
+}
+
 function handleGetAccessGrants(res: http.ServerResponse, identity: SessionIdentity | null): void {
   // Closed to access-code sessions in both directions, not just writes: the deprecated path must
   // not gain a capability, and a change here needs an actor once grants reach the audit trail.
@@ -2765,9 +3230,10 @@ async function handleListGlobalSecrets(
   }
   try {
     const allSecrets = await listAppSecrets(config.flySessionsToken, config.flySessionsApp);
-    const teamPrefixes = Object.keys(getMappings()).map((k) => `${k.toUpperCase()}_`);
+    const globalNames = new Set(classifyFlySecretNames(allSecrets.map((s) => s.name), Object.keys(getMappings()))
+      .filter((s) => s.group === "global").map((s) => s.name));
     const globalSecrets = allSecrets
-      .filter((s) => !teamPrefixes.some((prefix) => s.name.startsWith(prefix)))
+      .filter((s) => globalNames.has(s.name))
       .map((s) => ({ name: s.name, createdAt: s.created_at }));
     json(res, 200, globalSecrets);
   } catch (err) {
@@ -2806,6 +3272,10 @@ async function handleSetGlobalSecret(
     json(res, 400, { error: "name must contain only letters, digits, and underscores" });
     return;
   }
+  if (name === MODEL_AUTH_ENV.protectionKey) {
+    json(res, 400, { error: "Secret name is reserved" });
+    return;
+  }
   const teamPrefixes = Object.keys(getMappings()).map((k) => `${k.toUpperCase()}_`);
   if (teamPrefixes.some((prefix) => name.startsWith(prefix))) {
     json(res, 400, { error: `Secret name must not start with a team key prefix (${teamPrefixes.join(", ")})` });
@@ -2834,6 +3304,10 @@ async function handleUnsetGlobalSecret(
   const upperName = secretName.toUpperCase();
   if (!/^[A-Z0-9_]+$/.test(upperName)) {
     json(res, 400, { error: "name must contain only letters, digits, and underscores" });
+    return;
+  }
+  if (upperName === MODEL_AUTH_ENV.protectionKey) {
+    json(res, 400, { error: "Secret name is reserved" });
     return;
   }
   const teamPrefixes = Object.keys(getMappings()).map((k) => `${k.toUpperCase()}_`);
@@ -2867,6 +3341,7 @@ export interface UpsertMappingBody {
   maxInProgressAiIssues?: number;
   executionMode?: string;
   sessionMode?: string;
+  machineCpuKind?: "shared" | "performance";
   machineCpus?: number;
   machineMemoryMb?: number;
   planningEnabled?: boolean;
@@ -2890,20 +3365,23 @@ export interface UpsertMappingBody {
   dependencyTokenScope?: string | null;
   reviewers?: unknown;
   prDispatchBudget?: number | null;
+  /** @deprecated Ignored; the stored field is historical metadata, not a lifecycle choice. */
   reviewFixLifecycle?: string | null;
+  trustedReviewAuthors?: unknown;
+  reviewProcess?: unknown;
 }
 
 export async function upsertMappingAction(
   body: UpsertMappingBody,
   config: AdminConfig,
   registry: ProviderRegistry,
-  deps: AdminDeps = {},
+  _deps: AdminDeps = {},
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   if (!body.teamKey || !body.owner || !body.repo) {
     return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
   }
 
-  const existingMapping = getMappings()[body.teamKey];
+  const existingMapping = getOwnMapping(body.teamKey);
   const defaultBranch = typeof body.defaultBranch === "string"
     ? body.defaultBranch.trim()
     : (existingMapping?.defaultBranch ?? "");
@@ -2937,6 +3415,19 @@ export async function upsertMappingAction(
   const machineMemoryMb = body.machineMemoryMb ?? DEFAULT_MACHINE_MEMORY_MB;
   if (!Number.isInteger(machineMemoryMb) || machineMemoryMb < 256) {
     return { status: 400, body: { error: "machineMemoryMb must be an integer >= 256" } };
+  }
+
+  const machineCpuKind = body.machineCpuKind === undefined
+    ? existingMapping?.machineCpuKind ?? "shared"
+    : body.machineCpuKind;
+  if (machineCpuKind !== "shared" && machineCpuKind !== "performance") {
+    return { status: 400, body: { error: "machineCpuKind must be 'shared' or 'performance'" } };
+  }
+  if (machineCpuKind === "performance" && !VALID_CPUS.includes(machineCpus)) {
+    return { status: 400, body: { error: `machineCpus must be one of ${VALID_CPUS.join(", ")} for performance CPUs` } };
+  }
+  if (machineCpuKind === "performance" && machineMemoryMb < PERFORMANCE_MIN_MB_PER_CPU * machineCpus) {
+    return { status: 400, body: { error: `machineMemoryMb must be at least ${PERFORMANCE_MIN_MB_PER_CPU} MB per CPU for performance CPUs` } };
   }
 
   const workflowFile = body.workflowFile || existingMapping?.workflowFile || "claude-implement.yml";
@@ -2976,6 +3467,26 @@ export async function upsertMappingAction(
       return { status: 400, body: { error: "extraEnv values must all be strings" } };
     }
     extraEnv = body.extraEnv as Record<string, string>;
+    if (Object.keys(extraEnv).some((k) => k.toUpperCase() === EXECUTION_POLICY_ENV)) {
+      return { status: 400, body: { error: `extraEnv name ${EXECUTION_POLICY_ENV} is reserved` } };
+    }
+    if (Object.keys(extraEnv).some((k) => isEphemeralPolicyEnvName(k) && k !== EPHEMERAL_FULL_ACCESS_EXTRA_ENV)) {
+      return { status: 400, body: { error: `extraEnv name ${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must be spelled exactly` } };
+    }
+    if (EPHEMERAL_FULL_ACCESS_EXTRA_ENV in extraEnv) {
+      if (extraEnv[EPHEMERAL_FULL_ACCESS_EXTRA_ENV] !== EPHEMERAL_FULL_ACCESS_ASSERTION) {
+        return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} must equal ${EPHEMERAL_FULL_ACCESS_ASSERTION}` } };
+      }
+      const modeForOptIn = body.executionMode ?? existingMapping?.executionMode ?? DEFAULT_EXECUTION_MODE;
+      if (modeForOptIn !== "github-actions") {
+        return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"` } };
+      }
+    }
+  }
+
+  // AII-1437: a mode change without extraEnv in the body keeps the stored opt-in, so check the effective value.
+  if (body.extraEnv === undefined && executionMode !== "github-actions" && hasEphemeralFullAccessOptIn(existingMapping?.extraEnv)) {
+    return { status: 400, body: { error: `${EPHEMERAL_FULL_ACCESS_EXTRA_ENV} is supported only with executionMode "github-actions"` } };
   }
 
   const validProviders: ClaudeProvider[] = ["anthropic", "bedrock"];
@@ -3083,21 +3594,9 @@ export async function upsertMappingAction(
     return { status: 400, body: { error: `dependencyTokenScope invalid: must be null or "installation"` } };
   }
 
-  let reviewFixLifecycle: "legacy" | "restate" | null;
-  const rawLifecycle = body.reviewFixLifecycle;
-  if (rawLifecycle === undefined) {
-    // Preserve stored value on omit — an unrelated project edit must not silently move which
-    // lifecycle coordinates this project's automatic review-fix runs.
-    reviewFixLifecycle = existingMapping?.reviewFixLifecycle ?? null;
-  } else if (rawLifecycle === null || rawLifecycle === "") {
-    reviewFixLifecycle = null;
-  } else if (rawLifecycle === "legacy") {
-    reviewFixLifecycle = "legacy";
-  } else if (rawLifecycle === "restate") {
-    reviewFixLifecycle = "restate";
-  } else {
-    return { status: 400, body: { error: `reviewFixLifecycle invalid: must be null, "legacy", or "restate"` } };
-  }
+  // Retired API input is ignored. Preserve history for a reviewed deploy revert;
+  // Restate owns new dispatches regardless of the stored value.
+  const reviewFixLifecycle = existingMapping?.reviewFixLifecycle ?? null;
 
   let reviewers: ReviewerSelection[] | null;
   if (body.reviewers === undefined) {
@@ -3114,6 +3613,32 @@ export async function upsertMappingAction(
     }
   }
 
+  let trustedReviewAuthors: string[] | null;
+  if (body.trustedReviewAuthors === undefined) {
+    // Preserve stored value on omit — a PATCH-style save must not silently strip a project's trusted-author grant.
+    trustedReviewAuthors = existingMapping?.trustedReviewAuthors ?? null;
+  } else if (body.trustedReviewAuthors === null) {
+    // Explicit null resets to the NULL default (built-ins only), mirroring reviewers above.
+    trustedReviewAuthors = null;
+  } else {
+    try {
+      trustedReviewAuthors = normalizeTrustedReviewAuthors(body.trustedReviewAuthors);
+    } catch (err) {
+      return { status: 400, body: { error: `trustedReviewAuthors invalid: ${err instanceof Error ? err.message : String(err)}` } };
+    }
+  }
+
+  // Validate the selected review process independently of retired lifecycle metadata.
+  let reviewProcess: ReviewProcessId | null;
+  if (body.reviewProcess === undefined) {
+    reviewProcess = existingMapping?.reviewProcess ?? null;
+  } else if (body.reviewProcess === null || body.reviewProcess === "ai-implement") {
+    reviewProcess = null;
+  } else if (isReviewProcessId(body.reviewProcess)) {
+    reviewProcess = body.reviewProcess;
+  } else {
+    return { status: 400, body: { error: `reviewProcess invalid: must be null, "ai-implement", "claude-code-review", "claude-code-review-repository-fix", or "codex-code-review"` } };
+  }
   const mapping: RepoMapping = {
     owner: body.owner,
     repo: body.repo,
@@ -3122,6 +3647,7 @@ export async function upsertMappingAction(
     maxInProgressAiIssues,
     executionMode,
     sessionMode,
+    machineCpuKind,
     machineCpus,
     machineMemoryMb,
     planningEnabled,
@@ -3151,24 +3677,9 @@ export async function upsertMappingAction(
     reviewers,
     prDispatchBudget,
     reviewFixLifecycle,
+    trustedReviewAuthors,
+    reviewProcess,
   };
-
-  // Existing attempts keep their stored owner. Revalidate only when a save first enables
-  // Restate or changes where future attempts dispatch; ordinary edits keep the selection
-  // even while the endpoint is temporarily unhealthy.
-  if (reviewFixLifecycle === "restate" && (
-    !existingMapping || existingMapping.reviewFixLifecycle !== "restate" ||
-    mapping.owner !== existingMapping.owner || mapping.repo !== existingMapping.repo ||
-    mapping.workflowFile !== existingMapping.workflowFile || mapping.defaultBranch !== existingMapping.defaultBranch ||
-    mapping.executionMode !== existingMapping.executionMode
-  )) {
-    const enablementError = await reviewFixLifecycleEnablementError(
-      { executionMode, owner: mapping.owner, repo: mapping.repo, workflowFile: mapping.workflowFile, ref: mapping.defaultBranch },
-      config,
-      deps,
-    );
-    if (enablementError) return { status: 400, body: { error: enablementError } };
-  }
 
   // Advisory only: a Linear mapping already holding this key is the one signal we have that it
   // is a Linear team key (no provider method lists teams). Selection drops that team's issues
@@ -3181,6 +3692,14 @@ export async function upsertMappingAction(
   }
 
   upsertMapping(body.teamKey, mapping);
+  try {
+    if (!existingMapping && !getProjectStageConfig(body.teamKey) && getOrchestratorDefaults()?.config.mode === "configured") {
+      setProjectConfigured(body.teamKey, true);
+    }
+  } catch (err) {
+    console.error("[admin] configure new project failed:", err);
+    warnings.push("Project saved in legacy mode: resolution-failed");
+  }
   registry.invalidate();
 
   // Kick the workflow sync off in the background and return immediately
@@ -3403,4 +3922,674 @@ async function handleTemplateStatus(
     }),
   );
   json(res, 200, results);
+}
+
+
+// --- Model accounts and stage configuration (AII-962) ---
+
+function runAsync(res: http.ServerResponse, task: Promise<void>): void {
+  task.catch(() => {
+    if (!res.headersSent) json(res, 500, { error: "internal error" });
+  });
+}
+
+async function readJsonObject(req: http.IncomingMessage, res: http.ServerResponse): Promise<Record<string, unknown> | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readBody(req));
+  } catch {
+    json(res, 400, { error: "body must be valid JSON" });
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    json(res, 400, { error: "body must be a JSON object" });
+    return null;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function unsupportedKeys(body: Record<string, unknown>, allowed: readonly string[]): string[] {
+  return Object.keys(body).filter((k) => !allowed.includes(k));
+}
+
+/** The readiness vocabulary shown on profile and resolved reads (AII-1203/1200). No token, client id or host id. */
+type AccountReadiness = "ready" | "sign-in required" | "refresh failed (transient)" | "missing" | "unknown";
+
+interface AccountStatusView {
+  readiness: AccountReadiness;
+  /** Fixed failure code from the credential status projection; never a reference or value. */
+  failureCode: string | null;
+}
+
+function accountStatus(profile: AccountProfileProjection, deps: AdminDeps): AccountStatusView {
+  const view: AccountStatusView = { readiness: "unknown", failureCode: null };
+  if (!deps.agentConfig) return view;
+  let status;
+  try {
+    status = getCredentialStatus(
+      { profileId: profile.profileId, revision: profile.revision, provider: profile.provider, authMode: profile.authMode },
+      deps.agentConfig.credentials,
+    );
+  } catch {
+    return view;
+  }
+  view.failureCode = status.failure?.code ?? null;
+  if (status.usable) {
+    // Reference status does not inspect protected values. Row presence is safe
+    // metadata, not proof that the provider will accept the setup-token.
+    if (profile.authMode === "claude-subscription" && !credentialView(profile).credentialSet) {
+      view.readiness = "missing";
+      view.failureCode = "secret_unavailable";
+    } else {
+      view.readiness = "ready";
+    }
+  } else if (status.failure?.code === "session_unavailable") {
+    view.readiness = status.failure.category === "authentication_required" ? "sign-in required" : "refresh failed (transient)";
+  } else if (status.failure?.code === "reference_missing" || status.referenceConfigured === false) {
+    view.readiness = "missing";
+  }
+  return view;
+}
+
+function handleListModelAccounts(res: http.ServerResponse, deps: AdminDeps): void {
+  const accounts = listAccountProfiles().map((p) => ({
+    profileId: p.profileId,
+    identity: p.identity,
+    revision: p.revision,
+    agent: p.agent,
+    provider: p.provider,
+    authMode: p.authMode,
+    profileStatus: p.status,
+    account: accountStatus(p, deps),
+    ...credentialView(p),
+  }));
+  json(res, 200, { accounts });
+}
+
+/** `credentialSet` reads the row directly (not the resolver), so an unset or rotated RUNNER_TOKEN_SECRET cannot make a stored key look unset. Never returns the reference. */
+function credentialView(p: AccountProfileProjection): { credentialSet: boolean; credentialUpdatedAt: number | null } {
+  try {
+    const ref = lookupCredentialReference(p.profileId, p.revision);
+    if (ref === null) return { credentialSet: false, credentialUpdatedAt: null };
+    const row = getDb().prepare("SELECT updated_at FROM model_protected_secrets WHERE secret_ref = ?").get(ref) as { updated_at: number } | undefined;
+    return row ? { credentialSet: true, credentialUpdatedAt: row.updated_at } : { credentialSet: false, credentialUpdatedAt: null };
+  } catch {
+    return { credentialSet: false, credentialUpdatedAt: null };
+  }
+}
+
+const CREDENTIAL_AUTH_MODES: readonly string[] = ["openai-api-key", "openrouter-api-key", "anthropic-api-key", "claude-subscription"];
+
+const CREDENTIAL_FAILURES: Record<ProtectedSecretFailure, string> = {
+  invalid_ref: "the reference is not a valid model-account reference",
+  invalid_value: "the value is not a valid credential",
+  key_unavailable: "RUNNER_TOKEN_SECRET is not set; the encryption key derives from it",
+  row_missing: "could not write the credential",
+  decrypt_failed: "could not write the credential",
+  write_failed: "could not write the credential",
+};
+
+/** Email, seconds left and last refresh outcome for a codex-subscription profile; the admin UI shows these after pairing. */
+async function handleChatGptStatus(res: http.ServerResponse, profileId: string, deps: AdminDeps): Promise<void> {
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  if (head.authMode !== "codex-subscription") {
+    json(res, 400, { error: "only codex-subscription profiles have a ChatGPT status" });
+    return;
+  }
+  try {
+    const status = await readPairingStatus(profileId, {
+      store: () => createModelSessionStore({
+        keys: createModelSessionKeyProvider(),
+        verifyOwner: () => false,
+        authorizeOperator: (operator) => operator === PAIRING_OPERATOR,
+        db: () => getDb(),
+      }),
+      readState: deps.readChatGptPlanState,
+      now: () => Date.now(),
+    });
+    json(res, 200, status);
+  } catch {
+    json(res, 500, { error: "could not read the status" });
+  }
+}
+
+/** Mints a single-use pairing code for the laptop helper (AII-1501). The code is in this response only; the table keeps its hash. */
+function handleChatGptPairingMint(req: http.IncomingMessage, res: http.ServerResponse, profileId: string, actor: string): void {
+  const head = getAccountProfile(profileId);
+  if (!head) {
+    json(res, 404, { error: "account profile not found" });
+    return;
+  }
+  if (head.authMode !== "codex-subscription") {
+    json(res, 400, { error: "only codex-subscription profiles take a ChatGPT pairing code" });
+    return;
+  }
+  if (head.status !== "active") {
+    json(res, 400, { error: "profile is not active" });
+    return;
+  }
+  if (!process.env.RUNNER_TOKEN_SECRET) {
+    json(res, 503, { error: "RUNNER_TOKEN_SECRET is not set; the session key derives from it" });
+    return;
+  }
+  const { code, expiresAt } = mintPairingCode(profileId, Date.now());
+  const base = (process.env.OAUTH_REDIRECT_BASE_URL || process.env.RUNNER_CALLBACK_BASE_URL || `https://${req.headers.host ?? "<host>"}`).replace(/\/+$/, "");
+  console.log(`[admin] chatgpt pairing mint actor=${actor} profile=${profileId}`);
+  json(res, 200, {
+    code,
+    expiresAt,
+    command: `node dist/chatgpt-plan-login.js connect --orchestrator ${base} --record ~/.ai-implement/chatgpt-plan.json`,
+  });
+}
+
+// Account mutations share references across profiles. Read and validate bodies before
+// joining this queue so incomplete or disconnected requests cannot hold the lock.
+let modelAccountMutation: Promise<unknown> = Promise.resolve();
+function mutateModelAccounts(operation: () => Promise<void>): Promise<void> {
+  const next = modelAccountMutation.then(operation);
+  modelAccountMutation = next.catch(() => {});
+  return next;
+}
+
+async function handleModelAccountCredential(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  profileId: string,
+  method: string,
+  actor: string,
+  deps: AdminDeps,
+): Promise<void> {
+  const isPut = method === "PUT";
+  let apiKey = "";
+  if (isPut) {
+    const body = await readJsonObject(req, res);
+    if (!body) return;
+    const keys = Object.keys(body);
+    if (keys.length !== 1 || keys[0] !== "apiKey" || typeof body.apiKey !== "string" || body.apiKey.trim() === "") {
+      json(res, 400, { error: 'body must be exactly { "apiKey": "<non-empty string>" }' });
+      return;
+    }
+    apiKey = body.apiKey;
+  }
+  return mutateModelAccounts(async () => {
+    const head = getAccountProfile(profileId);
+    if (!head) {
+      json(res, 404, { error: "account profile not found" });
+      return;
+    }
+    if (!CREDENTIAL_AUTH_MODES.includes(head.authMode)) {
+      json(res, 400, { error: "only openai-api-key, openrouter-api-key, anthropic-api-key and claude-subscription profiles take a browser credential" });
+      return;
+    }
+    const existingRef = lookupCredentialReference(profileId, head.revision);
+    const ref = existingRef ?? `model-account:${profileId}`;
+    if (!MODEL_ACCOUNT_REF_PATTERN.test(ref)) {
+      json(res, 400, { error: "this profile has no usable credential reference; set a credentialRef by hand (model-account:<lowercase-name>)" });
+      return;
+    }
+    const store = createModelProtectedSecrets({ env: process.env });
+    // The fallback reference is only this profile's when no other profile's head revision resolves to it.
+    const fallbackClash =
+      existingRef === null &&
+      listAccountProfiles().some((p) => p.profileId !== profileId && lookupCredentialReference(p.profileId, p.revision) === ref);
+    if (!isPut) {
+      if (fallbackClash) {
+        // The fallback belongs to another profile; otherwise also clear orphaned bindings.
+        json(res, 200, { ref, result: "removed" });
+        return;
+      }
+      if (!store.delete(ref).ok) {
+        json(res, 500, { error: "could not delete the credential" });
+        return;
+      }
+      try {
+        if (!deps.clearKeyBinding) throw new Error("unavailable");
+        await deps.clearKeyBinding(ref);
+      } catch {
+        json(res, 503, { error: "key binding service unavailable" });
+        return;
+      }
+      console.log(`[admin] model-account credential remove actor=${actor} profile=${profileId} ref=${ref}`);
+      json(res, 200, { ref, result: "removed" });
+      return;
+    }
+    if (!process.env.RUNNER_TOKEN_SECRET) {
+      json(res, 503, { error: CREDENTIAL_FAILURES.key_unavailable });
+      return;
+    }
+    if (fallbackClash) {
+      json(res, 409, { error: "another profile already uses this credential reference; set a credentialRef on this profile by hand" });
+      return;
+    }
+    let binding: KeyBindOutcome = "unavailable";
+    try { binding = await deps.bindKey?.(ref, `${head.provider}/${head.authMode}`) ?? "unavailable"; } catch { /* fail closed */ }
+    if (binding === "conflict" || binding === "unavailable") {
+      json(res, binding === "conflict" ? 409 : 503, { error: binding === "conflict" ? "stored key is bound to another destination; remove the stored key first" : "key binding service unavailable" });
+      return;
+    }
+    const prior = store.open(ref);
+    const written = store.write(ref, apiKey as never);
+    if (!written.ok) {
+      json(res, written.code === "invalid_value" ? 400 : 500, { error: CREDENTIAL_FAILURES[written.code] });
+      return;
+    }
+    if (existingRef === null) {
+      try {
+        saveAccountProfileRevision({
+          profileId,
+          identity: head.identity,
+          revision: head.revision + 1,
+          agent: head.agent as never,
+          provider: head.provider as never,
+          authMode: head.authMode as never,
+          status: head.status as never,
+          metadata: { credentialRef: ref },
+        });
+      } catch {
+        // Undo only this request's write: restore a row that existed, delete one it created.
+        if (prior.ok) store.write(ref, prior.value);
+        else if (prior.code === "row_missing") store.delete(ref);
+        json(res, 500, { error: "could not save the profile revision" });
+        return;
+      }
+    }
+    console.log(`[admin] model-account credential set actor=${actor} profile=${profileId} ref=${ref}`);
+    json(res, 200, { ref, result: "set" });
+  });
+}
+
+const ACCOUNT_WRITE_FIELDS = ["profileId", "identity", "agent", "provider", "authMode", "credentialRef", "status"] as const;
+
+function accountWriteView(p: AccountProfileProjection, deps: AdminDeps): Record<string, unknown> {
+  const { status, ...rest } = p;
+  return { ...rest, profileStatus: status, account: accountStatus(p, deps) };
+}
+
+async function handleCreateModelAccount(req: http.IncomingMessage, res: http.ServerResponse, deps: AdminDeps): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  const result = createModelAccountAction(body, deps);
+  json(res, result.status, result.body);
+}
+
+export function createModelAccountAction(body: Record<string, unknown>, deps: AdminDeps): { status: number; body: Record<string, unknown> } {
+  const extra = unsupportedKeys(body, ACCOUNT_WRITE_FIELDS);
+  if (extra.length > 0) {
+    return { status: 400, body: { error: `unsupported field(s): ${extra.join(", ")}. Account writes carry metadata and a protected credentialRef, never credential values` } };
+  }
+  const profileId = body.profileId;
+  if (typeof profileId !== "string") {
+    return { status: 400, body: { error: "profileId is required" } };
+  }
+  if (getAccountProfile(profileId)) {
+    return { status: 409, body: { error: "account profile already exists; PATCH it to append a revision" } };
+  }
+  if (body.status !== undefined && body.status !== "active") {
+    return { status: 400, body: { error: "a new account profile must be created active" } };
+  }
+  return saveAccountWriteAction(deps, profileId, 1, body, 201);
+}
+
+async function handlePatchModelAccount(req: http.IncomingMessage, res: http.ServerResponse, profileId: string, deps: AdminDeps): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  const extra = unsupportedKeys(body, ACCOUNT_WRITE_FIELDS.filter((f) => f !== "profileId"));
+  if (extra.length > 0) {
+    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}. Account writes carry metadata and a protected credentialRef, never credential values` });
+    return;
+  }
+  return mutateModelAccounts(async () => {
+    const head = getAccountProfile(profileId);
+    if (!head) {
+      json(res, 404, { error: "account profile not found" });
+      return;
+    }
+    const merged: Record<string, unknown> = {
+      identity: head.identity,
+      agent: head.agent,
+      provider: head.provider,
+      authMode: head.authMode,
+      status: head.status,
+    };
+    const currentRef = lookupCredentialReference(profileId, head.revision);
+    if (currentRef !== null) merged.credentialRef = currentRef;
+    for (const [k, v] of Object.entries(body)) {
+      if (k === "credentialRef" && v === null) delete merged.credentialRef;
+      else merged[k] = v;
+    }
+    if (typeof merged.credentialRef === "string") {
+      const binding = readKeyBinding(merged.credentialRef);
+      const destinationChanged = merged.provider !== head.provider || merged.authMode !== head.authMode;
+      const stored = binding || getDb().prepare("SELECT 1 FROM model_protected_secrets WHERE secret_ref = ?").get(merged.credentialRef);
+      if ((destinationChanged && stored) || (binding && binding.destination !== `${merged.provider}/${merged.authMode}`)) {
+        json(res, 409, { error: "remove the stored key first before changing its destination" });
+        return;
+      }
+    }
+    saveAccountWrite(res, deps, profileId, head.revision + 1, merged, 200);
+  });
+}
+
+function saveAccountWrite(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+  profileId: string,
+  revision: number,
+  fields: Record<string, unknown>,
+  okStatus: number,
+): void {
+  const result = saveAccountWriteAction(deps, profileId, revision, fields, okStatus);
+  json(res, result.status, result.body);
+}
+
+function saveAccountWriteAction(
+  deps: AdminDeps, profileId: string, revision: number, fields: Record<string, unknown>, okStatus: number,
+): { status: number; body: Record<string, unknown> } {
+  try {
+    const saved = saveAccountProfileRevision({
+      profileId,
+      identity: fields.identity as string,
+      revision,
+      agent: fields.agent as never,
+      provider: fields.provider as never,
+      authMode: fields.authMode as never,
+      status: fields.status as never,
+      metadata: fields.credentialRef === undefined ? {} : { credentialRef: fields.credentialRef as string },
+    });
+    return { status: okStatus, body: accountWriteView(saved, deps) };
+  } catch (err) {
+    // The store throws fixed messages and writes everything in one transaction, so a failure leaves no revision behind.
+    return { status: 400, body: { error: err instanceof Error ? err.message : "invalid account profile" } };
+  }
+}
+
+function storedConfigView(stored: { configRevisionId: string; revision: number; config: StageAgentConfigurationV1; createdAt: number }): Record<string, unknown> {
+  return {
+    enabled: stored.config.mode === "configured",
+    mode: stored.config.mode,
+    stages: stored.config.stages ?? {},
+    revision: stored.revision,
+    configRevisionId: stored.configRevisionId,
+    updatedAt: stored.createdAt,
+  };
+}
+
+/** Validates the value types the store leaves to the resolver, so a legacy-mode write cannot park a malformed stage. */
+function validateStagesBody(stages: unknown, defaults = false): string | null {
+  if (typeof stages !== "object" || stages === null || Array.isArray(stages)) return "stages must be an object";
+  for (const [stage, patch] of Object.entries(stages)) {
+    if (!(STAGE_NAMES as readonly string[]).includes(stage)) return "stages contains unknown key(s)";
+    if (typeof patch !== "object" || patch === null || Array.isArray(patch)) return `stages.${stage} must be an object`;
+    for (const [field, value] of Object.entries(patch)) {
+      if (!(STORED_STAGE_SELECTION_FIELDS as readonly string[]).includes(field)) return `stages.${stage} contains unknown key(s)`;
+      if (field === "accounts") {
+        if (!defaults) return "accounts is only supported in orchestrator defaults";
+        try { validateAccounts(value, stage); } catch (err) { return (err as Error).message; }
+        continue;
+      }
+      if (field === "preferOpenModel") {
+        if (defaults || stage !== "implementation" || typeof value !== "boolean") return "preferOpenModel must be a boolean in project implementation settings";
+        continue;
+      }
+      if (value === null) continue;
+      if (field === "invocationTimeoutMs" ? !Number.isSafeInteger(value) || (value as number) <= 0 : typeof value !== "string" || value.trim() === "") {
+        return `stages.${stage}.${field} is malformed`;
+      }
+    }
+  }
+  return null;
+}
+
+async function handlePutAgentDefaults(req: http.IncomingMessage, res: http.ServerResponse, actor: string | null): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  const extra = unsupportedKeys(body, ["mode", "stages"]);
+  if (extra.length > 0) {
+    json(res, 400, { error: `unsupported field(s): ${extra.join(", ")}` });
+    return;
+  }
+  if (body.mode !== "legacy" && body.mode !== "configured") {
+    json(res, 400, { error: "mode must be legacy or configured" });
+    return;
+  }
+  if (body.stages !== undefined) {
+    const bad = validateStagesBody(body.stages, true);
+    if (bad) {
+      json(res, 400, { error: bad });
+      return;
+    }
+  }
+  try {
+    const stored = setOrchestratorDefaults(
+      { version: STAGE_AGENT_CONFIG_VERSION, mode: body.mode, ...(body.stages !== undefined ? { stages: body.stages as StageAgentConfigurationV1["stages"] } : {}) },
+      actor,
+    );
+    json(res, 200, { configured: true, ...storedConfigView(stored) });
+  } catch (err) {
+    json(res, 400, { error: err instanceof Error ? err.message : "invalid defaults" });
+  }
+}
+
+/** Only stored mappings qualify; inherited object properties are not projects. */
+function getOwnMapping(key: string): RepoMapping | undefined {
+  const mappings = getMappings();
+  return Object.hasOwn(mappings, key) ? mappings[key] : undefined;
+}
+
+function handleGetProjectAgentConfig(res: http.ServerResponse, projectKey: string): void {
+  if (!getOwnMapping(projectKey)) {
+    json(res, 404, { error: "mapping not found" });
+    return;
+  }
+  const stored = getProjectStageConfig(projectKey);
+  json(res, 200, { projectKey, ...(stored ? storedConfigView(stored) : { enabled: false, mode: "legacy", stages: {} }) });
+}
+
+/** Per-field overlay: a supplied field replaces the stored one (null clears it back to inheritance); the rest stay. */
+function overlayStages(
+  current: StageAgentConfigurationV1["stages"],
+  incoming: Record<string, Record<string, unknown>>,
+): StageAgentConfigurationV1["stages"] {
+  const next: Record<string, Record<string, unknown>> = {};
+  for (const [stage, patch] of Object.entries(current ?? {})) next[stage] = { ...(patch as Record<string, unknown>) };
+  for (const [stage, patch] of Object.entries(incoming)) next[stage] = { ...next[stage], ...patch };
+  return next as StageAgentConfigurationV1["stages"];
+}
+
+function backendsFor(mapping: { executionMode: "github-actions" | "fly-machines" }): AgentRunRequest["backend"][] {
+  const path = resolveExecutionPath(getRunnerMode().mode, mapping.executionMode);
+  return path === "both" ? ["github-actions", "fly-machines"] : [path];
+}
+
+const WORKFLOW_SYNC_ACTION =
+  "Run the existing workflow sync for this project (/admin#projects) and merge its PR in the target repo; this API does not enable or rewrite workflows.";
+
+interface ReadinessRefusal {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+/** Read-only readiness of an uncommitted candidate for the backend(s) dispatch would use. Nothing is stored to inspect it. */
+async function readinessRefusal(projectKey: string, mapping: RepoMapping, candidate: StageAgentConfigurationV1, deps: AdminDeps): Promise<ReadinessRefusal | null> {
+  try {
+    resolveCandidateProjectStageConfig(projectKey, candidate);
+  } catch {
+    return { status: 422, body: { error: "stage configuration does not resolve", code: "resolution_failed" } };
+  }
+  for (const backend of backendsFor(mapping)) {
+    let readiness: AgentReadiness;
+    try {
+      readiness = await deps.agentConfig!.inspectReadiness(
+        {
+          projectKey,
+          backend,
+          workflowRepository: `${mapping.owner}/${mapping.repo}`,
+          workflowFile: mapping.workflowFile,
+        },
+        candidate,
+      );
+    } catch {
+      return { status: 503, body: { error: "readiness inspection failed", code: "readiness_unavailable", backend } };
+    }
+    if (readiness.status === "ready") continue;
+    const code = readiness.status === "not-ready" ? readiness.code : "resolution_failed";
+    const templateCodes = ["runner_incompatible", "retired_workflow_present", "delivery_unreadable"];
+    return {
+      status: 409,
+      body: {
+        error: "project is not ready to run configured agents",
+        code,
+        backend,
+        ...(backend === "github-actions" && templateCodes.includes(code) ? { action: WORKFLOW_SYNC_ACTION } : {}),
+      },
+    };
+  }
+  return null;
+}
+
+const projectConfigLocks = new Map<string, Promise<unknown>>();
+
+/** Serialises read-inspect-write sequences per project so one PUT's rollback cannot overwrite another's write. */
+async function withProjectConfigLock<T>(projectKey: string, fn: () => Promise<T>): Promise<T> {
+  const prior = projectConfigLocks.get(projectKey) ?? Promise.resolve();
+  const run = prior.then(fn, fn);
+  const tail = run.catch(() => undefined);
+  projectConfigLocks.set(projectKey, tail);
+  try {
+    return await run;
+  } finally {
+    if (projectConfigLocks.get(projectKey) === tail) projectConfigLocks.delete(projectKey);
+  }
+}
+
+async function handlePutProjectAgentConfig(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  projectKey: string,
+  deps: AdminDeps,
+  actor: string | null,
+): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  const result = await putProjectAgentConfigAction(projectKey, deps, actor, body);
+  json(res, result.status, result.body);
+}
+
+export function putProjectAgentConfigAction(
+  projectKey: string, deps: AdminDeps, actor: string | null, body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  return withProjectConfigLock(projectKey, () => putProjectAgentConfigLocked(projectKey, deps, actor, body));
+}
+
+async function putProjectAgentConfigLocked(
+  projectKey: string,
+  deps: AdminDeps,
+  actor: string | null,
+  body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const mapping = getOwnMapping(projectKey);
+  if (!mapping) {
+    return { status: 404, body: { error: "mapping not found" } };
+  }
+  const extra = unsupportedKeys(body, ["stages"]);
+  if (extra.length > 0) {
+    return { status: 400, body: { error: `unsupported field(s): ${extra.join(", ")}` } };
+  }
+  const previous = getProjectStageConfig(projectKey);
+  if (body.stages !== undefined) {
+    const bad = validateStagesBody(body.stages);
+    if (bad) {
+      return { status: 400, body: { error: bad } };
+    }
+  }
+  const enabled = previous?.config.mode === "configured";
+  if (enabled && !deps.agentConfig) {
+    return { status: 501, body: { error: "agent configuration readiness inspection is not configured", code: "readiness_unavailable" } };
+  }
+  const stages = body.stages === undefined ? previous?.config.stages : overlayStages(previous?.config.stages, body.stages as Record<string, Record<string, unknown>>);
+  const candidate: StageAgentConfigurationV1 = {
+    version: STAGE_AGENT_CONFIG_VERSION,
+    mode: enabled ? "configured" : "legacy",
+    ...(stages !== undefined ? { stages } : {}),
+  };
+  // Taken before any await: if a default, profile, permission or project head moves while readiness is
+  // inspected, the commit below refuses rather than publishing a verdict about inputs that no longer exist.
+  const inputs = readStageInputsFingerprint(projectKey);
+  if (enabled) {
+    try {
+      resolveCandidateProjectStageConfig(projectKey, candidate);
+    } catch (err) {
+      return { status: 400, body: { error: err instanceof Error ? err.message : "invalid stage configuration" } };
+    }
+    const refusal = await readinessRefusal(projectKey, mapping, candidate, deps);
+    if (refusal) {
+      return { status: refusal.status, body: refusal.body };
+    }
+  }
+  let stored;
+  try {
+    stored = setProjectStageConfig(projectKey, candidate, actor, inputs); // re-validates resolution inside its own transaction
+  } catch (err) {
+    if (err instanceof StaleStageInputsError) {
+      return { status: 409, body: { error: "stage configuration inputs changed while readiness was inspected; retry", code: "stale_inputs" } };
+    }
+    return { status: 400, body: { error: err instanceof Error ? err.message : "invalid stage configuration" } };
+  }
+  return { status: 200, body: { projectKey, ...storedConfigView(stored) } };
+}
+
+/**
+ * The response's fallbacksDropped field is true only when a project account
+ * override has no following diagnostic entry; an override alone does not imply
+ * that its default fallbacks were dropped. This applies to both response paths.
+ */
+function handleGetResolvedAgentConfig(res: http.ServerResponse, projectKey: string, deps: AdminDeps): void {
+  const mapping = getOwnMapping(projectKey);
+  if (!mapping) {
+    json(res, 404, { error: "mapping not found" });
+    return;
+  }
+  const stored = getProjectStageConfig(projectKey);
+  const base = { projectKey, enabled: stored?.config.mode === "configured" };
+  const backends = backendsFor(mapping);
+  const checkAccount = (entry: StageAccount): AccountFailure | null =>
+    entry.authMode === "bedrock" && backends.some(backend => backend !== "github-actions") ? "unsupported_combination" : null;
+  let projection;
+  try {
+    projection = resolveProjectStageConfig(projectKey, undefined, checkAccount);
+  } catch (err) {
+    // Resolver messages are fixed text (disabled or incompatible profile); none carries a credential.
+    const accountEntries = inspectProjectStageAccounts(projectKey, checkAccount);
+    json(res, 200, {
+      ...base,
+      mode: "configured",
+      resolved: false,
+      stages: Object.fromEntries(STAGE_NAMES.map(stage => [stage, { entries: accountEntries[stage], fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null && (accountEntries[stage]?.length ?? 0) <= 1 }])),
+      error: { code: "resolution_failed", message: err instanceof Error ? err.message : "stage configuration does not resolve" },
+    });
+    return;
+  }
+  const { resolution } = projection;
+  if (resolution.mode !== "configured") {
+    json(res, 200, { ...base, mode: "legacy", resolved: true });
+    return;
+  }
+  const stages = {} as Record<StageName, unknown>;
+  for (const stage of STAGE_NAMES) {
+    const profile = resolution.profiles[stage];
+    const projectionProfile = getAccountProfile(profile.id);
+    stages[stage] = {
+      entries: resolution.accountEntries?.[stage],
+      fallbacksDropped: stored?.config.stages?.[stage]?.accountProfileId != null && (resolution.accountEntries?.[stage]?.length ?? 0) <= 1,
+      values: { ...resolution.stages[stage], fallbackModel: resolution.fallbackModels[stage] ?? null },
+      sources: { ...resolution.sources[stage], fallbackModel: resolution.fallbackModelSources[stage] ?? null },
+      profile: { id: profile.id, identity: profile.identity, revision: profile.revision, agent: profile.agent, provider: profile.provider, authMode: profile.authMode },
+      account: projectionProfile ? accountStatus({ ...projectionProfile, revision: profile.revision }, deps) : { readiness: "unknown", failureCode: "profile_not_found" },
+    };
+  }
+  json(res, 200, { ...base, mode: "configured", resolved: true, stages, configRevisions: projection.configReferences });
 }

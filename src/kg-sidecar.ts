@@ -6,6 +6,11 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { stopChildWithBackstop } from "./process-stop.js";
 
+/** Whether the selected backend serves the graph from a remote store. */
+export function isRemoteKgStore(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.KG_BACKEND === "stardog_run";
+}
+
 /** Default directory where the baked KG graph lives inside the image. */
 export const KG_DIR = "/app/kg";
 
@@ -21,7 +26,7 @@ const SIDECAR_PORT = 8765;
 const SIDECAR_URL = `http://127.0.0.1:${SIDECAR_PORT}/mcp`;
 
 /**
- * Reads the IRI namespace of whatever graph is actually being served: the runtime
+ * Uses a nonempty KG_NAMESPACE first, otherwise reads the served graph: the runtime
  * overlay when one has been staged, else the baked image — the same selection
  * kg-refresh.ts's status() uses to read servedStamp. Used to build the spine IRI
  * for the sidecar liveness probe's kg_neighbors call (AII-648). Best-effort: a
@@ -31,6 +36,8 @@ export async function getServedNamespace(
   kgDir: string = KG_DIR,
   runtimeDataDir: string = RUNTIME_DATA_DIR,
 ): Promise<string | null> {
+  if (process.env.KG_NAMESPACE) return process.env.KG_NAMESPACE;
+
   const servedDir = existsSync(join(runtimeDataDir, "sources.yml")) ? runtimeDataDir : kgDir;
   try {
     const raw = await readFile(join(servedDir, "sources.yml"), "utf8");
@@ -116,7 +123,7 @@ export class KgSidecar {
   /**
    * Spawns the sidecar, polls its MCP endpoint for up to pollTimeoutMs, and sets
    * KG_SIDECAR_URL on success. KG_EMBEDDINGS_DEGRADED is set when embeddings are
-   * missing regardless of whether the sidecar started. All failure modes are logged
+   * missing for a local store after readiness. All failure modes are logged
    * and non-fatal.
    */
   async start(): Promise<void> {
@@ -155,7 +162,7 @@ export class KgSidecar {
     process.env.KG_SIDECAR_URL = SIDECAR_URL;
     console.error(`[kg] KG_SIDECAR_URL set to ${SIDECAR_URL}`);
 
-    if (checkDegraded(this._kgDir)) {
+    if (!isRemoteKgStore(childEnv) && checkDegraded(this._kgDir)) {
       console.error("[kg] WARNING: embeddings missing — hybrid search is lexical-only");
       process.env.KG_EMBEDDINGS_DEGRADED = "1";
     }
@@ -206,6 +213,13 @@ export class KgSidecar {
 
   private _resolveChildEnv(): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
+
+    if (isRemoteKgStore(env)) {
+      delete env.KG_DATA_DIR;
+      delete env.KG_PARTS_DIR;
+      console.error("[kg] serving remote store stardog_run");
+      return env;
+    }
 
     if (existsSync(this._runtimeDataDir)) {
       const markerPath = join(this._runtimeDataDir, COMPLETION_MARKER);

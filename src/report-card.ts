@@ -1,4 +1,7 @@
+import { estimateCallCostUsd, type ModelPriceRates } from "./model-price-estimate.js";
+import { toInvocation } from "./job-accounting.js";
 import { getDb } from "./dedup.js";
+import { read as readAdmission } from "./dispatch-admission.js";
 
 // ---- Types ----
 
@@ -12,13 +15,15 @@ export interface RunEntry {
   terminationReason: string | null;
   costUsd: number | null;
   maxTurnsHits: number;
+  /** The Restate workflow/object this run is keyed by, the lookup key for the Restate UI link `/ui/workflows/<service>/<key>`; null when not Restate-owned. */
+  restate: { service: "KgRefresh" | "PlanningRun" | "ImplementationRun" | "ReviewFixAttempt"; key: string } | null;
 }
 
 export interface IssueReportCard {
   issue: string;
   repo: string | null;
   runs: RunEntry[];
-  totals: { dispatches: number; passes: number; costUsd: number | null };
+  totals: { dispatches: number; passes: number; costUsd: number | null; estimatedCostUsd: number | null; unpricedCalls: number };
   approved: boolean;
   planned: boolean;
   merged: boolean;
@@ -80,6 +85,7 @@ interface DispatchRow {
   status: string;
   conclusion: string | null;
   pr_url: string | null;
+  dispatch_id: string | null;
 }
 
 interface FeedbackLoopOutputs {
@@ -247,14 +253,38 @@ function derivedStatsForJob(db: Db, jobId: number): DerivedRunStats {
   return { ...base, costUsd: addCost(base.costUsd, extraCostUsd(db, jobId)) };
 }
 
+// ---- Restate lookup key ----
+
+/** Same rule as `isRestateOwnedJob` in index.ts (copied: this module must not import it). */
+function isRestateOwned(dispatchId: string): boolean {
+  try {
+    return readAdmission(dispatchId)?.lifecycleOwner.kind === "restate";
+  } catch {
+    return false; // admissions table absent
+  }
+}
+
+/** Resolve the owning workflow using durable admission and review-fix attempt records. */
+export function restateRefForJob(dispatchId: string | null, phase: string): RunEntry["restate"] {
+  if (!dispatchId) return null;
+  if (phase === "kg-refresh") return { service: "KgRefresh", key: dispatchId };
+  if (!isRestateOwned(dispatchId)) return null;
+  if (phase === "implementation") return { service: "ImplementationRun", key: dispatchId };
+  if (phase === "gap-analysis") {
+    const attempt = getDb().prepare("SELECT 1 FROM review_fix_attempts WHERE dispatch_id = ?").get(dispatchId);
+    return { service: attempt ? "ReviewFixAttempt" : "ImplementationRun", key: dispatchId };
+  }
+  return { service: phase === "planning" ? "PlanningRun" : "ReviewFixAttempt", key: dispatchId };
+}
+
 // ---- getIssueReportCard ----
 
-export function getIssueReportCard(identifier: string): IssueReportCard | null {
+export function getIssueReportCard(identifier: string, prices: readonly ModelPriceRates[] = []): IssueReportCard | null {
   const db = getDb();
 
   const dispatches = db
     .prepare(
-      `SELECT id, issue_id, repo, dispatched_at, phase, status, conclusion, pr_url
+      `SELECT id, issue_id, repo, dispatched_at, phase, status, conclusion, pr_url, dispatch_id
        FROM dispatch_log
        WHERE issue_identifier = ?
        ORDER BY dispatched_at ASC`,
@@ -262,6 +292,22 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
     .all(identifier) as DispatchRow[];
 
   if (dispatches.length === 0) return null;
+
+  let estimatedCostUsd: number | null = null;
+  let unpricedCalls = 0;
+  const calls = db.prepare(`
+    SELECT a.* FROM model_invocation_attribution a
+    WHERE a.dispatch_id IN (
+      SELECT dispatch_id FROM dispatch_log WHERE issue_identifier = ?
+    ) ORDER BY a.rowid
+  `).all(identifier) as Parameters<typeof toInvocation>[0][];
+  for (const row of calls) {
+    const call = toInvocation(row);
+    if (call.costStatus !== "unavailable") continue;
+    const estimate = estimateCallCostUsd(call, prices);
+    if (estimate === null) unpricedCalls++;
+    else estimatedCostUsd = (estimatedCostUsd ?? 0) + estimate;
+  }
 
   const repo = dispatches.find((d) => d.repo != null)?.repo ?? null;
 
@@ -271,6 +317,7 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
     status: d.status,
     conclusion: d.conclusion,
     ...derivedStatsForJob(db, d.id),
+    restate: restateRefForJob(d.dispatch_id, d.phase),
   }));
 
   const implRuns = runs.filter((r) => r.phase !== "planning");
@@ -339,7 +386,14 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
        WHERE rfq.issue_identifier = ?`,
     )
     .get(identifier) as { n: number };
-  const reviewFixRounds = reviewFixRow.n;
+  const restateReviewFixRow = db
+    .prepare(
+      `SELECT COUNT(*) as n FROM review_fix_attempts rfa
+       JOIN review_fix_queue rfq ON json_extract(rfa.task_snapshot_json, '$.queueCursor.queueId') = rfq.id
+       WHERE rfq.issue_identifier = ?`,
+    )
+    .get(identifier) as { n: number };
+  const reviewFixRounds = reviewFixRow.n + restateReviewFixRow.n;
 
   // parked: dedup entry exists with no in-flight run
   const dedupRow = db
@@ -352,7 +406,7 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
     issue: identifier,
     repo,
     runs,
-    totals: { dispatches: dispatches.length, passes: totalPasses, costUsd: totalCostUsd },
+    totals: { dispatches: dispatches.length, passes: totalPasses, costUsd: totalCostUsd, estimatedCostUsd, unpricedCalls },
     approved,
     planned,
     merged,
@@ -813,4 +867,38 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
     escapeRate,
     runaways,
   };
+}
+
+export interface ReviewerScore {
+  source: string;
+  total: number;
+  fixed: number;
+  rejected: number;
+  deferred: number;
+  ignored: number;
+  rejectedRate: number;
+}
+
+/** First-seen cohort; active open findings contribute to total but not ignored. */
+export function getReviewerScorecard(opts: { days?: number; repo?: string } = {}): ReviewerScore[] {
+  const now = Date.now();
+  const since = now - (opts.days ?? 30) * 86_400_000;
+  const db = getDb();
+  const hasMergeCapture = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pr_merge_capture'").get();
+  const merged = hasMergeCapture
+    ? "EXISTS (SELECT 1 FROM pr_merge_capture m WHERE m.repo = f.repo AND m.pr_number = f.pr_number AND m.merged_at IS NOT NULL AND m.merged_at <= @now)"
+    : "0";
+  const rows = db.prepare(`
+    SELECT source, COUNT(*) AS total,
+      SUM(status = 'resolved' AND COALESCE(disposition = 'fixed', 0)) AS fixed,
+      SUM(status = 'rejected') AS rejected,
+      SUM(status = 'deferred') AS deferred,
+      SUM((status = 'resolved' AND (disposition IS NULL OR disposition != 'fixed'))
+        OR (status = 'open' AND ${merged})) AS ignored
+    FROM review_findings f
+    WHERE first_seen_at >= @since AND first_seen_at <= @now
+      AND (@repo IS NULL OR repo = @repo)
+    GROUP BY source ORDER BY source
+  `).all({ since, now, repo: opts.repo ?? null }) as Omit<ReviewerScore, "rejectedRate">[];
+  return rows.map(row => ({ ...row, rejectedRate: row.rejected / row.total }));
 }

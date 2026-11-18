@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type * as DedupModule from "../dedup.js";
 import type * as PublicationTokenModule from "../publication-token-vending.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
+import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
@@ -13,31 +11,26 @@ vi.mock("../github-app-auth.js", () => ({
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
 let publicationToken: typeof PublicationTokenModule;
 let mockGetScopedToken: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
-  vi.resetModules();
   vi.clearAllMocks();
-  dbPath = path.join(
-    os.tmpdir(),
-    `publication-token-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  runnerTokens = await import("../runner-tokens.js");
-  publicationToken = await import("../publication-token-vending.js");
-  const ghAuth = await import("../github-app-auth.js");
-  mockGetScopedToken = vi.mocked(ghAuth.getScopedInstallationToken);
-  dedup.getDb();
+  const { modules } = await testDb({
+    modules: {
+      dedup: () => import("../dedup.js"),
+      runnerTokens: () => import("../runner-tokens.js"),
+      publicationToken: () => import("../publication-token-vending.js"),
+      ghAuth: () => import("../github-app-auth.js"),
+    },
+  });
+  ({ dedup, runnerTokens, publicationToken } = modules);
+  mockGetScopedToken = vi.mocked(modules.ghAuth.getScopedInstallationToken);
 });
 
 afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
   vi.restoreAllMocks();
 });
 
@@ -68,6 +61,53 @@ async function callHandler(
 }
 
 describe("handlePublicationTokenRequest", () => {
+  it.each(["github-actions", "fly-machines", "local-docker"])("allows bound %s publication once and rejects released pre-write authority", async (backend) => {
+    const attemptId = "fly-attempt-1";
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO dispatch_admissions
+      (dispatch_id, mapping_key, issue_scope, issue_id, installation_id, repository,
+       pr_number, lifecycle_owner, phase, backend, created_at)
+      VALUES (?, 'AII', 'pr', 'acme/app#42', '7', 'acme/app', 42, ?,
+              'implementation', 'fly-machines', ?)`)
+      .run(attemptId, `restate:${attemptId}`, Date.now());
+    db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       execution_backend, execution_ref, task_snapshot_json, finding_versions_json)
+      VALUES (?, ?, 'AII', '7', 'acme/app', 42, 'pr', 'acme/app#42', ?,
+              'launch_intent', ?, ?, 'fly-machines', 'machine-1', '{}', '[]')`)
+      .run(attemptId, attemptId, attemptId, Date.now(), Date.now() + 60_000);
+    db.prepare(`UPDATE review_fix_attempts SET execution_backend = ?, github_run_id = 123,
+      github_run_attempt = 2 WHERE attempt_id = ?`).run(backend, attemptId);
+    db.prepare("UPDATE dispatch_admissions SET backend = ? WHERE dispatch_id = ?").run(backend, attemptId);
+    const publication = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "publication", secret: SECRET });
+    const result = runnerTokens.mintPreparedReviewFixToken({ attemptId, audience: "result", secret: SECRET });
+    const request = {
+      secret: SECRET, githubAppId: "app-id", githubAppPrivateKey: "fake-key",
+      repository: "acme/app",
+      ...(backend === "github-actions" ? { githubRunId: 123, githubRunAttempt: 2 } : {}),
+    };
+    const authorityRequest = { ...request, authorization: `Bearer ${result.token}` };
+    expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(200);
+    expect(publicationToken.handlePublicationAuthorityCheck({ ...authorityRequest, repository: "other/repo" }).status).toBe(403);
+    db.prepare("UPDATE review_fix_attempts SET execution_ref = NULL, github_run_id = NULL, github_run_attempt = NULL WHERE attempt_id = ?").run(attemptId);
+    expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(403);
+    expect((await publicationToken.handlePublicationTokenRequest({ ...request,
+      authorization: `Bearer ${publication.token}` })).status).toBe(403);
+    expect(mockGetScopedToken).not.toHaveBeenCalled();
+    db.prepare("UPDATE review_fix_attempts SET execution_ref = 'machine-1', github_run_id = 123, github_run_attempt = 2 WHERE attempt_id = ?").run(attemptId);
+    mockGetScopedToken.mockResolvedValue({ token: "ghs_fresh", expiresAt: "2030-01-01T00:00:00Z" });
+    expect((await publicationToken.handlePublicationTokenRequest({ ...request,
+      authorization: `Bearer ${publication.token}` })).status).toBe(200);
+    expect((await publicationToken.handlePublicationTokenRequest({ ...request,
+      authorization: `Bearer ${publication.token}` })).status).toBe(403);
+    expect(mockGetScopedToken).toHaveBeenCalledTimes(1);
+    expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(200);
+    db.prepare("UPDATE dispatch_admissions SET released_at = ? WHERE dispatch_id = ?").run(Date.now(), attemptId);
+    expect(publicationToken.handlePublicationAuthorityCheck(authorityRequest).status).toBe(403);
+    expect(runnerTokens.verifyPreparedReviewFixToken(result.token, SECRET, "result").ok).toBe(true);
+  });
+
   it("binds pilot issuance and subsequent push checks to the live attempt and exact run", async () => {
     const attemptId = "pilot-attempt-1";
     const db = dedup.getDb();
@@ -126,6 +166,26 @@ describe("handlePublicationTokenRequest", () => {
         forceRefresh: true,
       },
     );
+  });
+
+  it("logs one line per mint without the token value (AII-922)", async () => {
+    const token = mintPublicationToken("implementation", "acme/app");
+    mockGetScopedToken.mockResolvedValueOnce({
+      token: "ghs_secret_value",
+      expiresAt: "2030-01-01T00:00:00Z",
+      installationId: 4242,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await callHandler(token);
+
+    const lines = log.mock.calls.map((c) => c.join(" ")).filter((l) => l.includes("[publication-token] minted"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("repo=acme/app");
+    expect(lines[0]).toContain("installation=4242");
+    expect(lines[0]).toContain("expires_at=2030-01-01T00:00:00Z");
+    expect(lines[0]).toMatch(/dispatch=\S+/);
+    expect(lines[0]).not.toContain("ghs_secret_value");
   });
 
   it("is single-use", async () => {
