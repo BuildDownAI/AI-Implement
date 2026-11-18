@@ -93,8 +93,11 @@ export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
   // Outcome repair runs first; tombstones must not suppress cancellation retries.
   for (const link of listUncheckedClosedLinks()) {
     const { issue, repository, number } = link;
+    // Superseded grouping PRs retain the parent's cancellation exemption even
+    // when the current PR closes in this same poll. Only finalization needs
+    // current-PR identity.
     if (link.role === "roll-up" ||
-        isCurrentGroupingParent(link) ||
+        link.groupingParent ||
         listOpenLinksForIssue(issue.trackerKind, issue.trackerIssueId).length > 0) {
       setCancelCheckedAt(repository, number, Date.now());
       continue;

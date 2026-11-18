@@ -393,24 +393,27 @@ describe("detectMergedPrs", () => {
       expect(links.findLinkByPr("o/r", 7)?.outcome).toBe("closed-unmerged");
     });
 
-    it("finalizes only the replacement PR after pruning, without cancellation", async () => {
+    it("finalizes only the replacement when both PRs close before polling after pruning", async () => {
       const job = log.appendLog({ issueId: "p1", issueIdentifier: "ENG-40",
         repo: "o/r", teamKey: "m", groupingParent: true });
       log.updateJobPrUrl(job, url(7));
       log.updateJobPrUrl(job, url(8));
       db.exec("DELETE FROM dispatch_log");
+      db.prepare("INSERT INTO dispatched (issue_id, dispatched_at, team_key) VALUES ('p1', 1, 'm')").run();
       const deps = makeDeps(async () => true);
-      deps.getPullRequestState.mockImplementation(async (_t, _o, _r, n) =>
-        n === 7 ? closed : { merged: false, state: "open" as const });
-      await mod.detectMergedPrs(deps);
-      expect(deps.finalizeGroupingParent).not.toHaveBeenCalled();
-      expect(deps.cancelIssue).not.toHaveBeenCalled();
-      deps.getPullRequestState.mockResolvedValue(closed);
-      await mod.detectMergedPrs(deps);
       await mod.detectMergedPrs(deps);
       expect(deps.finalizeGroupingParent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ number: 8 }));
       expect(deps.cancelIssue).not.toHaveBeenCalled();
-      expect(recon.hasReconciliationForPr("o/r", 8)).toBe(true);
+      for (const number of [7, 8]) {
+        expect(links.findLinkByPr("o/r", number)).toMatchObject({
+          outcome: "closed-unmerged", cancelCheckedAt: expect.any(Number),
+        });
+        expect(recon.hasReconciliationForPr("o/r", number)).toBe(true);
+      }
+      await mod.detectMergedPrs(deps);
+      expect(deps.finalizeGroupingParent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ number: 8 }));
+      expect(deps.cancelIssue).not.toHaveBeenCalled();
+      expect(db.prepare("SELECT 1 FROM dispatched WHERE issue_id = 'p1'").get()).toBeDefined();
     });
 
     it("repairs a tombstoned parent's outcome without finalizing again", async () => {
