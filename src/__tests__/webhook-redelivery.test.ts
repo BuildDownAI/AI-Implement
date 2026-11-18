@@ -1,14 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
 import { listRecentAppDeliveries, redeliverFailedAppDeliveries, sweepOnRegistered, type AppDelivery } from "../webhook-redelivery.js";
 import { GitHubApiError } from "../github-errors.js";
+import { makeAppPrivateKey } from "./helpers/builders.js";
 import { fakeFetch, type FakeFetch, type Reply, type Routes } from "./helpers/fake-fetch.js";
 
-const { privateKey } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs8", format: "pem" },
-});
+const privateKey = makeAppPrivateKey();
 const APP_ID = "123456";
 const NOW = Date.parse("2026-10-09T12:00:00Z");
 const ago = (h: number) => new Date(NOW - h * 3600_000).toISOString();

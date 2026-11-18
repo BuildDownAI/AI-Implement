@@ -1,18 +1,13 @@
-import { generateKeyPairSync } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SeedOnceSettingsModule from "../../seed-once-settings.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { SetupCheckContext, SetupCheckId, SetupCheckOutcome } from "../../setup-checks/index.js";
 import { isAdminPathConfigured, ORCHESTRATOR_CONFIG_CHECKS } from "../../setup-checks/orchestrator-config.js";
-import { makeAccessEntry, makeMapping } from "../helpers/builders.js";
+import { makeAccessEntry, makeAppPrivateKey, makeMapping } from "../helpers/builders.js";
 import { makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
 
-const { privateKey: pkcs1Key } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs1", format: "pem" },
-});
+const pkcs1Key = makeAppPrivateKey("pkcs1");
 
 async function run(id: SetupCheckId, overrides: Partial<SetupCheckContext> = {}): Promise<SetupCheckOutcome[]> {
   const check = ORCHESTRATOR_CONFIG_CHECKS.find((c) => c.id === id);

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parse } from "smol-toml";
+import { makeAppPrivateKey } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted, stubAbortTimeout } from "./helpers/fake-fetch.js";
 import { testDir } from "./helpers/test-dir.js";
 import { GITHUB_APP_EVENTS } from "../github-app-permissions.js";
@@ -49,7 +49,7 @@ describe("probeHealth", () => {
   });
 });
 
-const PEM = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+const PEM = makeAppPrivateKey();
 const EXISTING_CLIENT_FILE = '[fly]\napp_name = "orchestrator"\norg = "my-org"\nregion = "lhr"\n';
 
 /** Every secret a first run sets, generated ones included. Each value contains "sentinel" so a leak is easy to find. */

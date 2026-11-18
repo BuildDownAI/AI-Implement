@@ -1,11 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
 import type * as DedupModule from "../../dedup.js";
 import type * as SetupChecksModule from "../../setup-checks/index.js";
 import type { FilesystemSetupFacts, JiraSetupFacts } from "../../providers/types.js";
 import type { SetupCheck, SetupCheckContext, SetupCheckResult } from "../../setup-checks/index.js";
 import { waitOn } from "../../setup-checks/contract.js";
-import { makeAccessEntry, makeMapping, makeProvider } from "../helpers/builders.js";
+import { makeAccessEntry, makeAppPrivateKey, makeMapping, makeProvider } from "../helpers/builders.js";
 import { makeGitHubSetupFacts, makeLinearSetupFacts, makeSentinelSetupCheckContext, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 import { testDb } from "../helpers/test-db.js";
 import { fakeFetch } from "../helpers/fake-fetch.js";
@@ -211,9 +210,8 @@ describe("SETUP_CHECKS", () => {
 
   it("declares perProject on exactly the checks that answer a row for a project", async () => {
     // GitHub accepts the App but it is installed nowhere, so each GitHub per-project check reaches its projects. The webhook secret lets the webhook checks run.
-    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
     const githubAccepting = makeSetupCheckContext({
-      env: { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey, GITHUB_WEBHOOK_SECRET: "secret" },
+      env: { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: makeAppPrivateKey(), GITHUB_WEBHOOK_SECRET: "secret" },
       mappings: () => ({ ENG: makeMapping() }),
       githubSetupFacts: () => makeGitHubSetupFacts({
         app: async () => ({ status: 200, slug: "ai-implement", events: [], errorBody: "", githubTime: null, localTime: 0 }),
@@ -654,8 +652,7 @@ describe("createSetupCheckContext", () => {
   });
 
   describe("githubSetupFacts", () => {
-    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
-    const env = { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey };
+    const env = { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: makeAppPrivateKey() };
     const installed = (id: number, selection: "all" | "selected" = "all") =>
       ({ json: { id, repository_selection: selection, permissions: { contents: "write", pull_requests: "write", metadata: "read" } } });
 

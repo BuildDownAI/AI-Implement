@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
 import type { RepoMapping } from "../../config.js";
 import type { AppIdentityRead, AppInstallation } from "../../github-app-auth.js";
 import type { RepositoryFacts } from "../../github.js";
@@ -9,11 +8,10 @@ import type { PreflightCheckResult } from "../../kg-refresh.js";
 import { GITHUB_CONFIG_CHECKS, ownerRepositoryRequests, workflowFileExpression, workflowFiles } from "../../setup-checks/github-config.js";
 import type { GitHubSetupFacts, SetupCheckContext, SetupCheckOutcome } from "../../setup-checks/index.js";
 import type { AppDelivery } from "../../webhook-redelivery.js";
-import { makeMapping } from "../helpers/builders.js";
+import { makeAppPrivateKey, makeMapping } from "../helpers/builders.js";
 import { makeGitHubSetupFacts, makeSetupCheckContext } from "../helpers/fixtures/setup-checks.js";
 
-const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048, publicKeyEncoding: { type: "spki", format: "pem" }, privateKeyEncoding: { type: "pkcs8", format: "pem" } });
-const APP_ENV = { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: privateKey };
+const APP_ENV = { GITHUB_APP_ID: "123456", GITHUB_APP_PRIVATE_KEY: makeAppPrivateKey() };
 const NOW = Date.parse("2026-11-10T02:42:14Z");
 
 const ALL_EVENTS = ["issue_comment", "pull_request", "pull_request_review", "pull_request_review_comment", "push"];

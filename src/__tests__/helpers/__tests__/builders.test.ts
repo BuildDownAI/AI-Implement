@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { generateKeyPairSync } from "node:crypto";
+import { createPrivateKey } from "node:crypto";
 import { parseChatGptPlanRecord } from "../../../chatgpt-plan-token.js";
 import { getMappings, initMappingsTable, upsertMapping } from "../../../config.js";
 import { runDevHarnessCli } from "../../../dev-harness/cli.js";
@@ -17,6 +17,7 @@ import {
   makeAccessEntry,
   makeAppConfig,
   makeAppendLogEntry,
+  makeAppPrivateKey,
   makeChatGptPlanRecord,
   makeContext,
   makeExecutor,
@@ -167,12 +168,17 @@ describe("makeScopedPrIdentity", () => {
   });
 });
 
-describe("makeScopedInstallationToken", () => {
-  const { privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: "spki", format: "pem" },
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+describe("makeAppPrivateKey", () => {
+  it("is one key, in either form", () => {
+    expect(createPrivateKey(makeAppPrivateKey("pkcs1")).export({ type: "pkcs8", format: "pem" }).toString()).toBe(makeAppPrivateKey());
+    expect(makeAppPrivateKey()).toMatch(/^-----BEGIN PRIVATE KEY-----/);
+    expect(makeAppPrivateKey("pkcs1")).toMatch(/^-----BEGIN RSA PRIVATE KEY-----/);
   });
+});
+
+describe("makeScopedInstallationToken", () => {
+  // The key signs the App's JWT for the mint, as a real one does.
+  const privateKey = makeAppPrivateKey();
 
   beforeEach(() => {
     vi.useFakeTimers();
