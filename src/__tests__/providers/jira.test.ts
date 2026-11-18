@@ -2222,7 +2222,6 @@ describe("JiraProvider.listIssueStatuses", () => {
   });
 });
 
-
 runPrClosedUnmergedContract("JiraProvider", async (terminal) => {
   clearFieldCache();
   const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY,

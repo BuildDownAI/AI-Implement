@@ -314,6 +314,24 @@ describe("FilesystemProvider", () => {
     });
   });
 
+  it("refuses an unmerged-close write for an archived failed task", async () => {
+    const dir = testDir("fs-close-archived");
+    const id = "filesystem:LOCAL:LOCAL-1";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-1.md", "---\ntitle: Archived task\n---\nNeeds a human.");
+    await p.markImplementationFailed(id, "LOCAL", "needs a human");
+    await expect(p.archiveFailed(id, "LOCAL", "implementation")).resolves.toBe(true);
+    const statePath = join(dir, ".state", "LOCAL", "LOCAL-1.json");
+    const before = await readFile(statePath, "utf8");
+    vi.mocked(writeFile).mockClear();
+
+    await expect(p.markPrClosedUnmerged(id, "LOCAL", "https://github.com/acme/widgets/pull/1")).resolves.toBe(false);
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(await readFile(statePath, "utf8")).toBe(before);
+    expect(await p.readIssueDetails(id)).toMatchObject({ location: "failed" });
+  });
+
   it("explicitly archives failed tickets and retries them without dropping history", async () => {
     const dir = testDir("fs-provider");
     const id = "filesystem:LOCAL:LOCAL-6";

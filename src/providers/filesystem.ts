@@ -319,7 +319,7 @@ export class FilesystemProvider implements TicketingProvider {
         { ...state, status: "cancelled" },
         `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the task status to its pickup value.`,
       );
-    });
+    }, { activeOnly: true });
   }
 
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
