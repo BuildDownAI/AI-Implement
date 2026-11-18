@@ -19,6 +19,8 @@ export interface OpenPullsDeps {
   now(): number;
 }
 
+const CACHE_MS = 60_000;
+const STALE_SERVE_MS = 300_000;
 const cache = new Map<string, { fetchedAt: number; pulls: OpenPullRequest[] }>();
 export function clearOpenPullsCache(): void { cache.clear(); }
 
@@ -44,13 +46,22 @@ export async function listOpenPulls(deps: Partial<OpenPullsDeps> = {}): Promise<
   for (const [repo, mappings] of repositories) {
     const { owner, repo: name } = mappings[0][1];
     let cached = cache.get(repo);
-    if (!cached || now - cached.fetchedAt >= 60_000) {
-      const pulls = await read(owner, name);
-      cached = { fetchedAt: (deps.now ?? defaults.now)(), pulls };
-      cache.set(repo, cached);
+    let servingStale = false;
+    if (!cached || (deps.now ?? defaults.now)() - cached.fetchedAt >= CACHE_MS) {
+      try {
+        const pulls = await read(owner, name);
+        cached = { fetchedAt: (deps.now ?? defaults.now)(), pulls };
+        cache.set(repo, cached);
+      } catch (error) {
+        const age = cached ? (deps.now ?? defaults.now)() - cached.fetchedAt : null;
+        if (!cached || age === null || age >= STALE_SERVE_MS) throw error;
+        servingStale = true;
+        console.warn(`Serving cached open pull requests for repository ${repo} after refresh failure; copy age ${age} ms`);
+      }
     }
     for (const pr of cached.pulls) {
       const link = findLinkByPr(repo, pr.number);
+      if (servingStale && link && link.outcome !== "open") continue;
       const lastJob = getDb().prepare(`SELECT phase, status, conclusion, completed_at AS finishedAt
         FROM dispatch_log WHERE pr_url = ? AND completed_at IS NOT NULL ORDER BY id DESC LIMIT 1`)
         .get(pr.url) as OpenPullEntry["lastJob"] | undefined;

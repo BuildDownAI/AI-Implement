@@ -168,3 +168,60 @@ it("defaults to an installation token and the complete GitHub reader", async () 
   expect(auth.getInstallationToken).toHaveBeenCalledWith(process.env.GITHUB_APP_ID, process.env.GITHUB_APP_PRIVATE_KEY, "acme");
   expect(github.listAllOpenPullRequests).toHaveBeenCalledWith("token", "acme", "app");
 });
+it.each([120_000, 299_999])("serves every repository after a refresh failure at age %i", async age => {
+  config.upsertMapping("Z", makeMapping({ owner: "z", repo: "app" }));
+  await api.listOpenPulls({ now, listRepoPulls: async () => [pull(1), pull(2)] });
+  time += age;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const result = await api.listOpenPulls({ now, listRepoPulls: async owner => {
+      if (owner === "acme") throw new Error("504");
+      return [pull(3)];
+    } });
+    expect(result.map(entry => [entry.repo, entry.pr.number])).toEqual([
+      ["acme/app", 2], ["acme/app", 1], ["z/app", 3],
+    ]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      `Serving cached open pull requests for repository acme/app after refresh failure; copy age ${age} ms`);
+  } finally { warn.mockRestore(); }
+});
+it("does not extend the stale window, and recovers after an expired failure", async () => {
+  await api.listOpenPulls({ now, listRepoPulls: async () => [] });
+  const error = new Error("504");
+  const read = vi.fn(async (): Promise<OpenPullRequest[]> => { throw error; });
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    time += 120_000;
+    expect(await api.listOpenPulls({ now, listRepoPulls: read })).toEqual([]);
+    time += 179_999;
+    expect(await api.listOpenPulls({ now, listRepoPulls: read })).toEqual([]);
+    time++;
+    await expect(api.listOpenPulls({ now, listRepoPulls: read })).rejects.toBe(error);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(await api.listOpenPulls({ now, listRepoPulls: async () => [pull()] })).toHaveLength(1);
+  } finally { warn.mockRestore(); }
+});
+it("measures stale age after the failed read finishes", async () => {
+  await api.listOpenPulls({ now, listRepoPulls: async () => [pull()] });
+  time += 299_999;
+  const error = new Error("slow failure");
+  await expect(api.listOpenPulls({ now, listRepoPulls: async () => { time++; throw error; } })).rejects.toBe(error);
+});
+it("filters terminal links only during fallback and recomputes local enrichment", async () => {
+  link(1); link(2); link(3);
+  const pulls = [pull(1), pull(2), pull(3), pull(4)];
+  await api.listOpenPulls({ now, listRepoPulls: async () => pulls });
+  links.setLinkOutcome("acme/app", 1, "merged", time);
+  links.setLinkOutcome("acme/app", 2, "closed-unmerged", time);
+  job({ pr_url: pull(3).url, completed_at: time });
+  time += 120_000;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const result = await api.listOpenPulls({ now, listRepoPulls: async () => { throw new Error("504"); } });
+    expect(result.map(entry => entry.pr.number)).toEqual([4, 3]);
+    expect(result[1].lastJob?.finishedAt).toBe(time - 120_000);
+    expect(result[0].tracked).toBe(false);
+    expect(pulls).toHaveLength(4);
+    expect(await api.listOpenPulls({ now, listRepoPulls: async () => pulls })).toHaveLength(4);
+  } finally { warn.mockRestore(); }
+});

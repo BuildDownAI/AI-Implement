@@ -1085,7 +1085,7 @@ export const getReviewFixActivityTool = tool(
 );
 
 export const LIST_OPEN_PULLS_DESCRIPTION =
-  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; any unreadable repository fails the whole call. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
+  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; a failed refresh serves the last good repository copy only while it is less than 5 minutes old, otherwise the whole call fails. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
 
 export const listOpenPullsTool = tool(
   {
@@ -1101,7 +1101,7 @@ export const listOpenPullsTool = tool(
 );
 
 export const LIST_ISSUE_STATUSES_DESCRIPTION =
-  "Returns a JSON array with one entry per in-scope issue: open issues matching the pickup query in any state, plus merged and failed issues from the last 7 days. States: ready, planning, awaiting-approval, plan-approved, implementing, pr-ready, merged, failed, unknown. changedAt is the tracker's last-updated time, or a newer job time when there is one (epoch ms). Breaker parks mark nonmerged issues failed; jobs supply missing failure phase and newer changedAt. Tracker reads are cached for 60 s; one unreadable tracker fails the whole call. Linear and filesystem never report awaiting-approval. Read.";
+  "Returns a JSON array with one entry per in-scope issue: open issues matching the pickup query in any state, plus merged and failed issues from the last 7 days. States: ready, planning, awaiting-approval, plan-approved, implementing, pr-ready, merged, failed, unknown. changedAt is the tracker's last-updated time, or a newer job time when there is one (epoch ms). Breaker parks mark nonmerged issues failed; jobs supply missing failure phase and newer changedAt. Tracker reads are cached for 60 s; a failed refresh serves the last good team copy only while it is less than 5 minutes old, otherwise the whole call fails. Linear and filesystem never report awaiting-approval. Read.";
 
 export const listIssueStatusesTool = tool(
   {
