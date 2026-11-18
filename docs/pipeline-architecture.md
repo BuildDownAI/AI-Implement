@@ -404,3 +404,18 @@ This supplements the clone-time `.git/info/exclude` guard, which cannot prevent
 force-added or already tracked scratch from being committed. Index-removal
 failures fail the step before commit. Scratch files remain on disk for disposition
 processing and callbacks; scratch-only passes take the existing no-changes path.
+
+
+### Gap-fill review scope
+
+A non-empty `commentInstruction` defines the scope of the in-loop review through
+the existing `reviewRubric` channel, recorded in the review step's inputs on every
+iteration. The reviewer blocks on defects in the requested work and on regressions,
+broken tests, or unsafe changes introduced by the diff. Other original issue
+requirements and acceptance-bar claims are advisory: they belong in `feedback`,
+not `blocking_issues`. The instruction is guarded as untrusted data, with grading
+rules outside the guard; the verdict schema and approval contract stay unchanged.
+Review-fix tasks keep all open findings carried by their instruction in scope,
+even when the same task appears in the issue description. Initial runs and bare
+`/ai-implement` comments keep the existing prompt. Post-push and hosted external
+reviews do not use this scope override.

@@ -10,8 +10,8 @@ describe("systemCaller", () => {
 });
 
 describe("serviceCaller", () => {
-  it("keeps deploy authority separate from the service role", () => {
-    expect(serviceCaller({ grants: ["deploy"] })).toEqual({ kind: "service", email: null, role: "user", grants: ["deploy"] });
+  it.each(["deploy", "projects", "secrets"] as const)("keeps %s authority separate from the service role", (grant) => {
+    expect(serviceCaller({ grants: [grant] })).toEqual({ kind: "service", email: null, role: "user", grants: [grant] });
   });
 
   it("returns kind service, no email, and the read-only user role", () => {

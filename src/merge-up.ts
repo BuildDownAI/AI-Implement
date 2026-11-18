@@ -1,6 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import type { FeatureNodeRollUp, IssueLifecycleState, TicketingProvider, TrackerIssueRecord } from "./providers/types.js";
 import { enqueueRollupReview } from "./comment-gapfill-queue.js";
+import { linkPullRequest } from "./pr-links.js";
 import { getDb } from "./dedup.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
@@ -203,6 +204,15 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
       "Automated feature-branch grouping: this branch's work is complete and ready " +
       "to merge into the base branch. Opened for human review." +
       grouped,
+  });
+  // Persist creation before further GitHub calls: this PR may close before the sweep.
+  linkPullRequest({
+    repository: `${owner}/${repo}`, number: newPr.number, url: newPr.url,
+    headRef: branch, baseRef: target, role: "roll-up", source: "result",
+    issue: {
+      trackerKind: mapping.ticketingConfig.kind, mappingKey: rollUp.scopeKey,
+      trackerIssueId: rollUp.issueId, identifier: rollUp.identifier, title: null, url: null,
+    },
   });
   const headSha = await getBranchSha(ghToken, owner, repo, branch);
   if (headSha) requestRollupReview(owner, repo, newPr.number, headSha);

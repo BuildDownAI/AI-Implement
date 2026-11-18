@@ -175,7 +175,7 @@ export interface RunAutopsy {
   /**
    * Set when the run worked on an existing PR (a gap-fill): that PR's URL. Such a run has one
    * review, on that PR, so no stage is named; an unapproved run does not push, so the PR is
-   * unchanged.
+   * unchanged. Installation failures occur after approval and push instead.
    */
   existingPrUrl?: string;
 }
@@ -238,6 +238,9 @@ export function reasonCodeTag(code: string): string {
  * run: the second review on the open PR, or the first review before it.
  */
 function autopsyHeadline(a: RunAutopsy): string {
+  if (a.terminationReason === "install_failed") {
+    return `Dependency installation failed; the change was approved by review but never built or tested. ${reasonCodeTag(a.terminationReason)}`;
+  }
   if (a.terminationReason === "verify_failed") {
     return `The repository's verify hook still failed after ${a.iterations} iteration(s), so the review did not examine the last pass. ${reasonCodeTag(a.terminationReason)}`;
   }
@@ -270,6 +273,9 @@ function autopsyHeadline(a: RunAutopsy): string {
  */
 function autopsyPrLine(a: RunAutopsy): string {
   // A gap-fill push reports no prUrl, and an unapproved gap-fill does not push.
+  if (a.existingPrUrl && a.terminationReason === "install_failed") {
+    return `The existing PR was updated by this run, but the change was not verified: ${a.existingPrUrl}`;
+  }
   if (a.existingPrUrl) return `The existing PR is unchanged by this run: ${a.existingPrUrl}`;
   if (!a.prUrl) {
     // APPROVED_WITHOUT_PR already says there is no PR and why.
@@ -311,7 +317,7 @@ export function formatRunAutopsy(a: RunAutopsy): string {
     "",
     ...(prLine ? [prLine, ""] : []),
     // On max_turns the feedback is the implement loop's own message, not a review's.
-    verifyFailed || providerUnavailable || checksPermissionDenied || a.terminationReason === "max_turns"
+    verifyFailed || providerUnavailable || checksPermissionDenied || a.terminationReason === "max_turns" || a.terminationReason === "install_failed"
       ? "**Run notes:**"
       : reviewerTurnsExhausted
         ? "**Reviewer telemetry and carried context:**"

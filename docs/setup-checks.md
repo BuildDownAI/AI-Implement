@@ -75,6 +75,7 @@ The orchestrator's own environment and settings (`ORCHESTRATOR_CONFIG_CHECKS`, `
 | [`env.github-app`](orchestrator-configuration.md#boot-checks-presence-not-validity) | The App pair unset, or a key that does not parse |
 | [`env.admin-access-code`](orchestrator-configuration.md#what-boot-warns-about) | The refused `.env.example` placeholder |
 | [`env.runner-mode`](orchestrator-configuration.md#environment-overrides) | An unrecognized `RUNNER_MODE`, ignored |
+| `kg.remote-store` | Missing or empty `KG_STARDOG_RUN_TOKEN`, `KG_STARDOG_DB` or `KG_NAMESPACE` when `KG_BACKEND=stardog_run`. This feature check reads only the environment; it makes no Stardog request. A wrong token shows as `sidecar.lastError` on `GET /` after boot, not in this check. |
 | [`env.poll-interval`](orchestrator-configuration.md#numeric-tuning-values) | A set `POLL_INTERVAL_MS` that is not a whole number of milliseconds from 1 to 2147483647 |
 | [`env.breaker-threshold`](orchestrator-configuration.md#numeric-tuning-values) | A `DISPATCH_BREAKER_THRESHOLD` that turns the breaker off |
 | `model.credentials-adopted` | Warns to run `node dist/model-account-cli.js adopt-env` when an environment credential exists without configured defaults; otherwise warns to run `node dist/model-account-cli.js adopt-projects`, listing mapped projects with absent or legacy rows (use `set_project_agent_mode` for projects with stored legacy rows). Fails with no model access configured when mappings exist without defaults or environment credentials. Passes with no credentials/defaults/mappings, or configured defaults and projects; notes an unused environment credential when present. Reads only; does not validate credentials. |
@@ -100,7 +101,7 @@ The tracker each project uses (`TRACKER_CONFIG_CHECKS`, `src/setup-checks/tracke
 | [`tracker.linear.credentials`](ticketing-providers.md#the-apps-credentials) | Linear refusing the app's credentials, with its HTTP status |
 | [`tracker.linear.team-access`](ticketing-providers.md#team-access) | A Linear project whose key names no team the app can see |
 | [`tracker.linear.pickup-label`](ticketing-providers.md#the-pickup-label) | No label with the pickup label's exact name at workspace level or in the team, or one only in a different case |
-| [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case |
+| [`tracker.linear.lifecycle-labels`](ticketing-providers.md#lifecycle-labels) | A lifecycle label the orchestrator would reuse in a different case (`warn`), or a missing label whose creation permission cannot be checked read-only (`cannot-verify`); mixed cases warn and report both |
 | [`tracker.linear.workflow-states`](ticketing-providers.md#workflow-states) | A team with no `started`-type or no `completed`-type state |
 | [`tracker.jira.credentials`](ticketing-providers.md#credentials) | Jira refusing the credentials, with its HTTP status, or OAuth mode, whose access token is never refreshed |
 | [`tracker.jira.fields`](ticketing-providers.md#custom-fields) | A required field that matches no field or several by name, which stops every Jira project; a warning for an optional field named twice |

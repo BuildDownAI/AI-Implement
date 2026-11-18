@@ -61,6 +61,25 @@ export interface TicketIssue {
   maxIterations?: number;
 }
 
+/** One vocabulary for issue status across trackers. `unknown` covers any tracker value with no mapping. */
+export type NormalizedIssueState =
+  | "ready" | "planning" | "awaiting-approval" | "plan-approved"
+  | "implementing" | "pr-ready" | "merged" | "failed" | "unknown";
+
+export interface IssueStatusRecord {
+  id: string;                    // tracker issue id (internal: used to join the dispatch breaker; never served)
+  identifier: string;            // the same string dispatch_log.issue_identifier holds
+  title: string | null;
+  url: string | null;
+  state: NormalizedIssueState;
+  phase: "planning" | "implementation" | null;   // set only when state is "failed" and the tracker says which
+  labels: string[];              // the tracker labels behind `state`, the deciding label first
+  workflowState: string | null;  // the tracker's own status name
+  updatedAt: number | null;      // epoch ms, the tracker's last-updated time
+}
+
+export const ISSUE_STATUS_RECENT_MS = 7 * 24 * 60 * 60 * 1000;
+
 export interface AIImplementSnapshot {
   needsPlanning: TicketIssue[];
   readyForImplementation: TicketIssue[];
@@ -201,6 +220,10 @@ export type IssueLifecycleState = "active" | "completed" | "cancelled";
 
 export type ProviderId = "linear" | "jira" | (string & {});
 
+export type LifecycleLabelsResult =
+  | { ok: true }
+  | { ok: false; permanent: boolean; label: string; message: string };
+
 export interface TicketingProvider {
   readonly id: string;
 
@@ -210,6 +233,10 @@ export interface TicketingProvider {
   /** Recently-completed feature-node issues whose branch should roll up into its
    *  parent (feature-branch grouping merge-up). */
   fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]>;
+
+  /** Prepare lifecycle labels for a scope. May write by creating missing labels; safe
+   *  to call on every dispatch. Providers with nothing to prepare leave this out. */
+  ensureLifecycleLabels?(scopeKey: string): Promise<LifecycleLabelsResult>;
 
   // Lifecycle verbs.
   //
@@ -246,6 +273,10 @@ export interface TicketingProvider {
    *  filesystem: a terminal task). Not the dispatch-breaker park (`src/dispatch-breaker.ts`),
    *  which holds re-dispatch per phase. */
   parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean>;
+  /** The issue's pull request closed without a merge. Moves the issue to the tracker's
+   * cancelled state and posts one comment. Returns false, with no write, when the issue
+   * is already terminal. */
+  markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
   markMerged(issueId: string, scopeKey: string): Promise<void>;
@@ -272,6 +303,12 @@ export interface TicketingProvider {
 
   /** One page of the mapping's issues for export or review-child discovery. When supplied, filter must narrow results server-side (a title-prefix superset is allowed). Optional so a fork's custom provider factory still compiles. Throws `TrackerUnavailableError` when the credential is missing; any other throw is retried. Does not set `sourceSystem` or `team`. */
   listIssuesPage?(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage>;
+  /** Every in-scope issue for this mapping with a normalized state: open issues the pickup query
+   *  matches, in any state, plus `merged` and `failed` issues updated in the last 7 days.
+   *  Throws `TrackerUnavailableError` when the credential is missing, and
+   *  throws on any read it cannot complete: never returns a partial list. Optional so a fork's
+   *  custom provider still compiles. */
+  listIssueStatuses?(mapping: RepoMapping): Promise<IssueStatusRecord[]>;
   /** The facts the setup checks judge for these projects, read without any write. A Linear project's key is its team's key. Optional so a fork's custom provider still compiles. */
   fetchSetupFacts?(projectKeys: string[]): Promise<TrackerSetupFacts>;
 }

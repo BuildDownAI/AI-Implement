@@ -69,6 +69,10 @@ describe("verifyControlPlaneToken", () => {
   it.each([
     ["orchestrator:read", []],
     ["orchestrator:projects", ["projects"]],
+    ["orchestrator:secrets", ["secrets"]],
+    ["orchestrator:secrets orchestrator:projects orchestrator:deploy", ["deploy", "projects", "secrets"]],
+    ["orchestrator:read orchestrator:deploy orchestrator:projects orchestrator:secrets", ["deploy", "projects", "secrets"]],
+    ["orchestrator:read orchestrator:secrets-extra", []],
     ["orchestrator:projects orchestrator:deploy", ["deploy", "projects"]],
     ["orchestrator:deploy", ["deploy"]],
     ["orchestrator:read orchestrator:deploy", ["deploy"]],
@@ -93,6 +97,7 @@ describe("verifyControlPlaneToken", () => {
     ["wrong aud", () => token({ aud: "https://orch-b.example.com" })],
     ["audience array without the base URL", () => token({ aud: ["https://orch-b.example.com"] })],
     ["unknown write scope", () => token({ scope: "orchestrator:write" })],
+    ["secrets substring", () => token({ scope: "orchestrator:secrets-extra" })],
     ["projects substring", () => token({ scope: "orchestrator:projects-extra" })],
     ["deploy substring", () => token({ scope: "orchestrator:deployment" })],
     ["missing scope", () => token({ scope: "openid" })],

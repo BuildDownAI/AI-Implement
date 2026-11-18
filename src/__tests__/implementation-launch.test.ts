@@ -205,6 +205,19 @@ describe("implementation session launches", () => {
     expect(vi.mocked(buildSessionMachineConfig).mock.calls[0][0]).toMatchObject({ cpus: 4, memoryMb: 8192 });
   });
 
+  it.each(["shared", "performance"] as const)("fly builds the project's %s guest", async (machineCpuKind) => {
+    const actual = await vi.importActual<typeof import("../fly-machines.js")>("../fly-machines.js");
+    vi.mocked(buildSessionMachineConfig).mockImplementationOnce(actual.buildSessionMachineConfig);
+    vi.mocked(createMachine).mockResolvedValue({ id: "m-kind", name: "kind" } as never);
+    const result = await launchImplementationFlySession({
+      ...args, mapping: { ...mapping, machineCpuKind, machineCpus: 4, machineMemoryMb: 8192 }, shadow: false,
+    });
+    expect(vi.mocked(createMachine).mock.calls[0][2].config.guest).toEqual({
+      cpu_kind: machineCpuKind, cpus: 4, memory_mb: 8192,
+    });
+    expect(result.machineSize).toEqual({ cpuKind: machineCpuKind, cpus: 4, memoryMb: 8192 });
+  });
+
   it("fly shadow: posts no status comment", async () => {
     vi.mocked(createMachine).mockResolvedValue({ id: "m-2", name: "machine-two" } as never);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);

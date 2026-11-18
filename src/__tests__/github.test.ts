@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob } from "../github.js";
+import { listAllOpenPullRequests, dispatchWorkflow, postWorkflowDispatch, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, getPrReadiness, classifyPullReadiness, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles, listPullRequestCommits, getCommitTime, getDefaultBranchFileText, listPrComments, getFailedContainerInitJob } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import { buildIssueBranchName } from "../pipeline/branch-name.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
@@ -1292,5 +1292,94 @@ describe("classifyPullReadiness", () => {
   it("clean requires mergeable === true", () => {
     expect(classifyPullReadiness({ ...base, mergeable: false }).ready).toBe(false);
     expect(classifyPullReadiness({ ...base, mergeable: null }).reason).toBe("unknown");
+  });
+});
+
+
+describe("listAllOpenPullRequests", () => {
+  const PULLS = "GET /repos/owner/repo/pulls";
+  const nextUrl = "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100&page=2";
+  const next = { link: `<${nextUrl}>; rel="next"` };
+  const pull = (number: number, draft?: boolean, created_at = "2026-10-10T19:10:30Z") => ({
+    number, html_url: `https://github.com/owner/repo/pull/${number}`,
+    base: { ref: "main" }, head: { ref: `feature-${number}`, sha: `sha-${number}` },
+    title: `Pull ${number}`, created_at, ...(draft === undefined ? {} : { draft }),
+  });
+
+  it("follows the next URL and maps both pages in order with authenticated, bounded requests", async () => {
+    const fake = fakeFetch({ [PULLS]: [
+      { json: [pull(1, true)], headers: next },
+      { json: [pull(2, false), pull(3)] },
+    ] }).install();
+    const result = await listAllOpenPullRequests("token", "owner", "repo");
+    expect(result).toEqual([1, 2, 3].map((number) => ({
+      number, url: `https://github.com/owner/repo/pull/${number}`, base: "main",
+      head: `feature-${number}`, headSha: `sha-${number}`, title: `Pull ${number}`,
+      author: null, draft: number === 1, createdAt: Date.parse("2026-10-10T19:10:30Z"),
+    })));
+    expect(fake.calls.map((c) => c.url.href)).toEqual([
+      "https://api.github.com/repos/owner/repo/pulls?state=open&per_page=100", nextUrl,
+    ]);
+    for (const call of fake.calls) {
+      expect(call.headers.get("authorization")).toBe("Bearer token");
+      expect(call.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it("maps author logins and absent users", async () => {
+    fakeFetch({ [PULLS]: { json: [
+      { ...pull(1), user: { login: "app[bot]" } },
+      { ...pull(2), user: null }, pull(3),
+    ] } }).install();
+    expect((await listAllOpenPullRequests("t", "owner", "repo")).map((p) => p.author))
+      .toEqual(["app[bot]", null, null]);
+  });
+
+  it("returns an empty list for a successful empty response", async () => {
+    fakeFetch({ [PULLS]: { json: [] } }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).resolves.toEqual([]);
+  });
+
+  it.each([403, 404, 500])("throws repository and HTTP status for %s", async (status) => {
+    fakeFetch({ [PULLS]: { status } }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toThrow(`owner/repo: HTTP ${status}`);
+  });
+
+  it("rejects the whole read when page two fails", async () => {
+    fakeFetch({ [PULLS]: [
+      { json: [pull(1)], headers: next }, { status: 500 },
+    ] }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toThrow("owner/repo: HTTP 500");
+  });
+
+  it.each([1, 2])("propagates fetch rejection unchanged on page %s", async (page) => {
+    const error = new Error("connection reset");
+    const fail = () => { throw error; };
+    fakeFetch({ [PULLS]: page === 1 ? fail : [
+      { json: [pull(1)], headers: next }, fail,
+    ] }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toBe(error);
+  });
+
+  it.each([false, true])("handles the 50-page boundary with further pages=%s", async (more) => {
+    const fake = fakeFetch({ [PULLS]: Array.from({ length: 50 }, (_, i) => ({
+      json: [pull(i + 1)], headers: i < 49 || more ? next : {},
+    })) }).install();
+    const result = listAllOpenPullRequests("t", "owner", "repo");
+    if (more) await expect(result).rejects.toThrow(/owner\/repo.*50 pages/);
+    else expect((await result).map((p) => p.number)).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
+    expect(fake.calls).toHaveLength(50);
+  });
+
+  it("rejects an invalid creation date on a later page", async () => {
+    fakeFetch({ [PULLS]: [
+      { json: [pull(1)], headers: next }, { json: [pull(2, false, "invalid")] },
+    ] }).install();
+    await expect(listAllOpenPullRequests("t", "owner", "repo")).rejects.toThrow(/created_at.*owner\/repo/);
+  });
+
+  it("accepts an epoch-zero creation date", async () => {
+    fakeFetch({ [PULLS]: { json: [pull(1, false, "1970-01-01T00:00:00Z")] } }).install();
+    expect((await listAllOpenPullRequests("t", "owner", "repo"))[0].createdAt).toBe(0);
   });
 });

@@ -1,21 +1,5 @@
-/**
- * Atomic admission storage for the Restate review-fix pilot (AII-775), backed by the
- * additive `dispatch_admissions` / `dispatch_budget_entries` schema `dedup.ts` created
- * for AII-771. This module is the single authority for team capacity and scoped
- * issue/PR occupancy going forward — it does not read `dispatch_log` or `dispatched`
- * (the old predicate `dispatch-gate.ts#canDispatch` still uses), and nothing here calls
- * it or is called by it. No production call site exists yet; a later issue wires a
- * caller (e.g. the review-fix admission port) on top of `acquire`/`release`.
- *
- * Two occupancy sources exist during the pilot: this table, and the legacy
- * `dispatch_log`-derived predicate in `dispatch-gate.ts`. They are only consistent
- * while one is empty — cutover drains the legacy path first rather than backfilling
- * history into this one (see the issue's "no active-run backfill" note).
- *
- * Every mutation is one synchronous `better-sqlite3` transaction on the single shared
- * connection (`getDb()`), so "check policy, reserve capacity/occupancy, record the
- * dispatch identity" is atomic and race-free without needing real concurrency in tests.
- */
+/** Atomic dispatch admission and read-only policy preview, backed by the
+ * admission and budget ledgers. Acquire revalidates policy transactionally. */
 import type Database from "better-sqlite3";
 import { getDb } from "./dedup.js";
 import type { DispatchKind } from "./dispatch-gate.js";
@@ -221,6 +205,55 @@ function isUniqueConstraintError(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/.test(error.message);
 }
 
+/** Read-only preview; acquire re-evaluates this policy inside its transaction. */
+export function checkAdmission(request: DispatchAdmissionRequest):
+  | { ok: true; record?: DispatchAdmissionRecord; count: number; cap: number }
+  | Extract<DispatchAdmissionDecision, { ok: false }> {
+  const db = getDb();
+  const existing = db
+    .prepare("SELECT * FROM dispatch_admissions WHERE dispatch_id = ?")
+    .get(request.dispatchId) as Row | undefined;
+  if (existing && existing.released_at === null) {
+    return {
+      ok: true,
+      record: toRecord(existing),
+      count: countActive(db, request.mappingKey),
+      cap: request.cap,
+    };
+  }
+
+  const cap = request.cap;
+  const capCount = countActive(db, request.mappingKey);
+
+  if (isOccupied(db, request.scope)) {
+    return { ok: false, reason: "occupied", count: capCount, cap };
+  }
+
+  if (!request.humanRequested && request.scope.kind === "pr" && request.prDispatchBudget !== undefined) {
+    const since = Date.now() - PR_BUDGET_WINDOW_MS;
+    const budgetRow = db
+      .prepare(
+        "SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ? AND created_at >= ?",
+      )
+      .get(request.scope.repository, request.scope.prNumber, since) as { n: number };
+    if (budgetRow.n >= request.prDispatchBudget) {
+      return { ok: false, reason: "budget_exhausted", count: capCount, cap };
+    }
+  }
+
+  // Budget refusal takes precedence over an issue park so callers can retry
+  // an owed budget notice (including a breaker-first park) without admitting.
+  if (!request.humanRequested && request.parked) {
+    return { ok: false, reason: "parked", count: capCount, cap };
+  }
+
+  if (request.kind !== "kg-refresh" && capCount >= cap) {
+    return { ok: false, reason: "at_capacity", count: capCount, cap };
+  }
+
+  return { ok: true, count: capCount, cap };
+}
+
 /**
  * Atomically evaluates policy (parked, PR budget, team capacity) and scoped occupancy,
  * then reserves a slot and records the dispatch identity — all before any external
@@ -244,46 +277,11 @@ export function acquire(
 ): DispatchAdmissionDecision {
   const db = getDb();
   return db.transaction((): DispatchAdmissionDecision => {
-    const existing = db
-      .prepare("SELECT * FROM dispatch_admissions WHERE dispatch_id = ?")
-      .get(request.dispatchId) as Row | undefined;
-    if (existing && existing.released_at === null) {
-      return {
-        ok: true,
-        record: toRecord(existing),
-        count: countActive(db, request.mappingKey),
-        cap: request.cap,
-      };
-    }
-
+    const decision = checkAdmission(request);
+    if (!decision.ok) return decision;
+    if (decision.record) return { ...decision, record: decision.record };
     const cap = request.cap;
-    const capCount = countActive(db, request.mappingKey);
-
-    if (isOccupied(db, request.scope)) {
-      return { ok: false, reason: "occupied", count: capCount, cap };
-    }
-
-    if (!request.humanRequested && request.scope.kind === "pr" && request.prDispatchBudget !== undefined) {
-      const since = Date.now() - PR_BUDGET_WINDOW_MS;
-      const budgetRow = db
-        .prepare(
-          "SELECT COUNT(*) as n FROM dispatch_budget_entries WHERE repository = ? AND pr_number = ? AND created_at >= ?",
-        )
-        .get(request.scope.repository, request.scope.prNumber, since) as { n: number };
-      if (budgetRow.n >= request.prDispatchBudget) {
-        return { ok: false, reason: "budget_exhausted", count: capCount, cap };
-      }
-    }
-
-    // Budget refusal takes precedence over an issue park so callers can retry
-    // an owed budget notice (including a breaker-first park) without admitting.
-    if (!request.humanRequested && request.parked) {
-      return { ok: false, reason: "parked", count: capCount, cap };
-    }
-
-    if (request.kind !== "kg-refresh" && capCount >= cap) {
-      return { ok: false, reason: "at_capacity", count: capCount, cap };
-    }
+    const capCount = decision.count;
 
     let executionId: string | undefined;
     if (prepare) {

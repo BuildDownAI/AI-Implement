@@ -156,7 +156,7 @@ Liveness is a second, independent signal: the boot-time probe's result is surfac
 | `rdflib` | The database. Parses `graph.trig` into a `Dataset`, flattens quads into one union `Graph`, runs SPARQL SELECT in process. |
 | `numpy` | Cosine similarity as one normalized matrix-vector product. No ANN index at this scale. |
 | `fastembed` | Embeds the **query** at request time — `BAAI/bge-small-en-v1.5`, 384 dimensions, ONNX, no torch. |
-| `requests` | Only under `KG_BACKEND=stardog`. That seam is evaluated, not committed. |
+| `requests` | Only under a remote store (`KG_BACKEND=stardog` or `stardog_run`). The store seam is committed: see ADR 050. |
 
 **Node orchestrator**, same container:
 

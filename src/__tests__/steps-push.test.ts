@@ -1104,15 +1104,16 @@ describe("pushStep draft PRs", () => {
     expect(outputs.draft).toBe(true);
     const body = prRequest(fake);
     expect(body.draft).toBe(true);
-    expect(body.body).toContain("Automated review did not approve");
+    // max_turns is unfinished work, not a review rejection (AII-887).
+    expect(body.body).toContain("## ⏱️ The implementation did not finish within its turn budget");
+    expect(body.body).not.toContain("Automated review did not approve");
     expect(body.body).toContain("Implementation hit the 50-turn cap");
-    expect(body.body).toContain("max_turns");
     expect(body.body).toContain("Post-mortem");
     // The test-plan line must not contradict the unapproved section above it: no
     // testsSummary/preflight summary was supplied, so the fallback must say
     // verification was skipped (unchecked box), not that it ran (checked box).
-    expect(body.body).toContain("- [ ] Automated verification was skipped — the review loop did not approve this change.");
-    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the review loop did not approve this change."}\n\n${TEST_VERDICT_SENTENCE}\n`);
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the implementation did not finish within its turn budget.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the implementation did not finish within its turn budget."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
@@ -1143,6 +1144,28 @@ describe("pushStep draft PRs", () => {
     expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the AI service was not available and the run was interrupted."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("the review loop did not approve this change");
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  });
+
+  it.each([true, false])("heads a max_turns PR (draft=%s) as unfinished work, not a review rejection (AII-887)", async (draft) => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft, reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "max_turns", finalFeedback: "Implementation hit the turn cap." } },
+      new NoopStepReporter(),
+    );
+
+    const text = String(prRequest(fake).body);
+    expect(text).toContain("## ⏱️ The implementation did not finish within its turn budget");
+    expect(text).toContain(`because the implementation used its full turn budget before it finished (after ${REVIEW_SUMMARY.iterations} iteration(s)). The work so far is preserved here. It is incomplete.`);
+    expect(text).toContain(draft ? "opened as a draft because" : "opened for human review because");
+    expect(text).toContain("**Run notes:**");
+    expect(text).toContain("_Preflight was skipped because the implementation did not finish._");
+    expect(text).toContain("- [ ] Automated verification was skipped — the implementation did not finish within its turn budget.");
+    expect(text).not.toContain("did not approve");
+    expect(text).not.toContain("review loop ended without approval");
+    expect(text).not.toContain("Reviewer's final feedback");
   });
 
   it("shows an implement invocation failure code next to the review verdict in the pass table", async () => {

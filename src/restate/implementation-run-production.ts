@@ -710,7 +710,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
     },
     reserve: async (run) => {
       const held = run.gapFill ? await gapfill.reserve(run) : await reserve(run);
-      if (held) requireImplementationRunOwner(run);
+      if (held === true) requireImplementationRunOwner(run);
       return held;
     },
     findExistingRun: async (run, dispatchedAt) => {

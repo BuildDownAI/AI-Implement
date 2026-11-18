@@ -8,7 +8,7 @@ import { testDir } from "../helpers/test-dir.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, access: vi.fn(actual.access), link: vi.fn(actual.link), writeFile: vi.fn(actual.writeFile) };
+  return { ...actual, access: vi.fn(actual.access), readdir: vi.fn(actual.readdir), link: vi.fn(actual.link), writeFile: vi.fn(actual.writeFile) };
 });
 
 afterEach(() => {
@@ -312,6 +312,24 @@ describe("FilesystemProvider", () => {
       location: "completed",
       ticketPath: "completed/LOCAL-5.md",
     });
+  });
+
+  it("refuses an unmerged-close write for an archived failed task", async () => {
+    const dir = testDir("fs-close-archived");
+    const id = "filesystem:LOCAL:LOCAL-1";
+    const p = provider({ LOCAL: mapping({ directory: dir }) });
+    await writeTask(dir, "LOCAL-1.md", "---\ntitle: Archived task\n---\nNeeds a human.");
+    await p.markImplementationFailed(id, "LOCAL", "needs a human");
+    await expect(p.archiveFailed(id, "LOCAL", "implementation")).resolves.toBe(true);
+    const statePath = join(dir, ".state", "LOCAL", "LOCAL-1.json");
+    const before = await readFile(statePath, "utf8");
+    vi.mocked(writeFile).mockClear();
+
+    await expect(p.markPrClosedUnmerged(id, "LOCAL", "https://github.com/acme/widgets/pull/1")).resolves.toBe(false);
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(await readFile(statePath, "utf8")).toBe(before);
+    expect(await p.readIssueDetails(id)).toMatchObject({ location: "failed" });
   });
 
   it("explicitly archives failed tickets and retries them without dropping history", async () => {
@@ -631,7 +649,7 @@ describe("FilesystemProvider.fetchSetupFacts", () => {
   });
 });
 
-import { runChildIssueContract } from "./contract.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 
 for (const planningEnabled of [true, false]) {
   runChildIssueContract(`FilesystemProvider planning=${planningEnabled}`, async () => {
@@ -721,4 +739,165 @@ it("does not overwrite a task that appears before child publication", async () =
   expect(await readFile(destination, "utf8")).toBe("Existing task");
   expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
   expect((await readdir(directory)).some((f) => f.endsWith(".tmp"))).toBe(false);
+});
+
+describe("listIssueStatuses", () => {
+  async function fixture() {
+    const directory = testDir("fs-statuses");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    const p = provider({ TEAM: config });
+    await mkdir(join(directory, ".state", "TEAM"), { recursive: true });
+    return { directory, config, p };
+  }
+
+  async function task(directory: string, status: string, options: {
+    location?: "completed" | "failed"; age?: number; failurePhase?: string;
+  } = {}) {
+    const target = options.location ? join(directory, options.location) : directory;
+    await mkdir(target, { recursive: true });
+    await writeTask(target, "TEST-1.md", "---\ntitle: Status task\n---\nBody");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+      version: 1, status, comments: [], prUrls: [], failurePhase: options.failurePhase,
+      updatedAt: new Date(Date.now() - (options.age ?? 0) * 86400000).toISOString(),
+    }));
+  }
+
+  it.each([
+    ["ready", "ready", null], ["planning", "planning", null],
+    ["plan-approved", "plan-approved", null], ["implementing", "implementing", null],
+    ["pr-ready", "pr-ready", null], ["failed", "failed", "planning"],
+    ["failed", "failed", "implementation"], ["failed", "failed", null],
+    ["completed", "merged", null], ["cancelled", null, null],
+    ["unfamiliar", "unknown", null],
+  ])("normalizes %s to %s with phase %s", async (status, state, phase) => {
+    const { directory, config, p } = await fixture();
+    await task(directory, status, { failurePhase: phase ?? undefined });
+    const result = await p.listIssueStatuses(config);
+    if (state === null) expect(result).toEqual([]);
+    else expect(result).toEqual([{
+      id: "filesystem:TEAM:TEST-1", identifier: "TEST-1", title: "Status task",
+      url: "/admin?filesystemIssue=filesystem%3ATEAM%3ATEST-1",
+      state, phase, labels: [], workflowState: status, updatedAt: expect.any(Number),
+    }]);
+    expect(await readFile(join(directory, "TEST-1.md"), "utf8")).toContain("Status task");
+  });
+
+  it("keeps an active task with a malformed timestamp as null", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "implementing");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+      version: 1, status: "implementing", comments: [], prUrls: [], updatedAt: "invalid",
+    }));
+    expect(await p.listIssueStatuses(config)).toMatchObject([{
+      identifier: "TEST-1", state: "implementing", updatedAt: null,
+    }]);
+  });
+
+  it.each(["completed", "failed"] as const)("filters %s archives by timestamp", async (location) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-16T12:00:00Z"));
+    try {
+      const { directory, config, p } = await fixture();
+      for (const age of [6, 7, 8]) {
+        await task(directory, location, { location, age });
+        const result = await p.listIssueStatuses(config);
+        expect(result).toHaveLength(age <= 7 ? 1 : 0);
+        if (age <= 7) expect(result[0]).toMatchObject({
+          state: location === "completed" ? "merged" : "failed",
+          updatedAt: Date.now() - age * 86400000,
+        });
+      }
+      await writeFile(join(directory, ".state", "TEAM", "TEST-1.json"), JSON.stringify({
+        version: 1, status: location, comments: [], prUrls: [], updatedAt: "invalid",
+      }));
+      expect(await p.listIssueStatuses(config)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps old active tasks", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "completed", { age: 8 });
+    expect(await p.listIssueStatuses(config)).toMatchObject([{ state: "merged" }]);
+  });
+
+  it.each([true, false])("defaults missing state with planning=%s without writing", async (planningEnabled) => {
+    const { directory, config, p } = await fixture();
+    config.planningEnabled = planningEnabled;
+    await writeTask(directory, "TEST-1.md", "---\ntitle: No state\n---\nBody");
+    await mkdir(join(directory, "completed"));
+    await writeTask(join(directory, "completed"), "TEST-2.md", "---\ntitle: Archived\n---\nBody");
+    expect(await p.listIssueStatuses(config)).toMatchObject([{
+      state: planningEnabled ? "ready" : "plan-approved", phase: null, updatedAt: null,
+      workflowState: planningEnabled ? "ready" : "plan-approved",
+    }]);
+    expect(await readdir(join(directory, ".state", "TEAM"))).toEqual([]);
+  });
+
+  it("rejects invalid state JSON alongside a valid task", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "ready");
+    await writeTask(directory, "TEST-2.md", "---\ntitle: Broken\n---\nBody");
+    await writeFile(join(directory, ".state", "TEAM", "TEST-2.json"), "{invalid");
+    await expect(p.listIssueStatuses(config)).rejects.toThrow(/Invalid state/);
+  });
+
+  it("rejects a missing configured task root", async () => {
+    const directory = join(testDir("fs-statuses-missing"), "missing");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a configured task root that is a regular file", async () => {
+    const directory = join(testDir("fs-statuses-file"), "file");
+    await writeFile(directory, "not a directory");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).rejects.toThrow("task root is not a directory");
+  });
+
+  it("allows an empty task root without optional archive directories", async () => {
+    const directory = testDir("fs-statuses-empty");
+    const config = mapping({ directory, teamKey: "TEAM" });
+    await expect(provider({ TEAM: config }).listIssueStatuses(config)).resolves.toEqual([]);
+  });
+
+  it("rejects directory read errors", async () => {
+    const { directory, config, p } = await fixture();
+    await task(directory, "ready");
+    vi.mocked(readdir).mockRejectedValueOnce(Object.assign(new Error("permission denied"), { code: "EACCES" }));
+    await expect(p.listIssueStatuses(config)).rejects.toThrow("permission denied");
+  });
+
+  it("only scans the requested mapping", async () => {
+    const { directory, config } = await fixture();
+    await task(directory, "ready");
+    const other = mapping({ directory: testDir("fs-other"), teamKey: "OTHER" });
+    await writeTask(other.ticketingConfig.kind === "filesystem" ? other.ticketingConfig.directory : "", "TEST-2.md", "invalid");
+    expect(await provider({ TEAM: config, OTHER: other }).listIssueStatuses(config)).toHaveLength(1);
+  });
+});
+
+runPrClosedUnmergedContract("FilesystemProvider", async (terminal) => {
+  const dir = testDir("fs-close");
+  await writeTask(dir, "TASK-1.md", "---\ntitle: Task\n---\nWork");
+  const p = provider({ TEAM: mapping({ directory: dir }) });
+  const id = "filesystem:TEAM:TASK-1";
+  await p.markPrReady(id, "TEAM", "url");
+  if (terminal) await p.markMerged(id, "TEAM");
+  const path = join(dir, ".state", "TEAM", "TASK-1.json");
+  const before = await readFile(path, "utf8");
+  return { provider: p, issueId: id, scopeKey: "TEAM", restartSentence: "To run it again, set the task status to its pickup value.",
+    verify: async (terminal, comment) => {
+      const after = await readFile(path, "utf8");
+      if (terminal) expect(after).toBe(before);
+      else {
+        const state = JSON.parse(after);
+        expect(state.status).toBe("cancelled");
+        expect(state.comments).toHaveLength(JSON.parse(before).comments.length + 1);
+        expect(state.comments.at(-1).body).toBe(comment);
+        expect(await p.markPrClosedUnmerged(id, "TEAM", "url")).toBe(false);
+        expect(await readFile(path, "utf8")).toBe(after);
+      }
+    } };
 });

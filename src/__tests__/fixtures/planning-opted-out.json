@@ -60,6 +60,7 @@
     "machineNonce": "NONCE",
     "phase": "planning",
     "sessionMode": "autonomous",
+    "cpuKind": "shared",
     "cpus": 2,
     "memoryMb": 4096,
     "teamKey": "ENG",

@@ -21,11 +21,23 @@ vi.mock("node:child_process", async (importOriginal) => {
 const diff = "diff --git a/earlier.ts b/earlier.ts\n+earlier commit\ndiff --git a/package-lock.json b/package-lock.json\n+lockfile change";
 
 describe("advisory roll-up review", () => {
+  it("skips a retry queued for head A when the PR has moved to B", async () => {
+    const invoke = vi.fn();
+    const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [{ id: "code-review", gates: true }],
+      expectedHeadSha: "a".repeat(40) } }, { invoke });
+    const gh = vi.fn(() => ({ exitCode: 0, stdout: "b".repeat(40) }));
+    const result = await runReviewOnly(ctx, "/unused", new NoopStepReporter(), gh);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(result.rollupReview?.skipReason).toContain("head moved");
+    expect(result.iterations).toBe(0);
+  });
+
   it("publishes one bounded verdict for oversized reports from multiple reviewers", async () => {
     const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 1, terminalStatus: { subtype: "success", isError: false },
       structuredOutput: { approved: false, summary: "Summary ".repeat(30_000), checks: [{ check: "Integration", result: "passed", evidence: "Reviewed diff" }],
-        findings: Array.from({ length: 75 }, (_, i) => ({ severity: "blocking", path: `file-${i}.ts`, line: 7,
-          body: `Finding ${i}: ` + "Detailed evidence 😀 ".repeat(2_000) })) } }));
+        findings: Array.from({ length: 125 }, (_, i) => ({ severity: "blocking", path: `file-${i}.ts`, line: 7,
+          body: `Finding ${i}: ` + "Detailed evidence 😀 ".repeat(200) })) } }));
     let body = "";
     const gh = vi.fn((args: string[]) => {
       if (args[1] === "comment") {
@@ -44,7 +56,62 @@ describe("advisory roll-up review", () => {
     expect(body).toContain("Roll-up review: Changes recommended");
     expect(body).toContain("**blocking** file-0.ts:7 — Finding 0:");
     expect(body).toContain("[truncated]");
-    expect(body).toContain("50 additional findings omitted");
+    expect(body).toContain("25 additional findings omitted");
+  });
+
+  it.each(["wording", "head", "duplicates"])("roll-up %s (head matches or expected head omitted)", async (check) => {
+    let body = "";
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 1,
+      terminalStatus: { subtype: "success", isError: false }, structuredOutput: {
+        approved: false, summary: "Reviewed", checks: [{ check: "Contract", result: "passed", evidence: "same.ts" }],
+        findings: [{ severity: "blocking", path: "same.ts", line: 7, body: "Duplicate evidence" }],
+      } }));
+    const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [
+      { id: "code-review", gates: true }, { id: "integration-review", gates: true },
+    ], ...(check === "head" ? { expectedHeadSha: "a".repeat(40) } : {}) } }, { invoke });
+    await runReviewOnly(ctx, "/unused", new NoopStepReporter(), (args) => {
+      if (args[1] === "comment") body = readFileSync(args[4], "utf8");
+      return { exitCode: 0, stdout: args[1] === "view" ? "a".repeat(40) : args[1] === "diff" ? diff : "" };
+    });
+    if (check === "wording") {
+      expect(body).not.toContain("Advisory only.");
+      expect(body).toContain("does not block the merge");
+      expect(body).toContain("[roll-up-review]");
+    }
+    if (check === "head") expect(body).toContain("Reviewed head: `aaaaaaa`");
+    if (check === "duplicates") {
+      expect(body.match(/same.ts:7/g)).toHaveLength(1);
+      expect(body).toMatch(/Reviewers: code-review, integration-review/);
+    }
+  });
+
+  it.each([
+    ["minor", "blocking", "blocking"],
+    ["blocking", "minor", "blocking"],
+    ["minor", "medium", "medium"],
+    ["medium", "minor", "medium"],
+  ])("keeps distinct stable keys and strongest severity: %s then %s", async (first, second, strongest) => {
+    let body = "";
+    let invocation = 0;
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 1,
+      terminalStatus: { subtype: "success", isError: false }, structuredOutput: {
+        approved: false, summary: "Reviewed", checks: [{ check: "Contract", result: "passed", evidence: "diff" }],
+        findings: [
+          { severity: ++invocation === 1 ? first : second, path: "one.ts", line: 7, body: "Shared evidence" },
+          { severity: "minor", path: "two.ts", line: 7, body: "Shared evidence" },
+          { severity: "minor", path: "one.ts", line: 8, body: "Shared evidence" },
+          { severity: "minor", path: "one.ts", line: 7, body: "Different evidence" },
+        ],
+      } }));
+    const ctx = makeContext({ prNumber: "42", reviewOnly: { reviewers: [
+      { id: "code-review", gates: true }, { id: "integration-review", gates: true },
+    ] } }, { invoke });
+    await runReviewOnly(ctx, "/unused", new NoopStepReporter(), (args) => {
+      if (args[1] === "comment") body = readFileSync(args[4], "utf8");
+      return { exitCode: 0, stdout: args[1] === "view" ? "a".repeat(40) : args[1] === "diff" ? diff : "" };
+    });
+    expect(body.match(/^- \*\*(?:blocking|medium|minor)\*\* .* — /gm)).toHaveLength(4);
+    expect(body).toContain(`**${strongest}** one.ts:7 — Shared evidence (Reviewers: code-review, integration-review)`);
   });
 
   it("reports diff buffer overflow without reviewing partial output", async () => {
@@ -71,7 +138,7 @@ describe("advisory roll-up review", () => {
 
   it.each(["findings", "clean", "failure"])("runs reviewers once and posts one verdict: %s", async (kind) => {
     const invoke = vi.fn(async () => kind === "failure"
-      ? { stdout: "", exitCode: 1, tokensUsed: 0, errorMessage: "reviewer unavailable" }
+      ? { stdout: "", exitCode: 1, tokensUsed: 0, errorMessage: "overloaded_error" }
       : { stdout: "", exitCode: 0, tokensUsed: 1, terminalStatus: { subtype: "success", isError: false }, structuredOutput: {
         approved: kind === "clean", findings: kind === "clean" ? [] : [
           { severity: "blocking", path: "earlier.ts", line: 7, body: "Missing shared contract" },
@@ -102,7 +169,15 @@ describe("advisory roll-up review", () => {
       expect(body).toContain("Missing shared contract");
     }
     expect(result.terminationReason).toBe(kind === "failure" ? "review_error" : "approved");
-    expect(result.rollupReview).toEqual({ headSha: "a".repeat(40), verdictUrl: "https://github.com/org/repo/pull/42#issuecomment-99" });
+    expect(result.rollupReview).toMatchObject({ headSha: "a".repeat(40), verdictUrl: "https://github.com/org/repo/pull/42#issuecomment-99",
+      failedReviewers: kind === "failure" ? ["code-review", "integration-review"] : [] });
+    if (kind === "failure") {
+      expect(result.rollupReview.incompleteReviews).toHaveLength(2);
+      expect(result.rollupReview.incompleteReviews).toEqual(expect.arrayContaining([
+        expect.objectContaining({ reviewerId: "code-review", failure: expect.objectContaining({ category: "transient", code: "PROVIDER_OVERLOADED" }) }),
+        expect.objectContaining({ reviewerId: "integration-review", failure: expect.objectContaining({ category: "transient", code: "PROVIDER_OVERLOADED" }) }),
+      ]));
+    } else expect(result.rollupReview.incompleteReviews).toEqual([]);
     expect(result.internalFindings.length).toBe(kind === "findings" ? 2 : 0);
   });
 });

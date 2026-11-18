@@ -5,6 +5,8 @@
 // discoverTools/callTool are exercised against a faked fetch. Docker-backed round-trip
 // coverage through a real ingress/admin API lives in tools.restate.test.ts.
 import { readFileSync } from "node:fs";
+import { Readable } from "node:stream";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import * as restate from "@restatedev/restate-sdk";
 import { z } from "zod";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,6 +33,10 @@ import {
   addProjectTool,
   setProjectAgentModeTool,
   SetProjectAgentModeArgsSchema,
+  addModelAccountTool,
+  setProjectStageTool,
+  AddModelAccountArgsSchema,
+  SetProjectStageArgsSchema,
   addProjectArgsSchema,
   triggerWorkflowSyncTool,
   clearDispatchDedupTool,
@@ -66,7 +72,7 @@ import type * as AdmissionModule from "../dispatch-admission.js";
 import type * as InFlightModule from "../in-flight-work.js";
 import type * as LogModule from "../log.js";
 import type * as ToolsModule from "../restate/tools.js";
-import { makeAppendLogEntry, makeMapping, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
+import { makeAppendLogEntry, makeMapping, makeProvider, makeRegistry, makeStageAgentDefaults, makeStageAgentProfile } from "./helpers/builders.js";
 import { fakeFetch, hangUntilAborted } from "./helpers/fake-fetch.js";
 import { testDb } from "./helpers/test-db.js";
 
@@ -89,6 +95,8 @@ vi.mock("../config.js", async (importOriginal) => ({
 // wholesale (no importOriginal) since tools.ts only imports these six names from admin.ts
 // and nothing here needs the rest of that module's (much heavier) real behaviour.
 vi.mock("../admin.js", () => ({
+  createModelAccountAction: vi.fn(),
+  putProjectAgentConfigAction: vi.fn(),
   setProjectAgentModeAction: vi.fn(),
   setRunnerModeAction: vi.fn(),
   pauseProjectAction: vi.fn(),
@@ -786,7 +794,7 @@ describe("migrated read handlers (AII-711)", () => {
   it("list_projects selects its fields explicitly — extraEnv never leaves the handler", async () => {
     vi.mocked(getMappings).mockReturnValue({
       BDS: makeMapping({
-        owner: "BuildDownAI", repo: "skills", extraEnv: { SUPER_SECRET: "leak-me" },
+        owner: "BuildDownAI", repo: "skills", machineCpuKind: "performance", extraEnv: { SUPER_SECRET: "leak-me" },
         trustedReviewAuthors: ["codex-reviewer[bot]"], reviewProcess: "claude-code-review",
       }),
     });
@@ -794,6 +802,7 @@ describe("migrated read handlers (AII-711)", () => {
     expect(result.isError).toBeUndefined();
     const rows = JSON.parse(result.content[0].text) as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(1);
+    expect(rows[0].machineCpuKind).toBe("performance");
     expect(rows[0].teamKey).toBe("BDS");
     expect(rows[0].repo).toBe("BuildDownAI/skills");
     expect(rows[0].trustedReviewAuthors).toEqual(["codex-reviewer[bot]"]);
@@ -2200,5 +2209,564 @@ describe("list_job_accounting (AII-1564)", () => {
       expect(page.records.map((r: { dispatchId: string }) => r.dispatchId)).toEqual(["00000000-0000-4000-8000-0000000000d1"]);
       expect(page.oldestRetainedCompletedAt).toBe(done);
     }
+  });
+});
+
+describe("list_open_pulls (AII-1964)", () => {
+  afterEach(() => vi.restoreAllMocks());
+  let api: typeof import("../open-pulls.js");
+  let tools: typeof ToolsModule;
+  let github: typeof import("../github.js");
+
+  beforeEach(async () => {
+    ({ modules: { api, tools, github } } = await testDb({
+      modules: {
+        api: () => import("../open-pulls.js"),
+        tools: () => import("../restate/tools.js"),
+        github: () => import("../github.js"),
+      },
+    }));
+    vi.mocked(getMappings).mockReturnValue({ APP: makeMapping({ owner: "acme", repo: "app" }) });
+    api.clearOpenPullsCache();
+    const auth = await import("../github-app-auth.js");
+    vi.spyOn(auth, "getInstallationToken").mockResolvedValue("token");
+  });
+
+  it.each([false, true])("returns a top-level array (populated: %s) inside the named step", async (populated) => {
+    const reader = vi.spyOn(github, "listAllOpenPullRequests").mockResolvedValue(populated ? [{
+      number: 42, url: "https://github.com/acme/app/pull/42", head: "work",
+      base: "main", headSha: "sha", author: null, draft: false, title: "Title", createdAt: 123,
+    }] : []);
+    let insideStep = false;
+    const read = api.listOpenPulls;
+    vi.spyOn(api, "listOpenPulls").mockImplementation(() => {
+      expect(insideStep).toBe(true);
+      return read();
+    });
+    const calls: RunCall[] = [];
+    const ctx = fakeContext("list_open_pulls", calls);
+    const run = ctx.run;
+    ctx.run = ((name: string, action: () => unknown, options: Parameters<typeof run>[2]) => {
+      insideStep = true;
+      return run(name, action, options);
+    }) as typeof ctx.run;
+    const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    const entries = JSON.parse(result.content[0].text);
+    expect(Array.isArray(entries)).toBe(true);
+    expect(entries).toHaveLength(populated ? 1 : 0);
+    if (populated) expect(entries[0]).toMatchObject({ repo: "acme/app", pr: { number: 42 } });
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([{ name: "list-open-pulls", options: { maxRetryAttempts: 1 }, result: entries }]);
+  });
+
+  it("uses a recorded step result without reading the cache or GitHub again", async () => {
+    const reader = vi.spyOn(api, "listOpenPulls");
+    const recorded = [{ repo: "recorded/app" }];
+    const run = vi.fn(async () => recorded);
+    const ctx = { ...fakeContext("list_open_pulls"), run } as unknown as restate.Context;
+    const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(JSON.parse(result.content[0].text)).toEqual(recorded);
+    expect(run).toHaveBeenCalledWith("list-open-pulls", expect.any(Function), { maxRetryAttempts: 1 });
+    expect(reader).not.toHaveBeenCalled();
+  });
+
+  it.each(["credential", "GitHub"])("surfaces a %s failure as a named tool error with bounded retries", async (source) => {
+    const detail = `${source} unavailable`;
+    if (source === "credential") {
+      const auth = await import("../github-app-auth.js");
+      vi.mocked(auth.getInstallationToken).mockRejectedValue(new Error(detail));
+    } else {
+      vi.spyOn(github, "listAllOpenPullRequests").mockRejectedValue(new Error(detail));
+    }
+    const ctx = fakeContext("list_open_pulls");
+    const run = vi.spyOn(ctx, "run");
+    const result = await tools.listOpenPullsTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(run).toHaveBeenCalledWith("list-open-pulls", expect.any(Function), { maxRetryAttempts: 1 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("list_open_pulls");
+    expect(result.content[0].text).toContain(detail);
+  });
+});
+
+
+describe("list_issue_statuses (AII-1966)", () => {
+  let tools: typeof ToolsModule;
+  let api: typeof import("../issue-statuses.js");
+
+  beforeEach(async () => {
+    ({ modules: { tools, api } } = await testDb({
+      modules: {
+        tools: () => import("../restate/tools.js"),
+        api: () => import("../issue-statuses.js"),
+      },
+    }));
+    api.clearIssueStatusesCache();
+  });
+
+  afterEach(() => {
+    tools.setProviderRegistry(null);
+    api.clearIssueStatusesCache();
+    vi.restoreAllMocks();
+  });
+
+  it("returns a populated top-level array through the shared registry inside the named step", async () => {
+    const mapping = makeMapping();
+    vi.mocked(getMappings).mockReturnValue({ APP: mapping });
+    let insideStep = false;
+    const reader = vi.fn(async () => {
+      expect(insideStep).toBe(true);
+      return [{
+        id: "internal", identifier: "APP-1", title: "Issue", url: null,
+        state: "ready" as const, phase: null, labels: [], workflowState: null, updatedAt: 123,
+      }];
+    });
+    const registry = makeRegistry({ provider: makeProvider({ listIssueStatuses: reader }) });
+    const providerFor = vi.spyOn(registry, "forMapping");
+    tools.setProviderRegistry(registry);
+    const calls: RunCall[] = [];
+    const ctx = fakeContext("list_issue_statuses", calls);
+    const run = ctx.run;
+    ctx.run = ((name: string, action: () => unknown, options: Parameters<typeof run>[2]) => {
+      insideStep = true;
+      return run(name, action, options);
+    }) as typeof ctx.run;
+    const result = await tools.listIssueStatusesTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([{
+      teamKey: "APP", tracker: mapping.ticketingConfig.kind,
+      issue: { identifier: "APP-1", title: "Issue", url: null },
+      state: "ready", phase: null, raw: { labels: [], workflowState: null }, changedAt: 123,
+    }]);
+    const providerMapping = { ...mapping, teamKey: "APP" };
+    expect(providerFor).toHaveBeenCalledWith(providerMapping);
+    expect(reader).toHaveBeenCalledWith(providerMapping);
+    expect(mapping.teamKey).toBeUndefined();
+    expect(calls).toEqual([{ name: "list-issue-statuses", options: { maxRetryAttempts: 1 }, result: JSON.parse(result.content[0].text) }]);
+  });
+
+  it("returns an empty array successfully when there are no mappings", async () => {
+    vi.mocked(getMappings).mockReturnValue({});
+    const result = await tools.listIssueStatusesTool(fakeContext("list_issue_statuses"), { caller: HUMAN_USER, args: {} });
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual([]);
+  });
+
+  it.each(["resolution", "unsupported", "read"])("surfaces a provider %s failure as a named tool error with bounded retries", async (failure) => {
+    vi.mocked(getMappings).mockReturnValue({ APP: makeMapping() });
+    const registry = makeRegistry({ provider: makeProvider({
+      listIssueStatuses: failure === "unsupported" ? undefined : vi.fn().mockRejectedValue(new Error("tracker unavailable")),
+    }) });
+    if (failure === "resolution") vi.spyOn(registry, "forMapping").mockImplementation(() => { throw new Error("provider unavailable"); });
+    tools.setProviderRegistry(registry);
+    const ctx = fakeContext("list_issue_statuses");
+    const run = vi.spyOn(ctx, "run");
+    const result = await tools.listIssueStatusesTool(ctx, { caller: HUMAN_USER, args: {} });
+    expect(run).toHaveBeenCalledWith("list-issue-statuses", expect.any(Function), { maxRetryAttempts: 1 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("list_issue_statuses");
+    expect(result.content[0].text).toContain(failure === "resolution" ? "provider unavailable" : failure === "unsupported" ? "cannot list issue statuses" : "tracker unavailable");
+  });
+});
+
+
+it("add_project accepts CPU kinds without defaulting omitted input", () => {
+  const base = { teamKey: "AII", owner: "org", repo: "repo" };
+  for (const machineCpuKind of ["shared", "performance"]) {
+    expect(addProjectArgsSchema.safeParse({ ...base, machineCpuKind }).success).toBe(true);
+  }
+  expect(addProjectArgsSchema.safeParse({ ...base, machineCpuKind: "invalid" }).success).toBe(false);
+  expect(addProjectArgsSchema.parse(base)).not.toHaveProperty("machineCpuKind");
+});
+
+describe("model administration tools", () => {
+  const account = { profileId: "openrouter", identity: "operator", agent: "claude", provider: "openrouter", authMode: "openrouter-api-key" };
+
+  it.each(["key", "apiKey", "credentialRef", "status", "unexpected"])("rejects extra account field %s", (field) => {
+    expect(AddModelAccountArgsSchema.safeParse({ ...account, [field]: "secret" }).success).toBe(false);
+  });
+
+  it("rejects unknown stages and fields", () => {
+    expect(SetProjectStageArgsSchema.safeParse({ teamKey: "AII", stage: "unknown" }).success).toBe(false);
+    expect(SetProjectStageArgsSchema.safeParse({ teamKey: "AII", stage: "review", key: "secret" }).success).toBe(false);
+  });
+
+  it("forbids user callers before journaling", async () => {
+    const calls: RunCall[] = [];
+    const results = [
+      await addModelAccountTool(fakeContext("add_model_account", calls), { caller: HUMAN_USER, args: account }),
+      await setProjectStageTool(fakeContext("set_project_stage", calls), {
+        caller: HUMAN_USER, args: { teamKey: "AII", stage: "implementation" },
+      }),
+    ];
+    for (const result of results) {
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("forbidden");
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it("creates active profiles and shares duplicate and combination refusals", async () => {
+    await testDb();
+    const admin = await vi.importActual<typeof import("../admin.js")>("../admin.js");
+    const store = await import("../agent-config-store.js");
+    const created = admin.createModelAccountAction(account, {});
+    expect(created.status).toBe(201);
+    expect(store.getAccountProfile(account.profileId)?.status).toBe("active");
+    expect(created.body.profileStatus).toBe("active");
+    expect(admin.createModelAccountAction(account, {}).status).toBe(409);
+    expect(admin.createModelAccountAction({ ...account, profileId: "bad", authMode: "bedrock" }, {}).status).toBe(400);
+  });
+
+  it("overlays only one stage and preserves legacy mode", async () => {
+    await testDb();
+    vi.mocked(getMappings).mockReturnValue({ AII: makeMapping() });
+    const admin = await vi.importActual<typeof import("../admin.js")>("../admin.js");
+    const store = await import("../agent-config-store.js");
+    const before = store.setProjectStageConfig("AII", {
+      version: 1, mode: "legacy", stages: {
+        planning: { model: "planning" }, implementation: { model: "old" }, review: { model: "review" },
+      },
+    }, "seed");
+    const result = await admin.putProjectAgentConfigAction("AII", {}, "operator", {
+      stages: { implementation: { model: "new", fallbackModel: null, preferOpenModel: true } },
+    });
+    expect(result.status).toBe(200);
+    const after = store.getProjectStageConfig("AII")!;
+    expect(after.config.mode).toBe(before.config.mode);
+    expect(after.config.stages?.planning).toEqual(before.config.stages?.planning);
+    expect(after.config.stages?.review).toEqual(before.config.stages?.review);
+    expect(after.config.stages?.implementation).toMatchObject({ model: "new", fallbackModel: null, preferOpenModel: true });
+    expect((await admin.putProjectAgentConfigAction("missing", {}, null, {})).status).toBe(404);
+    expect((await admin.putProjectAgentConfigAction("AII", {}, null, { stages: { unknown: {} } })).status).toBe(400);
+  });
+});
+
+describe("model tools shared action dispatch", () => {
+  it("journals once, forwards actor, and returns shared refusals", async () => {
+    const admin = await import("../admin.js");
+    const calls: RunCall[] = [];
+    vi.mocked(admin.putProjectAgentConfigAction).mockResolvedValue({
+      status: 409, body: { code: "stale_inputs" },
+    });
+    const result = await setProjectStageTool(fakeContext("set_project_stage", calls), {
+      caller: SYSTEM_ADMIN, args: { teamKey: "AII", stage: "implementation", model: "open/model", accountProfileId: null },
+    });
+    expect(calls).toHaveLength(1);
+    expect(admin.putProjectAgentConfigAction).toHaveBeenCalledWith("AII", expect.any(Object), "system", {
+      stages: { implementation: { model: "open/model", accountProfileId: null } },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("stale_inputs");
+    vi.mocked(admin.createModelAccountAction).mockReturnValue({ status: 201, body: { profileStatus: "active" } });
+    const accountCalls: RunCall[] = [];
+    const created = await addModelAccountTool(fakeContext("add_model_account", accountCalls), {
+      caller: SYSTEM_ADMIN, args: { profileId: "router", identity: "operator", agent: "claude", provider: "openrouter", authMode: "openrouter-api-key" },
+    });
+    expect(accountCalls).toHaveLength(1);
+    expect(JSON.parse(created.content[0].text)).toEqual({ profileStatus: "active" });
+  });
+
+  it("preserves configured state on readiness and stale-input refusals", async () => {
+    await testDb();
+    vi.mocked(getMappings).mockReturnValue({ AII: makeMapping() });
+    const admin = await vi.importActual<typeof import("../admin.js")>("../admin.js");
+    const store = await import("../agent-config-store.js");
+    store.saveAccountProfileRevision(makeStageAgentProfile());
+    store.setOrchestratorDefaults(makeStageAgentDefaults());
+    const before = store.setProjectStageConfig("AII", { version: 1, mode: "configured" }, "seed");
+    const unavailable = await admin.putProjectAgentConfigAction("AII", {}, null, { stages: { implementation: {} } });
+    expect(unavailable.body.code).toBe("readiness_unavailable");
+    const deps = { agentConfig: {
+      credentials: {},
+      inspectReadiness: vi.fn().mockResolvedValue({ status: "not-ready", code: "runner_incompatible" }),
+    } } as unknown as import("../admin.js").AdminDeps;
+    expect((await admin.putProjectAgentConfigAction("AII", deps, null, { stages: { implementation: {} } })).body.code).toBe("runner_incompatible");
+    vi.mocked(deps.agentConfig!.inspectReadiness).mockImplementation(async () => {
+      store.setOrchestratorDefaults(makeStageAgentDefaults());
+      return { status: "ready" } as Awaited<ReturnType<NonNullable<typeof deps.agentConfig>["inspectReadiness"]>>;
+    });
+    expect((await admin.putProjectAgentConfigAction("AII", deps, null, { stages: { implementation: {} } })).body.code).toBe("stale_inputs");
+    expect(store.getProjectStageConfig("AII")?.configRevisionId).toBe(before.configRevisionId);
+  });
+});
+
+// Exercise the SDK's actual input deserializer, rather than bypassing it by calling
+// the transposed handler directly. This also checks strict refusals precede ctx.run.
+function invokeModelTool(handler: Function, name: string, args: unknown, calls: RunCall[] = []) {
+  const wrapper = Object.getOwnPropertySymbols(handler)
+    .map(symbol => (handler as unknown as Record<symbol, unknown>)[symbol])
+    .find(value => typeof value === "object" && value !== null && "invoke" in value) as {
+      invoke(ctx: restate.Context, bytes: Uint8Array): Promise<Uint8Array>;
+    };
+  return wrapper.invoke(fakeContext(name, calls), Buffer.from(JSON.stringify({ caller: SYSTEM_ADMIN, args })))
+    .then(bytes => JSON.parse(Buffer.from(bytes).toString()) as import("../restate/tools.js").ToolResponse);
+}
+
+describe("model administration acceptance through shared actions", () => {
+  const account = { profileId: "router", identity: "Operator", agent: "claude", provider: "openrouter", authMode: "openrouter-api-key" };
+  async function setup() {
+    await testDb();
+    const admin = await vi.importActual<typeof import("../admin.js")>("../admin.js");
+    const mocked = await import("../admin.js");
+    vi.mocked(mocked.createModelAccountAction).mockImplementation(admin.createModelAccountAction);
+    vi.mocked(mocked.putProjectAgentConfigAction).mockImplementation(admin.putProjectAgentConfigAction);
+    const store = await import("../agent-config-store.js");
+    vi.mocked(getMappings).mockReturnValue({ AII: makeMapping() });
+    const runtime = await import("../model-auth-runtime.js");
+    const inspectReadiness = vi.fn().mockResolvedValue({ status: "ready" });
+    const agentConfig = { credentials: {}, inspectReadiness } as unknown as NonNullable<import("../admin.js").AdminDeps["agentConfig"]>;
+    vi.spyOn(runtime, "createAgentConfigAdminDeps").mockReturnValue(agentConfig);
+    const tools = await import("../restate/tools.js");
+    return { admin, store, tools, inspectReadiness, deps: { agentConfig } };
+  }
+
+  it.each(["key", "apiKey", "credential", "credentialRef", "status", "unexpected"])("rejects %s at the SDK boundary without writing", async field => {
+    const { store, tools } = await setup();
+    const calls: RunCall[] = [];
+    await expect(invokeModelTool(tools.addModelAccountTool, "add_model_account", { ...account, [field]: "secret" }, calls)).rejects.toThrow("deserialize");
+    expect(calls).toEqual([]);
+    expect(store.listAccountProfiles()).toEqual([]);
+  });
+
+  it("returns the entire shared HTTP action result and stores exactly active revision one", async () => {
+    const { store, admin, deps } = await setup();
+    // Compare identical requests in fresh stores so duplicate detection does not interfere.
+    const sessions = await import("../admin-session.js");
+    const token = sessions.createSession();
+    const expected = await new Promise<{ status: number; body: unknown }>(resolve => {
+      const req = Readable.from([Buffer.from(JSON.stringify(account))]);
+      Object.assign(req, { method: "POST", url: "/api/model-accounts", headers: { authorization: `Bearer ${token}` } });
+      let status = 0;
+      const res = { writeHead(code: number) { status = code; }, end(body: string) { resolve({ status, body: JSON.parse(body) }); } };
+      admin.handleAdminRequest(req as IncomingMessage, res as ServerResponse, { adminAccessCode: "test" } as never, makeRegistry(), deps);
+    });
+    expect(expected.status).toBe(201);
+    const expectedHead = store.getAccountProfile(account.profileId);
+    const fresh = await setup();
+    const calls: RunCall[] = [];
+    const result = await invokeModelTool(fresh.tools.addModelAccountTool, "add_model_account", account, calls);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual(expected.body);
+    expect(fresh.store.getAccountProfile(account.profileId)).toEqual(expectedHead);
+    expect(expectedHead).toEqual({ ...account, revision: 1, status: "active" });
+    expect(fresh.store.getAccountProfileRevision(account.profileId, 2)).toBeNull();
+    expect(calls).toHaveLength(1);
+    for (const args of [account, { ...account, profileId: "bad", authMode: "bedrock" }]) {
+      const refusal = fresh.admin.createModelAccountAction(args, fresh.deps);
+      const refused = await invokeModelTool(fresh.tools.addModelAccountTool, "add_model_account", args);
+      expect(refused.isError).toBe(true);
+      expect(JSON.parse(refused.content[0].text)).toEqual(refusal);
+      expect(fresh.store.listAccountProfiles()).toEqual([expectedHead]);
+    }
+  });
+
+  it.each(["legacy", "configured"] as const)("preserves %s mode and other stages while clearing every inherited field", async mode => {
+    const { store, tools, inspectReadiness } = await setup();
+    store.saveAccountProfileRevision(makeStageAgentProfile());
+    store.setOrchestratorDefaults(makeStageAgentDefaults());
+    const before = store.setProjectStageConfig("AII", { version: 1, mode, stages: {
+      planning: { model: "plan" }, review: { model: "review" },
+      implementation: { ...makeStageAgentDefaults().stages!.implementation, fallbackModel: "fallback" },
+    } }, "seed");
+    const patch = { agent: null, provider: null, model: null, fallbackModel: null, accountProfileId: null, invocationTimeoutMs: null, preferOpenModel: true };
+    const calls: RunCall[] = [];
+    const result = await invokeModelTool(tools.setProjectStageTool, "set_project_stage", { teamKey: "AII", stage: "implementation", ...patch }, calls);
+    expect(result.isError).toBeUndefined();
+    const after = store.getProjectStageConfig("AII")!;
+    expect(after.config).toEqual({ ...before.config, stages: { ...before.config.stages, implementation: patch } });
+    expect(after.revision).toBe(before.revision + 1);
+    expect(calls).toHaveLength(1);
+    expect(inspectReadiness).toHaveBeenCalledTimes(mode === "configured" ? 1 : 0);
+  });
+
+  it.each([
+    { stage: "unknown" }, { stage: "review", key: "secret" },
+    { model: 42 }, { invocationTimeoutMs: 0 }, { invocationTimeoutMs: 1.5 },
+    { preferOpenModel: null },
+  ])("rejects malformed stage input %j before writing", async patch => {
+    const { store, tools } = await setup();
+    const before = store.setProjectStageConfig("AII", { version: 1, mode: "legacy" }, "seed");
+    const calls: RunCall[] = [];
+    await expect(invokeModelTool(tools.setProjectStageTool, "set_project_stage", { teamKey: "AII", stage: "implementation", ...patch }, calls)).rejects.toThrow("deserialize");
+    expect(calls).toEqual([]);
+    expect(store.getProjectStageConfig("AII")).toEqual(before);
+  });
+
+  it.each([
+    { teamKey: "missing", stage: "implementation" },
+    { teamKey: "AII", stage: "review", preferOpenModel: true },
+    { teamKey: "AII", stage: "planning", preferOpenModel: false },
+    { teamKey: "AII", stage: "implementation", model: " " },
+  ])("matches route validation refusal without writing: %j", async args => {
+    const { admin, store, tools, deps } = await setup();
+    const before = store.setProjectStageConfig("AII", { version: 1, mode: "legacy" }, "seed");
+    const { teamKey, stage, ...patch } = args;
+    const expected = await admin.putProjectAgentConfigAction(teamKey, deps, "system", { stages: { [stage]: patch } });
+    expect(expected.status).toBe(teamKey === "missing" ? 404 : 400);
+    const result = await invokeModelTool(tools.setProjectStageTool, "set_project_stage", args);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toEqual(expected);
+    expect(store.getProjectStageConfig("AII")).toEqual(before);
+  });
+
+  it.each(["runner_incompatible", "stale_inputs", "readiness_unavailable"])("exercises real %s refusal through the tool without changing the project", async code => {
+    const { admin, store, tools, deps, inspectReadiness } = await setup();
+    store.saveAccountProfileRevision(makeStageAgentProfile());
+    store.setOrchestratorDefaults(makeStageAgentDefaults());
+    const before = store.setProjectStageConfig("AII", { version: 1, mode: "configured" }, "seed");
+    inspectReadiness.mockImplementation(async () => {
+      if (code === "readiness_unavailable") throw new Error("unavailable");
+      if (code === "stale_inputs") {
+        store.setOrchestratorDefaults(makeStageAgentDefaults());
+        return { status: "ready" };
+      }
+      return { status: "not-ready", code };
+    });
+    const expected = await admin.putProjectAgentConfigAction("AII", deps, "system", { stages: { implementation: {} } });
+    expect(expected.body.code).toBe(code);
+    const result = await invokeModelTool(tools.setProjectStageTool, "set_project_stage", { teamKey: "AII", stage: "implementation" });
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text)).toEqual(expected);
+    expect(store.getProjectStageConfig("AII")).toEqual(before);
+  });
+
+  it("registers and routes both writes and keeps documented counts accurate", async () => {
+    const { tools } = await setup();
+    const { RESTATE_WRITE_TOOL_NAMES } = await import("../mcp.js");
+    const source = readFileSync("src/mcp.ts", "utf8");
+    const routing = source.slice(source.indexOf("const RESTATE_TOOL_NAMES"), source.indexOf("export const RESTATE_WRITE_TOOL_NAMES"));
+    const docs = readFileSync("docs/mcp-server.md", "utf8");
+    for (const [name, handler] of [["add_model_account", tools.addModelAccountTool], ["set_project_stage", tools.setProjectStageTool], ["unpark_issue", tools.unparkIssueTool]] as const) {
+      expect((tools.orchestratorTools as unknown as { service: Record<string, unknown> }).service[name]).toBe(handler);
+      expect(RESTATE_WRITE_TOOL_NAMES.has(name)).toBe(true);
+      expect(routing).toContain(`"${name}"`);
+      expect(docs).toContain(`| \`${name}\` | admin |`);
+    }
+    const declarations = readFileSync("src/restate/tools.ts", "utf8");
+    const writes = [...declarations.matchAll(/= tool\(\s*\{([\s\S]*?)\n  async \(/g)]
+      .filter(([, options]) => options.includes('role: "admin"') && !options.includes('operation: "read"')).length;
+    expect(writes).toBe(18);
+    expect(RESTATE_WRITE_TOOL_NAMES.size).toBe(17);
+    expect(docs).toContain("eighteen declared write handlers");
+    expect(docs).toContain("seventeen are in `RESTATE_WRITE_TOOL_NAMES`");
+  });
+});
+
+describe("unpark_issue (AII-2018)", () => {
+  let tools: typeof ToolsModule;
+  let log: typeof LogModule;
+  let breaker: typeof import("../dispatch-breaker.js");
+  let db: ReturnType<typeof import("../dedup.js").getDb>;
+  const parse = (r: { content: { text: string }[] }) => JSON.parse(r.content[0].text);
+  const rows = () => db.prepare("SELECT * FROM dispatch_breaker ORDER BY issue_id, phase").all();
+  const call = (args: { identifier: string; phase?: string; issueId?: string }, caller = SYSTEM_ADMIN, calls: RunCall[] = []) =>
+    tools.unparkIssueTool(fakeContext("unpark_issue", calls), { caller, args });
+
+  beforeEach(async () => {
+    const fixture = await testDb({ modules: {
+      tools: () => import("../restate/tools.js"),
+      log: () => import("../log.js"),
+      breaker: () => import("../dispatch-breaker.js"),
+      dedup: () => import("../dedup.js"),
+    } });
+    ({ tools, log, breaker } = fixture.modules);
+    db = fixture.modules.dedup.getDb();
+    log.appendLog(makeAppendLogEntry({ issueId: "tracker-id", issueIdentifier: "CON-146" }));
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  function park(issueId = "tracker-id", phase = "implementation") {
+    breaker.recordDispatchFailure(issueId, phase, "failure");
+    breaker.parkIssue(issueId, phase, "failure");
+    breaker.claimPrBudgetNotice(issueId, phase);
+    breaker.markTripNotified(issueId, phase);
+  }
+
+  it("clears all phases, counters and notices in one journaled step and audits the resolved identity", async () => {
+    park();
+    park("tracker-id", "planning");
+    const audit = vi.spyOn(console, "log").mockImplementation(() => {});
+    const calls: RunCall[] = [];
+    const result = await call({ identifier: "con-146" }, SYSTEM_ADMIN, calls);
+    expect(result.isError).toBeUndefined();
+    expect(parse(result)).toEqual({ identifier: "con-146", issueId: "tracker-id", unparked: true });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ name: "unpark-issue", options: { maxRetryAttempts: 1 } });
+    for (const phase of ["implementation", "planning"]) expect(breaker.isParked("tracker-id", phase)).toBe(false);
+    expect(rows()).toHaveLength(2);
+    for (const row of rows()) expect(row).toMatchObject({
+      parked_at: null, consecutive_failures: 0, trip_notified_at: null, pr_budget_notified_at: null,
+    });
+    expect(audit.mock.calls.some(c => String(c[0]).includes("identifier=con-146 issue=tracker-id phase=all"))).toBe(true);
+  });
+
+  it("clears only the specified phase", async () => {
+    park();
+    park("tracker-id", "planning");
+    const before = rows();
+    expect(parse(await call({ identifier: "CON-146", phase: "planning" })).unparked).toBe(true);
+    expect(breaker.isParked("tracker-id", "planning")).toBe(false);
+    expect(breaker.isParked("tracker-id", "implementation")).toBe(true);
+    expect(rows()[0]).toEqual(before[0]);
+  });
+
+  it("returns the exact unknown-identifier error without changing any row", async () => {
+    park();
+    const before = rows();
+    const result = await call({ identifier: "CON-999" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("no dispatch record for CON-999");
+    expect(rows()).toEqual(before);
+  });
+
+  it("leaves nonparked rows and missing breaker rows unchanged", async () => {
+    expect(parse(await call({ identifier: "CON-146" })).unparked).toBe(false);
+    expect(rows()).toEqual([]);
+    breaker.recordDispatchFailure("tracker-id", "planning", "failure");
+    park("tracker-id", "implementation");
+    const before = rows();
+    expect(parse(await call({ identifier: "CON-146", phase: "planning" })).unparked).toBe(false);
+    expect(rows()).toEqual(before);
+    breaker.unpark("tracker-id");
+    breaker.recordDispatchFailure("tracker-id", "planning", "failure");
+    const nonparked = rows();
+    expect(parse(await call({ identifier: "CON-146" })).unparked).toBe(false);
+    expect(rows()).toEqual(nonparked);
+  });
+
+  it("rejects an unresolved identifier even when an extra tracker issueId is supplied", async () => {
+    park();
+    park("tracker-id", "planning");
+    db.prepare("DELETE FROM dispatch_log").run();
+    const before = rows();
+    const calls: RunCall[] = [];
+    const result = await call({ identifier: "CON-146", issueId: "tracker-id", phase: "planning" }, SYSTEM_ADMIN, calls);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("no dispatch record for CON-146");
+    expect(calls).toHaveLength(1);
+    expect(rows()).toEqual(before);
+  });
+
+  it("refuses callers without the admin role before running the mutation", async () => {
+    park();
+    const before = rows();
+    const calls: RunCall[] = [];
+    const result = await call({ identifier: "CON-146" }, HUMAN_USER, calls);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("forbidden: unpark_issue requires the admin role");
+    expect(calls).toEqual([]);
+    expect(rows()).toEqual(before);
+  });
+
+  it("resolves across repositories by timestamp, breaking ties by newest row id", async () => {
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 100").run();
+    const newest = log.appendLog(makeAppendLogEntry({ issueId: "newest", issueIdentifier: "con-146", repo: "another/repo" }));
+    const older = log.appendLog(makeAppendLogEntry({ issueId: "older", issueIdentifier: "CON-146" }));
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 200 WHERE id = ?").run(newest);
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 150 WHERE id = ?").run(older);
+    expect(parse(await call({ identifier: "Con-146" })).issueId).toBe("newest");
+    db.prepare("UPDATE dispatch_log SET dispatched_at = 200 WHERE id = ?").run(older);
+    expect(parse(await call({ identifier: "Con-146" })).issueId).toBe("older");
   });
 });

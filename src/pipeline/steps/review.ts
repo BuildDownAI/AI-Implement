@@ -87,6 +87,8 @@ Approval contract:
 - Do not set approved=true while listing unresolved issues.
 - Put every required fix in blocking_issues[]; feedback is only summary context.`;
 
+  // Rubrics contain trusted run-specific grading rules; task text is guarded
+  // by their builder. Preserve the legacy prompt bytes when no rubric exists.
   if (reviewRubric) {
     prompt += `\n\n## Run-specific review rubric\n${reviewRubric}`;
   }

@@ -357,6 +357,18 @@ The full architecture, env-var reference, SQLite schema, multi-client deploy mod
 
 **Linear**: create a label in your workspace matching the orchestrator's pickup label, default `AI-Implement`, changeable at `/admin#settings`. That label is the trigger. Change it only for a planned migration — issues that carry the old label stop dispatching at the next poll.
 
+The Linear provider also uses these lifecycle labels:
+
+| Label | Applying verb |
+|---|---|
+| `AI-Planning` | `markPlanningStarted` |
+| `Plan-Complete` | `markPlanComplete` |
+| `AI-Working` | `markImplementing` |
+| `Ready for Review` | `markPrReady` |
+| `AI-Needs-Human` | `parkForHuman` |
+
+The orchestrator creates a missing lifecycle label in the team at first dispatch. This needs the app to be allowed to create team labels. Creating these labels by hand with the exact names also works.
+
 **Jira**: add two custom fields to your Jira project. The orchestrator auto-discovers them by name, so use these exact names — or pick the field explicitly in the mapping (stored as a `customfield_XXXXX` override) if yours are named differently.
 
 | Field name | Type | Purpose |

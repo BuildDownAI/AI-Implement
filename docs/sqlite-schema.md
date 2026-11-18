@@ -41,6 +41,13 @@ Every step is idempotent, so a second boot changes nothing:
 - One trigger is the exception. `trg_dispatch_log_changed_at` is dropped and created at every
   boot, so an older form of it is replaced by the current form.
 
+### Project CPU kind
+
+`initMappingsTable()` creates `mappings.machine_cpu_kind TEXT NOT NULL DEFAULT 'shared'`.
+For an older database it checks `PRAGMA table_info(mappings)` and adds the missing
+column with the same default. Existing projects read as `shared`; repeated boots
+leave it unchanged. Older orchestrators ignore the column on rollback.
+
 ### OpenRouter CHECK constraint rebuilds (AII-1883)
 
 `getDb()` creates `model_account_profile_revisions` and `model_invocation_attribution`
@@ -177,6 +184,14 @@ Running the change before `ensureAccountingTriggers()` is not enough for this ta
 5. Read the deploy paths in [deployment.md](deployment.md#deploy-paths). Remember that a
    rollback keeps the schema change (section 3).
 
+### Pull request cancellation decisions
+
+On first access, `src/pr-links.ts` adds nullable `pull_request_link.cancel_checked_at INTEGER` after checking `PRAGMA table_info`, before importing surviving job rows.
+Existing rows keep NULL. Closed-unmerged links with NULL are reconsidered without
+another GitHub read; final decisions receive an epoch-millisecond timestamp.
+In-flight runs and provider errors leave NULL for retry. Link metadata refreshes
+preserve the marker, and rollback leaves the nullable column in place.
+
 ## Gap-fill dispatch uncertainty
 
 `src/comment-gapfill-queue.ts` owns `comment_gapfill_launch`, keyed by
@@ -238,3 +253,14 @@ the scorecard counts historical resolved rows without evidence as ignored.
 with a primary key on dispatch and finding. Ingestion writes it atomically with
 the finding so callback retries reuse the original revision, while a new dispatch
 can reopen a resolved finding and clear stale fixed credit.
+
+`comment_gapfill_queue` admission refusal tracking uses additive, boot-time
+`PRAGMA table_info` guarded migrations (existing rows are preserved):
+
+| Column | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `refusal_count` | INTEGER NOT NULL | 0 | Admission refusals for this queue row |
+| `last_refusal_reason` | TEXT nullable | NULL | Last admission refusal, retained when skipped |
+| `last_refusal_dispatch_id` | TEXT nullable | NULL | Deduplicates reservation step retries |
+
+`comment_gapfill_refusals` stores durable reservation decisions with `queue_item_id INTEGER NOT NULL`, `dispatch_id TEXT NOT NULL`, and `reason TEXT NOT NULL`; the composite primary key is `(queue_item_id, dispatch_id)`. Boot uses additive `CREATE TABLE IF NOT EXISTS` and seeds the previously recorded last refusal with `INSERT OR IGNORE`. Decisions remain available after terminal queue transitions.

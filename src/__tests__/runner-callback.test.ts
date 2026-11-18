@@ -14,6 +14,7 @@ import type * as ReviewFixEvidenceModule from "../review-fix-evidence.js";
 import type * as ReviewFixAttemptStoreModule from "../review-fix-attempt-store.js";
 import type { CycleSummary } from "../pipeline/cycle-summary.js";
 import { formatFailureComment, boundStatusText } from "../runner-callback.js";
+import { formatRunAutopsy } from "../run-autopsy.js";
 import { FakeProvider } from "./providers/fake.js";
 import { createImplementationAdmissionTerminationHook } from "../restate/implementation-run-client.js";
 import { STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
@@ -43,6 +44,7 @@ import { testDb } from "./helpers/test-db.js";
 // (which never mocked github.js/github-app-auth.js) keeps exercising the
 // real code.
 const hoisted = vi.hoisted(() => ({
+  postPrComment: vi.fn(async (..._args: unknown[]) => {}),
   getInstallationToken: vi.fn<() => Promise<string>>(() => Promise.resolve("fake-installation-token")),
   getPullRequestState: vi.fn<
     () => Promise<{ merged: boolean; state: "open" | "closed"; headRef: string | null } | null>
@@ -61,6 +63,7 @@ vi.mock("../github.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../github.js")>();
   return {
     ...actual,
+    postPrComment: hoisted.postPrComment,
     getPullRequestState: hoisted.getPullRequestState,
     getCommitAuthorType: hoisted.getCommitAuthorType,
     postOrUpdateStickyComment: hoisted.postOrUpdateStickyComment,
@@ -330,7 +333,7 @@ describe("handleRunnerResult — planning", () => {
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
 
-  it("a markPlanComplete throw answers 200, fails the row, parks the issue and writes Planning Failed with Jira's text", async () => {
+  it.each(["jira", "linear"])("a %s markPlanComplete throw answers 200, fails the row, parks and forwards the failure text", async (providerId) => {
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase: "planning", ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS, secret: SECRET,
     });
@@ -339,9 +342,12 @@ describe("handleRunnerResult — planning", () => {
       dispatchId, executionMode: "github-actions", phase: "planning",
     });
     const fake = new FakeProvider({ recordCalls: true, initialIssues: [makeIssue({ id: "i" })] });
-    vi.spyOn(fake, "markPlanComplete").mockRejectedValue(
-      new jiraClient.JiraApiError(400, "Option value 'Plan Approved' is not valid", "x"),
-    );
+    Object.defineProperty(fake, "id", { value: providerId });
+    const { LinearLabelWriteError, LinearGraphQLError } = await import("../providers/linear.js");
+    const error = providerId === "jira"
+      ? new jiraClient.JiraApiError(400, "Option value 'Plan Approved' is not valid", "x")
+      : new LinearLabelWriteError("Plan-Complete", "THR2", new LinearGraphQLError("issueLabelCreate", "access denied"));
+    vi.spyOn(fake, "markPlanComplete").mockRejectedValue(error);
     const failSpy = vi.spyOn(fake, "markPlanningFailed");
     const commentSpy = vi.spyOn(fake, "postComment");
     const res = await runnerCallback.handleRunnerResult({
@@ -356,8 +362,9 @@ describe("handleRunnerResult — planning", () => {
     const row = log.getJobByDispatchId(dispatchId);
     expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
     expect(row?.failure?.code).toBe("PLAN_STATUS_WRITE_FAILED");
-    expect(row?.failure?.message).toContain("Option value 'Plan Approved' is not valid");
+    expect(row?.failure?.message).toBe(runnerCallback.planCompleteFailureText(providerId, false, error));
     expect(row?.failure?.message).toContain("Unpark at /admin#runners");
+    expect(failSpy).toHaveBeenCalledWith("i", "ENG", row?.failure?.message);
     expect(row?.failureCommentedAt).toBeTruthy();
     expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
   });
@@ -384,6 +391,55 @@ describe("handleRunnerResult — planning", () => {
     expect(row).toMatchObject({ status: "failed", conclusion: "plan_status_write_failed" });
     expect(row?.failureCommentedAt ?? null).toBeNull();
     expect(dispatchBreaker.isParked("i", "planning")).toBe(true);
+  });
+
+  describe("planCompleteFailureText", () => {
+    it.each([false, true])("uses exact provider-specific text (awaitApproval=%s)", async (awaitApproval) => {
+      const { LinearGraphQLError, LinearLabelWriteError } = await import("../providers/linear.js");
+      const graphql = new LinearGraphQLError("issueUpdate", "access denied");
+      const cases: [string, unknown, string][] = [
+        ["jira", new jiraClient.JiraApiError(400, "bad option", "x"),
+          `The plan was recorded, but the tracker refused the "${awaitApproval ? "Awaiting Approval" : "Plan Approved"}" status write. Jira answered 400: bad option. Fix the status field, then use Unpark at /admin#runners.`],
+        ["linear", new LinearLabelWriteError("Plan-Complete", "THR2", graphql),
+          'The plan was recorded, but Linear refused to create label "Plan-Complete" on team THR2: access denied. Create the label in the team by hand, or let the app create labels, then use Unpark at /admin#runners.'],
+        ["linear", graphql,
+          "The plan was recorded, but Linear refused the plan-complete label write (issueUpdate): access denied. Fix the app's access to the team, then use Unpark at /admin#runners."],
+        ["linear", new Error("offline"),
+          "The plan was recorded, but the plan-complete label write failed: offline. Then use Unpark at /admin#runners."],
+        ["linear", "odd",
+          "The plan was recorded, but the plan-complete label write failed: odd. Then use Unpark at /admin#runners."],
+        ...["filesystem", "unknown"].map((id): [string, unknown, string] => [id, new Error("offline"),
+          "The plan was recorded, but the tracker refused the plan-complete write: offline. Then use Unpark at /admin#runners."]),
+      ];
+      for (const [providerId, error, expected] of cases) {
+        const text = runnerCallback.planCompleteFailureText(providerId, awaitApproval, error);
+        expect(text).toBe(expected);
+        if (providerId === "linear") expect(text).not.toMatch(/Plan Approved|Awaiting Approval|status field/);
+      }
+    });
+
+    it("reports a real ensureTeamLabel refusal using the issue's actual team", async () => {
+      const { LinearProvider, LinearLabelWriteError } = await import("../providers/linear.js");
+      const auth = await import("../linear-app-auth.js");
+      auth.configureLinearAuth("client-id", "client-secret");
+      auth.__setLinearTokenForTest("test-token");
+      fakeFetch({ "POST /graphql": [
+        { json: { data: { issue: { team: { key: "THR2" } } } } },
+        { json: { data: { teams: { nodes: [{ id: "team-thr2" }] } } } },
+        { json: { data: { issueLabels: { nodes: [] } } } },
+        { json: { errors: [{ message: "not allowed to take action" }] } },
+      ] }).install();
+      try {
+        const error = await new LinearProvider({}).markPlanComplete("i", "AII", { awaitApproval: false })
+          .catch((err: unknown) => err);
+        expect(error).toBeInstanceOf(LinearLabelWriteError);
+        expect(runnerCallback.planCompleteFailureText("linear", false, error)).toBe(
+          'The plan was recorded, but Linear refused to create label "Plan-Complete" on team THR2: not allowed to take action. Create the label in the team by hand, or let the app create labels, then use Unpark at /admin#runners.',
+        );
+      } finally {
+        auth.__resetLinearAuthForTest();
+      }
+    });
   });
 
   describe("describeTrackerWriteError", () => {
@@ -2901,7 +2957,39 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
   });
 
-  it.each(["restate", "legacy", "structured", "retry", "initial"] as const)("preserves failure reporting behavior for %s", async mode => {
+  it.each(["planning", "implementation", "gap-analysis"] as const)("does not post a failure PR comment for planning failure or approved %s", async phase => {
+    hoisted.postPrComment.mockClear();
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i", mappingTeamKey: "ENG", phase,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET,
+    });
+    dispatchAdmission.acquire({ dispatchId, mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" },
+      kind: phase === "planning" ? "planning" : "implementation", backend: "github-actions", cap: 1,
+      lifecycleOwner: { kind: "restate", attemptId: dispatchId } });
+    const id = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, phase });
+    log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
+    const hook = vi.fn(async () => ({ status: "accepted" as const }));
+    const result = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`, secret: SECRET, resolveProvider: makeResolve(new FakeProvider()),
+      checkPlanningAdmissionTermination: hook, checkImplementationAdmissionTermination: hook,
+      body: { phase, outcome: phase === "planning" ? "failure" : "success", comments: [], prUrl: "https://github.com/org/repo/pull/12" },
+    });
+    expect(result.status).toBe(200);
+    expect(hoisted.postPrComment).not.toHaveBeenCalled();
+  });
+
+  it.each(["restate", "legacy", "structured", "retry", "overlapping", "initial", "post-error", "VERIFY_FAILED", "INSTALL_FAILED", "no-pr", "missing-autopsy"] as const)("preserves failure reporting behavior for %s", async mode => {
+    const config = await import("../config.js");
+    hoisted.postPrComment.mockClear();
+    if (mode === "post-error") hoisted.postPrComment.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    config.upsertMapping("ENG", makeMapping({ owner: "org", repo: "repo" }));
+    const autopsy = mode === "INSTALL_FAILED" ? formatRunAutopsy({
+      issueIdentifier: "ENG-1", terminationReason: "install_failed", iterations: 1,
+      finalFeedback: "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.\n\nnpm ci failed again: dependency conflict",
+      passes: [], existingPrUrl: "https://github.com/org/repo/pull/12",
+    }) : "## 🔎 Run autopsy — ENG-1\n\nThe review did not approve the change.\nThe existing PR is unchanged by this run: https://github.com/org/repo/pull/12\n\n" +
+      (mode === "VERIFY_FAILED" ? "Run notes: verification stopped" : "Reviewer's final feedback: fix the boundary");
     const phase = mode === "initial" ? "implementation" : "gap-analysis";
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i", mappingTeamKey: "ENG", phase,
@@ -2914,6 +3002,7 @@ describe("handleRunnerResult — gap-analysis", () => {
     });
     const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, phase });
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    if (mode === "no-pr") log.updateJobPrUrl(jobId, "");
     const failure = {
       category: "crash" as const, code: "REVIEW_UNAPPROVED", stage: "feedback-loop/review-3",
       attempt: 1, retryable: false, message: "Review did not approve",
@@ -2925,30 +3014,63 @@ describe("handleRunnerResult — gap-analysis", () => {
     const input: RunnerCallbackModule.HandleRunnerResultInput = {
       authorization: `Bearer ${token}`, secret: SECRET,
       resolveProvider: makeResolve(provider), checkImplementationAdmissionTermination: hook,
+      watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
       body: {
-        phase, outcome: "failure" as const, failureCode: "REVIEW_UNAPPROVED",
-        failureReason: "iterations_exhausted after 3/3 iterations", comments: [{ body: "Review exhausted" }],
-        prUrl: "https://github.com/org/repo/pull/12",
+        phase, outcome: "failure" as const, failureCode: ["VERIFY_FAILED", "INSTALL_FAILED"].includes(mode) ? mode : "REVIEW_UNAPPROVED",
+        failureReason: mode === "INSTALL_FAILED" ? "Dependency install failed twice (npm ci); the change was approved by review but never built or tested.\n\ndependency conflict" : "iterations_exhausted after 3/3 iterations", comments: [{ body: "Other summary" }, ...(mode === "missing-autopsy" ? [] : [{ body: autopsy }])],
+        ...(mode === "INSTALL_FAILED" ? {} : { prUrl: "https://github.com/org/repo/pull/12" }),
         ...(mode === "structured" ? { failure } : {}),
       },
     };
-    expect((await runnerCallback.handleRunnerResult(input)).status).toBe(mode === "retry" ? 503 : 200);
+    let overlapping: Promise<RunnerCallbackModule.HandleRunnerResultOutput>[] = [];
+    let releasePost!: () => void;
+    let enteredPost!: () => void;
+    const postEntered = new Promise<void>(resolve => { enteredPost = resolve; });
+    const postReleased = new Promise<void>(resolve => { releasePost = resolve; });
+    if (mode === "overlapping") {
+      hoisted.postPrComment.mockImplementationOnce(async () => {
+        enteredPost();
+        await postReleased;
+      });
+      hook.mockRejectedValueOnce(new Error("report unavailable"));
+    }
+    const first = runnerCallback.handleRunnerResult(input);
+    if (mode === "overlapping") {
+      await postEntered;
+      // Both retries arrive while the first callback is paused inside GitHub.
+      overlapping = [runnerCallback.handleRunnerResult(input), runnerCallback.handleRunnerResult(input)];
+      releasePost();
+    }
+    const result = await first;
+    const retries = await Promise.all(overlapping);
+    expect(retries.map(r => r.status)).toEqual(mode === "overlapping" ? [200, 200] : []);
+    expect(result.status).toBe(mode === "retry" || mode === "overlapping" ? 503 : 200);
+    if (mode === "post-error") expect(result.body.warnings).toContain("postPrComment: GitHub unavailable");
+    const shouldPost = !["legacy", "initial", "no-pr", "missing-autopsy"].includes(mode);
+    expect(hoisted.postPrComment).toHaveBeenCalledTimes(shouldPost ? 1 : 0);
+    if (shouldPost) expect(hoisted.postPrComment).toHaveBeenCalledWith("fake-installation-token", "org", "repo", 12,
+      autopsy + "\n\nTo start a new round, post a new `/ai-implement` comment with a changed instruction.");
+    if (mode !== "missing-autopsy") expect(provider.recordedCalls()).toContainEqual(expect.objectContaining({ method: "postComment", args: ["i", autopsy] }));
     const job = log.getJobById(jobId);
     if (mode === "legacy" || mode === "initial") {
       expect(job?.status).toBe("dispatched");
       expect(job?.failure).toBeNull();
     } else {
-      expect(job).toMatchObject({ status: "failed", conclusion: "REVIEW_UNAPPROVED", approved: false });
+      expect(job).toMatchObject({ status: "failed", conclusion: input.body.failureCode, approved: false });
       expect(job?.failure).toMatchObject(mode === "structured" ? failure : {
-        code: "REVIEW_UNAPPROVED", message: input.body.failureReason, retryable: false,
+        code: input.body.failureCode, message: input.body.failureReason, retryable: false,
       });
       expect(job?.failureCommentedAt).toBeNull();
     }
     expect(dispatchAdmission.read(dispatchId)?.releasedAt).toBeNull();
-    expect(hook).toHaveBeenCalledTimes(mode === "legacy" ? 0 : 1);
+    expect(hook).toHaveBeenCalledTimes(mode === "legacy" ? 0 : mode === "overlapping" ? 3 : 1);
+    if (mode === "overlapping") {
+      expect(provider.recordedCalls().filter(call => call.method === "postComment")).toHaveLength(2);
+      expect(log.hasCompletedCallbackLifecycle(dispatchId)).toBe(true);
+    }
     if (mode === "retry") {
       const effects = provider.recordedCalls();
-      expect(effects.filter(call => call.method === "postComment")).toHaveLength(1);
+      expect(effects.filter(call => call.method === "postComment")).toHaveLength(2);
       expect(log.hasCompletedCallbackLifecycle(dispatchId)).toBe(true);
       expect((await runnerCallback.handleRunnerResult(input)).status).toBe(200);
       expect(log.getJobById(jobId)).toEqual(job);
@@ -2959,6 +3081,7 @@ describe("handleRunnerResult — gap-analysis", () => {
       expect(log.getJobById(jobId)).toEqual(job);
       expect(provider.recordedCalls()).toEqual(effects);
       expect(hook).toHaveBeenCalledTimes(3);
+      expect(hoisted.postPrComment).toHaveBeenCalledTimes(1);
     }
   });
 
@@ -6595,7 +6718,7 @@ describe("owned result accounting boundary", () => {
   });
 });
 
-it.each(["success", "failure"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
+it.each(["success", "failure", "skipped"] as const)("review-only %s preserves findings and approval and finishes dispatch", async (outcome) => {
   const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis",
     ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS, secret: SECRET });
   const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
@@ -6608,7 +6731,8 @@ it.each(["success", "failure"] as const)("review-only %s preserves findings and 
   const provider = new FakeProvider({ recordCalls: true });
   const res = await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
     resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
-    body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [],
+    body: { phase: "gap-analysis", outcome: outcome === "skipped" ? "success" : outcome, reviewOnly: true, comments: [],
+      ...(outcome === "skipped" ? { rollupReview: { headSha: "a".repeat(40), verdictUrl: "", skipReason: "PR head moved" } } : {}),
       internalFindings: [...findings, { source: "ai-implement-internal", severity: "blocking", body: "new" }],
       findingDispositions: findings.map((f, i) => ({ findingKey: reviewStore.stableReviewFindingKey(f),
         disposition: (["fixed", "invalid", "follow-up"] as const)[i], reason: "test" })),
@@ -6616,7 +6740,7 @@ it.each(["success", "failure"] as const)("review-only %s preserves findings and 
   });
   expect(res.status).toBe(200);
   expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual(before);
-  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome === "success" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
+  expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: outcome !== "failure" ? "completed" : "failed", approved: false, conclusion: "rollup_review" });
   expect(submit).not.toHaveBeenCalled();
   expect(provider.recordedCalls()).toHaveLength(0);
 });
@@ -6647,15 +6771,18 @@ describe("roll-up review follow-up children", () => {
       { source: "ai-implement-internal", severity: "blocking", path: "two.ts", line: 9, body: "When retried, work is duplicated." },
       { source: "ai-implement-internal", severity: "minor", body: "minor nit" },
     ];
-    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success") {
+    async function prepare(head: string, internalFindings = findings, outcome: "success" | "failure" = "success",
+      failedReviewers = outcome === "failure" ? ["code-review", "integration-review"] : [],
+      incompleteReviews?: Array<{ reviewerId: string; failure?: { category: import("../pipeline/failure-classification.js").FailureCategory; code: string } }>, skipReason?: string) {
       const { token, dispatchId } = runnerTokens.mintRunToken({ issueId: "i", mappingTeamKey: "ENG", phase: "gap-analysis", ttlSeconds: 3600, secret: SECRET });
       const id = log.appendLog(makeAppendLogEntry({ issueId: "i", issueIdentifier: "ENG-7", repo: "org/repo", dispatchId, phase: "gap-analysis" }));
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
       const deliver = () => runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
         resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
+        checkImplementationAdmissionTermination: async () => ({ status: "accepted" }),
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
         body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
-          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99" } } });
+          rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers, incompleteReviews, skipReason } } });
       return { deliver, dispatchId };
     }
     async function run(head: string, internalFindings = findings) {
@@ -6670,6 +6797,71 @@ describe("roll-up review follow-up children", () => {
     return { provider, children, listing, create, update, run, prepare, findings };
   }
 
+  it("acknowledges a stale-head skip without child, tracker verdict, or retry", async () => {
+    const { prepare, provider, create, listing, update, findings } = await setup();
+    const { deliver, dispatchId } = await prepare("a", findings, "success", [], [], "PR head moved from A to B");
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "completed", conclusion: "rollup_review", approved: false });
+    expect(create).not.toHaveBeenCalled();
+    expect(listing).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(provider.recordedCalls()).toEqual([]);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(0);
+  });
+
+  it("queues one retry for PROVIDER_OVERLOADED incomplete reviewers", async () => {
+    const { prepare, update } = await setup();
+    const first = await prepare("a", [], "failure", ["code-review"], [
+      { reviewerId: "code-review", failure: { category: "transient", code: "PROVIDER_OVERLOADED" } },
+    ]);
+    expect((await first.deliver()).status).toBe(200);
+    const rows = dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ owner: "org", repo: "repo", pr_number: 12, commenter: "ai-implement-rollup-review" });
+    expect(update.mock.calls.at(-1)?.[4]).toContain("one retry is queued");
+  });
+
+  it("does not retry a second incomplete result, including after terminal queue states", async () => {
+    const { prepare, update } = await setup();
+    const failures = ["code-review", "integration-review"].map(reviewerId => ({ reviewerId,
+      failure: { category: "transient" as const, code: "PROVIDER_OVERLOADED" } }));
+    const first = await prepare("a", [], "failure", failures.map(r => r.reviewerId), failures);
+    await first.deliver();
+    dedup.getDb().prepare("UPDATE comment_gapfill_queue SET status = 'completed'").run();
+    const second = await prepare("a", [], "failure", failures.map(r => r.reviewerId), failures);
+    expect((await second.deliver()).status).toBe(200);
+    // A replay of the same callback token is refused and queues nothing.
+    expect((await second.deliver()).status).toBe(409);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("no retry is left; a person decides");
+  });
+
+  it.each(["auth", "missing", "empty", "complete"])("does not retry %s failures", async kind => {
+    const { prepare, update } = await setup();
+    const failures = kind === "empty" ? [] : [
+      { reviewerId: "code-review", failure: { category: "transient" as const, code: "PROVIDER_OVERLOADED" } },
+      { reviewerId: "integration-review", ...(kind === "missing" ? {} : {
+        failure: { category: "auth" as const, code: "AUTH_FAILED" } }) },
+    ];
+    const result = await prepare("a", [], kind === "complete" ? "success" : "failure",
+      ["code-review", "integration-review"], failures);
+    expect((await result.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(0);
+    if (kind !== "complete") expect(update.mock.calls.at(-1)?.[4]).toContain("no retry is left; a person decides");
+  });
+
+  it("keeps a queued retry notice when the comment write needs redelivery", async () => {
+    const { prepare, update } = await setup();
+    update.mockRejectedValueOnce(new Error("comment unavailable"));
+    const first = await prepare("a", [], "failure", ["code-review"], [
+      { reviewerId: "code-review", failure: { category: "transient", code: "PROVIDER_OVERLOADED" } },
+    ]);
+    expect((await first.deliver()).status).toBe(503);
+    expect((await first.deliver()).status).toBe(200);
+    expect(dedup.getDb().prepare("SELECT * FROM comment_gapfill_queue").all()).toHaveLength(1);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("one retry is queued");
+  });
+
   it("files both blockers in one templated child and keeps minors in the verdict", async () => {
     const { create, run, update } = await setup();
     await run("a");
@@ -6682,6 +6874,8 @@ describe("roll-up review follow-up children", () => {
     expect(content.title).toMatch(/^\[roll-up-review\] org\/repo#12 /);
     expect(content.body).not.toContain("minor nit");
     expect(update.mock.calls[0][4]).toContain("minor nit");
+    expect(update.mock.calls[0][4]).toContain("Blocking findings filed as");
+    expect(update.mock.calls[0][4]).toContain((await create.mock.results[0].value).identifier);
   });
 
   it("does not file partial blockers from an incomplete review or consume the child budget", async () => {
@@ -6690,20 +6884,33 @@ describe("roll-up review follow-up children", () => {
     expect((await deliver()).status).toBe(200);
     expect(log.getJobByDispatchId(dispatchId)).toMatchObject({ status: "failed", approved: false, conclusion: "rollup_review" });
     expect(create).not.toHaveBeenCalled();
-    expect(update).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("code-review, integration-review");
     await run("a");
     await run("b");
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  it("notifies on a failure before the reviewed head or reviewers are available", async () => {
+    const { prepare, create, update } = await setup();
+    const { deliver } = await prepare("", [], "failure", []);
+    expect((await deliver()).status).toBe(200);
+    expect(create).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("No failed reviewer was identified");
+    expect(dedup.getDb().prepare("SELECT value FROM settings WHERE key = ?")
+      .get("roll-up-review:children:org/repo#12")).toBeUndefined();
+  });
+
   it("ignores minor-only results", async () => {
-    const { run, create, findings } = await setup();
+    const { run, create, findings, update } = await setup();
     await run("a", [findings[2]]);
     expect(create).not.toHaveBeenCalled();
+    expect(update.mock.calls.at(-1)?.[4]).toContain("No blocking findings");
   });
 
   it("serializes concurrent same-head creates and caps at two including terminal children", async () => {
-    const { run, create, update, children, provider } = await setup();
+    const { run, create, update, children, provider, prepare, findings } = await setup();
     await Promise.all([run("a"), run("a")]);
     expect(create).toHaveBeenCalledOnce();
     provider.setLifecycle(children[0].id, "completed");
@@ -6711,11 +6918,16 @@ describe("roll-up review follow-up children", () => {
     await run("a");
     expect(create).toHaveBeenCalledOnce();
     await run("b");
-    expect(update.mock.calls.at(-1)?.[4]).toContain("a person decides");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("a person must decide");
     dedup.getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:children:%");
     await run("c");
     expect(create).toHaveBeenCalledTimes(2);
     expect(update.mock.calls.at(-1)?.[4]).toContain("limit");
+    const incomplete = await prepare("d", findings, "failure");
+    expect((await incomplete.deliver()).status).toBe(200);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(update.mock.calls.at(-1)?.[4]).toContain("review did not finish");
+    expect(update.mock.calls.at(-1)?.[4]).toContain("a person must decide");
   });
 
   it("fails closed on tracker reads and ambiguous creates", async () => {
@@ -6733,16 +6945,106 @@ describe("roll-up review follow-up children", () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
-  it("acknowledges failures after creation and unsupported child discovery", async () => {
-    const { prepare, create, update, provider } = await setup();
-    update.mockRejectedValueOnce(new Error("comment unavailable"));
-    const { deliver } = await prepare("a");
-    expect((await deliver()).status).toBe(200);
+  it.each(["creation", "edit", "failed edit", "pending retry"])("serializes shared notices during overlapping %s callbacks", async stage => {
+    const { prepare, create, update } = await setup();
+    const first = await prepare("a");
+    const second = await prepare("a"); // Separate legacy dispatches share the same notice receipt.
+    if (stage === "pending retry") {
+      update.mockRejectedValueOnce(new Error("comment unavailable"));
+      expect((await first.deliver()).status).toBe(503);
+      update.mockClear();
+    }
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    if (stage === "creation") {
+      const actual = create.getMockImplementation()!;
+      create.mockImplementationOnce(async (...args) => {
+        entered();
+        await gate;
+        return actual(...args);
+      });
+    } else {
+      update.mockImplementationOnce(async () => {
+        entered();
+        await gate;
+        if (stage === "failed edit") throw new Error("comment unavailable");
+      });
+    }
+    const delivery = first.deliver();
+    await started;
+    const overlapping = second.deliver();
+    // Drain the mocked I/O in the second callback while the first remains suspended.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release();
+    const results = await Promise.all([delivery, overlapping]);
+    expect(results.map(result => result.status)).toEqual(stage === "failed edit" ? [503, 200] : [200, 200]);
     expect(create).toHaveBeenCalledOnce();
+    expect(update).toHaveBeenCalledTimes(stage === "failed edit" ? 2 : 1);
+    const child = await create.mock.results[0].value;
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toEqual({
+      headSha: "a".repeat(40), commentId: 99,
+      text: `<!-- roll-up-review follow-up -->\n\nBlocking findings filed as ${child.identifier}.`,
+      delivered: true,
+    });
+    expect(update.mock.calls[0][4]).toContain(JSON.parse(row.value).text);
+    if (stage === "failed edit") expect(update.mock.calls[1][4]).toBe(update.mock.calls[0][4]);
+  });
+
+  it("retries a durable notice after child creation without filing or posting twice", async () => {
+    const { prepare, create, update, listing } = await setup();
+    update.mockRejectedValueOnce(new Error("comment unavailable"));
+    const { deliver, dispatchId } = await prepare("a");
+    expect((await deliver()).status).toBe(503);
+    expect(create).toHaveBeenCalledOnce();
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toMatchObject({ headSha: "a".repeat(40), commentId: 99, delivered: false });
+    const originalText = update.mock.calls[0][4];
+    listing.mockRejectedValue(new Error("tracker discovery unavailable"));
+    expect((await deliver()).status).toBe(200);
+    expect(update.mock.calls[1][4]).toBe(originalText);
+    expect(create).toHaveBeenCalledOnce();
+    const second = await prepare("a");
+    expect((await second.deliver()).status).toBe(200);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it.each(["read", "missing", "lost-response"])("retains and retries a notice after %s with Restate ownership", async failure => {
+    const { prepare, create, update } = await setup();
+    const gh = await import("../github.js");
+    const { deliver, dispatchId } = await prepare("a");
+    expect(dispatchAdmission.acquire({ dispatchId, mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" }, kind: "implementation",
+      backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 1 }).ok).toBe(true);
+    const comments = vi.mocked(gh.listPrComments);
+    if (failure === "read") comments.mockRejectedValueOnce(new Error("comments unavailable"));
+    if (failure === "missing") comments.mockResolvedValueOnce([]);
+    if (failure === "lost-response") update.mockImplementationOnce(async (_token, _owner, _repo, id, body) => {
+      comments.mockResolvedValue([{ id, body }]);
+      throw new Error("response lost after edit");
+    });
+    expect((await deliver()).status).toBe(503);
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
+    expect(create).toHaveBeenCalledOnce();
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)?.status).toBe("completed");
+    expect((await deliver()).status).toBe(200);
+    expect(update).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toMatchObject({ delivered: true });
+  });
+
+  it("keeps unsupported child discovery advisory", async () => {
+    const { prepare, create, provider } = await setup();
     Object.assign(provider, { listIssuesPage: undefined });
     const next = await prepare("b");
     expect((await next.deliver()).status).toBe(200);
-    expect(create).toHaveBeenCalledOnce();
+    expect(create).not.toHaveBeenCalled();
   });
 
   it("parks a child if the PR closes during creation", async () => {

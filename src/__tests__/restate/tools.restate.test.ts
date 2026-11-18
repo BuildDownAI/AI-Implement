@@ -32,6 +32,23 @@ import { createSetupChecks } from "../../restate/setup-checks.js";
 import type { SetupCheckRun } from "../../setup-checks/index.js";
 import { VARIANTS, journalEntries, journalText, callObject, callService, gate, queryInvocations, startVariants, stopAll } from "./harness.js";
 
+// Supply valid inputs so registry-wide grant checks reach authorization even for
+// strict schemas, which reject unrelated shared fixture fields at ingress.
+function adminToolArgs(name: string, fallback: Record<string, unknown>): Record<string, unknown> {
+  switch (name) {
+    case "get_fly_setup": return {};
+    case "unpark_issue": return { identifier: "CON-146" };
+    case "set_project_agent_mode": return { teamKey: "BDS", mode: "legacy" };
+    case "start_deploy": return { branch: "testing", requestedBy: "test" };
+    case "add_model_account": return {
+      profileId: "grant-test", identity: "operator", agent: "claude",
+      provider: "openrouter", authMode: "openrouter-api-key",
+    };
+    case "set_project_stage": return { teamKey: "BDS", stage: "implementation" };
+    default: return fallback;
+  }
+}
+
 // A second service, built with tool(), whose only handler throws — proves the wrapper's
 // try/catch (not just get_tenant_health's own well-behaved body) turns a thrown error into
 // an isError result instead of letting Restate retry a hung handler forever.
@@ -132,6 +149,7 @@ const authorizationTools = restate.service({
     read: tool({ description: "test read", input: z.object({}), role: "user" }, authorizationHandler),
     admin: tool({ description: "test admin", input: z.object({}), role: "admin" }, authorizationHandler),
     projects: tool({ description: "test projects", input: z.object({}), role: "admin", grant: "projects" }, authorizationHandler),
+    secrets: tool({ description: "test secrets", input: z.object({}), role: "admin", grant: "secrets" }, authorizationHandler),
     deploy: tool({ description: "test deploy", input: z.object({}), role: "admin", grant: "deploy" }, authorizationHandler),
   },
 });
@@ -243,17 +261,19 @@ describe("orchestratorTools (Restate)", () => {
   it.each(VARIANTS.map(([label]) => label))("enforces every authorization state-table cell (%s)", async (label) => {
     const env = environments.get(label)!;
     const rows: Array<[string, Caller, boolean[]]> = [
-      ["projects token", serviceCaller({ grants: ["projects"] }), [true, false, false, true]],
-      ["projects + deploy token", serviceCaller({ grants: ["deploy", "projects"] }), [true, false, true, true]],
-      ["read token", serviceCaller(), [true, false, false, false]],
-      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
-      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false]],
-      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false, false]],
-      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true, true]],
-      ["system", systemCaller(), [true, true, true, true]],
+      ["projects token", serviceCaller({ grants: ["projects"] }), [true, false, false, true, false]],
+      ["projects + deploy token", serviceCaller({ grants: ["deploy", "projects"] }), [true, false, true, true, false]],
+      ["read token", serviceCaller(), [true, false, false, false, false]],
+      ["deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false, false]],
+      ["read + deploy token", serviceCaller({ grants: ["deploy"] }), [true, false, true, false, false]],
+      ["human user", { kind: "human", email: "user@example.com", role: "user", grants: [] }, [true, false, false, false, false]],
+      ["human admin", { kind: "human", email: "admin@example.com", role: "admin", grants: [] }, [true, true, true, true, true]],
+      ["system", systemCaller(), [true, true, true, true, true]],
+      ["secrets token", serviceCaller({ grants: ["secrets"] }), [true, false, false, false, true]],
+      ["all grants token", serviceCaller({ grants: ["deploy", "projects", "secrets"] }), [true, false, true, true, true]],
     ];
     for (const [row, caller, allowed] of rows) {
-      for (const [index, name] of ["read", "admin", "deploy", "projects"].entries()) {
+      for (const [index, name] of ["read", "admin", "deploy", "projects", "secrets"].entries()) {
         const before = authorizationExecutions;
         const result = await callService<ToolCallResult>(env.baseUrl(), "authorizationTools", name, { caller, args: {} });
         if (allowed[index]) {
@@ -363,15 +383,15 @@ describe("orchestratorTools (Restate)", () => {
     const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
     const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
     expect(admins.length).toBeGreaterThan(0);
-    // A superset of schema-valid fields covers every current admin handler. Unknown
-    // fields are stripped by its schema; missing/new required fields fail ingress.
+    // Shared fields cover permissive admin schemas; strict schemas get their own
+    // arguments below so ingress validation reaches the authorization check.
     const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
       backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
       paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
     // start_deploy is the one admin tool the deploy grant reaches (its own cases are below).
     for (const { name } of admins.filter((handler) => handler.name !== "start_deploy")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["deploy"] }), args: name === "set_project_agent_mode" ? { teamKey: "BDS", mode: "legacy" } : args,
+        caller: serviceCaller({ grants: ["deploy"] }), args: adminToolArgs(name, args),
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -387,15 +407,15 @@ describe("orchestratorTools (Restate)", () => {
     const { handlers } = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
     const admins = handlers.filter((handler) => handler.metadata?.["mcp.role"] === "admin");
     expect(admins.length).toBeGreaterThan(0);
-    // A superset of schema-valid fields covers every current admin handler. Unknown
-    // fields are stripped by its schema; missing/new required fields fail ingress.
+    // Shared fields cover permissive admin schemas; strict schemas get their own
+    // arguments below so ingress validation reaches the authorization check.
     const args = { action: "cancel", attemptId: "test-attempt", pipeline: "kg-refresh",
       backend: "fly-machines", patch: {}, schedule: null, mode: "default", teamKey: "BDS",
       paused: true, issueId: "test-issue", dispatchId: "test-dispatch" };
     // Only the project mode tool is reachable with the projects grant.
     for (const { name } of admins.filter((handler) => handler.name !== "set_project_agent_mode")) {
       const result = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
-        caller: serviceCaller({ grants: ["projects"] }), args: name === "start_deploy" ? { branch: "testing", requestedBy: "test" } : args,
+        caller: serviceCaller({ grants: ["projects"] }), args: adminToolArgs(name, args),
       });
       expect(result.isError, name).toBe(true);
       expect(result.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -581,10 +601,10 @@ describe("orchestratorTools (Restate)", () => {
       };
       setReviewFixAttemptsFacade(facade);
       try {
-        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]) {
           const denied = await callService<ToolCallResult>(env.baseUrl(), "orchestratorTools", name, {
             caller: { kind: "human", email: "reader@example.com", role: "user" },
-            args: { attemptId: "exact-attempt" },
+            args: name === "get_fly_setup" ? {} : { attemptId: "exact-attempt" },
           });
           expect(denied.isError).toBe(true);
           expect(denied.content?.[0]?.text).toBe(`forbidden: ${name} requires the admin role`);
@@ -626,7 +646,7 @@ describe("orchestratorTools (Restate)", () => {
         const response = await fetch(`${env.adminAPIBaseUrl()}/services/orchestratorTools`);
         expect(response.ok).toBe(true);
         const catalog = await response.json() as { handlers: Array<{ name: string; metadata?: Record<string, string> }> };
-        for (const name of ["get_review_fix_attempt", "get_review_fix_activity"]) {
+        for (const name of ["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]) {
           expect(catalog.handlers.find((h) => h.name === name)?.metadata).toMatchObject({
             "mcp.type": "tool", "mcp.role": "admin",
           });

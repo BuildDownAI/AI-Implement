@@ -16,6 +16,9 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { Machine, SettleOptions } from "../fly-machines.js";
 import { GONE_BEFORE_SCRUB } from "../fly-machines.js";
+import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "../fly-machine-sizing.js";
+
+export { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "../fly-machine-sizing.js";
 
 export interface FlyMachineProfileConfig {
   cpuKind: "shared" | "performance";
@@ -37,12 +40,9 @@ export const FLY_MACHINE_PROFILE_DEFAULTS: Record<string, FlyMachineProfileConfi
   "kg-refresh": { cpuKind: "performance", cpus: 2, memoryMb: 8192, idleTimeoutMs: SEVEN_DAYS_MS },
 };
 
-const VALID_CPUS = [1, 2, 4, 8, 16];
 const MIN_MEMORY_MB = 256;
 const MAX_MEMORY_MB = 65536;
 const MIN_IDLE_TIMEOUT_MS = 60_000;
-/** Fly performance machines need at least this much memory per CPU. Shared with kg-refresh-production.ts. */
-export const PERFORMANCE_MIN_MB_PER_CPU = 2048;
 
 const PROFILE_KEY = "profile";
 const MACHINE_KEY = "machine";

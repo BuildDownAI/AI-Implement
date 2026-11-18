@@ -1414,6 +1414,51 @@ export async function listOpenPullRequests(
   }));
 }
 
+export interface OpenPullRequest {
+  author: string | null;
+  number: number;
+  url: string;
+  base: string;
+  head: string;
+  headSha: string;
+  draft: boolean;
+  title: string;
+  createdAt: number; // Epoch milliseconds from GitHub's created_at.
+}
+
+/** Lists every open PR, rejecting incomplete reads (including the 50-page limit). */
+export async function listAllOpenPullRequests(
+  token: string, owner: string, repo: string,
+): Promise<OpenPullRequest[]> {
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
+  const pulls: OpenPullRequest[] = [];
+  for (let page = 0; page < 50; page++) {
+    const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      throw new Error(`Cannot list open pull requests for ${owner}/${repo}: HTTP ${res.status}`);
+    }
+    const data = (await res.json()) as Array<{
+      number: number; html_url: string; draft?: boolean; title: string; created_at: string;
+      user?: { login?: string | null } | null;
+      base: { ref: string }; head: { ref: string; sha: string };
+    }>;
+    for (const p of data) {
+      const createdAt = Date.parse(p.created_at);
+      if (Number.isNaN(createdAt)) {
+        throw new Error(`Invalid created_at for ${owner}/${repo} pull request #${p.number}`);
+      }
+      pulls.push({
+        number: p.number, url: p.html_url, base: p.base.ref,
+        head: p.head.ref, headSha: p.head.sha, draft: p.draft === true,
+        title: p.title, createdAt, author: p.user?.login ?? null,
+      });
+    }
+    url = parseLinkNext(res.headers.get("link"));
+    if (!url) return pulls;
+  }
+  throw new Error(`Cannot list all open pull requests for ${owner}/${repo}: exceeded 50 pages`);
+}
+
 /** Repos for which a check-runs permission denial has already been logged this process —
  *  auto-merge polls every open PR on every tick, and a missing Checks: read grant does not
  *  clear itself between polls, so an unconditional warn would repeat once per PR per tick. */

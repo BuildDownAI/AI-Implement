@@ -340,6 +340,9 @@ function fixPassLabel(iteration: number, maxIterations: number): string {
   return `${iteration}/${Math.max(1, maxIterations - 1)}`;
 }
 
+const CI_CHECK_FAILING_TITLE = "CI check failing";
+const CI_CHECK_UNVERIFIED_TITLE = "CI check status could not be verified";
+
 function formatReviewHistory(history: ReviewFinding[]): string {
   if (history.length === 0) {
     return "No previous post-push review findings.";
@@ -1744,7 +1747,7 @@ async function runSelectedInternalReviewers(params: {
     };
     let prompt: string;
     try {
-      prompt = definition.buildPrompt({
+      prompt = `The pipeline reads the CI checks on the current commit; do not report CI status as an issue.\n\n` + definition.buildPrompt({
         issueIdentifier: params.context.data.issueIdentifier,
         issueTitle: params.context.data.issueTitle,
         issueDescription: params.context.data.issueDescription,
@@ -2180,7 +2183,11 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
 
-      const previousFindings = formatReviewHistory(reviewHistory);
+      const previousFindings = formatReviewHistory(reviewHistory.map(finding => ({
+        ...finding,
+        issues: finding.issues.filter(issue =>
+          issue.title !== CI_CHECK_FAILING_TITLE && issue.title !== CI_CHECK_UNVERIFIED_TITLE),
+      })));
       const advisoryConfigReviewers = configAdvisoryReviewers(configReviewerResolution.branchDefinitions, selectedInternalReviewers);
       const activeInternalReviewers: SelectedReviewer[] = [
         ...selectedInternalReviewers,
@@ -2328,14 +2335,14 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
         // issue so it flows through the same ledger/gating path "CI check failing" already uses,
         // rather than silently approving on missing evidence.
         internalIssues.push({
-          title: "CI check status could not be verified",
+          title: CI_CHECK_UNVERIFIED_TITLE,
           problem: `Could not read check runs at ${externalReviewResult.headSha} to determine whether CI checks passed.`,
           requiredFix: "Investigate the check-runs read failure (transient API error or credential issue), then re-run review once check runs can be read.",
         });
       }
       for (const checkName of ciChecksResult.failingChecks) {
         internalIssues.push({
-          title: "CI check failing",
+          title: CI_CHECK_FAILING_TITLE,
           problem: `CI check '${checkName}' is failing on the current head`,
           requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
         });
@@ -3040,7 +3047,7 @@ export default postPushReviewStep;
 
 // Keep one comment below GitHub's 65,536-character limit. Allocate finding
 // space before summaries, and make any omitted detail explicit.
-function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLedgerFinding[]): string {
+function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLedgerFinding[], reviewedHead: string): string {
   const limit = 65_000;
   const clip = (value: string, size: number) => {
     if (value.length <= size) return value;
@@ -3049,16 +3056,28 @@ function rollupReviewBody(verdict: string, feedback: string, findings: ReviewLed
     if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
     return `${value.slice(0, end)}… [truncated]`;
   };
-  const header = `<!-- ai-implement rollup-review -->\n\n## Roll-up review: ${verdict}\n\nAdvisory only.`;
-  const shown = findings.slice(0, 100);
+  const header = `<!-- ai-implement rollup-review -->\n\n## Roll-up review: ${verdict}\n\nThis verdict does not block the merge; blocking findings are filed as one [roll-up-review] child until the automatic follow-up limit is reached.\n\nReviewed head: \`${reviewedHead ? reviewedHead.slice(0, 7) : "unavailable"}\``;
+  const severityRank = { minor: 0, medium: 1, blocking: 2 };
+  const grouped = new Map<string, { finding: ReviewLedgerFinding; reviewers: Set<string> }>();
+  for (const finding of findings) {
+    const key = stableReviewFindingKey(finding);
+    const entry = grouped.get(key);
+    if (entry) {
+      if (finding.reviewerId) entry.reviewers.add(finding.reviewerId);
+      if (severityRank[finding.severity] > severityRank[entry.finding.severity]) entry.finding = finding;
+    } else grouped.set(key, { finding, reviewers: new Set(finding.reviewerId ? [finding.reviewerId] : []) });
+  }
+  const unique = [...grouped.values()];
+  const shown = unique.slice(0, 100);
   const findingBudget = 50_000;
   const perFinding = Math.floor(findingBudget / Math.max(1, shown.length));
-  const details = shown.map(f => {
+  const details = shown.map(({ finding: f, reviewers }) => {
     const location = `${clip(f.path ?? "(general)", Math.floor(perFinding / 3))}:${f.line ?? "?"}`;
     const prefix = `- **${f.severity}** ${location} — `;
-    return prefix + clip(f.body, Math.max(30, perFinding - prefix.length - 2));
+    const attribution = ` (Reviewers: ${clip([...reviewers].join(", "), Math.floor(perFinding / 3))})`;
+    return prefix + clip(f.body, Math.max(30, perFinding - prefix.length - attribution.length - 2)) + attribution;
   }).join("\n\n");
-  const omitted = findings.length > shown.length ? `\n\n${findings.length - shown.length} additional findings omitted from this comment.` : "";
+  const omitted = unique.length > shown.length ? `\n\n${unique.length - shown.length} additional findings omitted from this comment.` : "";
   const body = [header, details + omitted].filter(Boolean).join("\n\n");
   return `${body}\n\n${clip(feedback, limit - body.length - 2)}`;
 }
@@ -3072,6 +3091,8 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
   let findings: ReviewLedgerFinding[] = [];
   let feedback = "";
   let failed = false;
+  let failedReviewers: string[] = [];
+  let incompleteReviews: import("../../runner-result.js").RollupReviewResult["incompleteReviews"] = [];
   let approved = false;
   let costUsd: number | null = null;
   try {
@@ -3079,6 +3100,14 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
     const head = gh(headArgs);
     if (head.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim())) throw new Error("Cannot read reviewed roll-up head");
     reviewedHead = head.stdout.trim();
+    const expectedHead = context.data.reviewOnly?.expectedHeadSha;
+    if (expectedHead && expectedHead.toLowerCase() !== reviewedHead.toLowerCase()) {
+      const skipReason = `Roll-up review skipped: PR head moved from queued head ${expectedHead} to ${reviewedHead}.`;
+      console.log(`[roll-up-review] ${skipReason}`);
+      return { approved: false, iterations: 0, finalFeedback: skipReason, terminationReason: "approved" as const,
+        passes: [], extraCostUsd: null, internalFindings: [],
+        rollupReview: { headSha: expectedHead, verdictUrl: "", skipReason } };
+    }
     // gh returns the entire base-to-head PR diff, including earlier commits and lockfiles.
     const diff = gh(["pr", "diff", prNumber]);
     if (diff.exitCode !== 0) throw new Error(`Cannot read PR diff: ${resultMessage(diff)}`);
@@ -3098,7 +3127,10 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
       previousFindings: "", model: context.data.model ?? DEFAULT_MODEL, sleep: async () => {} });
     findings = result.findings;
     feedback = result.feedback;
-    failed = result.incompleteReviews.length > 0;
+    incompleteReviews = result.incompleteReviews.map(({ reviewerId, failure }) => ({ reviewerId,
+      ...(failure ? { failure: { category: failure.category, code: failure.code } } : {}) }));
+    failedReviewers = result.incompleteReviews.map(review => review.reviewerId);
+    failed = failedReviewers.length > 0;
     approved = result.approved;
     costUsd = result.costUsd;
   } catch (error) {
@@ -3106,7 +3138,7 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
     feedback = error instanceof Error ? error.message : String(error);
   }
   const verdict = failed ? "Review incomplete" : approved ? "Approved" : "Changes recommended";
-  const body = rollupReviewBody(verdict, feedback, findings);
+  const body = rollupReviewBody(verdict, feedback, findings, reviewedHead);
   let verdictUrl = "";
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rollup-review-"));
   try {
@@ -3119,5 +3151,5 @@ export async function runReviewOnly(context: PipelineContext, workspaceDir: stri
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
   return { approved, iterations: 1, finalFeedback: feedback, terminationReason: failed ? "review_error" as const : "approved" as const,
-    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl } };
+    passes: [], extraCostUsd: costUsd, internalFindings: findings, rollupReview: { headSha: reviewedHead, verdictUrl, failedReviewers, incompleteReviews } };
 }

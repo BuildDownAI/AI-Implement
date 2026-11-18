@@ -1,3 +1,7 @@
+import { listParked, unpark } from "../dispatch-breaker.js";
+import { resolveDefaultRunnerImage } from "../repo-image.js";
+import { STAGE_NAMES } from "../agent-config.js";
+import { createAgentConfigAdminDeps } from "../model-auth-runtime.js";
 import { importEnvironmentCredential } from "../model-account-cli.js";
 import { createModelProtectedSecrets } from "../model-protected-secrets.js";
 import { modelPrices } from "./model-prices.js";
@@ -20,16 +24,18 @@ import { serde } from "@restatedev/restate-sdk-zod";
 import { z } from "zod";
 import type { AccessRole } from "../access-entries.js";
 import { effectiveAccessCode } from "../admin-session.js";
-import { getRunnerMode, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
+import { getRunnerMode, resolveExecutionPath, getFlyProcessLevelSecrets, getKgMaterializeDirect, getKgExecutionMode, resolveKgBackend } from "../runner-mode.js";
 import { getMappings, resolveReviewProcessId, type RepoMapping } from "../config.js";
-import { getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
+import { getLatestIssueIdForIdentifier, getInFlightJobs, getRunRecordMergeVerdict, getJobById, getJobByMachineId, parseFailureJson, type Job } from "../log.js";
 import {
-  getMachine, listMachines, fetchMachineLogs, readMachineExit,
+  classifyFlySecretNames, listAppSecrets, FlyApiError, getMachine, listMachines, fetchMachineLogs, readMachineExit,
   type Machine,
 } from "../fly-machines.js";
 import { getDb } from "../dedup.js";
 import { getOrchestratorDefaults, isProjectConfigured } from "../agent-config-store.js";
 import { summarizeSetupChecks } from "../setup-checks/index.js";
+import { listOpenPulls } from "../open-pulls.js";
+import { listIssueStatuses } from "../issue-statuses.js";
 import { JobAccountingArgsSchema, listJobAccounting } from "../job-accounting.js";
 import {
   listHeldReservations,
@@ -51,11 +57,13 @@ import { RunnerBackend } from "./runner-backend.js";
 import { PipelineSchedule } from "./pipeline-schedule.js";
 import type { KgRefreshToolDeps } from "./kg-refresh-production.js";
 import type { KgRefreshDefinition, KgRepoDefinition } from "./kg-refresh-types.js";
-import { getOrchestratorSettings, getFlySessionsConfig, getLinearPickupLabel } from "../orchestrator-settings.js";
+import { getOrchestratorSettings, getFlySessionsConfig, getRunnerBackendSource, getLinearPickupLabel } from "../orchestrator-settings.js";
 import { getIssueReportCard, getFleetReport, getReviewerScorecard } from "../report-card.js";
 import { getDeployPosture, type DeployPosture } from "../deploy-posture.js";
 import { isActiveSelfDeploy, type SelfDeployDefinition, type SelfDeployRecord } from "./self-deploy.js";
 import {
+  createModelAccountAction,
+  putProjectAgentConfigAction,
   setProjectAgentModeAction,
   setRunnerModeAction,
   pauseProjectAction,
@@ -72,7 +80,7 @@ const CallerSchema = z.object({
   kind: z.enum(["human", "system", "service"]),
   email: z.string().nullable(),
   role: z.enum(["user", "admin"]).nullable(),
-  grants: z.array(z.enum(["deploy", "projects"])).readonly().default([]),
+  grants: z.array(z.enum(["deploy", "projects", "secrets"])).readonly().default([]),
 });
 
 const ToolResponse = z.object({
@@ -93,7 +101,7 @@ interface ToolOptions<I extends z.ZodType> {
   input: I;
   role: AccessRole;
   /** Alternate authority, accepted only by tools that explicitly request it. */
-  grant?: "deploy" | "projects";
+  grant?: "deploy" | "projects" | "secrets";
   /** Declares mutability for wrapper write-audit logging. Defaults preserve the original rule: admin-role tools are writes. */
   operation?: "read" | "write";
   /**
@@ -105,7 +113,7 @@ interface ToolOptions<I extends z.ZodType> {
    */
   retryPolicy?: restate.RetryPolicy;
   /** Extra `key=value` text appended to this tool's write-audit line, for a write whose audit must name its target. */
-  auditDetail?: (input: WireInput<I>) => string;
+  auditDetail?: (input: WireInput<I>, response?: ToolResponse) => string;
 }
 
 function wireInputSchema<I extends z.ZodType>(input: I) {
@@ -163,12 +171,12 @@ export function tool<I extends z.ZodType>(
     async (ctx: restate.Context, input: WireInput<I>): Promise<ToolResponse> => {
       const name = ctx.request().target.handler;
       const operation = opts.operation ?? (opts.role === "admin" ? "write" : "read");
-      const audit = (result: "forbidden" | "ok" | "error"): void => {
+      const audit = (result: "forbidden" | "ok" | "error", response?: ToolResponse): void => {
         if (operation !== "write") return;
         const actor = auditActor(input.caller, "system");
         let detail = "";
         try {
-          detail = opts.auditDetail ? ` ${opts.auditDetail(input)}` : "";
+          detail = opts.auditDetail ? ` ${opts.auditDetail(input, response)}` : "";
         } catch {
           detail = "";
         }
@@ -185,7 +193,7 @@ export function tool<I extends z.ZodType>(
       }
       try {
         const result = await handler(ctx, input);
-        audit(result.isError ? "error" : "ok");
+        audit(result.isError ? "error" : "ok", result);
         return result;
       } catch (err) {
         if (restate.internal.isSuspendedError(err)) {
@@ -305,6 +313,7 @@ export const listProjects = tool(
       dependencyTokenScope: m.dependencyTokenScope,
       sensitiveAddPatterns: m.sensitiveAddPatterns,
       sensitiveAllowPatterns: m.sensitiveAllowPatterns,
+      machineCpuKind: m.machineCpuKind,
       machineCpus: m.machineCpus,
       machineMemoryMb: m.machineMemoryMb,
       awsRegion: m.awsRegion,
@@ -509,6 +518,50 @@ export const getSessionMachine = tool(
         result.logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, logLines);
       } catch (err) {
         result.logsError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+export const GetFlySetupArgsSchema = z.object({}).strict();
+
+export const getFlySetup = tool(
+  {
+    description: "Reports live Fly sessions connectivity and secret names by group, never values.",
+    input: GetFlySetupArgsSchema,
+    role: "admin",
+    grant: "secrets",
+    operation: "read",
+  },
+  async (): Promise<ToolResponse> => {
+    const config = mcpAdminConfig();
+    const mappings = getMappings();
+    const appSource = getRunnerBackendSource();
+    const configured = appSource !== "not-loaded" && !!config.flySessionsToken && !!config.flySessionsApp;
+    const result = {
+      usedBy: Object.keys(mappings).filter((key) => {
+        const path = resolveExecutionPath(getRunnerMode().mode, mappings[key].executionMode);
+        return path === "fly-machines" || path === "both";
+      }).sort(),
+      appSource, configured, app: config.flySessionsApp || null,
+      processLevelSecrets: getFlyProcessLevelSecrets(),
+      reachable: null as boolean | null,
+      reachError: null as string | null,
+      names: [] as Array<{ name: string; group: string; projects: string[]; createdAt: string }>,
+    };
+    if (configured) {
+      try {
+        const secrets = await listAppSecrets(config.flySessionsToken!, config.flySessionsApp!, 10_000);
+        result.names = secrets.map((secret) => {
+          const { group, projects } = classifyFlySecretNames([secret.name], Object.keys(mappings))[0];
+          return { name: secret.name, group, projects, createdAt: secret.created_at };
+        }).sort((a, b) => a.name.localeCompare(b.name));
+        result.reachable = true;
+      } catch (err) {
+        result.reachable = false;
+        result.reachError = err instanceof FlyApiError ? `http-${err.status}`
+          : err instanceof Error && err.name === "AbortError" ? "timeout" : "error";
       }
     }
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -1037,6 +1090,41 @@ export const getReviewFixActivityTool = tool(
   },
 );
 
+export const LIST_OPEN_PULLS_DESCRIPTION =
+  "One entry per open PR in every mapped repository. Returns a JSON array. GitHub lists are cached for 60 s; a failed refresh serves the last good repository copy only while it is less than 5 minutes old, otherwise the whole call fails. workflow is absent when the orchestrator has no verdict; workflow.state is active when work remains and settled when it does not. Times are epoch ms. Read.";
+
+export const listOpenPullsTool = tool(
+  {
+    description: LIST_OPEN_PULLS_DESCRIPTION,
+    input: z.object({}),
+    role: "user",
+    operation: "read",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    const entries = await ctx.run("list-open-pulls", () => listOpenPulls(), { maxRetryAttempts: 1 });
+    return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+  },
+);
+
+export const LIST_ISSUE_STATUSES_DESCRIPTION =
+  "Returns a JSON array with one entry per in-scope issue: open issues matching the pickup query in any state, plus merged and failed issues from the last 7 days. States: ready, planning, awaiting-approval, plan-approved, implementing, pr-ready, merged, failed, unknown. changedAt is the tracker's last-updated time, or a newer job time when there is one (epoch ms). Breaker parks mark nonmerged issues failed; jobs supply missing failure phase and newer changedAt. Tracker reads are cached for 60 s; a failed refresh serves the last good team copy only while it is less than 5 minutes old, otherwise the whole call fails. Linear and filesystem never report awaiting-approval. Read.";
+
+export const listIssueStatusesTool = tool(
+  {
+    description: LIST_ISSUE_STATUSES_DESCRIPTION,
+    input: z.object({}),
+    role: "user",
+    operation: "read",
+  },
+  async (ctx): Promise<ToolResponse> => {
+    const entries = await ctx.run("list-issue-statuses", () => listIssueStatuses({
+      providerFor: (m) => providerRegistryForTools().forMapping(m),
+      now: Date.now,
+    }), { maxRetryAttempts: 1 });
+    return { content: [{ type: "text", text: JSON.stringify(entries) }] };
+  },
+);
+
 export const LIST_JOB_ACCOUNTING_DESCRIPTION =
   "Returns one page of finished-job accounting records, oldest change first: dispatch id, phase, status, conclusion, lifecycle owner, times, changedAt, issue, PR, pushed SHAs, every model invocation (tokens, cost, cost status, attempts) and compute (backend, size, start, stop). A job that changes after it was served (a second terminal write, a late review conclusion, a late invocation row) is served again with a newer changedAt: the newest copy of a job replaces older ones. usage is reported only when the runner's invocation list arrived whole, partial when some invocation rows exist without that, unknown when none exist. Args: optional cursor { changedAt, dispatchId }, optional pageSize 1..200 (default 100), optional includeUnsettled (boolean; also serves jobs that changed in the last 10 minutes — only for a caller about to lose the orchestrator; such records may still change and are replaced by changedAt). Returns records, nextCursor, oldestRetainedCompletedAt (information only) and prunedThrough ({ changedAt, dispatchId } of the newest finished job pruned, or null). Without includeUnsettled a record is returned 10 minutes after its last change. Read.";
 
@@ -1485,6 +1573,7 @@ export const addProjectArgsSchema = z.object({
   maxInProgressAiIssues: z.number().optional(),
   executionMode: z.enum(["github-actions", "fly-machines"]).optional(),
   sessionMode: z.enum(["autonomous", "interactive", "hybrid"]).optional(),
+  machineCpuKind: z.enum(["shared", "performance"]).optional(),
   machineCpus: z.number().optional(),
   machineMemoryMb: z.number().optional(),
   planningEnabled: z.boolean().optional(),
@@ -1523,6 +1612,64 @@ export const addProjectArgsSchema = z.object({
     "The project's review process. Restate coordinates AI-Implement fixes for every project. Omit to keep the stored value; pass null or \"ai-implement\" for the default. All review processes apply to every project.",
   ),
 });
+
+function modelAdminDeps() {
+  return { agentConfig: createAgentConfigAdminDeps({
+    ...mcpAdminConfig(), sessionImage: resolveDefaultRunnerImage(process.env).image,
+  }) };
+}
+
+export const AddModelAccountArgsSchema = z.object({
+  profileId: z.string(), identity: z.string(), agent: z.string(),
+  provider: z.string(), authMode: z.string(),
+}).strict();
+
+export const SetProjectStageArgsSchema = z.object({
+  teamKey: z.string(),
+  stage: z.enum(STAGE_NAMES),
+  agent: z.string().nullable().optional(),
+  provider: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  fallbackModel: z.string().nullable().optional(),
+  accountProfileId: z.string().nullable().optional(),
+  invocationTimeoutMs: z.number().int().positive().nullable().optional(),
+  preferOpenModel: z.boolean().optional(),
+}).strict();
+
+export const addModelAccountTool = tool(
+  {
+    description: "Create an active model account profile. No credential values are accepted; use Set key on /admin#models.",
+    input: AddModelAccountArgsSchema,
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const result = await ctx.run("add-model-account", () =>
+      createModelAccountAction(input.args, modelAdminDeps()), { maxRetryAttempts: 1 });
+    if (result.status >= 400) return toolError(JSON.stringify(result));
+    return { content: [{ type: "text", text: JSON.stringify(result.body) }] };
+  },
+);
+
+export const setProjectStageTool = tool(
+  {
+    description: "Overlay one project agent stage, preserving other stages and mode, with the admin UI readiness checks.",
+    input: SetProjectStageArgsSchema,
+    role: "admin",
+    operation: "write",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { teamKey, stage, ...patch } = input.args;
+    const result = await ctx.run("set-project-stage", () =>
+      putProjectAgentConfigAction(teamKey, modelAdminDeps(), auditActor(input.caller, "system"), {
+        stages: { [stage]: patch },
+      }), { maxRetryAttempts: 1 });
+    if (result.status >= 400) return toolError(JSON.stringify(result));
+    return { content: [{ type: "text", text: JSON.stringify(result.body) }] };
+  },
+);
 
 export const SetProjectAgentModeArgsSchema = z.object({
   teamKey: z.string(),
@@ -1671,6 +1818,36 @@ export const releaseDispatchReservationTool = tool(
   },
 );
 
+export const unparkIssueTool = tool(
+  {
+    description: "Unpark an issue by its tracker identifier, resolved case-insensitively from its newest dispatch across all repositories. Omit phase to clear all phases. Returns { identifier, issueId, unparked }; a nonparked issue is unchanged.",
+    input: z.object({
+      identifier: z.string().min(1),
+      phase: z.string().optional(),
+    }),
+    role: "admin",
+    retryPolicy: { maxAttempts: 1, onMaxAttempts: "kill" },
+    auditDetail: (input, response) => {
+      const issueId = response && !response.isError ? JSON.parse(response.content[0].text).issueId : "none";
+      return `identifier=${input.args.identifier} issue=${issueId} phase=${input.args.phase ?? "all"}`;
+    },
+  },
+  async (ctx, input): Promise<ToolResponse> => {
+    const { identifier, phase } = input.args;
+    const result = await ctx.run("unpark-issue", () => {
+      const issueId = getLatestIssueIdForIdentifier(identifier);
+      if (issueId === null) return null;
+      // unpark also resets nonparked rows; call it only when a matching phase is parked.
+      const parked = listParked().some(row => row.issueId === issueId && (phase === undefined || row.phase === phase));
+      return { identifier, issueId, unparked: parked ? unpark(issueId, phase) : false };
+    }, { maxRetryAttempts: 1 });
+    if (result === null) {
+      return { isError: true, content: [{ type: "text", text: `no dispatch record for ${identifier}` }] };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+  },
+);
+
 export const orchestratorTools = restate.service({
   name: "orchestratorTools",
   handlers: {
@@ -1681,6 +1858,7 @@ export const orchestratorTools = restate.service({
     list_in_flight_jobs: listInFlightJobs,
     get_session_machine: getSessionMachine,
     list_session_machines: listSessionMachines,
+    get_fly_setup: getFlySetup,
     get_issue_dispatch_status: getIssueDispatchStatus,
     get_issue_report_card: getIssueReportCardTool,
     get_fleet_report: getFleetReportTool,
@@ -1690,6 +1868,8 @@ export const orchestratorTools = restate.service({
     get_review_fix_attempt: getReviewFixAttemptTool,
     get_review_fix_activity: getReviewFixActivityTool,
     list_job_accounting: listJobAccountingTool,
+    list_open_pulls: listOpenPullsTool,
+    list_issue_statuses: listIssueStatusesTool,
     kg_hybrid_search: kgHybridSearch,
     kg_search: kgSearch,
     kg_semantic_search: kgSemanticSearch,
@@ -1710,10 +1890,13 @@ export const orchestratorTools = restate.service({
     pause_project: pauseProjectTool,
     start_deploy: startDeployTool,
     add_project: addProjectTool,
+    add_model_account: addModelAccountTool,
+    set_project_stage: setProjectStageTool,
     set_project_agent_mode: setProjectAgentModeTool,
     trigger_workflow_sync: triggerWorkflowSyncTool,
     clear_dispatch_dedup: clearDispatchDedupTool,
     list_dispatch_reservations: listDispatchReservationsTool,
     release_dispatch_reservation: releaseDispatchReservationTool,
+    unpark_issue: unparkIssueTool,
   },
 });

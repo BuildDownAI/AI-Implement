@@ -2,7 +2,7 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as restate from "@restatedev/restate-sdk";
-import { handleMcpRequest } from "../mcp.js";
+import { RESTATE_WRITE_TOOL_NAMES, handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider, sidecarHealth, sidecarHealthFields, setKgMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider, KgToolResult } from "../kg-provider.js";
 import { setKgRefreshToolDeps } from "../restate/tools.js";
@@ -20,6 +20,7 @@ import {
   listInFlightJobs,
   getSessionMachine,
   listSessionMachines,
+  getFlySetup,
   getIssueDispatchStatus,
   getIssueReportCardTool,
   getFleetReportTool,
@@ -29,6 +30,8 @@ import {
   getReviewFixAttemptTool,
   getReviewFixActivityTool,
   listJobAccountingTool,
+  listOpenPullsTool,
+  listIssueStatusesTool,
   setReviewFixAttemptsFacade,
   kgHybridSearch,
   kgSearch,
@@ -96,6 +99,7 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   list_in_flight_jobs: listInFlightJobs,
   get_session_machine: getSessionMachine,
   list_session_machines: listSessionMachines,
+  get_fly_setup: getFlySetup,
   get_issue_dispatch_status: getIssueDispatchStatus,
   get_issue_report_card: getIssueReportCardTool,
   get_fleet_report: getFleetReportTool,
@@ -105,6 +109,8 @@ const TOOL_HANDLERS: Record<string, FixtureToolHandler> = {
   get_review_fix_attempt: getReviewFixAttemptTool,
   get_review_fix_activity: getReviewFixActivityTool,
   list_job_accounting: listJobAccountingTool,
+  list_open_pulls: listOpenPullsTool,
+  list_issue_statuses: listIssueStatusesTool,
   kg_hybrid_search: kgHybridSearch,
   kg_search: kgSearch,
   kg_semantic_search: kgSemanticSearch,
@@ -138,7 +144,7 @@ const WRITE_TOOL_NAMES = new Set([
   "clear_dispatch_dedup",
   "release_dispatch_reservation",
 ]);
-const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity"]);
+const ADMIN_READ_TOOL_NAMES = new Set(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]);
 
 const DISCOVERED_TOOLS = Object.keys(TOOL_HANDLERS).map((name) => ({
   name,
@@ -1700,7 +1706,7 @@ describe("handleMcpRequest", () => {
       }
     });
 
-    it("lists review-fix read tools for admins only", async () => {
+    it("lists privileged read tools for admins only", async () => {
       mockRole("admin");
       const adminResult = await callMcp(
         { authorization: "Bearer tok" },
@@ -1723,15 +1729,27 @@ describe("handleMcpRequest", () => {
       );
       const userNames = JSON.parse(userResult.body).result.tools.map((t: { name: string }) => t.name);
 
-      expect(adminNames).toEqual(expect.arrayContaining(["get_review_fix_attempt", "get_review_fix_activity"]));
+      expect(adminNames).toEqual(expect.arrayContaining(["get_review_fix_attempt", "get_review_fix_activity", "get_fly_setup"]));
       expect(userNames).not.toContain("get_review_fix_attempt");
       expect(userNames).not.toContain("get_review_fix_activity");
+      expect(userNames).not.toContain("get_fly_setup");
     });
   });
 
   describe("tools/call — review-fix read tools", () => {
     afterEach(() => {
       setReviewFixAttemptsFacade(null);
+    });
+
+    it("routes get_fly_setup for an admin", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_fly_setup", arguments: {} } }),
+      );
+      const reply = JSON.parse(result.body).result;
+      expect(reply.isError).toBeFalsy();
+      expect(JSON.parse(reply.content[0].text)).toHaveProperty("reachable", null);
     });
 
     it("as admin, calls get_review_fix_attempt and returns the status envelope", async () => {
@@ -2760,6 +2778,72 @@ describe("handleMcpRequest", () => {
       expect(toolsClientMock.callTool).toHaveBeenCalledWith(name, { q: "x" }, expect.objectContaining({ kind: "human" }), undefined);
       expect(mockHttpRequest).not.toHaveBeenCalled();
       setKgMemoryProvider(null);
+    });
+  });
+
+  describe("list_open_pulls through /mcp (AII-1964)", () => {
+    it("stays discoverable for users after failure and routes empty arguments as a read", async () => {
+      mockRole("user");
+      const api = await import("../open-pulls.js");
+      const reader = vi.spyOn(api, "listOpenPulls").mockRejectedValueOnce(new Error("GitHub unavailable"));
+      const request = (method: string, params: Record<string, unknown>) => callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      );
+      const listed = async () => {
+        const response = await request("tools/list", {});
+        expect(JSON.parse(response.body).result.tools.map((t: { name: string }) => t.name)).toContain("list_open_pulls");
+      };
+      await listed();
+      expect(reader).not.toHaveBeenCalled();
+      const failed = JSON.parse((await request("tools/call", { name: "list_open_pulls", arguments: {} })).body).result;
+      expect(failed.isError).toBe(true);
+      expect(failed.content[0].text).toContain("list_open_pulls");
+      await listed();
+      expect(reader).toHaveBeenCalledTimes(1);
+      reader.mockResolvedValue([]);
+      const result = JSON.parse((await request("tools/call", {
+        name: "list_open_pulls", arguments: {}, _meta: { idempotencyKey: "invalid key!" },
+      })).body).result;
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content[0].text)).toEqual([]);
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "list_open_pulls", {}, expect.objectContaining({ role: "user" }), undefined,
+      );
+      expect(RESTATE_WRITE_TOOL_NAMES.has("list_open_pulls")).toBe(false);
+    });
+  });
+
+  describe("list_issue_statuses through /mcp (AII-1966)", () => {
+    it("stays discoverable for users after failure and routes empty arguments as a read", async () => {
+      mockRole("user");
+      const api = await import("../issue-statuses.js");
+      const reader = vi.spyOn(api, "listIssueStatuses").mockRejectedValueOnce(new Error("tracker unavailable"));
+      const request = (method: string, params: Record<string, unknown>) => callMcp(
+        { authorization: "Bearer tok" }, true, null, BASE_URL, "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      );
+      const listed = async () => {
+        const response = await request("tools/list", {});
+        expect(JSON.parse(response.body).result.tools.map((t: { name: string }) => t.name)).toContain("list_issue_statuses");
+      };
+      await listed();
+      expect(reader).not.toHaveBeenCalled();
+      const failed = JSON.parse((await request("tools/call", { name: "list_issue_statuses", arguments: {} })).body).result;
+      expect(failed.isError).toBe(true);
+      expect(failed.content[0].text).toContain("list_issue_statuses");
+      await listed();
+      expect(reader).toHaveBeenCalledTimes(1);
+      reader.mockResolvedValue([]);
+      const result = JSON.parse((await request("tools/call", {
+        name: "list_issue_statuses", arguments: {}, _meta: { idempotencyKey: "invalid key!" },
+      })).body).result;
+      expect(result.isError).not.toBe(true);
+      expect(JSON.parse(result.content[0].text)).toEqual([]);
+      expect(toolsClientMock.callTool).toHaveBeenLastCalledWith(
+        "list_issue_statuses", {}, expect.objectContaining({ role: "user" }), undefined,
+      );
+      expect(RESTATE_WRITE_TOOL_NAMES.has("list_issue_statuses")).toBe(false);
     });
   });
 

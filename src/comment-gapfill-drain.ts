@@ -1,4 +1,5 @@
-import { ROLLUP_REVIEW_COMMENTER } from "./comment-gapfill-queue.js";
+import { getDb } from "./dedup.js";
+import { ROLLUP_REVIEW_COMMENTER, rollupReviewExpectedHead } from "./comment-gapfill-queue.js";
 import { resolveReviewerSelection } from "./config.js";
 import { createImplementationRunIngressClient, type ImplementationRunIngressClient } from "./restate/implementation-run-client.js";
 import { restateCanServe } from "./restate/status.js";
@@ -8,13 +9,15 @@ import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { canDispatch } from "./dispatch-gate.js";
-import { claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
+import { isParked, claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
 import {
+  checkAdmission,
   acquire as acquireAdmission,
   release as releaseAdmission,
 } from "./dispatch-admission.js";
-import { claimPendingCommentGapfills, markCommentGapfillSubmitted, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
+import { MAX_COMMENT_GAPFILL_REFUSALS, getCommentGapfillItem, recordCommentGapfillRefusal, claimPendingCommentGapfills, markCommentGapfillSubmitted, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, type Job } from "./log.js";
+import { findLinkByPr } from "./pr-links.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
 import { trackerAccounting as defaultTrackerAccounting, type TrackerAccounting } from "./job-accounting.js";
@@ -228,14 +231,33 @@ function resolveInFlightDispatch(owner: string, repo: string, headRef: string | 
   return matches.length > 0 ? matches[matches.length - 1]! : null;
 }
 
+export async function notifyCommentGapfillSkipped(
+  opts: Pick<DrainCommentGapfillsInput, "getInstallationToken" | "listPrComments" | "postComment">,
+  itemId: number,
+): Promise<void> {
+  const item = getCommentGapfillItem(itemId);
+  if (!item || item.status !== "skipped" || item.refusalCount < MAX_COMMENT_GAPFILL_REFUSALS || item.commentId <= 0 || item.commenter === ROLLUP_REVIEW_COMMENTER) return;
+  const marker = `<!-- ai-implement:gapfill-refusal:${item.id} -->`;
+  try {
+    const token = await opts.getInstallationToken(item.owner);
+    const comments = await opts.listPrComments(token, item.owner, item.repo, item.prNumber);
+    if (!comments.some(c => c.body.includes(marker))) {
+      await opts.postComment(token, item.owner, item.repo, item.prNumber,
+        `${marker}\n@${item.commenter} AI-Implement stopped retrying your request after ${item.refusalCount} admission refusals. Last reason: ${item.lastRefusalReason}. Please post /ai-implement again when this condition clears.`);
+    }
+  } catch (err) {
+    console.error(`[comment-gapfill] Failed to post refusal notice for item #${item.id}:`, err);
+  }
+}
+
 /**
  * Fires whenever the gate returns `pr_budget` for a gap-fill dispatch, whoever
  * parked the row. Posts one PR comment per park (also when the breaker parked
  * first) and a tracker comment unless the breaker's trip comment already reached
  * the tracker, both best-effort. Never throws.
  */
-async function firePrBudgetPark(
-  opts: DrainCommentGapfillsInput,
+export async function firePrBudgetPark(
+  opts: Pick<DrainCommentGapfillsInput, "getInstallationToken" | "listPrComments" | "postComment" | "postTrackerComment">,
   mapping: RepoMapping,
   issueId: string,
   owner: string,
@@ -305,22 +327,47 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
-      let prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
+      // Share one read between terminal-state detection and branch identity recovery.
+      // A failed read keeps the flow that existed before the terminal check: an item
+      // with a dispatch log goes on to the gate, and an item without one gets the
+      // "could not read" reply and ends `failed`, so it cannot be read again forever.
+      // A token failure affects every row, so it leaves this row pending for the next tick.
+      let ghToken: string;
+      try {
+        ghToken = await opts.getInstallationToken(item.owner);
+      } catch (err) {
+        console.warn(`[comment-gapfill] could not get a token for ${fullRepo}; item #${item.id} stays pending:`, err);
+        continue;
+      }
+      let pr: Awaited<ReturnType<typeof getPullRequestState>> = null;
+      try {
+        pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
+      } catch (err) {
+        console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
+      }
+      if (pr && (pr.merged || pr.state === "closed")) {
+        const reason = pr.merged ? "pr_merged" : "pr_closed";
+        getDb().prepare(`UPDATE comment_gapfill_queue SET status = 'skipped',
+          last_refusal_reason = ?, processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+          WHERE id = ? AND status = 'pending'`).run(reason, Date.now(), item.id);
+        console.log(`[comment-gapfill] Skipped item #${item.id} for PR #${item.prNumber}: ${reason}`);
+        continue;
+      }
+
+      let prLog: Pick<Job, "issueId" | "issueIdentifier" | "teamKey"> | null =
+        getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
       if (!prLog) {
-        // One PR read per item serves both fallbacks.
-        let headRef: string | null = null;
-        let prReadOk = false;
-        const ghToken = await opts.getInstallationToken(item.owner);
-        try {
-          const pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
-          if (pr) {
-            prReadOk = true;
-            headRef = pr.headRef;
-          }
-        } catch (err) {
-          console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
-        }
-        if (!prReadOk) {
+        // Link identity survives job pruning; all mapping and admission checks below
+        // still apply, including the live GitHub terminal-state check above.
+        const link = findLinkByPr(fullRepo, item.prNumber);
+        if (link) prLog = {
+          issueId: link.issue.trackerIssueId,
+          issueIdentifier: link.issue.identifier,
+          teamKey: link.issue.mappingKey,
+        };
+      }
+      if (!prLog) {
+        if (!pr) {
           await opts.postComment(
             ghToken, item.owner, item.repo, item.prNumber,
             "AI-Implement could not read this PR from GitHub just now, so it cannot tell which run it belongs to. Please repost the `/ai-implement` comment.",
@@ -328,6 +375,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           markCommentGapfillProcessed(item.id, "failed");
           continue;
         }
+        const headRef = pr.headRef;
         // Roll-up fallback: the top-of-tree feature→base PR is opened by merge-up, not
         // by a dispatch, so it has no row of its own — but its head branch encodes the
         // feature-node parent's key (ai-implement/<mode>/<key-slug>), and that parent's
@@ -385,10 +433,9 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         prDispatchBudget: prBudget,
         humanRequested,
       });
-      if (!gateDecision.ok) {
-        if (gateDecision.reason === "pr_budget") {
-          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
-        }
+      // The dispatch log can detect work not represented by an admission yet.
+      // Policy refusals must reach the shared preview and bounded refusal path.
+      if (!gateDecision.ok && gateDecision.reason === "in_flight") {
         console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
         continue;
       }
@@ -409,6 +456,32 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       const installationId = String(await opts.getInstallationId(item.owner));
       const dispatchId = crypto.randomUUID();
       const backend = execPath === "both" ? "github-actions" : execPath;
+      const admission = checkAdmission({ dispatchId, mappingKey: scopeKey,
+        scope: { kind: "pr", issueId: prLog.issueId, installationId, repository: fullRepo, prNumber: item.prNumber },
+        kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+        cap: mapping.maxInProgressAiIssues, prDispatchBudget: prBudget, humanRequested,
+        parked: isParked(prLog.issueId, "gap-analysis") });
+      if (!admission.ok) {
+        recordCommentGapfillRefusal(item.id, admission.reason, dispatchId);
+        await notifyCommentGapfillSkipped(opts, item.id);
+        if (admission.reason === "budget_exhausted" || (!gateDecision.ok && gateDecision.reason === "pr_budget")) {
+          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+        }
+        continue;
+      }
+      // Preserve safeguards for historical dispatch-log rows which predate admissions,
+      // but count those policy refusals too rather than leaving rows pending forever.
+      if (!gateDecision.ok) {
+        const reason = gateDecision.reason === "pr_budget" ? "budget_exhausted"
+          : gateDecision.reason === "team_capacity" ? "at_capacity" : gateDecision.reason;
+        recordCommentGapfillRefusal(item.id, reason, dispatchId);
+        await notifyCommentGapfillSkipped(opts, item.id);
+        if (reason === "budget_exhausted") {
+          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+        }
+        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
+        continue;
+      }
       const submitted = await (opts.implementationRun ?? createImplementationRunIngressClient()).submit(dispatchId, {
         dispatchId,
         teamKey: scopeKey,
@@ -447,10 +520,11 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 }
 
 /** Advisory roll-up review selection; project authority is retained for trusted resolution only. */
-export function rollupReviewMode(commenter: string, mapping: RepoMapping) {
+export function rollupReviewMode(commenter: string, mapping: RepoMapping, instruction?: string) {
   if (commenter !== ROLLUP_REVIEW_COMMENTER) return undefined;
   const reviewers = new Map(resolveReviewerSelection(mapping)
     .filter(r => r.gates).map(r => [r.id, r]));
   reviewers.set("integration-review", { id: "integration-review", gates: true });
-  return { reviewers: [...reviewers.values()] };
+  return { reviewers: [...reviewers.values()],
+    ...(instruction !== undefined ? { expectedHeadSha: rollupReviewExpectedHead(instruction) } : {}) };
 }

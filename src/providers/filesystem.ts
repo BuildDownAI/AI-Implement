@@ -23,10 +23,12 @@ import type {
   AIImplementSnapshot,
   FeatureNodeRollUp,
   IssueLifecycleState,
+  IssueStatusRecord,
   TicketIssue,
   TicketingProvider,
   TrackerIssuePage,
 } from "./types.js";
+import { ISSUE_STATUS_RECENT_MS } from "./types.js";
 
 export type FilesystemStatus =
   | "ready"
@@ -48,12 +50,14 @@ export interface FilesystemState {
   updatedAt: string;
 }
 
-interface FilesystemTask {
+type StatusState = Omit<FilesystemState, "status"> & { status: string };
+
+interface FilesystemTask<S = FilesystemState> {
   issue: TicketIssue;
   taskPath: string;
   statePath: string;
   markdown: string;
-  state: FilesystemState | null;
+  state: S | null;
   ticketPath: string;
   location: FilesystemIssueLocation;
 }
@@ -136,6 +140,28 @@ export class FilesystemProvider implements TicketingProvider {
     }
 
     return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize: [] };
+  }
+
+  async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
+    const tasks = await this.scanTasks(mapping);
+    const cutoff = Date.now() - ISSUE_STATUS_RECENT_MS;
+    const records: IssueStatusRecord[] = [];
+    for (const { issue, state, location } of tasks.values()) {
+      const status = state?.status ?? (mapping.planningEnabled ? "ready" : "plan-approved");
+      const parsedUpdatedAt = state ? Date.parse(state.updatedAt) : NaN;
+      const updatedAt = Number.isFinite(parsedUpdatedAt) ? parsedUpdatedAt : null;
+      if (status === "cancelled") continue;
+      if (location !== "active" && (updatedAt === null || !(updatedAt >= cutoff))) continue;
+      const normalized = status === "completed" ? "merged"
+        : isFilesystemStatus(status) && status !== "completed" && status !== "cancelled" ? status : "unknown";
+      records.push({
+        id: issue.id, identifier: issue.identifier, title: issue.title,
+        url: this.issueUrl(issue), state: normalized,
+        phase: status === "failed" ? state?.failurePhase ?? null : null,
+        labels: [], workflowState: status, updatedAt,
+      });
+    }
+    return records;
   }
 
   async listIssuesPage(mapping: RepoMapping, _cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
@@ -287,6 +313,16 @@ export class FilesystemProvider implements TicketingProvider {
     }, { activeOnly: true });
   }
 
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    return this.updateTask(issueId, scopeKey, (state) => {
+      if (state.status === "completed" || state.status === "cancelled") return null;
+      return appendComment(
+        { ...state, status: "cancelled" },
+        `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the task status to its pickup value.`,
+      );
+    }, { activeOnly: true });
+  }
+
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
     const updated = await this.updateTask(issueId, scopeKey, (state) => (
       state.status === "cancelled" ? state : { ...state, status: "completed" }
@@ -435,17 +471,22 @@ export class FilesystemProvider implements TicketingProvider {
     }
   }
 
-  private async scanTasks(): Promise<Map<string, FilesystemTask>> {
-    const tasks: FilesystemTask[] = [];
-    for (const [scopeKey, mapping] of Object.entries(this.getMappings())) {
+  private scanTasks(): Promise<Map<string, FilesystemTask>>;
+  private scanTasks(mapping: RepoMapping): Promise<Map<string, FilesystemTask<StatusState>>>;
+  private async scanTasks(statusMapping?: RepoMapping): Promise<Map<string, FilesystemTask<StatusState>>> {
+    const tasks: FilesystemTask<StatusState>[] = [];
+    const strict = statusMapping !== undefined;
+    if (statusMapping && !statusMapping.teamKey) throw new Error("Filesystem mapping carries no team key");
+    const mappings = statusMapping ? { [statusMapping.teamKey!]: statusMapping } : this.getMappings();
+    for (const [scopeKey, mapping] of Object.entries(mappings)) {
       if (mapping.ticketingConfig.kind !== "filesystem") continue;
       validateSafeSegment(scopeKey, "scopeKey");
-      const directory = await existingRealDirectory(mapping.ticketingConfig.directory);
+      const directory = await existingRealDirectory(mapping.ticketingConfig.directory, strict);
       if (!directory) continue;
       const stateRoot = join(directory, ".state", scopeKey);
       for (const location of ["active", "completed", "failed"] as const) {
         const scanDirectory = location === "active" ? directory : join(directory, location);
-        const entries = await readTaskDirectory(scanDirectory, location === "active");
+        const entries = await readTaskDirectory(scanDirectory, location === "active", strict);
         for (const entry of entries) {
           const taskPath = join(scanDirectory, entry);
           const fallbackIdentifier = basename(entry, ".md");
@@ -456,7 +497,7 @@ export class FilesystemProvider implements TicketingProvider {
             if (!IDENTIFIER_RE.test(identifier)) throw new Error("Ticket id must have the form REVIEW-001 (or use that filename when id is omitted)");
             const statePath = join(stateRoot, `${identifier}.json`);
             await checkStateDirectories(stateRoot);
-            const state = await readState(statePath);
+            const state = strict ? await readState(statePath, true) : await readState(statePath);
             if (state === "corrupt") throw new Error(`Invalid state in ${statePath}; refusing to redispatch`);
             tasks.push({
               taskPath,
@@ -480,13 +521,14 @@ export class FilesystemProvider implements TicketingProvider {
               },
             });
           } catch (err) {
+            if (strict) throw err;
             console.warn(`[filesystem] Skipping malformed task ${taskPath}: ${(err as Error).message}`);
           }
         }
       }
     }
 
-    const byId = new Map<string, FilesystemTask>();
+    const byId = new Map<string, FilesystemTask<StatusState>>();
     const duplicates = new Set<string>();
     for (const task of tasks) {
       if (byId.has(task.issue.id)) duplicates.add(task.issue.id);
@@ -572,13 +614,17 @@ function appendComment(state: FilesystemState, body: string): FilesystemState {
   };
 }
 
-async function existingRealDirectory(path: string): Promise<string | null> {
+async function existingRealDirectory(path: string, strict = false): Promise<string | null> {
   try {
     const resolved = resolve(path);
     const info = await stat(resolved);
-    if (!info.isDirectory()) return null;
+    if (!info.isDirectory()) {
+      if (strict) throw new Error(`Configured filesystem task root is not a directory: ${resolved}`);
+      return null;
+    }
     return await realpath(resolved);
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     return null;
   }
 }
@@ -593,12 +639,13 @@ async function accessFault(directory: string): Promise<"not-writable" | null> {
   }
 }
 
-async function readTaskDirectory(directory: string, isRoot: boolean): Promise<string[]> {
+async function readTaskDirectory(directory: string, isRoot: boolean, strict = false): Promise<string[]> {
   if (!(await isSafeScanDirectory(directory))) return [];
   let entries: string[];
   try {
     entries = await readdir(directory);
-  } catch {
+  } catch (err) {
+    if (strict) throw err;
     return [];
   }
   const result: string[] = [];
@@ -610,7 +657,8 @@ async function readTaskDirectory(directory: string, isRoot: boolean): Promise<st
     try {
       const fileStat = await lstat(taskPath);
       if (fileStat.isFile() && !fileStat.isSymbolicLink()) result.push(entry);
-    } catch {
+    } catch (err) {
+      if (strict) throw err;
       continue;
     }
   }
@@ -657,7 +705,9 @@ async function isSharedFilesystemRoot(root: string, mappings: Record<string, Rep
   return matches > 1;
 }
 
-async function readState(path: string): Promise<FilesystemState | null | "corrupt"> {
+function readState(path: string): Promise<FilesystemState | null | "corrupt">;
+function readState(path: string, allowUnknown: true): Promise<StatusState | null | "corrupt">;
+async function readState(path: string, allowUnknown = false): Promise<StatusState | null | "corrupt"> {
   try {
     const info = await lstat(path);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error(`State must be a regular file: ${path}`);
@@ -666,15 +716,15 @@ async function readState(path: string): Promise<FilesystemState | null | "corrup
     throw err;
   }
   try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<FilesystemState>;
-    if (parsed.version !== 1 || !isFilesystemStatus(parsed.status) ||
+    const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<StatusState>;
+    if (parsed.version !== 1 || (allowUnknown ? typeof parsed.status !== "string" : !isFilesystemStatus(parsed.status)) ||
         !Array.isArray(parsed.comments) || !parsed.comments.every(isComment) ||
         !Array.isArray(parsed.prUrls) || !parsed.prUrls.every((url) => typeof url === "string") ||
         typeof parsed.updatedAt !== "string") return "corrupt";
     return {
       version: 1,
       ...(parsed.parentRef && typeof parsed.parentRef.identifier === "string" ? { parentRef: parsed.parentRef } : {}),
-      status: parsed.status,
+      status: parsed.status!,
       comments: Array.isArray(parsed.comments)
         ? parsed.comments.filter(isComment)
         : [],

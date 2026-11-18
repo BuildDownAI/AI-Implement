@@ -224,9 +224,9 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     return /role:\s*"admin"/.test(block) && /operation:\s*"read"/.test(block);
   });
 
-  it("found the fifteen documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
+  it("found the eighteen documented write handlers as role: \"admin\" (not zero, not accidentally all of them)", () => {
     expect(writeEntries.map((e) => e.toolName).sort()).toEqual(
-      ["add_project", "clear_dispatch_dedup", "decide_kg_refresh", "import_environment_credential", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_pipeline_schedule", "set_project_agent_mode", "set_run_profile", "set_runner_backend", "set_runner_mode", "start_deploy", "trigger_kg_refresh", "trigger_workflow_sync"],
+      ["add_model_account", "add_project", "clear_dispatch_dedup", "decide_kg_refresh", "import_environment_credential", "pause_project", "release_dispatch_reservation", "set_fly_machine_profile", "set_pipeline_schedule", "set_project_agent_mode", "set_project_stage", "set_run_profile", "set_runner_backend", "set_runner_mode", "start_deploy", "trigger_kg_refresh", "trigger_workflow_sync", "unpark_issue"],
     );
   });
 
@@ -239,8 +239,8 @@ describe("every declared write handler wraps its side effect in ctx.run under a 
     },
   );
 
-  it("the two review-fix admin reads are explicitly marked read-only and declare no retryPolicy", () => {
-    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_review_fix_activity", "get_review_fix_attempt"]);
+  it("the admin reads are explicitly marked read-only and declare no retryPolicy", () => {
+    expect(adminReadEntries.map((e) => e.toolName).sort()).toEqual(["get_fly_setup", "get_review_fix_activity", "get_review_fix_attempt"]);
     for (const { identifier } of adminReadEntries) {
       const block = definitionBlockFor(identifier, TOOLS_SOURCE);
       expect(block).toContain('operation: "read"');

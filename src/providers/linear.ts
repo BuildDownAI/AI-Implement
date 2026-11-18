@@ -3,14 +3,16 @@ import type {
   FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
+  IssueStatusRecord,
   LinearSetupFacts,
+  LifecycleLabelsResult,
   TicketIssue,
   TicketingProvider,
   ProviderConfig,
   TrackerIssuePage,
 } from "./types.js";
 import { getMappings, type RepoMapping } from "../config.js";
-import { MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 import { getLinearToken, isLinearAuthConfigured, LinearApiError, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
@@ -20,7 +22,32 @@ import { DEFAULT_LINEAR_PICKUP_LABEL, getLinearPickupLabel } from "../orchestrat
 
 interface GraphQLResponse<T> {
   data?: T;
-  errors?: Array<{ message: string }>;
+  errors?: Array<{ message: string; extensions?: unknown }>;
+}
+
+/** A GraphQL refusal, retaining only the first error's message and structured type. */
+export class LinearGraphQLError extends Error {
+  constructor(
+    readonly operation: string | undefined,
+    readonly linearMessage: string,
+    readonly extensionsType?: string,
+    readonly permanent: boolean = false,
+  ) {
+    super(`Linear GraphQL error${operation ? ` (${operation})` : ""}: ${linearMessage}`);
+    this.name = "LinearGraphQLError";
+    // permanent is true when Linear reports a permission refusal (extensions.type forbidden, extensions.code FORBIDDEN, or extensions.statusCode 403), so a retry cannot help.
+  }
+}
+
+/** A refused label creation, with the issue's actual team and requested label. */
+export class LinearLabelWriteError extends LinearGraphQLError {
+  readonly action = "create" as const;
+
+  constructor(readonly label: string, readonly teamKey: string, error: LinearGraphQLError) {
+    super(error.operation, error.linearMessage, error.extensionsType, error.permanent);
+    this.name = "LinearLabelWriteError";
+    this.message = `Linear refused to create label "${label}" on team ${teamKey}: ${error.linearMessage}`;
+  }
 }
 
 /** How far back to scan completed feature nodes for roll-up (bounds the query). */
@@ -132,6 +159,7 @@ export class LinearProvider implements TicketingProvider {
   private needsHumanLabelCache = new Map<string, string>();
   private teamIdByKey = new Map<string, string>();
   private inProgressStateByTeamKey = new Map<string, string>();
+  private canceledStateByTeamKey = new Map<string, string>();
   private completedStateByTeamKey = new Map<string, string>();
 
   constructor(config: ProviderConfig) {
@@ -224,6 +252,72 @@ export class LinearProvider implements TicketingProvider {
     };
   }
 
+  async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
+    refreshPickupLabel();
+    if (!isLinearAuthConfigured()) throw new TrackerUnavailableError("Linear credential not configured");
+    if (!mapping.teamKey) throw new TrackerUnavailableError("mapping carries no team key");
+    const label = AI_IMPLEMENT_LABEL;
+    const since = new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString();
+    type StatusNode = {
+      id: string; identifier: string; title: string; updatedAt: string;
+      state: { name: string; type: string };
+      labels: { nodes: Array<{ name: string }> };
+    };
+    type StatusPage = { issues: {
+      nodes: StatusNode[];
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    } };
+    const nodes = new Map<string, StatusNode>();
+    for (const recent of [false, true]) {
+      const query = `query($teamKey: String!, $label: String!, $first: Int!, $after: String${recent ? ", $since: DateTimeOrDuration!" : ""}) {
+        issues(first: $first, after: $after, filter: {
+          team: { key: { eq: $teamKey } }
+          labels: { name: { eq: $label } }
+          ${recent ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }'}
+        }) {
+          nodes { id identifier title updatedAt state { name type } labels { nodes { name } } }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`;
+      let after: string | null = null;
+      for (let page = 1; ; page++) {
+        const data: StatusPage = await this.linearMutation<StatusPage>(query, {
+          teamKey: mapping.teamKey, label, first: 100, after, ...(recent ? { since } : {}),
+        });
+        for (const node of data.issues.nodes) nodes.set(node.id, node);
+        const { hasNextPage, endCursor } = data.issues.pageInfo;
+        if (!hasNextPage) break;
+        if (page >= 20) throw new Error("Linear listIssueStatuses exceeded 20 pages");
+        if (!endCursor || endCursor === after) throw new Error("Linear listIssueStatuses missing advancing cursor");
+        after = endCursor;
+      }
+    }
+
+    const precedence: Array<[string, IssueStatusRecord["state"]]> = [
+      [LINEAR_LABELS.needsHuman.name, "failed"],
+      [LINEAR_LABELS.readyForReview.name, "pr-ready"],
+      [LINEAR_LABELS.working.name, "implementing"],
+      [LINEAR_LABELS.planComplete.name, "plan-approved"],
+      [LINEAR_LABELS.planning.name, "planning"],
+      [label, "ready"],
+    ];
+    const records: IssueStatusRecord[] = [];
+    for (const node of nodes.values()) {
+      if (node.state.type === "canceled" || node.state.type === "duplicate") continue;
+      const labels = node.labels.nodes.map((l) => l.name);
+      const deciding = precedence.find(([name]) => labels.includes(name)) ?? [label, "ready"];
+      const completed = node.state.type === "completed";
+      records.push({
+        id: node.id, identifier: node.identifier, title: node.title,
+        url: this.issueUrl({ id: node.id, identifier: node.identifier, title: node.title, description: null, scopeKey: mapping.teamKey, nativeStatus: node.state.name }),
+        state: completed ? "merged" : deciding[1], phase: null,
+        labels: completed ? [] : [deciding[0], ...labels.filter((name) => name !== deciding[0])],
+        workflowState: node.state.name, updatedAt: Date.parse(node.updatedAt),
+      });
+    }
+    return records;
+  }
+
   async fetchSetupFacts(teamKeys: string[]): Promise<LinearSetupFacts> {
     const refused = await tokenRefusal();
     if (refused) return refused;
@@ -288,6 +382,7 @@ export class LinearProvider implements TicketingProvider {
   private async linearMutation<T>(
     query: string,
     variables: Record<string, unknown>,
+    operation?: string,
   ): Promise<T> {
     const res = await withLinearToken((token) =>
       fetch("https://api.linear.app/graphql", {
@@ -308,7 +403,18 @@ export class LinearProvider implements TicketingProvider {
 
     const json = (await res.json()) as GraphQLResponse<T>;
     if (json.errors?.length) {
-      throw new Error(`Linear GraphQL error: ${json.errors[0].message}`);
+      const error = json.errors[0];
+      const extensions = error.extensions;
+      let extensionsType: string | undefined;
+      let permanent = false;
+      if (extensions && typeof extensions === "object") {
+        permanent = ("type" in extensions && extensions.type === "forbidden")
+          || ("code" in extensions && extensions.code === "FORBIDDEN")
+          || ("statusCode" in extensions && extensions.statusCode === 403);
+        if ("type" in extensions && typeof extensions.type === "string") extensionsType = extensions.type;
+        else if ("code" in extensions && typeof extensions.code === "string") extensionsType = extensions.code;
+      }
+      throw new LinearGraphQLError(operation, error.message, extensionsType, permanent);
     }
     if (!json.data) {
       throw new Error("Linear API returned no data");
@@ -729,20 +835,28 @@ export class LinearProvider implements TicketingProvider {
       return reusableMatch.id;
     }
 
-    const createData = await this.linearMutation<{
-      issueLabelCreate: { issueLabel: { id: string } };
-    }>(
-      `mutation($teamId: String!, $name: String!, $color: String!) {
-        issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
-          issueLabel { id }
-        }
-      }`,
-      { teamId, name: label.name, color: label.color },
-    );
-    console.log(`[linear] Created '${label.name}' label for team ${teamId}`);
-    const id = createData.issueLabelCreate.issueLabel.id;
-    cache.set(teamKey, id);
-    return id;
+    try {
+      const createData = await this.linearMutation<{
+        issueLabelCreate: { issueLabel: { id: string } };
+      }>(
+        `mutation($teamId: String!, $name: String!, $color: String!) {
+          issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
+            issueLabel { id }
+          }
+        }`,
+        { teamId, name: label.name, color: label.color },
+        "issueLabelCreate",
+      );
+      console.log(`[linear] Created '${label.name}' label for team ${teamId}`);
+      const id = createData.issueLabelCreate.issueLabel.id;
+      cache.set(teamKey, id);
+      return id;
+    } catch (error) {
+      if (error instanceof LinearGraphQLError) {
+        throw new LinearLabelWriteError(label.name, teamKey, error);
+      }
+      throw error;
+    }
   }
 
   private async getInProgressStateId(teamKey: string): Promise<string> {
@@ -795,6 +909,30 @@ export class LinearProvider implements TicketingProvider {
     return state.id;
   }
 
+  private async getCanceledStateId(teamKey: string): Promise<string> {
+    const cached = this.canceledStateByTeamKey.get(teamKey);
+    if (cached) return cached;
+    const teamId = await this.getTeamIdByKey(teamKey);
+    const data = await this.linearMutation<{
+      workflowStates: { nodes: Array<{ id: string; name: string; type: string }> };
+    }>(
+      `query($teamId: ID!) {
+        workflowStates(filter: { team: { id: { eq: $teamId } }, type: { eq: "canceled" } }) {
+          nodes { id name type }
+        }
+      }`,
+      { teamId },
+    );
+    const state =
+      data.workflowStates.nodes.find((s) => ["canceled", "cancelled"].includes(s.name.toLowerCase())) ??
+      data.workflowStates.nodes[0];
+    if (!state) {
+      throw new Error(`No "canceled" workflow state found for team ${teamId}`);
+    }
+    this.canceledStateByTeamKey.set(teamKey, state.id);
+    return state.id;
+  }
+
   private async updateIssueState(issueId: string, stateId: string): Promise<void> {
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
       `mutation($issueId: String!, $stateId: String!) {
@@ -803,34 +941,38 @@ export class LinearProvider implements TicketingProvider {
         }
       }`,
       { issueId, stateId },
+      "issueUpdate",
     );
   }
 
-  private async addLabelToIssue(issueId: string, labelId: string): Promise<void> {
-    const getData = await this.linearMutation<{
-      issue: { labels: { nodes: Array<{ id: string }> } };
-    }>(
-      `query($issueId: String!) {
-        issue(id: $issueId) {
-          labels { nodes { id } }
-        }
-      }`,
-      { issueId },
-    );
-    const currentIds = getData.issue.labels.nodes.map((l) => l.id);
-    if (currentIds.includes(labelId)) return;
+  /**
+   * The one label writer. It sends only the labels that change (`addedLabelIds` /
+   * `removedLabelIds`), never a full `labelIds` set, so a stale read can never restore a
+   * label another writer removed (AII-889). Sends nothing when both lists are empty.
+   */
+  private async updateIssueLabels(
+    issueId: string,
+    change: { addedLabelIds?: string[]; removedLabelIds?: string[]; stateId?: string },
+  ): Promise<void> {
+    const input: { addedLabelIds?: string[]; removedLabelIds?: string[]; stateId?: string } = {};
+    if (change.stateId) input.stateId = change.stateId;
+    if (change.addedLabelIds?.length) input.addedLabelIds = change.addedLabelIds;
+    if (change.removedLabelIds?.length) input.removedLabelIds = change.removedLabelIds;
+    if (!input.stateId && !input.addedLabelIds && !input.removedLabelIds) return;
 
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
+      `mutation($issueId: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $issueId, input: $input) {
           success
         }
       }`,
-      { issueId, labelIds: [...currentIds, labelId] },
+      { issueId, input },
+      "issueUpdate",
     );
   }
 
-  private async removeLabelByName(issueId: string, name: string): Promise<void> {
+  /** IDs of the named labels the issue carries now. The read is safe: the write it feeds only removes. */
+  private async labelIdsByName(issueId: string, names: string[]): Promise<string[]> {
     const getData = await this.linearMutation<{
       issue: { labels: { nodes: Array<{ id: string; name: string }> } };
     }>(
@@ -841,17 +983,15 @@ export class LinearProvider implements TicketingProvider {
       }`,
       { issueId },
     );
-    const remaining = getData.issue.labels.nodes.filter((l) => l.name !== name);
-    if (remaining.length === getData.issue.labels.nodes.length) return;
+    return getData.issue.labels.nodes.filter((l) => names.includes(l.name)).map((l) => l.id);
+  }
 
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, labelIds: remaining.map((l) => l.id) },
-    );
+  private async addLabelToIssue(issueId: string, labelId: string): Promise<void> {
+    await this.updateIssueLabels(issueId, { addedLabelIds: [labelId] });
+  }
+
+  private async removeLabelsByName(issueId: string, names: string[]): Promise<void> {
+    await this.updateIssueLabels(issueId, { removedLabelIds: await this.labelIdsByName(issueId, names) });
   }
 
   private async transitionToInProgressIfMovable(issueId: string, scopeKey: string): Promise<void> {
@@ -879,6 +1019,31 @@ export class LinearProvider implements TicketingProvider {
 
   // ---------- lifecycle verbs ----------
 
+  async ensureLifecycleLabels(scopeKey: string): Promise<LifecycleLabelsResult> {
+    const caches: Record<keyof typeof LINEAR_LABELS, Map<string, string>> = {
+      planning: this.aiPlanningLabelCache,
+      planComplete: this.planCompleteLabelCache,
+      working: this.aiWorkingLabelCache,
+      readyForReview: this.readyForReviewLabelCache,
+      needsHuman: this.needsHumanLabelCache,
+    };
+    for (const key of Object.keys(LINEAR_LABELS) as Array<keyof typeof LINEAR_LABELS>) {
+      const label = LINEAR_LABELS[key];
+      try {
+        await this.ensureTeamLabel(scopeKey, label, caches[key]);
+      } catch (err) {
+        if (err instanceof LinearLabelWriteError) {
+          return { ok: false, permanent: err.permanent, label: err.label, message: err.message };
+        }
+        return {
+          ok: false, permanent: false, label: label.name,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+    return { ok: true };
+  }
+
   async markPlanningStarted(issueId: string, _scopeKey: string): Promise<void> {
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(teamKey, LINEAR_LABELS.planning, this.aiPlanningLabelCache);
@@ -887,14 +1052,17 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async markPlanComplete(issueId: string, _scopeKey: string, _opts: { awaitApproval: boolean }): Promise<void> {
-    await this.removeLabelByName(issueId, LINEAR_LABELS.planning.name);
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(teamKey, LINEAR_LABELS.planComplete, this.planCompleteLabelCache);
-    await this.addLabelToIssue(issueId, labelId);
+    // One write for the swap, so nothing can interleave between the remove and the add.
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, [LINEAR_LABELS.planning.name]),
+      addedLabelIds: [labelId],
+    });
   }
 
   async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
-    await this.removeLabelByName(issueId, LINEAR_LABELS.planning.name);
+    await this.removeLabelsByName(issueId, [LINEAR_LABELS.planning.name]);
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
     return true;
   }
@@ -910,34 +1078,11 @@ export class LinearProvider implements TicketingProvider {
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const readyLabelId = await this.ensureTeamLabel(teamKey, LINEAR_LABELS.readyForReview, this.readyForReviewLabelCache);
 
-    // Atomic label swap: remove AI-Working, add Ready for Review in a single
-    // issueUpdate (matches legacy markIssueReadyForReview behaviour).
-    const getData = await this.linearMutation<{
-      issue: { labels: { nodes: Array<{ id: string; name: string }> } };
-    }>(
-      `query($issueId: String!) {
-        issue(id: $issueId) {
-          labels { nodes { id name } }
-        }
-      }`,
-      { issueId },
-    );
-    const currentLabels = getData.issue.labels.nodes;
-    const newLabelIds = currentLabels
-      .filter((l) => l.name !== LINEAR_LABELS.working.name)
-      .map((l) => l.id);
-    if (!newLabelIds.includes(readyLabelId)) {
-      newLabelIds.push(readyLabelId);
-    }
-
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, labelIds: newLabelIds },
-    );
+    // Atomic label swap: remove AI-Working, add Ready for Review in a single issueUpdate.
+    await this.updateIssueLabels(issueId, {
+      removedLabelIds: await this.labelIdsByName(issueId, [LINEAR_LABELS.working.name]),
+      addedLabelIds: [readyLabelId],
+    });
 
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
     // Label swaps have no Merged-regression hazard (Done is a state, not a label),
@@ -964,30 +1109,44 @@ export class LinearProvider implements TicketingProvider {
     );
     const issue = data.issue;
     if (!issue) return;
-    if (isTerminalStateType(issue.state.type)) return;
-    const stateId = await this.getCompletedStateId(issue.team.key);
-    const labelIds = issue.labels.nodes
-      .filter((l) => l.name !== LINEAR_LABELS.readyForReview.name)
+    const removedLabelIds = issue.labels.nodes
+      .filter((l) => l.name === LINEAR_LABELS.readyForReview.name || l.name === LINEAR_LABELS.planComplete.name)
       .map((l) => l.id);
-    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
-      `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
-        issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) {
-          success
-        }
-      }`,
-      { issueId, stateId, labelIds },
+    if (isTerminalStateType(issue.state.type)) {
+      // Native integrations can close the issue before merge reconciliation runs.
+      // Clean up labels without changing its terminal state or looking up Done.
+      await this.updateIssueLabels(issueId, { removedLabelIds });
+      return;
+    }
+    const stateId = await this.getCompletedStateId(issue.team.key);
+    await this.updateIssueLabels(issueId, { stateId, removedLabelIds });
+  }
+
+  async markPrClosedUnmerged(issueId: string, _scopeKey: string, prUrl: string): Promise<boolean> {
+    const data = await this.linearMutation<{
+      issue: { state: { type: string }; team: { key: string }; labels: { nodes: Array<{ id: string; name: string }> } } | null;
+    }>(
+      `query($id: String!) { issue(id: $id) { state { type } team { key } labels { nodes { id name } } } }`,
+      { id: issueId },
     );
+    const issue = data.issue;
+    if (!issue || isTerminalStateType(issue.state.type)) return false;
+    const stateId = await this.getCanceledStateId(issue.team.key);
+    const removedLabelIds = issue.labels.nodes.filter((l) => l.name === LINEAR_LABELS.readyForReview.name).map((l) => l.id);
+    // Comment first: a failed comment must leave the issue active for the next retry.
+    await this.postComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, move the issue back to Todo.`);
+    await this.updateIssueLabels(issueId, { stateId, removedLabelIds });
+    return true;
   }
 
   async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<boolean> {
-    await this.removeLabelByName(issueId, LINEAR_LABELS.working.name);
+    await this.removeLabelsByName(issueId, [LINEAR_LABELS.working.name]);
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
     return true;
   }
 
   async clearWorkingState(issueId: string, _scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
-    await this.removeLabelByName(issueId, LINEAR_LABELS.working.name);
-    await this.removeLabelByName(issueId, LINEAR_LABELS.planning.name);
+    await this.removeLabelsByName(issueId, [LINEAR_LABELS.working.name, LINEAR_LABELS.planning.name]);
     return true;
   }
   async parkForHuman(issueId: string, _scopeKey: string, _phase: "planning" | "implementation"): Promise<boolean> {
@@ -1003,8 +1162,7 @@ export class LinearProvider implements TicketingProvider {
     // being non-terminal, keeps holding its parent's roll-up.
     const markerId = await this.ensureTeamLabel(data.issue.team.key, LINEAR_LABELS.needsHuman, this.needsHumanLabelCache);
     await this.addLabelToIssue(issueId, markerId);
-    await this.removeLabelByName(issueId, LINEAR_LABELS.working.name);
-    await this.removeLabelByName(issueId, LINEAR_LABELS.planning.name);
+    await this.removeLabelsByName(issueId, [LINEAR_LABELS.working.name, LINEAR_LABELS.planning.name]);
     return true;
   }
   async postComment(issueId: string, body: string): Promise<void> {
@@ -1018,6 +1176,6 @@ export class LinearProvider implements TicketingProvider {
     await this.linearMutation<{ commentCreate: { success: boolean } }>(query, {
       issueId,
       body,
-    });
+    }, "commentCreate");
   }
 }

@@ -1,3 +1,4 @@
+import { VALID_CPUS, PERFORMANCE_MIN_MB_PER_CPU } from "../fly-machine-sizing.js";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
@@ -708,8 +709,58 @@ describe("admin mappings", () => {
     const data = JSON.parse(create.body);
     expect(data.executionMode).toBe("github-actions");
     expect(data.sessionMode).toBe("autonomous");
+    expect(data.machineCpuKind).toBe("shared");
     expect(data.machineCpus).toBe(2);
     expect(data.machineMemoryMb).toBe(4096);
+  });
+
+  it.each(VALID_CPUS)("saves performance with %s CPUs at the exact memory boundary", async (machineCpus) => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PERF", owner: "org", repo: "app", machineCpuKind: "performance",
+      machineCpus, machineMemoryMb: machineCpus * PERFORMANCE_MIN_MB_PER_CPU,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().PERF.machineCpuKind).toBe("performance");
+  });
+
+  it("keeps performance when the old drawer saves sizing without a kind", async () => {
+    config.upsertMapping("PERF", makeMapping({ machineCpuKind: "performance" }));
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PERF", owner: "org", repo: "app", machineCpus: 4,
+      machineMemoryMb: 4 * PERFORMANCE_MIN_MB_PER_CPU,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().PERF.machineCpuKind).toBe("performance");
+  });
+
+  it("keeps the existing shared sizing rules", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SHARED", owner: "org", repo: "app", machineCpuKind: "shared",
+      machineCpus: 3, machineMemoryMb: 256,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(config.getMappings().SHARED).toMatchObject({ machineCpuKind: "shared", machineCpus: 3, machineMemoryMb: 256 });
+  });
+
+  it.each([
+    { machineCpuKind: "performance", machineCpus: 3, machineMemoryMb: 8192, field: "machineCpus" },
+    { machineCpuKind: "performance", machineCpus: 2, machineMemoryMb: 2 * PERFORMANCE_MIN_MB_PER_CPU - 1, field: "machineMemoryMb" },
+    { machineCpuKind: "unknown", machineCpus: 2, machineMemoryMb: 4096, field: "machineCpuKind" },
+    { machineCpuKind: null, machineCpus: 2, machineMemoryMb: 4096, field: "machineCpuKind" },
+    { machineCpus: 3, machineMemoryMb: 8192, field: "machineCpus" },
+  ])("rejects invalid kind/sizing without changing storage: %j", async ({ field, ...size }) => {
+    config.upsertMapping("PERF", makeMapping({ machineCpuKind: "performance" }));
+    const before = config.getMappings().PERF;
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PERF", owner: "org", repo: "app", ...size,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain(field);
+    expect(config.getMappings().PERF).toEqual(before);
   });
 
   it("rejects invalid executionMode", async () => {

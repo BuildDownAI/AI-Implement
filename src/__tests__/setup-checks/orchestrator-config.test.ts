@@ -1,3 +1,5 @@
+import { runCheckSetup } from "../../check-setup.js";
+import { countFailingCore, runSetupChecks } from "../../setup-checks/index.js";
 import { generateKeyPairSync } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SeedOnceSettingsModule from "../../seed-once-settings.js";
@@ -100,6 +102,78 @@ describe("env.runner-mode", () => {
     expect(await run("env.runner-mode", { env: { RUNNER_MODE: mode } })).toMatchObject([
       { state: "warn", fix: "Set RUNNER_MODE to one of default, gha, fly, local, shadow, or unset it." },
     ]);
+  });
+});
+
+
+describe("kg.remote-store", () => {
+  const complete = {
+    KG_BACKEND: "stardog_run",
+    KG_STARDOG_RUN_TOKEN: "stardog-token-sentinel",
+    KG_STARDOG_DB: "graph",
+    KG_NAMESPACE: "https://example.com/graph",
+  };
+  const fix = "Set the listed variables in the orchestrator environment and restart.";
+
+  it.each([undefined, "", "local", "STARDOG_RUN"])("does not apply for backend %j", async (backend) => {
+    expect(await run("kg.remote-store", { env: { KG_BACKEND: backend } })).toEqual([{
+      state: "not-applicable", detail: "The knowledge graph is served from the local sidecar store",
+    }]);
+  });
+
+  it("passes with required values and no optional values", async () => {
+    expect(await run("kg.remote-store", { env: complete })).toEqual([{
+      state: "pass", detail: "The Stardog store values are set",
+    }]);
+  });
+
+  it.each(["KG_STARDOG_RUN_TOKEN", "KG_STARDOG_DB", "KG_NAMESPACE"])("names missing or empty %s", async (name) => {
+    for (const value of [undefined, ""]) {
+      expect(await run("kg.remote-store", { env: { ...complete, [name]: value } })).toEqual([{
+        state: "fail", detail: `Missing: ${name}`, fix,
+      }]);
+    }
+  });
+
+  it("names multiple missing values in stable order", async () => {
+    expect(await run("kg.remote-store", { env: { KG_BACKEND: "stardog_run" } })).toEqual([{
+      state: "fail", detail: "Missing: KG_STARDOG_RUN_TOKEN, KG_STARDOG_DB, KG_NAMESPACE", fix,
+    }]);
+  });
+
+  it.each([complete, { ...complete, KG_STARDOG_DB: "" }])("reads only the supplied environment and never exposes the token (%j)", async (env) => {
+    const ctx = new Proxy(makeSetupCheckContext({ env }), {
+      get(target, key, receiver) {
+        if (key !== "env") throw new Error(`Unexpected context read: ${String(key)}`);
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const check = ORCHESTRATOR_CONFIG_CHECKS.find((c) => c.id === "kg.remote-store")!;
+    const result = await runSetupChecks(ctx, [check]);
+    expect(result.results[0].state).toBe(env.KG_STARDOG_DB ? "pass" : "fail");
+    expect(JSON.stringify(result)).not.toContain(complete.KG_STARDOG_RUN_TOKEN);
+  });
+
+  it("keeps a feature failure out of the core count and exits the setup command successfully", async () => {
+    const check = ORCHESTRATOR_CONFIG_CHECKS.find((c) => c.id === "kg.remote-store")!;
+    const ctx = makeSetupCheckContext({ env: { KG_BACKEND: "stardog_run" } });
+    const result = await runSetupChecks(ctx, [check]);
+    expect(result.results).toMatchObject([{
+      id: "kg.remote-store", title: "KG remote store values", group: "orchestrator",
+      tier: "feature", onAdminPath: false, state: "fail",
+    }]);
+    expect(countFailingCore(result)).toBe(0);
+    expect(await runCheckSetup([], {
+      checks: [check],
+      useReadOnlyDb: () => {},
+      configureTrackers: () => {},
+      createContext: () => ctx,
+      refreshRunnerBackend: async () => {},
+      fetch: async () => { throw new Error("orchestrator offline"); },
+      port: 8080,
+      writeStdout: () => {},
+      writeStderr: () => {},
+    })).toBe(0);
   });
 });
 

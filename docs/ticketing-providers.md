@@ -101,7 +101,11 @@ The poll matches the pickup label by its exact name (`labels: { name: { eq } }`)
 
 ### Lifecycle labels
 
-The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working`, once a PR opens `Ready for Review`, and, when the stuck watchdog gives up, `AI-Needs-Human`. The poll skips an issue carrying `AI-Needs-Human` before it counts capacity, so a park that added the marker but failed to remove `AI-Working` does not hold a slot. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
+The optional `ensureLifecycleLabels(scopeKey)` provider verb prepares every lifecycle label for a scope and may create missing labels. Before planning or implementation dispatch, the poll calls this verb with the issue’s scope key. It is safe to call on every dispatch. Linear checks labels in `LINEAR_LABELS` order using the lifecycle verbs’ existing caches, stops at the first failure, and returns its label, message and permanence (other errors are transient). Once cached, preparation sends no requests. Providers with nothing to prepare, including Jira and filesystem, omit the verb.
+
+A transient refusal or thrown error skips dispatch, logs the failure, and retries on the next poll without parking. A permanent refusal skips dispatch and parks the issue for its dispatch phase with conclusion `tracker_setup_refused`. Only a new park posts an issue comment naming the refused label, team, error, and remedy; comment failures are logged without undoing the park. Create the label manually or allow the app to create labels, then Unpark the issue at `/admin#runners` so the next poll can dispatch. Providers omitting the verb dispatch without a preparation request. Setup checks remain read-only.
+
+The lifecycle verbs apply `AI-Planning`, `Plan-Complete`, `AI-Working`, once a PR opens `Ready for Review`, and, when the stuck watchdog gives up, `AI-Needs-Human`. Every label write sends only the labels it adds or removes (`addedLabelIds` and `removedLabelIds` on `issueUpdate`), never the full label set, so a stale label read cannot restore a label another write removed. A swap, such as `AI-Planning` to `Plan-Complete`, is one write. `markMerged` removes `Ready for Review` and `Plan-Complete`, including from an issue already in a terminal (completed or canceled) state; terminal issues keep their state, and already-clean terminal issues need no update. The poll skips an issue carrying `AI-Needs-Human` before it counts capacity, so a park that added the marker but failed to remove `AI-Working` does not hold a slot. Each label's name and color are defined once (`LINEAR_LABELS`, `src/providers/linear.ts`), and each label is created at first use. Before creating one, `ensureTeamLabel` searches the workspace for the name ignoring case and reuses the team's own match, else a workspace match (`reusableLabel`); another team's label is never reused, since this team's issues cannot carry it. With neither, it creates the label in the issue's team, which needs no workspace admin rights. The poll's label tests, `removeLabelsByName` and `markMerged` compare exact names, so a reused label in a different case, such as `ai-working`, is applied but never recognized by the poll, and never removed.
 
 ### Workflow states
 
@@ -225,3 +229,25 @@ remain invisible to polling, and failed writes remove temporary files and state.
 Parent metadata is stored in provider-owned state
 and survives restart; pickup follows the mapping's planning setting. The fake
 provider records the parent association and puts children in planning pickup.
+
+## Aggregated issue statuses
+
+`src/issue-statuses.ts` exposes `listIssueStatuses`, called by `listIssueStatusesTool` in `src/restate/tools.ts` and registered as the user-role `list_issue_statuses` read tool. See [Spotter status tools](spotter-status-tools.md) for the tool contract. It reads every mapping, including paused mappings, and caches only successful provider status reads for 60 seconds per mapping key. Missing provider support or any provider failure rejects the whole call.
+
+Each call refreshes dispatch-breaker and job-log overlays. Merged issues retain their state and phase; otherwise a park makes an issue failed with the park's phase (gap-analysis maps to implementation). A failed issue with no tracker phase uses the newest job's phase. The newest job is ordered by `dispatched_at`, then row ID; its `completed_at`, falling back to `dispatched_at`, can advance the tracker change time. If multiple phases are parked, the newest park wins.
+
+Output contains only named public fields. Identifier collisions retain the first mapping in key order and warn with both team keys. Entries sort by team key and descending change time, with null times last.
+
+## Pull request closed without a merge
+
+`markPrClosedUnmerged(issueId, scopeKey, prUrl)` returns `true` after cancelling the issue and posting one comment naming the PR URL. It returns `false` without a write for an already terminal issue. The production merge poll (`detectMergedPrs` in `src/poll-merged-prs.ts`) calls it through the `cancelIssue` dependency wired in `src/index.ts`, resolving the provider from the linked issue's mapping key.
+
+Cancellation runs for paused projects too. Roll-up links, a grouping parent's own PR, and issues with another open PR link are excluded. An in-flight run defers the decision until a later poll. Final decisions set the link's `cancel_checked_at`; in-flight deferrals and provider errors leave it null so the next poll retries without a GitHub read. Either provider result (`true` or `false`) removes the issue's dispatch dedup row so a person can restart it.
+
+| Provider | Write | Terminal guard | Restart |
+|---|---|---|---|
+| Linear | One issue update sets the team's canceled state and removes `Ready for Review`, retaining `Plan-Complete` so a restart reuses the plan; then posts the comment | Completed, canceled, or duplicate state type | Move the issue back to Todo |
+| Jira | Sets AI-Implement status to `Implementation Failed`, then posts the comment; the field has no cancelled value | Field is `Merged` or native status is in the Done category | Set AI-Implement status to its pickup value |
+| Filesystem | Sets status `cancelled` and appends the comment in one locked task update | `completed` or `cancelled`, or a task that is not active | Set task status to its pickup value |
+
+The comment reads: “The pull request &lt;prUrl&gt; was closed without a merge. AI-Implement cancelled this issue.” It appends the provider's restart instruction. A person must restart the issue. Linear prefers a canceled workflow state named `Canceled` or `Cancelled` ignoring case, falling back to the first canceled state, and throws if none exists. Jira requires a successful terminal-state read before writing. Linear and Jira update state before commenting; a comment failure does not roll back the state write.

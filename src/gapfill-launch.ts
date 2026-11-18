@@ -139,6 +139,7 @@ export async function dispatchFlyGapfill(input: DispatchFlyGapfillInput): Promis
     machineNonce,
     sessionMode: mapping.sessionMode,
     region: input.flySessionsRegion ?? undefined,
+    cpuKind: mapping.machineCpuKind,
     cpus: mapping.machineCpus,
     memoryMb: mapping.machineMemoryMb,
     teamKey: scopeKey,

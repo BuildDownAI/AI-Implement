@@ -1,3 +1,4 @@
+import { findLinkByPr, deleteLinksForMapping } from "../pr-links.js";
 import { getDb } from "../dedup.js";
 import { describe, it, expect, vi, beforeEach, onTestFinished } from "vitest";
 import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
@@ -60,6 +61,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   reviewHeads.clear();
   resetRollUpHandledMarkers();
+  deleteLinksForMapping("OOL");
   getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run("roll-up-review:%");
   resetClosedVetoLogGuard();
   vi.mocked(findOpenPullRequest).mockResolvedValue(null);
@@ -119,6 +121,23 @@ describe("runMergeUps", () => {
     // PR title/body carry no issue identifier.
     const arg = vi.mocked(createPullRequest).mock.calls[0][3];
     expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
+  });
+
+  it("stores the roll-up link before a subsequent GitHub failure", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(getBranchSha).mockRejectedValueOnce(new Error("GitHub unavailable"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await runMergeUps([rollUp({ parent: null })], deps(() => mapping()));
+      expect(findLinkByPr("jodwyer/alpacaWheel", 7)).toMatchObject({
+        role: "roll-up", source: "result", outcome: "open",
+        headRef: "ai-implement/feature/ool-107", baseRef: "testing",
+        issue: { trackerKind: "linear", mappingKey: "OOL",
+          trackerIssueId: "issue-uuid-1", identifier: "OOL-107" },
+      });
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("recovers a missing creation head on the next open poll", async () => {

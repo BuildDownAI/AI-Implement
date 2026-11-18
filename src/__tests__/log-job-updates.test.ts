@@ -1,13 +1,16 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
+import { makeMapping } from "./helpers/builders.js";
 import { testDb } from "./helpers/test-db.js";
 
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
+let links: typeof import("../pr-links.js");
+let config: typeof import("../config.js");
 
 beforeEach(async () => {
-  ({ dedup, log } = (await testDb({ modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js") } })).modules);
+  ({ dedup, log, links, config } = (await testDb({ modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js"), links: () => import("../pr-links.js"), config: () => import("../config.js") } })).modules);
 });
 
 describe("updateJobStatus pr_url handling", () => {
@@ -482,5 +485,69 @@ describe("prune keeps recently finished rows (AII-1564)", () => {
     for (let i = 0; i < 510; i++) log.appendLog({ issueId: `n${i}` });
     expect(log.getJobById(recent)).not.toBeNull();
     expect(log.getJobById(old)).toBeNull();
+  });
+});
+
+
+afterEach(() => vi.restoreAllMocks());
+
+describe("job pull request links", () => {
+  const url = "https://github.com/o/r/pull/42";
+  function job(teamKey: string | undefined = "ENG", trackerKind?: string) {
+    config.upsertMapping("ENG", makeMapping());
+    return log.appendLog({ issueId: "issue-link", issueIdentifier: "ENG-42",
+      issueTitle: "Link the PR", issueUrl: "https://tracker/42", teamKey, trackerKind });
+  }
+  const setters = [
+    (id: number) => log.updateJobPrUrl(id, url),
+    (id: number) => log.stampJobApproved(id, url),
+    (id: number) => log.updateJobStatus(id, "completed", "success", url),
+  ];
+
+  it.each(setters)("links the job issue from each setter", (set) => {
+    links.listLinksByOutcome("open");
+    const id = job("ENG", "jira");
+    set(id);
+    expect(links.findLinkByPr("o/r", 42)).toMatchObject({
+      repository: "o/r", number: 42, url, source: "result", role: "implementation",
+      issue: { trackerKind: "jira", mappingKey: "ENG", trackerIssueId: "issue-link",
+        identifier: "ENG-42", title: "Link the PR", url: "https://tracker/42" },
+    });
+    expect(log.getJobById(id)?.prUrl).toBe(url);
+  });
+
+  it("uses the mapping tracker kind when the stored kind is null", () => {
+    log.updateJobPrUrl(job(), url);
+    expect(links.findLinkByPr("o/r", 42)?.issue.trackerKind).toBe("linear");
+  });
+
+  it.each(["https://github.com/o/r/actions/runs/42", "https://github.com/o/r/pull/42/extra",
+    "https://example.com/o/r/pull/42", "garbage", ""])("ignores non-PR URL %s", (input) => {
+    log.updateJobPrUrl(job(), input);
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+  });
+
+  it.each([null, "missing"])("ignores absent mapping %s", (teamKey) => {
+    const id = job();
+    dedup.getDb().prepare("UPDATE dispatch_log SET team_key = ? WHERE id = ?").run(teamKey, id);
+    log.updateJobPrUrl(id, url);
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+  });
+
+  it("does not link a stored URL when the status caller supplies none", () => {
+    links.listLinksByOutcome("open");
+    const id = job();
+    dedup.getDb().prepare("UPDATE dispatch_log SET pr_url = ? WHERE id = ?").run(url, id);
+    log.updateJobStatus(id, "completed", "success");
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+  });
+
+  it.each(setters)("keeps the setter update when linking throws", (set) => {
+    const id = job();
+    vi.spyOn(links, "linkPullRequest").mockImplementation(() => { throw new Error("link fault"); });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(() => set(id)).not.toThrow();
+    expect(log.getJobById(id)?.prUrl).toBe(url);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed to link"), expect.any(Error));
   });
 });

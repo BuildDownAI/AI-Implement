@@ -636,6 +636,8 @@ function buildPullRequestBody(
           ? "Automated verification was skipped — the AI service was not available and the run was interrupted."
           : verifyFailedForTestsSummary
             ? "Automated verification ran and failed — the repository's verify hook did not pass."
+            : inputs.reviewSummary.terminationReason === "max_turns"
+            ? "Automated verification was skipped — the implementation did not finish within its turn budget."
             : "Automated verification was skipped — the review loop did not approve this change."
         : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
   const testsSummaryChecked = dependenciesFailed ? false : explicitTestsSummary != null || !inputs.reviewSummary;
@@ -711,18 +713,24 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
   const providerUnavailable = summary.terminationReason === "provider_unavailable";
   // A failing verify hook is not a review verdict either: the review never examined the last pass.
   const verifyFailed = summary.terminationReason === "verify_failed";
+  // Turn-cap exhaustion is unfinished work, not a review verdict: no reviewer rejected it.
+  const maxTurns = summary.terminationReason === "max_turns";
   return [
     verifyFailed
       ? "## ⚠️ The verify hook failed"
-      : providerUnavailable ? "## 🟠 The AI service was not available during this run" : "## ⚠️ Automated review did not approve",
+      : providerUnavailable ? "## 🟠 The AI service was not available during this run"
+      : maxTurns ? "## ⏱️ The implementation did not finish within its turn budget"
+      : "## ⚠️ Automated review did not approve",
     "",
     verifyFailed
       ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the repository's verify hook still failed after ${summary.iterations} iteration(s); the review did not examine the last pass.`
       : providerUnavailable
       ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI service was not available and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
+      : maxTurns
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the implementation used its full turn budget before it finished (after ${summary.iterations} iteration(s)). The work so far is preserved here. It is incomplete.`
       : `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
     "",
-    verifyFailed ? "**Verify hook result:**" : providerUnavailable ? "**Run notes:**" : "**Reviewer's final feedback:**",
+    verifyFailed ? "**Verify hook result:**" : providerUnavailable || maxTurns ? "**Run notes:**" : "**Reviewer's final feedback:**",
     "",
     ...summary.finalFeedback.split("\n").map((l) => `> ${l}`),
     "",
@@ -734,7 +742,11 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
     ...(summary.postMortem ? ["", "<details><summary><strong>Post-mortem</strong></summary>", "", summary.postMortem, "", "</details>"] : []),
     "",
     // The verify hook runs inside the feedback loop, so only preflight is skipped here.
-    providerUnavailable ? "_Preflight was skipped because the run was interrupted._" : "_Preflight was skipped for this unapproved run._",
+    providerUnavailable
+      ? "_Preflight was skipped because the run was interrupted._"
+      : maxTurns
+        ? "_Preflight was skipped because the implementation did not finish._"
+        : "_Preflight was skipped for this unapproved run._",
   ].join("\n");
 }
 

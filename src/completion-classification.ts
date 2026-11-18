@@ -29,6 +29,10 @@ const CATEGORY_NEXT_STEPS: Record<FailureCategory, string> = {
   unknown: "The failure could not be classified. Check the run logs.",
 };
 
+const CODE_NEXT_STEPS: Partial<Record<string, string>> = {
+  PLAN_STATUS_WRITE_FAILED: "The tracker refused a write the plan needs. Fix the tracker setup that the message above names, then use Unpark at /admin#runners.",
+};
+
 /** The ticket comment shows a short excerpt, never the whole (up to 8 KiB) tail — the drawer has the rest. */
 const EVIDENCE_MAX_LINES = 12;
 
@@ -384,7 +388,7 @@ export function classificationForFailure(
   return {
     summary: `❌ Failed at stage \`${failure.stage}\` — ${failure.category}/${failure.code}${attemptSuffix}`,
     detail: detailParts.join("\n\n"),
-    remediation: CATEGORY_NEXT_STEPS[failure.category],
+    remediation: CODE_NEXT_STEPS[failure.code] ?? CATEGORY_NEXT_STEPS[failure.category],
     docsUrl: TROUBLESHOOTING_URL,
     ...(runUrl ? { runUrl } : {}),
   };
@@ -507,19 +511,13 @@ export function classifyCompletion(job: Job, lastSuccessfulStage?: string | null
  * `classificationForFailure`'s summary is deliberately phase-free (see its own doc comment) —
  * the callback supplies the phase via this prefix, so the monitor's backstop comment
  * (`reportJobCompletion` in `src/index.ts`) must prepend the same prefix itself for an actual
- * failure (`job.status === "failed"`), or a gap-analysis failure (which the callback never
- * comments for, so the monitor is the only commenter) would post without naming a phase at
- * all. gap-analysis has no comment shape of its own — it is implementation's retry path, so it
- * takes implementation's phrase. `reportJobCompletion` does NOT apply this prefix for
- * `review_failed` or `timed_out`: those statuses are not failures — markImplementationFailed/
- * markPlanningFailed never runs for them either — so prefixing would assert a failure the run
- * didn't have (a review_failed run completed and opened a PR the ticket already got a
- * "ready for review" comment about).
+ * failure (`job.status === "failed"`). Gap-fill failures use their own phase name.
  */
 export function monitorFailureCommentPrefix(phase: string): string {
   // kg-refresh has no tracker issue and its outcome notice is owned by notifyKgRefreshOutcome
   // (`shouldSkipCompletionNotice` in index.ts returns before this is reached) — the case exists
   // so a caller that does route one here never labels it "Implementation".
+  if (phase === "gap-analysis") return "⚠️ Gap-fill failed: ";
   if (phase === "kg-refresh") return "⚠️ KG refresh failed: ";
   return phase === "planning" ? "⚠️ Planning failed: " : "⚠️ Implementation failed: ";
 }

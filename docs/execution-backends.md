@@ -120,3 +120,22 @@ An unbound `launch_unresolved` outcome records the unresolved launch without
 cleanup, even if the dispatch row already has a machine or container ID. There is
 no terminal confirmation: the resource, nonce and occupancy remain for operator
 recovery.
+
+
+## Project machine size
+
+Fly implementation, planning, gap-fill and review-fix runs use the project's
+`machineCpus`, `machineMemoryMb` and `machineCpuKind`. Defaults are 2 CPUs,
+4096 MB and `shared`. On `/admin#projects`, the project drawer's Execution tab
+and the New project stepper's Execution step have a **CPU kind** select beside
+CPUs and Memory. The kind can also be set through `add_project` or the mapping API.
+Omitting the kind on an existing project's save preserves its stored value; new projects default to shared.
+
+The mapping API accepts `shared` and `performance` only. Shared machines retain
+the existing rules: a positive integer CPU count and integer memory of at least
+256 MB. Performance machines require 1, 2, 4, 8 or 16 CPUs and at least 2048 MB
+per CPU. Invalid values return 400 with the offending field named.
+
+Fly limits a shared CPU's sustained CPU time; its CPU count does not imply
+continuous dedicated compute. Performance CPUs cost more and are intended for
+sustained work. Keeping the shared default leaves existing project costs unchanged.

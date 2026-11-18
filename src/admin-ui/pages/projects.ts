@@ -267,7 +267,7 @@ export const projectsHtml = `
               </select>
             </div>
           </div>
-          <div id="md-fly-fields" class="hidden" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div id="md-fly-fields" class="hidden" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
             <div class="field">
               <label class="field-label">CPUs</label>
               <input class="input" id="md-cpus" type="number" min="1" value="2">
@@ -275,6 +275,14 @@ export const projectsHtml = `
             <div class="field">
               <label class="field-label">Memory (MB)</label>
               <input class="input" id="md-mem" type="number" min="256" step="256" value="4096">
+            </div>
+            <div class="field">
+              <label class="field-label" for="md-cpu-kind">CPU kind</label>
+              <select class="select" id="md-cpu-kind">
+                <option value="shared">shared</option>
+                <option value="performance">performance</option>
+              </select>
+              <div class="field-hint">Fly limits a shared CPU. Use performance for a project whose tests use the CPU for more than some minutes. Performance needs 2048 MB or more for each CPU.</div>
             </div>
           </div>
           <div class="field">
@@ -1104,6 +1112,7 @@ export const projectsScript = `
     document.getElementById('md-max-ai').value = String(m.maxInProgressAiIssues ?? 3);
     document.getElementById('md-exec-mode').value = m.executionMode || 'github-actions';
     document.getElementById('md-session-mode').value = m.sessionMode || 'autonomous';
+    document.getElementById('md-cpu-kind').value = m.machineCpuKind ?? 'shared';
     document.getElementById('md-cpus').value = String(m.machineCpus ?? 2);
     document.getElementById('md-mem').value = String(m.machineMemoryMb ?? 4096);
     document.getElementById('md-env').value = envToText(m.extraEnv);
@@ -1533,6 +1542,7 @@ export const projectsScript = `
       maxInProgressAiIssues: Number(document.getElementById('md-max-ai').value.trim() || NaN),
       executionMode: document.getElementById('md-exec-mode').value,
       sessionMode: document.getElementById('md-session-mode').value,
+      machineCpuKind: document.getElementById('md-cpu-kind').value,
       machineCpus: parseInt(document.getElementById('md-cpus').value, 10),
       machineMemoryMb: parseInt(document.getElementById('md-mem').value, 10),
       planningEnabled: document.getElementById('md-planning').checked,

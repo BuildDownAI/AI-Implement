@@ -6,7 +6,7 @@ import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import type * as restate from "@restatedev/restate-sdk";
 import type * as AdminModule from "../admin.js";
 import type * as ToolsModule from "../restate/tools.js";
-import { fakeFetch } from "./helpers/fake-fetch.js";
+import { fakeFetch, type Routes } from "./helpers/fake-fetch.js";
 
 const ISSUER = "https://cp.builddown.test";
 const BASE_URL = "https://orch-a.example.com";
@@ -86,6 +86,7 @@ function ingress(tools: typeof ToolsModule, handlerName: string, objectClient?: 
 }
 
 export interface RecordOptions {
+  routes?: Routes;
   scope?: string;
   /** Stands in for `ctx.objectClient` in handlers that call a Restate object; absent, the context has none. */
   objectClient?: (definition: unknown, key: string) => unknown;
@@ -104,6 +105,7 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
   const signingKey = pair.privateKey;
   const jwk = { ...(await exportJWK(pair.publicKey)), kid: "k1", alg: "ES256", use: "sig" };
   fakeFetch({
+    ...opts?.routes,
     "GET /.well-known/openid-configuration": { json: { jwks_uri: `${ISSUER}/jwks` } },
     "GET /jwks": { json: { keys: [jwk] } },
   }).install();
@@ -121,7 +123,7 @@ export async function recordExchange(tool: string, body: { args: Record<string, 
     callTool: async (name, args, caller) => {
       expect(caller).toEqual({
         kind: "service", email: null, role: "user",
-        grants: ["deploy", "projects"].filter((grant) => (opts?.scope ?? "orchestrator:read").split(" ").includes(`orchestrator:${grant}`)),
+        grants: ["deploy", "projects", "secrets"].filter((grant) => (opts?.scope ?? "orchestrator:read").split(" ").includes(`orchestrator:${grant}`)),
       });
       return callTool(name, args, caller, {
         restateReady: () => true,

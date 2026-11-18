@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
 import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira.js";
 import { JiraApiError, JiraClient, type JiraIssue } from "../../providers/jira-client.js";
-import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
 import { validateTicketingConfig } from "../../providers/ticketing-config.js";
 import { validateIssueBaseBranch } from "../../base-branch.js";
@@ -2026,7 +2026,7 @@ describe("JiraProvider.fetchSetupFacts", () => {
   });
 });
 
-import { runChildIssueContract } from "./contract.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 import { adfToPlainText } from "../../providers/jira.js";
 
 for (const repo of ["acme/x", { id: "option", value: "acme/x" }]) {
@@ -2106,4 +2106,151 @@ describe("JiraProvider creates children above the subtask level", () => {
       expect(fields.customfield_10014).toBe(simplified ? undefined : "P-1");
     });
   }
+});
+
+describe("JiraProvider.listIssueStatuses", () => {
+  beforeEach(() => clearFieldCache());
+
+  const mapping = (): RepoMapping => ({
+    ...jiraMapping({ ...ALL_OVERRIDES, jql: 'project = P OR project = Q' }),
+    teamKey: "status-team",
+  });
+  const provider = () => makeProvider({ cacheScope: "statuses", mappings: { "status-team": mapping() } });
+  const updated = "2026-11-15T12:00:00.000Z";
+  const issue = (status = "Ready", repo: unknown = { value: "acme/x" }): JiraIssue => ({
+    id: "10001", key: "P-1",
+    fields: { summary: "A task", updated, customfield_10100: { value: status }, customfield_10101: repo },
+  });
+
+  it.each([
+    ["Ready", "ready", null],
+    ["Planning", "planning", null],
+    ["Awaiting Approval", "awaiting-approval", null],
+    ["Plan Approved", "plan-approved", null],
+    ["Implementing", "implementing", null],
+    ["PR Ready", "pr-ready", null],
+    ["Merged", "merged", null],
+    ["Planning Failed", "failed", "planning"],
+    ["Implementation Failed", "failed", "implementation"],
+    ["Unexpected", "unknown", null],
+  ])("normalizes %s", async (status, state, phase) => {
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [issue(status!)] }) }).install();
+    expect(await provider().listIssueStatuses(mapping())).toEqual([{
+      id: "10001", identifier: "P-1", title: "A task", url: "https://x/browse/P-1",
+      state, phase, labels: [], workflowState: status, updatedAt: Date.parse(updated),
+    }]);
+  });
+
+  it("uses scoped field overrides and the mapping JQL with recent terminal statuses", async () => {
+    const fake = fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/ }) }).install();
+    await provider().listIssueStatuses(mapping());
+    expect(searchBodies(fake)[0]).toEqual({
+      jql: `(project = P OR project = Q) AND cf[10100] is not EMPTY AND (cf[10100] not in ("Merged","Planning Failed","Implementation Failed") OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`,
+      fields: ["summary", "updated", "customfield_10100", "customfield_10101"],
+      maxResults: 100,
+    });
+  });
+
+  it("keeps string and select repo values and excludes another repository", async () => {
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [
+      issue("Ready", " acme/x "), issue("Ready"), issue("Ready", { value: "acme/other" }),
+    ] }) }).install();
+    expect(await provider().listIssueStatuses(mapping())).toHaveLength(2);
+  });
+
+  it.each(["Won't Do", "Cancelled", "CANCELED", "Duplicate"])("keeps custom-status state and phase for native resolution %s", async (resolution) => {
+    const nativeIssue = (category: string, name: string | null, customStatus = "Ready"): JiraIssue => {
+      const raw = issue(customStatus);
+      return { ...raw, fields: { ...raw.fields,
+        status: { statusCategory: { key: category } },
+        resolution: name === null ? null : { name },
+      } };
+    };
+    fakeFetch({ [SEARCH]: jqlSearch({ when: /is not EMPTY/, issues: [
+      nativeIssue("done", resolution),
+      nativeIssue("done", resolution, "Merged"),
+      nativeIssue("done", resolution, "Planning Failed"),
+      nativeIssue("done", resolution, "Implementation Failed"),
+      nativeIssue("done", "Done", "Merged"),
+      nativeIssue("indeterminate", resolution),
+      nativeIssue("done", null),
+    ] }) }).install();
+    expect((await provider().listIssueStatuses(mapping())).map(({ workflowState, state, phase }) => ({ workflowState, state, phase })))
+      .toEqual([
+        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Merged", state: "merged", phase: null },
+        { workflowState: "Planning Failed", state: "failed", phase: "planning" },
+        { workflowState: "Implementation Failed", state: "failed", phase: "implementation" },
+        { workflowState: "Merged", state: "merged", phase: null },
+        { workflowState: "Ready", state: "ready", phase: null },
+        { workflowState: "Ready", state: "ready", phase: null },
+      ]);
+  });
+
+  it("accumulates pages and forwards tokens through an empty page", async () => {
+    const fake = fakeFetch({ [SEARCH]: [
+      { json: { issues: [issue()], nextPageToken: "second" } },
+      { json: { issues: [], nextPageToken: "third" } },
+      { json: { issues: [issue("Planning")] } },
+    ] }).install();
+    expect((await provider().listIssueStatuses(mapping())).map((record) => record.state)).toEqual(["ready", "planning"]);
+    expect(fake.calls.map((call) => JSON.parse(call.body).nextPageToken)).toEqual([undefined, "second", "third"]);
+  });
+
+  it.each([false, true])("enforces the 20-page ceiling (has more: %s)", async (hasMore) => {
+    const fake = fakeFetch({ [SEARCH]: Array.from({ length: 21 }, (_, page) => ({
+      json: { issues: [issue()], nextPageToken: page < 19 || hasMore ? `page-${page + 2}` : undefined },
+    })) }).install();
+    const result = provider().listIssueStatuses(mapping());
+    if (hasMore) await expect(result).rejects.toThrow(TrackerUnavailableError);
+    else await expect(result).resolves.toHaveLength(20);
+    expect(fake.calls).toHaveLength(20);
+  });
+
+  it.each([401, 500])("propagates Jira %s after a successful page", async (status) => {
+    fakeFetch({ [SEARCH]: [
+      { json: { issues: [issue()], nextPageToken: "second" } },
+      jiraError(status, "Search failed"),
+    ] }).install();
+    await expect(provider().listIssueStatuses(mapping())).rejects.toBeInstanceOf(JiraApiError);
+  });
+
+  it("rejects missing Jira config or mapping key", async () => {
+    fakeFetch({}).install();
+    await expect(provider().listIssueStatuses(makeMapping())).rejects.toBeInstanceOf(TrackerUnavailableError);
+    await expect(provider().listIssueStatuses({ ...mapping(), teamKey: undefined })).rejects.toBeInstanceOf(TrackerUnavailableError);
+  });
+});
+
+runPrClosedUnmergedContract("JiraProvider", async (terminal) => {
+  clearFieldCache();
+  const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY,
+    [STATUS_READ]: { json: { id: "10001", key: "P-1", fields: { customfield_10100: { value: terminal ? "Merged" : "PR Ready" } } } },
+    [STATUS_WRITE]: { status: 204 }, [COMMENT]: { status: 201, json: { id: "comment" } },
+  }).install();
+  return { provider: makeProvider({ cacheScope: "close", mappings: { "acme/x": jiraMapping() } }), issueId: "10001", scopeKey: "acme/x",
+    restartSentence: "To run it again, set the AI-Implement status to its pickup value.",
+    verify: async (terminal, comment) => {
+      expect(fake.calls.map((c) => c.method)).toEqual(terminal ? ["GET", "GET"] : ["GET", "GET", "PUT", "POST"]);
+      if (!terminal) {
+        expect(JSON.parse(fake.calls[2].body).fields.customfield_10100).toEqual({ value: "Implementation Failed" });
+        expect(adfToPlainText(JSON.parse(fake.calls[3].body).body)).toBe(comment);
+      }
+    } };
+});
+describe("JiraProvider unmerged close guards", () => {
+  it("refuses native terminal issues", async () => {
+    clearFieldCache();
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: { json: { id: "10001", key: "P-1", fields: { status: { statusCategory: { key: "done" } } } } } }).install();
+    const p = makeProvider({ cacheScope: "close-native", mappings: { "acme/x": jiraMapping() } });
+    expect(await p.markPrClosedUnmerged("10001", "acme/x", "url")).toBe(false);
+    expect(fake.calls.map((c) => c.method)).toEqual(["GET", "GET"]);
+  });
+  it("does not write when the terminal-state read fails", async () => {
+    clearFieldCache();
+    const fake = fakeFetch({ [FIELDS]: FIELDS_REPLY, [STATUS_READ]: { status: 403, json: {} } }).install();
+    const p = makeProvider({ cacheScope: "close-error", mappings: { "acme/x": jiraMapping() } });
+    await expect(p.markPrClosedUnmerged("10001", "acme/x", "url")).rejects.toThrow();
+    expect(fake.calls.map((c) => c.method)).toEqual(["GET", "GET"]);
+  });
 });

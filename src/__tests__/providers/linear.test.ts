@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as mappingConfig from "../../config.js";
-import { LinearProvider } from "../../providers/linear.js";
-import { MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
+import { LinearGraphQLError, LinearLabelWriteError, LinearProvider } from "../../providers/linear.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError, type TicketingProvider } from "../../providers/types.js";
 import {
   clearLinearTokenCache,
   configureLinearAuth,
@@ -43,6 +43,68 @@ describe("LinearProvider", () => {
   });
 });
 
+describe("LinearProvider.ensureLifecycleLabels", () => {
+  const names = ["AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review", "AI-Needs-Human"];
+  const team = () => data({ teams: { nodes: [{ id: "team-eng" }] } });
+  const found = (id: string) => data({ issueLabels: { nodes: [{ id, team: { id: "team-eng" } }] } });
+
+  it("reads all labels in order once and sends no requests when cached", async () => {
+    const fake = linear(team(), ...names.map(found));
+    const provider = new LinearProvider({});
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    expect(fake.calls).toHaveLength(6);
+    expect(variables(fake, 0)).toEqual({ key: "ENG" });
+    expect(fake.calls.slice(1).map((_, i) => variables(fake, i + 1))).toEqual(names.map(name => ({ name })));
+    expect(fake.calls.every(call => !JSON.parse(call.body).query.includes("mutation"))).toBe(true);
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    expect(fake.calls).toHaveLength(6);
+  });
+
+  it.each([true, false])("stops at a refused Plan-Complete create, forwarding permanent=%s, and retries there", async (permanent) => {
+    const fake = linear(
+      team(), found("planning"), data({ issueLabels: { nodes: [] } }),
+      { json: { errors: [{ message: "write refused", extensions: { type: permanent ? "forbidden" : "unknown" } }] } },
+      ...names.slice(1).map(found),
+    );
+    const provider = new LinearProvider({});
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({
+      ok: false, permanent, label: "Plan-Complete",
+      message: 'Linear refused to create label "Plan-Complete" on team ENG: write refused',
+    });
+    expect(fake.calls).toHaveLength(4);
+    expect(variables(fake, 2)).toEqual({ name: "Plan-Complete" });
+    expect(variables(fake, 3)).toEqual({ teamId: "team-eng", name: "Plan-Complete", color: "#10B981" });
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    expect(fake.calls.slice(4).map((_, i) => variables(fake, i + 4).name)).toEqual(names.slice(1));
+  });
+
+  it.each([new Error("network down"), "network down"])("returns a transient result for a request rejection: %s", async (error) => {
+    const fake = linear(team(), () => { throw error; });
+    await expect(new LinearProvider({}).ensureLifecycleLabels("ENG")).resolves.toEqual({
+      ok: false, permanent: false, label: "AI-Planning", message: "network down",
+    });
+    expect(fake.calls).toHaveLength(2);
+  });
+
+  it("reuses a created label in its lifecycle verb without another search", async () => {
+    const fake = linear(
+      team(), data({ issueLabels: { nodes: [] } }),
+      data({ issueLabelCreate: { issueLabel: { id: "created-planning" } } }),
+      ...names.slice(1).map(found),
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ issueUpdate: { success: true } }),
+      data({ issue: { state: { type: "completed" } } }),
+    );
+    const provider = new LinearProvider({});
+    await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
+    const preparedCalls = fake.calls.length;
+    await provider.markPlanningStarted("issue-1", "ENG");
+    expect(fake.calls).toHaveLength(preparedCalls + 3);
+    expect(variables(fake, preparedCalls + 1)).toEqual({ issueId: "issue-1", input: { addedLabelIds: ["created-planning"] } });
+    expect(fake.calls.slice(preparedCalls).every(call => !JSON.parse(call.body).query.includes("issueLabels"))).toBe(true);
+  });
+});
+
 describe("LinearProvider.postComment", () => {
   it("sends the GraphQL commentCreate mutation with issueId and body", async () => {
     const fake = linear(data({ commentCreate: { success: true } }));
@@ -67,6 +129,146 @@ describe("LinearProvider.postComment", () => {
 
     const p = new LinearProvider({});
     await expect(p.postComment("i", "b")).rejects.toThrow(/Permission denied/);
+  });
+});
+
+describe("Linear GraphQL failures", () => {
+  it.each([
+    [undefined, undefined],
+    [null, undefined],
+    [{}, undefined],
+    [[], undefined],
+    [42, undefined],
+    [false, undefined],
+    [{ type: null, code: 42 }, undefined],
+    [{ type: "unknown", code: "fallback" }, "unknown"],
+    [{ code: "unknown" }, "unknown"],
+    [{ type: "FORBIDDEN", code: "forbidden", statusCode: "403" }, "FORBIDDEN"],
+    [{ http: { status: 403 } }, undefined],
+    [{ type: 42, code: "fallback" }, "fallback"],
+    ["malformed", undefined],
+  ])("retains the first error and safely reads extensions %j", async (extensions, extensionsType) => {
+    linear({ json: { errors: [
+      { message: "not allowed to take action", extensions },
+      { message: "second error", extensions: { type: "other" } },
+    ] } });
+    const error = await new LinearProvider({}).postComment("i", "b").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(LinearGraphQLError);
+    expect(error).toMatchObject({
+      name: "LinearGraphQLError", operation: "commentCreate",
+      linearMessage: "not allowed to take action", extensionsType, permanent: false,
+      message: "Linear GraphQL error (commentCreate): not allowed to take action",
+    });
+  });
+
+  it("classifies the recorded scope refusal as permanent through label creation", async () => {
+    const refusal = { errors: [{
+      message: "Invalid scope: `write` required",
+      extensions: {
+        type: "forbidden", code: "FORBIDDEN", statusCode: 403,
+        userError: true, http: { status: 400 },
+      },
+    }] };
+    linear(
+      { json: refusal },
+      data({ issue: { team: { key: "THR2" } } }),
+      data({ teams: { nodes: [{ id: "team-thr2" }] } }),
+      data({ issueLabels: { nodes: [] } }),
+      { json: refusal },
+    );
+    const provider = new LinearProvider({});
+    const error = await provider.postComment("i", "b").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(LinearGraphQLError);
+    expect(error).toMatchObject({
+      permanent: true, extensionsType: "forbidden",
+      linearMessage: "Invalid scope: `write` required",
+    });
+    const labelError = await provider.markPlanningStarted("i", "AII").catch((err: unknown) => err);
+    expect(labelError).toBeInstanceOf(LinearLabelWriteError);
+    expect(labelError).toBeInstanceOf(LinearGraphQLError);
+    expect(labelError).toMatchObject({
+      operation: "issueLabelCreate", label: "AI-Planning", teamKey: "THR2", action: "create",
+      permanent: true, extensionsType: "forbidden",
+      linearMessage: "Invalid scope: `write` required",
+    });
+  });
+
+  it.each([
+    { type: "forbidden" },
+    { code: "FORBIDDEN" },
+    { statusCode: 403 },
+    { type: "unknown", code: "FORBIDDEN" },
+  ])("classifies structured permission refusals as permanent %j", async (extensions) => {
+    linear({ json: { errors: [{ message: "write refused", extensions }] } });
+    await expect(new LinearProvider({}).postComment("i", "b")).rejects.toMatchObject({ permanent: true });
+  });
+
+  it("adds label and actual team context to a refused create", async () => {
+    linear(
+      data({ issue: { team: { key: "THR2" } } }),
+      data({ teams: { nodes: [{ id: "team-thr2" }] } }),
+      data({ issueLabels: { nodes: [] } }),
+      { json: { errors: [{ message: "not allowed to take action", extensions: { code: "unknown" } }] } },
+    );
+    const error = await new LinearProvider({}).markPlanningStarted("i", "AII").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(LinearLabelWriteError);
+    expect(error).toBeInstanceOf(LinearGraphQLError);
+    expect(error).toMatchObject({
+      name: "LinearLabelWriteError", operation: "issueLabelCreate", label: "AI-Planning",
+      teamKey: "THR2", action: "create", linearMessage: "not allowed to take action",
+      extensionsType: "unknown", permanent: false,
+      message: 'Linear refused to create label "AI-Planning" on team THR2: not allowed to take action',
+    });
+  });
+
+  it.each([
+    ["planning label", (p: LinearProvider) => p.markPlanningStarted("i", "ENG"), 1],
+    ["planning state", (p: LinearProvider) => p.markPlanningStarted("i", "ENG"), 2],
+    ["plan complete", (p: LinearProvider) => p.markPlanComplete("i", "ENG", { awaitApproval: false }), 1],
+    ["planning failed", (p: LinearProvider) => p.markPlanningFailed("i", "ENG", "reason"), 1],
+    ["implementing", (p: LinearProvider) => p.markImplementing("i", "ENG"), 1],
+    ["PR ready", (p: LinearProvider) => p.markPrReady("i", "ENG", "url"), 1],
+    ["merged", (p: LinearProvider) => p.markMerged("i", "ENG"), 1],
+    ["implementation failed", (p: LinearProvider) => p.markImplementationFailed("i", "ENG", "reason"), 1],
+    ["clear working", (p: LinearProvider) => p.clearWorkingState("i", "ENG", "planning"), 1],
+    ["park", (p: LinearProvider) => p.parkForHuman("i", "ENG", "planning"), 1],
+  ] as const)("names issueUpdate for %s failures", async (_name, run, failAt) => {
+    let mutations = 0;
+    fakeFetch({ "POST /graphql": ({ body }) => {
+      const { query } = JSON.parse(body) as { query: string };
+      if (query.includes("mutation")) {
+        mutations++;
+        return mutations === failAt
+          ? { json: { errors: [{ message: "write refused" }] } }
+          : { json: { data: { issueUpdate: { success: true } } } };
+      }
+      return { json: { data: {
+        issue: { team: { key: "ENG" }, state: { type: "unstarted" }, labels: { nodes: [
+          { id: "planning", name: "AI-Planning" }, { id: "working", name: "AI-Working" },
+        ] } },
+        teams: { nodes: [{ id: "team-eng" }] },
+        issueLabels: { nodes: [{ id: "reusable", team: null }] },
+        workflowStates: { nodes: [{ id: "state", name: "In Progress", type: "started" }] },
+      } } };
+    } }).install();
+    await expect(run(new LinearProvider({}))).rejects.toMatchObject({
+      operation: "issueUpdate", linearMessage: "write refused",
+      message: "Linear GraphQL error (issueUpdate): write refused",
+    });
+  });
+
+  it.each(["lookup", "http"])("does not wrap a label %s failure", async (kind) => {
+    const failure = kind === "http" ? { status: 403, text: "refused" }
+      : { json: { errors: [{ message: "lookup refused" }] } };
+    linear(
+      data({ issue: { team: { key: "ENG" } } }),
+      data({ teams: { nodes: [{ id: "team-eng" }] } }),
+      ...(kind === "http" ? [data({ issueLabels: { nodes: [] } })] : []),
+      failure,
+    );
+    const error = await new LinearProvider({}).markPlanningStarted("i", "ENG").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(kind === "http" ? LinearApiError : LinearGraphQLError);
+    expect(error).not.toBeInstanceOf(LinearLabelWriteError);
   });
 });
 
@@ -794,9 +996,7 @@ describe("LinearProvider.markPlanningStarted", () => {
       data({ issueLabels: { nodes: [{ id: "label-other-team", team: { id: "team-other" } }] } }),
       // 4. ensureTeamLabel: create team-scoped label
       data({ issueLabelCreate: { issueLabel: { id: "label-thr2-planning" } } }),
-      // 5. addLabelToIssue: fetch current labels
-      data({ issue: { labels: { nodes: [] } } }),
-      // 6. addLabelToIssue: issueUpdate
+      // addLabelToIssue: issueUpdate (no preceding read)
       data({ issueUpdate: { success: true } }),
       // 7. transitionToInProgressIfMovable — non-movable, so no state update
       data({ issue: { state: { type: "started" } } }),
@@ -807,7 +1007,7 @@ describe("LinearProvider.markPlanningStarted", () => {
 
     expect(variables(fake, 1)).toEqual({ key: "THR2" });
     expect(variables(fake, 3)).toEqual({ teamId: "team-thr2", name: "AI-Planning", color: "#8B5CF6" });
-    expect(variables(fake, 5)).toEqual({ issueId: "issue-1", labelIds: ["label-thr2-planning"] });
+    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", input: { addedLabelIds: ["label-thr2-planning"] } });
   });
 
   it("ensures AI-Planning label, adds it to the issue, and transitions to In Progress when movable", async () => {
@@ -818,9 +1018,7 @@ describe("LinearProvider.markPlanningStarted", () => {
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       // 3. ensureTeamLabel — find existing AI-Planning label (workspace-level)
       data({ issueLabels: { nodes: [{ id: "label-planning", team: null }] } }),
-      // 4. addLabelToIssue — fetch current labels
-      data({ issue: { labels: { nodes: [] } } }),
-      // 5. addLabelToIssue — issueUpdate
+      // addLabelToIssue: issueUpdate (no preceding read)
       data({ issueUpdate: { success: true } }),
       // 6. transitionToInProgressIfMovable — fetch state.type (movable)
       data({ issue: { state: { type: "unstarted" } } }),
@@ -833,8 +1031,8 @@ describe("LinearProvider.markPlanningStarted", () => {
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
-    expect(fake.calls).toHaveLength(8);
-    expect(variables(fake, 7)).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
+    expect(fake.calls).toHaveLength(7);
+    expect(variables(fake, 6)).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
   });
 
   it("does not transition state when issue is in a non-movable state", async () => {
@@ -842,7 +1040,6 @@ describe("LinearProvider.markPlanningStarted", () => {
       data({ issue: { team: { key: "ENG" } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ issueLabels: { nodes: [{ id: "label-planning", team: null }] } }),
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issueUpdate: { success: true } }),
       // state.type fetch returns "started" — not movable
       data({ issue: { state: { type: "started" } } }),
@@ -851,7 +1048,7 @@ describe("LinearProvider.markPlanningStarted", () => {
     const p = new LinearProvider({});
     await p.markPlanningStarted("issue-1", "ENG");
 
-    expect(fake.calls).toHaveLength(6);
+    expect(fake.calls).toHaveLength(5);
   });
 
   it("creates AI-Planning label with #8B5CF6 color when not found", async () => {
@@ -861,7 +1058,6 @@ describe("LinearProvider.markPlanningStarted", () => {
       // ensureTeamLabel: search returns empty → create
       data({ issueLabels: { nodes: [] } }),
       data({ issueLabelCreate: { issueLabel: { id: "new-label" } } }),
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issueUpdate: { success: true } }),
       // state.type fetch (movable)
       data({ issue: { state: { type: "backlog" } } }),
@@ -878,35 +1074,29 @@ describe("LinearProvider.markPlanningStarted", () => {
 });
 
 describe("LinearProvider.markPlanComplete", () => {
-  it("removes AI-Planning label, then adds Plan-Complete label resolved via issue's team key", async () => {
+  it("swaps AI-Planning for Plan-Complete in one issueUpdate, resolved via the issue's team key", async () => {
     const fake = linear(
-      // 1. removeLabelByName: fetch labels
-      data({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
-      // 2. removeLabelByName: issueUpdate to drop AI-Planning
-      data({ issueUpdate: { success: true } }),
-      // 3. getTeamKeyForIssue
+      // 1. getTeamKeyForIssue
       data({ issue: { team: { key: "ENG" } } }),
-      // 4. getTeamIdByKey
+      // 2. getTeamIdByKey
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
-      // 5. ensureTeamLabel: find existing Plan-Complete (workspace-level)
+      // 3. ensureTeamLabel: find existing Plan-Complete (workspace-level)
       data({ issueLabels: { nodes: [{ id: "label-pc", team: null }] } }),
-      // 6. addLabelToIssue: fetch current labels
-      data({ issue: { labels: { nodes: [{ id: "lo" }] } } }),
-      // 7. addLabelToIssue: issueUpdate
+      // 4. labelIdsByName: find AI-Planning
+      data({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
+      // 5. one issueUpdate for the swap
       data({ issueUpdate: { success: true } }),
     );
 
     const p = new LinearProvider({});
     await p.markPlanComplete("issue-1", "ENG", { awaitApproval: false });
 
-    expect(fake.calls).toHaveLength(7);
-    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
-    expect(variables(fake, 6).labelIds).toEqual(["lo", "label-pc"]);
+    expect(fake.calls).toHaveLength(5);
+    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", input: { addedLabelIds: ["label-pc"], removedLabelIds: ["lp"] } });
   });
 
   it("creates Plan-Complete with #10B981 when not found", async () => {
     const fake = linear(
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issue: { team: { key: "ENG" } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       // ensureTeamLabel: search returns empty → create
@@ -919,8 +1109,8 @@ describe("LinearProvider.markPlanComplete", () => {
     const p = new LinearProvider({});
     await p.markPlanComplete("issue-1", "ENG", { awaitApproval: false });
 
-    expect(variables(fake, 3)).toEqual({ name: "Plan-Complete" });
-    expect(variables(fake, 4)).toEqual({ teamId: "team-uuid", name: "Plan-Complete", color: "#10B981" });
+    expect(variables(fake, 2)).toEqual({ name: "Plan-Complete" });
+    expect(variables(fake, 3)).toEqual({ teamId: "team-uuid", name: "Plan-Complete", color: "#10B981" });
   });
 });
 
@@ -930,7 +1120,6 @@ describe("LinearProvider.markImplementing", () => {
       data({ issue: { team: { key: "ENG" } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issueUpdate: { success: true } }),
       // state.type fetch returns "started" — not movable, no transition
       data({ issue: { state: { type: "started" } } }),
@@ -939,8 +1128,8 @@ describe("LinearProvider.markImplementing", () => {
     const p = new LinearProvider({});
     await p.markImplementing("issue-1", "ENG");
 
-    expect(fake.calls).toHaveLength(6);
-    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", labelIds: ["label-aw"] });
+    expect(fake.calls).toHaveLength(5);
+    expect(variables(fake, 3)).toEqual({ issueId: "issue-1", input: { addedLabelIds: ["label-aw"] } });
   });
 
   it("does not transition state when issue is in a non-movable state", async () => {
@@ -948,7 +1137,6 @@ describe("LinearProvider.markImplementing", () => {
       data({ issue: { team: { key: "ENG" } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issueUpdate: { success: true } }),
       // state.type "completed" — not movable
       data({ issue: { state: { type: "completed" } } }),
@@ -958,7 +1146,7 @@ describe("LinearProvider.markImplementing", () => {
     await p.markImplementing("issue-1", "ENG");
 
     // 4 setup/label requests + 1 state.type query, but no getInProgressStateId/updateIssueState
-    expect(fake.calls).toHaveLength(6);
+    expect(fake.calls).toHaveLength(5);
   });
 
   it("transitions state to In Progress when issue is in a movable state", async () => {
@@ -966,7 +1154,6 @@ describe("LinearProvider.markImplementing", () => {
       data({ issue: { team: { key: "ENG" } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issueUpdate: { success: true } }),
       // state.type "backlog" — movable
       data({ issue: { state: { type: "backlog" } } }),
@@ -979,8 +1166,8 @@ describe("LinearProvider.markImplementing", () => {
     const p = new LinearProvider({});
     await p.markImplementing("issue-1", "ENG");
 
-    expect(fake.calls).toHaveLength(8);
-    expect(variables(fake, 7)).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
+    expect(fake.calls).toHaveLength(7);
+    expect(variables(fake, 6)).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
   });
 
   it("creates AI-Working label with #F59E0B color when not found", async () => {
@@ -989,7 +1176,6 @@ describe("LinearProvider.markImplementing", () => {
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ issueLabels: { nodes: [] } }),
       data({ issueLabelCreate: { issueLabel: { id: "new-label" } } }),
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issueUpdate: { success: true } }),
       // state.type fetch — not movable to keep the request count minimal
       data({ issue: { state: { type: "started" } } }),
@@ -1019,7 +1205,7 @@ describe("LinearProvider.markPrReady", () => {
       if (query.includes("issueUpdate")) return data({ issueUpdate: { success: true } }) as ReplyInit;
       return data({ commentCreate: { success: true } }) as ReplyInit;
     } }).install();
-    const labelSwap = () => fake.calls.map((c) => JSON.parse(c.body)).find((b) => b.query.includes("issueUpdate"))?.variables.labelIds;
+    const labelSwap = () => fake.calls.map((c) => JSON.parse(c.body)).find((b) => b.query.includes("issueUpdate"))?.variables.input.addedLabelIds;
     return { created, labelSwap };
   };
 
@@ -1041,11 +1227,10 @@ describe("LinearProvider.markPrReady", () => {
 
   it("keeps Ready for Review's label apart from the AI-Working label the same team already resolved", async () => {
     const fake = linear(
-      // markImplementing: team key, team id, AI-Working search, label fetch, update, state (not movable)
+      // markImplementing: team key, team id, AI-Working search, update, state (not movable)
       data({ issue: { team: { key: "ENG" } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ issueLabels: { nodes: [{ id: "label-aw", team: null }] } }),
-      data({ issue: { labels: { nodes: [] } } }),
       data({ issueUpdate: { success: true } }),
       data({ issue: { state: { type: "started" } } }),
       // markPrReady: team key, then its own search, since the team id is cached and its label is not
@@ -1060,8 +1245,8 @@ describe("LinearProvider.markPrReady", () => {
     await p.markImplementing("issue-1", "ENG");
     await p.markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
 
-    expect(variables(fake, 7)).toEqual({ name: "Ready for Review" });
-    expect(variables(fake, 9)).toEqual({ issueId: "issue-1", labelIds: ["label-rfr"] });
+    expect(variables(fake, 6)).toEqual({ name: "Ready for Review" });
+    expect(variables(fake, 8)).toEqual({ issueId: "issue-1", input: { addedLabelIds: ["label-rfr"], removedLabelIds: ["label-aw"] } });
   });
 
   it("swaps AI-Working for Ready for Review atomically and posts a PR comment", async () => {
@@ -1084,7 +1269,7 @@ describe("LinearProvider.markPrReady", () => {
     await p.markPrReady("issue-1", "ENG", "https://github.com/o/r/pull/7");
 
     expect(fake.calls).toHaveLength(6);
-    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", labelIds: ["lo", "label-rfr"] });
+    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", input: { addedLabelIds: ["label-rfr"], removedLabelIds: ["lw"] } });
     expect(variables(fake, 5)).toEqual({
       issueId: "issue-1",
       body: "AI implementation PR: https://github.com/o/r/pull/7",
@@ -1101,10 +1286,6 @@ describe("LinearProvider.parkForHuman", () => {
         { id: "li", name: "AI-Implement" }, { id: "lnh", name: "AI-Needs-Human" },
       ] } } }),
       data({ issueUpdate: { success: true } }),
-      data({ issue: { labels: { nodes: [
-        { id: "lp", name: "AI-Planning" }, { id: "li", name: "AI-Implement" }, { id: "lnh", name: "AI-Needs-Human" },
-      ] } } }),
-      data({ issueUpdate: { success: true } }),
     );
 
     const p = new LinearProvider({});
@@ -1116,14 +1297,13 @@ describe("LinearProvider.parkForHuman", () => {
 
     expect(ensure).toHaveBeenCalledWith("ENG", expect.objectContaining({ name: "AI-Needs-Human" }), expect.any(Map));
     expect(add).toHaveBeenCalledWith("issue-1", "lnh");
-    expect(fake.calls).toHaveLength(5);
-    expect(variables(fake, 4)).toEqual({ issueId: "issue-1", labelIds: ["li", "lnh"] });
+    expect(fake.calls).toHaveLength(3);
+    expect(variables(fake, 2)).toEqual({ issueId: "issue-1", input: { removedLabelIds: ["lw", "lp"] } });
   });
 
   it("puts the marker on before any label comes off", async () => {
     linear(
       data({ issue: { state: { type: "started" }, team: { key: "ENG" } } }),
-      data({ issue: { labels: { nodes: [{ id: "li", name: "AI-Implement" }] } } }),
       data({ issue: { labels: { nodes: [{ id: "li", name: "AI-Implement" }] } } }),
     );
     const p = new LinearProvider({});
@@ -1131,12 +1311,12 @@ describe("LinearProvider.parkForHuman", () => {
     const internals = p as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
     vi.spyOn(internals, "ensureTeamLabel").mockResolvedValue("lnh");
     vi.spyOn(internals, "addLabelToIssue").mockImplementation(async () => { order.push("add"); });
-    const remove = internals.removeLabelByName.bind(p);
-    vi.spyOn(internals, "removeLabelByName").mockImplementation(async (...a: unknown[]) => { order.push("remove"); return remove(...a); });
+    const remove = internals.removeLabelsByName.bind(p);
+    vi.spyOn(internals, "removeLabelsByName").mockImplementation(async (...a: unknown[]) => { order.push("remove"); return remove(...a); });
 
     await p.parkForHuman("issue-1", "ENG", "planning");
 
-    expect(order).toEqual(["add", "remove", "remove"]);
+    expect(order).toEqual(["add", "remove"]);
   });
 
   it.each(["completed", "canceled"])("returns false and changes nothing on a %s issue", async (type) => {
@@ -1148,26 +1328,21 @@ describe("LinearProvider.parkForHuman", () => {
 });
 
 describe("LinearProvider.clearWorkingState", () => {
-  it("removes the AI-Working label from the issue", async () => {
+  it("removes AI-Working and AI-Planning in one issueUpdate, leaving other labels alone", async () => {
     const fake = linear(
-      data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } }),
+      data({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
       data({ issueUpdate: { success: true } }),
-      // second removeLabelByName call for AI-Planning — not present, no mutation
-      data({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } }),
     );
 
     const p = new LinearProvider({});
     await p.clearWorkingState("issue-1", "ENG", "implementation");
 
-    expect(fake.calls).toHaveLength(3);
-    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+    expect(fake.calls).toHaveLength(2);
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", input: { removedLabelIds: ["lw", "lp"] } });
   });
 
-  it("removes the AI-Planning label from the issue", async () => {
+  it("removes only the label the issue carries", async () => {
     const fake = linear(
-      data({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
-      // AI-Working absent — no mutation
-      // second removeLabelByName call for AI-Planning
       data({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } }),
       data({ issueUpdate: { success: true } }),
     );
@@ -1175,35 +1350,16 @@ describe("LinearProvider.clearWorkingState", () => {
     const p = new LinearProvider({});
     await p.clearWorkingState("issue-1", "ENG", "implementation");
 
-    expect(fake.calls).toHaveLength(3);
-    expect(variables(fake, 2)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", input: { removedLabelIds: ["lp"] } });
   });
 
-  it("no-ops (no mutation) when AI-Working label is absent", async () => {
-    const fake = linear(
-      data({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } }),
-      // second removeLabelByName call for AI-Planning — also absent
-      data({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } }),
-    );
+  it.each([[[{ id: "lo", name: "Other" }]], [[]]])("sends no mutation when neither label is present (%j)", async (nodes) => {
+    const fake = linear(data({ issue: { labels: { nodes } } }));
 
     const p = new LinearProvider({});
     await p.clearWorkingState("issue-1", "ENG", "implementation");
 
-    expect(fake.calls).toHaveLength(2);
-  });
-
-  it("no-ops when the issue has no labels at all", async () => {
-    const fake = linear(
-      data({ issue: { labels: { nodes: [] } } }),
-      // second removeLabelByName call for AI-Planning — also empty
-      data({ issue: { labels: { nodes: [] } } }),
-    );
-
-    const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1", "ENG", "implementation");
-
-    // Two labels-fetch queries run; no update mutation when there's nothing to remove
-    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls).toHaveLength(1);
   });
 });
 
@@ -1219,7 +1375,7 @@ describe("LinearProvider.markPlanningFailed", () => {
     const commented = await p.markPlanningFailed("issue-1", "ENG", "GraphQL exploded");
 
     expect(fake.calls).toHaveLength(3);
-    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", input: { removedLabelIds: ["lblP"] } });
     expect(variables(fake, fake.calls.length - 1).body).toContain("Planning failed: GraphQL exploded");
     expect(commented).toBe(true);
   });
@@ -1237,17 +1393,17 @@ describe("LinearProvider.markImplementationFailed", () => {
     const commented = await p.markImplementationFailed("issue-1", "ENG", "tests timed out");
 
     expect(fake.calls).toHaveLength(3);
-    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+    expect(variables(fake, 1)).toEqual({ issueId: "issue-1", input: { removedLabelIds: ["lblW"] } });
     expect(variables(fake, fake.calls.length - 1).body).toContain("Implementation failed: tests timed out");
     expect(commented).toBe(true);
   });
 });
 
 describe("LinearProvider.markMerged", () => {
-  it("moves a started issue to Done and drops the Ready for Review label", async () => {
+  it("moves a started issue to Done and drops the Ready for Review and Plan-Complete labels", async () => {
     const fake = linear(
       // 1. fetch issue state, team key, and labels
-      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }] } } }),
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "LP", name: "Plan-Complete" }, { id: "L2", name: "bug" }] } } }),
       // 2. getTeamIdByKey
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       // 3. getCompletedStateId: workflowStates query
@@ -1260,24 +1416,41 @@ describe("LinearProvider.markMerged", () => {
     await p.markMerged("issue-1", "ENG");
 
     expect(fake.calls).toHaveLength(4);
-    expect(variables(fake, 3)).toMatchObject({ issueId: "issue-1", stateId: "s-done", labelIds: ["L2"] });
+    expect(variables(fake, 3)).toEqual({ issueId: "issue-1", input: { stateId: "s-done", removedLabelIds: ["L1", "LP"] } });
   });
 
-  it("no-ops when the issue is already completed", async () => {
-    const fake = linear(data({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
+  describe.each(["completed", "canceled"])("already %s", (type) => {
+    it.each([
+      ["both", ["Ready for Review", "Plan-Complete"]],
+      ["review only", ["Ready for Review"]],
+      ["plan only", ["Plan-Complete"]],
+    ])("cleans %s labels without a state write or lookup", async (_name, names) => {
+      const fake = linear(
+        data({ issue: { state: { type }, team: { key: "ENG" }, labels: { nodes: [
+          ...names.map((name, i) => ({ id: `cleanup-${i}`, name })),
+          { id: "bug", name: "bug" }, { id: "pickup", name: "AI-Implement" },
+        ] } } }),
+        data({ issueUpdate: { success: true } }),
+      );
 
-    const p = new LinearProvider({});
-    await p.markMerged("issue-1", "ENG");
+      await new LinearProvider({}).markMerged("issue-1", "ENG");
 
-    expect(fake.calls).toHaveLength(1);
+      expect(fake.calls).toHaveLength(2);
+      expect(variables(fake, 1)).toEqual({ issueId: "issue-1", input: { removedLabelIds: names.map((_, i) => `cleanup-${i}`) } });
+      expect(JSON.parse(fake.calls[1].body).query).toContain("issueUpdate");
+      expect(fake.calls.every(call => !JSON.parse(call.body).query.includes("workflowStates"))).toBe(true);
+    });
+
+    it.each([{ nodes: [] }, { nodes: [{ id: "bug", name: "bug" }] }])("does not write when labels are clean (%j)", async ({ nodes }) => {
+      const fake = linear(data({ issue: { state: { type }, team: { key: "ENG" }, labels: { nodes } } }));
+      await new LinearProvider({}).markMerged("issue-1", "ENG");
+      expect(fake.calls).toHaveLength(1);
+    });
   });
 
-  it("no-ops when the issue is already canceled", async () => {
-    const fake = linear(data({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } }));
-
-    const p = new LinearProvider({});
-    await p.markMerged("issue-1", "ENG");
-
+  it("no-ops when the issue is missing", async () => {
+    const fake = linear(data({ issue: null }));
+    await new LinearProvider({}).markMerged("issue-1", "ENG");
     expect(fake.calls).toHaveLength(1);
   });
 
@@ -1296,12 +1469,12 @@ describe("LinearProvider.markMerged", () => {
     const p = new LinearProvider({});
     await p.markMerged("issue-1", "ENG");
 
-    expect(variables(fake, 3).stateId).toBe("s-shipped");
+    expect(variables(fake, 3)).toEqual({ issueId: "issue-1", input: { stateId: "s-shipped" } });
   });
 
-  it("keeps all labels except Ready for Review", async () => {
+  it("removes only Ready for Review and Plan-Complete, and never sends a full label set", async () => {
     const fake = linear(
-      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }, { id: "L3", name: "AI-Implement" }] } } }),
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "LP", name: "Plan-Complete" }, { id: "L2", name: "bug" }, { id: "L3", name: "AI-Implement" }] } } }),
       data({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } }),
       data({ workflowStates: { nodes: [{ id: "s-done", name: "Done", type: "completed" }] } }),
       data({ issueUpdate: { success: true } }),
@@ -1310,7 +1483,8 @@ describe("LinearProvider.markMerged", () => {
     const p = new LinearProvider({});
     await p.markMerged("issue-1", "ENG");
 
-    expect(variables(fake, 3).labelIds).toEqual(["L2", "L3"]);
+    expect(variables(fake, 3).input).toEqual({ stateId: "s-done", removedLabelIds: ["L1", "LP"] });
+    expect(variables(fake, 3)).not.toHaveProperty("labelIds");
   });
 });
 
@@ -1589,7 +1763,7 @@ describe("LinearProvider.fetchSetupFacts", () => {
   });
 });
 
-import { runChildIssueContract } from "./contract.js";
+import { runChildIssueContract, runPrClosedUnmergedContract } from "./contract.js";
 import * as settings from "../../orchestrator-settings.js";
 
 runChildIssueContract("LinearProvider", async () => {
@@ -1642,5 +1816,173 @@ describe("LinearProvider.createChildIssue", () => {
       data({ issueLabels: { nodes: [{ id: "label", name: "Pickup", team: null }] } }),
       data({ issueCreate: { success: false, issue: null } }));
     await expect(new LinearProvider({}).createChildIssue("p", "T", { title: "Title", body: "Body" })).rejects.toThrow(/creation failed/);
+  });
+});
+
+
+describe("LinearProvider.listIssueStatuses", () => {
+  beforeEach(() => {
+    vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("AI-Implement");
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+  const mapping = makeMapping({ teamKey: "ENG" });
+  const node = (type = "started", names = ["AI-Implement"], id = "uuid") => ({
+    id, identifier: "ENG-1", title: "Status", url: "https://api.example/issue",
+    updatedAt: "2026-01-01T12:00:00Z", state: { name: "Workflow", type },
+    labels: { nodes: names.map(name => ({ name })) },
+  });
+  const page = (nodes: ReturnType<typeof node>[] = [], hasNextPage = false, endCursor: string | null = null) =>
+    data({ issues: { nodes, pageInfo: { hasNextPage, endCursor } } });
+
+  it.each([
+    ["canceled", ["AI-Needs-Human"], undefined, undefined],
+    ["completed", ["Ready for Review", "AI-Needs-Human"], "merged", undefined],
+    ["started", ["AI-Working", "AI-Needs-Human", "Ready for Review"], "failed", "AI-Needs-Human"],
+    ["started", ["AI-Working", "Ready for Review"], "pr-ready", "Ready for Review"],
+    ["started", ["Plan-Complete", "AI-Working"], "implementing", "AI-Working"],
+    ["started", ["AI-Planning", "Plan-Complete"], "plan-approved", "Plan-Complete"],
+    ["started", ["AI-Planning"], "planning", "AI-Planning"],
+    ["started", ["AI-Implement"], "ready", "AI-Implement"],
+  ] as const)("normalizes %s with %j", async (type, names, state, first) => {
+    const labels = ["other", ...names, "last"];
+    linear(page([node(type, labels)]), page());
+    const result = await new LinearProvider({ linearWorkspaceUrl: "https://linear.app/acme" }).listIssueStatuses(mapping);
+    if (!state) {
+      expect(result).toEqual([]);
+      expect(result[0]?.state).toBeUndefined();
+      expect(result[0]?.labels[0]).toBeUndefined();
+      expect(result[0]?.phase).toBeUndefined();
+      return;
+    }
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ id: "uuid", identifier: "ENG-1", title: "Status",
+      url: "https://linear.app/acme/issue/ENG-1", state, phase: null,
+      workflowState: "Workflow", updatedAt: Date.parse("2026-01-01T12:00:00Z") });
+    expect(result[0].labels[0]).toBe(first);
+    expect(result[0].labels).toEqual(first ? [first, ...labels.filter(l => l !== first)] : []);
+  });
+
+  it("filters both reads by team and live pickup, with a seven-day completedAt window", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-01-10T00:00:00Z"));
+    const setting = vi.spyOn(settings, "getLinearPickupLabel").mockReturnValue("First");
+    const fake = linear(page(), page(), page(), page());
+    const provider = new LinearProvider({});
+    await provider.listIssueStatuses(mapping);
+    setting.mockReturnValue("Second");
+    await provider.listIssueStatuses(mapping);
+    fake.calls.forEach((call, i) => {
+      const { query, variables: vars } = JSON.parse(call.body);
+      expect(query).toContain("team: { key: { eq: $teamKey } }");
+      expect(query).toContain("labels: { name: { eq: $label } }");
+      expect(query).toContain("id identifier title updatedAt state { name type } labels { nodes { name } }");
+      expect(query).not.toMatch(/\burl\b/);
+      expect(vars).toEqual({ teamKey: "ENG", label: i < 2 ? "First" : "Second", first: 100, after: null,
+        ...(i % 2 ? { since: new Date(Date.now() - ISSUE_STATUS_RECENT_MS).toISOString() } : {}) });
+      expect(query).toContain(i % 2 ? "completedAt: { gte: $since }" : 'state: { type: { nin: ["completed", "canceled", "duplicate"] } }');
+    });
+  });
+
+  it.each([false, true])("omits duplicate issues from either query (recent=%s)", async recent => {
+    const duplicate = page([node("duplicate", ["AI-Implement", "AI-Planning"])]);
+    linear(...(recent ? [page(), duplicate] : [duplicate, page()]));
+    expect(await new LinearProvider({}).listIssueStatuses(mapping)).toEqual([]);
+  });
+
+  it("traverses both queries and deduplicates overlapping ids", async () => {
+    const fake = linear(page([node()], true, "a"), page([node("started", undefined, "second")]),
+      page([node()], true, "b"), page([node("completed", undefined, "third")]));
+    const result = await new LinearProvider({}).listIssueStatuses(mapping);
+    expect(result.map(r => r.id)).toEqual(["uuid", "second", "third"]);
+    expect(fake.calls.map((_, i) => variables(fake, i).after)).toEqual([null, "a", null, "b"]);
+  });
+
+  it.each([false, true])("accepts exactly 20 pages (recent=%s)", async recent => {
+    const pages = Array.from({ length: 20 }, (_, i) => page([node("started", undefined, String(i))], i < 19, String(i)));
+    linear(...(recent ? [page(), ...pages] : [...pages, page()]));
+    expect(await new LinearProvider({}).listIssueStatuses(mapping)).toHaveLength(20);
+  });
+
+  it.each([false, true])("rejects a 21-page result without returning partial data (recent=%s)", async recent => {
+    const pages = Array.from({ length: 21 }, (_, i) => page([node()], true, String(i)));
+    const fake = linear(...(recent ? [page(), ...pages] : pages));
+    await expect(new LinearProvider({}).listIssueStatuses(mapping)).rejects.toThrow(/exceeded 20 pages/);
+    expect(fake.calls).toHaveLength(recent ? 21 : 20);
+  });
+
+  it("rejects a GraphQL failure after a successful page", async () => {
+    linear(page([node()], true, "next"), { json: { errors: [{ message: "bad" }] } });
+    await expect(new LinearProvider({}).listIssueStatuses(mapping)).rejects.toThrow(/GraphQL error/);
+  });
+
+  it("rejects a next page with no cursor", async () => {
+    linear(page([node()], true));
+    await expect(new LinearProvider({}).listIssueStatuses(mapping)).rejects.toThrow(/cursor/);
+  });
+
+  it.each(["auth", "team"])("rejects missing %s before fetching", async missing => {
+    const fake = linear();
+    const provider = new LinearProvider({});
+    if (missing === "auth") __resetLinearAuthForTest();
+    await expect(provider.listIssueStatuses(missing === "team" ? makeMapping({ teamKey: "" }) : mapping))
+      .rejects.toBeInstanceOf(TrackerUnavailableError);
+    expect(fake.calls).toHaveLength(0);
+  });
+});
+
+runPrClosedUnmergedContract("LinearProvider", async (terminal) => {
+  const fake = linear(
+    data({ issue: { state: { type: terminal ? "completed" : "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "review", name: "Ready for Review" }, { id: "plan", name: "Plan-Complete" }, { id: "bug", name: "bug" }] } } }),
+    ...(terminal ? [] : [data({ teams: { nodes: [{ id: "team", key: "ENG" }] } }),
+      data({ workflowStates: { nodes: [{ id: "other", name: "Rejected", type: "canceled" }, { id: "cancel", name: "cAnCeLlEd", type: "canceled" }] } }),
+      data({ commentCreate: { success: true } }), data({ issueUpdate: { success: true } })]),
+  );
+  return { provider: new LinearProvider({}), issueId: "i", scopeKey: "ENG", restartSentence: "To run it again, move the issue back to Todo.",
+    verify: async (terminal, comment) => {
+      expect(fake.calls).toHaveLength(terminal ? 1 : 5);
+      if (!terminal) {
+        expect(variables(fake, 4)).toEqual({ issueId: "i", input: { stateId: "cancel", removedLabelIds: ["review"] } });
+        expect(variables(fake, 3)).toEqual({ issueId: "i", body: comment });
+      }
+    } };
+});
+describe("LinearProvider unmerged close state lookup", () => {
+  it("does not cancel before the explanation comment succeeds", async () => {
+    const fake = linear(
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [] } } }),
+      data({ teams: { nodes: [{ id: "team", key: "ENG" }] } }),
+      data({ workflowStates: { nodes: [{ id: "cancel", name: "Canceled", type: "canceled" }] } }),
+      { json: { errors: [{ message: "comment unavailable" }] } },
+      data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [] } } }),
+      data({ commentCreate: { success: true } }), data({ issueUpdate: { success: true } }),
+    );
+    const provider = new LinearProvider({});
+    await expect(provider.markPrClosedUnmerged("i", "ENG", "url")).rejects.toThrow();
+    expect(JSON.parse(fake.calls[3].body).query).toContain("commentCreate");
+    expect(fake.calls.some(call => JSON.parse(call.body).query.includes("issueUpdate"))).toBe(false);
+    await expect(provider.markPrClosedUnmerged("i", "ENG", "url")).resolves.toBe(true);
+    expect(JSON.parse(fake.calls[5].body).query).toContain("commentCreate");
+    expect(JSON.parse(fake.calls[6].body).query).toContain("issueUpdate");
+  });
+
+  it.each(["canceled", "completed", "duplicate"])("does not write to %s issues", async (type) => {
+    const fake = linear(data({ issue: { state: { type }, team: { key: "ENG" }, labels: { nodes: [{ id: "r", name: "Ready for Review" }] } } }));
+    expect(await new LinearProvider({}).markPrClosedUnmerged("i", "ENG", "url")).toBe(false);
+    expect(fake.calls).toHaveLength(1);
+  });
+  it.each(["Canceled", "CANCELED", "Rejected", ""])("selects canceled state %s or rejects missing state", async (name) => {
+    const fake = linear(data({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [] } } }),
+      data({ teams: { nodes: [{ id: "team", key: "ENG" }] } }),
+      data({ workflowStates: { nodes: name ? [
+        ...(name.toLowerCase() === "canceled" ? [{ id: "other", name: "Rejected", type: "canceled" }] : []),
+        { id: "cancel", name, type: "canceled" },
+        { id: "last", name: "Archived", type: "canceled" },
+      ] : [] } }),
+      data({ commentCreate: { success: true } }), data({ issueUpdate: { success: true } }));
+    const result = new LinearProvider({}).markPrClosedUnmerged("i", "ENG", "url");
+    if (!name) {
+      await expect(result).rejects.toThrow('No "canceled" workflow state');
+      expect(fake.calls).toHaveLength(3);
+    }
+    else { expect(await result).toBe(true); expect(variables(fake, 4).input.stateId).toBe("cancel"); }
   });
 });

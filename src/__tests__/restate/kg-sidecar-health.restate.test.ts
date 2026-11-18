@@ -161,6 +161,16 @@ describe.each(VARIANTS.map(([label]) => label))("KgSidecarHealth (%s)", (label) 
     expect(second?.checkedAt).toBe(2002);
   });
 
+  it("does not notify recovery for an empty store error", async () => {
+    const result = { ...health("", 2500), reachable: true, toolsListed: true };
+    const notify = vi.fn(async () => {});
+    nextProbe = async () => result;
+    nextNotify = notify;
+    onTestFinished(() => { nextNotify = async () => {}; });
+    expect(await check()).toEqual(result);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it("never runs two probes at once", async () => {
     const hold = gate("probe");
     let running = 0;

@@ -516,6 +516,155 @@ describe("SidecarMemoryProvider probe", () => {
     return new SidecarMemoryProvider("http://127.0.0.1:8765/mcp", async () => namespace);
   }
 
+  it("keeps local isError results healthy and passes them through", async () => {
+    vi.stubEnv("KG_BACKEND", "local");
+    try {
+      const p = makeProvider();
+      const result = { isError: true, content: [{ type: "text", text: "bad token" }] };
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ result }));
+      expect((await p.probe()).lastError).toBeNull();
+      queueResponse(200, JSON.stringify({ result }));
+      expect(await p.callKgTool("kg_neighbors", {})).toEqual({ ok: true, result });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  describe("remote store", () => {
+    beforeEach(() => vi.stubEnv("KG_BACKEND", "stardog_run"));
+    afterEach(() => vi.unstubAllEnvs());
+
+    it("keeps a failed tools/list unavailable", async () => {
+      queueConnectionError("ECONNREFUSED");
+      expect((await makeProvider().probe()).lastError).toContain("ECONNREFUSED");
+      expect(sidecarHealth.toolsListed).toBe(false);
+    });
+
+    it("still requires all core tools", async () => {
+      queueResponse(200, toolsListResult([]));
+      expect((await makeProvider().probe()).lastError).toContain("missing");
+      expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it("records a successful boot query as healthy", async () => {
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, neighborsOk());
+      expect(await makeProvider().probe()).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+    });
+
+    it("accepts a boot query timeout and logs the wake-up explanation", async () => {
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueHang();
+      expect(await makeProvider().probe()).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+      expect(log).toHaveBeenCalledWith("[kg] remote store did not answer in 10 s; it is possibly starting");
+    });
+
+    it("preserves a boot store error across list failures and recovery until a user query succeeds", async () => {
+      const p = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }));
+      expect((await p.probe()).lastError).toBe("Error executing tool kg_neighbors: bad token");
+      queueConnectionError("ECONNREFUSED");
+      await p.probe("list-only");
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBe("Error executing tool kg_neighbors: bad token");
+      queueResponse(200, neighborsOk());
+      expect((await p.callKgTool("kg_neighbors", {})).ok).toBe(true);
+      expect(sidecarHealth).toMatchObject({ reachable: true, toolsListed: true, lastError: null });
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBeNull();
+    });
+
+    it.each([{}, { result: null }, { result: false }, { result: [] }, { result: "invalid" }])(
+      "preserves the boot store error after a malformed tool response %j",
+      async (response) => {
+        const p = makeProvider();
+        queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+        queueResponse(200, JSON.stringify({ result: { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] } }));
+        expect((await p.probe()).lastError).toBe("Error executing tool kg_neighbors: bad token");
+        const before = { ...sidecarHealth };
+
+        queueResponse(200, JSON.stringify(response));
+        expect(await p.callKgTool("kg_search", {})).toEqual({ ok: false, error: "KG sidecar error" });
+        expect(sidecarHealth).toEqual(before);
+
+        queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+        expect((await p.probe("list-only")).lastError).toBe("Error executing tool kg_neighbors: bad token");
+        expect(mockHttpRequest).toHaveBeenCalledTimes(4);
+      },
+    );
+
+    it.each([
+      [{ result: { isError: true, content: [{ type: "text", text: "" }, { type: "text", text: "ignored" }] } }, ""],
+      [{ result: { isError: true, content: [{ type: "image" }, { type: "text", text: "x".repeat(250) }, { type: "text", text: "ignored" }] } }, "x".repeat(200)],
+      [{ result: { isError: true, content: [] } }, "store call failed"],
+      [{ error: { message: "x".repeat(250) } }, "x".repeat(200)],
+    ])("records bounded store failures %j", async (response, message) => {
+      const p = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify(response));
+      expect((await p.probe()).lastError).toBe(message);
+      expect(isKgUnavailable()).toBe(true);
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBe(message);
+      expect(isKgUnavailable()).toBe(true);
+    });
+
+    it.each(["handshake", "unparseable"])("clears a transient %s failure after list-only recovery", async (failure) => {
+      const p = makeProvider();
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      if (failure === "handshake") {
+        queueResponse(400, MISSING_SESSION_BODY);
+        queueResponse(500, "failed initialization");
+      } else queueResponse(200, "not json");
+      expect((await p.probe()).lastError).toContain(failure === "handshake" ? "session handshake failed" : "unparseable response");
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBeNull();
+    });
+
+    it("passes through failed tool results without clearing health or re-probing", async () => {
+      const p = makeProvider();
+      const result = { isError: true, content: [{ type: "text", text: "Error executing tool kg_neighbors: bad token" }] };
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      queueResponse(200, JSON.stringify({ result }));
+      await p.probe();
+      const before = { ...sidecarHealth };
+      queueResponse(200, JSON.stringify({ result }));
+      expect(await p.callKgTool("kg_neighbors", {})).toEqual({ ok: true, result });
+      expect(sidecarHealth).toEqual(before);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(3);
+      queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      expect((await p.probe("list-only")).lastError).toBe(result.content[0].text);
+    });
+
+    it("answers a user timeout without changing health or re-probing", async () => {
+      Object.assign(sidecarHealth, { reachable: true, toolsListed: true, lastError: "bad token", checkedAt: 1 });
+      const before = { ...sidecarHealth };
+      queueHang();
+      expect(await makeProvider().callKgTool("kg_search", {})).toEqual({
+        ok: false, error: "The knowledge graph store is starting. Try again in one minute.",
+      });
+      expect(sidecarHealth).toEqual(before);
+      expect(mockHttpRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns the sidecar's JSON-RPC error to a caller", async () => {
+      queueResponse(200, JSON.stringify({ error: { message: "bad query" } }));
+      expect(await makeProvider().callKgTool("kg_search", {})).toEqual({ ok: false, error: "bad query" });
+    });
+
+    it("re-probes after a failed call using tools/list only", async () => {
+      const p = makeProvider();
+      queueConnectionError("ECONNREFUSED");
+      const list = queueResponse(200, toolsListResult(ALL_SIX_TOOLS));
+      const completed = new Promise<void>((resolve) => list.on("finish", resolve));
+      await p.callKgTool("kg_search", {});
+      await completed;
+      expect(mockHttpRequest).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(list.read().toString()).method).toBe("tools/list");
+    });
+  });
+
   it("probe requests carry Accept: application/json, text/event-stream (the transport answers 406 without it)", async () => {
 
     queueResponse(200, JSON.stringify({ jsonrpc: "2.0", id: "probe-tools-list", result: { tools: Object.keys(KG_TOOL_CAPABILITY).map((name) => ({ name })) } }));
