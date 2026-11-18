@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { listLog, getLatestDispatchForPr } from "./log.js";
 import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
+import { findLinkByPr, setLinkOutcome } from "./pr-links.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { acceptReviewFixWebhookEvent } from "./review-fix-queue.js";
 import { recordReviewFinding } from "./review-ledger-store.js";
@@ -448,12 +449,20 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  const match = findMatchingDispatch(repoFullName, branch, prUrl, prNumber);
+  const link = findLinkByPr(repoFullName, prNumber);
 
-  if (!match) {
-    // Not an AI-created PR — ignore silently
+  if (!link) {
+    // Only linked PRs belong to merge reconciliation.
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    res.end(JSON.stringify({ ignored: true, reason: "no pull request link" }));
+    return;
+  }
+
+  setLinkOutcome(repoFullName, prNumber, "merged", Date.now());
+
+  if (link.role === "roll-up") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
     return;
   }
 
@@ -464,15 +473,15 @@ export async function handleGitHubWebhook(
   }
 
   const reconciliationId = enqueueReconciliation({
-    issueId: match.issueId,
-    issueIdentifier: match.issueIdentifier,
+    issueId: link.issue.trackerIssueId,
+    issueIdentifier: link.issue.identifier,
     prNumber,
     repo: repoFullName,
     mergeCommitSha,
   });
 
   console.log(
-    `[webhook] Queued reconciliation #${reconciliationId} for ${match.issueIdentifier} (PR #${prNumber} merged in ${repoFullName})`,
+    `[webhook] Queued reconciliation #${reconciliationId} for ${link.issue.identifier} (PR #${prNumber} merged in ${repoFullName})`,
   );
 
   res.writeHead(200, { "Content-Type": "application/json" });
