@@ -687,7 +687,7 @@ describe("ImplementationRun gap-fill ingress", () => {
       expect(admission.acquire({ dispatchId: "competing-run", mappingKey: "AII",
         scope: { kind: "issue", issueScope: "AII", issueId: "other" },
         kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 }).ok).toBe(true);
-      expect(await deps.reserve(input)).toBe(false);
+      expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
       return { status: "accepted" };
     });
     await drain.drainCommentGapfillQueue(optsFor(mapping));
@@ -720,7 +720,7 @@ describe("ImplementationRun gap-fill ingress", () => {
       kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
     expect(held.ok).toBe(true);
     const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
-    expect(await deps.reserve(submit.mock.calls[0]![1])).toBe(false);
+    expect(await deps.reserve(submit.mock.calls[0]![1])).toEqual({ ok: false, reason: "at_capacity" });
     expect(queue.getCommentGapfillItem(id)?.status).toBe("pending");
   });
 });
@@ -735,4 +735,91 @@ it("selects integration-review plus deduplicated effective gating reviewers only
   expect(drain.rollupReviewMode(queue.ROLLUP_REVIEW_COMMENTER, makeMapping({ reviewers: [
     { id: "integration-review", gates: true }, { id: "code-review", gates: true }, { id: "optional", gates: false },
   ] }))?.reviewers).toEqual([{ id: "integration-review", gates: true }, { id: "code-review", gates: true }]);
+});
+
+ it("bounds admission refusals across explicit drain ticks", async () => {
+  const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+  seedOrigin();
+  const id = seedItem();
+  const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+  admission.acquire({ dispatchId: "held", mappingKey: "AII", scope: { kind: "issue", issueScope: "AII", issueId: "other" }, kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
+  const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
+  submit.mockImplementation(async (_key, input) => { await deps.reserve(input); return { status: "accepted" }; });
+  const opts = optsFor(mapping);
+  for (let tick = 0; tick < 4; tick++) await drain.drainCommentGapfillQueue(opts);
+  expect(opts.postComment).toHaveBeenCalledTimes(1);
+  expect(opts.postComment).toHaveBeenCalledWith(expect.any(String), "acme", "billing", 42, expect.stringContaining("Last reason: at_capacity"));
+  expect(submit).not.toHaveBeenCalled();
+  expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity" }));
+  expect(lines).toHaveBeenCalledWith(expect.stringContaining("at_capacity (3/3, skipped)"));
+ });
+
+it("counts parked automatic rows through three refusals across explicit ticks", async () => {
+  const lines = vi.spyOn(console, "log").mockImplementation(() => {});
+  seedOrigin();
+  const id = seedItem({ commenter: queue.ROLLUP_REVIEW_COMMENTER });
+  breaker.parkIssue("issue-1", "gap-analysis", "pr_budget");
+  for (let tick = 1; tick <= 4; tick++) {
+    await drain.drainCommentGapfillQueue(optsFor());
+    expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({
+      refusalCount: Math.min(tick, 3), lastRefusalReason: "parked",
+      status: tick >= 3 ? "skipped" : "pending",
+    }));
+  }
+  expect(submit).not.toHaveBeenCalled();
+  expect(lines).toHaveBeenCalledWith(expect.stringContaining("parked (3/3, skipped)"));
+});
+
+it("previews budget exhaustion without admission writes and parks the PR", async () => {
+  seedOrigin();
+  const id = seedItem({ commenter: queue.ROLLUP_REVIEW_COMMENTER });
+  const mapping = makeMapping({ owner: "acme", repo: "billing", prDispatchBudget: 1 });
+  const prior = admission.acquire({ dispatchId: "spent-budget", mappingKey: "AII", scope: { kind: "pr", issueId: "issue-1", installationId: "778899", repository: "acme/billing", prNumber: 42 }, kind: "gap-fill", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 10 });
+  if (!prior.ok) throw new Error("seed refused");
+  admission.release(prior.record.dispatchId, prior.record.lifecycleOwner, prior.record.generation, "finalized");
+  const opts = optsFor(mapping);
+  await drain.drainCommentGapfillQueue(opts);
+  expect(submit).not.toHaveBeenCalled();
+  expect(admission.count("AII")).toBe(0);
+  expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ refusalCount: 1, lastRefusalReason: "budget_exhausted" }));
+  expect(breaker.isParked("issue-1", "gap-analysis")).toBe(true);
+  for (let tick = 2; tick <= 4; tick++) {
+    await drain.drainCommentGapfillQueue(opts);
+    expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({
+      refusalCount: Math.min(tick, 3), lastRefusalReason: "budget_exhausted",
+      status: tick >= 3 ? "skipped" : "pending",
+    }));
+  }
+  expect(submit).not.toHaveBeenCalled();
+  expect(opts.postComment).toHaveBeenCalledTimes(1);
+});
+
+it.each(["occupied", "budget_exhausted", "parked", "at_capacity"] as const)("admission preview shares acquire's %s decision without writing", reason => {
+  const request = { dispatchId: "preview", mappingKey: "AII", scope: { kind: "pr" as const, issueId: "issue-1", installationId: "778899", repository: "acme/billing", prNumber: 42 }, kind: "gap-fill" as const, backend: "github-actions" as const, lifecycleOwner: { kind: "legacy" as const }, cap: reason === "at_capacity" ? 0 : 10, parked: reason === "parked", prDispatchBudget: reason === "budget_exhausted" ? 0 : 10 };
+  if (reason === "occupied") expect(admission.acquire({ ...request, dispatchId: "occupant" }).ok).toBe(true);
+  const before = admission.count("AII");
+  const preview = admission.checkAdmission(request);
+  expect(preview).toEqual(expect.objectContaining({ ok: false, reason }));
+  expect(admission.read(request.dispatchId)).toBeNull();
+  expect(admission.count("AII")).toBe(before);
+  expect(admission.acquire(request)).toEqual(preview);
+});
+
+it("skips after three late reservation refusals and never submits a fourth", async () => {
+  seedOrigin();
+  const id = seedItem();
+  const mapping = makeMapping({ owner: "acme", repo: "billing", maxInProgressAiIssues: 1 });
+  const deps = gapfill.createImplementationGapfillDependencies({} as Parameters<typeof gapfill.createImplementationGapfillDependencies>[0], () => mapping);
+  submit.mockImplementation(async (dispatchId, input) => {
+    const competing = admission.acquire({ dispatchId: `race-${dispatchId}`, mappingKey: "AII", scope: { kind: "issue", issueScope: "AII", issueId: "other" }, kind: "implementation", backend: "github-actions", lifecycleOwner: { kind: "legacy" }, cap: 1 });
+    if (!competing.ok) throw new Error("race seed refused");
+    expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
+    // A retry of the same reservation must not burn another refusal.
+    expect(await deps.reserve(input)).toEqual({ ok: false, reason: "at_capacity" });
+    admission.release(competing.record.dispatchId, competing.record.lifecycleOwner, competing.record.generation, "finalized");
+    return { status: "accepted" };
+  });
+  for (let tick = 0; tick < 4; tick++) await drain.drainCommentGapfillQueue(optsFor(mapping));
+  expect(submit).toHaveBeenCalledTimes(3);
+  expect(queue.getCommentGapfillItem(id)).toEqual(expect.objectContaining({ status: "skipped", refusalCount: 3, lastRefusalReason: "at_capacity" }));
 });

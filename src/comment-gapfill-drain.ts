@@ -8,12 +8,13 @@ import type { RepoMapping } from "./config.js";
 import { resolvePrDispatchBudget } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { canDispatch } from "./dispatch-gate.js";
-import { claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
+import { isParked, claimPrBudgetNotice, parkIssue, prBudgetMarker, prBudgetParkMessage, prBudgetTrackerCommentOwed, releasePrBudgetNotice } from "./dispatch-breaker.js";
 import {
+  checkAdmission,
   acquire as acquireAdmission,
   release as releaseAdmission,
 } from "./dispatch-admission.js";
-import { claimPendingCommentGapfills, markCommentGapfillSubmitted, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
+import { MAX_COMMENT_GAPFILL_REFUSALS, getCommentGapfillItem, recordCommentGapfillRefusal, claimPendingCommentGapfills, markCommentGapfillSubmitted, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, getInFlightJobs, type Job } from "./log.js";
 import { hasEphemeralFullAccessOptIn } from "./model-auth-contract.js";
 import { checkForcedPathEligibility, resolveExecutionPath, type RunnerMode } from "./runner-mode.js";
@@ -228,14 +229,33 @@ function resolveInFlightDispatch(owner: string, repo: string, headRef: string | 
   return matches.length > 0 ? matches[matches.length - 1]! : null;
 }
 
+export async function notifyCommentGapfillSkipped(
+  opts: Pick<DrainCommentGapfillsInput, "getInstallationToken" | "listPrComments" | "postComment">,
+  itemId: number,
+): Promise<void> {
+  const item = getCommentGapfillItem(itemId);
+  if (!item || item.status !== "skipped" || item.refusalCount < MAX_COMMENT_GAPFILL_REFUSALS || item.commentId <= 0 || item.commenter === ROLLUP_REVIEW_COMMENTER) return;
+  const marker = `<!-- ai-implement:gapfill-refusal:${item.id} -->`;
+  try {
+    const token = await opts.getInstallationToken(item.owner);
+    const comments = await opts.listPrComments(token, item.owner, item.repo, item.prNumber);
+    if (!comments.some(c => c.body.includes(marker))) {
+      await opts.postComment(token, item.owner, item.repo, item.prNumber,
+        `${marker}\n@${item.commenter} AI-Implement stopped retrying your request after ${item.refusalCount} admission refusals. Last reason: ${item.lastRefusalReason}. Please post /ai-implement again when this condition clears.`);
+    }
+  } catch (err) {
+    console.error(`[comment-gapfill] Failed to post refusal notice for item #${item.id}:`, err);
+  }
+}
+
 /**
  * Fires whenever the gate returns `pr_budget` for a gap-fill dispatch, whoever
  * parked the row. Posts one PR comment per park (also when the breaker parked
  * first) and a tracker comment unless the breaker's trip comment already reached
  * the tracker, both best-effort. Never throws.
  */
-async function firePrBudgetPark(
-  opts: DrainCommentGapfillsInput,
+export async function firePrBudgetPark(
+  opts: Pick<DrainCommentGapfillsInput, "getInstallationToken" | "listPrComments" | "postComment" | "postTrackerComment">,
   mapping: RepoMapping,
   issueId: string,
   owner: string,
@@ -385,10 +405,9 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         prDispatchBudget: prBudget,
         humanRequested,
       });
-      if (!gateDecision.ok) {
-        if (gateDecision.reason === "pr_budget") {
-          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
-        }
+      // The dispatch log can detect work not represented by an admission yet.
+      // Policy refusals must reach the shared preview and bounded refusal path.
+      if (!gateDecision.ok && gateDecision.reason === "in_flight") {
         console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
         continue;
       }
@@ -409,6 +428,32 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       const installationId = String(await opts.getInstallationId(item.owner));
       const dispatchId = crypto.randomUUID();
       const backend = execPath === "both" ? "github-actions" : execPath;
+      const admission = checkAdmission({ dispatchId, mappingKey: scopeKey,
+        scope: { kind: "pr", issueId: prLog.issueId, installationId, repository: fullRepo, prNumber: item.prNumber },
+        kind: "gap-fill", backend, lifecycleOwner: { kind: "restate", attemptId: dispatchId },
+        cap: mapping.maxInProgressAiIssues, prDispatchBudget: prBudget, humanRequested,
+        parked: isParked(prLog.issueId, "gap-analysis") });
+      if (!admission.ok) {
+        recordCommentGapfillRefusal(item.id, admission.reason, dispatchId);
+        await notifyCommentGapfillSkipped(opts, item.id);
+        if (admission.reason === "budget_exhausted" || (!gateDecision.ok && gateDecision.reason === "pr_budget")) {
+          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+        }
+        continue;
+      }
+      // Preserve safeguards for historical dispatch-log rows which predate admissions,
+      // but count those policy refusals too rather than leaving rows pending forever.
+      if (!gateDecision.ok) {
+        const reason = gateDecision.reason === "pr_budget" ? "budget_exhausted"
+          : gateDecision.reason === "team_capacity" ? "at_capacity" : gateDecision.reason;
+        recordCommentGapfillRefusal(item.id, reason, dispatchId);
+        await notifyCommentGapfillSkipped(opts, item.id);
+        if (reason === "budget_exhausted") {
+          await firePrBudgetPark(opts, mapping, prLog.issueId, item.owner, item.repo, item.prNumber, prBudget);
+        }
+        console.log(`[comment-gapfill] Deferring item #${item.id} for PR #${item.prNumber}: ${gateDecision.reason}`);
+        continue;
+      }
       const submitted = await (opts.implementationRun ?? createImplementationRunIngressClient()).submit(dispatchId, {
         dispatchId,
         teamKey: scopeKey,
