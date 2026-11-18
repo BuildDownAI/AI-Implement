@@ -1049,7 +1049,7 @@ async function handleRunnerResultInternal(
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
   const owned = readAdmission(preflight.claims.dispatchId)?.lifecycleOwner.kind === "restate";
-  // Review-only delivery must retain its credential until pre-write failures can be retried.
+  // Review-only delivery retains its credential while discovery or a saved notice needs retry.
   const verified = owned || body.reviewOnly === true ? preflight : verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     console.warn(
@@ -1184,7 +1184,7 @@ async function handleRunnerResultInternal(
       await fileRollupReviewChild(input, provider, job, mappingTeamKey, claims.issueId, () => { trackerWriteReserved = true; });
     } catch (err) {
       warn("roll-up-review", err);
-      if (!trackerWriteReserved) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
+      if (!trackerWriteReserved || err instanceof RollupNoticeDeliveryError) return { status: 503, body: { error: "Roll-up review follow-up unavailable", warnings } };
     }
     if (!owned) verifyAndConsumeRunToken(bearerToken, input.secret);
     if (job) updateJobStatus(job.id, body.outcome === "success" ? "completed" : "failed", "rollup_review", undefined, { skipAdmissionRelease: true });
@@ -2130,6 +2130,36 @@ export async function resubmitPendingGapFillReviews(opts: {
 
 const ROLLUP_REVIEW_CHILD_LIMIT = 2;
 
+class RollupNoticeDeliveryError extends Error {}
+
+interface RollupNotice {
+  headSha: string;
+  commentId: number;
+  text: string;
+  delivered: boolean;
+}
+
+/** Replay only the saved notice: tracker reservations and discovery are never revisited. */
+async function deliverRollupNotice(token: string, owner: string, repo: string, prNumber: number,
+  key: string, notice: RollupNotice): Promise<void> {
+  if (notice.delivered) return;
+  try {
+    const comments = await listPrComments(token, owner, repo, prNumber, { strict: true });
+    const verdict = comments.find(c => c.id === notice.commentId);
+    if (!verdict) throw new Error("Cannot find roll-up verdict comment");
+    // A response can be lost after GitHub applied the edit. Read before writing on every retry.
+    if (!verdict.body.includes(notice.text)) {
+      const marker = "<!-- roll-up-review follow-up -->";
+      await updatePrComment(token, owner, repo, notice.commentId,
+        verdict.body.split(marker)[0].trimEnd() + "\n\n" + notice.text);
+    }
+    getDb().prepare("UPDATE settings SET value = ? WHERE key = ?")
+      .run(JSON.stringify({ ...notice, delivered: true }), key);
+  } catch (err) {
+    throw new RollupNoticeDeliveryError(`Roll-up notice delivery pending: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 /** Tracker discovery supplies identity; settings reservations bound concurrent/ambiguous creates without a schema change. */
 async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: TicketingProvider, job: Job | null,
   scopeKey: string, parentId: string, onTrackerWriteReserved: () => void): Promise<void> {
@@ -2154,7 +2184,23 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   if (!mapping || mapping.owner !== owner || mapping.repo !== repo) return;
   const verdictMatch = review.verdictUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)#issuecomment-(\d+)$/);
   if (!verdictMatch || verdictMatch[1] !== owner || verdictMatch[2] !== repo || Number(verdictMatch[3]) !== prNumber) return;
-  const token = await getInstallationToken(input.watchdogConfig.githubAppId, input.watchdogConfig.githubAppPrivateKey, owner);
+  // Complete verdicts share a receipt across dispatches for the same head/comment.
+  // Incomplete reviews retain their own wording (for example, retry queued vs exhausted).
+  const noticeKey = `roll-up-review:notice:${owner}/${repo}#${prNumber}:${review.headSha}:${verdictMatch[4]}:${complete ? "complete" : job.dispatchId}`;
+  const saved = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(noticeKey) as { value: string } | undefined;
+  const savedNotice = saved ? JSON.parse(saved.value) as RollupNotice : undefined;
+  if (savedNotice?.delivered) return;
+  let token: string;
+  try {
+    token = await getInstallationToken(input.watchdogConfig.githubAppId, input.watchdogConfig.githubAppPrivateKey, owner);
+  } catch (err) {
+    if (savedNotice) throw new RollupNoticeDeliveryError("Roll-up notice authentication unavailable");
+    throw err;
+  }
+  if (savedNotice) {
+    await deliverRollupNotice(token, owner, repo, prNumber, noticeKey, savedNotice);
+    return;
+  }
   const pr = await getPullRequestState(token, owner, repo, prNumber);
   if (!pr) throw new Error("Cannot read roll-up PR state");
   const branch = pr.headRef?.match(/^ai-implement\/(?:feature|multi-issue)\/(.+)$/);
@@ -2195,9 +2241,6 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
     // Closure can race the tracker write; the independent poll sweep also retries this cleanup.
     await reconcileRollupReviewChildren(provider, mapping, scopeKey, input.watchdogConfig);
   }
-  const comments = await listPrComments(token, owner, repo, prNumber, { strict: true });
-  const verdict = comments.find(c => c.id === Number(verdictMatch[4]));
-  if (!verdict) throw new Error("Cannot find roll-up verdict comment");
   const marker = "<!-- roll-up-review follow-up -->";
   const failedReviewers = Array.isArray(review.failedReviewers)
     ? review.failedReviewers.filter((id): id is string => typeof id === "string" && !!id.trim()) : [];
@@ -2223,5 +2266,8 @@ async function fileRollupReviewChild(input: HandleRunnerResultInput, provider: T
   const notice = `${marker}\n\n${resultNotice}` +
     (reservation.count >= ROLLUP_REVIEW_CHILD_LIMIT
       ? ` The automatic follow-up limit (${ROLLUP_REVIEW_CHILD_LIMIT} children per roll-up PR) is reached; a person must decide any further fixes.` : "");
-  await updatePrComment(token, owner, repo, verdict.id, verdict.body.split(marker)[0].trimEnd() + "\n\n" + notice);
+  const record: RollupNotice = { headSha: review.headSha, commentId: Number(verdictMatch[4]), text: notice, delivered: false };
+  getDb().prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").run(noticeKey, JSON.stringify(record));
+  const pending = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(noticeKey) as { value: string };
+  await deliverRollupNotice(token, owner, repo, prNumber, noticeKey, JSON.parse(pending.value) as RollupNotice);
 }

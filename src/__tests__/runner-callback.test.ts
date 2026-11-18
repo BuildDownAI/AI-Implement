@@ -6779,6 +6779,7 @@ describe("roll-up review follow-up children", () => {
       log.updateJobPrUrl(id, "https://github.com/org/repo/pull/12");
       const deliver = () => runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, secret: SECRET,
         resolveProvider: makeResolve(provider), submitLateExternalReview: submit,
+        checkImplementationAdmissionTermination: async () => ({ status: "accepted" }),
         watchdogConfig: { githubAppId: "1", githubAppPrivateKey: "key", notifyType: "slack", notifyWebhookUrl: null },
         body: { phase: "gap-analysis", outcome, reviewOnly: true, comments: [], internalFindings,
           rollupReview: { headSha: head.repeat(40), verdictUrl: "https://github.com/org/repo/pull/12#issuecomment-99", failedReviewers, incompleteReviews } } });
@@ -6932,17 +6933,58 @@ describe("roll-up review follow-up children", () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
-  it("acknowledges failures after creation and unsupported child discovery", async () => {
-    const { prepare, create, update, provider } = await setup();
+  it("retries a durable notice after child creation without filing or posting twice", async () => {
+    const { prepare, create, update, listing } = await setup();
     update.mockRejectedValueOnce(new Error("comment unavailable"));
-    const { deliver } = await prepare("a");
-    expect((await deliver()).status).toBe(200);
+    const { deliver, dispatchId } = await prepare("a");
+    expect((await deliver()).status).toBe(503);
     expect(create).toHaveBeenCalledOnce();
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toMatchObject({ headSha: "a".repeat(40), commentId: 99, delivered: false });
+    const originalText = update.mock.calls[0][4];
+    listing.mockRejectedValue(new Error("tracker discovery unavailable"));
+    expect((await deliver()).status).toBe(200);
+    expect(update.mock.calls[1][4]).toBe(originalText);
+    expect(create).toHaveBeenCalledOnce();
+    const second = await prepare("a");
+    expect((await second.deliver()).status).toBe(200);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it.each(["read", "missing", "lost-response"])("retains and retries a notice after %s with Restate ownership", async failure => {
+    const { prepare, create, update } = await setup();
+    const gh = await import("../github.js");
+    const { deliver, dispatchId } = await prepare("a");
+    expect(dispatchAdmission.acquire({ dispatchId, mappingKey: "ENG",
+      scope: { kind: "issue", issueScope: "ENG", issueId: "i" }, kind: "implementation",
+      backend: "github-actions", lifecycleOwner: { kind: "restate", attemptId: dispatchId }, cap: 1 }).ok).toBe(true);
+    const comments = vi.mocked(gh.listPrComments);
+    if (failure === "read") comments.mockRejectedValueOnce(new Error("comments unavailable"));
+    if (failure === "missing") comments.mockResolvedValueOnce([]);
+    if (failure === "lost-response") update.mockImplementationOnce(async (_token, _owner, _repo, id, body) => {
+      comments.mockResolvedValue([{ id, body }]);
+      throw new Error("response lost after edit");
+    });
+    expect((await deliver()).status).toBe(503);
+    expect(log.getJobByDispatchId(dispatchId)?.status).not.toBe("completed");
+    expect(create).toHaveBeenCalledOnce();
+    expect((await deliver()).status).toBe(200);
+    expect(log.getJobByDispatchId(dispatchId)?.status).toBe("completed");
+    expect((await deliver()).status).toBe(200);
+    expect(update).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key LIKE 'roll-up-review:notice:%'").get() as { value: string };
+    expect(JSON.parse(row.value)).toMatchObject({ delivered: true });
+  });
+
+  it("keeps unsupported child discovery advisory", async () => {
+    const { prepare, create, provider } = await setup();
     Object.assign(provider, { listIssuesPage: undefined });
     const next = await prepare("b");
     expect((await next.deliver()).status).toBe(200);
-    expect(create).toHaveBeenCalledOnce();
-    expect(update).toHaveBeenCalledTimes(2);
+    expect(create).not.toHaveBeenCalled();
   });
 
   it("parks a child if the PR closes during creation", async () => {
