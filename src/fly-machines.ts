@@ -1,3 +1,4 @@
+import type { ImplementationSandbox } from "./implementation-launch.js";
 import crypto from "node:crypto";
 
 import {
@@ -712,6 +713,7 @@ export interface SessionMachineInput {
   teamKey?: string;
   teamSecretNames?: string[]; // full prefixed secret names from the Fly app (e.g. ["ENG_DATABASE_URL"])
   allTeamKeys?: string[]; // all known team keys across all mappings, used to identify foreign secrets
+  implementationSandbox?: ImplementationSandbox;
   flyProcessLevelSecrets?: boolean; // when true, use processes[].secrets + ignore_app_secrets (see FLY_PROCESS_LEVEL_SECRETS)
   minSecretsVersion?: number;
   orchestratorUrl?: string;
@@ -749,6 +751,18 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   const protectedBootstrap = input.protectedModelBootstrap;
   const verifiedSecretsVersion = protectedBootstrap ? validateProtectedInput(input, protectedBootstrap) : undefined;
 
+  const policy = protectedBootstrap?.runConfig.credentials?.executionPolicy;
+  if (policy && ((input.purpose ?? "session") !== "session" || !input.flyProcessLevelSecrets)) {
+    throw new Error("Fly execution policy requires a session with process-level secrets");
+  }
+  if (policy && (policy.backend !== "fly" || policy.dispatchId !== protectedBootstrap!.sealed.dispatchId || policy.projectKey !== protectedBootstrap!.projectKey)) {
+    throw new Error("Fly execution policy binding mismatch");
+  }
+  const sandbox = input.implementationSandbox ?? (policy ? { sandbox: "runner-isolated" } : { sandbox: "agent-default", reason: "unprotected" });
+  if ((sandbox.sandbox === "runner-isolated") !== Boolean(policy)) {
+    throw new Error("Fly implementation sandbox policy mismatch");
+  }
+
   const env: Record<string, string> = {
     ISSUE_ID: input.issueId,
     ISSUE_IDENTIFIER: input.issueIdentifier,
@@ -785,8 +799,8 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     env.RUN_PUBLICATION_TOKEN = input.runPublicationToken;
   }
   if (input.extraEnv && Object.keys(input.extraEnv).some(isEphemeralPolicyEnvName)) {
-    // The ephemeral full-access opt-in is GHA-only (AII-1437): refuse before any machine is created.
-    throw new Error("ephemeral full-access opt-in is not supported on Fly machines");
+    // Policies must arrive through protected credentials, never project environment.
+    throw new Error("execution policy environment names are not supported on Fly machines; use protected credentials");
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);
@@ -816,6 +830,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     auto_destroy: false,
     restart: { policy: "no" },
     metadata: {
+      implementation_sandbox: sandbox.sandbox === "runner-isolated" ? sandbox.sandbox : `agent-default:${sandbox.reason}`,
       [DURABLE_RUNNER_PURPOSE_KEY]: input.purpose ?? "session",
       ...(input.pipeline ? { [DURABLE_RUNNER_PIPELINE_KEY]: input.pipeline } : {}),
       ...(input.dispatchId ? { [DURABLE_RUNNER_DISPATCH_ID_KEY]: input.dispatchId } : {}),

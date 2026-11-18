@@ -20,6 +20,7 @@ import * as githubAuth from "../../github-app-auth.js";
 import * as githubApi from "../../github.js";
 import * as workflowProbe from "../../workflow-probe.js";
 import * as managedAuth from "../../managed-dispatch-auth.js";
+import { makeSnapshot } from "../helpers/fixtures/configured-run.js";
 import { makeMapping } from "../helpers/builders.js";
 import { initMappingsTable, upsertMapping, deleteMapping, type RepoMapping } from "../../config.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
@@ -199,7 +200,10 @@ vi.mock("../../local-docker.js", async (original) => ({ ...await original<typeof
 containerEdges.launch = async (input) => {
   const fixture = findFixture(input.reviewFix.repository);
   // Mirror each transport's before-launch callback without changing worker bookkeeping.
-  if (input.flySessionsApp !== undefined) input.onBeforeLaunch(undefined, "container-nonce");
+  if (input.flySessionsApp !== undefined) {
+    expect(input.implementationSandbox).toEqual(input.decision.kind !== "launch" ? { sandbox: "agent-default", reason: "unprotected" } : process.env.FLY_PROCESS_LEVEL_SECRETS === "false" ? { sandbox: "agent-default", reason: "process-secrets-off" } : { sandbox: "runner-isolated" });
+    input.onBeforeLaunch(undefined, "container-nonce");
+  }
   else input.onBeforeLaunch("container-nonce");
   try { await fixture.dispatchImpl({} as never); }
   finally {
@@ -429,7 +433,7 @@ const ghaWorker = new GithubReviewFixWorker({
   }),
 });
 
-const containerWorker = new ContainerReviewFixWorker({ credentials: fakeCredentials,
+const containerWorker = new ContainerReviewFixWorker({ modelAuthRuntime: {} as never, credentials: fakeCredentials,
   scopeStore: reviewFixAttemptStoreScopeStore(sqliteStore),
   callbackInputs: async () => ({ runner_callback_url: "https://orchestrator.test", run_token: "result" }),
   fly: { flySessionsToken: "fly", flySessionsApp: "sessions", flySessionsRegion: null, flyOrchestratorApp: null,
@@ -763,6 +767,30 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
         }
       } finally { replacement?.close(); await env.stop(); }
     }, 60000);
+
+  it.each(VARIANTS.flatMap(([label]) => [true, false].flatMap(protectedLaunch => [true, false].map(secrets => ({ label, protectedLaunch, secrets })))))("Fly sandbox $label protected=$protectedLaunch secrets=$secrets stays inside launch-once", async ({ label, protectedLaunch, secrets }) => {
+    const env = envFor(label);
+    const fixture = freshScenario("sandbox");
+    getDb().prepare("UPDATE mappings SET execution_mode = ? WHERE owner = ?").run("fly-machines", fixture.scope.repository.split("/")[0]);
+    vi.stubEnv("FLY_PROCESS_LEVEL_SECRETS", String(secrets));
+    const managed = vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(protectedLaunch);
+    const prepare = vi.spyOn(managedAuth, "prepareManagedDispatch").mockResolvedValue({ kind: "launch", dispatchId: "private", projectKey: "sandbox", backend: "fly-machines", snapshot: makeSnapshot(), fallbackModels: {}, grant: {} as never, takeBootstrap: () => undefined });
+    const settleLaunch = vi.spyOn(managedAuth, "settleLaunch").mockImplementation(() => ({ revoked: false }));
+    try {
+      await admitOne(env, fixture, [{ findingKey: "f1", version: 1 }]);
+      await eventually(() => fixture.runId !== null, Boolean, { label: "sandbox launch" });
+      const attemptId = latestAttemptRow(fixture.scope)!.attemptId;
+      await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "cancel");
+      fixture.runDetail = { status: "completed", conclusion: "cancelled", runAttempt: 1 };
+      await attachWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId);
+      expect(fixture.dispatchCalls).toBe(1);
+      const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ReviewFixAttempt' AND target_service_key = '${attemptId}' AND target_handler_name = 'run'`);
+      const text = journalText(await journalEntries(env.adminAPIBaseUrl(), String(rows[0]!.id)));
+      for (const secret of ["container-nonce", "executionPolicy", "ephemeral-full-access"]) expect(text).not.toContain(secret);
+    } finally {
+      managed.mockRestore(); prepare.mockRestore(); settleLaunch.mockRestore(); vi.unstubAllEnvs();
+    }
+  }, 60_000);
 
   it.each(VARIANTS.map(([label]) => label))("mixed Legacy/Restate team capacity defers a Restate admission and release wakes it (%s)", async (label) => {
     const env = envFor(label);
@@ -1463,7 +1491,7 @@ describe("Restate review-fix pilot: production-composition fault matrix", () => 
       { timeoutMs: 8_000, label: "launch-once journaled result" },
     );
     const launchText = journalText(launchJournal!);
-    for (const token of launchTokens) expect(launchText).not.toContain(token);
+    for (const token of [...launchTokens, "container-nonce", "executionPolicy", "ephemeral-full-access"]) expect(launchText).not.toContain(token);
     await callWorkflow(env.baseUrl(), "ReviewFixAttempt", attemptId, "result", result);
     fixture.runDetail = { status: "completed", conclusion: "success", runAttempt: 1 };
     const done = await attachWorkflow<ReviewFixAttemptCompletion>(env.baseUrl(), "ReviewFixAttempt", attemptId);

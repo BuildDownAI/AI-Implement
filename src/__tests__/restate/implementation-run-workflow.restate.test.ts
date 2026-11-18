@@ -9,7 +9,7 @@
 import { getDb } from "../../dedup.js";
 import { initMappingsTable } from "../../config.js";
 import { initDispatchBreakerTable } from "../../dispatch-breaker.js";
-import { initSettingsTable } from "../../runner-mode.js";
+import { initSettingsTable, setFlyProcessLevelSecrets } from "../../runner-mode.js";
 import { initLogTable } from "../../log.js";
 import { toRecordedUsage } from "../../agent-usage.js";
 import type { OwnedRunReportResult } from "../../restate/owned-run-lifecycle.js";
@@ -319,8 +319,15 @@ describe("ImplementationRun durable workflow", () => {
     return { dispatchId, sc, done, read, report };
   }
 
-  it.each(["github-actions", "fly-machines", "local-docker"] as const)("%s gap-fill finishes once and releases its reservation without journaling credentials", async backend => {
-    const label = labels[0]!;
+  it.each(labels.flatMap(label =>
+    (["github-actions", "fly-machines", "local-docker"] as const).flatMap(backend =>
+      (backend === "fly-machines" ? [true, false] : [true]).flatMap(secrets =>
+        (backend === "fly-machines" ? [true, false] : [true]).map(protectedLaunch => ({ label, backend, secrets, protectedLaunch }))
+      )
+    )
+  ))("$backend gap-fill $label secrets=$secrets protected=$protectedLaunch finishes without journaling credentials", async ({ backend, label, secrets, protectedLaunch }) => {
+    setFlyProcessLevelSecrets(secrets);
+    onTestFinished(() => setFlyProcessLevelSecrets(true));
     const nonce = "NONCE-SENTINEL";
     const bootstrap = "BOOTSTRAP-SENTINEL";
     onTestFinished(() => { vi.restoreAllMocks(); });
@@ -328,10 +335,10 @@ describe("ImplementationRun durable workflow", () => {
     const minted = vi.spyOn(runnerTokens, "mintLaunchTokens").mockReturnValue({ runToken: SECRET_TOKEN, runProgressToken: SECRET_TOKEN, runPublicationToken: SECRET_TOKEN });
     vi.spyOn(auth, "getInstallationToken").mockResolvedValue(SECRET_TOKEN);
     vi.spyOn(auth, "getScopedInstallationToken").mockResolvedValue({ token: SECRET_TOKEN } as Awaited<ReturnType<typeof auth.getScopedInstallationToken>>);
-    vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(true);
+    vi.spyOn(managedAuth, "isManagedProject").mockReturnValue(protectedLaunch);
     const takeBootstrap = vi.fn(() => ({ bearer: bootstrap }) as ReturnType<Extract<managedAuth.ManagedDispatchDecision, { kind: "launch" }>["takeBootstrap"]>);
     const decision = { kind: "launch", dispatchId: "private", projectKey: "ENG", backend, snapshot: {} as never, fallbackModels: {}, grant: {} as never, takeBootstrap } as Extract<managedAuth.ManagedDispatchDecision, { kind: "launch" }>;
-    const managed = vi.spyOn(gapfillDrain, "resolveManagedDecision").mockResolvedValue(decision);
+    const managed = vi.spyOn(gapfillDrain, "resolveManagedDecision").mockResolvedValue(protectedLaunch ? decision : { kind: "legacy" });
     vi.spyOn(gapfillDrain, "gapfillAccounting").mockResolvedValue({ trackerKind: "linear", issueUrl: "https://tracker.test/ENG-1" });
     const prepared = vi.spyOn(gapfillLaunch, "prepareGhaGapfillLaunch").mockImplementation(async args => {
       expect(args.ghToken).toBe(SECRET_TOKEN);
@@ -344,10 +351,11 @@ describe("ImplementationRun durable workflow", () => {
       return { success: true, status: 200, runId: 987654 };
     });
     const fly = vi.spyOn(gapfillLaunch, "dispatchFlyGapfill").mockImplementation(async args => {
+      expect(args.implementationSandbox).toEqual(!protectedLaunch ? { sandbox: "agent-default", reason: "unprotected" } : secrets ? { sandbox: "runner-isolated" } : { sandbox: "agent-default", reason: "process-secrets-off" });
       expect(args.githubToken).toBe(SECRET_TOKEN);
       expect(args.runToken).toBe(SECRET_TOKEN);
-      expect(args.decision).toBe(decision);
-      expect(args.decision.kind === "launch" && args.decision.takeBootstrap()!.bearer).toBe(bootstrap);
+      expect(args.decision.kind).toBe(protectedLaunch ? "launch" : "legacy");
+      if (protectedLaunch) expect(args.decision.kind === "launch" && args.decision.takeBootstrap()!.bearer).toBe(bootstrap);
       args.onBeforeLaunch({} as never, nonce, "runner:test");
       return { machine: { id: "fly-gapfill", nonce, bootstrap }, resolvedImage: "runner:test" } as unknown as Awaited<ReturnType<typeof gapfillLaunch.dispatchFlyGapfill>>;
     });
@@ -361,7 +369,7 @@ describe("ImplementationRun durable workflow", () => {
     });
     const production = createImplementationGapfillDependencies({ config: {
       githubAppId: "app", githubAppPrivateKey: "key", runnerCallbackBaseUrl: "https://callback.test", runnerTokenSecret: "secret",
-      flySessionsToken: SECRET_TOKEN, flySessionsApp: "sessions", sessionImage: "runner:test", localRunnerImage: "runner:test",
+      anthropicApiKey: "synthetic-key", flySessionsToken: SECRET_TOKEN, flySessionsApp: "sessions", sessionImage: "runner:test", localRunnerImage: "runner:test",
     } } as ImplementationRunProductionInput, () => mapping);
     const queueItemId = enqueueCommentGapfill({ owner: "Org", repo: "repo", prNumber: 42, commentId: 900000 + counter, commenter: "human", instruction: "Fix review findings" });
     const w = begin(slow, label, { status: "ended", row: makeJob({ status: "completed" }),
@@ -377,7 +385,7 @@ describe("ImplementationRun durable workflow", () => {
     expect(getJobByDispatchId(w.dispatchId)).toMatchObject({ executionMode: backend });
     expect(minted).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ dispatchId: w.dispatchId }));
     expect(managed).toHaveBeenCalledTimes(1);
-    expect(takeBootstrap).toHaveBeenCalledTimes(1);
+    expect(takeBootstrap).toHaveBeenCalledTimes(protectedLaunch ? 1 : 0);
     expect(prepared).toHaveBeenCalledTimes(backend === "github-actions" ? 1 : 0);
     expect(gha).toHaveBeenCalledTimes(backend === "github-actions" ? 1 : 0);
     expect(fly).toHaveBeenCalledTimes(backend === "fly-machines" ? 1 : 0);
@@ -387,7 +395,7 @@ describe("ImplementationRun durable workflow", () => {
     const rows = await queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'ImplementationRun' AND target_service_key = '${w.dispatchId}'`);
     expect(rows.length).toBeGreaterThan(0);
     const text = (await Promise.all(rows.map(async row => journalText(await journalEntries(env.adminAPIBaseUrl(), String(row.id)))))).join("\n");
-    for (const sentinel of [SECRET_TOKEN, nonce, bootstrap]) expect(text).not.toContain(sentinel);
+    for (const sentinel of [SECRET_TOKEN, nonce, bootstrap, "executionPolicy", "ephemeral-full-access"]) expect(text).not.toContain(sentinel);
   }, 60_000);
 
   it.each(labels)("accepts an empty HTTP report body (%s)", async (label) => {

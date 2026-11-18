@@ -20,7 +20,7 @@ import { acquireDispatch } from "../dispatch-gate.js";
 import { read as readAdmission } from "../dispatch-admission.js";
 import type { AppConfig } from "../index.js";
 import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
-import { getRunnerMode } from "../runner-mode.js";
+import { getFlyProcessLevelSecrets, getRunnerMode } from "../runner-mode.js";
 import type { TicketIssue, TicketingProvider } from "../providers/types.js";
 import { cancelWorkflowRun, defaultFetchSignal, getPullRequestState, getWorkflowRunStatus } from "../github.js";
 import { getInstallationToken } from "../github-app-auth.js";
@@ -53,6 +53,7 @@ import {
   settleLaunch,
   type ManagedDispatchDecision,
 } from "../managed-dispatch-auth.js";
+import { decideImplementationSandbox } from "../implementation-launch.js";
 import type {
   launchImplementationFlySession,
   launchImplementationLocalSession,
@@ -431,7 +432,7 @@ export function createProductionImplementationRunServices(input: ImplementationR
         },
       };
       launched = execPath === "fly-machines"
-        ? await input.launchImplementationFlySession({ ...args, shadow: false })
+        ? await input.launchImplementationFlySession({ ...args, shadow: false, implementationSandbox: decideImplementationSandbox({ protectedLaunch: ctx.managedDecision.kind === "launch", processLevelSecrets: getFlyProcessLevelSecrets().enabled }) })
         : await input.launchImplementationLocalSession(args);
     } catch (err) {
       const outcome = classifyLaunchError(execPath, launchAttempted, err);
