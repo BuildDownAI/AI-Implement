@@ -1,3 +1,4 @@
+import { getDb } from "./dedup.js";
 import { ROLLUP_REVIEW_COMMENTER } from "./comment-gapfill-queue.js";
 import { resolveReviewerSelection } from "./config.js";
 import { createImplementationRunIngressClient, type ImplementationRunIngressClient } from "./restate/implementation-run-client.js";
@@ -325,29 +326,28 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
+      // Share one read between terminal-state detection and branch identity recovery.
+      const ghToken = await opts.getInstallationToken(item.owner);
+      let pr: Awaited<ReturnType<typeof getPullRequestState>>;
+      try {
+        pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
+      } catch (err) {
+        console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
+        continue;
+      }
+      if (!pr) continue;
+      if (pr.merged || pr.state === "closed") {
+        const reason = pr.merged ? "pr_merged" : "pr_closed";
+        getDb().prepare(`UPDATE comment_gapfill_queue SET status = 'skipped',
+          last_refusal_reason = ?, processed_at = MAX(?, COALESCE(processed_at + 1, 0))
+          WHERE id = ? AND status = 'pending'`).run(reason, Date.now(), item.id);
+        console.log(`[comment-gapfill] Skipped item #${item.id} for PR #${item.prNumber}: ${reason}`);
+        continue;
+      }
+
       let prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
       if (!prLog) {
-        // One PR read per item serves both fallbacks.
-        let headRef: string | null = null;
-        let prReadOk = false;
-        const ghToken = await opts.getInstallationToken(item.owner);
-        try {
-          const pr = await getPullRequestState(ghToken, item.owner, item.repo, item.prNumber);
-          if (pr) {
-            prReadOk = true;
-            headRef = pr.headRef;
-          }
-        } catch (err) {
-          console.warn(`[comment-gapfill] could not read PR #${item.prNumber} in ${fullRepo}:`, err);
-        }
-        if (!prReadOk) {
-          await opts.postComment(
-            ghToken, item.owner, item.repo, item.prNumber,
-            "AI-Implement could not read this PR from GitHub just now, so it cannot tell which run it belongs to. Please repost the `/ai-implement` comment.",
-          );
-          markCommentGapfillProcessed(item.id, "failed");
-          continue;
-        }
+        const headRef = pr.headRef;
         // Roll-up fallback: the top-of-tree feature→base PR is opened by merge-up, not
         // by a dispatch, so it has no row of its own — but its head branch encodes the
         // feature-node parent's key (ai-implement/<mode>/<key-slug>), and that parent's
