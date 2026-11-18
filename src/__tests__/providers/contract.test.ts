@@ -7,7 +7,6 @@ runProviderContract("FakeProvider", async ({ initialIssues }: { initialIssues: T
   return new FakeProvider({ initialIssues });
 });
 
-
 runChildIssueContract("FakeProvider", async () => {
   const parent = { id: "parent", identifier: "TEST-1", title: "Parent", description: "", scopeKey: "TEAM", nativeStatus: "Ready" };
   const provider = new FakeProvider({ initialIssues: [parent] });
