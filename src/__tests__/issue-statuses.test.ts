@@ -112,6 +112,19 @@ describe("listIssueStatuses", () => {
     expect(await s.list()).toMatchObject([{ state: "failed", phase: phase === "planning" ? "planning" : "implementation" }]);
   });
 
+  it("removes the park overlay from cached Linear status immediately after unpark", async () => {
+    const s = await setup();
+    const underlying = record({ state: "implementing", phase: "implementation" });
+    s.read.mockResolvedValue([underlying]);
+    expect(await s.list()).toMatchObject([{ tracker: "linear", state: "implementing" }]);
+    s.breaker.parkIssue("internal", "planning", "failure");
+    expect(await s.list()).toMatchObject([{ state: "failed", phase: "planning" }]);
+    expect(s.breaker.unpark("internal")).toBe(true);
+    expect(await s.list()).toMatchObject([{ tracker: "linear", state: "implementing", phase: "implementation" }]);
+    expect(s.read).toHaveBeenCalledTimes(1);
+    expect(underlying).toEqual(record({ state: "implementing", phase: "implementation" }));
+  });
+
   it("reads parks once and uses the newest phase, refreshing overlays on cache hits", async () => {
     const s = await setup();
     const spy = vi.spyOn(s.breaker, "listParked");

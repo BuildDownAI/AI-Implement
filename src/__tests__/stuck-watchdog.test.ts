@@ -1,3 +1,5 @@
+import { parkIssue } from "../dispatch-breaker.js";
+vi.mock("../dispatch-breaker.js", () => ({ parkIssue: vi.fn() }));
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Job } from "../log.js";
 import { makeJob, makeProvider } from "./helpers/builders.js";
@@ -54,6 +56,7 @@ const stuckJob = (overrides: Partial<Job> = {}) => makeJob({ issueId: "issue-abc
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(parkIssue).mockReset();
   // Default: getJobById returns a job with null conclusion (no callback yet)
   vi.mocked(getJobById).mockReturnValue(stuckJob({ conclusion: null }));
 });
@@ -437,7 +440,7 @@ describe("remediateStuckJob — Restate-owned job", () => {
 
 describe("boundedCleanup give-up — parkForHuman", () => {
   const GIVE_UP = 4;
-  const linearLine = "To start AI-Implement again, remove the AI-Needs-Human label from the ticket.";
+  const linearLine = "To start AI-Implement again, unpark the issue at /admin#runners.";
   const resetLine = "To start AI-Implement again, reset the AI-Implement status or label on the ticket.";
 
   beforeEach(() => {
@@ -450,16 +453,31 @@ describe("boundedCleanup give-up — parkForHuman", () => {
 
     expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "implementation");
     expect(provider.clearWorkingState).not.toHaveBeenCalled();
-    const park = vi.mocked(provider.parkForHuman).mock.invocationCallOrder[0];
+    expect(parkIssue).toHaveBeenCalledWith("issue-abc", "implementation", "failure");
+    const park = vi.mocked(parkIssue).mock.invocationCallOrder[0];
     expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(park);
     expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
     expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+  });
+
+  it("keeps dedup and the counter when persisting the Linear park fails", async () => {
+    vi.mocked(parkIssue).mockImplementationOnce(() => { throw new Error("database unavailable"); });
+    await remediateFailedJob(mockConfig, makeProvider(), stuckJob(), "failure");
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(resetStuckAttempts).not.toHaveBeenCalled();
   });
 
   it("planning give-up parks with the planning phase", async () => {
     const provider = makeProvider();
     await remediateFailedJob(mockConfig, provider, stuckJob({ phase: "planning" }), "failure");
     expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", "planning");
+    expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", "planning", "failure");
+    const park = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(park);
   });
 
   it("the timeout path (remediateStuckJob) gives up the same way", async () => {
@@ -487,7 +505,7 @@ describe("boundedCleanup give-up — parkForHuman", () => {
     expect(notifyStuckGiveUp).toHaveBeenCalledOnce();
   });
 
-  it("on Linear the give-up comment ends with the remove-the-marker line", async () => {
+  it("on Linear the give-up comment ends with the admin unpark instruction", async () => {
     const provider = makeProvider({ id: "linear" });
     await remediateFailedJob(mockConfig, provider, stuckJob(), "failure");
     const body = vi.mocked(provider.postComment).mock.calls[0][1];
@@ -556,13 +574,20 @@ describe("remediateFailedJob — runner image pull failure", () => {
     );
   });
 
-  it("on Linear the image-pull comment's restart step removes the marker", async () => {
+  it.each(["implementation", "planning"])("Linear %s image-pull give-up persists before cleanup and explains unpark", async (phase) => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(2);
     vi.mocked(getFailedContainerInitJob).mockResolvedValueOnce(initFailure);
     const provider = makeProvider({ id: "linear" });
-    await remediateFailedJob(mockConfig, provider, ghaJob(), "failure");
+    await remediateFailedJob(mockConfig, provider, ghaJob({ phase }), "failure");
+    expect(provider.parkForHuman).toHaveBeenCalledWith("issue-abc", "ENG", phase);
+    expect(parkIssue).toHaveBeenCalledExactlyOnceWith("issue-abc", phase, "runner_image_pull_failed");
+    const park = vi.mocked(parkIssue).mock.invocationCallOrder[0];
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(resetStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(vi.mocked(deleteDispatched).mock.invocationCallOrder[0]).toBeGreaterThan(park);
+    expect(vi.mocked(resetStuckAttempts).mock.invocationCallOrder[0]).toBeGreaterThan(park);
     const body = vi.mocked(provider.postComment).mock.calls[0][1];
-    expect(body).toContain("3. To start AI-Implement again, remove the AI-Needs-Human label from the ticket.");
+    expect(body).toContain("3. To start AI-Implement again, unpark the issue at /admin#runners.");
   });
 
   it("falls back to 'the resolved runner image' when sessionImage is unset", async () => {

@@ -1,3 +1,6 @@
+import { checkTrackerWrites } from "../../tracker-write-gate.js";
+import { initDispatchBreakerTable, parkIssue, unpark } from "../../dispatch-breaker.js";
+import { getDb } from "../../dedup.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as mappingConfig from "../../config.js";
 import { LinearGraphQLError, LinearLabelWriteError, LinearProvider } from "../../providers/linear.js";
@@ -17,6 +20,8 @@ import { linearData as data, linearGraphql } from "../helpers/replies/linear.js"
 // and seed a token before every test so the provider's requests carry `Bearer test-token`, and
 // no mint round-trip is injected into the request counts these assertions rely on.
 beforeEach(() => {
+  initDispatchBreakerTable();
+  getDb().exec("DELETE FROM dispatch_breaker");
   configureLinearAuth("client-id", "client-secret");
   __setLinearTokenForTest("test-token");
 });
@@ -44,7 +49,7 @@ describe("LinearProvider", () => {
 });
 
 describe("LinearProvider.ensureLifecycleLabels", () => {
-  const names = ["AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review", "AI-Needs-Human"];
+  const names = ["AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review"];
   const team = () => data({ teams: { nodes: [{ id: "team-eng" }] } });
   const found = (id: string) => data({ issueLabels: { nodes: [{ id, team: { id: "team-eng" } }] } });
 
@@ -52,12 +57,23 @@ describe("LinearProvider.ensureLifecycleLabels", () => {
     const fake = linear(team(), ...names.map(found));
     const provider = new LinearProvider({});
     await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
-    expect(fake.calls).toHaveLength(6);
+    expect(fake.calls).toHaveLength(5);
     expect(variables(fake, 0)).toEqual({ key: "ENG" });
     expect(fake.calls.slice(1).map((_, i) => variables(fake, i + 1))).toEqual(names.map(name => ({ name })));
     expect(fake.calls.every(call => !JSON.parse(call.body).query.includes("mutation"))).toBe(true);
     await expect(provider.ensureLifecycleLabels("ENG")).resolves.toEqual({ ok: true });
-    expect(fake.calls).toHaveLength(6);
+    expect(fake.calls).toHaveLength(5);
+  });
+
+  it("dispatches with only four existing labels when label creation is forbidden", async () => {
+    const fake = linear(team(), ...names.map(found));
+    const park = vi.fn();
+    expect(await checkTrackerWrites({
+      provider: new LinearProvider({}), issue: { id: "test", identifier: "TEST-12", scopeKey: "TEST" },
+      phase: "planning", park, comment: vi.fn(), log: vi.fn(),
+    })).toBe("dispatch");
+    expect(park).not.toHaveBeenCalled();
+    expect(fake.calls.every(call => !JSON.parse(call.body).query.includes("mutation"))).toBe(true);
   });
 
   it.each([true, false])("stops at a refused Plan-Complete create, forwarding permanent=%s, and retries there", async (permanent) => {
@@ -816,9 +832,10 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     expect(snap.readyForImplementation).toEqual([]);
   });
 
-  it("skips issues parked for a human (AI-Needs-Human), even with the pickup label", async () => {
+  it("skips record-parked issues until unparked", async () => {
+    parkIssue("a", "planning", "stuck");
     singlePage([
-      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "AI-Needs-Human"] }),
+      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement"] }),
       issueNode({ id: "b", identifier: "ENG-2", labels: ["AI-Implement"] }),
     ]);
 
@@ -826,11 +843,15 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
 
     expect(snap.needsPlanning.map((i) => i.id)).toEqual(["b"]);
     expect(snap.readyForImplementation).toEqual([]);
+    unpark("a");
+    singlePage([issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "AI-Needs-Human"] })]);
+    expect((await new LinearProvider({}).fetchAIImplementSnapshot()).needsPlanning.map(i => i.id)).toEqual(["a"]);
   });
 
-  it("does not count a half-parked issue (AI-Working + AI-Needs-Human) against capacity", async () => {
+  it("does not count a record-parked working issue against capacity", async () => {
+    parkIssue("a", "implementation", "stuck");
     singlePage([
-      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "AI-Working", "AI-Needs-Human"] }),
+      issueNode({ id: "a", identifier: "ENG-1", labels: ["AI-Implement", "AI-Working"] }),
       issueNode({ id: "b", identifier: "ENG-2", labels: ["AI-Implement", "AI-Working"] }),
     ]);
 
@@ -1278,7 +1299,7 @@ describe("LinearProvider.markPrReady", () => {
 });
 
 describe("LinearProvider.parkForHuman", () => {
-  it("adds AI-Needs-Human first, removes AI-Working and AI-Planning, and keeps the pickup label", async () => {
+  it("adds no labels, removes active labels, and keeps pickup and legacy labels", async () => {
     const fake = linear(
       data({ issue: { state: { type: "started" }, team: { key: "ENG" } } }),
       data({ issue: { labels: { nodes: [
@@ -1295,28 +1316,10 @@ describe("LinearProvider.parkForHuman", () => {
 
     await expect(p.parkForHuman("issue-1", "ENG", "implementation")).resolves.toBe(true);
 
-    expect(ensure).toHaveBeenCalledWith("ENG", expect.objectContaining({ name: "AI-Needs-Human" }), expect.any(Map));
-    expect(add).toHaveBeenCalledWith("issue-1", "lnh");
+    expect(ensure).not.toHaveBeenCalled();
+    expect(add).not.toHaveBeenCalled();
     expect(fake.calls).toHaveLength(3);
     expect(variables(fake, 2)).toEqual({ issueId: "issue-1", input: { removedLabelIds: ["lw", "lp"] } });
-  });
-
-  it("puts the marker on before any label comes off", async () => {
-    linear(
-      data({ issue: { state: { type: "started" }, team: { key: "ENG" } } }),
-      data({ issue: { labels: { nodes: [{ id: "li", name: "AI-Implement" }] } } }),
-    );
-    const p = new LinearProvider({});
-    const order: string[] = [];
-    const internals = p as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
-    vi.spyOn(internals, "ensureTeamLabel").mockResolvedValue("lnh");
-    vi.spyOn(internals, "addLabelToIssue").mockImplementation(async () => { order.push("add"); });
-    const remove = internals.removeLabelsByName.bind(p);
-    vi.spyOn(internals, "removeLabelsByName").mockImplementation(async (...a: unknown[]) => { order.push("remove"); return remove(...a); });
-
-    await p.parkForHuman("issue-1", "ENG", "planning");
-
-    expect(order).toEqual(["add", "remove"]);
   });
 
   it.each(["completed", "canceled"])("returns false and changes nothing on a %s issue", async (type) => {
@@ -1654,7 +1657,7 @@ describe("LinearProvider.fetchSetupFacts", () => {
     expect(query).not.toMatch(/\bmutation\b/);
     expect(variables(fake, 0)).toEqual({
       keys: ["ENG", "OPS"],
-      names: ["AI-Implement", "AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review", "AI-Needs-Human"].map((name) => ({ name: { eqIgnoreCase: name } })),
+      names: ["AI-Implement", "AI-Planning", "Plan-Complete", "AI-Working", "Ready for Review"].map((name) => ({ name: { eqIgnoreCase: name } })),
     });
   });
 
@@ -1691,7 +1694,6 @@ describe("LinearProvider.fetchSetupFacts", () => {
         "Plan-Complete": [],
         "AI-Working": [{ name: "ai-working", teamKey: "ENG" }],
         "Ready for Review": [{ name: "Ready for Review", teamKey: null }],
-        "AI-Needs-Human": [],
       },
     });
   });
@@ -1836,8 +1838,8 @@ describe("LinearProvider.listIssueStatuses", () => {
 
   it.each([
     ["canceled", ["AI-Needs-Human"], undefined, undefined],
-    ["completed", ["Ready for Review", "AI-Needs-Human"], "merged", undefined],
-    ["started", ["AI-Working", "AI-Needs-Human", "Ready for Review"], "failed", "AI-Needs-Human"],
+    ["completed", ["Ready for Review"], "merged", undefined],
+    ["started", ["AI-Working", "AI-Needs-Human", "Ready for Review"], "pr-ready", "Ready for Review"],
     ["started", ["AI-Working", "Ready for Review"], "pr-ready", "Ready for Review"],
     ["started", ["Plan-Complete", "AI-Working"], "implementing", "AI-Working"],
     ["started", ["AI-Planning", "Plan-Complete"], "plan-approved", "Plan-Complete"],

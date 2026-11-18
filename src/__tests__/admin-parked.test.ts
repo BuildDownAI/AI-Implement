@@ -6,6 +6,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as BreakerModule from "../dispatch-breaker.js";
 import { makeMapping, makeRegistry } from "./helpers/builders.js";
+import { linearData, linearGraphql } from "./helpers/replies/linear.js";
 import { testDb } from "./helpers/test-db.js";
 
 vi.mock("../notify.js", async (importOriginal) => ({
@@ -284,6 +285,41 @@ describe("POST /api/parked/unpark", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ unparked: true });
     expect(breaker.isParked("issue-to-unpark", "implementation")).toBe(false);
+  });
+
+  it("restores Linear snapshot eligibility and dispatch admission after HTTP unpark", async () => {
+    const [{ LinearProvider }, auth, gate] = await Promise.all([
+      import("../providers/linear.js"), import("../linear-app-auth.js"), import("../dispatch-gate.js"),
+    ]);
+    auth.configureLinearAuth("client-id", "client-secret");
+    auth.__setLinearTokenForTest("test-token");
+    config.upsertMapping("AII", makeMapping());
+    const node = {
+      id: "linear-issue", identifier: "AII-1", title: "Retry me", description: null,
+      team: { id: "team-aii", key: "AII" }, state: { id: "todo", name: "Todo", type: "unstarted" },
+      labels: { nodes: [{ id: "pickup", name: "AI-Implement" }, { id: "plan", name: "Plan-Complete" }] },
+      inverseRelations: { nodes: [] }, children: { nodes: [] }, parent: null,
+    };
+    const page = () => linearData({ issues: { nodes: [node], pageInfo: { hasNextPage: false, endCursor: null } } });
+    linearGraphql(page(), page()).install();
+    const provider = new LinearProvider({});
+    const input = { issueId: node.id, kind: "implementation" as const, teamKey: "AII", maxInProgressAiIssues: 1 };
+    breaker.parkIssue(node.id, "implementation", "failure");
+    const parked = await provider.fetchAIImplementSnapshot();
+    expect(parked.readyForImplementation).toEqual([]);
+    expect(parked.needsPlanning).toEqual([]);
+    expect(gate.canDispatch(input)).toEqual({ ok: false, reason: "parked" });
+    const admission = { ...input, dispatchId: "retry", issueIdentifier: node.identifier, backend: "github-actions" as const };
+    expect(gate.acquireDispatch(admission)).toMatchObject({ ok: false, reason: "parked" });
+
+    const res = await makeRequest("/api/parked/unpark", "POST", await login(), { issueId: node.id });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ unparked: true });
+    expect((await provider.fetchAIImplementSnapshot()).readyForImplementation.map(issue => issue.id)).toEqual([node.id]);
+    expect(gate.canDispatch(input)).toEqual({ ok: true });
+    const admitted = gate.acquireDispatch(admission);
+    expect(admitted.ok).toBe(true);
+    if (admitted.ok) admitted.release("launch_rejected");
   });
 
   it("returns { unparked: false } when the issue was not parked", async () => {

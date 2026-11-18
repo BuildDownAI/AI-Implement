@@ -79,7 +79,7 @@ Teams are processed alphabetically. Duplicate identifiers keep the alphabeticall
 | Tracker condition, in precedence order | State |
 |---|---|
 | Workflow type `completed` | `merged` |
-| Label `AI-Needs-Human` | `failed` |
+| Orchestrator park record | `failed` |
 | Label `Ready for Review` | `pr-ready` |
 | Label `AI-Working` | `implementing` |
 | Label `Plan-Complete` | `plan-approved` |

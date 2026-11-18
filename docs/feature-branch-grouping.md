@@ -61,7 +61,7 @@ testing                                  (repo base branch)
 | `Plan-Complete` | Planning finished and approved → the issue is ready for implementation. | Orchestrator via the **runner callback** (`runner-callback.ts` → `markPlanComplete`) |
 | `AI-Working` | Implementation in flight. Counts against capacity; the issue is skipped while present. | Orchestrator on implementation dispatch |
 | `Ready for Review` | An implementation PR is open. The issue is skipped (waiting on the human to merge). | Orchestrator when the PR is detected |
-| `AI-Needs-Human` | The stuck watchdog gave up on the issue (`parkForHuman`). The issue is skipped until a human removes this label. It keeps `AI-Implement`, so it stays in the grouping tree and, while not terminal, holds its parent's roll-up. | Orchestrator on give-up |
+| Park record | The stuck watchdog gave up on the issue (`parkForHuman`). The issue is skipped until an operator unparks it at `/admin#runners`. It keeps `AI-Implement`, so it stays in the grouping tree and, while not terminal, holds its parent's roll-up. | Orchestrator on give-up |
 
 When a PR merges, the orchestrator moves the issue to **Done** via `markMerged` — driven by
 a poll detector (guaranteed, runs every tick) and optionally accelerated by a webhook delivery
@@ -78,7 +78,7 @@ classifies each one (`src/providers/linear.ts`, `fetchAIImplementSnapshot`):
 
 | Condition | Class | Action |
 |-----------|-------|--------|
-| `AI-Needs-Human` present (checked before the capacity count) | parked | skipped, not counted for capacity |
+| Park record present (checked before the capacity count) | parked | skipped, not counted for capacity |
 | `AI-Working` or `AI-Planning` present | in-progress | counted for capacity, skipped |
 | `Ready for Review` present | in review | skipped |
 | blocked by an open "blocks" relation | blocked | skipped |

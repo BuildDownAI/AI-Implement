@@ -27,7 +27,7 @@ function linearIssue(initial: Label[], opts: { stateType?: string } = {}) {
     { id: "label-rfr", name: "Ready for Review" },
     { id: "label-planning", name: "AI-Planning" },
     { id: "label-aw", name: "AI-Working" },
-    { id: "label-nh", name: "AI-Needs-Human" },
+    { id: "label-nh", name: "Other" },
   ];
   const state = { live: [...initial], readLabels: [...initial] as Label[] | null };
   const writes: Input[] = [];
@@ -84,8 +84,8 @@ describe("Linear label writes never replace the full label set", () => {
   });
 
   it("a stale read in markMerged does not restore a label removed meanwhile", async () => {
-    const linear = linearIssue([{ id: "label-rfr", name: "Ready for Review" }, { id: "lx", name: "AI-Needs-Human" }]);
-    linear.state.live = linear.state.live.filter((l) => l.name !== "AI-Needs-Human");
+    const linear = linearIssue([{ id: "label-rfr", name: "Ready for Review" }, { id: "lx", name: "Other" }]);
+    linear.state.live = linear.state.live.filter((l) => l.name !== "Other");
 
     await new LinearProvider({}).markMerged("issue-1", "SAN");
 
