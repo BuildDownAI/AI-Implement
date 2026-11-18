@@ -1,29 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
+let links: typeof import("../pr-links.js");
+let config: typeof import("../config.js");
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `log-job-updates-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  log.initLogTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ dedup, log, links, config } = (await testDb({ modules: { dedup: () => import("../dedup.js"), log: () => import("../log.js"), links: () => import("../pr-links.js"), config: () => import("../config.js") } })).modules);
 });
 
 describe("updateJobStatus pr_url handling", () => {
@@ -66,6 +53,14 @@ describe("updateJobStatus CASE guard — runner_approved conclusion survives mon
     const job = log.getJobById(id);
     expect(job?.status).toBe("completed");
     expect(job?.conclusion).toBe("operator_cancelled");
+  });
+
+  it("preserves external_review_pending against monitor writes (AII-1304)", () => {
+    const id = log.appendLog({ issueId: "i-pend", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "external_review_pending", "https://github.com/o/r/pull/11");
+    log.updateJobStatus(id, "failed", "failure", null);
+    log.updateJobStatus(id, "completed", "success", null);
+    expect(log.getJobById(id)?.conclusion).toBe("external_review_pending");
   });
 
   it("updates conclusion when not in the protected set", () => {
@@ -201,7 +196,8 @@ describe("stampJobApproved", () => {
 
   it("clears machine_nonce so the row is not exempt from the retention sweep", () => {
     const id = log.appendLog({ issueId: "sa3", issueIdentifier: "AII-202", executionMode: "github-actions" });
-    log.updateJobMachineDetails(id, { machineNonce: "nonce-abc", machineId: "m1" });
+    log.setJobMachineNonce(id, "nonce-abc");
+    log.setJobMachineId(id, "m1");
     expect(log.getJobById(id)?.machineNonce).toBe("nonce-abc");
     log.stampJobApproved(id, "https://github.com/o/r/pull/3");
     expect(log.getJobById(id)?.machineNonce).toBeNull();
@@ -334,12 +330,36 @@ describe("appendLog retains pilot-correlated rows beyond MAX_LOG_ENTRIES (AII-79
     expect(log.getJobById(id)).toBeNull();
   });
 
+  it.each(["fly-machines", "local-docker"])("prunes bound %s history and retains unbound history", (backend) => {
+    const db = dedup.getDb();
+    const old = Date.now() - SEVEN_DAYS_MS - 1_000;
+    const ids = [null, "execution-1"].map((executionRef, index) => {
+      const dispatchId = `dispatch-backend-${index}`;
+      const attemptId = `attempt-backend-${index}`;
+      const id = log.appendLog({ issueId: `backend-${index}`, dispatchId });
+      insertReviewFixAttempt(attemptId, dispatchId, old, { githubRunId: null, prNumber: 60 + index });
+      db.prepare("UPDATE review_fix_attempts SET execution_backend = ?, execution_ref = ? WHERE attempt_id = ?")
+        .run(backend, executionRef, attemptId);
+      db.prepare(`INSERT INTO dispatch_admissions
+        (dispatch_id, mapping_key, issue_scope, issue_id, lifecycle_owner, phase, backend, created_at, released_at)
+        VALUES (?, 'APP', 'pr', ?, 'restate', 'implementation', ?, 10, ?)`)
+        .run(dispatchId, `backend-${index}`, backend, old);
+      log.updateJobStatus(id, "completed");
+      db.prepare("UPDATE dispatch_log SET completed_at = ? WHERE id = ?").run(old, id);
+      db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(old, id);
+      ageOut(id);
+      return id;
+    });
+    floodWithUnrelatedJobs(501);
+    expect(log.getJobById(ids[0]!)).not.toBeNull();
+    expect(log.getJobById(ids[1]!)).toBeNull();
+  });
+
   it("holds old pilot history while ownership evidence remains unresolved", () => {
     const db = dedup.getDb();
     const old = Date.now() - SEVEN_DAYS_MS - 1_000;
     const cases = [
       { name: "reservation", prNumber: 51 },
-      { name: "delivery", prNumber: 52 },
       { name: "conflict", prNumber: 53 },
       { name: "execution", prNumber: 54 },
     ];
@@ -359,11 +379,6 @@ describe("appendLog retains pilot-correlated rows beyond MAX_LOG_ENTRIES (AII-79
        pr_number, lifecycle_owner, phase, backend, created_at)
       VALUES ('dispatch-reservation', 'APP', 'pr', 'issue-reservation', '7', 'acme/app',
               51, 'restate', 'implementation', 'github-actions', 10)`).run();
-    db.prepare(`INSERT INTO review_fix_inbox
-      (authenticated_source, event_id, installation_id, repository, pr_number,
-       kind, payload_json, payload_hash, accepted_at, delivery_state)
-      VALUES ('github-webhook', 'event-delivery', '7', 'acme/app', 52,
-              'feedback', '{}', 'hash', 10, 'pending')`).run();
 
     floodWithUnrelatedJobs(501);
     for (const id of ids) expect(log.getJobById(id)).not.toBeNull();
@@ -411,5 +426,128 @@ describe("listLog strips evidence tails", () => {
     // The single-job read keeps the full record, untouched.
     expect(log.getJobById(id)?.failure?.evidence.truncated).toBe(false);
     expect(log.getJobById(id)?.failure?.evidence.stdoutTail).toBe("full tail, not actually truncated");
+  });
+});
+
+describe("late_review_pending outbox (AII-1362)", () => {
+  const rows = () => dedup.getDb().prepare("SELECT * FROM late_review_pending").all() as Array<Record<string, unknown>>;
+
+  it("moves attempt_review_pending rows at every boot without overwriting", () => {
+    const db = dedup.getDb();
+    const ins = db.prepare("INSERT INTO attempt_review_pending (attempt_id, dispatch_id, pr_url, created_at) VALUES (?, ?, ?, ?)");
+    ins.run("a", "d", "https://github.com/o/r/pull/1", 1234);
+    log.initLogTable();
+    expect(rows()).toEqual([{ workflow_key: "d-a", dispatch_id: "d", pr_url: "https://github.com/o/r/pull/1", head_sha: null, attempt_id: "a", created_at: 1234 }]);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM attempt_review_pending").get()).toEqual({ n: 0 });
+    ins.run("a", "d", "https://github.com/o/r/pull/1", 9999);
+    log.initLogTable();
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0]!.created_at).toBe(1234);
+  });
+
+  it("is idempotent per key, drops rows older than the window and clears by key", () => {
+    log.recordPendingLateReview({ workflowKey: "k", dispatchId: "k", prUrl: "u", headSha: "s" }, 100);
+    log.recordPendingLateReview({ workflowKey: "k", dispatchId: "k", prUrl: "u", headSha: "s" }, 500);
+    log.recordPendingLateReview({ workflowKey: "old", dispatchId: "old", prUrl: "u" }, 10);
+    expect(log.getPendingLateReviews(50)).toEqual([{ workflowKey: "k", dispatchId: "k", prUrl: "u", headSha: "s", attemptId: null }]);
+    expect(rows()).toHaveLength(1);
+    log.clearPendingLateReview("k");
+    expect(rows()).toEqual([]);
+  });
+});
+
+describe("late_review_pending head upgrade (AII-1596)", () => {
+  const head = (k: string) => log.getPendingLateReviews(0).find((r) => r.workflowKey === k)?.headSha;
+
+  it("fills a headless row from a repeat record and keeps an existing head", () => {
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u" }, 100);
+    expect(head("h")).toBeNull();
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u", headSha: "a".repeat(40) }, 200);
+    expect(head("h")).toBe("a".repeat(40));
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u", headSha: "b".repeat(40) }, 300);
+    expect(head("h")).toBe("a".repeat(40));
+    log.recordPendingLateReview({ workflowKey: "h", dispatchId: "h", prUrl: "u" }, 400);
+    expect(head("h")).toBe("a".repeat(40));
+  });
+});
+
+describe("prune keeps recently finished rows (AII-1564)", () => {
+  it("keeps a finished row younger than 7 days beyond 500 rows and prunes an older one", () => {
+    const db = dedup.getDb();
+    const recent = log.appendLog({ issueId: "recent", dispatchId: "recent" });
+    const old = log.appendLog({ issueId: "old", dispatchId: "old" });
+    const now = Date.now();
+    db.prepare("UPDATE dispatch_log SET completed_at = ?, status = 'completed' WHERE id = ?").run(now - 24 * 3600_000, recent);
+    db.prepare("UPDATE dispatch_log SET completed_at = ?, status = 'completed' WHERE id = ?").run(now - 8 * 24 * 3600_000, old);
+    // The trigger stamps the wall clock on the writes above; pin the change times afterwards.
+    db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(now - 24 * 3600_000, recent);
+    db.prepare("UPDATE dispatch_log SET changed_at = ? WHERE id = ?").run(now - 8 * 24 * 3600_000, old);
+    for (let i = 0; i < 510; i++) log.appendLog({ issueId: `n${i}` });
+    expect(log.getJobById(recent)).not.toBeNull();
+    expect(log.getJobById(old)).toBeNull();
+  });
+});
+
+
+afterEach(() => vi.restoreAllMocks());
+
+describe("job pull request links", () => {
+  const url = "https://github.com/o/r/pull/42";
+  function job(teamKey: string | undefined = "ENG", trackerKind?: string) {
+    config.upsertMapping("ENG", makeMapping());
+    return log.appendLog({ issueId: "issue-link", issueIdentifier: "ENG-42",
+      issueTitle: "Link the PR", issueUrl: "https://tracker/42", teamKey, trackerKind });
+  }
+  const setters = [
+    (id: number) => log.updateJobPrUrl(id, url),
+    (id: number) => log.stampJobApproved(id, url),
+    (id: number) => log.updateJobStatus(id, "completed", "success", url),
+  ];
+
+  it.each(setters)("links the job issue from each setter", (set) => {
+    links.listLinksByOutcome("open");
+    const id = job("ENG", "jira");
+    set(id);
+    expect(links.findLinkByPr("o/r", 42)).toMatchObject({
+      repository: "o/r", number: 42, url, source: "result", role: "implementation",
+      issue: { trackerKind: "jira", mappingKey: "ENG", trackerIssueId: "issue-link",
+        identifier: "ENG-42", title: "Link the PR", url: "https://tracker/42" },
+    });
+    expect(log.getJobById(id)?.prUrl).toBe(url);
+  });
+
+  it("uses the mapping tracker kind when the stored kind is null", () => {
+    log.updateJobPrUrl(job(), url);
+    expect(links.findLinkByPr("o/r", 42)?.issue.trackerKind).toBe("linear");
+  });
+
+  it.each(["https://github.com/o/r/actions/runs/42", "https://github.com/o/r/pull/42/extra",
+    "https://example.com/o/r/pull/42", "garbage", ""])("ignores non-PR URL %s", (input) => {
+    log.updateJobPrUrl(job(), input);
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+  });
+
+  it.each([null, "missing"])("ignores absent mapping %s", (teamKey) => {
+    const id = job();
+    dedup.getDb().prepare("UPDATE dispatch_log SET team_key = ? WHERE id = ?").run(teamKey, id);
+    log.updateJobPrUrl(id, url);
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+  });
+
+  it("does not link a stored URL when the status caller supplies none", () => {
+    links.listLinksByOutcome("open");
+    const id = job();
+    dedup.getDb().prepare("UPDATE dispatch_log SET pr_url = ? WHERE id = ?").run(url, id);
+    log.updateJobStatus(id, "completed", "success");
+    expect(links.listLinksByOutcome("open")).toEqual([]);
+  });
+
+  it.each(setters)("keeps the setter update when linking throws", (set) => {
+    const id = job();
+    vi.spyOn(links, "linkPullRequest").mockImplementation(() => { throw new Error("link fault"); });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(() => set(id)).not.toThrow();
+    expect(log.getJobById(id)?.prUrl).toBe(url);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("Failed to link"), expect.any(Error));
   });
 });

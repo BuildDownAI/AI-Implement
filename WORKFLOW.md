@@ -63,7 +63,7 @@ npm test
 Both must pass before reporting the implementation complete. Fix failures caused
 by the change; if verification is blocked, name the blocker in the summary.
 
-`tsconfig.json` excludes `src/__tests__`, so type-check new test files explicitly.
+`npm run typecheck` also type-checks test files (via `tsconfig.tests.json`), so run it after adding or editing a test.
 There is no lint script; use the repository's existing checks. Report the commands
 actually run and their outcomes, including any validation gap. Preflight records
 check results but does not replace your verification.

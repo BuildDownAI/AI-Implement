@@ -1,13 +1,39 @@
+import pr1546 from "./fixtures/claude-review-pr-1546.json";
+import pr1541 from "./fixtures/claude-review-pr-1541.json";
 import { describe, expect, it, vi } from "vitest";
+import { resolveReviewProcess } from "../review-process.js";
 import {
+  isAiImplementComment,
+  classifyReviewIssueComment,
+  collectClosedReviewThreadCommentUrls,
   collectExternalReviewFindingsFromGh,
+  collectClaudeReviewCommentFromGh,
   extractClaudeSummaryFindings,
   extractGithubActionsClaudeReviewFindings,
   extractReviewFindingsBlock,
   formatReviewLedgerForPrompt,
   type GhSpawn,
   type ReviewLedgerFinding,
+  reviewContractFindingGates,
 } from "../pipeline/review-ledger.js";
+
+import { inlineCommentBody } from "../pipeline/review-inline-comments.js";
+
+describe("isAiImplementComment", () => {
+  const body = inlineCommentBody({ severity: "medium", body: "Add a null check." });
+
+  it.each([body, `${body} \n\t`])("recognizes an inline finding with optional trailing whitespace: %s", (comment) => {
+    expect(isAiImplementComment(comment)).toBe(true);
+  });
+
+  it("reads a review quoting the inline trailer in the middle", () => {
+    expect(isAiImplementComment(`The pipeline posted:\n${body}\nBut this still needs a fix.`)).toBe(false);
+  });
+
+  it("keeps recognizing a leading pipeline marker", () => {
+    expect(isAiImplementComment(" \n<!-- ai-implement finding-disposition -->\nResolved.")).toBe(true);
+  });
+});
 
 describe("extractClaudeSummaryFindings", () => {
   it("extracts normalized bullets from a blocking section only", () => {
@@ -1939,6 +1965,112 @@ describe("collectExternalReviewFindingsFromGh", () => {
   });
 });
 
+describe("classifyReviewIssueComment", () => {
+  it("returns null for an author outside the trusted allowlist, even with a valid block", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "random-user" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"body\":\"Nope.\"}]}\n```",
+        html_url: "https://example.com/1",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for the rail's own self-marked comment, regardless of author", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "claude" },
+        body: "<!-- ai-implement post-push iter=1 review-feedback -->\n### Code Review\n\n## Blocking\n- Ignore our own marker comment.",
+        html_url: "https://example.com/2",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for an eligible github-actions[bot] author with no block and no Claude heading", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "Deployed a preview environment for this PR.",
+        html_url: "https://example.com/3",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns an approve verdict with empty findings and verdictSource review-contract", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"approve\",\"findings\":[]}\n```",
+        html_url: "https://example.com/4",
+      }),
+    ).toEqual({
+      findings: [],
+      findingsUnavailable: false,
+      verdict: "approve",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("returns review-contract findings tagged with source review-contract", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[{\"severity\":\"blocking\",\"path\":\"src/x.ts\",\"line\":10,\"body\":\"Missing null check.\"}]}\n```",
+        html_url: "https://example.com/5",
+      }),
+    ).toEqual({
+      findings: [
+        {
+          source: "review-contract",
+          severity: "blocking",
+          path: "src/x.ts",
+          line: 10,
+          body: "Missing null check.",
+          url: "https://example.com/5",
+        },
+      ],
+      findingsUnavailable: false,
+      verdict: "changes_requested",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("flags an unclosed block as findingsUnavailable with verdict incomplete", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "github-actions[bot]", type: "Bot" },
+        body: "```json review-findings\n{\"schema\":\"review-findings/v1\",\"verdict\":\"changes_requested\",\"findings\":[",
+        html_url: "https://example.com/6",
+      }),
+    ).toEqual({
+      findings: [],
+      findingsUnavailable: true,
+      verdict: "incomplete",
+      verdictSource: "review-contract",
+    });
+  });
+
+  it("falls back to heading-based prose extraction for a trusted Claude author with no block", () => {
+    expect(
+      classifyReviewIssueComment({
+        user: { login: "claude" },
+        body: "### Code Review\n\n## Blocking\n- Validate path params before database access.",
+        html_url: "https://example.com/7",
+      }),
+    ).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Validate path params before database access.",
+          url: "https://example.com/7",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+});
+
 function isPullReviewsRequest(args: string[]): boolean {
   return args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100");
 }
@@ -1946,3 +2078,385 @@ function isPullReviewsRequest(args: string[]): boolean {
 function isIssueCommentsRequest(args: string[]): boolean {
   return args.includes("repos/:owner/:repo/issues/42/comments?per_page=100");
 }
+
+describe("collectExternalReviewFindingsFromGh review process options (AII-1181)", () => {
+  function spawnWithThreads(threads: Array<{ login: string; body: string; commit?: string; origin?: { body: string; author: { login: string }; commit: { oid: string } } }>, reviews: unknown[] = []): GhSpawn {
+    return (args) => {
+      if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: JSON.stringify(reviews) };
+      if (isIssueCommentsRequest(args)) return { exitCode: 0, stdout: "[]" };
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: threads.map((t, i) => ({
+                    isResolved: false,
+                    isOutdated: false,
+                    path: "src/x.ts",
+                    line: i + 1,
+                    originatingComment: t.origin ? { nodes: [t.origin] } : undefined,
+                    comments: { nodes: [{ body: t.body, url: `https://example.com/t${i}`, commit: { oid: t.commit }, author: { login: t.login } }] },
+                  })),
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+  }
+
+  const ccr = { process: resolveReviewProcess("claude-code-review"), extraAuthors: [] as string[] };
+  const threads = [
+    { login: "claude", body: "🔴 bug" },
+    { login: "claude", body: "untagged" },
+    { login: "claude", body: "🟣 old" },
+    { login: "claude", body: "🟡 nit" },
+  ];
+
+  it("maps 🔴 to blocking, untagged and 🟡 to minor, and skips 🟣 under claude-code-review", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads(threads), "42", ccr);
+    expect(result.findings.map((f) => [f.body, f.severity])).toEqual([
+      ["🔴 bug", "blocking"],
+      ["untagged", "minor"],
+      ["🟡 nit", "minor"],
+    ]);
+  });
+
+  it.each([0, 1, 2])("preserves Codex P%s severity and reply context from the originating head finding", (priority) => {
+    const origin = {
+      body: `**<sub><sub>![P${priority} Badge](https://img.shields.io/badge/P${priority}-yellow?style=flat)</sub></sub> Original finding**`,
+      author: { login: "chatgpt-codex-connector" },
+      commit: { oid: "current-head" },
+    };
+    const spawn = spawnWithThreads([{ login: "human", body: "Please investigate", origin }]);
+    const result = collectExternalReviewFindingsFromGh(spawn, "42", {
+      process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head",
+    });
+    expect(result.findings).toEqual([expect.objectContaining({
+      severity: priority === 2 ? "minor" : "blocking",
+      body: `${origin.body}\n\nLatest reply:\nPlease investigate`,
+    })]);
+    origin.commit.oid = "old-head";
+    expect(collectExternalReviewFindingsFromGh(spawn, "42", {
+      process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head",
+    }).findings).toEqual([]);
+  });
+
+  it("retains Codex P2 as minor and P0/P1 as blocking, including the GraphQL login", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([0, 1, 2].map((p) => ({
+      login: "chatgpt-codex-connector",
+      body: `**<sub><sub>![P${p} Badge](https://img.shields.io/badge/P${p}-yellow?style=flat)</sub></sub>  Finding**`,
+    }))), "42", { process: resolveReviewProcess("codex-code-review"), extraAuthors: [] });
+    expect(result.findings.map((f) => f.severity)).toEqual(["blocking", "blocking", "minor"]);
+  });
+
+  it.each([
+    { login: "chatgpt-codex-connector", commit: "old-head", expected: [] },
+    { login: "untrusted-codex", commit: "current-head", expected: ["medium"] },
+  ])("does not collect blocking Codex findings from $login at $commit", ({ login, commit, expected }) => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{
+      login, commit,
+      body: "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Bug**",
+    }]), "42", { process: resolveReviewProcess("codex-code-review"), extraAuthors: [], headSha: "current-head" });
+    expect(result.findings.map((finding) => finding.severity)).toEqual(expected);
+    expect(result.findings.some((finding) => finding.severity === "blocking")).toBe(false);
+  });
+
+  it("stays medium for every thread with no options", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads(threads), "42");
+    expect(result.findings.map((f) => f.severity)).toEqual(["medium", "medium", "medium", "medium"]);
+  });
+
+  it("keeps a human thread medium under claude-code-review", () => {
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{ login: "a-human", body: "🟣 note" }]), "42", ccr);
+    expect(result.findings.map((f) => f.severity)).toEqual(["medium"]);
+  });
+
+  it("keeps blocking for a CHANGES_REQUESTED author whatever the marker", () => {
+    const reviews = [{ state: "CHANGES_REQUESTED", user: { login: "claude[bot]" }, body: "", html_url: "https://example.com/r" }];
+    const result = collectExternalReviewFindingsFromGh(spawnWithThreads([{ login: "claude", body: "🟡 nit" }], reviews), "42", ccr);
+    expect(result.findings.filter((f) => f.source === "github-review-thread").map((f) => f.severity)).toEqual(["blocking"]);
+  });
+
+  it("applies the extra authors to trusted-author comment classification", () => {
+    const comment = { body: "### Code Review\n\n## Blocking\n- A finding.", user: { login: "topia-ai-implement-bot[bot]", type: "Bot" } };
+    expect(classifyReviewIssueComment(comment)).toBeNull();
+    const withExtra = { process: resolveReviewProcess("ai-implement"), extraAuthors: ["topia-ai-implement-bot[bot]"] };
+    expect(classifyReviewIssueComment(comment, withExtra)?.findings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("collectClosedReviewThreadCommentUrls", () => {
+  const page = (nodes: unknown[], hasNextPage = false, endCursor: string | null = null): ReturnType<GhSpawn> => ({
+    exitCode: 0,
+    stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage, endCursor }, nodes } } } } }),
+  });
+  const thread = (isResolved: boolean, isOutdated: boolean, urls: string[]) => ({
+    isResolved,
+    isOutdated,
+    comments: { pageInfo: { hasNextPage: false }, nodes: urls.map((url) => ({ url })) },
+  });
+
+  it("collects every comment URL on resolved or outdated threads and skips open ones", () => {
+    const spawn: GhSpawn = () =>
+      page([thread(true, false, ["u1", "u2"]), thread(false, true, ["u3"]), thread(false, false, ["u4"])]);
+    expect(collectClosedReviewThreadCommentUrls(spawn, "42")).toEqual(new Set(["u1", "u2", "u3"]));
+  });
+
+  it("follows pagination across pages", () => {
+    const spawn: GhSpawn = (args) =>
+      args.some((a) => a === "after=c1")
+        ? page([thread(true, false, ["p2"])])
+        : page([thread(true, false, ["p1"])], true, "c1");
+    expect(collectClosedReviewThreadCommentUrls(spawn, "42")).toEqual(new Set(["p1", "p2"]));
+  });
+
+  it.each([
+    { nodes: [] },
+    { nodes: [], pageInfo: { hasNextPage: null } },
+    { nodes: [null], pageInfo: { hasNextPage: false } },
+    { nodes: [{ isResolved: true, isOutdated: false, comments: { nodes: [] } }], pageInfo: { hasNextPage: false } },
+    { nodes: [{ isResolved: true, isOutdated: false, comments: { nodes: [], pageInfo: { hasNextPage: true } } }], pageInfo: { hasNextPage: false } },
+  ])("rejects incomplete thread snapshots: %j", (reviewThreads) => {
+    expect(collectClosedReviewThreadCommentUrls(() => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads } } } }),
+    }), "42")).toBeUndefined();
+  });
+
+  it("rejects partial GraphQL data and repeated pagination cursors", () => {
+    const partial = JSON.parse(page([]).stdout);
+    partial.errors = [{ message: "Partial data" }];
+    expect(collectClosedReviewThreadCommentUrls(() => ({ exitCode: 0, stdout: JSON.stringify(partial) }), "42")).toBeUndefined();
+    expect(collectClosedReviewThreadCommentUrls(() => page([], true, "same"), "42")).toBeUndefined();
+  });
+
+  it("returns undefined when the read fails, errors, or cannot page on", () => {
+    expect(collectClosedReviewThreadCommentUrls(() => ({ exitCode: 1, stdout: "" }), "42")).toBeUndefined();
+    expect(collectClosedReviewThreadCommentUrls(() => ({ exitCode: 0, stdout: "not json" }), "42")).toBeUndefined();
+    expect(collectClosedReviewThreadCommentUrls(() => page([], true, null), "42")).toBeUndefined();
+  });
+});
+
+describe("🔴/🟡 headings in a Claude summary", () => {
+  const claude = (body: string) => ({ user: { login: "claude[bot]", type: "Bot" }, body, html_url: "https://x/c" });
+
+  it("records a 🔴 heading as blocking from a trusted claude[bot] summary", () => {
+    const result = classifyReviewIssueComment(claude("## Code Review\n\n### 🔴 Not actually 'no behavior change'\n- New guard added.\n"));
+    expect(result?.findings).toEqual([
+      expect.objectContaining({ source: "claude-review-summary", severity: "blocking", body: "New guard added." }),
+    ]);
+  });
+
+  it("records no blocking finding for 🟡 and 🟣 sections only", () => {
+    const result = classifyReviewIssueComment(claude("## Code Review\n\n### 🟡 Nit\n- a\n\n### 🟣 Old\n- b\n"));
+    expect(result?.findings.filter((f) => f.severity === "blocking")).toEqual([]);
+  });
+
+  it("ignores the same 🔴 body from an untrusted author", () => {
+    const result = classifyReviewIssueComment({ user: { login: "mallory", type: "User" }, body: "## Code Review\n\n### 🔴 Bad\n- x\n" });
+    expect(result).toBeNull();
+  });
+
+  it("maps 🔴/🟡 headings in the github-actions shape and keeps word rules otherwise", () => {
+    const body = (heading: string) => `**Claude finished**\n\n### ${heading}\n- item one\n`;
+    const sev = (h: string) => extractGithubActionsClaudeReviewFindings(body(h)).findings[0]?.severity;
+    expect(sev("🔴 Not actually fine")).toBe("blocking");
+    expect(sev("🟡 Something")).toBe("minor");
+    expect(sev("Minor notes")).toBe("minor");
+    expect(sev("Findings")).toBe("medium");
+  });
+});
+
+describe("reviewContractFindingGates", () => {
+  it.each([
+    ["blocking", "approve", true],
+    ["minor", "approve", false],
+    ["minor", "changes_requested", false],
+    ["minor", "incomplete", false],
+    ["minor", undefined, false],
+    ["blocking", "changes_requested", true],
+    ["blocking", "incomplete", true],
+    ["blocking", undefined, true],
+    ["medium", "approve", false],
+    ["medium", "changes_requested", true],
+    ["medium", "incomplete", true],
+    ["medium", undefined, true],
+  ] as const)("%s finding under verdict %s gates=%s", (severity, verdict, expected) => {
+    expect(reviewContractFindingGates({ severity }, verdict)).toBe(expected);
+  });
+});
+
+// Actual REST issue comments fetched from GitHub on 2026-11-10, including edits.
+describe("Claude GHA incident replays", () => {
+  it("distinguishes #1546's progress tracker from its review quoting a pipeline marker", () => {
+    const tracker = pr1546.find(c => c.id === 6778672152)!;
+    const review = pr1546.find(c => c.id === 6778794145)!;
+    expect(classifyReviewIssueComment(tracker)).toBeNull();
+    expect(review.body).toContain("<!-- ai-implement closed-findings");
+    expect(classifyReviewIssueComment(review)).toMatchObject({ verdict: "changes_requested", findingsUnavailable: false });
+    // The former body.includes("<!-- ai-implement") exclusion discarded this entire review.
+    expect(review.body.includes("<!-- ai-implement")).toBe(true);
+    expect(pr1541.filter(c => c.user.login === "github-actions[bot]").every(c => !c.body.includes("<!-- ai-implement"))).toBe(true);
+  });
+
+  it.each([[1546, pr1546, "blocking"], [1541, pr1541, "minor"]] as const)(
+    "reads PR #%s's newest review despite quoted pipeline markers", (_pr, comments, severity) => {
+      const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+        process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+        reviewWindow: _pr === 1546
+          ? { startedAt: "2026-11-10T20:38:09Z", completedAt: "2026-11-10T20:44:14Z" }
+          : { startedAt: "2026-11-10T19:46:53Z", completedAt: "2026-11-10T19:52:23Z" },
+        issueComments: { exitCode: 0, stdout: JSON.stringify(comments) },
+      });
+      expect(result.findingsUnavailable).toBe(false);
+      expect(result.selectedComment).toEqual({ id: _pr === 1546 ? 6778794145 : 6777662566, kind: "review-contract" });
+      expect(result.findings.length).toBeGreaterThan(0);
+      expect(result.findings.every(f => f.severity === severity)).toBe(true);
+      expect(result.findings.some(f => reviewContractFindingGates(f, result.verdict))).toBe(severity === "blocking");
+      if (severity === "blocking") expect(result.findings[0]).toMatchObject({ path: "src/pipeline/steps/post-push-review.ts" });
+    },
+  );
+  it("fails closed on a separate unclassifiable Actions review", () => {
+    expect(classifyReviewIssueComment({ user: { login: "github-actions[bot]", type: "Bot" }, body: "## Claude review\nSomething unexpected happened." }))
+      .toMatchObject({ findingsUnavailable: true });
+  });
+});
+
+describe("trusted Claude review selection", () => {
+  const user = { login: "github-actions[bot]", type: "Bot" };
+  const clean = { id: 1, user, body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```', created_at: "2026-11-10T20:00:00Z" };
+  it("selects an edited unclassifiable review over an older approval and ignores later progress", () => {
+    const comments = [
+      clean,
+      { id: 2, user, body: "## Claude review\nUnexpected output", created_at: "2026-11-10T19:00:00Z", updated_at: "2026-11-10T21:00:00Z" },
+      { id: 3, user, body: "**Claude finished**\n### Review in progress\n- [ ] Post review", created_at: "2026-11-10T22:00:00Z" },
+    ];
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], issueComments: { exitCode: 0, stdout: JSON.stringify(comments) },
+    });
+    expect(result).toMatchObject({ findingsUnavailable: true, selectedComment: { id: 2, kind: "unavailable" } });
+    expect(result.verdict).toBeUndefined();
+  });
+  it.each([{ login: "random-user", type: "User" }, { login: "github-actions[bot]", type: "User" }])("ignores an untrusted review identity %j", user => {
+    expect(classifyReviewIssueComment({ user, body: "## Claude review\nUnexpected output" })).toBeNull();
+  });
+  it.each([
+    "## Claude review\n### Approved\nThe implementation satisfies the requirements and is ready to ship.",
+    "## Claude review\n### 🟣 Pre-existing\n- Legacy behavior outside this change.",
+    "## Claude review\n### Blocking\nNone.",
+  ])("accepts recognized clean trusted Claude App sections: %s", body => {
+    expect(classifyReviewIssueComment({ user: { login: "claude[bot]", type: "Bot" }, body }))
+      .toMatchObject({ findings: [], findingsUnavailable: false });
+  });
+  it("keeps a trusted Claude App blocking section blocking", () => {
+    const result = classifyReviewIssueComment({
+      user: { login: "claude[bot]", type: "Bot" },
+      body: "## Claude review\n### 🔴 Blocking\n- Fix the missing authorization check.",
+    });
+    expect(result).toMatchObject({ findingsUnavailable: false, findings: [{ severity: "blocking" }] });
+  });
+  it("fails closed for an unclassifiable trusted Claude App review", () => {
+    expect(classifyReviewIssueComment({ user: { login: "claude[bot]", type: "Bot" }, body: "## Claude review\nUnexpected output" })).toMatchObject({ findingsUnavailable: true });
+  });
+});
+
+
+describe("current review comment association", () => {
+  const blocker = pr1546.find(c => c.id === 6778794145)!;
+  const stale = { ...blocker, id: 123, created_at: "2026-11-10T19:00:00Z", updated_at: "2026-11-10T21:00:00Z", body: '## Claude review\n```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' };
+  it.each(["new comment", "edited tracker"])("accepts a final %s published after check completion", mode => {
+    const comment = {
+      ...blocker,
+      created_at: mode === "new comment" ? "2026-11-10T20:45:00Z" : "2026-11-10T20:39:00Z",
+      updated_at: "2026-11-10T20:46:00Z",
+    };
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:38:00Z", completedAt: "2026-11-10T20:44:14Z" },
+      issueComments: { exitCode: 0, stdout: JSON.stringify([comment, stale]) },
+    });
+    expect(result.findingsUnavailable).toBe(false);
+    expect(result.selectedComment?.id).toBe(blocker.id);
+    expect(result.findings[0].severity).toBe("blocking");
+  });
+  it.each([true, false])("keeps the current blocker with window evidence=%s", evidence => {
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      ...(evidence ? { reviewWindow: { startedAt: "2026-11-10T20:38:00Z", completedAt: "2026-11-10T20:44:14Z" } } : {}),
+      issueComments: { exitCode: 0, stdout: JSON.stringify([blocker, stale]) },
+    });
+    if (evidence) {
+      expect(result.selectedComment?.id).toBe(blocker.id);
+      expect(result.findings[0].severity).toBe("blocking");
+    } else {
+      expect(result.findingsUnavailable).toBe(true);
+      expect(result.verdict).toBeUndefined();
+    }
+  });
+});
+
+
+describe("unavailable current Claude review evidence", () => {
+  const review = pr1546.find(c => c.id === 6778794145)!;
+  it.each([
+    { label: "missing creation time", comment: { ...review, created_at: "" }, exitCode: 0 },
+    { label: "only stale review", comment: { ...review, created_at: "2026-11-10T19:00:00Z" }, exitCode: 0 },
+    { label: "unreadable comments", comment: review, exitCode: 1 },
+  ])("fails closed for $label", ({ comment, exitCode }) => {
+    const result = collectExternalReviewFindingsFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:38:00Z", completedAt: "2026-11-10T20:44:14Z" },
+      issueComments: { exitCode, stdout: JSON.stringify([comment]) },
+    });
+    expect(result.findingsUnavailable).toBe(true);
+    expect(result.verdict).toBeUndefined();
+  });
+});
+
+describe("Claude tracker structure", () => {
+  it.each([
+    { label: "heading findings", body: "## Claude review\n### Blocking issues\n- Fix regression", unavailable: false, pending: false },
+    { label: "contract findings", body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"changes_requested","findings":[{"severity":"blocking","body":"Fix regression"}]}\n```', unavailable: false, pending: false },
+    { label: "unrecognized heading review", body: "## Claude review\nUnexpected output", unavailable: true, pending: false },
+    { label: "malformed contract", body: "```json review-findings\n{\n```", unavailable: true, pending: false },
+    { label: "genuine tracker", body: "", unavailable: true, pending: true },
+  ])("recognizes $label quoting the working phrase", ({ body, unavailable, pending }) => {
+    const result = collectClaudeReviewCommentFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:00:00Z", completedAt: "2026-11-10T20:05:00Z" },
+      issueComments: { exitCode: 0, stdout: JSON.stringify([{
+        id: 100, user: { login: "github-actions[bot]", type: "Bot" },
+        created_at: "2026-11-10T20:01:00Z", body: body + "\n\n**Claude is working…**",
+      }]) },
+    });
+    expect(result.findingsUnavailable).toBe(unavailable);
+    expect(Boolean(result.reviewPending)).toBe(pending);
+    if (!unavailable) {
+      if (body.includes("review-findings")) expect(result.verdict).toBe("changes_requested");
+      expect(result.findings[0].body).toContain("Fix regression");
+    }
+  });
+});
+
+describe("tracker author and head filtering", () => {
+  it.each(["untrusted", "older-head"])("ignores a newer %s tracker", mode => {
+    const result = collectClaudeReviewCommentFromGh(() => ({ exitCode: 0, stdout: "[]" }), "42", {
+      process: resolveReviewProcess(null), extraAuthors: [], requireCurrentReview: true,
+      reviewWindow: { startedAt: "2026-11-10T20:00:00Z", completedAt: "2026-11-10T20:05:00Z" },
+      issueComments: { exitCode: 0, stdout: JSON.stringify([
+        { id: 100, user: { login: "github-actions[bot]", type: "Bot" }, created_at: "2026-11-10T20:01:00Z",
+          body: '```json review-findings\n{"schema":"review-findings/v1","verdict":"approve","findings":[]}\n```' },
+        { id: 101, user: { login: mode === "untrusted" ? "random-user" : "github-actions[bot]", type: "Bot" },
+          created_at: mode === "older-head" ? "2026-11-09T20:01:00Z" : "2026-11-10T20:02:00Z",
+          updated_at: "2026-11-10T20:06:00Z", body: "**Claude is working…**" },
+      ]) },
+    });
+    expect(result.verdict).toBe("approve");
+    expect(result.findingsUnavailable).toBe(false);
+    expect(result.reviewPending).toBeFalsy();
+  });
+});

@@ -67,6 +67,7 @@ describe("blank overrides no longer reach jira-fields as field ids", () => {
     statusOverride: cfg.statusFieldOverride ?? null,
     repoOverride: cfg.repoFieldOverride ?? null,
     profilesOverride: cfg.profilesFieldOverride ?? null,
+    baseBranchOverride: cfg.baseBranchFieldOverride ?? null,
   });
 
   it('falls back to discovery by name for an "" override rather than using it as an id', async () => {

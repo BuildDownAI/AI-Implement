@@ -1,35 +1,21 @@
 /**
  * Behavioral tests for `src/dispatch-admission.ts` (AII-775). Exercises the module
- * directly against a temp SQLite file, matching `dispatch-gate.test.ts`'s harness.
- * `npm run typecheck` excludes `src/__tests__` and vitest strips types without
- * checking them, so the `prepare` synchronous-only contract is additionally
- * type-checked explicitly via `npx tsc --noEmit -p tsconfig.dispatch-admission-tests.json`.
+ * directly against a temp SQLite file from the shared `testDb` harness.
+ * Vitest strips types without checking them, so the `prepare` synchronous-only
+ * contract is type-checked by `npm run typecheck` (its `tsconfig.tests.json` pass).
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
-import type * as DedupModule from "../dedup.js";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import type * as AdmissionModule from "../dispatch-admission.js";
+import type * as LogModule from "../log.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
-let dedup: typeof DedupModule;
 let admission: typeof AdmissionModule;
+let log: typeof LogModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `dispatch-admission-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  admission = await import("../dispatch-admission.js");
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ admission, log } = (
+    await testDb({ modules: { admission: () => import("../dispatch-admission.js"), log: () => import("../log.js") } })
+  ).modules);
 });
 
 const LEGACY = { kind: "legacy" as const };
@@ -362,7 +348,7 @@ describe("acquire — synchronous prepare", () => {
 });
 
 describe("acquire — prepare type contract", () => {
-  it("rejects an async prepare callback at compile time (checked via tsconfig.dispatch-admission-tests.json)", () => {
+  it("rejects an async prepare callback at compile time (checked via npm run typecheck)", () => {
     const callWithAsyncPrepare = () =>
       admission.acquire(
         issueRequest({ dispatchId: "type-check-only" }),
@@ -587,13 +573,6 @@ describe("reconcileTerminalCallbackAdmissions", () => {
   const CONFIRM_ALL = async () => true;
   const CONFIRM_NONE = async () => false;
 
-  let log: typeof import("../log.js");
-
-  beforeEach(async () => {
-    log = await import("../log.js");
-    log.initLogTable();
-  });
-
   it("holds a generic callback success until the exact backend terminates, then releases it", async () => {
     const dispatchId = "dispatch-generic-success";
     const admitted = admission.acquire(issueRequest({ dispatchId }));
@@ -800,5 +779,76 @@ describe("reconcileTerminalCallbackAdmissions", () => {
       issueRequest({ dispatchId: "waiting", scope: { kind: "issue", issueScope: "team-a", issueId: "AII-2" }, cap: 1 }),
     );
     expect(retry.ok).toBe(true);
+  });
+});
+
+describe("listHeldReservations / releaseHeldReservation (AII-1069)", () => {
+  const never = async () => false;
+
+  it("lists only unreleased rows with job status and conclusion", async () => {
+    admission.acquire(issueRequest({ dispatchId: "held-1", scope: { kind: "issue", issueScope: "t", issueId: "i1" } }));
+    admission.acquire(issueRequest({ dispatchId: "held-2", scope: { kind: "issue", issueScope: "t", issueId: "i2" }, lifecycleOwner: RESTATE_A }));
+    admission.acquire(issueRequest({ dispatchId: "done", scope: { kind: "issue", issueScope: "t", issueId: "i3" } }));
+    admission.releaseByDispatchId("done", "finalized");
+    const jobId = log.appendLog({ issueId: "i1", issueIdentifier: "AII-9", dispatchId: "held-1", repo: "o/r" });
+    log.updateJobStatus(jobId, "failed", "boom");
+
+    const rows = admission.listHeldReservations();
+    expect(rows.map((r) => r.dispatchId)).toEqual(["held-1", "held-2"]);
+    expect(rows[0]).toMatchObject({ team: "AII", issueIdentifier: "AII-9", phase: "implementation", backend: "github-actions", lifecycleOwner: "legacy", jobStatus: "failed", jobConclusion: "boom" });
+    expect(rows[1]).toMatchObject({ lifecycleOwner: "restate:attempt-a", issueIdentifier: null, jobStatus: null, jobConclusion: null });
+  });
+
+  it("refuses without force when unconfirmed and leaves the row held", async () => {
+    admission.acquire(issueRequest());
+    const result = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
+    expect(result.status).toBe("refused");
+    expect(admission.read("dispatch-1")?.releasedAt).toBeNull();
+  });
+
+  it("treats a throwing confirmation as unconfirmed", async () => {
+    admission.acquire(issueRequest());
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const result = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: async () => { throw new Error("net"); } });
+    expect(result.status).toBe("refused");
+  });
+
+  it("does not trust a terminal job of an earlier generation", async () => {
+    admission.acquire(issueRequest());
+    const id = log.appendLog({ issueId: "AII-1", dispatchId: "dispatch-1", admissionGeneration: 0, repo: "o/r" });
+    log.updateJobStatus(id, "completed", "success");
+    admission.releaseByDispatchId("dispatch-1", "finalized");
+    admission.acquire(issueRequest());
+    expect(admission.read("dispatch-1")?.generation).toBe(1);
+    const result = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
+    expect(result.status).toBe("refused");
+    // The list hides the earlier generation's job too.
+    expect(admission.listHeldReservations()[0]).toMatchObject({ jobStatus: null, jobConclusion: null, issueIdentifier: null });
+  });
+
+  it("refuses a terminal job row without confirmation, releases it once confirmed, and with force either way", async () => {
+    admission.acquire(issueRequest());
+    const id = log.appendLog({ issueId: "AII-1", dispatchId: "dispatch-1", repo: "o/r" });
+    log.updateJobStatus(id, "completed", "planning_callback");
+    const refused = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: never });
+    expect(refused).toMatchObject({ status: "refused" });
+    expect((refused as { reason: string }).reason).toMatch(/completed/);
+    expect((refused as { reason: string }).reason).toMatch(/force/);
+    expect(admission.read("dispatch-1")?.releasedAt).toBeNull();
+
+    const confirmed = await admission.releaseHeldReservation("dispatch-1", { force: false, confirmTerminated: async () => true });
+    expect(confirmed).toMatchObject({ status: "released", forced: false, basis: "backend_confirmed" });
+
+    admission.acquire(issueRequest());
+    const forced = await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never });
+    expect(forced).toMatchObject({ status: "released", forced: true, basis: "forced" });
+  });
+
+  it("releases with force and reports nothing to release afterwards", async () => {
+    admission.acquire(issueRequest());
+    const first = await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never });
+    expect(first).toMatchObject({ status: "released", forced: true, lifecycleOwner: "legacy" });
+    expect(admission.read("dispatch-1")?.releaseReason).toBe("cancelled");
+    expect(await admission.releaseHeldReservation("dispatch-1", { force: true, confirmTerminated: never })).toEqual({ status: "nothing_to_release", dispatchId: "dispatch-1" });
   });
 });

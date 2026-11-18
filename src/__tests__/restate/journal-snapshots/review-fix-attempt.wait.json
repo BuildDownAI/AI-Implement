@@ -1,0 +1,46 @@
+[
+  {
+    "type": "Input",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "load-prepared-attempt"
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "check-prelaunch-authority"
+  },
+  {
+    "type": "Run",
+    "name": "launch-once"
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "bind-exact-execution"
+  },
+  {
+    "type": "GetPromise",
+    "name": ""
+  },
+  {
+    "type": "Run",
+    "name": "read-run-status-0"
+  },
+  {
+    "type": "Run",
+    "name": ""
+  },
+  {
+    "type": "Sleep",
+    "name": ""
+  }
+]

@@ -40,7 +40,7 @@ describe("poll cycle state management", () => {
   });
 
   it("pollCount increments with each cycle", () => {
-    const c1 = beginCycle()!;
+    beginCycle();
     abandonCycle();
     const c2 = beginCycle()!;
     endCycle(c2.cycleId);

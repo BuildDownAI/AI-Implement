@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseSourceResults } from "../../kg-source-results.js";
+import type { SourceResult } from "../../kg-source-results.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 
 /** Coded failure raised when the kg_ingest subprocess exits with a non-zero code. */
@@ -63,6 +65,8 @@ interface KgIngestInputs extends Record<string, unknown> {
 
 interface KgIngestOutputs extends Record<string, unknown> {
   statsFile: string | null;
+  /** Per-source results from ai-output/source-results.json; empty when absent. */
+  sourceResults: SourceResult[];
 }
 
 interface KgStats {
@@ -306,6 +310,19 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
     writeFn(statsFile, JSON.stringify(stats));
     console.log(`[kg-ingest] done in ${durationSec.toFixed(1)}s; wrote ${statsFile}`);
 
-    return { statsFile };
+    let sourceResults: SourceResult[] = [];
+    const resultsFile = join(aiOutputDir, "source-results.json");
+    if (existsFn(resultsFile)) {
+      try {
+        sourceResults = parseSourceResults(JSON.parse(readFileFn(resultsFile, "utf-8")));
+        console.log(`[kg-ingest] read ${sourceResults.length} source result(s) from ${resultsFile}`);
+      } catch (err) {
+        console.log(`[kg-ingest] ${resultsFile} unreadable (${err instanceof Error ? err.message : String(err)}); no per-source ingest results`);
+      }
+    } else {
+      console.log("[kg-ingest] no source-results.json; no per-source ingest results");
+    }
+
+    return { statsFile, sourceResults };
   },
 };

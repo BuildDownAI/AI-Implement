@@ -10,7 +10,8 @@ export interface DispatchFailureContext {
   repo: string;
   workflowFile: string;
   contract: "legacy" | "envelope";
-  issueUrl?: string;
+  issueUrl?: string | null;
+  trackerKind?: string;
   phase?: string;
   issueState?: string;
 }
@@ -48,6 +49,8 @@ export async function surfaceDispatchFailure(
     phase: ctx.phase ?? "implementation",
     status: "dispatch-failed",
     contract: ctx.contract,
+    trackerKind: ctx.trackerKind ?? null,
+    issueUrl: ctx.issueUrl ?? null,
   });
 
   if (notifyWebhookUrl) {

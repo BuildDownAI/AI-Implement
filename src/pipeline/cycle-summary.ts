@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { envSecrets, redactAndCap, redactEvidence } from "./failure-classification.js";
-import { ACTIVITY_MAX_EVENT_BYTES, type RunTelemetry } from "./types.js";
+import { ACTIVITY_MAX_EVENT_BYTES, sanitizeAttribution, type InvocationAttributionV1, type RunTelemetry } from "./types.js";
 
 /**
  * Per-review-cycle evidence contract (AII-801). Emitted once per feedback-loop
@@ -47,13 +47,22 @@ export interface CycleVerdict {
 
 export type CycleOutputCommitStatus = "committed" | "pending_push" | "not_applicable";
 
+export interface CycleVerifyHook {
+  ran: boolean;
+  exitCode: number | null;
+  durationMs: number;
+  /** `false` when the workspace snapshot or restore failed, so hook output could have shipped.
+   *  Absent when the guard worked. */
+  guarded?: boolean;
+}
+
 export interface CycleSummary {
   /** Stable per-cycle identity (e.g. "feedback-loop.2", "post-push-review.fix-1"). Writing the
    *  same id again with identical content is an idempotent no-op; writing it again with
    *  different content is rejected (the first-recorded summary wins) rather than silently
    *  replacing it — see `appendCycleSummary`. */
   id: string;
-  stage: "feedback-loop" | "post-push-review-fix";
+  stage: "feedback-loop" | "post-push-review-fix" | "publication";
   cycle: number;
   inputCommit: string | null;
   outputCommit: string | null;
@@ -64,6 +73,8 @@ export interface CycleSummary {
   tests: CycleTestResult[];
   verdict: CycleVerdict;
   usage: CycleUsage;
+  /** The pass's `verify` hook run. Absent when no hook was configured or it did not run. */
+  verifyHook?: CycleVerifyHook;
   /** True when any field below was capped (verdict summary redaction/cap, or the whole-record
    *  byte limit below). */
   truncated: boolean;
@@ -77,6 +88,8 @@ export interface CycleSummary {
    *  value that changed each time it was read would turn an idempotent replay into a spurious
    *  conflict. */
   completedAt: number;
+  /** Optional diagnostic attribution (AII-946). Stripped, never rejecting, when malformed — see `stripCycleAttribution`. */
+  attribution?: InvocationAttributionV1;
 }
 
 export type CycleSummaryInput = Omit<CycleSummary, "truncated" | "limitReached" | "completedAt">;
@@ -156,7 +169,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function isCycleSummary(value: unknown): value is CycleSummary {
   if (!isRecord(value)) return false;
   if (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 128) return false;
-  if (value.stage !== "feedback-loop" && value.stage !== "post-push-review-fix") return false;
+  if (value.stage !== "feedback-loop" && value.stage !== "post-push-review-fix" && value.stage !== "publication") return false;
   if (!Number.isSafeInteger(value.cycle) || (value.cycle as number) <= 0) return false;
   if ((value.inputCommit !== null && (typeof value.inputCommit !== "string" || value.inputCommit.length > 40))
     || (value.outputCommit !== null && (typeof value.outputCommit !== "string" || value.outputCommit.length > 40))) return false;
@@ -170,6 +183,13 @@ export function isCycleSummary(value: unknown): value is CycleSummary {
   for (const field of [value.usage.tokensIn, value.usage.tokensOut, value.usage.costUsd]) {
     if (field !== null && (typeof field !== "number" || !Number.isFinite(field))) return false;
   }
+  if (value.verifyHook !== undefined) {
+    const h = value.verifyHook;
+    if (!isRecord(h) || typeof h.ran !== "boolean" || !Number.isFinite(h.durationMs)
+      || (h.exitCode !== null && !Number.isSafeInteger(h.exitCode))
+      || (h.guarded !== undefined && typeof h.guarded !== "boolean")) return false;
+  }
+  if (value.attribution !== undefined && sanitizeAttribution(value.attribution) === null) return false;
   if (typeof value.truncated !== "boolean" || typeof value.limitReached !== "boolean") return false;
   if (!Number.isSafeInteger(value.completedAt) || (value.completedAt as number) <= 0) return false;
   try {
@@ -177,6 +197,17 @@ export function isCycleSummary(value: unknown): value is CycleSummary {
   } catch {
     return false;
   }
+}
+
+/** Strips a malformed optional `attribution` from a cycle-summary-shaped value so the rest of the
+ *  evidence record survives validation (AII-946). A valid attribution is re-projected to its
+ *  allowlisted fields; everything else is returned unchanged. `stripped` is true when one was dropped. */
+export function stripCycleAttribution(value: unknown): { value: unknown; stripped: boolean } {
+  if (!isRecord(value) || value.attribution === undefined) return { value, stripped: false };
+  const { attribution, ...rest } = value as Record<string, unknown>;
+  const clean = sanitizeAttribution(attribution);
+  if (clean) return { value: { ...rest, attribution: clean }, stripped: false };
+  return { value: rest, stripped: true };
 }
 
 /** Filters `value` down to well-formed `CycleSummary` entries, same fail-safe convention as
@@ -187,7 +218,9 @@ export function sanitizeCycleSummaries(value: unknown): { valid: CycleSummary[];
   if (!Array.isArray(value)) return { valid: [], dropped: 0 };
   const valid: CycleSummary[] = [];
   let dropped = 0;
-  for (const entry of value) {
+  for (const raw of value) {
+    const { value: entry, stripped } = stripCycleAttribution(raw);
+    if (stripped) console.warn("[cycle-summary] Dropped 1 invalid attribution record(s) from a cycle summary");
     if (isCycleSummary(entry)) valid.push(entry);
     else dropped++;
   }
@@ -210,7 +243,7 @@ export function readCycleSummaries(workspaceDir: string): CycleSummary[] {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      const parsed: unknown = JSON.parse(trimmed);
+      const { value: parsed } = stripCycleAttribution(JSON.parse(trimmed));
       if (isCycleSummary(parsed)) out.push(parsed);
     } catch {
       // Skip a malformed line rather than failing the whole read.
@@ -246,6 +279,74 @@ function appendCycleSummary(workspaceDir: string, record: CycleSummary): void {
   }
   const all = [...existing, record];
   fs.writeFileSync(filePath, `${all.map((s) => JSON.stringify(s)).join("\n")}\n`, "utf-8");
+}
+
+export const PUBLICATION_CYCLE_ID = "publication.1";
+
+/**
+ * Builds the one distinct publication record emitted after the pipeline-owned push succeeds. The
+ * immutable pre-push `feedback-loop.N` records stay `pending_push`/`outputCommit:null`; this record
+ * carries the actual pushed commit and the agent's validated dispositions, and reuses the final
+ * feedback-loop cycle's tests and verdict verbatim (missing stays missing) and carries null usage.
+ * Only a successful runner result with an explicitly approving source verdict yields a record.
+ * Returns null without a feedback-loop source cycle or a pushed commit. `completedAt` is derived from
+ * the source cycle, so every delivery of the same run is byte-identical (idempotent, never a 409).
+ */
+export function buildPublicationCycleSummary(
+  summaries: readonly CycleSummary[],
+  outputCommit: string | null,
+  dispositions: readonly CycleDisposition[],
+  resultOutcome: "success" | "failure",
+): CycleSummary | null {
+  if (resultOutcome !== "success") return null;
+  if (!outputCommit || outputCommit.length > 40) return null;
+  const feedback = summaries.filter((s) => s.stage === "feedback-loop");
+  const source = feedback.reduce<CycleSummary | null>((best, s) => (!best || s.cycle > best.cycle ? s : best), null);
+  // Approval-bearing coverage needs an explicit approving native verdict; a false/null verdict keeps
+  // only the truthful pre-push records (the job's green exit never stands in for review success).
+  if (!source || source.verdict.approved !== true) return null;
+  const full: CycleSummary = {
+    id: PUBLICATION_CYCLE_ID,
+    stage: "publication",
+    cycle: 1,
+    inputCommit: source.inputCommit,
+    outputCommit,
+    outputCommitStatus: "committed",
+    dispositions: dispositions.slice(0, MAX_DISPOSITION_ENTRIES).map((d) => ({
+      key: d.key.slice(0, MAX_DISPOSITION_FIELD_CHARS), disposition: d.disposition.slice(0, MAX_DISPOSITION_FIELD_CHARS),
+    })),
+    tests: source.tests,
+    verdict: source.verdict,
+    // Publication is not a model invocation: measured usage stays on the source cycle, never duplicated.
+    usage: { tokensIn: null, tokensOut: null, costUsd: null },
+    truncated: source.truncated,
+    limitReached: source.limitReached,
+    completedAt: source.completedAt,
+  };
+  const fits = (r: CycleSummary): boolean => isCycleSummary(r as unknown);
+  if (fits(full)) return full;
+  const record: CycleSummary = full;
+  // Over the byte cap: shed non-coverage evidence first (tests, then verdict detail), keeping the
+  // dispositions the approval gate needs; flag the loss via truncated/limitReached.
+  const shrunk: CycleSummary[] = [
+    { ...record, tests: record.tests.slice(0, OVERFLOW_ENTRY_CAP) },
+    { ...record, tests: [SIZE_LIMIT_TEST_PLACEHOLDER], verdict: { approved: record.verdict.approved, reason: record.verdict.reason } },
+  ].map((r) => ({ ...r, truncated: true, limitReached: true }));
+  for (const candidate of shrunk) if (fits(candidate)) return candidate;
+  // Dispositions alone overflow: keep as many as fit rather than publishing nothing.
+  let fallback: CycleSummary = shrunk[1];
+  while (fallback.dispositions.length > 0 && !fits(fallback)) {
+    fallback = { ...fallback, dispositions: fallback.dispositions.slice(0, Math.floor(fallback.dispositions.length * 0.9)) };
+  }
+  if (fits(fallback)) {
+    console.warn(
+      `[cycle-summary] publication record exceeded the ${CYCLE_SUMMARY_MAX_BYTES}-byte cap; ` +
+        `kept ${fallback.dispositions.length}/${record.dispositions.length} dispositions`,
+    );
+    return fallback;
+  }
+  console.warn(`[cycle-summary] publication record could not be bounded to ${CYCLE_SUMMARY_MAX_BYTES} bytes; omitting it`);
+  return null;
 }
 
 /** Redacts, then caps `value` to `maxChars`; `truncated` is explicit rather than inferred from
@@ -312,6 +413,7 @@ export function writeCycleSummary(
       ...(verdictSummary !== undefined ? { summary: verdictSummary } : {}),
     },
     usage: input.usage,
+    ...(input.verifyHook ? { verifyHook: input.verifyHook } : {}),
     truncated,
     limitReached: false,
     completedAt,

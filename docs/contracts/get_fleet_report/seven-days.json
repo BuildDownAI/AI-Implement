@@ -1,0 +1,16 @@
+{
+  "request": {
+    "args": {
+      "days": 7
+    }
+  },
+  "status": 200,
+  "response": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"byRepo\": [\n    {\n      \"repo\": \"acme/widgets\",\n      \"jobs\": 1,\n      \"issues\": 1,\n      \"completed\": 1,\n      \"failed\": 0,\n      \"merged\": 0,\n      \"avgPasses\": null,\n      \"costUsd\": null\n    }\n  ],\n  \"oneShotPct\": null,\n  \"eventualPct\": 0,\n  \"planning\": {\n    \"planned\": {\n      \"jobs\": 0,\n      \"oneShotPct\": null,\n      \"avgPasses\": null,\n      \"avgCostUsd\": null,\n      \"mergedPct\": null\n    },\n    \"unplanned\": {\n      \"jobs\": 1,\n      \"oneShotPct\": null,\n      \"avgPasses\": null,\n      \"avgCostUsd\": null,\n      \"mergedPct\": 0\n    }\n  },\n  \"escapeRate\": null,\n  \"runaways\": []\n}"
+      }
+    ]
+  }
+}

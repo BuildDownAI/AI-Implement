@@ -2,18 +2,23 @@
  * Every lookup is bound to a durable attempt ID and restricted to administrators;
  * no guessed URL can move another scope. Actions preserve the exact owner and
  * never free capacity without the workflow's backend-terminal confirmation. */
+import { sameExecution } from "./review-fix-contract.js";
 import type { ReviewFixAttemptsFacade, ReviewFixAttemptCaller, ReviewFixAttemptCycleSummary } from "./admin.js";
+import type { DispatchAdmissionBackend } from "./dispatch-admission.js";
 import { getDb } from "./dedup.js";
+import { getInvocationAttribution } from "./log.js";
 import { getReviewFixActivityGaps, isReviewFixEvidenceTombstoned,
   listReviewFixActivity, listReviewFixCycleSummaries } from "./review-fix-evidence.js";
-import { acceptDelivery } from "./review-fix-inbox.js";
-import { loadPendingReviewFixFeedback } from "./review-fix-pending.js";
+import type { ReviewFixCancelForwarder } from "./review-fix-close.js";
+import { inspectPendingReviewFixFeedback } from "./review-fix-pending.js";
 import type { SqliteReviewFixAttemptStore } from "./review-fix-attempt-store.js";
 import type { ReviewFixImmutableOutcome, ReviewFixWorkerPort } from "./review-fix-ports.js";
 
 interface AttemptRow {
   attempt_id: string; dispatch_id: string; installation_id: string; repository: string; pr_number: number;
   owner: string; state: string; deadline_at: number; authority_revoked_at: number | null;
+  execution_backend: DispatchAdmissionBackend;
+  execution_ref: string | null;
   github_run_id: number | null; github_run_attempt: number | null;
   task_snapshot_json: string; finding_versions_json: string;
   terminal_outcome_json: string | null; result_conflict_at: number | null;
@@ -32,13 +37,27 @@ function allowed(caller: ReviewFixAttemptCaller): boolean {
   return caller.role === "admin";
 }
 
+/** Projects the stored JSON verdict; a legacy plain string or malformed value keeps `approved: null` and the raw text. */
+export function parseStoredVerdict(raw: string): { approved: boolean | null; reason: string } {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const { approved, reason } = parsed as { approved?: unknown; reason?: unknown };
+      if ((approved === null || typeof approved === "boolean") && typeof reason === "string") return { approved, reason };
+    }
+  } catch {
+    // fall through to the raw text
+  }
+  return { approved: null, reason: raw };
+}
+
 function normalizeCycles(attemptId: string): ReviewFixAttemptCycleSummary[] {
   return listReviewFixCycleSummaries(attemptId).map((cycle) => ({
     cycle: cycle.cycle, inputCommit: cycle.inputCommit, outputCommit: cycle.outputCommit,
     dispositions: cycle.dispositions.map((item) => ({ key: item.findingKey, disposition: item.disposition })),
     tests: Array.isArray(cycle.tests) ? cycle.tests.filter((test): test is { name: string; status: string } =>
       !!test && typeof test === "object" && typeof test.name === "string" && typeof test.status === "string") : [],
-    verdict: { approved: null, reason: cycle.verdict },
+    verdict: parseStoredVerdict(cycle.verdict),
     usage: cycle.usage && typeof cycle.usage === "object" ? {
       tokensIn: typeof (cycle.usage as { tokensIn?: unknown }).tokensIn === "number"
         ? (cycle.usage as { tokensIn: number }).tokensIn : null,
@@ -74,7 +93,11 @@ function evidenceComplete(attemptId: string, cycles: ReviewFixAttemptCycleSummar
   });
 }
 
-export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, worker: Pick<ReviewFixWorkerPort, "reconcile">): ReviewFixAttemptsFacade {
+export function createReviewFixAdminFacade(
+  store: SqliteReviewFixAttemptStore,
+  worker: Pick<ReviewFixWorkerPort, "reconcile">,
+  ingress: ReviewFixCancelForwarder,
+): ReviewFixAttemptsFacade {
   return {
     async getAttempt(attemptId, caller) {
       if (!allowed(caller)) return { status: "not_found" };
@@ -88,14 +111,20 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
         ? JSON.parse(row.terminal_outcome_json) as ReviewFixImmutableOutcome : null;
       return { status: "ok", attempt: {
         attemptId, owner: { kind: "restate", attemptId: row.owner },
-        execution: row.github_run_id === null || row.github_run_attempt === null ? null
-          : { githubRunId: String(row.github_run_id), githubRunAttempt: row.github_run_attempt },
+        execution: row.execution_backend === "github-actions"
+          ? row.github_run_id === null || row.github_run_attempt === null ? null
+            : { backend: "github-actions", githubRunId: String(row.github_run_id), githubRunAttempt: row.github_run_attempt }
+          : row.execution_ref === null ? null
+            : { backend: row.execution_backend, runRef: row.execution_ref },
         deadlineAt: row.deadline_at,
-        pendingFeedback: loadPendingReviewFixFeedback(scope, null) !== null,
+        // An over-budget set is still pending feedback; the dashboard read must not throw on it.
+        pendingFeedback: (() => { const found = inspectPendingReviewFixFeedback(scope, null);
+          return found.status === "incomplete" || found.feedback !== null; })(),
         snapshot: { taskText: snapshot.taskText, findings },
         state: terminal ? terminal.terminal.status : row.result_conflict_at !== null ? "conflict" : row.state,
         evidenceComplete: evidenceComplete(attemptId, cycles),
         terminationConfirmed: row.released_at !== null,
+        attribution: getInvocationAttribution(row.dispatch_id),
         cycles,
       } };
     },
@@ -114,11 +143,10 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       const scope = { installationId: Number(row.installation_id), repository: row.repository, prNumber: row.pr_number };
       const found = await worker.reconcile(attemptId, scope);
       if (found.status !== "found") return { status: "rejected", reason: "execution identity remains unresolved" };
-      const bound = await store.bindExecution(attemptId, found.execution);
+      const bound = await store.bindExecution(attemptId, found.execution, Date.now());
       if (bound.status === "not_owner") return { status: "rejected", reason: "attempt no longer owns the PR" };
       if (bound.status === "already_bound" &&
-        (bound.execution.githubRunId !== found.execution.githubRunId
-          || bound.execution.githubRunAttempt !== found.execution.githubRunAttempt)) {
+        !sameExecution(bound.execution, found.execution)) {
         return { status: "rejected", reason: "another execution already owns the attempt" };
       }
       return { status: "accepted" };
@@ -130,12 +158,13 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       if (row.released_at !== null) return { status: "rejected", reason: "attempt is already released" };
       const scope = { installationId: Number(row.installation_id), repository: row.repository, prNumber: row.pr_number };
       const found = await worker.reconcile(attemptId, scope);
-      if (found.status !== "found" || String(found.execution.githubRunId) !== execution.githubRunId
+      if (found.status !== "found"
+        || (found.execution.backend !== undefined && found.execution.backend !== "github-actions")
+        || String(found.execution.githubRunId) !== execution.githubRunId
         || found.execution.githubRunAttempt !== execution.githubRunAttempt) return { status: "unverified" };
-      const bound = await store.bindExecution(attemptId, found.execution);
+      const bound = await store.bindExecution(attemptId, found.execution, Date.now());
       return bound.status === "not_owner" || bound.status === "already_bound"
-        && (bound.execution.githubRunId !== found.execution.githubRunId
-          || bound.execution.githubRunAttempt !== found.execution.githubRunAttempt)
+        && !sameExecution(bound.execution, found.execution)
         ? { status: "rejected", reason: "another execution already owns the attempt" }
         : { status: "accepted" };
     },
@@ -144,7 +173,7 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       const row = readAttempt(attemptId);
       if (!row) return { status: "not_found" };
       if (row.released_at !== null) return { status: "rejected", reason: "attempt is already released" };
-      await store.revokeAuthority(attemptId);
+      await store.revokeAuthority(attemptId, Date.now());
       return { status: "accepted" };
     },
     async requestCancellation(attemptId, caller) {
@@ -153,13 +182,9 @@ export function createReviewFixAdminFacade(store: SqliteReviewFixAttemptStore, w
       if (!row) return { status: "not_found" };
       if (row.released_at !== null) return { status: "rejected", reason: "attempt is already released" };
       if (row.authority_revoked_at === null) return { status: "rejected", reason: "revoke authority before cancellation" };
-      const accepted = acceptDelivery({ authenticatedSource: "operator",
-        deliveryId: `${attemptId}.cancel`, kind: "cancellation",
-        destination: { installationId: Number(row.installation_id), repository: row.repository, prNumber: row.pr_number },
-        payload: { attemptId },
-      });
-      return accepted.status === "accepted" ? { status: "accepted" }
-        : { status: "rejected", reason: "cancellation delivery could not be persisted" };
+      const forwarded = await ingress.cancel(attemptId, { idempotencyKey: `${attemptId}.cancel` });
+      return forwarded.status === "accepted" ? { status: "accepted" }
+        : { status: "rejected", reason: "cancellation could not be delivered to Restate" };
     },
   };
 }

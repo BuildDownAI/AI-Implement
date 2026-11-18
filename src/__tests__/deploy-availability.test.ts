@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DeployAvailabilityModule from "../deploy-availability.js";
 import type * as GithubAppAuthModule from "../github-app-auth.js";
 import type * as GithubModule from "../github.js";
+import { fakeFetch } from "./helpers/fake-fetch.js";
 
 // Both dependencies exist only to reach GitHub; what matters here is what they
 // return, so each is replaced by a spy exposing the functions we call.
@@ -268,27 +269,20 @@ describe("refreshAvailability", () => {
 // Live verification: the deploy-refs smoke on the feature branch confirms unauthenticated
 // reads succeed for public repos and 401s do not appear.
 describe("refreshAvailability — public mode (no App installation)", () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
+  const COMMITS = "GET /repos/BuildDownAI/AI-Implement/commits";
 
   it("reads the branch head unauthenticated when the App is not installed on the source owner", async () => {
     vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
       token: null,
       authMode: "public",
     });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
-      new Response(JSON.stringify([{ sha: HEAD }]), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    ));
+    const api = fakeFetch({ [COMMITS]: { json: [{ sha: HEAD }] } });
+    api.install();
 
     const state = await availability.refreshAvailability(input());
 
     // No Authorization header is sent in public mode — this is the load-bearing fix.
-    const [, opts] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
-    expect((opts?.headers as Record<string, string>)?.["Authorization"]).toBeUndefined();
+    expect(api.calls[0].headers.has("authorization")).toBe(false);
     // getRefSha is bypassed in public mode; the direct fetch above handles the lookup.
     expect(github.getRefSha).not.toHaveBeenCalled();
     expect(state.available).toBe(true);
@@ -301,7 +295,7 @@ describe("refreshAvailability — public mode (no App installation)", () => {
       token: null,
       authMode: "public",
     });
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 404 })));
+    fakeFetch({ [COMMITS]: { status: 404 } }).install();
 
     const state = await availability.refreshAvailability(input());
 
@@ -321,18 +315,12 @@ describe("refreshAvailability — public mode (no App installation)", () => {
       token: null,
       authMode: "public",
     });
-    let capturedHeaders: Record<string, string> | undefined;
-    vi.stubGlobal("fetch", vi.fn().mockImplementation((_url: string, opts: RequestInit) => {
-      capturedHeaders = opts?.headers as Record<string, string>;
-      return Promise.resolve(new Response(JSON.stringify([{ sha: HEAD }]), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }));
-    }));
+    const api = fakeFetch({ [COMMITS]: { json: [{ sha: HEAD }] } });
+    api.install();
 
     await availability.refreshAvailability(input());
 
-    expect(capturedHeaders?.["If-None-Match"]).toBeUndefined();
+    expect(api.calls[0].headers.has("if-none-match")).toBe(false);
   });
 
   it("stores the ETag from the first poll and sends If-None-Match on the second; 304 reuses the cached SHA", async () => {
@@ -340,21 +328,8 @@ describe("refreshAvailability — public mode (no App installation)", () => {
       token: null,
       authMode: "public",
     });
-
-    let secondCallHeaders: Record<string, string> | undefined;
-    vi.stubGlobal("fetch", vi.fn()
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify([{ sha: HEAD }]), {
-          status: 200,
-          headers: { "Content-Type": "application/json", "ETag": '"v1"' },
-        }),
-      )
-      .mockImplementationOnce((_url: string, opts: RequestInit) => {
-        secondCallHeaders = opts?.headers as Record<string, string>;
-        // Response constructor rejects 304; use a plain conforming object instead.
-        return Promise.resolve({ status: 304, ok: false, headers: { get: () => null } } as unknown as Response);
-      }),
-    );
+    const api = fakeFetch({ [COMMITS]: [{ json: [{ sha: HEAD }], headers: { ETag: '"v1"' } }, { status: 304 }] });
+    api.install();
 
     // First poll — fetches branch head and stores ETag.
     const state1 = await availability.refreshAvailability(input());
@@ -362,7 +337,7 @@ describe("refreshAvailability — public mode (no App installation)", () => {
 
     // Second poll — sends If-None-Match; 304 response reuses the cached SHA.
     const state2 = await availability.refreshAvailability(input());
-    expect(secondCallHeaders?.["If-None-Match"]).toBe('"v1"');
+    expect(api.calls[1].headers.get("if-none-match")).toBe('"v1"');
     expect(state2.headCommit).toBe(HEAD);
     expect(state2.available).toBe(true);
   });

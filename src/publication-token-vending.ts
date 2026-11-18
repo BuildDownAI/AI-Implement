@@ -73,7 +73,7 @@ export async function handlePublicationTokenRequest(
   if (!owner || !repo) return AUTH_FAILURE;
 
   try {
-    const { token, expiresAt } = await getScopedInstallationToken(
+    const { token, expiresAt, installationId } = await getScopedInstallationToken(
       input.githubAppId,
       input.githubAppPrivateKey,
       owner,
@@ -98,6 +98,11 @@ export async function handlePublicationTokenRequest(
     if (pilot && !verifyPreparedReviewFixToken(bearerToken, input.secret, "publication", {
       consumePublication: true, publicationExecution: execution!,
     }).ok) return AUTH_FAILURE;
+    // AII-922: one line per mint so a runner push 403 can be matched to its token.
+    console.log(
+      `[publication-token] minted dispatch=${verified.claims.dispatchId} repo=${owner}/${repo} `
+        + `installation=${installationId} expires_at=${expiresAt}`,
+    );
     return { status: 200, body: { token, expires_at: expiresAt } };
   } catch (err) {
     // The GitHub mint issued no credential. Restore only the exact claim made
@@ -112,12 +117,10 @@ export async function handlePublicationTokenRequest(
 }
 
 function publicationExecution(input: HandlePublicationTokenInput): {
-  repository: string; githubRunId: number; githubRunAttempt: number;
+  repository: string; githubRunId?: number; githubRunAttempt?: number;
 } | null {
-  if (!input.repository?.match(/^[^/\s]+\/[^/\s]+$/)
-    || !Number.isSafeInteger(input.githubRunId) || (input.githubRunId ?? 0) <= 0
-    || !Number.isSafeInteger(input.githubRunAttempt) || (input.githubRunAttempt ?? 0) <= 0) return null;
-  return { repository: input.repository, githubRunId: input.githubRunId!, githubRunAttempt: input.githubRunAttempt! };
+  if (!input.repository?.match(/^[^/\s]+\/[^/\s]+$/)) return null;
+  return { repository: input.repository, githubRunId: input.githubRunId, githubRunAttempt: input.githubRunAttempt };
 }
 
 /** Recheck current pilot authority before each external write, including later

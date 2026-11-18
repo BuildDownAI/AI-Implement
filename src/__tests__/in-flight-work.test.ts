@@ -1,47 +1,35 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { beforeEach, describe, expect, it } from "vitest";
 import type * as DedupModule from "../dedup.js";
 import type * as LogModule from "../log.js";
 import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import type * as InFlightWorkModule from "../in-flight-work.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as ReconciliationModule from "../reconciliation.js";
+import type * as DeployModule from "../deploy.js";
+import { testDb } from "./helpers/test-db.js";
 
-let dbPath: string;
 let dedup: typeof DedupModule;
 let log: typeof LogModule;
 let queue: typeof WorkflowSyncQueueModule;
 let inFlight: typeof InFlightWorkModule;
 let reviewFix: typeof ReviewFixQueueModule;
 let reconciliation: typeof ReconciliationModule;
+let deploy: typeof DeployModule;
 
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(
-    os.tmpdir(),
-    `in-flight-work-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`,
-  );
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  log = await import("../log.js");
-  queue = await import("../workflow-sync-queue.js");
-  inFlight = await import("../in-flight-work.js");
-  reviewFix = await import("../review-fix-queue.js");
-  reconciliation = await import("../reconciliation.js");
-  dedup.getDb(); // workflow_sync_queue + review_fix_queue DDL lives here
-  log.initLogTable();
-  reconciliation.initReconciliationTable();
-});
-
-afterEach(() => {
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
+  ({ dedup, log, queue, inFlight, reviewFix, reconciliation, deploy } = (
+    await testDb({
+      modules: {
+        dedup: () => import("../dedup.js"),
+        log: () => import("../log.js"),
+        queue: () => import("../workflow-sync-queue.js"),
+        inFlight: () => import("../in-flight-work.js"),
+        reviewFix: () => import("../review-fix-queue.js"),
+        reconciliation: () => import("../reconciliation.js"),
+        deploy: () => import("../deploy.js"),
+      },
+    })
+  ).modules);
 });
 
 /** A dispatch_log row defaults to 'dispatched', which is in-flight. */
@@ -106,8 +94,7 @@ describe("getInFlightWork", () => {
        task_snapshot_json, finding_versions_json)
       VALUES ('attempt-1', 'attempt-1', 'AII', '1', 'org/app', 1,
        'AII', 'issue-1', 'attempt-1', 'launch_intent', 1, 9999999999999, '{}', '[]')`).run();
-    const { createRestateDrainProbes } = await import("../deploy.js");
-    const probes = createRestateDrainProbes();
+    const probes = deploy.createRestateDrainProbes();
     expect(await probes.unresolvedLaunches()).toBe(1);
     expect(await probes.unresolvedTerminations()).toBe(0);
     expect(await probes.activeOwners()).toBe(1);
@@ -119,6 +106,22 @@ describe("getInFlightWork", () => {
     expect(await probes.unresolvedTerminations()).toBe(0);
     expect(await probes.activeOwners()).toBe(1);
   });
+  it.each(["fly-machines", "local-docker"])("counts only unbound %s launch intents", async (backend) => {
+    reserve("backend-attempt");
+    const db = dedup.getDb();
+    db.prepare(`INSERT INTO review_fix_attempts
+      (attempt_id, dispatch_id, mapping_key, installation_id, repository, pr_number,
+       issue_scope, issue_id, owner, state, created_at, deadline_at,
+       task_snapshot_json, finding_versions_json, execution_backend)
+      VALUES ('backend-attempt', 'backend-attempt', 'AII', '1', 'org/app', 1,
+       'AII', 'issue-1', 'backend-attempt', 'launch_intent', 1, 9999999999999, '{}', '[]', ?)`).run(backend);
+    db.prepare("UPDATE dispatch_admissions SET backend = ? WHERE dispatch_id = 'backend-attempt'").run(backend);
+    const probes = deploy.createRestateDrainProbes();
+    expect(await probes.unresolvedLaunches()).toBe(1);
+    db.prepare("UPDATE review_fix_attempts SET execution_ref = 'execution-1' WHERE attempt_id = 'backend-attempt'").run();
+    expect(await probes.unresolvedLaunches()).toBe(0);
+  });
+
   it("reports nothing on an idle orchestrator", () => {
     expect(inFlight.getInFlightWork()).toEqual([]);
   });

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type http from "node:http";
-import { withRequestErrorBoundary } from "../http-server.js";
+import { parseHealthPort, withRequestErrorBoundary } from "../http-server.js";
 
 function response(headersSent = false) {
   return {
@@ -42,5 +42,15 @@ describe("withRequestErrorBoundary", () => {
 
     expect(res.destroy).toHaveBeenCalledOnce();
     expect(res.writeHead).not.toHaveBeenCalled();
+  });
+});
+
+describe("parseHealthPort", () => {
+  it.each([[undefined], [""]])("defaults to 8080 when PORT is %j", (raw) => {
+    expect(parseHealthPort(raw)).toBe(8080);
+  });
+
+  it("reads PORT as a base-10 number", () => {
+    expect(parseHealthPort("9090")).toBe(9090);
   });
 });

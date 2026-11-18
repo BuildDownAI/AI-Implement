@@ -3,11 +3,12 @@ import { runHookScript } from "./hooks.js";
 
 interface VerifyInputs extends Record<string, unknown> {
   workspaceDir: string;
-  scriptPath: string;
+  scriptPath?: string;
 }
 
 interface VerifyOutputs extends Record<string, unknown> {
   ran: boolean;
+  skipped?: boolean;
 }
 
 export const verifyStep: StepModule<VerifyInputs, VerifyOutputs> = {
@@ -16,7 +17,8 @@ export const verifyStep: StepModule<VerifyInputs, VerifyOutputs> = {
     inputs: VerifyInputs,
     _reporter: StepReporter,
   ): Promise<VerifyOutputs> {
-    const result = runHookScript("verify", inputs.scriptPath, inputs.workspaceDir);
+    if (!inputs.scriptPath) return { ran: false, skipped: true };
+    const result = await runHookScript("verify", inputs.scriptPath, inputs.workspaceDir);
     if (result.exitCode !== 0) {
       throw new Error(`verify hook failed with exit code ${result.exitCode}`);
     }

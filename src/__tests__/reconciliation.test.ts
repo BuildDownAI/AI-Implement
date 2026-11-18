@@ -1,21 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-let dbPath: string;
+import { describe, it, expect, beforeEach } from "vitest";
+import { testDb } from "./helpers/test-db.js";
 let recon: typeof import("../reconciliation.js");
 let dedup: typeof import("../dedup.js");
 beforeEach(async () => {
-  vi.resetModules();
-  dbPath = path.join(os.tmpdir(), `recon-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
-  dedup = await import("../dedup.js");
-  recon = await import("../reconciliation.js");
-  recon.initReconciliationTable();
-});
-afterEach(() => {
-  dedup.closeDb();
-  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+  ({ recon, dedup } = (
+    await testDb({ modules: { recon: () => import("../reconciliation.js"), dedup: () => import("../dedup.js") } })
+  ).modules);
 });
 describe("reconciliation pr-dedup", () => {
   it("hasReconciliationForPr is false until a row exists, then true", () => {
@@ -35,12 +25,22 @@ describe("reconciliation pr-dedup", () => {
     expect(second).toBe(first);
     expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
-  it("enqueueReconciliation after a tombstone does not resurrect the PR", () => {
+  it("enqueueReconciliation promotes a tombstone when a merge is confirmed", () => {
     const tombstoneId = recon.recordReconciliationTombstone({ issueId: "i3", issueIdentifier: "ENG-3", prNumber: 7, repo: "o/r" });
     const enqueueId = recon.enqueueReconciliation({ issueId: "i3", issueIdentifier: "ENG-3", prNumber: 7, repo: "o/r", mergeCommitSha: "sha" });
     expect(enqueueId).toBe(tombstoneId);
-    expect(recon.getPendingReconciliations()).toHaveLength(0);
+    expect(recon.getPendingReconciliations()).toHaveLength(1);
   });
+  it.each(["dispatched", "failed"] as const)("does not promote a %s merge", (status) => {
+    const entry = { issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "sha" };
+    const id = recon.enqueueReconciliation(entry);
+    recon.updateReconciliationStatus(id, status);
+    expect(recon.enqueueReconciliation({ ...entry, mergeCommitSha: "later" })).toBe(id);
+    expect(recon.getPendingReconciliations()).toHaveLength(0);
+    expect(dedup.getDb().prepare("SELECT status, merge_commit_sha FROM reconciliation_queue").all())
+      .toEqual([{ status, merge_commit_sha: "sha" }]);
+  });
+
   it("initReconciliationTable dedupes pre-index duplicate rows before creating the unique index", () => {
     const db = dedup.getDb();
     db.exec("DROP INDEX IF EXISTS reconciliation_queue_repo_pr");

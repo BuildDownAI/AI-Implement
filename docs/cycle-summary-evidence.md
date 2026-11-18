@@ -189,6 +189,34 @@ interface CycleSummary {
   recomputed; see "Durability path" above for why this must stay stable
   across a delivery retry.
 
+## Publication record (AII-1450)
+
+The `feedback-loop.N` records are written **before** the pipeline-owned commit and push, so they are
+immutable `pending_push` records with `outputCommit: null` and `dispositions: []`. They are never
+rewritten (a different payload for an existing identity is a 409 `cycle_conflict`).
+
+After a successful push, `reportRunnerResult` (`src/run-autonomous.ts`) builds one extra record with
+`buildPublicationCycleSummary` (`stage: "publication"`, id `publication.1`) and streams it after the
+pre-push records and before the result. It carries the actual pushed `commitSha`
+(`outputCommitStatus: "committed"`) and the dispositions validated from
+`ai-output/finding-dispositions.json`. Tests and verdict are copied from the last feedback-loop
+cycle, so missing tests stay `missing`. Usage is **null** on the publication record: it is not a model
+invocation, so measured spend stays on the original cycle and is never counted twice.
+The record is approval-bearing, so it is built **only** when the overall runner result is `success` **and**
+the source cycle's native verdict is explicitly `approved: true`. A `false`/`null` verdict, a failure
+result (install failure, caught post-push failure, review-unapproved) or a missing verdict leaves only
+the truthful pre-push records; the job's green exit (handled failures exit 0) never stands in for approval. `completedAt` is taken from that source
+cycle, so every redelivery is byte-identical and idempotent. No record is built when the push produced
+no commit or the run wrote no feedback-loop cycle, and a `fixed` disposition is never inferred.
+
+In `review_fix_cycles` the record is stored in cycle band `50_000 + cycle` (`PUBLICATION_CYCLE_BAND`,
+`src/runner-callback.ts`): after every feedback-loop cycle and before the `100_000` post-push-review-fix
+band, so a later post-push-review-fix commit stays the final one. `dispositionsFor`
+(`src/restate/review-fix-production.ts`) requires the final cycle's commit to equal the authenticated
+result's `outputCommit`, which the publication record satisfies. The admin read model parses the stored
+verdict JSON into `approved` true/false/null, falling back to `approved: null` with the raw text for a
+legacy or malformed value.
+
 ## Test-status inference (`inferTestResults`)
 
 `extractTelemetry` correlates Bash `tool_use` IDs with structured `tool_result`

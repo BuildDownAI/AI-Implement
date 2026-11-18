@@ -6,14 +6,16 @@
 // that boundary with an actual 30-second wait, and the operator rule keeps that class of
 // test in the default suite where it runs in milliseconds.
 //
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate` (binary runtime, no Docker); excluded from `npm test`.
 import crypto from "node:crypto";
 import { randomUUID } from "node:crypto";
-import { RestateTestEnvironment } from "@restatedev/restate-sdk-testcontainers";
+import type { RestateEnvironment } from "./harness.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import * as restate from "@restatedev/restate-sdk";
+import { scrubOperatorLegacyTokens } from "../../restate/operator-legacy-scrub.js";
 import { operatorObject, RestateRefreshAuthority } from "../../restate/operator-object.js";
-import { getEffectiveAllowlist, matchAccessEntry } from "../../access-entries.js";
-import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
+import { getEffectiveAllowlist, matchAccessEntryOrOrgClaim } from "../../access-entries.js";
+import { VARIANTS, callObject, eventually, journalEntries, journalText, queryInvocations, startRetryEnabled, startVariants, stopAll } from "./harness.js";
 
 // Mocked so RestateRefreshAuthority.rotate's allowlist re-check and auth-event emission
 // don't need the access_entries/mcp_auth_events tables in this container-only suite, which
@@ -21,7 +23,7 @@ import { VARIANTS, callObject, startVariants, stopAll } from "./harness.js";
 // deauthorized-identity scenario below configures the allowlist mock.
 vi.mock("../../access-entries.js", () => ({
   getEffectiveAllowlist: vi.fn(),
-  matchAccessEntry: vi.fn(),
+  matchAccessEntryOrOrgClaim: vi.fn(),
 }));
 vi.mock("../../mcp-auth-events.js", () => ({
   recordAuthEvent: vi.fn(),
@@ -30,6 +32,11 @@ vi.mock("../../mcp-auth-events.js", () => ({
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+/** Stand-in for the hash of the orchestrator-derived next token: a deterministic function of the presented hash, as in production. */
+function nextOf(presentedHash: string): string {
+  return sha256(`next:${presentedHash}`);
 }
 
 interface IssueBody {
@@ -41,7 +48,7 @@ interface IssueBody {
 }
 
 type RefreshResult =
-  | { status: "ok"; token: string; expiresAt: number; email: string; sub: string; provider: string }
+  | { status: "ok"; expiresAt: number; email: string; sub: string; provider: string }
   | { status: "replay" }
   | { status: "expired" };
 
@@ -63,7 +70,7 @@ function issueBody(overrides: Partial<IssueBody> = {}): IssueBody {
 }
 
 describe("Operator object", () => {
-  let environments: Map<string, RestateTestEnvironment>;
+  let environments: Map<string, RestateEnvironment>;
 
   beforeAll(async () => {
     environments = await startVariants([operatorObject]);
@@ -84,8 +91,8 @@ describe("Operator object", () => {
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
 
       const [first, second] = await Promise.all([
-        callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash }),
-        callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash }),
+        callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) }),
+        callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) }),
       ]);
 
       expect(first.status).toBe("ok");
@@ -104,11 +111,11 @@ describe("Operator object", () => {
       const hash = sha256(raw);
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
 
-      const rotated = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const rotated = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
       expect(rotated.status).toBe("ok");
 
       // Present the now-rotated-away hash again — immediately, well inside the 30s window.
-      const concurrent = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const concurrent = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
       expect(concurrent).toEqual(rotated);
     },
   );
@@ -124,11 +131,12 @@ describe("Operator object", () => {
 
       const forged = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
         presentedHash: sha256("forged"),
+        nextHash: nextOf(sha256("forged")),
       });
       expect(forged).toEqual({ status: "replay" });
 
       // The legitimate current hash still works — the forged presentation did not clear state.
-      const legitimate = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const legitimate = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
       expect(legitimate.status).toBe("ok");
     },
   );
@@ -142,7 +150,7 @@ describe("Operator object", () => {
       const hash = sha256(randomUUID());
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash, expiresAt: Date.now() - 1000 }));
 
-      const result = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const result = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
       expect(result).toEqual({ status: "expired" });
 
       const description = await callObject<DescribeResult>(env.baseUrl(), "Operator", key, "describe", {});
@@ -160,7 +168,7 @@ describe("Operator object", () => {
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
       await callObject(env.baseUrl(), "Operator", key, "revoke", {});
 
-      const result = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const result = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
       expect(result).toEqual({ status: "replay" });
     },
   );
@@ -177,14 +185,14 @@ describe("Operator object", () => {
 
       // The old family's hash must no longer work post-revoke.
       const afterRevoke = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
-        presentedHash: firstHash,
+        presentedHash: firstHash, nextHash: nextOf(firstHash),
       });
       expect(afterRevoke).toEqual({ status: "replay" });
 
       const secondHash = sha256(randomUUID());
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash: secondHash, email: "re-signed-in@eudoxus.ai" }));
 
-      const refreshed = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: secondHash });
+      const refreshed = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: secondHash, nextHash: nextOf(secondHash) });
       expect(refreshed.status).toBe("ok");
       if (refreshed.status === "ok") {
         expect(refreshed.email).toBe("re-signed-in@eudoxus.ai");
@@ -233,28 +241,54 @@ describe("Operator object", () => {
       expect(identityResult).not.toHaveProperty("currentHash");
       expect(identityResult).not.toHaveProperty("rotatedAt");
 
-      const refreshed = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const refreshed = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
       expect(refreshed.status).toBe("ok");
     },
   );
 
+  it.each(VARIANTS.map(([label]) => label))(
+    "a concurrent call whose nextHash differs from currentHash answers unavailable and clears nothing (%s)",
+    async (label) => {
+      const env = environments.get(label);
+      if (!env) throw new Error(`environment "${label}" did not start`);
+      const key = randomUUID();
+      const hash = sha256(randomUUID());
+      await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
+      await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
+
+      const mismatched = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
+        presentedHash: hash,
+        nextHash: sha256("some other derivation"),
+      });
+      expect(mismatched).toEqual({ status: "unavailable" });
+
+      // The family is intact: the rotated-in hash still rotates.
+      const next = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
+        presentedHash: nextOf(hash),
+        nextHash: nextOf(nextOf(hash)),
+      });
+      expect(next.status).toBe("ok");
+    },
+  );
+
   it("state after issue then two refresh calls is equivalent whether or not the server forces replay", async () => {
-    async function runSequence(env: RestateTestEnvironment): Promise<{
+    async function runSequence(env: RestateEnvironment): Promise<{
       rotateStatus: string;
       concurrentStatus: string;
-      concurrentReturnedTheSameTokenAsTheRotation: boolean;
+      concurrentEqualsRotation: boolean;
+      journalsHoldNoRawToken: boolean;
     }> {
       const key = randomUUID();
       const raw = randomUUID();
       const hash = sha256(raw);
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash }));
-      const rotated = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
-      const concurrent = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+      const rotated = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
+      const concurrent = await callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash, nextHash: nextOf(hash) });
       return {
         rotateStatus: rotated.status,
         concurrentStatus: concurrent.status,
-        concurrentReturnedTheSameTokenAsTheRotation:
-          rotated.status === "ok" && concurrent.status === "ok" && rotated.token === concurrent.token,
+        concurrentEqualsRotation: JSON.stringify(rotated) === JSON.stringify(concurrent),
+        journalsHoldNoRawToken: !JSON.stringify(rotated).includes("token"),
       };
     }
 
@@ -268,7 +302,8 @@ describe("Operator object", () => {
     expect(withReplay).toEqual({
       rotateStatus: "ok",
       concurrentStatus: "ok",
-      concurrentReturnedTheSameTokenAsTheRotation: true,
+      concurrentEqualsRotation: true,
+      journalsHoldNoRawToken: true,
     });
     expect(withoutReplay).toEqual(withReplay);
   });
@@ -290,13 +325,17 @@ describe("Operator object", () => {
 
       const sleepMs = 8_000;
       const inFlight = callObject<RefreshResult>(env.baseUrl(), "Operator", key, "refresh", {
-        presentedHash: hash,
+        presentedHash: hash, nextHash: nextOf(hash),
         sleepMs,
       });
       // Give the exclusive invocation a moment to be admitted and start sleeping before
       // racing describe against it — otherwise describe could simply win an admission race
       // that says nothing about concurrency with an in-flight exclusive call.
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      await eventually(
+        () => queryInvocations(env.adminAPIBaseUrl(), `target_service_name = 'Operator' AND target_service_key = '${key}' AND target_handler_name = 'refresh'`),
+        (rows) => rows.some((row) => row.status === "running" || row.status === "suspended"),
+        { label: "the exclusive refresh to be admitted" },
+      );
 
       const start = Date.now();
       const description = await callObject<DescribeResult>(env.baseUrl(), "Operator", key, "describe", {});
@@ -328,7 +367,7 @@ describe("Operator object", () => {
       await callObject(env.baseUrl(), "Operator", key, "issue", issueBody({ hash, email: "denied@eudoxus.ai" }));
 
       vi.mocked(getEffectiveAllowlist).mockReturnValue({ entries: [], source: "env" });
-      vi.mocked(matchAccessEntry).mockReturnValue(null);
+      vi.mocked(matchAccessEntryOrOrgClaim).mockReturnValue(null);
 
       const revokeCalls: string[] = [];
       const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
@@ -351,4 +390,103 @@ describe("Operator object", () => {
     },
     20_000,
   );
+});
+
+
+// AII-1287: the one-time scrub-plus-purge. A stand-in `Operator` with the pre-AII-1287
+// handlers seeds a legacy family and legacy `refresh` invocations whose journals hold raw
+// tokens; the real `dropLegacyToken` handler is registered beside them.
+describe("Operator legacy-token scrub (AII-1287)", () => {
+  interface LegacyFamily {
+    currentHash: string;
+    currentToken: string;
+    previousHash: string | null;
+    rotatedAt: number;
+    expiresAt: number;
+  }
+  const realDrop = (operatorObject as unknown as { object: { dropLegacyToken: (ctx: restate.ObjectContext) => Promise<boolean> } }).object
+    .dropLegacyToken;
+  const legacyOperator = restate.object({
+    name: "Operator",
+    handlers: {
+      issue: async (ctx: restate.ObjectContext, request: { hash: string }) => {
+        ctx.set<LegacyFamily>("family", {
+          currentHash: request.hash,
+          currentToken: "",
+          previousHash: null,
+          rotatedAt: await ctx.date.now(),
+          expiresAt: Date.now() + 1e9,
+        });
+      },
+      refresh: async (ctx: restate.ObjectContext, request: { presentedHash: string }) => {
+        const f = (await ctx.get<LegacyFamily>("family")) as LegacyFamily;
+        const token = `${ctx.rand.uuidv4()}${ctx.rand.uuidv4()}`.replace(/-/g, "");
+        ctx.set<LegacyFamily>("family", { ...f, currentHash: sha256(token), currentToken: token, previousHash: request.presentedHash });
+        return { status: "ok", token };
+      },
+      dropLegacyToken: realDrop,
+    },
+  });
+
+  let env: RestateEnvironment;
+  beforeAll(async () => {
+    env = await startRetryEnabled([legacyOperator]);
+  }, 60_000);
+  afterAll(async () => {
+    await stopAll(new Map([["legacy", env]]));
+  });
+
+  it("removes every raw token from state and journals, purges legacy invocations, writes the row once", async () => {
+    const key = randomUUID();
+    const hash = sha256(randomUUID());
+    await callObject(env.baseUrl(), "Operator", key, "issue", { hash });
+    const legacyResult = await callObject<{ token: string }>(env.baseUrl(), "Operator", key, "refresh", { presentedHash: hash });
+    expect(legacyResult.token).toMatch(/^[0-9a-f]{64}$/);
+
+    const stateText = async (): Promise<string> => {
+      const r = await fetch(`${env.adminAPIBaseUrl()}/query`, { // restate-test-allow: state read, not an invocation lookup
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: "SELECT * FROM state WHERE service_name = 'Operator'" }),
+      });
+      return JSON.stringify(await r.json());
+    };
+    const journalsText = async (): Promise<string> => {
+      const invs = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'Operator'");
+      let out = "";
+      for (const inv of invs) out += journalText(await journalEntries(env.adminAPIBaseUrl(), String(inv.id)));
+      return out;
+    };
+
+    // Precondition: the raw token really is readable in both places.
+    const tokenHex = Buffer.from(legacyResult.token).toString("hex");
+    expect((await stateText()).includes(legacyResult.token)).toBe(true);
+    expect((await journalsText()).includes(legacyResult.token)).toBe(true);
+
+    let row: string | null = null;
+    const rowStore = { read: () => row, write: (iso: string) => { row = iso; }, clear: () => { row = null; } };
+    const deps = { adminBaseUrl: env.adminAPIBaseUrl(), ingressBaseUrl: env.baseUrl(), rowStore, restateReady: () => true };
+
+    const first = await scrubOperatorLegacyTokens(deps);
+    expect(first.ran).toBe(true);
+    expect(first.scrubbed).toBeGreaterThanOrEqual(1);
+    expect(first.purged).toBeGreaterThanOrEqual(2);
+    expect(row).not.toBeNull();
+
+    expect((await stateText()).includes(legacyResult.token)).toBe(false);
+    expect((await stateText()).includes(tokenHex)).toBe(false);
+    expect(await journalsText()).not.toContain(legacyResult.token);
+    const remaining = await queryInvocations(env.adminAPIBaseUrl(), "target_service_name = 'Operator' AND status = 'completed'");
+    expect(remaining.filter((inv) => inv.target_handler_name === "refresh" || inv.target_handler_name === "issue")).toEqual([]);
+
+    // The family survives, scrubbed: its key and hashes are intact.
+    expect(await stateText()).toContain(key);
+    expect(await stateText()).toContain(hash);
+
+    // A second run is a no-op.
+    const firstRow = row;
+    const second = await scrubOperatorLegacyTokens(deps);
+    expect(second).toEqual({ ran: false, scrubbed: 0, purged: 0 });
+    expect(row).toBe(firstRow);
+  });
 });

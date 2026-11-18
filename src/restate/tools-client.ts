@@ -8,6 +8,7 @@ import type { AccessRole } from "../access-entries.js";
 import type { Caller } from "../mcp-identity.js";
 import { systemCaller } from "../mcp-identity.js";
 import { isDeployHeld } from "../deploy-hold.js";
+import { restateCanServe } from "./status.js";
 import { RESTATE_ADMIN_BASE_URL, RESTATE_INGRESS_BASE_URL } from "./server.js";
 
 const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
@@ -15,7 +16,7 @@ const ORCHESTRATOR_TOOLS_SERVICE = "orchestratorTools";
 /** Admin discovery bound (AII-728): a hung admin API must not hang /mcp's tools/list. */
 const DISCOVER_TOOLS_TIMEOUT_MS = 5_000;
 /** Tool ingress bound (AII-728): a hung ingress must not hang a tools/call caller forever. */
-const CALL_TOOL_TIMEOUT_MS = 60_000;
+export const CALL_TOOL_TIMEOUT_MS = 60_000;
 
 export interface DiscoveredTool {
   name: string;
@@ -102,9 +103,20 @@ export async function toolCatalog(deps: DiscoverToolsDeps = {}): Promise<Discove
   return discoverTools(deps);
 }
 
+/**
+ * Tools that still answer during a deploy hold (AII-1401, AII-1612). All are short invocations that finish in
+ * milliseconds: `get_kg_status` and `get_deploy_posture` are reads, `decide_kg_refresh` decides a held KG refresh through
+ * `KgRepo.decide`, which starts the decision as a new run and so lets the drain finish, and `start_deploy` answers a
+ * retry during a drain with `alreadyActive: true`. `SelfDeploy.start` itself sets the hold, so the control plane's
+ * poll and retry would otherwise never reach the handler. Exact names only, compared before
+ * percent-encoding; every other tool answers `deploy-held`.
+ */
+const DEPLOY_HOLD_ALLOWED_TOOLS: ReadonlySet<string> = new Set(["get_kg_status", "decide_kg_refresh", "get_deploy_posture", "start_deploy"]);
+
 export type CallToolResult =
   | { status: "ok"; content: Array<{ type: string; text: string }>; isError?: boolean }
-  | { status: "unavailable" };
+  | { status: "unavailable" }
+  | { status: "deploy-held" };
 
 /** For testing: override the ingress base URL and the fetch implementation. */
 export interface CallToolDeps {
@@ -112,6 +124,12 @@ export interface CallToolDeps {
   fetchImpl?: typeof fetch;
   /** Shared deploy drain admission check; injectable for deterministic tests. */
   permitsExternalCall?: () => boolean;
+  /**
+   * `true` when the sidecar is `ready` and the endpoint `registered` (AII-1281). While registration
+   * is declined, the registered deployment is the old one, and a call that reaches a handler it lacks
+   * (RT0018) retries forever and pins the drain. Same name and meaning as the LateExternalReview hook.
+   */
+  restateReady?: () => boolean;
   /**
    * Restate's own idempotency key (https://docs.restate.dev/operate/invocation#invoke-a-handler-idempotently),
    * sent as the `idempotency-key` header. Restate scopes it by (service, handler, key), so a
@@ -126,7 +144,9 @@ export interface CallToolDeps {
 
 /**
  * Posts `{ caller, args }` to the ingress at `<service>/<name>` and returns the handler's
- * ToolResponse. A connection failure or a 5xx response answers `{ status: "unavailable" }`
+ * ToolResponse. While a deploy hold refuses admission it answers `{ status: "deploy-held" }`
+ * without contacting the ingress; with no hold, while Restate is not ready and registered it
+ * answers `{ status: "unavailable" }` the same way. A connection failure or a 5xx response answers `{ status: "unavailable" }`
  * — the signal src/mcp.ts maps to `503 { error: "restate-unavailable" }`.
  *
  * `name` is percent-encoded before it reaches the URL: an unencoded `../other-service/x`
@@ -142,8 +162,13 @@ export async function callTool(
   deps: CallToolDeps = {},
 ): Promise<CallToolResult> {
   // Both MCP and POST /api/tools/<name> enter through this seam. Refuse before
-  // contacting the old endpoint once deployment has closed external admission.
-  if (!(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) return { status: "unavailable" };
+  // contacting the old endpoint once deployment has closed external admission, except for the
+  // tools in DEPLOY_HOLD_ALLOWED_TOOLS; the Restate-ready check below still applies.
+  if (!DEPLOY_HOLD_ALLOWED_TOOLS.has(name) && !(deps.permitsExternalCall ?? (() => !isDeployHeld()))()) {
+    return { status: "deploy-held" };
+  }
+  const restateReady = deps.restateReady ?? restateCanServe;
+  if (!restateReady()) return { status: "unavailable" };
   const ingressBaseUrl = deps.ingressBaseUrl ?? RESTATE_INGRESS_BASE_URL;
   const fetchImpl = deps.fetchImpl ?? fetch;
 

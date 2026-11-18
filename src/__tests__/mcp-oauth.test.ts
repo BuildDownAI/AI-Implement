@@ -1,11 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import crypto from "node:crypto";
 import type http from "node:http";
 import type { AuthStart, VerifiedIdentity } from "../oauth/oidc.js";
 import type { OidcProviderConfig } from "../oauth/providers.js";
+import { testDb } from "./helpers/test-db.js";
 
 // Mock the OIDC engine so we don't need real network calls
 vi.mock("../oauth/oidc.js", () => ({
@@ -87,7 +85,6 @@ let access: typeof import("../access-entries.js");
 let oidc: typeof import("../oauth/oidc.js");
 let dedup: typeof import("../dedup.js");
 let authEvents: typeof import("../mcp-auth-events.js");
-let dbPath: string;
 
 /** Seed the list in force the way a pre-handover deployment does — from the env. */
 function setAllowedDomains(domains: string): void {
@@ -97,21 +94,20 @@ function setAllowedDomains(domains: string): void {
 }
 
 beforeEach(async () => {
-  vi.resetModules();
   vi.clearAllMocks();
-  dbPath = path.join(os.tmpdir(), `mcp-oauth-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
-  process.env.DEDUP_DB_PATH = dbPath;
+  ({ mcpOauth, providers, access, oidc, dedup, authEvents } = (
+    await testDb({
+      modules: {
+        mcpOauth: () => import("../mcp-oauth.js"),
+        providers: () => import("../oauth/providers.js"),
+        access: () => import("../access-entries.js"),
+        oidc: () => import("../oauth/oidc.js"),
+        dedup: () => import("../dedup.js"),
+        authEvents: () => import("../mcp-auth-events.js"),
+      },
+    })
+  ).modules);
 
-  mcpOauth = await import("../mcp-oauth.js");
-  providers = await import("../oauth/providers.js");
-  access = await import("../access-entries.js");
-  oidc = await import("../oauth/oidc.js");
-  dedup = await import("../dedup.js");
-  authEvents = await import("../mcp-auth-events.js");
-
-  mcpOauth.initMcpOAuthTables();
-  access.initAccessEntriesTable();
-  authEvents.initAuthEventsTable();
   providers.configureOAuthProviders([googleProvider]);
   setAllowedDomains("eudoxus.ai");
   (oidc.buildAuthUrl as ReturnType<typeof vi.fn>).mockResolvedValue(OIDC_START);
@@ -125,12 +121,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
-  dedup.closeDb();
-  try {
-    fs.unlinkSync(dbPath);
-  } catch {
-    /* ignore */
-  }
 });
 
 // Helper to compute PKCE challenge from a verifier
@@ -208,6 +198,56 @@ describe("handleMcpAuthorizationServerMetadata", () => {
     expect(body.code_challenge_methods_supported).toContain("S256");
     expect(body.grant_types_supported).toContain("authorization_code");
     expect(body.grant_types_supported).toContain("refresh_token");
+  });
+});
+
+// ---------- Unit: route gate ----------
+
+// The OAuth routes used to 503 unless a KG memory provider was configured, which locked an
+// MCP client out of every non-kg_* tool on a sidecar-less deploy. They gate on the base URL
+// alone now, matching handleMcpRequest.
+describe("routeMcpOAuth", () => {
+  it("serves both well-known metadata documents with no KG sidecar configured", () => {
+    for (const pathname of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname), asRes(res), pathname, BASE_URL)).toBe(true);
+      expect(res.statusCode).toBe(200);
+    }
+  });
+
+  it("serves the authorize route with no KG sidecar configured", async () => {
+    const clientId = await registerClient();
+    const url = `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:8080/callback")}&state=s&code_challenge=${pkceChallenge("verifier")}&code_challenge_method=S256`;
+    const res = new MockResponse();
+    expect(mcpOauth.routeMcpOAuth(mkReq(url), asRes(res), "/mcp/authorize", BASE_URL)).toBe(true);
+    await vi.waitFor(() => expect(res.statusCode).toBe(302));
+    expect(res.headers["Location"]).toContain("accounts.google.com");
+  });
+
+  it("503s every MCP OAuth route when OAUTH_REDIRECT_BASE_URL is unset", () => {
+    for (const pathname of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server", "/mcp/register", "/mcp/token"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname), asRes(res), pathname, null)).toBe(true);
+      expect(res.statusCode).toBe(503);
+    }
+  });
+
+  // The method check sits above the base-URL gate, as the old inline routes did: a non-GET
+  // well-known request falls through to the 404 handler rather than being answered 503.
+  it("leaves a non-GET well-known request to the caller even when OAUTH_REDIRECT_BASE_URL is unset", () => {
+    for (const pathname of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname, "POST"), asRes(res), pathname, null)).toBe(false);
+      expect(res.statusCode).toBe(0);
+    }
+  });
+
+  it("leaves /mcp itself and unrelated paths to the caller", () => {
+    for (const pathname of ["/mcp", "/admin", "/api/auth/providers"]) {
+      const res = new MockResponse();
+      expect(mcpOauth.routeMcpOAuth(mkReq(pathname), asRes(res), pathname, BASE_URL)).toBe(false);
+      expect(res.statusCode).toBe(0);
+    }
   });
 });
 
@@ -466,6 +506,25 @@ describe("handleMcpOidcCallback", () => {
     expect(new URL(location).searchParams.get("state")).toBe("clientstate");
   });
 
+  it("never calls the Restate ingress for an identity already bound to its provider (AII-1523)", async () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    dedup.getDb().prepare("INSERT INTO access_entry_bindings (value, provider, subject, bound_at) VALUES (?, ?, ?, ?)")
+      .run("ada@eudoxus.ai", "google", "google|1", Date.now());
+    access.refreshEffectiveAllowlist();
+    const fetchMock = vi.fn().mockRejectedValue(new Error("ingress must not be called"));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const clientId = await registerClient();
+      await startAuthorize(clientId);
+      const { res, code } = await doCallback();
+      expect(res.statusCode).toBe(302);
+      expect(code).toBeTruthy();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("redirects with error=access_denied when identity is not on allowlist", async () => {
     const clientId = await registerClient();
     await startAuthorize(clientId);
@@ -517,6 +576,56 @@ describe("handleMcpOidcCallback", () => {
     const res2 = new MockResponse();
     await mcpOauth.handleMcpOidcCallback(req2, asRes(res2), "google", BASE_URL);
     expect(res2.statusCode).toBe(400);
+  });
+});
+
+describe("handleMcpOidcCallback org role claim (AII-1526)", () => {
+  const builddownProvider: OidcProviderConfig = { ...googleProvider, id: "builddown", label: "BuildDown", issuer: "https://bd.example" };
+
+  it("denies a claim-admitted first sign-in when the Restate ingress is unreachable, minting no code", async () => {
+    providers.configureOAuthProviders([builddownProvider]);
+    setAllowedDomains("unrelated.example");
+    const clientId = await registerClient();
+    await startAuthorize(clientId);
+    (oidc.completeAuth as ReturnType<typeof vi.fn>).mockResolvedValue(
+      identity({ provider: "builddown", sub: "bd|1", rawClaims: { builddown_org_role: "member" } }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("ECONNREFUSED")));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = new MockResponse();
+      await mcpOauth.handleMcpOidcCallback(mkReq("/mcp/callback/builddown?state=oidcstate&code=c"), asRes(res), "builddown", BASE_URL);
+      const location = new URL(res.headers["Location"] as string);
+      expect(location.searchParams.get("error")).toBe("server_error");
+      expect(location.searchParams.get("code")).toBeNull();
+      expect(dedup.getDb().prepare("SELECT COUNT(*) AS c FROM mcp_auth_codes").get()).toEqual({ c: 0 });
+      expect(log.mock.calls.some((c) => String(c[0]).includes("[mcp-oauth]") && String(c[0]).includes("source: org-claim"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("rechecks a claim-admitted identity by its recorded role, and not after the claim is cleared", async () => {
+    providers.configureOAuthProviders([builddownProvider]);
+    setAllowedDomains("unrelated.example");
+    const db = dedup.getDb();
+    const who = { email: "ada@eudoxus.ai", sub: "bd|1", provider: "builddown" };
+    expect(access.recheckIdentity(who).status).toBe("denied");
+    access.recordOrgClaimRole(who, "user", Date.now() + 1e6);
+    expect(access.recheckIdentity(who)).toMatchObject({ status: "ok", entry: { role: "user" } });
+    expect(access.recheckIdentity({ ...who, sub: "bd|2" }).status).toBe("denied");
+    expect(access.recheckIdentity({ ...who, provider: "google" }).status).toBe("denied");
+    access.clearOrgClaimRole(who);
+    expect(access.recheckIdentity(who).status).toBe("denied");
+    // An expired row is ignored, so a claim-only identity is refused once the window passes.
+    access.recordOrgClaimRole(who, "user", 1000);
+    const entries = access.getEffectiveAllowlist()!.entries;
+    expect(access.matchAccessEntryOrOrgClaim(who, entries, 999)).toMatchObject({ role: "user" });
+    expect(access.matchAccessEntryOrOrgClaim(who, entries, 1000)).toBeNull();
+    access.clearOrgClaimRole(who);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM access_entries").get()).toEqual({ c: 0 });
   });
 });
 

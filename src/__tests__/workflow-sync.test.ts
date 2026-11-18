@@ -1,51 +1,21 @@
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { afterEach, describe, expect, it } from "vitest";
-import type { RepoMapping } from "../config.js";
+import { describe, expect, it } from "vitest";
 import { syncWorkflowTemplates, classifySyncError, isBareWorkflowFileName, workflowFileNamesCollide } from "../workflow-sync.js";
 import { GitHubApiError } from "../github-errors.js";
+import { makeMapping } from "./helpers/builders.js";
+import { testDir } from "./helpers/test-dir.js";
 
-const mapping: RepoMapping = {
-  owner: "acme",
-  repo: "app",
-  workflowFile: "claude-implement.yml",
-  defaultBranch: "main",
-  maxInProgressAiIssues: 3,
-  executionMode: "github-actions",
-  sessionMode: "autonomous",
-  machineCpus: 2,
-  machineMemoryMb: 4096,
-  planningEnabled: true,
-  planningWorkflowFile: "claude-plan.yml",
-  autoApprovePlans: true,
-  extraEnv: {},
-  provider: "anthropic",
-  ticketingProvider: "linear",
-  ticketingConfig: { kind: "linear" },
-  awsRegion: null,
-  paused: false,
-  maxTurns: null,
-  maxIterations: null,
-  maxJobMinutes: null,
-  branchPrefix: null,
-};
-
-let tempRoot: string | null = null;
-
-afterEach(() => {
-  if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
-  tempRoot = null;
-});
+const mapping = makeMapping({ owner: "acme", repo: "app" });
 
 function makeTemplatesRoot(): string {
-  tempRoot = mkdtempSync(join(tmpdir(), "workflow-sync-"));
-  mkdirSync(join(tempRoot, "workflows"), { recursive: true });
-  writeFileSync(join(tempRoot, "workflows/claude-implement.yml"), "implement-yml\n");
-  writeFileSync(join(tempRoot, "workflows/claude-plan.yml"), "plan-yml\n");
-  writeFileSync(join(tempRoot, "workflows/WORKFLOW.md"), "workflow-md\n");
-  writeFileSync(join(tempRoot, "workflows/PLANNING.md"), "planning-md\n");
-  return tempRoot;
+  const root = testDir("workflow-sync");
+  mkdirSync(join(root, "workflows"), { recursive: true });
+  writeFileSync(join(root, "workflows/claude-implement.yml"), "implement-yml\n");
+  writeFileSync(join(root, "workflows/claude-plan.yml"), "plan-yml\n");
+  writeFileSync(join(root, "workflows/WORKFLOW.md"), "workflow-md\n");
+  writeFileSync(join(root, "workflows/PLANNING.md"), "planning-md\n");
+  return root;
 }
 
 interface FakePull {
@@ -604,7 +574,7 @@ describe("syncWorkflowTemplates", () => {
   });
 
   describe("custom workflow file names (AII-739)", () => {
-    const customMapping: RepoMapping = {
+    const customMapping = {
       ...mapping,
       workflowFile: "claude-implement-2.yml",
       planningWorkflowFile: "claude-plan-2.yml",

@@ -1,100 +1,66 @@
 // Real-endpoint, real-registration coverage for src/restate/endpoint.ts (AII-727). Every
-// other Restate-tier test in this repo boots its container through
-// RestateTestEnvironment.start() (src/__tests__/restate/harness.ts), which auto-registers
-// its OWN internal endpoint — proving the harness, not this file's own
-// startRestateEndpoint()/register(). This file manages a RestateContainer directly so it
-// can call those two functions itself, against a real server 1.7.10 admin API.
+// other Restate-tier test in this repo boots its server through startVariants()
+// (src/__tests__/restate/harness.ts), which auto-registers its OWN internal endpoint —
+// proving the harness, not this file's own startRestateEndpoint()/register(). This file
+// starts a `restate-server` binary whose only registered service is a probe, then calls
+// those two functions itself against the server's admin API (AII-1195: the block formerly
+// ran in a container behind a tunnelling fetch).
 //
-// Container-to-host reachability (the acceptance bar asks this be documented, since the
-// planning notes flagged it as unverified by reading the SDK alone): this process's own SDK
-// endpoint stays bound to the production default, 127.0.0.1 (restateBindAddress(),
-// unmodified — ADR 023's loopback-only rule is never relaxed for this test). The container
-// reaches it via TestContainers.exposeHostPorts(), the same "testcontainers"
-// service-endpoint-access mode RestateTestEnvironment.start() itself offers
-// (@restatedev/restate-sdk-testcontainers's restate_test_environment.ts, DEFAULT_START_OPTIONS
-// aside — that default is "docker-host", but the "testcontainers" branch is the same library
-// code, just the other of the two options it ships): it starts a small proxy container and
-// tunnels host.testcontainers.internal:<port>, as seen from any container in this test run,
-// back to 127.0.0.1:<port> on the host — so the loopback bind itself never has to change.
+// The server and this process's SDK endpoint are both on the host, so the production
+// loopback bind (127.0.0.1, restateBindAddress() unmodified — ADR 023) is also the address
+// the server dials, and register() needs no fetch rewriting.
 //
-// One wrinkle is specific to calling register() directly rather than going through the
-// harness: restateBindAddress() supplies both this process's bind address and, inside
-// register(), the registered `uri` — one value serving two different purposes here (the
-// interface this process listens on, and the address the container must be told to dial).
-// tunnelingFetch below rewrites that one substring in the outgoing request body, from the
-// real bind address to the tunnel address — the `fetchImpl` seam register() already exposes
-// for testing. It changes no code in src/restate/endpoint.ts.
-//
-// Run with `npm run test:restate` (Docker required); excluded from `npm test`.
+// Run with `npm run test:restate`; excluded from `npm test`.
 import * as http2 from "node:http2";
 import crypto from "node:crypto";
 import { randomUUID } from "node:crypto";
+import * as restate from "@restatedev/restate-sdk";
 import { createEndpointHandler } from "@restatedev/restate-sdk/node";
-import { RestateContainer } from "@restatedev/restate-sdk-testcontainers";
-import { TestContainers } from "testcontainers";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { RESTATE_SERVICES, queryNonCompletedInvocations, register, restateBindAddress, startRestateEndpoint } from "../../restate/endpoint.js";
-import { orchestratorTools } from "../../restate/tools.js";
+import { callTool } from "../../restate/tools-client.js";
+import { resetRestateStatus, setRestateStatus } from "../../restate/status.js";
+import { systemCaller } from "../../mcp-identity.js";
 import * as dedup from "../../dedup.js";
 import { initSettingsTable } from "../../runner-mode.js";
-import { RESTATE_IMAGE_VERSION, callObject, callService } from "./harness.js";
+import { startBinaryEnvironment, type BinaryEnvironment } from "./binary-environment.js";
+import { callObject, callService, eventually, queryInvocations } from "./harness.js";
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-/**
- * Mirrors @restatedev/restate-sdk-testcontainers's own PartitionsReadyWaitStrategy, without
- * pulling in its apache-arrow dependency: a non-2xx response or a connection error just
- * means "not ready yet," not a fatal error. RestateContainer's default wait strategy
- * (Wait.forListeningPorts()) only proves the TCP ports are open, not that the admin API's
- * partitions are queryable yet — register() needs the latter.
- */
-async function waitForPartitionsReady(adminBaseUrl: string, timeoutMs = 60_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${adminBaseUrl}/query`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query: "SELECT count(1) FROM sys_invocation" }),
-      });
-      if (response.ok) return;
-    } catch {
-      // Admin API not accepting connections yet.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-  throw new Error(`Restate admin API partitions not ready after ${timeoutMs}ms`);
-}
+const probe = restate.service({
+  name: "registrationProbe",
+  handlers: { ping: async (_ctx: restate.Context) => "pong" },
+});
 
-/**
- * Rewrites the one literal `realHostPort` substring in an outgoing request body to
- * `tunnelHostPort` — see the file header for why register()'s own `uri` and this process's
- * bind address can't independently vary through env vars alone. Applies to every call
- * register() makes (the /deployments POST and, on a conflict, the internal /query POST for
- * queryNonCompletedInvocations), since both embed the same literal host:port text.
- */
-function tunnelingFetch(realHostPort: string, tunnelHostPort: string): typeof fetch {
-  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    if (init && typeof init.body === "string" && init.body.includes(realHostPort)) {
-      init = { ...init, body: init.body.split(realHostPort).join(tunnelHostPort) };
-    }
-    return fetch(input, init);
-  }) as typeof fetch;
-}
+// The service set the new deployment brings in the AII-1281 scenario: a service the old registered
+// deployment lacks, and an orchestratorTools that no longer has get_tenant_health. A call to that
+// handler is routed by Restate to the old deployment's manifest, reaches the new endpoint, which
+// lacks it (RT0018), and Restate retries it forever. Only the missing get_tenant_health handler
+// pins the drain; get_runner_mode and declinedWindowProbe are never invoked, they only make the new
+// service set differ from the old one so the registration is a real, conflicting change.
+const declinedWindowProbe = restate.service({
+  name: "declinedWindowProbe",
+  handlers: { ping: async (_ctx: restate.Context) => "pong" },
+});
+const newOrchestratorTools = restate.service({
+  name: "orchestratorTools",
+  handlers: {
+    get_runner_mode: async (ctx: restate.Context) => ctx.serviceClient<typeof declinedWindowProbe>({ name: "declinedWindowProbe" }).ping(),
+  },
+});
 
 describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-727)", () => {
   let server: http2.Http2Server;
   let port: number;
   let bindHost: string;
-  let started: Awaited<ReturnType<RestateContainer["start"]>>;
+  let env: BinaryEnvironment;
   let adminBaseUrl: string;
   let ingressBaseUrl: string;
-  let registerFetch: typeof fetch;
   let changedServer: http2.Http2Server;
   let changedPort: number;
-  let changedFetch: typeof fetch;
   let changedHandler = createEndpointHandler({ services: RESTATE_SERVICES });
 
   beforeAll(async () => {
@@ -117,45 +83,37 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
     vi.stubEnv("RESTATE_ENDPOINT_PORT", String(port));
     bindHost = restateBindAddress().host;
 
-    // A second endpoint has a swappable handler on one live HTTP/2 server. Keeping
-    // the connection alive matters: a closed server can still serve discovery on
-    // an existing HTTP/2 session through TestContainers' host-port proxy.
+    // A second endpoint has a swappable handler on one live HTTP/2 server.
     changedServer = http2.createServer((request, response) => changedHandler(request, response));
     await new Promise<void>((resolve) => changedServer.listen(0, bindHost, resolve));
     const changedAddress = changedServer.address();
     if (changedAddress === null || typeof changedAddress === "string") throw new Error("expected second TCP port");
     changedPort = changedAddress.port;
 
-    await TestContainers.exposeHostPorts(port, changedPort);
-    registerFetch = tunnelingFetch(`${bindHost}:${port}`, `host.testcontainers.internal:${port}`);
-    changedFetch = tunnelingFetch(`${bindHost}:${changedPort}`, `host.testcontainers.internal:${changedPort}`);
-
-    const container = new RestateContainer(RESTATE_IMAGE_VERSION).withExposedPorts(8080, 9070);
-    started = await container.start();
-    adminBaseUrl = `http://${started.getHost()}:${started.getMappedPort(9070)}`;
-    ingressBaseUrl = `http://${started.getHost()}:${started.getMappedPort(8080)}`;
-    await waitForPartitionsReady(adminBaseUrl);
+    env = await startBinaryEnvironment({ services: [probe] });
+    adminBaseUrl = env.adminAPIBaseUrl();
+    ingressBaseUrl = env.baseUrl();
   }, 120_000);
 
   afterAll(async () => {
-    await started?.stop();
+    await env?.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await new Promise<void>((resolve) => changedServer.close(() => resolve()));
     vi.unstubAllEnvs();
   });
 
   it(
-    "registers the real endpoint, safely re-discovers the same URI, and both bound services answer through the container ingress",
+    "registers the real endpoint, safely re-discovers the same URI, and both bound services answer through the ingress",
     async () => {
-      const first = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      const first = await register({ adminBaseUrl });
       expect(first).toEqual({ outcome: "registered-no-force" });
 
       // The pinned server answers 200 for the existing URI without re-discovery;
       // register() checks zero active invocations before forcing discovery.
-      const again = await register({ adminBaseUrl, fetchImpl: registerFetch });
+      const again = await register({ adminBaseUrl });
       expect(again).toEqual({ outcome: "registered-drained-force" });
 
-      // Operator (the Virtual Object) answers through the container's real ingress.
+      // Operator (the Virtual Object) answers through the real ingress.
       const key = randomUUID();
       const hash = sha256(randomUUID());
       await callObject(ingressBaseUrl, "Operator", key, "issue", {
@@ -172,7 +130,7 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
 
       // orchestratorTools (the service) answers through the same real ingress. If a future
       // edit drops either service from RESTATE_SERVICES, this call — or the Operator calls
-      // above — fails, since the dropped service is simply absent from the container.
+      // above — fails, since the dropped service is simply absent from the server.
       const runnerMode = await callService<{ content?: Array<{ text: string }>; isError?: boolean }>(
         ingressBaseUrl,
         "orchestratorTools",
@@ -192,7 +150,7 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       // test's production endpoint intact while making the second endpoint the
       // current deployment for both services.
       vi.stubEnv("RESTATE_ENDPOINT_PORT", String(changedPort));
-      expect(await register({ adminBaseUrl, fetchImpl: changedFetch })).toEqual({ outcome: "registered-no-force" });
+      expect(await register({ adminBaseUrl })).toEqual({ outcome: "registered-no-force" });
 
       // A genuinely in-flight, non-completed invocation against that deployment — held open
       // by the refresh test seam (AII-727, src/restate/operator-object.ts's sleepMs), not a
@@ -213,35 +171,132 @@ describe("startRestateEndpoint() / register() against a real server 1.7.10 (AII-
       void inFlight.catch(() => undefined);
       // Observe the actual non-completed invocation before swapping endpoints;
       // a fixed sleep can race Restate's admission on a busy CI host.
-      const oldUri = `http://host.testcontainers.internal:${changedPort}`;
-      const admissionDeadline = Date.now() + 10_000;
-      while (Date.now() < admissionDeadline) {
-        const count = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
-        if (count !== null && count > 0) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
+      const oldUri = `http://${bindHost}:${changedPort}`;
+      await eventually(
+        () => queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri),
+        (count) => count !== null && count > 0,
+        { label: `a non-completed invocation at ${oldUri}` },
+      );
       expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeGreaterThan(0);
 
       // Change the live endpoint's discovery manifest at the same URI. Restate's
       // duplicate-URI 200 does not rediscover it; register() must check drain
       // and force after the active Operator invocation finishes.
-      changedHandler = createEndpointHandler({ services: [orchestratorTools] });
+      changedHandler = createEndpointHandler({ services: [newOrchestratorTools, declinedWindowProbe] });
 
-      const declined = await register({ adminBaseUrl, fetchImpl: changedFetch });
+      const declined = await register({ adminBaseUrl });
       expect(declined.outcome).toBe("declined-conflict");
+
+      // Same scope as queryNonCompletedInvocations (src/restate/endpoint.ts), narrowed to the tool
+      // service: only orchestratorTools invocations on the deployment under test, never the Operator call.
+      const oldDeployments = `(SELECT id FROM sys_deployment WHERE endpoint = '${oldUri}' OR endpoint = '${oldUri}/')`;
+      const pinnedToolInvocations = async (): Promise<string[]> =>
+        (
+          await queryInvocations(
+            adminBaseUrl,
+            "target_service_name = 'orchestratorTools' AND status != 'completed' AND status != 'scheduled' AND (" +
+              `pinned_deployment_id IN ${oldDeployments} OR ` +
+              `last_attempt_deployment_id IN ${oldDeployments} OR ` +
+              "(pinned_deployment_id IS NULL AND last_attempt_deployment_id IS NULL AND " +
+              `target_service_name IN (SELECT name FROM sys_service WHERE deployment_id IN ${oldDeployments})))`,
+          )
+        ).map((row) => String(row.id));
+
+      setRestateStatus({ sidecar: { state: "ready" }, registration: { state: "declined-conflict" } });
+      try {
+        // Control: with the admission check bypassed, the call reaches a handler the live
+        // endpoint lacks, retries forever on the old deployment, and pins the drain (AII-1281).
+        const pinnedIds: string[] = [];
+        try {
+          void callTool("get_tenant_health", {}, systemCaller(), {
+            ingressBaseUrl,
+            permitsExternalCall: () => true,
+            restateReady: () => true,
+            fetchImpl: ((input: RequestInfo | URL, init?: RequestInit) =>
+              fetch(input, { ...init, signal: AbortSignal.timeout(2_000) })) as typeof fetch,
+          }).catch(() => undefined);
+          const ids = await eventually(
+            pinnedToolInvocations,
+            (found) => found.length > 0,
+            { label: "a pinned orchestratorTools invocation" },
+          );
+          pinnedIds.push(...ids);
+          expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeGreaterThanOrEqual(1);
+          // Still pinned: registration cannot complete.
+          expect((await register({ adminBaseUrl })).outcome).toBe("declined-conflict");
+        } finally {
+          // Cleanup only: the kill is never part of the assertion path.
+          for (const id of pinnedIds) {
+            await fetch(`${adminBaseUrl}/invocations/${id}/kill`, { method: "PATCH" });
+          }
+        }
+        await eventually(pinnedToolInvocations, (found) => found.length === 0, {
+          label: "the killed control invocation to leave the non-completed set",
+        });
+
+        // Fixed: the default check refuses admission in the declined window and starts nothing.
+        const beforeFixed = await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri);
+        const spy = vi.fn(fetch);
+        const answer = await callTool("get_tenant_health", {}, systemCaller(), {
+          ingressBaseUrl,
+          fetchImpl: spy as unknown as typeof fetch,
+          permitsExternalCall: () => true,
+        });
+        expect(answer).toEqual({ status: "unavailable" });
+        expect(spy).not.toHaveBeenCalled();
+        expect(await queryNonCompletedInvocations(fetch, adminBaseUrl, oldUri)).toBeLessThanOrEqual(beforeFixed ?? 0);
+        expect(await pinnedToolInvocations()).toEqual([]);
+      } finally {
+        resetRestateStatus();
+      }
 
       // Let the in-flight invocation complete — the old deployment now has zero
       // non-completed invocations pinned to it.
       await inFlight;
 
-      const forced = await register({ adminBaseUrl, fetchImpl: changedFetch });
+      const forced = await register({ adminBaseUrl });
       expect(forced).toEqual({ outcome: "registered-drained-force" });
       const deployments = await (await fetch(`${adminBaseUrl}/deployments`)).json() as {
         deployments: Array<{ uri: string; services: Array<{ name: string }> }>;
       };
       const current = deployments.deployments.find((deployment) => deployment.uri === `${oldUri}/`);
-      expect(current?.services.map((service) => service.name)).toEqual(["orchestratorTools"]);
+      expect(current?.services.map((service) => service.name)).toEqual(expect.arrayContaining(["orchestratorTools", "declinedWindowProbe"]));
     },
-    45_000,
+    90_000,
   );
+});
+
+// Request identity (AII-976): spawns a real server given the private key, with the endpoint
+// given the public one.
+describe("request identity (AII-976)", () => {
+  const echo = restate.service({
+    name: "identityEcho",
+    handlers: { ping: async (_ctx: restate.Context, input: { value: string }) => ({ echoed: input.value }) },
+  });
+  let env: BinaryEnvironment;
+  beforeAll(async () => {
+    env = await startBinaryEnvironment({ services: [echo], requestIdentity: true });
+  }, 60_000);
+  afterAll(async () => {
+    if (env) await env.stop();
+  });
+
+  it("rejects an unsigned direct request to the endpoint, while an ingress call succeeds", async () => {
+    expect(env.identityKey()).toMatch(/^publickeyv1_/);
+    const client = http2.connect(`http://127.0.0.1:${env.endpointPort()}`);
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = client.request({ ":method": "GET", ":path": "/discover", accept: "application/vnd.restate.endpointmanifest.v3+json" });
+        req.on("response", (headers) => resolve(Number(headers[":status"])));
+        req.on("error", reject);
+        req.resume();
+        req.end();
+      });
+      expect(status).toBe(401);
+    } finally {
+      client.close();
+    }
+    // The server signs its own calls: an ingress call reaches a handler through the endpoint.
+    expect(await callService(env.baseUrl(), "identityEcho", "ping", { value: "x" })).toEqual({ echoed: "x" });
+  });
 });

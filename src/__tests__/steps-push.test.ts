@@ -1,10 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { pushStep } from "../pipeline/steps/push.js";
-import { DefaultPipelineContext } from "../pipeline/context.js";
+import type { PipelineContextData } from "../pipeline/types.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
+import { makeContext as makeBaseContext, makeFeedbackLoopOutputs } from "./helpers/builders.js";
+import { fakeFetch, type FakeFetch, type ReplyInit, type Routes } from "./helpers/fake-fetch.js";
+import { githubError } from "./helpers/replies/github.js";
+import { collectedPushedCommits, resetJobAccounting } from "../pipeline/job-accounting.js";
+import { makeSnapshot } from "./helpers/fixtures/configured-run.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
@@ -15,23 +20,43 @@ vi.mock("../pipeline/retry-backoff.js", async (importOriginal) => {
   // Wraps the real implementation (so backoff math and every other test's timing-
   // insensitive behavior is unchanged) purely so a test can assert what it was called
   // with, rather than inferring timing from NODE_ENV=test's sleepSync no-op.
-  return { ...actual, computeBackoffMs: vi.fn(actual.computeBackoffMs) };
+  return { ...actual, computeBackoffMs: vi.fn(actual.computeBackoffMs), sleepAsync: vi.fn(actual.sleepAsync) };
 });
 
 import { spawnSync } from "node:child_process";
-import { computeBackoffMs } from "../pipeline/retry-backoff.js";
+import { computeBackoffMs, sleepAsync } from "../pipeline/retry-backoff.js";
 
-function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
-  return new DefaultPipelineContext({
-    jobId: 1,
-    issueId: "issue-1",
-    issueIdentifier: "ENG-42",
-    issueTitle: "Test",
-    issueDescription: "Desc",
-    nonce: "nonce",
-    orchestratorUrl: "http://localhost:8080",
-    ...overrides,
-  });
+// The issue the implementation branch below is named for; the PR title, body and commit assertions name it.
+// No orchestrator URL or nonce: a GitHub Actions run, like BASE_INPUTS. The pipeline copies these into the
+// step's inputs, so a test that vends a token passes the same values to both. The checked-out branch is the
+// inputs' base branch: the clone reports it back and the pipeline passes it on as `baseBranch`.
+function makeContext(overrides: Partial<PipelineContextData> = {}) {
+  return makeBaseContext({ issueIdentifier: "ENG-42", orchestratorUrl: "", nonce: "", branch: "main", ...overrides });
+}
+
+// A gap-fill run checks out the PR's own branch, which the inputs name as both base and branch.
+const GAP_FILL_CONTEXT = { prNumber: "42", branch: "feature/existing-pr" };
+
+const CREATE_PR = "POST /repos/acme/app/pulls";
+const LIST_PRS = "GET /repos/acme/app/pulls";
+const VEND_TOKEN = "POST /api/token";
+const PUBLICATION_TOKEN = "POST /api/runner/publication-token";
+
+/** GitHub's answer to a created pull request, trimmed to the fields the step reads. */
+const created = (number: number): ReplyInit => ({
+  status: 201,
+  json: { html_url: `https://github.com/acme/app/pull/${number}`, number },
+});
+/** The orchestrator's answer to a token vend; `/api/token` and `/api/runner/publication-token` share it. */
+const minted = (token: string): ReplyInit => ({ json: { token, expires_at: "2030-01-01T00:00:00Z" } });
+const unprocessable = githubError(422, "Validation Failed");
+
+interface PullRequestCreate { title: string; head: string; base: string; body: string; draft?: boolean }
+
+/** The body of the n-th pull request the step asked GitHub to create. */
+function prRequest(fake: FakeFetch, n = 0): PullRequestCreate {
+  const creates = fake.calls.filter((call) => `${call.method} ${call.path}` === CREATE_PR);
+  return JSON.parse(creates[n].body) as PullRequestCreate;
 }
 
 const BASE_INPUTS = {
@@ -39,9 +64,10 @@ const BASE_INPUTS = {
   repoOwner: "acme",
   repoRepo: "app",
   githubToken: "gh-token",
-  branchName: "ai-implement/eng-42-feature",
+  branchName: "ai-implement/eng-42-test",
   baseBranch: "main",
-  baseRef: "main",
+  // The commit the clone checked out, which the clone step reports as clonedRef; never a branch name.
+  baseRef: "c0ffee00",
 };
 
 function spawnResult(status: number, stdout = "", stderr = ""): ReturnType<typeof spawnSync> {
@@ -70,11 +96,20 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
   });
 }
 
+const TEST_VERDICT_SENTENCE =
+  "The CI checks on this PR are the source of truth for the test verdict. The line above is the runner's own pre-push report.";
+
+// No routes: a request in a test that installs none fails it. A test's own fake replaces this one.
+let unrouted: FakeFetch;
+beforeEach(() => {
+  unrouted = fakeFetch({}).install();
+});
+
 describe("pushStep", () => {
   beforeEach(() => {
     __resetPublicationCredentialForTests();
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
+    resetJobAccounting();
   });
 
   afterEach(() => {
@@ -84,12 +119,7 @@ describe("pushStep", () => {
 
   it("creates PR and returns prUrl, prNumber, commitSha on success", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(7) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -99,26 +129,69 @@ describe("pushStep", () => {
     expect(outputs.commitSha).toBe("abc123");
   });
 
+  describe("pushed commit accounting (AII-1562)", () => {
+    const SHA_1 = "1".repeat(40);
+    const SHA_2 = "2".repeat(40);
+
+    function mockRevList(revList: ReturnType<typeof spawnResult>, dirty = true) {
+      mockGitSuccess("abc123", dirty);
+      const base = vi.mocked(spawnSync).getMockImplementation()!;
+      vi.mocked(spawnSync).mockImplementation(((cmd: string, args: string[], opts: never) =>
+        args[0] === "rev-list" && args.includes("--reverse") ? revList : base(cmd, args, opts)) as never);
+    }
+
+    it("reports the SHAs in rev-list order after a successful push", async () => {
+      mockRevList(spawnResult(0, `${SHA_1}\n${SHA_2}\n`));
+      fakeFetch({ [CREATE_PR]: created(7) }).install();
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expect(spawnSync).toHaveBeenCalledWith("git", ["rev-list", "--reverse", "c0ffee00..HEAD"], expect.anything());
+      expect(collectedPushedCommits()).toEqual([SHA_1, SHA_2]);
+    });
+
+    it("leaves the list unknown when rev-list fails", async () => {
+      mockRevList(spawnResult(128, "", "fatal"));
+      fakeFetch({ [CREATE_PR]: created(7) }).install();
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expect(collectedPushedCommits()).toBeNull();
+    });
+
+    it("reports an empty list when the run changed nothing", async () => {
+      vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+        const gitArgs = args as string[];
+        if (gitArgs[0] === "rev-list") return spawnResult(0, "0\n"); // hasCommitsAheadOfBase: none
+        return spawnResult(0);
+      });
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()).catch(() => undefined);
+      expect(collectedPushedCommits()).toEqual([]);
+    });
+
+    it("reports an empty list in mounted mode, without touching git", async () => {
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      expect(spawnSync).not.toHaveBeenCalled();
+      expect(collectedPushedCommits()).toEqual([]);
+    });
+
+    it("reports nothing when the push throws", async () => {
+      mockGitSuccess("abc123");
+      const base = vi.mocked(spawnSync).getMockImplementation()!;
+      vi.mocked(spawnSync).mockImplementation(((cmd: string, args: string[], opts: never) =>
+        args[0] === "push" ? spawnResult(1, "", "rejected") : base(cmd, args, opts)) as never);
+      fakeFetch({ [CREATE_PR]: created(7) }).install();
+      await expect(pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter())).rejects.toThrow();
+      expect(collectedPushedCommits()).toBeNull();
+    });
+  });
+
   it("uses a freshly vended token for remote lookup, push, and PR creation", async () => {
     mockGitSuccess("abc123");
     vi.stubEnv("GITHUB_TOKEN", "gh-token");
     vi.stubEnv("GH_TOKEN", "gh-token");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresh-token", expires_at: "2026-08-07T01:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 201,
-        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
-        text: async () => "",
-      } as Response);
+    const fake = fakeFetch({ [VEND_TOKEN]: minted("fresh-token"), [CREATE_PR]: created(7) }).install();
 
     try {
       await pushStep.run(
-        makeContext(),
+        makeContext({ orchestratorUrl: "https://orchestrator.example", nonce: "machine-nonce" }),
         {
           ...BASE_INPUTS,
           orchestratorUrl: "https://orchestrator.example",
@@ -127,8 +200,10 @@ describe("pushStep", () => {
         new NoopStepReporter(),
       );
 
-      const tokenRequest = vi.mocked(fetch).mock.calls[0];
-      expect(tokenRequest[0]).toBe("https://orchestrator.example/api/token");
+      expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+        "POST https://orchestrator.example/api/token",
+        "POST https://api.github.com/repos/acme/app/pulls",
+      ]);
 
       const remoteCalls = vi.mocked(spawnSync).mock.calls.filter(([, args]) =>
         ["ls-remote", "push"].includes((args as string[])[0]),
@@ -152,8 +227,7 @@ describe("pushStep", () => {
       expect(process.env.GITHUB_TOKEN).toBe("fresh-token");
       expect(process.env.GH_TOKEN).toBe("fresh-token");
 
-      const prRequest = vi.mocked(fetch).mock.calls[1];
-      expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer fresh-token" }));
+      expect(fake.calls[1].headers.get("authorization")).toBe("Bearer fresh-token");
     } finally {
       vi.unstubAllEnvs();
     }
@@ -164,18 +238,7 @@ describe("pushStep", () => {
     vi.stubEnv("GITHUB_TOKEN", "workflow-token");
     vi.stubEnv("GH_TOKEN", "workflow-token");
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 201,
-        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
-        text: async () => "",
-      } as Response);
+    const fake = fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token"), [CREATE_PR]: created(7) }).install();
 
     try {
       await pushStep.run(
@@ -189,11 +252,12 @@ describe("pushStep", () => {
         new NoopStepReporter(),
       );
 
-      expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
-        "https://orchestrator.example/api/runner/publication-token",
-      );
-      expect(vi.mocked(fetch).mock.calls[0][1]?.headers).toEqual({
-        Authorization: "Bearer one-use-publication-token",
+      expect(fake.calls.map((call) => `${call.method} ${call.url.href}`)).toEqual([
+        "POST https://orchestrator.example/api/runner/publication-token",
+        "POST https://api.github.com/repos/acme/app/pulls",
+      ]);
+      expect(Object.fromEntries(fake.calls[0].headers)).toEqual({
+        authorization: "Bearer one-use-publication-token",
       });
       expect(process.env.RUN_PUBLICATION_TOKEN).toBeUndefined();
 
@@ -205,8 +269,7 @@ describe("pushStep", () => {
         expect((args as string[]).join(" ")).toContain("fresh-token");
         expect((args as string[]).join(" ")).not.toContain("one-use-publication-token");
       }
-      const prRequest = vi.mocked(fetch).mock.calls[1];
-      expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer fresh-token" }));
+      expect(fake.calls[1].headers.get("authorization")).toBe("Bearer fresh-token");
     } finally {
       vi.unstubAllEnvs();
     }
@@ -217,14 +280,10 @@ describe("pushStep", () => {
     vi.stubEnv("GITHUB_TOKEN", "workflow-token");
     vi.stubEnv("GH_TOKEN", "workflow-token");
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    const fake = fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -244,7 +303,7 @@ describe("pushStep", () => {
       draft: false,
       pushAttempts: 1,
     });
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
     expect(spawnSync).toHaveBeenCalledWith(
       "git",
       ["checkout", "feature/existing-pr"],
@@ -260,14 +319,10 @@ describe("pushStep", () => {
   it("pushes an existing PR gap-fill with the original branch head as the force-with-lease", async () => {
     mockGitSuccess("abc123");
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    const fake = fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -281,7 +336,7 @@ describe("pushStep", () => {
 
     expect(outputs.prUrl).toBeNull();
     expect(outputs.prNumber).toBe(42);
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
     expect(spawnSync).toHaveBeenCalledWith(
       "git",
       expect.arrayContaining([
@@ -298,7 +353,7 @@ describe("pushStep", () => {
     mockGitSuccess("abc123");
 
     await expect(pushStep.run(
-      makeContext({ prNumber: "42" }),
+      makeContext(GAP_FILL_CONTEXT),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -320,7 +375,7 @@ describe("pushStep", () => {
     mockGitSuccess("abc123", false);
 
     const outputs = await pushStep.run(
-      makeContext({ prNumber: "42" }),
+      makeContext(GAP_FILL_CONTEXT),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -337,25 +392,18 @@ describe("pushStep", () => {
       commitSha: "abc123",
       draft: false,
     });
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("completes the push with the boot token when credential vending returns 403", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 201,
-        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
-        text: async () => "",
-      } as Response);
+    const fake = fakeFetch({
+      [VEND_TOKEN]: { status: 403, json: { error: "Invalid or expired nonce" } },
+      [CREATE_PR]: created(7),
+    }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ orchestratorUrl: "https://orchestrator.example", nonce: "machine-nonce" }),
       {
         ...BASE_INPUTS,
         orchestratorUrl: "https://orchestrator.example",
@@ -372,18 +420,13 @@ describe("pushStep", () => {
     for (const [, args] of remoteCalls) {
       expect((args as string[]).join(" ")).toContain("gh-token");
     }
-    const prRequest = vi.mocked(fetch).mock.calls[1];
-    expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer gh-token" }));
+    expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual([VEND_TOKEN, CREATE_PR]);
+    expect(fake.calls[1].headers.get("authorization")).toBe("Bearer gh-token");
   });
 
   it("uses the context branch as the PR base when baseBranch input is omitted", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(7) }).install();
 
     await pushStep.run(
       makeContext({ branch: "development" }),
@@ -391,32 +434,22 @@ describe("pushStep", () => {
       new NoopStepReporter(),
     );
 
-    const fetchCall = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(fetchCall[1]?.body as string) as { base: string };
-    expect(body.base).toBe("development");
+    expect(prRequest(fake).base).toBe("development");
   });
 
   it("returns existing PR info on 422 (PR already open)", async () => {
     mockGitSuccess("sha999");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 422,
-        json: async () => ({}),
-        text: async () => "Validation Failed",
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => [{ html_url: "https://github.com/acme/app/pull/3", number: 3 }],
-        text: async () => "",
-      } as Response);
+    const fake = fakeFetch({
+      [CREATE_PR]: unprocessable,
+      [LIST_PRS]: { json: [{ html_url: "https://github.com/acme/app/pull/3", number: 3 }] },
+    }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
     expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/3");
     expect(outputs.prNumber).toBe(3);
     expect(outputs.branchPushed).toBe(true);
+    expect(fake.calls[1].url.search).toBe("?head=acme:ai-implement/eng-42-test&state=open");
   });
 
   it("throws on git push failure and redacts token", async () => {
@@ -425,7 +458,7 @@ describe("pushStep", () => {
       if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
       if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
       if (gitArgs[0] === "ls-remote") {
-        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
       }
       if (gitArgs[0] === "push") {
         return spawnResult(128, "", "fatal: gh-token authentication failed");
@@ -444,7 +477,7 @@ describe("pushStep", () => {
       if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
       if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
       if (gitArgs[0] === "ls-remote") {
-        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
       }
       if (gitArgs[0] === "push") {
         return spawnResult(128, "", "fatal: gh-token authentication failed");
@@ -468,11 +501,7 @@ describe("pushStep", () => {
 
   it("throws on non-200 non-422 PR creation", async () => {
     mockGitSuccess();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      text: async () => "Internal Server Error",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: { status: 500, text: "Internal Server Error" } }).install();
 
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
@@ -481,18 +510,7 @@ describe("pushStep", () => {
 
   it("throws when listing open PRs fails after 422", async () => {
     mockGitSuccess("sha404");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 422,
-        json: async () => ({}),
-        text: async () => "Validation Failed",
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        text: async () => "Service Unavailable",
-      } as Response);
+    fakeFetch({ [CREATE_PR]: unprocessable, [LIST_PRS]: { status: 503, text: "Service Unavailable" } }).install();
 
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
@@ -501,19 +519,7 @@ describe("pushStep", () => {
 
   it("throws when 422 returned but no open PR found for branch", async () => {
     mockGitSuccess("sha405");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 422,
-        json: async () => ({}),
-        text: async () => "Validation Failed",
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => [],
-        text: async () => "",
-      } as Response);
+    fakeFetch({ [CREATE_PR]: unprocessable, [LIST_PRS]: { json: [] } }).install();
 
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
@@ -522,34 +528,23 @@ describe("pushStep", () => {
 
   it("uses issueIdentifier in default PR title", async () => {
     mockGitSuccess();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
-    const fetchCall = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(fetchCall[1]?.body as string) as { title: string };
-    expect(body.title).toContain("ENG-42");
+    expect(prRequest(fake).title).toContain("ENG-42");
   });
 
   it("creates a concise PR body with summary, approach, and test plan sections", async () => {
     mockGitSuccess();
     const ctx = makeContext();
-    ctx.setOutputs("feedback-loop", { approved: true });
+    ctx.setOutputs("feedback-loop", makeFeedbackLoopOutputs());
     ctx.setOutputs("preflight", { summary: "typecheck: passed, tests: passed (12 assertions)" });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
 
-    const fetchCall = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    const body = prRequest(fake);
     expect(body.body).toContain("## Summary");
     expect(body.body).toContain("Implemented the requested work for ENG-42: Test.");
     expect(body.body).toContain("## Approach");
@@ -559,6 +554,7 @@ describe("pushStep", () => {
     expect(body.body).toContain("- Added: `src/app.test.ts`");
     expect(body.body).toContain("## Test plan");
     expect(body.body).toContain("- [x] typecheck: passed");
+    expect(body.body).toContain(`${"- [x] typecheck: passed, tests: passed (12 assertions)"}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).toContain("typecheck: passed");
     expect(body.body).toContain("- [ ] Manual: review the changed behavior against the ticket acceptance criteria.");
     expect(body.body).toContain("Generated with AI-Implement");
@@ -568,80 +564,80 @@ describe("pushStep", () => {
 
   it("footer includes harness, model, and provider with explicit values", async () => {
     mockGitSuccess();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext({ model: "claude-opus-4-5", provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
 
-    const fetchCall = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
-    expect(body.body).toContain("Generated with AI-Implement · harness: Claude Code · model: claude-opus-4-5 · provider: bedrock");
+    expect(prRequest(fake).body).toContain("Generated with AI-Implement · harness: Claude Code · model: claude-opus-4-5 · provider: bedrock");
   });
 
   it("footer degrades to model: unknown when model is absent", async () => {
     mockGitSuccess();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
-    const fetchCall = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    const body = prRequest(fake);
     expect(body.body).toContain("Generated with AI-Implement");
     expect(body.body).toContain("model: unknown");
   });
 
   it("footer defaults to provider: anthropic when provider is absent", async () => {
     mockGitSuccess();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext({ model: "claude-sonnet-4-6" }), BASE_INPUTS, new NoopStepReporter());
 
-    const fetchCall = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
-    expect(body.body).toContain("provider: anthropic");
+    expect(prRequest(fake).body).toContain("provider: anthropic");
+  });
+
+  it("footer names the implementation stage harness and provider for a configured Codex run", async () => {
+    mockGitSuccess();
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
+
+    // The fixture's implementation stage is Codex on OpenAI.
+    const agentConfig = makeSnapshot();
+    await pushStep.run(makeContext({ model: "gpt-6-luna", provider: "anthropic", agentConfig }), BASE_INPUTS, new NoopStepReporter());
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("Generated with AI-Implement · harness: Codex · model: gpt-6-luna · provider: openai");
+    expect(body.body).not.toContain("harness: Claude Code");
+    expect(body.body).not.toContain("provider: anthropic");
+  });
+
+  it("footer keeps Claude Code and shows the stage provider for a configured Bedrock run", async () => {
+    mockGitSuccess();
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
+
+    const snapshot = makeSnapshot();
+    const agentConfig = { ...snapshot, stages: { ...snapshot.stages, implementation: { ...snapshot.stages.implementation, agent: "claude", provider: "bedrock" } } } as const;
+    await pushStep.run(makeContext({ model: "m", provider: "bedrock", agentConfig }), BASE_INPUTS, new NoopStepReporter());
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("harness: Claude Code · model: m · provider: bedrock");
   });
 
   it("footer includes Bedrock ARN-style model ID verbatim", async () => {
     mockGitSuccess();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     const bedrockModel = "anthropic.claude-opus-4-5-20260101-v1:0";
     await pushStep.run(makeContext({ model: bedrockModel, provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
 
-    const fetchCall = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    const body = prRequest(fake);
     expect(body.body).toContain(`model: ${bedrockModel}`);
     expect(body.body).toContain("provider: bedrock");
   });
 
   it("checks out implementation branch and commits working tree changes before pushing", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
     expect(spawnSync).toHaveBeenCalledWith(
       "git",
-      ["checkout", "-B", "ai-implement/eng-42-feature"],
+      ["checkout", "-B", "ai-implement/eng-42-test"],
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
     expect(spawnSync).toHaveBeenCalledWith(
@@ -654,8 +650,8 @@ describe("pushStep", () => {
       expect.arrayContaining([
         "push",
         expect.any(String),
-        "HEAD:refs/heads/ai-implement/eng-42-feature",
-        "--force-with-lease=refs/heads/ai-implement/eng-42-feature:beadfeed",
+        "HEAD:refs/heads/ai-implement/eng-42-test",
+        "--force-with-lease=refs/heads/ai-implement/eng-42-test:beadfeed",
       ]),
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
@@ -669,11 +665,7 @@ describe("pushStep", () => {
       if (gitArgs[0] === "ls-remote") return spawnResult(0, "");
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -682,8 +674,8 @@ describe("pushStep", () => {
       expect.arrayContaining([
         "push",
         expect.any(String),
-        "HEAD:refs/heads/ai-implement/eng-42-feature",
-        "--force-with-lease=refs/heads/ai-implement/eng-42-feature:",
+        "HEAD:refs/heads/ai-implement/eng-42-test",
+        "--force-with-lease=refs/heads/ai-implement/eng-42-test:",
       ]),
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
@@ -716,15 +708,11 @@ describe("pushStep", () => {
       if (gitArgs[0] === "ls-remote") {
         lsRemoteAttempts++;
         if (lsRemoteAttempts < 3) return spawnResult(128, "", "temporary DNS failure");
-        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -734,8 +722,8 @@ describe("pushStep", () => {
       expect.arrayContaining([
         "push",
         expect.any(String),
-        "HEAD:refs/heads/ai-implement/eng-42-feature",
-        "--force-with-lease=refs/heads/ai-implement/eng-42-feature:beadfeed",
+        "HEAD:refs/heads/ai-implement/eng-42-test",
+        "--force-with-lease=refs/heads/ai-implement/eng-42-test:beadfeed",
       ]),
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
@@ -743,17 +731,13 @@ describe("pushStep", () => {
 
   it("looks up the exact implementation branch ref for the remote lease", async () => {
     mockGitSuccess();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(1) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
     expect(spawnSync).toHaveBeenCalledWith(
       "git",
-      ["ls-remote", expect.any(String), "refs/heads/ai-implement/eng-42-feature"],
+      ["ls-remote", expect.any(String), "refs/heads/ai-implement/eng-42-test"],
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
   });
@@ -764,7 +748,7 @@ describe("pushStep", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Nothing to commit/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("throws when git status fails", async () => {
@@ -779,7 +763,7 @@ describe("pushStep", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/git status failed/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("blocks the push when a sensitive file is staged", async () => {
@@ -793,7 +777,7 @@ describe("pushStep", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Push blocked/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("does not block a staged deletion of a sensitive file", async () => {
@@ -810,15 +794,11 @@ describe("pushStep", () => {
       if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
       if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\nD\t.env\n");
       if (gitArgs[0] === "ls-remote") {
-        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -841,7 +821,7 @@ describe("pushStep", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/git diff --cached failed/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("(c1) allow-list suppresses a default sensitive-file hit", async () => {
@@ -852,18 +832,14 @@ describe("pushStep", () => {
       if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
       if (gitArgs[0] === "show") return spawnResult(0, "M\t.env\n");
       if (gitArgs[0] === "ls-remote") {
-        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ sensitiveFiles: { allow: [".env"] } }),
       { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
       new NoopStepReporter(),
     );
@@ -880,12 +856,12 @@ describe("pushStep", () => {
 
     await expect(
       pushStep.run(
-        makeContext(),
+        makeContext({ sensitiveFiles: { allow: [".env"] } }),
         { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
         new NoopStepReporter(),
       ),
     ).rejects.toThrow(/Push blocked/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("(c3) no sensitiveFiles config → existing default behavior unchanged", async () => {
@@ -899,7 +875,7 @@ describe("pushStep", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Push blocked/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("add-pattern hit carries client-configured pattern description", async () => {
@@ -912,12 +888,12 @@ describe("pushStep", () => {
 
     await expect(
       pushStep.run(
-        makeContext(),
+        makeContext({ sensitiveFiles: { add: ["*.secret"] } }),
         { ...BASE_INPUTS, sensitiveFiles: { add: ["*.secret"] } },
         new NoopStepReporter(),
       ),
     ).rejects.toThrow(/client-configured pattern \(\*\.secret\)/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("allow-list glob suppresses a matching variant (.env.local)", async () => {
@@ -928,18 +904,14 @@ describe("pushStep", () => {
       if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
       if (gitArgs[0] === "show") return spawnResult(0, "M\t.env.local\n");
       if (gitArgs[0] === "ls-remote") {
-        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ sensitiveFiles: { allow: [".env.*"] } }),
       { ...BASE_INPUTS, sensitiveFiles: { allow: [".env.*"] } },
       new NoopStepReporter(),
     );
@@ -980,7 +952,7 @@ describe("pushStep", () => {
         if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
         if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
         if (gitArgs[0] === "ls-remote") {
-          return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+          return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
         }
         if (gitArgs[0] === "push") {
           return spawnResult(
@@ -991,12 +963,7 @@ describe("pushStep", () => {
         }
         return spawnResult(0);
       });
-      vi.mocked(fetch).mockResolvedValueOnce({
-        ok: true,
-        status: 201,
-        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
-        text: async () => "",
-      } as Response);
+      fakeFetch({ [CREATE_PR]: created(7) }).install();
 
       await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -1016,91 +983,172 @@ describe("pushStep", () => {
   });
 });
 
-const REVIEW_SUMMARY = {
-  terminationReason: "iterations_exhausted",
-  iterations: 3,
-  finalFeedback: "Missing tests for the retry path.",
-  passes: [
-    { iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 3.21, reviewApproved: false },
-  ],
-  postMortem: "## Post-mortem\nScope too broad.",
-};
+/** The review summary the pipeline hands push for an unapproved feedback-loop run (pipeline-loader.ts). */
+function reviewSummary(run: ReturnType<typeof makeFeedbackLoopOutputs>) {
+  const { terminationReason, iterations, finalFeedback, passes, postMortem } = run;
+  return { terminationReason, iterations, finalFeedback, passes, ...(postMortem ? { postMortem } : {}) };
+}
+
+const REVIEW_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ approved: false, iterations: 3, finalFeedback: "Missing tests for the retry path." }));
+// Only a run that hit the turn cap carries a post-mortem.
+const MAX_TURNS_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ terminationReason: "max_turns", postMortem: "## Post-mortem\nScope too broad." }));
+const OUTAGE_SUMMARY = reviewSummary(makeFeedbackLoopOutputs({ terminationReason: "provider_unavailable", finalFeedback: "Tried 2 time(s); partial changes were kept." }));
 
 describe("pushStep draft PRs", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("verify_failed PR body names the hook and carries the output", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        draft: true,
+        reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "verify_failed", finalFeedback: "The verify hook failed with exit code 3." },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("The verify hook failed");
+    expect(body.body).toContain("exit code 3");
+    expect(body.body).not.toContain("Automated review did not approve");
+  });
+
+  it("verify_failed pass table shows the verify hook exit code in the review column", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          terminationReason: "verify_failed",
+          finalFeedback: "The verify hook failed with exit code 3.",
+          passes: [{ ...REVIEW_SUMMARY.passes[0], reviewApproved: null, verifyExitCode: 3 }],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("not run (verify hook exit 3)");
+  });
+
+  it("marks a pass whose verify hook ran unguarded, and leaves a guarded pass unchanged", async () => {
+    const render = async (pass: Record<string, unknown>) => {
+      mockGitSuccess("abc123");
+      const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+      await pushStep.run(
+        makeContext(),
+        {
+          ...BASE_INPUTS,
+          draft: true,
+          reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "verify_failed", finalFeedback: "x", passes: [{ ...REVIEW_SUMMARY.passes[0], reviewApproved: null, verifyExitCode: 3, ...pass }] },
+        },
+        new NoopStepReporter(),
+      );
+      return prRequest(fake).body;
+    };
+    const unguarded = await render({ verifyGuarded: false });
+    expect(unguarded).toContain("not run (verify hook exit 3) (verify hook ran unguarded)");
+    const guarded = await render({});
+    expect(guarded).toContain("not run (verify hook exit 3) |");
+    expect(guarded).not.toContain("unguarded");
+  });
+
+  it("verify_failed Test plan line says the hook ran and failed, not that verification was skipped", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "verify_failed", finalFeedback: "The verify hook failed with exit code 2." } },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("Automated verification ran and failed — the repository's verify hook did not pass.");
+    expect(body.body).not.toContain("the review loop did not approve this change");
+  });
+
+  it("review-reason PR body does not claim the verify hook was skipped", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(makeContext(), { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY }, new NoopStepReporter());
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("Automated review did not approve");
+    expect(body.body).toContain("Preflight was skipped for this unapproved run.");
+    expect(body.body).not.toMatch(/verify hooks? (was|were) skipped/i);
   });
 
   it("creates a draft PR with an unapproved section in the body", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     const outputs = await pushStep.run(
       makeContext(),
-      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      { ...BASE_INPUTS, draft: true, reviewSummary: MAX_TURNS_SUMMARY },
       new NoopStepReporter(),
     );
 
     expect(outputs.draft).toBe(true);
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body));
+    const body = prRequest(fake);
     expect(body.draft).toBe(true);
-    expect(body.body).toContain("Automated review did not approve");
-    expect(body.body).toContain("Missing tests for the retry path.");
-    expect(body.body).toContain("iterations_exhausted");
+    // max_turns is unfinished work, not a review rejection (AII-887).
+    expect(body.body).toContain("## ⏱️ The implementation did not finish within its turn budget");
+    expect(body.body).not.toContain("Automated review did not approve");
+    expect(body.body).toContain("Implementation hit the 50-turn cap");
     expect(body.body).toContain("Post-mortem");
     // The test-plan line must not contradict the unapproved section above it: no
     // testsSummary/preflight summary was supplied, so the fallback must say
     // verification was skipped (unchecked box), not that it ran (checked box).
-    expect(body.body).toContain("- [ ] Automated verification was skipped — the review loop did not approve this change.");
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the implementation did not finish within its turn budget.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the implementation did not finish within its turn budget."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
   it("heads a provider_unavailable draft PR as a provider outage, not a review rejection", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     const outputs = await pushStep.run(
       makeContext(),
-      { ...BASE_INPUTS, draft: true, reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "provider_unavailable", finalFeedback: "Model provider was unavailable during implementation after 2 attempt(s); partial changes were preserved.", postMortem: undefined } },
+      { ...BASE_INPUTS, draft: true, reviewSummary: OUTAGE_SUMMARY },
       new NoopStepReporter(),
     );
 
     expect(outputs.draft).toBe(true);
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body));
+    const body = prRequest(fake);
     expect(body.draft).toBe(true);
-    expect(body.body).toContain("The model provider was unavailable during this run");
+    expect(body.body).toContain("The AI service was not available during this run");
     expect(body.body).not.toContain("Automated review did not approve");
     expect(body.body).not.toContain("Reviewer's final feedback");
     expect(body.body).not.toContain("unapproved run");
     expect(body.body).toContain("Run notes");
-    expect(body.body).toContain("partial changes were preserved");
+    expect(body.body).toContain("partial changes were kept");
     // The column is specifically the implement call's spawn attempts (not review's).
-    expect(body.body).toContain("| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |");
+    expect(body.body).toContain("| Pass | Implement outcome | Turns / limit | Implement attempts | Cost | Tokens | First review |");
     // The test-plan line must not read as a review rejection on a provider outage — the
     // reviewer may never have run at all (BAC-27201).
-    expect(body.body).toContain("- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted.");
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the AI service was not available and the run was interrupted.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — the AI service was not available and the run was interrupted."}\n\n${TEST_VERDICT_SENTENCE}\n`);
     expect(body.body).not.toContain("the review loop did not approve this change");
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
-  it.each([true, false])("heads a max_turns PR (draft=%s) as unfinished work, not a review rejection", async (draft) => {
+  it.each([true, false])("heads a max_turns PR (draft=%s) as unfinished work, not a review rejection (AII-887)", async (draft) => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
 
     await pushStep.run(
       makeContext(),
@@ -1108,32 +1156,81 @@ describe("pushStep draft PRs", () => {
       new NoopStepReporter(),
     );
 
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const text = String(JSON.parse(String(init?.body)).body);
+    const text = String(prRequest(fake).body);
     expect(text).toContain("## ⏱️ The implementation did not finish within its turn budget");
     expect(text).toContain(`because the implementation used its full turn budget before it finished (after ${REVIEW_SUMMARY.iterations} iteration(s)). The work so far is preserved here. It is incomplete.`);
     expect(text).toContain(draft ? "opened as a draft because" : "opened for human review because");
     expect(text).toContain("**Run notes:**");
-    expect(text).toContain("_Preflight and verify hooks were skipped because the implementation did not finish._");
+    expect(text).toContain("_Preflight was skipped because the implementation did not finish._");
     expect(text).toContain("- [ ] Automated verification was skipped — the implementation did not finish within its turn budget.");
     expect(text).not.toContain("did not approve");
     expect(text).not.toContain("review loop ended without approval");
     expect(text).not.toContain("Reviewer's final feedback");
   });
 
+  it("shows an implement invocation failure code next to the review verdict in the pass table", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS, draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          passes: [
+            { iteration: 1, implementTurns: 3, implementOutcome: "success", costUsd: 1, reviewApproved: false },
+            { iteration: 2, implementTurns: 4, implementOutcome: "error", implementFailureCode: "LLM_TERMINAL_ERROR", costUsd: 1, reviewApproved: true },
+          ],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("| 1 | success | 3 |");
+    expect(body.body).toContain("| 2 | error (LLM_TERMINAL_ERROR) | 4 |");
+    expect(body.body).toMatch(/\| 2 \| error \(LLM_TERMINAL_ERROR\).*\| approved \|/);
+  });
+
+  it("renders Codex turns as unavailable and missing cost as unavailable in the unapproved table (AII-113)", async () => {
+    mockGitSuccess("abc123");
+    const fake = fakeFetch({ [CREATE_PR]: created(9) }).install();
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS, draft: true,
+        reviewSummary: {
+          ...REVIEW_SUMMARY,
+          passes: [
+            {
+              iteration: 1, implementTurns: 7, implementOutcome: "success", costUsd: null, reviewCostUsd: null, reviewApproved: false,
+              tokensIn: 10, tokensOut: 20,
+              attribution: {
+                version: 1, invocationId: "inv-1", stage: "implementation", snapshotId: "snap-1", agent: "codex", provider: "openai",
+                model: "m", profileId: null, authMode: "codex-subscription",
+                limit: { kind: "timeout_ms", value: 600000 }, outcome: "success", usage: null,
+              },
+            },
+          ],
+        },
+      },
+      new NoopStepReporter(),
+    );
+
+    const body = prRequest(fake);
+    expect(body.body).toContain("| 1 | success; m | n/a (native turn count unavailable); limit 600s timeout | 1 | unavailable | in 10 / out 20 | rejected |");
+    expect(body.body).not.toContain("$0.00");
+  });
+
   it("titles a provider_unavailable 422 non-draft fallback as an interruption, not an unapproved rejection", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch)
-      // draft create → 422
-      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "draft not supported" } as Response)
-      // list open PRs → none
-      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [], text: async () => "" } as Response)
-      // retry without draft → created
-      .mockResolvedValueOnce({
-        ok: true, status: 201,
-        json: async () => ({ html_url: "https://github.com/acme/app/pull/10", number: 10 }),
-        text: async () => "",
-      } as Response);
+    const fake = fakeFetch({
+      // The draft create is refused, no PR is open, then the retry without the draft flag succeeds.
+      [CREATE_PR]: [unprocessable, created(10)],
+      [LIST_PRS]: { json: [] },
+    }).install();
 
     const outputs = await pushStep.run(
       makeContext(),
@@ -1141,32 +1238,26 @@ describe("pushStep draft PRs", () => {
         ...BASE_INPUTS,
         prTitle: "ENG-42: Test",
         draft: true,
-        reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "provider_unavailable" },
+        reviewSummary: OUTAGE_SUMMARY,
       },
       new NoopStepReporter(),
     );
 
     expect(outputs.draft).toBe(false);
     expect(outputs.prNumber).toBe(10);
-    const [, retryInit] = vi.mocked(fetch).mock.calls[2];
-    const retryBody = JSON.parse(String(retryInit?.body));
+    expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual([CREATE_PR, LIST_PRS, CREATE_PR]);
+    const retryBody = prRequest(fake, 1);
     expect(retryBody.draft).toBeUndefined();
     expect(retryBody.title).toBe("[INTERRUPTED — provider outage] ENG-42: Test");
   });
 
   it("falls back to a titled normal PR when the draft flag is rejected (422, no existing PR)", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch)
-      // draft create → 422
-      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "draft not supported" } as Response)
-      // list open PRs → none
-      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [], text: async () => "" } as Response)
-      // retry without draft → created
-      .mockResolvedValueOnce({
-        ok: true, status: 201,
-        json: async () => ({ html_url: "https://github.com/acme/app/pull/10", number: 10 }),
-        text: async () => "",
-      } as Response);
+    const fake = fakeFetch({
+      // The draft create is refused, no PR is open, then the retry without the draft flag succeeds.
+      [CREATE_PR]: [unprocessable, created(10)],
+      [LIST_PRS]: { json: [] },
+    }).install();
 
     const outputs = await pushStep.run(
       makeContext(),
@@ -1176,21 +1267,18 @@ describe("pushStep draft PRs", () => {
 
     expect(outputs.draft).toBe(false);
     expect(outputs.prNumber).toBe(10);
-    const [, retryInit] = vi.mocked(fetch).mock.calls[2];
-    const retryBody = JSON.parse(String(retryInit?.body));
+    expect(fake.calls.map((call) => `${call.method} ${call.path}`)).toEqual([CREATE_PR, LIST_PRS, CREATE_PR]);
+    const retryBody = prRequest(fake, 1);
     expect(retryBody.draft).toBeUndefined();
     expect(retryBody.title).toBe("[NEEDS REVIEW — unapproved] ENG-42: Test");
   });
 
   it("still resolves an already-open PR on 422 when drafting", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
-      .mockResolvedValueOnce({
-        ok: true, status: 200,
-        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: true }],
-        text: async () => "",
-      } as Response);
+    fakeFetch({
+      [CREATE_PR]: unprocessable,
+      [LIST_PRS]: { json: [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: true }] },
+    }).install();
 
     const outputs = await pushStep.run(
       makeContext(),
@@ -1204,13 +1292,10 @@ describe("pushStep draft PRs", () => {
 
   it("reports draft=false when the 422-resolved existing PR is not a draft", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
-      .mockResolvedValueOnce({
-        ok: true, status: 200,
-        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: false }],
-        text: async () => "",
-      } as Response);
+    fakeFetch({
+      [CREATE_PR]: unprocessable,
+      [LIST_PRS]: { json: [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: false }] },
+    }).install();
 
     const outputs = await pushStep.run(
       makeContext(),
@@ -1223,17 +1308,12 @@ describe("pushStep draft PRs", () => {
 
   it("non-draft pushes send no draft flag and no unapproved section", async () => {
     mockGitSuccess("abc123");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(7) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
     expect(outputs.draft).toBe(false);
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body));
+    const body = prRequest(fake);
     expect(body.draft).toBeUndefined();
     expect(body.body).not.toContain("Automated review did not approve");
   });
@@ -1242,7 +1322,6 @@ describe("pushStep draft PRs", () => {
 describe("pushStep — dependency install status in the PR body", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   it("leads the body with a warning and names installMethod/installError when both attempts failed", async () => {
@@ -1250,20 +1329,18 @@ describe("pushStep — dependency install status in the PR body", () => {
     const ctx = makeContext();
     ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
     ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "ERESOLVE unable to resolve dependency tree" });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(11) }).install();
 
-    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+    // The pipeline opens a run whose dependencies never installed as a draft, approved or not.
+    await pushStep.run(ctx, { ...BASE_INPUTS, draft: true }, new NoopStepReporter());
 
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body)) as { body: string };
+    const body = prRequest(fake);
+    expect(body.draft).toBe(true);
     expect(body.body.startsWith("## ⚠️ Dependencies did not install")).toBe(true);
     expect(body.body).toContain("`npm ci`");
     expect(body.body).toContain("ERESOLVE unable to resolve dependency tree");
     expect(body.body).toContain("- [ ] Automated verification was skipped — dependency install failed.");
+    expect(body.body).toContain(`${"- [ ] Automated verification was skipped — dependency install failed."}\n\n${TEST_VERDICT_SENTENCE}\n`);
   });
 
   it("neutralizes an embedded fence in installError so the PR body's code block is not broken", async () => {
@@ -1275,16 +1352,11 @@ describe("pushStep — dependency install status in the PR body", () => {
       installMethod: "npm ci",
       installError: "some output\n```\nmalicious markdown injected here\n```\nmore output",
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(11) }).install();
 
-    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+    await pushStep.run(ctx, { ...BASE_INPUTS, draft: true }, new NoopStepReporter());
 
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body)) as { body: string };
+    const body = prRequest(fake);
     const fenceCount = (body.body.match(/^```$/gm) ?? []).length;
     expect(fenceCount).toBe(2);
     expect(body.body).toContain("'''\nmalicious markdown injected here\n'''");
@@ -1295,16 +1367,11 @@ describe("pushStep — dependency install status in the PR body", () => {
     const ctx = makeContext();
     ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
     ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "boom" });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(11) }).install();
 
     await pushStep.run(ctx, { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY }, new NoopStepReporter());
 
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body)) as { body: string };
+    const body = prRequest(fake);
     const warningIdx = body.body.indexOf("## ⚠️ Dependencies did not install");
     const unapprovedIdx = body.body.indexOf("Automated review did not approve");
     expect(warningIdx).toBeGreaterThanOrEqual(0);
@@ -1316,18 +1383,15 @@ describe("pushStep — dependency install status in the PR body", () => {
     const ctx = makeContext();
     ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
     ctx.setOutputs("install-retry", { installFailed: false, installMethod: "npm ci" });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/12", number: 12 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(12) }).install();
 
     await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
 
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body)) as { body: string };
+    const body = prRequest(fake);
     expect(body.body).not.toContain("## ⚠️ Dependencies did not install");
     expect(body.body).toContain("Initial dependency install failed; it succeeded after this change.");
+    expect(body.body.indexOf(TEST_VERDICT_SENTENCE)).toBeGreaterThan(-1);
+    expect(body.body.indexOf(TEST_VERDICT_SENTENCE)).toBeLessThan(body.body.indexOf("- [x] Initial dependency install failed"));
   });
 
   it.each([
@@ -1337,16 +1401,11 @@ describe("pushStep — dependency install status in the PR body", () => {
     mockGitSuccess("abc123");
     const ctx = makeContext();
     ctx.setOutputs("install", installOutputs);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/13", number: 13 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(13) }).install();
 
     await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
 
-    const [, init] = vi.mocked(fetch).mock.calls[0];
-    const body = JSON.parse(String(init?.body)) as { body: string };
+    const body = prRequest(fake);
     expect(body.body).not.toContain("## ⚠️ Dependencies did not install");
     expect(body.body).not.toContain("Initial dependency install failed; it succeeded after this change.");
     expect(body.body).not.toContain("dependency install failed");
@@ -1354,7 +1413,7 @@ describe("pushStep — dependency install status in the PR body", () => {
 
   it("never renders install status for a gap-fill push (no PR body is built)", async () => {
     mockGitSuccess("abc123");
-    const ctx = makeContext({ prNumber: "42" });
+    const ctx = makeContext(GAP_FILL_CONTEXT);
     ctx.setOutputs("install", { installFailed: true, installMethod: "npm ci" });
     ctx.setOutputs("install-retry", { installFailed: true, installMethod: "npm ci", installError: "boom" });
 
@@ -1371,12 +1430,7 @@ describe("pushStep — dependency install status in the PR body", () => {
     );
 
     expect(outputs.prNumber).toBe(42);
-    for (const call of vi.mocked(fetch).mock.calls) {
-      const init = call[1];
-      if (init?.body) {
-        expect(String(init.body)).not.toContain("Dependencies did not install");
-      }
-    }
+    expect(unrouted.calls).toEqual([]);
   });
 });
 
@@ -1385,7 +1439,6 @@ describe("pushStep — dependency install status in the PR body", () => {
 describe("pushStep — Case A (agent-committed changes)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   function mockAgentCommitted(sha = "abc123") {
@@ -1403,7 +1456,7 @@ describe("pushStep — Case A (agent-committed changes)", () => {
       }
       if (gitArgs[0] === "rev-parse") return spawnResult(0, `${sha}\n`);
       if (gitArgs[0] === "ls-remote") {
-        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-test\n");
       }
       return spawnResult(0);
     });
@@ -1411,11 +1464,7 @@ describe("pushStep — Case A (agent-committed changes)", () => {
 
   it("pushes agent-committed work without throwing 'Nothing to commit'", async () => {
     mockAgentCommitted("commitA");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(11) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -1446,19 +1495,14 @@ describe("pushStep — Case A (agent-committed changes)", () => {
       if (gitArgs[0] === "ls-remote") return spawnResult(0, "");
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/21", number: 21 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(21) }).install();
 
     await pushStep.run(
-      makeContext(),
+      makeContext({ branch: "ai-implement/feature/eng-40" }),
       {
         ...BASE_INPUTS,
-        branchName: "ai-implement/ans-901-field-links",
-        baseBranch: "ai-implement/feature/ans-899",
+        branchName: "ai-implement/eng-42-test",
+        baseBranch: "ai-implement/feature/eng-40",
         baseRef: "clone-sha",
       },
       new NoopStepReporter(),
@@ -1469,10 +1513,9 @@ describe("pushStep — Case A (agent-committed changes)", () => {
       ["rev-list", "--count", "clone-sha..HEAD"],
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
-    const [, request] = vi.mocked(fetch).mock.calls[0];
-    expect(JSON.parse(String(request?.body))).toEqual(expect.objectContaining({
-      head: "ai-implement/ans-901-field-links",
-      base: "ai-implement/feature/ans-899",
+    expect(prRequest(fake)).toEqual(expect.objectContaining({
+      head: "ai-implement/eng-42-test",
+      base: "ai-implement/feature/eng-40",
     }));
   });
 
@@ -1491,23 +1534,19 @@ describe("pushStep — Case A (agent-committed changes)", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Push blocked/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("uses the range diff for the PR body summary in Case A", async () => {
     mockAgentCommitted();
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/12", number: 12 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(12) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
-    // Should use git diff --name-status main..HEAD (not git show HEAD)
+    // Should use git diff --name-status c0ffee00..HEAD (not git show HEAD)
     expect(spawnSync).toHaveBeenCalledWith(
       "git",
-      ["diff", "--name-status", "main..HEAD"],
+      ["diff", "--name-status", "c0ffee00..HEAD"],
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
     expect(spawnSync).not.toHaveBeenCalledWith(
@@ -1523,7 +1562,6 @@ describe("pushStep — Case A (agent-committed changes)", () => {
 describe("pushStep — Case B (grouping parent no-op)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   function mockNoChanges() {
@@ -1539,7 +1577,7 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
     mockNoChanges();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ groupingParent: true }),
       { ...BASE_INPUTS, groupingParent: true },
       new NoopStepReporter(),
     );
@@ -1548,19 +1586,19 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
     expect(outputs.prNumber).toBeNull();
     expect(outputs.branchPushed).toBe(false);
     expect(outputs.commitSha).toBeNull();
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("does NOT create a PR (never calls fetch) on a grouping-parent no-op", async () => {
     mockNoChanges();
 
     await pushStep.run(
-      makeContext(),
+      makeContext({ groupingParent: true }),
       { ...BASE_INPUTS, groupingParent: true },
       new NoopStepReporter(),
     );
 
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
     // No git commit or push either
     expect(spawnSync).not.toHaveBeenCalledWith("git", ["add", "-A"], expect.anything());
     expect(spawnSync).not.toHaveBeenCalledWith(
@@ -1574,7 +1612,7 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Nothing to commit/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("still throws 'Nothing to commit' for a leaf run with groupingParent=false", async () => {
@@ -1582,25 +1620,21 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
 
     await expect(
       pushStep.run(
-        makeContext(),
+        makeContext({ groupingParent: false }),
         { ...BASE_INPUTS, groupingParent: false },
         new NoopStepReporter(),
       ),
     ).rejects.toThrow(/Nothing to commit/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("pushes normally when a grouping parent DOES have working-tree changes", async () => {
     // groupingParent=true but the agent left uncommitted changes → standard path
     mockGitSuccess("sha-gp");
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/13", number: 13 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(13) }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ groupingParent: true }),
       { ...BASE_INPUTS, groupingParent: true },
       new NoopStepReporter(),
     );
@@ -1615,7 +1649,6 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
 describe("pushStep — hardening (review findings)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   it("fails CLOSED when git rev-list errors on a grouping-parent run (never silently no-ops)", async () => {
@@ -1624,14 +1657,14 @@ describe("pushStep — hardening (review findings)", () => {
     vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
       const gitArgs = args as string[];
       if (gitArgs[0] === "status") return spawnResult(0, ""); // clean working tree
-      if (gitArgs[0] === "rev-list") return spawnResult(128, "", "fatal: bad revision 'main..HEAD'");
+      if (gitArgs[0] === "rev-list") return spawnResult(128, "", "fatal: bad revision 'c0ffee00..HEAD'");
       return spawnResult(0);
     });
 
     await expect(
-      pushStep.run(makeContext(), { ...BASE_INPUTS, groupingParent: true }, new NoopStepReporter()),
+      pushStep.run(makeContext({ groupingParent: true }), { ...BASE_INPUTS, groupingParent: true }, new NoopStepReporter()),
     ).rejects.toThrow(/git rev-list .*failed/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("catches a committed secret in a MIXED commit+working-tree state (unified committed-diff scan)", async () => {
@@ -1644,7 +1677,7 @@ describe("pushStep — hardening (review findings)", () => {
       if (gitArgs[0] === "diff" && gitArgs.includes("--cached")) {
         return spawnResult(0, "src/app.ts\n"); // staged files — no secret here
       }
-      if (gitArgs[0] === "diff" && gitArgs.includes("main..HEAD")) {
+      if (gitArgs[0] === "diff" && gitArgs.includes("c0ffee00..HEAD")) {
         return spawnResult(0, "src/app.ts\n.env\n"); // full committed diff — secret committed earlier
       }
       if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
@@ -1654,14 +1687,13 @@ describe("pushStep — hardening (review findings)", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Push blocked/);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 });
 
 describe("pushStep — push failure classification and retry (BAC-27116)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   afterEach(() => {
@@ -1690,12 +1722,7 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/50", number: 50 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(50) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -1725,12 +1752,7 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/51", number: 51 }),
-      text: async () => "",
-    } as Response);
+    const fake = fakeFetch({ [CREATE_PR]: created(51) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -1739,7 +1761,7 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
     expect(lsRemoteCalls).toBe(2);
     expect(outputs.prNumber).toBe(51);
     expect(outputs.pushAttempts).toBe(2);
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
   });
 
   it("stops without retrying when the remote has advanced to a foreign SHA", async () => {
@@ -1781,7 +1803,7 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
     // what would be lost.
     expect(caught?.message).toContain("Unpublished local commit: abc123");
     expect(caught?.message).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("never retries an authentication failure", async () => {
@@ -1865,6 +1887,214 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
     expect(caught?.message).toContain("exhausted after 3 attempts");
   });
 
+  it("retries a 403 on a freshly minted token, but not on the boot token (AII-922)", async () => {
+    const run = async (vend: boolean) => {
+      let pushCalls = 0;
+      // The machine-nonce path vends again before the retried push; the boot token never vends.
+      fakeFetch(vend
+        ? { [VEND_TOKEN]: [minted("fresh-tok"), minted("fresher-tok")], [CREATE_PR]: created(7) }
+        : {}).install();
+      vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+        const gitArgs = args as string[];
+        if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+        if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+        if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+        if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+        if (gitArgs[0] === "push") {
+          pushCalls++;
+          return pushCalls === 1
+            ? spawnResult(128, "", "remote: Permission to acme/app.git denied to bot[bot].\nfatal: unable to access: The requested URL returned error: 403")
+            : spawnResult(0);
+        }
+        return spawnResult(0);
+      });
+      const result = pushStep.run(
+        makeContext({
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 2 },
+          ...(vend ? { orchestratorUrl: "https://orchestrator.example", nonce: "n" } : {}),
+        }),
+        vend ? { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "n" } : BASE_INPUTS,
+        new NoopStepReporter(),
+      );
+      return { result, pushCalls: () => pushCalls };
+    };
+
+    const fresh = await run(true);
+    await expect(fresh.result).resolves.toMatchObject({ prNumber: 7 });
+    expect(fresh.pushCalls()).toBe(2);
+
+    const boot = await run(false);
+    await expect(boot.result).rejects.toThrow(/git push failed/);
+    expect(boot.pushCalls()).toBe(1);
+  });
+
+  it("keeps the auth classification when a fresh-token 403 survives the final attempt (AII-922)", async () => {
+    let pushCalls = 0;
+    // One vend before the first push, and one before each of the two retries.
+    fakeFetch({ [VEND_TOKEN]: [minted("fresh-tok"), minted("fresher-tok"), minted("freshest-tok")] }).install();
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+      if (gitArgs[0] === "push") {
+        pushCalls++;
+        return spawnResult(128, "", "remote: Permission to acme/app.git denied to bot[bot].\nfatal: unable to access: The requested URL returned error: 403");
+      }
+      return spawnResult(0);
+    });
+    let caught: (Error & { failure?: { category: string; code: string } }) | undefined;
+    try {
+      await pushStep.run(
+        makeContext({
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 2 },
+          orchestratorUrl: "https://orchestrator.example",
+          nonce: "n",
+        }),
+        { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "n" },
+        new NoopStepReporter(),
+      );
+    } catch (e) {
+      caught = e as typeof caught;
+    }
+    expect(pushCalls).toBe(3);
+    expect(caught?.failure).toMatchObject({ category: "auth", code: "GIT_AUTH" });
+  });
+
+  describe("ls-remote retry after a token refresh (AII-936)", () => {
+    const NOT_FOUND = "remote: Repository not found.\nfatal: repository 'https://x-access-token:fresh-tok@github.com/acme/app.git/' not found";
+    const FRESH_INPUTS = { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "n" };
+    const freshContext = () => makeContext({ orchestratorUrl: "https://orchestrator.example", nonce: "n" });
+
+    const mockLsRemote = (failures: number, stderr = NOT_FOUND) => {
+      let calls = 0;
+      vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+        const gitArgs = args as string[];
+        if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+        if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+        if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+        if (gitArgs[0] === "ls-remote") {
+          calls++;
+          return calls <= failures ? spawnResult(128, "", stderr) : spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
+        }
+        return spawnResult(0);
+      });
+      return () => calls;
+    };
+    const vend = () => fakeFetch({ [VEND_TOKEN]: minted("fresh-tok"), [CREATE_PR]: created(7) }).install();
+    const sleeps = () => vi.mocked(sleepAsync).mock.calls.map((c) => c[0]);
+
+    it("continues when ls-remote fails twice then succeeds, logging each failed attempt", async () => {
+      vend();
+      const calls = mockLsRemote(2);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(pushStep.run(freshContext(), FRESH_INPUTS, new NoopStepReporter())).resolves.toMatchObject({ prNumber: 7 });
+        const lines = errSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("[push] ls-remote attempt"));
+        expect(lines).toHaveLength(2);
+        expect(lines[0]).toContain("attempt 1/5 failed: remote: Repository not found");
+        expect(lines.join("\n")).not.toContain("fresh-tok");
+        expect(lines.join("\n")).toContain("***");
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(calls()).toBe(3);
+      expect(sleeps()).toEqual([1000, 2000]);
+    });
+
+    it("throws GIT_AUTH_FRESH_TOKEN after five failed attempts on the 1/2/4/8 s schedule", async () => {
+      vend();
+      const calls = mockLsRemote(99);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let caught: (Error & { failure?: FailureRecord }) | undefined;
+      try {
+        await pushStep.run(freshContext(), FRESH_INPUTS, new NoopStepReporter());
+      } catch (e) {
+        caught = e as typeof caught;
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(calls()).toBe(5);
+      expect(sleeps()).toEqual([1000, 2000, 4000, 8000]);
+      expect(caught?.message).toMatch(/git ls-remote failed after 5 attempts/);
+      expect(caught?.message).not.toContain("fresh-tok");
+      expect(caught?.failure).toMatchObject({
+        category: "transient",
+        code: "GIT_AUTH_FRESH_TOKEN",
+        stage: "push",
+        retryable: false,
+      });
+    });
+
+    it("keeps the classifier's record for a non-auth failure after a refresh", async () => {
+      vend();
+      mockLsRemote(99, "fatal: unable to access: Could not resolve host: github.com");
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let caught: (Error & { failure?: FailureRecord }) | undefined;
+      try {
+        await pushStep.run(freshContext(), FRESH_INPUTS, new NoopStepReporter());
+      } catch (e) {
+        caught = e as typeof caught;
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(caught?.failure?.code).toBe("GIT_REMOTE_TRANSIENT");
+    });
+
+    it("keeps the short schedule and the unclassified error on the boot token", async () => {
+      const calls = mockLsRemote(99);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let caught: (Error & { failure?: FailureRecord }) | undefined;
+      try {
+        await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+      } catch (e) {
+        caught = e as typeof caught;
+      } finally {
+        errSpy.mockRestore();
+      }
+      expect(calls()).toBe(3);
+      expect(sleeps()).toEqual([250, 1000]);
+      expect(caught?.message).toMatch(/git ls-remote failed after 3 attempts/);
+      expect(caught?.failure).toBeUndefined();
+    });
+  });
+
+  it("logs the credential source of the push and never the token (AII-922)", async () => {
+    type Credentials = { orchestratorUrl?: string; machineNonce?: string; callbackUrl?: string };
+    const run = async (label: string, inputs: Credentials, vend: Routes, env?: string) => {
+      if (env) vi.stubEnv("RUN_PUBLICATION_TOKEN", env);
+      fakeFetch({ ...vend, [CREATE_PR]: created(7) }).install();
+      mockGitSuccess();
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      // The context carries what the pipeline copies into these inputs.
+      const ctx = makeContext({ orchestratorUrl: inputs.orchestratorUrl ?? "", nonce: inputs.machineNonce ?? "", callbackUrl: inputs.callbackUrl });
+      try {
+        await pushStep.run(ctx, { ...BASE_INPUTS, ...inputs }, new NoopStepReporter());
+        return log.mock.calls.map((c) => c.join(" ")).join("\n");
+      } finally {
+        log.mockRestore();
+        vi.unstubAllEnvs();
+        void label;
+      }
+    };
+    const nonce = await run("nonce", { orchestratorUrl: "https://orchestrator.example", machineNonce: "n" }, { [VEND_TOKEN]: minted("nonce-minted-secret") });
+    expect(nonce).toContain("[push] credential source: machine-nonce");
+    expect(nonce).not.toContain("nonce-minted-secret");
+
+    const pub = await run("pub", { callbackUrl: "https://orchestrator.example" }, { [PUBLICATION_TOKEN]: minted("pub-minted-secret") }, "one-use-publication-token");
+    expect(pub).toContain("[push] credential source: publication-token");
+    expect(pub).not.toContain("pub-minted-secret");
+    expect(pub).not.toContain("one-use-publication-token");
+
+    const refused = () => {
+      throw new Error("connection refused");
+    };
+    const boot = await run("boot", { orchestratorUrl: "https://orchestrator.example", machineNonce: "n" }, { [VEND_TOKEN]: refused });
+    expect(boot).toContain("[push] credential source: boot-token");
+    expect(boot).not.toContain("gh-token");
+  });
+
   it("a retried gap-fill push still returns the existing PR number and never creates a PR", async () => {
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
     let pushCalls = 0;
@@ -1881,14 +2111,10 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    const fake = fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       {
         ...BASE_INPUTS,
         branchName: "feature/existing-pr",
@@ -1906,7 +2132,7 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
     expect(outputs.pushAttempts).toBe(2);
     // Only the one-time token exchange — the retry's credential refresh must not
     // re-spend the already-consumed publication credential, and no PR create call.
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fake.calls).toHaveLength(1);
   });
 
   it("rethrows the original push failure record when ls-remote fails after a push failure", async () => {
@@ -1953,7 +2179,6 @@ describe("pushStep — push failure classification and retry (BAC-27116)", () =>
 describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   afterEach(() => {
@@ -1976,7 +2201,7 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
         return spawnResult(
           128,
           "",
-          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+          "! [rejected] ai-implement/eng-42-test -> ai-implement/eng-42-test (stale info)",
         );
       }
       return spawnResult(0);
@@ -2019,17 +2244,12 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
         return spawnResult(
           128,
           "",
-          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+          "! [rejected] ai-implement/eng-42-test -> ai-implement/eng-42-test (stale info)",
         );
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/70", number: 70 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(70) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -2066,12 +2286,7 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/71", number: 71 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(71) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -2104,7 +2319,7 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
         return spawnResult(
           128,
           "",
-          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+          "! [rejected] ai-implement/eng-42-test -> ai-implement/eng-42-test (stale info)",
         );
       }
       return spawnResult(0);
@@ -2125,7 +2340,7 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
     expect(caught?.failure?.message).toContain("someone-elses-sha");
     expect(caught?.message).toContain("Unpublished local commit: abc123");
     expect(caught?.message).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("keeps the original unknown category and message (not GIT_REMOTE_ADVANCED) when a retried unknown failure finds the remote advanced to a foreign SHA", async () => {
@@ -2167,7 +2382,7 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
     expect(caught?.failure?.category).toBe("unknown");
     expect(caught?.failure?.code).not.toBe("GIT_REMOTE_ADVANCED");
     expect(caught?.failure?.message).toContain("fatal: something completely unrecognized happened");
-    expect(caught?.failure?.message).toContain("Remote ai-implement/eng-42-feature advanced past the lease SHA during this attempt.");
+    expect(caught?.failure?.message).toContain("Remote ai-implement/eng-42-test advanced past the lease SHA during this attempt.");
     expect(caught?.message).toContain("Unpublished local commit: abc123");
   });
 
@@ -2230,7 +2445,7 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
         return spawnResult(
           128,
           "",
-          "! [rejected] ai-implement/eng-42-feature -> ai-implement/eng-42-feature (stale info)",
+          "! [rejected] ai-implement/eng-42-test -> ai-implement/eng-42-test (stale info)",
         );
       }
       return spawnResult(0);
@@ -2254,7 +2469,6 @@ describe("pushStep — conflict-on-retry re-inspection (BAC-27116 follow-up)", (
 describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   afterEach(() => {
@@ -2286,26 +2500,10 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresher-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 201,
-        json: async () => ({ html_url: "https://github.com/acme/app/pull/71", number: 71 }),
-        text: async () => "",
-      } as Response);
+    fakeFetch({ [VEND_TOKEN]: [minted("fresh-token"), minted("fresher-token")], [CREATE_PR]: created(71) }).install();
 
     const outputs = await pushStep.run(
-      makeContext(),
+      makeContext({ orchestratorUrl: "https://orchestrator.example", nonce: "machine-nonce" }),
       { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
       new NoopStepReporter(),
     );
@@ -2343,16 +2541,12 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    fakeFetch({ [VEND_TOKEN]: minted("fresh-token") }).install();
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
       await pushStep.run(
-        makeContext(),
+        makeContext({ orchestratorUrl: "https://orchestrator.example", nonce: "machine-nonce" }),
         { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
         new NoopStepReporter(),
       );
@@ -2498,24 +2692,15 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresher-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response);
+    fakeFetch({ [VEND_TOKEN]: [minted("fresh-token"), minted("fresher-token")] }).install();
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
       await pushStep.run(
         makeContext({
           orchestratorUrl: "https://orchestrator.example",
-          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 1 },
+          nonce: "machine-nonce",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries:1 },
         }),
         { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
         new NoopStepReporter(),
@@ -2560,29 +2745,15 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "fresher-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ token: "freshest-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response);
+    fakeFetch({ [VEND_TOKEN]: [minted("fresh-token"), minted("fresher-token"), minted("freshest-token")] }).install();
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
       await pushStep.run(
         makeContext({
           orchestratorUrl: "https://orchestrator.example",
-          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 2 },
+          nonce: "machine-nonce",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries:2 },
         }),
         { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
         new NoopStepReporter(),
@@ -2713,18 +2884,16 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    // One vend before the first push and one before each of the ten retries, each minting a new token.
+    fakeFetch({ [VEND_TOKEN]: Array.from({ length: 11 }, (_, i) => minted(`fresh-token-${i + 1}`)) }).install();
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
       await pushStep.run(
         makeContext({
           orchestratorUrl: "https://orchestrator.example",
-          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 10 },
+          nonce: "machine-nonce",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries:10 },
         }),
         { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
         new NoopStepReporter(),
@@ -2768,18 +2937,16 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    // One vend before the first push and one before each of the ten retries, each minting a new token.
+    fakeFetch({ [VEND_TOKEN]: Array.from({ length: 11 }, (_, i) => minted(`fresh-token-${i + 1}`)) }).install();
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
       await pushStep.run(
         makeContext({
           orchestratorUrl: "https://orchestrator.example",
-          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries: 10 },
+          nonce: "machine-nonce",
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, pushRetries:10 },
         }),
         { ...BASE_INPUTS, orchestratorUrl: "https://orchestrator.example", machineNonce: "machine-nonce" },
         new NoopStepReporter(),
@@ -2813,12 +2980,7 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/60", number: 60 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(60) }).install();
 
     await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -2841,12 +3003,7 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/61", number: 61 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(61) }).install();
 
     await pushStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, backoffInitialMs: 500 } }),
@@ -2876,12 +3033,7 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/62", number: 62 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(62) }).install();
 
     await pushStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, backoffMaxMs: 700_000 } }),
@@ -2911,12 +3063,7 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/63", number: 63 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(63) }).install();
 
     await pushStep.run(
       makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, backoffJitter: 2 } }),
@@ -2946,12 +3093,7 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/64", number: 64 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(64) }).install();
 
     // Individually in range ([1_000, 600_000]) but incoherent as a pair: a max
     // below the initial delay would make backoff shrink instead of grow.
@@ -2991,12 +3133,7 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 201,
-      json: async () => ({ html_url: "https://github.com/acme/app/pull/65", number: 65 }),
-      text: async () => "",
-    } as Response);
+    fakeFetch({ [CREATE_PR]: created(65) }).install();
 
     const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -3025,22 +3162,17 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
       return spawnResult(0);
     });
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "pub-token");
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
+    fakeFetch({
+      [PUBLICATION_TOKEN]: [
         // Same token as BASE_INPUTS.githubToken ("gh-token"): the single-use
         // publication credential is only cleared when the vended token differs
         // from the current one, so it stays available for the mid-retry call below.
-        json: async () => ({ token: "gh-token", expires_at: "2030-01-01T00:00:00Z" }),
-      } as Response)
-      .mockResolvedValueOnce({
-        // A non-retryable rejection: the fail-closed publication exchange throws
-        // immediately, before ever writing process.env.GITHUB_TOKEN.
-        ok: false,
-        status: 400,
-        json: async () => ({}),
-      } as Response);
+        minted("gh-token"),
+        // A non-retryable rejection, as the orchestrator answers a credential it already consumed:
+        // the fail-closed publication exchange throws immediately, before ever writing process.env.GITHUB_TOKEN.
+        { status: 403, json: { error: "Unauthorized" } },
+      ],
+    }).install();
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
@@ -3104,7 +3236,6 @@ describe("pushStep — retry resilience and guards (BAC-27116 follow-up)", () =>
 describe("pushStep — mounted workspace never pushes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
     vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
   });
 
@@ -3122,7 +3253,7 @@ describe("pushStep — mounted workspace never pushes", () => {
     expect(outputs.draft).toBe(false);
     // No git or HTTP calls.
     expect(spawnSync).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
+    expect(unrouted.calls).toEqual([]);
   });
 
   it("does NOT skip when AI_IMPLEMENT_WORKSPACE_MODE is not mounted", async () => {
@@ -3150,7 +3281,6 @@ describe("pushStep — mounted workspace never pushes", () => {
 describe("pushStep — push guard: adopt agent push vs refuse foreign work", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal("fetch", vi.fn());
   });
 
   afterEach(() => {
@@ -3181,15 +3311,12 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
 
   it("adopts agent push when remote SHA is reachable from HEAD (merge-base exit 0)", async () => {
     mockGapFillWithRemoteSha("246b3fe", 0);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const outputs = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );
@@ -3203,15 +3330,12 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
 
   it("uses the adopted remote SHA (not baseRef) in the force-with-lease arg when adopting", async () => {
     mockGapFillWithRemoteSha("246b3fe", 0);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );
@@ -3241,7 +3365,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
 
     let caught: (Error & { failure?: FailureRecord }) | undefined;
     try {
-      await pushStep.run(makeContext({ prNumber: "42" }), GAP_FILL_INPUTS, new NoopStepReporter());
+      await pushStep.run(makeContext(GAP_FILL_CONTEXT), GAP_FILL_INPUTS, new NoopStepReporter());
     } catch (err) {
       caught = err as typeof caught;
     }
@@ -3276,14 +3400,11 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
       }
       return spawnResult(0);
     });
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
 
     const result = await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );
@@ -3298,15 +3419,12 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
 
   it("calls merge-base with --is-ancestor <remoteSha> HEAD in that exact order", async () => {
     mockGapFillWithRemoteSha("246b3fe", 0);
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true, status: 200,
-      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
-    } as Response);
+    fakeFetch({ [PUBLICATION_TOKEN]: minted("fresh-token") }).install();
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     await pushStep.run(
-      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      makeContext({ callbackUrl: "https://orchestrator.example", ...GAP_FILL_CONTEXT }),
       { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
       new NoopStepReporter(),
     );

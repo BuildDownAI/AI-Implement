@@ -136,3 +136,14 @@ export async function resolveModuleImport<T>(
   }
   return null;
 }
+
+/**
+ * True when `resolveModuleImport(modulePath)` would return a custom module: a custom file with
+ * no default export counts as no override.
+ */
+export async function hasResolvableCustomModule(
+  modulePath: string,
+  options?: ImportModuleOptions,
+): Promise<boolean> {
+  return (await resolveModuleImport<unknown>(modulePath, options)) !== null;
+}

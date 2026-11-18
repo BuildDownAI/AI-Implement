@@ -1,83 +1,56 @@
-import { JSDOM } from "jsdom";
 import { describe, expect, it } from "vitest";
 import { overviewHtml, overviewScript } from "../pages/overview.js";
 import { blockersHtml, blockersScript } from "../pages/blockers.js";
+import { mountAdminPage } from "../../__tests__/helpers/fixtures/admin-ui.js";
 
 type CapacityByMapping = Record<string, { used: number; cap: number; source: "reservations" }>;
 
-function escapeText(value: unknown): string {
-  return String(value == null ? "" : value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mountOverview(fixtures: {
   log?: unknown[];
   mappings?: Record<string, unknown>;
   capacityOk?: boolean;
   capacityReject?: boolean;
   capacityByMapping?: CapacityByMapping | null;
-}): { win: any; doc: Document } {
+}) {
   const { log = [], mappings = {}, capacityOk = true, capacityReject = false, capacityByMapping = {} } = fixtures;
-  const dom = new JSDOM(`<!DOCTYPE html><body>${overviewHtml}</body>`, {
-    runScripts: "dangerously",
-    url: "http://localhost/admin#overview",
+  return mountAdminPage({
+    html: overviewHtml,
+    script: overviewScript,
+    route: "overview",
+    api: async (url) => {
+      if (url === "/api/log") return { ok: true, status: 200, json: async () => log };
+      if (url === "/api/mappings") return { ok: true, status: 200, json: async () => mappings };
+      if (url === "/api/reaper/summary") return { ok: true, status: 200, json: async () => ({ lastSweepAt: null }) };
+      if (url === "/api/blockers") {
+        if (capacityReject) throw new Error("network unavailable");
+        if (!capacityOk) return { ok: false, status: 503, json: async () => ({ error: "unavailable" }) };
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ blockers: [], totals: { teams: 0, issues: 0, byReason: {} }, capacityByMapping }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
   });
-  const win = dom.window as any;
-  win.esc = escapeText;
-  win.escAttr = escapeText;
-  win.safeUrl = (value: unknown) => String(value == null ? "#" : value);
-  win.registerPage = () => {};
-  win.navigate = () => {};
-  win.openJobDrawer = () => {};
-  win.api = async (url: string) => {
-    if (url === "/api/log") return { ok: true, status: 200, json: async () => log };
-    if (url === "/api/mappings") return { ok: true, status: 200, json: async () => mappings };
-    if (url === "/api/reaper/summary") return { ok: true, status: 200, json: async () => ({ lastSweepAt: null }) };
-    if (url === "/api/blockers") {
-      if (capacityReject) throw new Error("network unavailable");
-      if (!capacityOk) return { ok: false, status: 503, json: async () => ({ error: "unavailable" }) };
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ blockers: [], totals: { teams: 0, issues: 0, byReason: {} }, capacityByMapping }),
-      };
-    }
-    return { ok: true, status: 200, json: async () => ({}) };
-  };
-  const script = dom.window.document.createElement("script");
-  script.textContent = overviewScript;
-  dom.window.document.head.appendChild(script);
-  return { win, doc: dom.window.document as Document };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mountBlockers(fixtures: {
   totals?: { teams: number; issues: number; byReason: Record<string, number> };
   capacityByMapping?: CapacityByMapping | null;
-}): { win: any; doc: Document } {
+}) {
   const { totals = { teams: 0, issues: 0, byReason: {} }, capacityByMapping = {} } = fixtures;
-  const dom = new JSDOM(`<!DOCTYPE html><body>${blockersHtml}</body>`, {
-    runScripts: "dangerously",
-    url: "http://localhost/admin#blockers",
+  return mountAdminPage({
+    html: blockersHtml,
+    script: blockersScript,
+    route: "blockers",
+    api: async (url) => {
+      if (url === "/api/blockers") {
+        return { ok: true, status: 200, json: async () => ({ blockers: [], totals, capacityByMapping }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
   });
-  const win = dom.window as any;
-  win.esc = escapeText;
-  win.escAttr = escapeText;
-  win.safeUrl = (value: unknown) => String(value == null ? "#" : value);
-  win.registerPage = () => {};
-  win.api = async (url: string) => {
-    if (url === "/api/blockers") {
-      return { ok: true, status: 200, json: async () => ({ blockers: [], totals, capacityByMapping }) };
-    }
-    return { ok: true, status: 200, json: async () => ({}) };
-  };
-  const script = dom.window.document.createElement("script");
-  script.textContent = blockersScript;
-  dom.window.document.head.appendChild(script);
-  return { win, doc: dom.window.document as Document };
 }
 
 describe("overview page", () => {
@@ -135,9 +108,29 @@ describe("overview page", () => {
     expect(overviewScript).toContain("PROVIDER_UNAVAILABLE");
   });
 
-  it("includes stuck_giveup in the attention KPI filter", () => {
-    expect(overviewScript).toContain("stuck_giveup");
-    expect(overviewScript).toContain("e.conclusion === 'stuck_giveup'");
+  it("counts recent hard-stopped jobs as attention and excludes ordinary or old timeouts", async () => {
+    const recent = new Date(Date.now() - 3600000).toISOString();
+    const old = new Date(Date.now() - 48 * 3600000).toISOString();
+    const { win, doc } = mountOverview({
+      log: [
+        { id: 1, status: "timed_out", conclusion: "stuck_giveup", dispatchedAt: recent },
+        { id: 2, status: "failed", dispatchedAt: recent },
+        { id: 3, status: "review_failed", dispatchedAt: recent },
+        { id: 4, status: "timed_out", conclusion: "machine_timeout", dispatchedAt: recent },
+        { id: 5, status: "timed_out", conclusion: "run_not_found", dispatchedAt: recent },
+        { id: 6, status: "timed_out", conclusion: "stuck_giveup", dispatchedAt: old },
+        { id: 7, status: "completed", conclusion: "stuck_giveup", dispatchedAt: recent },
+      ],
+    });
+    await win.loadOverview();
+    expect(doc.getElementById("kpi-failed-value")?.textContent).toBe("3");
+    const rows = doc.querySelectorAll("#overview-failures-body [data-job-id]");
+    expect(Array.from(rows, (row) => row.getAttribute("data-job-id"))).toEqual(["1", "2", "3"]);
+  });
+
+  it("treats stuck_review_fix like stuck_giveup in the attention and failure filters", () => {
+    const needle = "(e.conclusion === 'stuck_giveup' || e.conclusion === 'stuck_review_fix')";
+    expect(overviewScript.split(needle).length - 1).toBe(2);
   });
 
   it("includes timed_out in statusBadge map for display consistency", () => {

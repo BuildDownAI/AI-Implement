@@ -4,7 +4,7 @@ import { projectsHtml, projectsScript } from "../admin-ui/pages/projects.js";
 import { stepperHtml, stepperScript } from "../admin-ui/stepper.js";
 
 /** Tab keys in the order the strip presents them. */
-const TABS = ["ticketing", "source", "context", "execution", "capacity", "guardrails", "provider"];
+const TABS = ["ticketing", "source", "context", "execution", "capacity", "guardrails", "provider", "agents"];
 
 /** The edit dialog alone. The page also carries the stepper, which it owns. */
 const dialogHtml = projectsHtml.slice(

@@ -106,6 +106,52 @@ Every run prints its artifact directory. By default, complete logs, summaries, a
 run metadata are saved under `.dev-runs/<timestamp>/` in the AI-Implement checkout.
 Planning and full-loop runs also save the assembled plan as `plan.md` there.
 
+### Select local stage configuration
+
+Use `--agent-config` with `--phase full` to select planning, implementation and
+review independently. Keep the JSON configuration and its referenced credential
+files outside both the target checkout and artifact directory. `projectKey` must
+match the checkout's GitHub `owner/repo`. Each stage selects an agent, provider,
+model, account profile and invocation timeout; profiles reference protected local
+files rather than embedding credentials. Credential files must be owned by you,
+mode `0600`, in a directory that other users cannot write.
+
+```bash
+npm run dev:run -- \
+  --workspace "$TARGET_REPO" \
+  --task "$TASK_FILE" \
+  --phase full \
+  --workspace-mode copy \
+  --agent-config "$HOME/ai-implement-profiles/agent-config.json"
+```
+
+`--workspace-mode copy` runs against an isolated source copy and preserves the
+original checkout. Use `--workspace-mode mounted` explicitly when you want the
+runner to edit the developer checkout. The default remains mounted. Configured
+runs use one frozen snapshot and one credential lifecycle across all three
+stages; stage settings take precedence over legacy model environment and task
+frontmatter. Without external configuration, the existing Claude credential and
+model behavior remains available.
+
+API profiles use `openai-api-key` or `anthropic-api-key` and an absolute
+`credentialPath`. Subscription profiles use `codex-subscription` or
+`claude-subscription`, an absolute `sessionPath`, `sessionSource: "local-login"`
+and `trustedPrivateTesting: true`.
+Use a dedicated independently signed-in testing profile. A failed or cancelled
+run retains ownership when refreshed state or container termination cannot be
+confirmed; do not delete its lock to start a competing run.
+
+### Codex and hosted model accounts
+
+On a running orchestrator, configure model accounts under **Models & providers** in the admin UI
+(`/admin`), and opt a project in or let it inherit the defaults from its **Agents** settings in the
+Projects drawer. Operator procedures, including the protected CLI steps, are in
+[docs/model-account-operations.md](docs/model-account-operations.md). Never paste raw browser
+credentials anywhere. Existing Codex local-login users re-sign in through `chatgpt-plan-login`; the
+orchestrator does not read or copy an `auth.json`. Support is provisional: see
+[docs/codex-parity-validation.md](docs/codex-parity-validation.md) for what is verified and what is
+still pending.
+
 ### Exercise planning and implementation separately
 
 Use `--phase` to choose the test surface:
@@ -311,12 +357,24 @@ The full architecture, env-var reference, SQLite schema, multi-client deploy mod
 
 **Linear**: create a label in your workspace matching the orchestrator's pickup label, default `AI-Implement`, changeable at `/admin#settings`. That label is the trigger. Change it only for a planned migration — issues that carry the old label stop dispatching at the next poll.
 
+The Linear provider also uses these lifecycle labels:
+
+| Label | Applying verb |
+|---|---|
+| `AI-Planning` | `markPlanningStarted` |
+| `Plan-Complete` | `markPlanComplete` |
+| `AI-Working` | `markImplementing` |
+| `Ready for Review` | `markPrReady` |
+| `AI-Needs-Human` | `parkForHuman` |
+
+The orchestrator creates a missing lifecycle label in the team at first dispatch. This needs the app to be allowed to create team labels. Creating these labels by hand with the exact names also works.
+
 **Jira**: add two custom fields to your Jira project. The orchestrator auto-discovers them by name, so use these exact names — or pick the field explicitly in the mapping (stored as a `customfield_XXXXX` override) if yours are named differently.
 
 | Field name | Type | Purpose |
 |---|---|---|
-| `AI-Implement Status` | Select | Orchestrator-managed state transitions (Ready → In Progress → Ready for Review) |
-| `AI-Implement Repo` | Select | Identifies which GitHub repo the issue belongs to — each option should be `owner/repo` |
+| `AI-Implement Status` | Select | Requires the [nine status options](docs/ticketing-providers.md#the-ai-implement-status-options) |
+| `AI-Implement Repo` | Select or text | Identifies which GitHub repo the issue belongs to — each option should be `owner/repo` |
 
 ### Step 2 — GitHub App
 
@@ -364,15 +422,15 @@ The orchestrator picks it up within 60 seconds and dispatches a run. The resulti
 src/                  Polling loop, HTTP + admin server, Linear/GitHub clients, Fly Machines runner
 workflows/            Templates synced to target repos (claude-implement.yml, claude-plan.yml,
                       comment-trigger.yml, WORKFLOW.md, PLANNING.md)
-clients/              One <slug>.toml per deployed Fly app (multi-tenant deploy)
+clients/              One <slug>.toml per deployed Fly app, written by npm run provision-client -- <slug>
 custom/               Fork-local step/provider/pipeline overrides (see custom/README.md
                       and docs/adr/001-custom-path-precedence.md)
-scripts/              provision-client.sh (interactive onboarding for multi-tenant operators)
+scripts/              operator helpers
 session/              Entrypoint scripts for the Fly Machines runner image
 docs/                 Design notes, ADRs
 CONTEXT.md            Domain glossary — the terms the ADRs turn on (developer harness
                       vs. local run, local artifact, task document, demo/managed run)
-.github/workflows/    deploy-clients.yml, sync-workflow.yml, build-runner.yml,
+.github/workflows/    deploy-clients.yml, build-runner.yml,
                       claude-review.yml
 ```
 

@@ -92,6 +92,14 @@ export function getRequestToken(req: http.IncomingMessage): string | undefined {
   return undefined;
 }
 
+/** The access code `.env.example` shipped for years. Anyone who has read the repository knows it, so it is never accepted. */
+export const PLACEHOLDER_ACCESS_CODE = "your-secret-access-code";
+
+/** The configured access code, or null when it is unset or the published placeholder. */
+export function effectiveAccessCode(raw: string | undefined): string | null {
+  return raw && raw !== PLACEHOLDER_ACCESS_CODE ? raw : null;
+}
+
 /**
  * Constant-time compare of a submitted access code against the configured one.
  * 

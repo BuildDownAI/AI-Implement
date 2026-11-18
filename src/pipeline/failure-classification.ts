@@ -26,7 +26,11 @@ export const FAILURE_CATEGORIES: readonly FailureCategory[] = [
   "unknown",
 ];
 
+export interface ModelFallback { stage: "planning" | "implementation" | "review"; from: string; to: string }
+
 export interface FailureRecord {
+  modelFallback?: ModelFallback;
+  accountFallback?: ModelFallback;
   category: FailureCategory;
   /** Open-ended machine code, UPPER_SNAKE, e.g. PROVIDER_OVERLOADED, GIT_LEASE_REJECTED. */
   code: string;
@@ -50,6 +54,8 @@ export interface FailureRecord {
     llmIsError?: boolean | null;
     /** From RunTelemetry.outcome — makes e.g. a `subtype: success` / `outcome: max_turns` mismatch explainable from the record alone. */
     llmOutcome?: RunTelemetry["outcome"] | null;
+    /** Redacted, capped terminal error text the stream parser captured (e.g. a Codex `error` event) — present even when the process exited 0. */
+    llmErrorMessage?: string;
     /** Set only when evidence capture itself failed (best-effort — see classify* catch blocks). */
     captureError?: string;
   };
@@ -95,10 +101,16 @@ function matchSignature(table: SignatureRow[], text: string): { category: Failur
  * the classify* functions directly rather than as rows here.
  */
 export const PROVIDER_SIGNATURES: SignatureRow[] = [
+  // Account exhaustion must win over accompanying rate-limit statuses (e.g. 429).
+  {
+    category: "auth",
+    code: "ACCOUNT_USAGE_LIMIT",
+    test: /usage limit reached|reached your weekly usage limit|hit your usage limit|usage_limit_reached|workspace_member_usage_limit_reached|reached their Subscription Sharing usage limit/i,
+  },
   {
     category: "transient",
     code: "PROVIDER_OVERLOADED",
-    test: /overloaded_error|\b529\b|\boverloaded\b/i,
+    test: /overloaded_error|\b529\b|\boverloaded\b|at capacity|try a different model/i,
   },
   {
     category: "transient",
@@ -125,6 +137,13 @@ export const PROVIDER_SIGNATURES: SignatureRow[] = [
     test: /not_found_error|invalid_request_error|unknown model/i,
   },
 ];
+
+/** Provider codes permitted for exit-zero terminal error matching. */
+export const EXIT_ZERO_TERMINAL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ACCOUNT_USAGE_LIMIT",
+  "PROVIDER_AUTH",
+  "PROVIDER_CONFIG",
+]);
 
 /**
  * Lines carrying a transport-level marker, checked when falling back to
@@ -258,6 +277,7 @@ const FIXED_REDACTION_PATTERNS: RegExp[] = [
   /ghs_[A-Za-z0-9]+/g,
   /ghp_[A-Za-z0-9]+/g,
   /github_pat_[A-Za-z0-9_]+/g,
+  /sk-or-[A-Za-z0-9-]+/g,
   /sk-ant-[A-Za-z0-9-]+/g,
   /Bearer\s+\S+/g,
   /x-api-key:\s*\S+/gi,
@@ -429,6 +449,7 @@ export function projectFailureRecord(value: FailureRecord): FailureRecord {
       ...(evidence.llmSubtype !== undefined ? { llmSubtype: evidence.llmSubtype } : {}),
       ...(evidence.llmIsError !== undefined ? { llmIsError: evidence.llmIsError } : {}),
       ...(evidence.llmOutcome !== undefined ? { llmOutcome: evidence.llmOutcome } : {}),
+      ...(evidence.llmErrorMessage !== undefined ? { llmErrorMessage: evidence.llmErrorMessage } : {}),
       ...(evidence.captureError !== undefined ? { captureError: evidence.captureError } : {}),
     },
   };
@@ -479,7 +500,10 @@ export function classifyLlmResult(
     const secrets = envSecrets();
     const stdout = result.stdout ?? "";
     const stderr = result.stderr ?? "";
-    const text = [stderr, stdout].filter(Boolean).join("\n");
+    const errorMessage = result.errorMessage?.trim() ?? "";
+    // The parser's terminal error text leads the message for every failure: stdout
+    // carries only the model's final prose, which says nothing about why the stream was fatal.
+    const text = [errorMessage, stderr, stdout].filter(Boolean).join("\n");
 
     let category: FailureCategory;
     let code: string;
@@ -494,7 +518,9 @@ export function classifyLlmResult(
       // text is part of PROVIDER_SIGNATURES' match input (see signatureMatchText), so
       // a reviewer note like "treat API Error 503 as transient" appearing in a dropped
       // verdict's stdout must not turn a structural failure into a retryable transport
-      // one. PROVIDER_SIGNATURES is consulted only in the exitCode !== 0 branch below.
+      // one. Only a provider terminal error can identify account exhaustion, refused
+      // credentials, or provider configuration errors here; no stdout/stderr text
+      // or transient provider signature can override these checks.
       // Ordered so a genuinely absent result event (terminalStatus == null, which
       // also always means structuredOutput === undefined — both derive from the
       // same event) is never shadowed by the missing-structured-output check below:
@@ -511,8 +537,11 @@ export function classifyLlmResult(
         result.terminalStatus?.isError === true ||
         (ctx.expectsStructuredOutput && result.terminalStatus != null && result.terminalStatus.subtype !== "success")
       ) {
-        category = "invalid_output";
-        code = "LLM_TERMINAL_ERROR";
+        const providerError = result.terminalStatus?.isError === true
+          ? matchSignature(PROVIDER_SIGNATURES.filter(row => EXIT_ZERO_TERMINAL_ERROR_CODES.has(row.code)), errorMessage)
+          : null;
+        category = providerError?.category ?? "invalid_output";
+        code = providerError?.code ?? "LLM_TERMINAL_ERROR";
       } else if (
         ctx.expectsStructuredOutput &&
         result.telemetry?.outcome != null &&
@@ -532,7 +561,7 @@ export function classifyLlmResult(
         code = "UNKNOWN";
       }
     } else {
-      const matched = matchSignature(PROVIDER_SIGNATURES, signatureMatchText(stdout, stderr));
+      const matched = matchSignature(PROVIDER_SIGNATURES, [errorMessage, signatureMatchText(stdout, stderr)].filter(Boolean).join("\n"));
       if (matched) {
         category = matched.category;
         code = matched.code;
@@ -562,6 +591,7 @@ export function classifyLlmResult(
         llmOutcome: result.telemetry?.outcome ?? null,
         llmSubtype: result.terminalStatus?.subtype ?? null,
         llmIsError: result.terminalStatus?.isError ?? null,
+        ...(errorMessage ? { llmErrorMessage: redactAndCap(errorMessage, 500, secrets) } : {}),
       },
     };
   } catch (captureErr) {
@@ -684,8 +714,8 @@ export function providerUnavailablePhrase(
       ? { stageLabel: "implementation", codeState: "partially implemented" }
       : { stageLabel: "implementation", codeState: "not implemented" };
   }
-  if (stage === "post-push-review") return { stageLabel: "post-push review", codeState: "not reviewed" };
-  return { stageLabel: "review", codeState: "not reviewed" };
+  if (stage === "post-push-review") return { stageLabel: "the second review", codeState: "not reviewed" };
+  return { stageLabel: "the review", codeState: "not reviewed" };
 }
 
 function attachedFailure(err: unknown): FailureRecord | null {

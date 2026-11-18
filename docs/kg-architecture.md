@@ -5,7 +5,7 @@ lifecycle stage, and the single fact that governs every operational decision —
 and the KG are one deployable unit.**
 
 Reference for the configured KG source repository (set via `KG_SOURCE_REPO`; unset builds without a
-sidecar — `/mcp` returns 503), its `kg_ingest/`, `kg_query/`,
+sidecar — `/mcp` serves without the `kg_*` tools), its `kg_ingest/`, `kg_query/`,
 and `snapshot/` directories, the KG stages of `Dockerfile`, `docker-entrypoint.sh`, and
 `src/deploy.ts`. For the `/mcp` endpoint, the OAuth flow, and the ways a build ships degraded, see
 [kg-sidecar.md](kg-sidecar.md). For deploy paths and their flags, see [deployment.md](deployment.md).
@@ -23,7 +23,7 @@ consequences follow, and every one of them has surprised somebody.
 
 ### A data refresh is a code deploy
 
-Updating the graph means building a new image and replacing the machine. `runDeploy` takes a deploy
+Updating the graph means building a new image and replacing the machine. The `SelfDeploy` object takes a deploy
 hold first, so **dispatch stops**, then waits for in-flight work to drain — up to 75 minutes, after
 which the deploy fails rather than interrupting a run. A KG refresh during a busy period therefore
 either waits or fails.
@@ -143,8 +143,8 @@ Every soft failure that skips real work must leave a receipt. The embed step wri
 boot, surfaced as `kgDegraded` on `GET /`, in the deploy notification, and in `get_tenant_health`
 (AII-422). See [deployment.md](deployment.md#kg-embeddings-health).
 Liveness is a second, independent signal: the boot-time probe's result is surfaced as `kgUnavailable` and
-`sidecar` on the same three reads and in the Deployments card (AII-648, AII-650). See
-[deployment.md](deployment.md#kg-sidecar-health).
+`sidecar` on the same three reads and in the Knowledge graph card on the Knowledge Graph Pipelines page
+(`/admin#kg-pipelines`; AII-648, AII-650). See [deployment.md](deployment.md#kg-sidecar-health).
 
 ### Stage 4 — Serve
 
@@ -156,7 +156,7 @@ Liveness is a second, independent signal: the boot-time probe's result is surfac
 | `rdflib` | The database. Parses `graph.trig` into a `Dataset`, flattens quads into one union `Graph`, runs SPARQL SELECT in process. |
 | `numpy` | Cosine similarity as one normalized matrix-vector product. No ANN index at this scale. |
 | `fastembed` | Embeds the **query** at request time — `BAAI/bge-small-en-v1.5`, 384 dimensions, ONNX, no torch. |
-| `requests` | Only under `KG_BACKEND=stardog`. That seam is evaluated, not committed. |
+| `requests` | Only under a remote store (`KG_BACKEND=stardog` or `stardog_run`). The store seam is committed: see ADR 050. |
 
 **Node orchestrator**, same container:
 
@@ -203,8 +203,8 @@ or these steps by hand.
 
 1. Reconcile scope in `sources.yml` (through a PR on the KG repo when it changes) — the rail runs the ingest and pushes the snapshot itself; no laptop ingest, no laptop push.
 2. **Trigger the refresh**: the `trigger_kg_refresh` MCP tool (admin role; this is what `bd-kg-refresh` calls),
-   `POST /api/kg/refresh` with an admin session token, or the Deployments page's "Refresh graph now" — all three
-   run the same handler. `202` = accepted; `409` = a refresh or a deploy is
+   `POST /api/kg/refresh` with an admin session token, or **Refresh graph now** on the Knowledge Graph
+   Pipelines page (`/admin#kg-pipelines`) — all three run the same handler. `202` = accepted; `409` = a refresh or a deploy is
    already in progress; `422` = callback not configured or credential preflight failed (see below). The orchestrator
    first runs a **credential preflight** (probing the KG write token and the installation-wide
    dependency token against every `code_repo` and `secondary_repos` slug in `sources.yml`) and
@@ -235,6 +235,7 @@ or these steps by hand.
 | `checking` | Refresh triggered; comparing snapshot SHA against last recorded |
 | `ingest-running` | Runner job dispatched; waiting for callback |
 | `snapshot-landed` | Callback received; snapshot commit verified |
+| `awaiting-decision` | A snapshot is held at the decision gate with its PR open. No run is in flight: the hold is `KgRepo` state (AII-1489). `currentRun.decisions` is `["accept", "cancel"]`, or `["cancel"]` when the hold is `acceptBlocked` |
 | `staging` | Local rail running (fetch → materialize → swap) |
 | `serving` | Rail succeeded; sidecar serving new graph |
 | `reverted` | Gate failed; rolled back to previous overlay |
@@ -245,24 +246,170 @@ blocking all future refreshes for the remainder of the 4-hour ingest TTL. A live
 dispatched a runner and received no callback within the TTL self-heals at the next `POST
 /api/kg/refresh` call.
 
+### Decision gate (AII-1248)
+
+A snapshot shrink, or a refresh that could not read tracker data, is one decision inside the same run,
+not a failed run and a second ingest. The `held` state carries a `cause`: `shrink` (a content-shrink
+rule fired) or `tracker-missing` (`kg-tracker-data` reported `fetched: false` while the cloned snapshot
+has `issue.nt` or `comment.nt`). A `tracker-missing` PR body starts with a warning line naming the
+failed teams, and `held.failedTeams` lists them. The KG Pipelines page shows `held.cause` and
+`held.failedTeams` in the current-run card, and the Accept prompt names the cause.
+
+A skipped (404, no mapping) or failed tracker team is judged by what the served snapshot already holds
+(AII-1471). `kg-snapshot-push` counts that team's issues in the **cloned** `snapshot/parts/issue.nt`
+(`git show <clonedRef>:…`, one `onto#trackerTeam "<team>"` literal per issue; the working tree's file is
+already the reduced one). A dry run ends **completed with warnings** (`guardVerdict: "warnings"`, no push)
+whenever the tracker is the only problem. A live run has two outcomes:
+
+| A skipped or failed team has served issues | Outcome |
+|---|---|
+| yes | The PR opens and the run holds (`KG_SNAPSHOT_HELD`, cause `tracker-missing`) with `acceptBlocked: true` and `lostTeams: [{ team, servedIssues }]`: accepting would publish a graph without those issues. `status.decisions` is `["cancel"]`, and `decide({ action: "accept" })` answers a 409 `accept-blocked` and leaves the run at the gate. |
+| no | The snapshot publishes through the normal gates with a warning in the PR body and `warnings` (the team names) on the outcome. |
+
+A zero count is trusted only when every `trackerTeam` literal in the served `issue.nt` is a `sources.yml`
+tracker key. A snapshot written before KGB-33 holds the identifier prefix (`"TOP"`) rather than the key
+(`topia-mobile`), so with any other literal present a zero-count team is unknown (`servedIssues: -1`) and
+counts as lost. A new team, where every literal matches a key, stays in the publish-with-warning row.
+
+A third cause, `source-failed` (AII-1474), covers any `failed` entry in `sources` whose `kind` is not
+`tracker` (`code_repo`, `secondary_repo`, `self`, `docs_site`, `ingest`). Since KGB-36 the ingest finishes
+every source it can and exits 0, and it does not roll back a source that raised, so a failed source can
+leave half-written triples in the graph. A live run opens the PR and holds with `acceptBlocked: true`
+(`decisions: ["cancel"]`, Accept answers `accept-blocked`); the failed rows are in `held.sources` and the PR
+body's warning names them. A dry run completes with `guardVerdict: "warnings"` and pushes nothing. A
+`skipped` non-tracker source stays a warning. When a tracker-missing or shrink hold is already set, that
+cause stays but Accept is blocked all the same.
+
+A fetch that failed with no team named, and a shrink, still hold with both decisions offered. A `held`
+state stored before `acceptBlocked` existed reads as unblocked.
+
+When the runner's `report` is `failureCode: "KG_SNAPSHOT_HELD"` with a `snapshotPr`, `KgRefresh` ends
+at a gate (`src/restate/kg-refresh-workflow.ts`). A held snapshot is a `KgRepo` record, not a suspended
+run (AII-1489): nothing waits during the hold, so a deploy does not wait for a person and Restate never
+replays a held journal on new code. The gate run:
+
+1. Sends `FlyMachineProfile("kg-refresh").release({ dispatchId })`: the runner has finished, so the
+   machine returns to the profile now.
+2. **Calls** `KgRepo.hold` and awaits it (a call, not a send), so the hold is stored before the run ends and
+   the `release` that `watch` sends afterwards always sees it. `KgRepo`'s exclusive handlers never call
+   `KgRefresh` synchronously, so the call cannot deadlock. The stored hold is the original trigger and
+   dispatch id, the report (snapshot PR, commit and branch, part table, `cause`, `failedTeams`,
+   `acceptBlocked`, `lostTeams`, `sources`), the runner step table, and `decideBy` (now + 24 h).
+3. **Then** writes the `dispatch_log` row `completed` / `awaiting_decision` (AII-1493), in a `ctx.run`, through a
+   guarded write (`markJobAwaitingDecision`, `src/log.ts`) that lands only on a fresh `running` row, and only
+   if `KgRepo.status` still shows the hold undecided. The hold comes first so a kill between the two leaves a
+   hold with the row still `running`, which a decision closes, instead of an `awaiting_decision` row with no hold.
+4. Returns an `awaiting_decision` outcome. It does not write `lastRefresh` or notify: the resumed run does both.
+   A Stop that arrived after the report was taken (so no run is left to read it) is forwarded as a cancel
+   through `KgRepo.decide`.
+
+`KgRepo.hold` (exclusive, ingress-private) stores `held` and sends a delayed
+`KgRepo.decide({ action: "timeout", triggerId })` at `decideBy`. **The lock stays while a hold exists:**
+`release` for the held trigger does not clear `inFlight` while `held` is set, whether it arrives before or
+after `hold` (a release that beat the hold cleared the marker, and `hold` takes the lock back), and a new
+`trigger` answers `refresh-in-progress`. `KgRepo.status` carries the hold as `held` (`snapshotPr`,
+`partTable`, `cause`, `failedTeams`, `acceptBlocked`, `lostTeams`, `sources`, `decideBy`; not the commit or
+branch), which `get_kg_status` surfaces as `currentRun.held` with `step: "decision"`.
+
+`KgRepo.decide` is the one decision door (exclusive, so two decisions never interleave). It takes
+`{ action: "accept" | "cancel" | "timeout", actor?, triggerId?, reason? }`:
+
+| Event | Answer / action |
+| -- | -- |
+| No hold, a hold already `decided`, or a `triggerId` that is not the current hold's | 409 `no-decision-open`; a `timeout` answers `null` and does nothing, so a timer from an older hold or one that fires after a decision never decides anything |
+| `accept` on a blocked hold (`acceptBlocked`) | 409 `accept-blocked`; the hold stays open |
+| `accept` | Marks the hold `decided` (it stays), calls `submit` with `resume: { hold, action: "accept", actor }`: the resumed run posts a `### Baseline` comment naming the actor, then runs the normal merge, delete-branch and fetch/stage/swap/verify gates |
+| `cancel` | Marks the hold `decided`, resumes with `cancel`: closes the PR (gate `operator_cancelled`), closes the row, releases |
+| `cancel` with `reason: "superseded_by_schedule"` | Same, with the PR closed under gate `superseded_by_schedule`; the run's classification stays `operator_cancelled` |
+| `timeout` for the current hold (24 h, `KG_REFRESH_DECISION_TIMEOUT_MS`, fixed, no setting) | Resumes with `timeout`: closes the PR (gate `decision_timeout`), closes the row, releases |
+
+**The hold lives until the run that acts on it ends (AII-1493).** `decide` does not clear `held`: it records
+`decided: { action, triggerId }` on it, and `status` reports no open decisions (`held: null`) while `decided` is
+set. `watch` tells `release` how the run ended: `ended: "returned"` when `attach` resolves (any outcome, a Restate
+cancel included), `"killed"` when `attach` throws. The run's own `finally` sends no `ended`, read as `returned`.
+For the resumed trigger, `release` does this:
+
+| `ended` | Effect |
+| -- | -- |
+| `returned` (or absent) | Clears `held`, then `clearAndDrain` frees the lock and submits a queued dry-run, as before |
+| `killed` | Clears `decided` (the hold is open again), puts the marker back on the hold's own trigger (lock kept) and arms a timeout at `decideBy` (delay 0 if past). The operator can decide again; a repeated kill repeats this |
+
+`watch` reads the ended run's `KgRefresh.status` first. A run past its commit point (`committed`, AII-1296) counts as
+`returned` even if killed: the snapshot PR may already be merged, so nothing reopens and there is no second merge.
+A failed read errs the same way. A kill of the gate run itself leaves the hold, since `clearAndDrain` skips a held
+trigger. The resumed run's first step takes the row back (`reopenHeldJob`): `completed` / `awaiting_decision`
+becomes `running`, stamped `resumed`, a plain conditional write with none of `updateJobStatus`'s terminal side
+effects. A row therefore reads `awaiting_decision` only while a hold is open and undecided. The stamp also
+makes the gate's guarded write a no-op if it was parked while the decision was made. A killed resumed run leaves its
+row `running`, like any other killed run; the next decision closes it once.
+
+`decide` returns the resumed run's `triggerId`. `submit` replaces the `inFlight` marker with the resumed run's
+and starts its `watch`, so the lock follows the new run, and a late `release` from the gate run (its marker no
+longer matches) does nothing. `KgRefresh.run` with `resume` skips the dispatch and the runner wait. It rebuilds
+the held PR and step table from the hold, uses the hold's dispatch id for the row, `lastRefresh` and the
+notification (its own key is only the workflow key and `KgRepo` trigger id), and goes straight to the accept
+note and `mergeAndRunGates`, or to `cleanupCancelled`, or to the timeout close. The commit point, `past-merge`,
+the schedule supersede and `status` are the ordinary ones, because it is a normal `KgRefresh` run. The
+workflow no longer has a `decide` handler.
+
+The `decide_kg_refresh` tool (admin) calls `KgRepo.decide` with the caller's email as `actor`. It takes an
+optional `triggerId`; the KG page passes the trigger of the hold it shows, so a stale page cannot decide a
+newer hold, and a named hold that is gone answers `no-decision-open` without falling back. With no `triggerId`
+and no hold open, `accept` answers `no-decision-open`, and `cancel` re-reads `KgRepo.status` and sends the
+`cancel` signal to the run now in flight (the resumed run after an accept, answering `past-merge` once it is
+past the commit point). If that signal answers 409 or 404 because the gate run stored its hold and ended in
+between, it reads `KgRepo.status` once more and cancels a hold it finds through `KgRepo.decide`. A second accept answers `no-decision-open` (the hold is marked decided, not gone). The pipeline schedule
+reads the hold from `KgRepo.status` (`busy`) and replaces its own held run with
+`KgRepo.decide({ action: "cancel", triggerId, reason: "superseded_by_schedule" })`; after an accept there is no
+hold, so the schedule never replaces a run a person accepted.
+
+A Stop that lands near the gate goes through the same door. Once the gate run's `step` is `held`, the workflow
+`cancel` handler also sends `KgRepo.decide({ action: "cancel", triggerId })`, and the run reads a Stop that arrived
+earlier from its `cancel` promise right after `hold`. The tool's no-`triggerId` cancel does the same when
+`KgRepo.status` shows a hold. A lost lock (`hold` answers `lock-lost`) is a workflow error, not a cancel.
+
+A held dry-run never reaches the gate. Any other report takes the unchanged success or failure paths; a
+`KG_SNAPSHOT_HELD` report with no `snapshotPr` takes the failure path.
+
+**Deploy order (AII-1489).** Ship when no refresh is held: `get_kg_status` stage is not `awaiting-decision`. A
+run held on the old code is a suspended `KgRefresh.run` with no `KgRepo` hold, and it cannot replay into the new
+gate. A hold created by this code must be decided before a revert. After the deploy a hold costs the drain
+nothing, and `decide_kg_refresh` is still one of the two tools the deploy hold lets through. **Refresh graph
+now** stays refused.
+
+The page's Stop route sends the workflow's `cancel` and returns its answer. On 200 it writes nothing and destroys nothing (the workflow stops the machine and closes the row; the notice says "stop requested"). On 409 `no-refresh-in-flight` it stamps `failed` / `operator_cancelled` once, because no workflow will. Any other answer (`past-merge`, 503) is returned unchanged and the row is left alone. The route writes a refresh row only when no workflow will; the other writers are the workflow (`closeJobLog`, `cleanupCancelled`) and the reaper's max-age sweep (`src/reaper.ts`), which also writes `timed_out`.
+
+**The start of the merge is the point of no return (AII-1296).** The merge cannot be undone (GitHub answers 405 on a merged PR), and a run that stopped after it would leave the repo snapshot and the served graph different. Two rules follow:
+
+1. **Before the merge starts, a cancel stops the run and closes the PR.** A Restate cancel of the `run` invocation (from the Restate UI or the admin API) does the full cleanup at every step, including the decision gate, through the same function as the `cancel` signal (`cleanupCancelled`): cancel the GitHub run and stop the machine while the runner has not yet reported, close the held snapshot PR (`operator_cancelled`), run the failure path without a notification, and close the row. It logs `[KgRefresh] cancelled by Restate at step <step>`, and each step is best effort. At the gate the run has handed the hold to `KgRepo` and is about to end, so a cancel that landed during `close-row-held` or the `hold` call is seen by one cancel-arm race right after `hold` returns: the run then sends `KgRepo.decide { action: "cancel", triggerId }`, and the resumed run closes the PR and the row once. `run` sends the `KgRepo` and `FlyMachineProfile` releases from one `finally` on every exit except a suspension.
+2. **After the merge starts, the run finishes.** The merge, the gates, `persist`, `close-row` and `outcome` run to the end. A `cancel` signal answers 409 `past-merge`, and the `decide_kg_refresh` tool passes that through as the error `past-merge` when its fallback cancel reaches a run past the merge (`KgRepo.decide { action: "cancel" }` itself answers `no-decision-open` when no hold is open), and a Restate cancel has no effect: the invocation ends `succeeded` and `lastRefresh` shows the result. A Restate-UI cancel cannot answer `past-merge`, because the admin API accepts every cancel.
+
+How it works: `run` is registered with `explicitCancellation: true`, so Restate never throws at a pending await or interrupts a `ctx.run` step. The run sees a Restate cancel only where it races a cancel arm (`ctx.cancellation()`, passed to `awaitOwnedRun` as `cancelArm`, plus a 1 ms check before the dispatch and one at the commit point); the arm throws a 409 that reaches the outer catch and `cleanupCancelled("restate")`. The commit point is the start of `mergeAndRunGates`: after the cancel check, `run` resolves its own `cancel` promise with the reserved value `COMMITTED` (the `cancel` handler refuses it as a reason). The durable promise decides: the first of that write and an operator cancel wins. If the operator won, `run` reads the operator's reason and takes `cleanupCancelled("signal")`; nothing is merged. The operator's reason, `superseded_by_schedule` included, goes to the gate close. If `run` won, it records a durable `committed` state key, and the `cancel` handler reads that key first, then peeks `COMMITTED`, and answers `past-merge`. After this point nothing races the cancel arm.
+
+| Cancelled while | Cleanup |
+| -- | -- |
+| `reserve` / `dispatch` (no run id) | row closed, released; no stop call |
+| `await-progress` (GitHub run known) | run cancelled, row closed, released |
+| `await-progress` (Fly) | machine stopped, row closed, released |
+| held (a `KgRepo` record, no run) | `KgRepo.decide` cancel or timeout: a new run closes the PR and the row and releases |
+| accepted, before the merge starts (the baseline note) | PR closed, row `operator_cancelled`, released; no merge |
+| `merge` / gates and after | no cleanup: the run finishes; the cancel answers `past-merge` |
+
+The journal shape changed in AII-1296 (the cancel arm in the races, the pre-dispatch and commit-point sleeps, the commit resolve), so deploy and revert only with no refresh in flight.
+
+
 ### Dry run (AII-632)
 
-`trigger_kg_refresh { dryRun: true }` (the MCP tool, admin role) dispatches the same runner job
-as a normal trigger, with the push skipped: every guard in `kg-snapshot-push` still runs against
-the freshly ingested snapshot, but nothing is committed or pushed. The verdict and the per-part
-line-count table land on `get_kg_status` as `lastRefresh.dryRun`, `lastRefresh.detail`
-(`"dry-run: guard passed: ..."` / `"dry-run: guard refused: ..."` / `"dry-run: failed: ..."`), and
-`lastRefresh.partTable`. `servedStamp` and `current/` never change, and `stage` is restored to
-whatever it held before the dispatch rather than advancing through `staging`/`serving`/`reverted`.
-A dry-run and a real run of the same KG head print the same part table. The same dry-run is
-reachable from the admin REST route, `POST /api/kg/refresh` with body `{ "dryRun": true }` (the
-response echoes `dryRun` beside the trigger's fields; no body is the unchanged real refresh), and
-from the Deployments page's **Dry-run refresh** button beside **Refresh graph now** (AII-635). When
-the last terminal outcome was a dry-run, the Knowledge graph card shows its verdict and the
-per-part table (`part | previous | new | delta`). A guard refusal carries the same
-`lastRefresh.partTable` and a part-naming `detail` on `get_kg_status` whether it came from a
-dry-run or a real (non-dry-run) refresh (AII-638) — only a real success omits `guardVerdict`/
-`partTable`, since it reports a snapshot commit instead.
+The admin dry run is removed: `trigger_kg_refresh` and `POST /api/kg/refresh` refuse `dryRun: true`
+with `option-removed` (a held run at the decision gate is the preview). The only dry run left is the
+KG-repo PR check below: the same runner job with the push skipped, so every guard in
+`kg-snapshot-push` still runs against the freshly ingested snapshot but nothing is committed or
+pushed. `servedStamp` and `current/` never change, and `stage` is restored to whatever it held before
+the dispatch. A dry-run and a real run of the same KG head print the same part table. A dry-run never
+writes `lastRefresh` (it reports through the PR check's sticky comment instead). A guard refusal on a
+real (non-dry-run) refresh carries `lastRefresh.partTable` and a part-naming `detail` on
+`get_kg_status` (AII-638) — only a real success omits `guardVerdict`/`partTable`, since it reports a
+snapshot commit instead.
 
 **Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
 than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
@@ -285,42 +432,45 @@ reloadable on its own; here it rides a release, so the release has to be sequenc
 ### PR check (AII-633)
 
 A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**` on the bound KG
-source repo (`kg.sourceRepo` in the `get_project_binding` answer) or the configured base template repo (Settings → KG Refresh · "Base
-template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `kg-upstream/*` or
-`sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
-gets the same dry run described above run against the PR's head instead of the default branch: the
-webhook (`opened` / `synchronize`) dispatches `trigger({ dryRun: true, ref: <head branch>, report })`,
-which runs `kg-snapshot-push`'s guards without committing or pushing, exactly as a manual dry run
-does. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
+source repo (`kg.sourceRepo` in the `get_project_binding` answer), or whose head branch matches
+`kg-upstream/*` or `sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it
+happens to touch), gets the same dry run described above run against the PR's head instead of the
+default branch: the webhook (`opened` / `synchronize`) dispatches
+`trigger({ dryRun: true, ref: <head branch>, report })`, which runs `kg-snapshot-push`'s guards
+without committing or pushing.
+
+A PR on the base template repo (Settings → KG Refresh · "Base template repo", seeded once from
+`KG_BASE_REPO`) is **skipped**: the webhook answers `{ ignored: true, reason: "base_repo_pr" }`, enqueues
+nothing, and posts no status or comment. The dry run dispatches the source repo's workflow at the PR's
+head branch, and that branch exists only in the base repo, so the dispatch can never succeed. Base
+changes get their dry run one step later, on the source repo's upstream-merge PR (`kg-upstream/*`,
+`sync/upstream-*`). A repo configured as both source and base is treated as the source. A rejected
+dispatch ends the run `dispatch_rejected` with `dispatch was rejected: <reason>`, and that text
+reaches the sticky comment and the commit status description.
+
+A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
 all.
 
 The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in
-place (not duplicated) on every subsequent push, carrying the same per-part line-count table
-`get_kg_status` shows for a manual dry run. A `kg-refresh/dry-run` **commit status** is set alongside
+place (not duplicated) on every subsequent push, carrying the per-part line-count table
+the runner prints. A `kg-refresh/dry-run` **commit status** is set alongside
 it, but only when the GitHub App has been granted `statuses: write` on the PR's repo — see "Manual
 step" below. Losing that grant degrades the check to comment-only; it never blocks the dispatch or
 the PR.
 
-The `accept-baseline` label changes only what the comment says, never what the guard decides: applying
-it to a PR whose dry run refused a tracker-file shrink changes the report's wording to "refused,
-accepted by label" (and, symmetrically, the commit status to success) without re-running anything —
-a `labeled` webhook event just re-posts the last computed verdict. Removing the label (`unlabeled`,
-AII-640) re-posts the same verdict with the plain refusal wording and the status back to failure;
-the check forces `acceptBaseline: false` on `unlabeled` rather than reading the payload's `labels`
-array, which GitHub does not guarantee to reflect the removal by delivery time. Both events act only
-on the `accept-baseline` label itself. The label is **report-only**. It
-is a distinct mechanism from an admin accepting a new baseline at refresh time (AII-628): a real
-refresh against that same source still refuses the shrink unless that refresh-time acceptance has
-happened. Treat the label as "we've seen this and it's expected," not as a bypass.
+A refused tracker-file shrink fails the commit status and the comment says so. There is no PR label that accepts it: a shrink is accepted at the decision gate of the refresh that runs after the PR merges, so the dry-run never decides on the baseline.
 
-Outcomes are stored per PR, keyed by `repo#prNumber` and pinned to the head sha they ran against
-(AII-636), so a `labeled` re-report can only ever surface that PR's own verdict — never another PR's
-— and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`),
-evicted immediately on PR close, and persisted as one JSON blob under the `kg_refresh_dry_run_outcomes`
-settings key on every record and eviction, so a restart between a dry run and a later `labeled` /
-`unlabeled` event still finds the outcome (AII-640). A webhook head queued behind a 409 is woken by
-`onRefreshSettled` on every `running → false` transition, not only a dry-run's — a real refresh, a
-failure, a revert, TTL expiry, or a deploy hold clearing all wake it.
+The PR check is a commit status and its sticky comment on the PR's own head SHA, posted by the workflow's
+`dry-run-report` step; nothing is stored or read back, so each report carries only that PR's own verdict
+(AII-636, AII-977). `forgetPr` on PR close drops any held head. The old `kg_refresh_dry_run_outcomes`
+settings row is deleted at boot. `KgRepo.recordDryRunOutcome` is a no-op kept until 2026-11-13 for the
+send that a dry-run workflow in flight at deploy has journaled. The webhook keeps no sha dedup: the delivery id is
+the `enqueueDryRun` idempotency key, and the object keeps one `sha:<repo>#<pr>` state key holding the
+last head sha it accepted for the PR — a second event for that sha (any delivery id) returns
+`{ duplicate: true }`, neither submitting nor queuing, and the webhook answers 200. `forgetPr` clears the key. A PR dry-run queued behind a
+running refresh is held in the `KgRepo` object's `pending` state and submitted by its `release`
+handler when the in-flight refresh lets go — a real refresh, a failure, a revert, or a stale marker
+clearing all release it.
 
 **Manual step — granting the status.** The commit status needs the GitHub App to hold the
 **Commit statuses: Read and write** repository permission. GitHub App permissions live on the App
@@ -341,9 +491,10 @@ installation accepts it — so this is two clicks by an org owner, not a per-rep
 
 This is not requestable through code, and there is no way to detect the gap from inside the PR
 itself. Until granted, the sticky comment is the only signal; nothing errors or blocks in the
-meantime. The preflight's `statuses:write` rows probe this grant against the same two repos the
-webhook actually posts to — the KG source repo, and whichever repo is configured as "Base template
-repo" (see the note on the two "base repo" notions below), not sources.yml's `base_repo:`. The
+meantime. The preflight's `statuses:write` rows probe this grant on the KG source repo, which the
+webhook posts to, and on whichever repo is configured as "Base template repo" (see the note on the
+two "base repo" notions below), not sources.yml's `base_repo:`. The webhook skips PRs on the base
+repo (see above), so the base row is advisory only and kept for settings that read it. The
 "Base template repo" field is seeded once from `KG_BASE_REPO` on first boot; a deployment that
 never set that variable has an empty field and must set it by hand under Settings → KG Refresh
 (the preflight then falls back to sources.yml's `base_repo:` for its probe until it is set).
@@ -352,8 +503,8 @@ never set that variable has an empty field and must set it by hand under Setting
 by itself it is advisory and a PR can be merged straight through it regardless of the guard's verdict.
 The ticket's "required check" only exists once a repo admin adds `kg-refresh/dry-run` as a required
 context in that repo's branch protection settings (Settings → Branches → Branch protection rule →
-"Require status checks to pass" → add `kg-refresh/dry-run`), on both the KG source repo and the base
-template repo. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
+"Require status checks to pass" → add `kg-refresh/dry-run`), on the KG source repo. The base
+template repo gets no `kg-refresh/dry-run` status, since the webhook skips its PRs. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
 — it stays a one-time, per-repo manual step alongside the App's **Commit statuses: Read and write** permission (`statuses: write` in API terms) described above. Until that step is
 done on a given repo, `kg-refresh/dry-run` is informational only there, no matter how the guard votes.
 
@@ -378,6 +529,28 @@ repo or team decommissioned on the orchestrator side stays in `sources.yml` unti
 prunes it by hand) and **never touches `docs_sites` or `code_repo`'s `docs_url`** — doc roots stay
 entirely operator-owned, maintained through `bd-mega-kg-refresh` rather than this rail. A refresh
 with nothing to add logs `scope in sync` and leaves the file byte-for-byte unchanged.
+
+### Where to watch a refresh
+
+`/admin#kg-pipelines` (admin only) shows one Knowledge graph card above a table of kg-refresh runs, which
+is the dispatch log filtered to `phase: kg-refresh`, with Logs and Stop on each row (rows are reference
+only; they carry no decision buttons). The card renders `GET /api/kg/status` and shows the one current run:
+
+| `currentRun` | Card shows |
+|---|---|
+| `null` | The served stamp, the last outcome line, **Refresh graph now** |
+| set, no open decision | "Run in flight: <step>" and **Cancel** |
+| set, `accept` open (`awaiting-decision`) | "Held for a decision until <decideBy>", the part table (part / previous / new / delta), a link to the held PR, **Accept new baseline & refresh** and **Cancel** |
+
+Both decision buttons ask `confirm()` and post `{ args: { action, triggerId } }` to `/api/tools/decide_kg_refresh`
+when a hold is shown (`triggerId` is that hold's), so a decision acts only on that hold; a
+`no-decision-open` answer (the hold is gone or replaced) is shown in the page's message box. If the status call fails the card is hidden
+and offers no action. The same runs also appear on the Pipelines page with the `kg` badge, because that
+page is the complete dispatch log. Deployments keeps only the deploy-side signals: the drain tile counts an
+in-flight KG ingest run (a held refresh is not one: it is `KgRepo` state plus a delayed `decide` message, so it does
+not hold a deploy, `waitForQuiet` ignores its `completed` / `awaiting_decision` row, and the endpoint drain does not
+count the scheduled timer), and a release whose sidecar does not serve records "Released, but the knowledge
+graph is not serving".
 
 ## Refresh rail implementation (AII-426, AII-495)
 
@@ -434,7 +607,7 @@ flowchart TD
 
 ### Two materialize paths (AII-599)
 
-`KG_MATERIALIZE_DIRECT=true` switches the refresh rail to the base repo's low-memory `--direct`
+The materialize-direct setting (seeded by `KG_MATERIALIZE_DIRECT=true` on first boot) switches the refresh rail to the base repo's low-memory `--direct`
 path (KGB-15, base PR #34), gated behind the flag because it requires the configured
 `KG_SOURCE_REPO` derivative to already carry that base change — an image whose venv predates it
 fails the materialize step and the rail reverts safely, same as any other staging failure.
@@ -456,77 +629,75 @@ could not hold on 2026-09-08 with the rdflib path (see the Failure history table
 figure above remains the committed setting, but the direct path is what would let that incident's
 fix be reverted instead of the memory bump.
 
-**The flag is a seed, not the only control (AII-602).** `KG_MATERIALIZE_DIRECT` resolves through
-the same `db | env | default` precedence as `RUNNER_MODE` (`getKgMaterializeDirect()` /
-`setKgMaterializeDirect()` in `src/runner-mode.ts`): the env var wins outright when set, else the
-`settings` table row, else `false` (rdflib). `materializeDirectEnabled()` in `src/kg-refresh.ts`
-reads the resolved setting rather than `process.env` directly. The Deployments page
-(`/admin#deployments`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
-now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row; while the env var is set,
-the control is disabled and the write comes back `409`, same as the `RUNNER_MODE` /
-`FLY_PROCESS_LEVEL_SECRETS` pattern on the Runners page. The toggle only affects the *next*
+**The flag is a seed-once setting (AII-602, AII-1109).** `KG_MATERIALIZE_DIRECT` is read only at
+boot by `seedSettingsFromEnv()`, from its `SEED_ONCE_SETTINGS` entry (`src/seed-once-settings.ts`), which writes the `settings` row
+when none exists and is inert afterward. `getKgMaterializeDirect()` / `setKgMaterializeDirect()`
+resolve the stored row, else `false` (rdflib); the env var is never consulted at runtime. `materializeDirectEnabled()` in `src/kg-refresh.ts`
+reads the resolved setting rather than `process.env` directly. The Knowledge Graph Pipelines page
+(`/admin#kg-pipelines`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
+now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row, which is the only
+runtime control. The toggle only affects the *next*
 refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
 MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
 
-### Dry-run plumbing (AII-632)
+### Per-source results (AII-1470)
 
-The dry-run flag travels the same envelope path as every other kg-refresh setting: `trigger(opts)`
-sets `kgDryRun: true` on the `RunConfigV1` it builds (the pattern `kgSourceRepo` already follows),
-and `kg-refresh-run.ts`'s `resolveKgRefreshInputs` decodes it, OR'd with the existing
-`AI_IMPLEMENT_KG_DRY_RUN` env var so the dev harness's `--phase kg-refresh` path (which sets the
-env var directly, with no envelope) keeps working unchanged. `kg-snapshot-push.ts` returns
-`guardVerdict` and `partTable` in its step output on both the success path and, via
-`KgSnapshotTrackerRegressionError.partTable`, on a guard refusal — the guard still throws on
-refusal; dry-run only adds structured reporting on top of the existing throw-based contract. The
-runner's callback body carries both fields back to the orchestrator (`RunnerResultBody.guardVerdict`
-/ `.partTable`), and `handleRunnerResult` forwards them verbatim into
-`onKgRefreshRunnerComplete`. `onRunnerComplete` in `src/kg-refresh.ts` branches on a dispatch-time
-dry-run flag: it skips `runRefreshAndSettle()` entirely, restores `stage` to the value captured
-before the dispatch, and builds `lastRefresh.detail` from `data.guardVerdict` — `"refused"` yields
-`"dry-run: guard refused: ..."`, a clean success yields `"dry-run: guard passed: no shrink"`, and a
-runner failure that never reached the guard (clone, ingest, callback) yields
-`"dry-run: failed: ..."` rather than being mislabeled as a guard refusal. The dry-run flag and the
-pre-dispatch stage are written into the same persisted stage envelope as `dispatchId`/`jobId` (not
-kept only in memory), so a callback arriving after an orchestrator restart mid-`ingest-running` is
-still recognized and handled as a dry run instead of falling through to the real staging rail.
+A refresh reports one result per source: `source`, `kind`, `status` (`success` / `skipped` /
+`failed`), `reason`, and `counts`. The type and the defensive parser are in `src/kg-source-results.ts`.
+Two steps supply the rows and `kg-snapshot-push` merges them:
 
-### Accept-new-baseline plumbing (AII-628)
+| Part | Produced by | Rows |
+|---|---|---|
+| Tracker | `kg-tracker-data` output `teamResults` | one `tracker:<team>` row per team in `sources.yml`: `success` with `counts.issues`, `skipped` (reason `no mapping`, a 404), or `failed` (reason the HTTP status or `error: …`). With no teams at all, one `skipped` row, reason `no trackers in sources.yml`. A 401/403 aborts the step, so those teams have no row |
+| Ingest | `kg-ingest` output `sourceResults`, read from `ai-output/source-results.json` | code repo, secondary repos, self-ingest, docs sites. The file is written by the KG repo's ingest and is optional: when it is absent or unparseable the output is `[]` (one log line) and malformed entries are dropped |
 
-`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role), `POST /api/kg/refresh`
-with body `{ "acceptNewBaseline": true }`, and the Deployments page's **Accept new baseline &
-refresh** button (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
-refresh** — deliberately not a third argument to the existing refresh button, so accepting a shrink
-is always a distinct, deliberate click after reading the guard table, never the default path) all
-carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
-sets `kgAcceptNewBaseline: true` on the `RunConfigV1` it builds, along with `kgBaselineActor` (the
-caller's email — from `identity.email` on the MCP path, from the admin session on the REST path) —
-`resolveKgRefreshInputs` in `kg-refresh-run.ts` decodes both back out and puts them on
-`PipelineContextData` as `kgAcceptNewBaseline`/`kgBaselineActor`, and `pipeline-loader.ts` forwards
-them into `kg-snapshot-push`'s `acceptNewBaseline`/`baselineActor` inputs, the same shape as
-`kgDryRun`/`dryRun`.
+For the same `source`, the tracker row wins, because the tracker step is the only place that saw the
+fetch. The merged list is `sources` in the `kg-snapshot-push` output and in `KgSnapshotHeldError`. It is
+rendered as the "Sources" table in the refresh report (the PR body, or the dry-run log), and travels
+the way `failedTeams` does: `kg-refresh-run.ts` → `postRunnerResult` → `runner-callback.ts` →
+`KgRefresh.report`. The workflow stores it on the outcome and returns it on `status` (`sources`), and on
+`status.held.sources` while the run waits at the decision gate. Only success, dry-run, and held reports
+carry it; other failures send none. A runner that predates the field sends none and reads as `[]`.
 
-**The actor rides the envelope because the guard runs inside the runner, not the orchestrator.**
-`dryRun` never needed to attribute anything to a person; this flag does, and the code that decides
-whether to push (and writes the refresh PR body) runs in the dispatched container, a separate
-process from whichever door the operator called.
+### Held-verdict plumbing (AII-1253, AII-1264)
 
-Inside `kg-snapshot-push.ts`, guard 0b's regressions split into two classes: a part missing
-entirely is a **hard regression** and always refuses, flag or not; a part shrinking (the zero-shrink
-rule or the general 50% rule) is a **soft regression** — when `acceptNewBaseline` is set, these are
-logged (`[kg-refresh] baseline accepted by <email>`) and the run proceeds instead of throwing. The
-per-part table already prints unconditionally before either check fires, so an accepted run's table
-looks identical to a refused one; only the guard verdict and the new `### Baseline` section in the
-refresh report (which becomes the PR body on a real push, or is printed on a dry run) distinguish
-them. Guard 0 (the `fetched=false` tracker-regression check, a different failure — the tracker
-fetch itself failed, not a content reclassification) is never overridden by this flag.
+The run envelope carries one guard-related flag, `kgDryRun`, and it is set only by the KG-repo PR
+check: `buildKgRefreshRunConfig` writes `kgDryRun: true` (the pattern `kgSourceRepo` and
+`kgSourceRef` follow), and `resolveKgRefreshInputs` in `kg-refresh-run.ts` decodes it, OR'd with the
+`AI_IMPLEMENT_KG_DRY_RUN` env var so the dev harness's `--phase kg-refresh` path (which sets the env
+var directly, with no envelope) keeps working. `pipeline-loader.ts` forwards it into
+`kg-snapshot-push`'s `dryRun` input. There is no trigger-time accept: the envelope has no
+`kgAcceptNewBaseline` or `kgBaselineActor`, `trigger_kg_refresh` and `POST /api/kg/refresh` refuse
+`dryRun: true` and `acceptNewBaseline: true` with `option-removed`, and a decoder drops those keys from
+an envelope written by an older orchestrator. The `KgRefresh` and `KgRepo.trigger` options schema still
+tolerates `acceptNewBaseline` (optional, ignored) for inputs queued or journaled before the removal.
+An accept travels in `KgRepo.decide`, whose `actor` the resumed run's PR note and log line name.
 
-**The flag is never persisted** (unlike `dryRun`, which is written into the same stage envelope as
-`dispatchId`/`jobId` so a callback arriving after an orchestrator restart is still recognized as a
-dry run). `acceptNewBaseline` only changes runner-side guard evaluation inside the one dispatched
-job; there is no "callback arrives after restart and needs reclassifying" case for it, because the
-orchestrator's own handling of the callback (success or failure) does not change based on whether a
-shrink was accepted — only the pushed content and the PR body do, and those are already decided by
-the time the callback lands.
+`kg-snapshot-push.ts` returns `guardVerdict` and `partTable` in its step output on the success path and,
+via `KgSnapshotTrackerRegressionError.partTable`, on a hard guard refusal. The runner's callback body
+carries both back (`RunnerResultBody.guardVerdict` / `.partTable`), and `handleRunnerResult` forwards them
+to the workflow. A held error also carries `cause` and `failedTeams`, which travel the same way into the
+`held` state. Guard 0b's regressions split into two classes:
+
+| Case | Push and PR | Report |
+|---|---|---|
+| No regression | yes | success |
+| Hard regression (a part missing), with or without soft | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table, no `snapshot*` fields |
+| A file under `snapshot/` over 95 MB (size check, runs before guard 0, so a dry run reports it too) | no | failure `KG_SNAPSHOT_FILE_TOO_LARGE`, no commit or push |
+| Soft only (zero-shrink or 50% rule) | yes | failure `KG_SNAPSHOT_HELD`, `guardVerdict: "held"`, part table, `snapshotPr`/`snapshotCommit`/`snapshotBranch` |
+| Guard 0 (tracker fetch failed, tracker part in the clone), real run | yes | failure `KG_SNAPSHOT_HELD`, `cause: "tracker-missing"`, `failedTeams`, part table; a missing or smaller `issue.nt` / `comment.nt` is held, any other missing part is hard |
+| Dry run (PR check), tracker data only: skipped or failed teams, missing tracker parts | no | completes with warnings (`guardVerdict: "warnings"`), never `held`; the report carries the guard table, the Sources table and the warnings |
+| Dry run (PR check), hard regression, or a soft shrink that tracker data does not explain (non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost team explains) | no | failure `KG_SNAPSHOT_TRACKER_REGRESSION`, `guardVerdict: "refused"`, part table |
+
+A held run commits, pushes `kg-refresh/<stamp>` and opens the PR (body: `Guard verdict: held — a shrink
+waits for an operator decision`; for `tracker-missing`, the body starts with a `⚠️` line naming the
+failed teams), then throws `KgSnapshotHeldError`. It is never reported as `success`;
+`KgRefresh` stops at the [decision gate](#decision-gate-aii-1248) on it.
+
+A PR-check dry run takes the workflow's dry-run branch: it never writes `lastRefresh`, never reaches the
+gate, and reports through the PR check's sticky comment and commit status. `servedStamp` and `current/`
+never change. A guard refusal on a real refresh carries `lastRefresh.partTable` and a part-naming
+`detail` on `get_kg_status` (AII-638).
 
 ### The `index.ts` budget
 
@@ -535,7 +706,7 @@ a route only through `handleAdminRequest` → `AdminDeps` → `index.ts`, and an
 else would mean a new public surface and a new credential. The design is therefore a budget,
 not an absence — `index.ts` gains exactly **one config field, one supervisor construction, one
 `main()` lifecycle hook, and one `AdminDeps` entry**. All logic lives in injected-dependency
-modules (`src/kg-sidecar.ts`, `src/kg-refresh.ts`), built in the `makeStartDeploy` shape from
+modules (`src/kg-sidecar.ts`, `src/kg-refresh.ts`), built as injected-dependency factories from
 the start. No new top-level function, no new route branch.
 
 ### Invariants the refresh must hold
@@ -566,7 +737,7 @@ deleted `snapshot/parts/pr.nt`. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
-`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker.
+`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker. A KG refresh goes to Fly Machines in every runner mode except `local` (local Docker); with no Fly sessions app configured the dispatch step fails and the run ends `dispatch_rejected` (the GitHub Actions fallback is AII-1110). The machine size comes from the `FlyMachineProfile` object under key `kg-refresh`, which the `KgRefresh` workflow reads once, journaled, before its `dispatch` step, so a replay reuses the same size. The default is 2 performance CPUs / 8192 MB; an admin changes it with `set_fly_machine_profile` or from the KG Pipelines page (the same `kg-refresh` profile), and `get_kg_status` reports it as `flyMachine` (`{ ...config, source }`, `source` `profile` or `default`). The mapping's `machineCpus` / `machineMemoryMb` size issue runs only, not a KG run.
 When the runner completes, it calls `POST /api/runner/result` which routes to `onRunnerComplete` in
 `src/kg-refresh.ts`. If a `snapshotCommit` SHA is included, the orchestrator verifies the commit is
 visible via the GitHub API (one retry for git-cache lag) before starting the local staging rail.
@@ -597,31 +768,54 @@ GitHub token; it never pushes.
 
 The snapshot push step (`src/pipeline/steps/kg-snapshot-push.ts`) calls `refreshRunnerGithubCredentials`
 immediately before the push — the same pattern as `push.ts`. In Fly/local-docker mode this re-mints
-a fresh token via the machine nonce; in GHA mode it is a no-op (no publication token for kg-refresh)
-and the dispatch-time `GITHUB_TOKEN` is used directly.
+a fresh token via the machine nonce; in GHA mode it exchanges the run's single-use publication
+credential (`getPublicationCredential()`, dispatched as `run_publication_token`) for a fresh token, so an
+ingest that outlasts the ~1 h dispatch-time `GITHUB_TOKEN` still pushes. No earlier kg-refresh step
+exchanges that credential, and a dry run returns before reading it. The push, PR open and PR comment all
+use the refreshed token.
 
 **Snapshot push contract — content-based, not flag-based.** `kg-snapshot-push` judges the
 snapshot by comparing the working tree's `snapshot/parts/*.nt` line counts against the cloned
 HEAD before committing. The push is refused with `KG_SNAPSHOT_TRACKER_REGRESSION` if any of the
-following hold:
+following hold. Rules apply per **logical part**: a piece `<part>.<NN>.nt` (a part the KGB
+export split to stay under GitHub's file limit) counts toward `<part>.nt`, and line counts are
+summed over the pieces on both sides, so a part that changes from one file to several pieces, or
+back, is not "missing". The part table lists logical parts. The tracker rules and the lost-team
+count read every `issue` / `comment` piece.
 
 | Rule | Condition |
 |---|---|
-| Missing part | A part file present in the previous snapshot is absent from the working tree |
+| Missing part | A part file present in the previous snapshot is absent from the working tree. Hard, except `issue.nt` / `comment.nt` when tracker data is missing (`fetched=false`), which hold |
 | General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
 | `issue.nt` / `comment.nt` zero-shrink | `issue.nt` or `comment.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
 
-The general-shrink and zero-shrink rules — but never the missing-part rule, nor the separate
-`fetched=false` tracker guard above them — can be overridden for one dispatch with
-`acceptNewBaseline` (AII-628, below): an intentional change in what the ingest emits (a base-repo
-classification change, for example) also shrinks these files, and the guard has no way to
-distinguish that from data loss on its own.
+The general-shrink and zero-shrink rules hold the run at the decision gate rather than failing it.
+So does `fetched=false` with tracker parts in the cloned snapshot (cause `tracker-missing`): there a
+missing or smaller `issue.nt` / `comment.nt` counts as held too. Any other missing part, and a
+missing tracker part when `fetched=true`, stays a hard refusal, since a part that vanishes for
+another reason is an ingest defect and holding it would invite an operator to accept a broken graph.
+A dry run pushes nothing and has no PR to hold, so a tracker-data problem alone (skipped or failed
+teams, missing tracker parts) completes it with warnings. A hard regression, or a soft shrink that
+tracker data does not explain (a non-tracker zero-shrink or 50% rule, a tracker-file shrink no lost
+team explains), still refuses it with `KG_SNAPSHOT_TRACKER_REGRESSION`. See
+[Held-verdict plumbing](#held-verdict-plumbing-aii-1253-aii-1264).
+
+For a shrink, an intentional change in what the ingest emits (a base-repo classification change, for
+example) also shrinks these files, and the guard cannot tell that from data loss on its own, so an
+operator decides.
+
+**Size check (`KG_SNAPSHOT_FILE_TOO_LARGE`).** Before any guard, and before the dry-run exit, the step
+scans every file under `snapshot/` (parts, `embeddings.npz`, anything nested). A file over 95 MB (a
+margin under GitHub's 100 MB per-file limit) fails the run with `KG_SNAPSHOT_FILE_TOO_LARGE`, the
+message naming each file and its size and telling the operator to update the KG repo to a KGB version
+that splits parts. Nothing is committed or pushed.
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a
-tracker-enriched graph) is a separate, prior guard; both must pass before a commit is made.
+tracker-enriched graph) runs first; it marks the run held rather than throwing, and the part
+comparison then computes the table.
 
-**Fly session image pinning (AII-534, updated AII-555).** `dispatchKgRefreshRun` resolves the
+**Fly session image pinning (AII-534, updated AII-555).** The Fly sender (`src/restate/kg-refresh-senders.ts`) resolves the
 session machine image via `resolveRunnerImageForDispatch` (`src/repo-image.ts`), the same
 function the standard implement and planning dispatch paths use. Resolution order:
 
@@ -652,6 +846,22 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-09-08 | With the report step gone, the stale-stamp gate read `snapshot/embeddings.stamp`, a file only hand edits and that agent ever wrote; the first guard-clean run (34270413381) failed `KG_SNAPSHOT_STALE` on it | The gate reads `age_stamp` from `snapshot/embeddings.meta.json` — the ingest's own stamp and the one the rail's materialize checks — with the legacy file as fallback |
 | 2026-09-08 | The kg-refresh report step (feedback-loop) re-ran the ingest by hand without a GitHub token and rewrote `snapshot/parts/` without `pr.nt`; the guard refused three runs | The report step is removed from `pipelines/kg-refresh.yml`; the ingest step's counters and `ai-output/kg-ingest.log` (AII-581) plus the snapshot-push guard are the report |
 | 2026-09-08 | Refresh rail's materialize OOM-killed at ~31.6k quads (271 MB RSS beside the serving sidecar on a 512 MB machine); the rail refused the swap and kept serving the old graph | `fly.toml` memory raised to 1 GB — the documented headroom figure, not a code change |
+
+### Row conclusions and dashboard outcomes (AII-1472)
+
+`KgRefresh` is the only writer of a kg-refresh job row, and every close carries a conclusion:
+
+| Close | Status | Conclusion |
+|---|---|---|
+| Success, no-new-data, clean dry run | `completed` | `passed` |
+| Ok with warnings (`guardVerdict: "warnings"` or a non-empty `warnings` list), live or dry run | `completed` | `warnings` |
+| Held at the decision gate (AII-1490) | `completed` | `awaiting_decision` until accept, cancel, or timeout re-closes the row |
+| Not ok, including a refused dry run | `failed` / `timed_out` | the failure code (`dry_run_refused` when the report carries none) |
+
+The Pipelines badge for a `kg-refresh` row reads **awaiting decision** (warn style, also on the KG Pipelines dispatch log; counted as `awaitingDecisionCount` in `get_tenant_health`, not in `inFlightJobCount`), **passed**, **completed with warnings**, or **failed** from
+status and conclusion; other run kinds keep their status label. A legacy row (`completed`, no conclusion)
+keeps the plain `completed` label. The KG page's last-refresh line shows the same three outcomes for live
+refreshes (**passed**, **completed with warnings**, or **failed**, as above); dry runs appear only as Pipelines rows.
 
 ## KG-refresh outcome visibility (AII-496)
 
@@ -692,7 +902,7 @@ critical section after the TTL watchdog has already resolved the run.
 
 AII-495 wired `POST /api/kg/refresh` to dispatch a Claude runner when the source repo has no newer snapshot. On 2026-09-03, a refresh was triggered on the testing orchestrator for the first time with runner dispatch enabled. Two bugs blocked the run from completing; both were diagnosed and fixed within the window.
 
-**AII-544 — progress token not minted.** `dispatchKgRefreshRun()` minted only a result token (`audience: "result"`). The `POST /api/runner/kg-tracker-data` endpoint gates on `audience = "progress"`, so the runner received 403. The `kg-tracker-data` step no-oped silently (`RUN_PROGRESS_TOKEN` absent → early return). Fix: mint a progress token alongside the result token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv`.
+**AII-544 — progress token not minted.** The kg-refresh dispatch minted only a result token (`audience: "result"`). The `POST /api/runner/kg-tracker-data` endpoint gates on `audience = "progress"`, so the runner received 403. The `kg-tracker-data` step no-oped silently (`RUN_PROGRESS_TOKEN` absent → early return). Fix: mint a progress token alongside the result token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv`.
 
 **AII-548 — `runnerCallbackUrl` carried the full result URL.** The `RunConfigV1` field was set to `RUNNER_CALLBACK_BASE_URL + "/runner/result"` (the full callback URL) instead of the bare base URL. Every runner-side client that appended its own path produced a doubled path — `/runner/result/runner/result`, `/api/runner/kg-tracker-data/runner/result`, etc. — all of which hit the admin-auth wall and returned 401. Fix: `runnerCallbackUrl` is always the bare base URL (e.g. `https://my-orchestrator.fly.dev`); each client is responsible for appending its own path suffix. This contract is now documented in `docs/issueless-runs.md` §3.
 
@@ -711,7 +921,7 @@ After both fixes landed, the review of the implementation also identified an arc
 | Snapshot push step | — | `src/pipeline/steps/kg-snapshot-push.ts` | present |
 | Push credential | `src/pipeline/steps/push.ts` `refreshRunnerGithubCredentials` | — | removed by AII-583 ✓ |
 | Callback routing | `src/runner-callback.ts` (carve-out within shared file) | — | present |
-| Dispatch function | — | `src/index.ts` `dispatchKgRefreshRun` | present |
+| Dispatch function | — | `src/restate/kg-refresh-senders.ts` `createKgRefreshSenders` | present |
 
 The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`, and the kg-push credential helper should have reused `refreshRunnerGithubCredentials` from the standard push step. AII-556, AII-557, and AII-583 collapse those pairs. Rows with no shared counterpart (the state machine, pipeline steps) are legitimately kg-refresh-only and belong exactly where they are.
 

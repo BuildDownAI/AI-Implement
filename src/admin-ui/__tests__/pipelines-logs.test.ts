@@ -1,6 +1,7 @@
 import { JSDOM } from "jsdom";
 import { describe, expect, it, vi } from "vitest";
 import { pipelinesHtml, pipelinesScript } from "../pages/pipelines.js";
+import { kgPipelinesHtml } from "../pages/kg-pipelines.js";
 import { localJobLogsHtml, localJobLogsScript } from "../local-job-logs.js";
 
 const job = {
@@ -9,7 +10,7 @@ const job = {
   runnerMode: "local", machineId: "a".repeat(64), status: "running", dispatchedAt: Date.now(),
 };
 
-async function setup(entries = [job], logsStatus = 200) {
+async function setup(entries: Array<typeof job & { trigger?: string | null }> = [job], logsStatus = 200) {
   const dom = new JSDOM(pipelinesHtml + localJobLogsHtml, { runScripts: "outside-only" });
   const { window } = dom;
   window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
@@ -68,6 +69,110 @@ describe("pipeline list log actions", () => {
       expect(button).not.toBeNull();
       button.click();
       await vi.waitFor(() => expect(api).toHaveBeenCalledWith("/api/jobs/396/logs"));
+    } finally { dom.window.close(); }
+  });
+});
+
+describe("dispatch log instances", () => {
+  const rows = [
+    { ...job, id: 1, issueId: "i1", phase: "implement", dispatchNumber: 2, status: "completed", machineId: undefined },
+    { ...job, id: 2, issueId: "i1", phase: "planning", dispatchNumber: 1, status: "completed", machineId: undefined },
+    { ...job, id: 3, issueId: "kg", phase: "kg-refresh", executionMode: "fly-machines", machineId: "kgm1", status: "running" },
+  ];
+
+  async function setupTwo() {
+    const dom = new JSDOM(pipelinesHtml + kgPipelinesHtml, { runScripts: "outside-only" });
+    const { window } = dom;
+    const api = vi.fn(async (url: string) => ({
+      ok: true, status: 200,
+      json: async () => url.startsWith("/api/log?") ? rows : {},
+    }));
+    window.api = api;
+    window.esc = window.escAttr = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+    window.safeUrl = (value: string) => value;
+    window.isAdmin = () => true;
+    window.registerPage = vi.fn();
+    window.eval(pipelinesScript);
+    return { dom, window, api, document: window.document };
+  }
+
+  it("filters before grouping when a filter is given, and groups without one", async () => {
+    const { dom, window, document } = await setupTwo();
+    try {
+      await window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" }).load();
+      const kgRows = document.querySelectorAll("#kglog-body tr");
+      expect(kgRows).toHaveLength(1);
+      expect(kgRows[0].querySelector(".badge")?.textContent).toBe("kg");
+      await window.loadLog();
+      expect(document.querySelectorAll("#log-body tr")).toHaveLength(2);
+    } finally { dom.window.close(); }
+  });
+
+  it("each instance writes only to its own elements", async () => {
+    const { dom, window, document } = await setupTwo();
+    try {
+      const kg = window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" });
+      await kg.load();
+      expect(document.getElementById("log-body")?.children).toHaveLength(0);
+      expect(document.getElementById("log-count")?.textContent).toBe("—");
+      expect(document.getElementById("kglog-count")?.textContent).toContain("1 job");
+    } finally { dom.window.close(); }
+  });
+
+  it("Stop on an in-flight kg-refresh row confirms, then DELETEs the session", async () => {
+    const { dom, window, document, api } = await setupTwo();
+    try {
+      window.confirm = () => true;
+      const kg = window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" });
+      await kg.load();
+      const stop = document.querySelector("#kglog-body [data-cancel-id]") as HTMLElement;
+      expect(document.querySelector("#kglog-body [data-machine-id]")).not.toBeNull();
+      stop.click();
+      await vi.waitFor(() => expect(api).toHaveBeenCalledWith("/api/sessions/kgm1", { method: "DELETE" }));
+    } finally { dom.window.close(); }
+  });
+
+  it("defaults both instances to a 7 day relative window, so /api/log gets since", async () => {
+    const { dom, window, api } = await setupTwo();
+    try {
+      await window.createDispatchLog("kglog").load();
+      expect(api.mock.calls[0][0]).toMatch(/^\/api\/log\?since=\d+$/);
+    } finally { dom.window.close(); }
+  });
+});
+
+
+describe("recurring dispatch presentation", () => {
+  it.each([1, 21])("renders KG run #%s with only recognized trigger badges", async dispatchNumber => {
+    for (const trigger of ["schedule", "manual", null, undefined, '<img src=x onerror="alert(1)">']) {
+      const { dom, window, document } = await setup([{ ...job, phase: "kg-refresh", dispatchNumber, trigger }]);
+      try {
+        document.body.insertAdjacentHTML("beforeend", kgPipelinesHtml);
+        await window.createDispatchLog("kglog", { filter: (e: { phase: string }) => e.phase === "kg-refresh" }).load();
+        for (const prefix of ["log", "kglog"]) {
+          const row = document.querySelector(`#${prefix}-body tr`)!;
+          expect(row.classList.contains("redispatch-row")).toBe(false);
+          expect(row.children[1].textContent).toBe(`run #${dispatchNumber}`);
+          expect(row.children[1].querySelector("span")).toBeNull();
+          expect(row.children[2].textContent).toBe("KG refresh" + (trigger === "schedule" ? " scheduled" : trigger === "manual" ? " manual" : ""));
+          expect(row.children[2].querySelectorAll(".badge")).toHaveLength(trigger === "schedule" || trigger === "manual" ? 1 : 0);
+          expect(row.children[2].querySelector("img")).toBeNull();
+          expect(row.children[3].textContent).toBe("—");
+          expect(row.children[4].textContent).toBe("—");
+        }
+      } finally { dom.window.close(); }
+    }
+  });
+
+  it.each([false, true])("keeps issue re-dispatch styling (grouped: %s)", async grouped => {
+    const entries = [{ ...job, dispatchNumber: grouped ? 4 : 3 }];
+    if (grouped) entries.push({ ...job, id: 395, phase: "planning", dispatchNumber: 3 });
+    const { dom, document } = await setup(entries);
+    try {
+      const row = document.querySelector("#log-body tr")!;
+      expect(row.classList.contains("redispatch-row")).toBe(true);
+      expect(row.children[1].querySelector('[title="Re-dispatch"]')?.textContent).toBe("3");
+      expect(row.children[1].innerHTML).toContain("#d63384");
     } finally { dom.window.close(); }
   });
 });

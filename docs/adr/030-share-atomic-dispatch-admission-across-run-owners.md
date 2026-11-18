@@ -1,6 +1,6 @@
 # 030. Share atomic dispatch admission across run owners
 
-**Status:** Accepted — design approved on 2026-09-24; live pilot evaluation pending.
+**Status:** Accepted — design approved on 2026-09-24; amended on 2026-11-07 to require Restate.
 **Date:** 2026-09-23
 **References:** ADR 018, ADR 026, Restate review-fix pilot
 
@@ -60,3 +60,17 @@ The pilot adds schema without tightening existing historical columns. New tables
 The pilot can share capacity with existing run owners. Its implementation touches admissions beyond review-fix, so the writer inventory and cross-path race tests must cover those paths.
 
 This decision does not migrate those other run lifecycles onto Restate.
+
+## Amendment (2026-11-07): Restate is required; Legacy ownership is temporary
+
+**Decision.** The operator requires Restate to own review fix, planning and implementation on every backend. Under [Gates, Not Inspectors](https://linear.app/eudoxus/project/gates-not-inspectors-85011c2b1f67) Stages 2 and 3, the Legacy owner remains only for implementation and gap-fill runs until [AII-1555](https://linear.app/eudoxus/issue/AII-1555/send-every-implementation-dispatch-to-implementationrun) Part 2 (Stage 3) deletes the legacy implementation lifecycle. The cutovers are tracked separately: first-time implementation in AII-1555 and gap-fill in [AII-1554](https://linear.app/eudoxus/issue/AII-1554); both must precede that deletion. Shared atomic admission stays; `lifecycleOwner` `legacy` stays until then. The Legacy lifecycle is being removed in those stages; this amendment does not claim the code removal or live pilot evaluation has completed.
+
+**Rejection reasons re-checked (standing rule 3).**
+
+| Alternative and quoted reason | Assessment and evidence |
+| --- | --- |
+| Reserve only for Restate review-fix attempts: “Another dispatch path can pass its capacity check before it sees the reservation and exceed the limit.” | **still holds** — First-time implementation and gap-fill await separate cutovers (AII-1555 and AII-1554 respectively), and all competing paths continue to need the same atomic admission even after ownership converges. |
+| Use a separate orchestrator as the full pilot boundary: “An isolated live test remains useful, but it does not prove safe operation with competing dispatch paths.” | **still holds** — Required ownership on every backend retains the shared team-capacity pool across dispatch paths, which an isolated test alone cannot validate. |
+| Release capacity immediately on cancellation: “The external runner can remain active after the cancellation request. A replacement must wait for confirmed termination.” | **still holds** — Restate ownership does not change the admission contract's distinction between requesting cancellation and confirming backend termination. |
+
+**Rollback.** Revert this documentation amendment.

@@ -1,0 +1,331 @@
+/** Production composition for the `PlanningRun` service (AII-1020): the real GitHub Actions deps
+ * for `createPlanningRunWorkflow`. Sibling of `kg-refresh-production.ts`; `src/index.ts` composes
+ * and registers the service and owns what this file takes as input. Nothing submits the workflow
+ * yet — the switch is a later change. One deps set serves all three backends: each backend-selected dep
+ * switches on `input.backend`. */
+import type { RepoMapping } from "../config.js";
+import { getMappings } from "../config.js";
+import { acquireDispatch } from "../dispatch-gate.js";
+import { read as readAdmission, releaseByDispatchId } from "../dispatch-admission.js";
+import type { AppConfig, HeldReservation } from "../index.js";
+import { classifyFlyMachine, classifyLocalContainer, destroyMachineRecorded, stopBackendRun } from "../backend-run.js";
+import { getRunnerMode } from "../runner-mode.js";
+import type { TicketIssue, TicketingProvider } from "../providers/types.js";
+import { defaultFetchSignal, cancelWorkflowRun, getWorkflowRunStatus } from "../github.js";
+import { getInstallationToken } from "../github-app-auth.js";
+import { findLogIdByDispatchId, getJobByDispatchId, markJobFailureCommented, recordGhaRunCompleted, updateJobRunId, updateJobStatus, type Job } from "../log.js";
+import { planningSessionName, type launchPlanningRun, type launchPlanningSession, type preparePlanningLaunch } from "../planning-launch.js";
+import { listMachines, getMachine, machineNeverStarted } from "../fly-machines.js";
+import { findLocalContainerIdByName, removeLocalContainer } from "../local-docker.js";
+import { parkIssue } from "../dispatch-breaker.js";
+import { buildRunUrl, FLY_MACHINE_NEVER_STARTED_REMEDIATION } from "../completion-classification.js";
+import type { RestateService } from "./endpoint.js";
+import type { OwnedRunStatus } from "./owned-run-wait.js";
+import {
+  createPlanningRunWorkflow,
+  type PlanningFinishOutcome,
+  type PlanningLaunchResult,
+  type PlanningRunDependencies,
+  type PlanningRunInput,
+} from "./planning-run-workflow.js";
+
+/** The display title of a planning run: `<prefix><issueIdentifier>`. It must equal the `run-name`
+ *  in `workflows/claude-plan.yml`; a test reads that file and fails on a drift. */
+export const PLANNING_RUN_TITLE_PREFIX = "Claude AI Planning — ";
+
+/** `planningContext` keys the submitter sets for the launch (both optional). */
+export const PLANNING_CONTEXT_BRANCH_KEY = "resolvedPlanningBranch";
+export const PLANNING_CONTEXT_FIELD_VALUE_KEY = "planningFieldValue";
+
+const GHA_BACKEND = "github-actions";
+const TERMINAL_JOB_STATUSES: ReadonlySet<string> = new Set(["completed", "review_failed", "failed", "timed_out", "dispatch-failed"]);
+
+export interface PlanningRunProductionInput {
+  /** The full config: `preparePlanningLaunch` reads from it. */
+  config: AppConfig;
+  /** Maps a team key to its mapping. Defaults to `getMappings()[teamKey]`. */
+  getMapping?: (teamKey: string) => RepoMapping | undefined;
+  /** The provider lookup (`ProviderRegistry.forMapping`). */
+  resolveProvider: (mapping: RepoMapping) => Promise<TicketingProvider>;
+  /** `resolveDispatchRunnerImage` from `src/index.ts`. */
+  resolveRunnerImage: Parameters<typeof preparePlanningLaunch>[0]["resolveRunnerImage"];
+  /** `fireBreakerTrip` from `src/index.ts`. */
+  fireBreakerTrip: Parameters<typeof launchPlanningRun>[0]["fireBreakerTrip"];
+  preparePlanningLaunch: typeof preparePlanningLaunch;
+  launchPlanningRun: typeof launchPlanningRun;
+  /** The Fly Machines / local Docker launch (AII-1053). */
+  launchPlanningSession: typeof launchPlanningSession;
+  /** `reportTerminalJob` from `src/index.ts`, called as an owner call: the completion notice, failure comment, and breaker count. */
+  reportTerminalJob: (job: Job) => Promise<void>;
+  /** The `index.ts` helpers `launchPlanningSession` takes, passed in to avoid an import cycle. */
+  sessionDeps: Parameters<typeof launchPlanningSession>[0]["deps"];
+  /** Test seam: awaited after the reservation was taken, inside the `reserve` step. Production leaves it unset. */
+  afterReserve?: (run: PlanningRunInput) => Promise<void>;
+}
+
+/** The two container backends; the GitHub Actions path has its own deps. */
+function containerBackend(input: PlanningRunInput): "fly-machines" | "local-docker" | null {
+  return input.backend === GHA_BACKEND ? null : input.backend;
+}
+
+function requireMapping(getMapping: (teamKey: string) => RepoMapping | undefined, teamKey: string): RepoMapping {
+  const mapping = getMapping(teamKey);
+  if (!mapping) throw new Error(`no project mapping found for team ${teamKey}`);
+  return mapping;
+}
+
+/** Looks a planning run up: a container backend by the row's id, else by the name derived from the dispatch id;
+ *  GitHub Actions by its exact title and creation time. `null` means only "GitHub answered, and
+ *  no run matches"; an HTTP error throws, so the workflow retries the lookup rather than launching a second run.
+ *  GitHub stamps `created_at` to the second, so the dispatch time is floored to the second before the compare. */
+export function createPlanningFindExistingRun(opts: {
+  getMapping: (teamKey: string) => RepoMapping | undefined;
+  getToken: (owner: string) => Promise<string>;
+  /** The Fly sessions credentials for the by-name machine lookup; absent values throw. */
+  getFlySessions?: () => { token: string | null; app: string | null };
+}): PlanningRunDependencies["findExistingRun"] {
+  return async (input, dispatchedAt) => {
+    const backend = containerBackend(input);
+    if (backend) {
+      // The launch records the id on the dispatch row; a crash before that leaves only the name.
+      const recorded = getJobByDispatchId(input.dispatchId)?.machineId;
+      if (recorded) return recorded;
+      const name = planningSessionName(input.dispatchId);
+      if (backend === "local-docker") return findLocalContainerIdByName(name);
+      const fly = opts.getFlySessions?.();
+      if (!fly?.token || !fly.app) {
+        throw new Error("findExistingRun: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set");
+      }
+      const machines = await listMachines(fly.token, fly.app);
+      return machines.find((m) => m.name === name)?.id ?? null;
+    }
+    const mapping = requireMapping(opts.getMapping, input.teamKey);
+    const title = `${PLANNING_RUN_TITLE_PREFIX}${input.issueIdentifier}`;
+    const floor = Math.floor(dispatchedAt / 1000) * 1000;
+    const res = await fetch(
+      `https://api.github.com/repos/${mapping.owner}/${mapping.repo}/actions/workflows/${mapping.planningWorkflowFile}/runs?event=workflow_dispatch&per_page=20`,
+      {
+        headers: { Authorization: `Bearer ${await opts.getToken(mapping.owner)}`, Accept: "application/vnd.github+json" },
+        signal: defaultFetchSignal(),
+      },
+    );
+    if (!res.ok) throw new Error(`findExistingRun: workflow runs lookup answered HTTP ${res.status}`);
+    const data = (await res.json()) as { workflow_runs: Array<{ id: number; created_at?: string; display_title?: string }> };
+    const match = data.workflow_runs.find(
+      (r) => r.display_title === title && r.created_at !== undefined && Date.parse(r.created_at) >= floor,
+    );
+    return match ? String(match.id) : null;
+  };
+}
+
+export function createProductionPlanningRunServices(input: PlanningRunProductionInput): { services: RestateService[] } {
+  const { config } = input;
+  const getMapping = input.getMapping ?? ((teamKey: string) => getMappings()[teamKey]);
+  const getToken = (owner: string) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+
+  /** The run's mapping key is the source of truth: a provider's `findByKey` may return an empty `scopeKey` (Jira). */
+  function withRunScope(issue: TicketIssue, run: PlanningRunInput): TicketIssue {
+    return { ...issue, scopeKey: run.teamKey };
+  }
+
+  async function launchSession(run: PlanningRunInput, execPath: "fly-machines" | "local-docker"): Promise<PlanningLaunchResult> {
+    let ctx: { mapping: RepoMapping; provider: TicketingProvider; issue: TicketIssue; reservation: HeldReservation };
+    try {
+      const mapping = requireMapping(getMapping, run.teamKey);
+      const provider = await input.resolveProvider(mapping);
+      const found = await provider.findByKey(run.issueIdentifier, run.teamKey);
+      if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
+      const issue = withRunScope(found, run);
+      const admission = readAdmission(run.dispatchId);
+      if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
+      // The workflow owns the reservation: the `release` here is never called by the launch.
+      ctx = { mapping, provider, issue, reservation: { dispatchId: run.dispatchId, admission: { ok: true, admissionGeneration: admission.generation, release: () => {} } } };
+    } catch (err) {
+      console.error(`[planning-run] launch preparation failed dispatch=${run.dispatchId}:`, err);
+      return { outcome: "rejected" };
+    }
+    const launched = await input.launchPlanningSession({
+      config, provider: ctx.provider, issue: ctx.issue, mapping: ctx.mapping, execPath,
+      runnerMode: getRunnerMode().mode,
+      resolvedPlanningBranch: run.planningContext[PLANNING_CONTEXT_BRANCH_KEY] || ctx.mapping.defaultBranch,
+      planningFieldValue: run.planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] || null,
+      reservation: ctx.reservation,
+      deps: input.sessionDeps,
+    });
+    // Only the outcome and the machine id: the step result is journaled, so no nonce or token.
+    return launched.machineId === undefined ? { outcome: launched.outcome } : { outcome: launched.outcome, jobId: launched.machineId };
+  }
+
+  async function launch(run: PlanningRunInput): Promise<PlanningLaunchResult> {
+    const execPath = containerBackend(run);
+    if (execPath) return launchSession(run, execPath);
+    // Everything up to `preparePlanningLaunch` is pure preparation: a throw is a definitive non-launch.
+    let prepared: Awaited<ReturnType<typeof preparePlanningLaunch>>;
+    let ctx: { mapping: RepoMapping; provider: TicketingProvider; issue: TicketIssue; generation: number };
+    try {
+      const mapping = requireMapping(getMapping, run.teamKey);
+      const provider = await input.resolveProvider(mapping);
+      const found = await provider.findByKey(run.issueIdentifier, run.teamKey);
+      if (!found) throw new Error(`issue ${run.issueIdentifier} not found`);
+      const issue = withRunScope(found, run);
+      const admission = readAdmission(run.dispatchId);
+      if (!admission || admission.releasedAt !== null) throw new Error(`no active reservation for dispatch ${run.dispatchId}`);
+      ctx = { mapping, provider, issue, generation: admission.generation };
+      prepared = await input.preparePlanningLaunch({
+        config, provider, issue, mapping, dispatchId: run.dispatchId,
+        resolvedPlanningBranch: run.planningContext[PLANNING_CONTEXT_BRANCH_KEY] || mapping.defaultBranch,
+        resolveRunnerImage: input.resolveRunnerImage,
+        fireBreakerTrip: input.fireBreakerTrip,
+      });
+    } catch (err) {
+      console.error(`[planning-run] launch preparation failed dispatch=${run.dispatchId}:`, err);
+      return { outcome: "rejected" };
+    }
+
+    // A throw from here on propagates: the launch may have happened, and the retry reconciles by title first.
+    // The workflow owns the reservation, so there is no `onRejected` release here.
+    const launched = await input.launchPlanningRun({
+      ...prepared,
+      config, provider: ctx.provider, issue: ctx.issue, mapping: ctx.mapping, dispatchId: run.dispatchId,
+      admissionGeneration: ctx.generation,
+      planningFieldValue: run.planningContext[PLANNING_CONTEXT_FIELD_VALUE_KEY] || null,
+      fireBreakerTrip: input.fireBreakerTrip,
+    });
+    if (launched.runId === undefined) return { outcome: launched.outcome };
+    const rowId = findLogIdByDispatchId(run.dispatchId);
+    if (rowId !== undefined) updateJobRunId(rowId, launched.runId);
+    // Only the outcome and the run id are returned: the step result is journaled, and the token stays in `prepared`.
+    return { outcome: launched.outcome, jobId: String(launched.runId) };
+  }
+
+  async function readStatus(run: PlanningRunInput, jobId: string): Promise<OwnedRunStatus> {
+    // The same `ended` rule as the Legacy release (`confirmAdmissionTerminated`).
+    if (run.backend === "fly-machines") return classifyFlyMachine(config, jobId);
+    if (run.backend === "local-docker") return classifyLocalContainer(jobId);
+    const mapping = requireMapping(getMapping, run.teamKey);
+    const status = await getWorkflowRunStatus(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
+    if (status) recordGhaRunCompleted(Number(jobId), status);
+    if (status?.status === "completed") return "ended";
+    if (status?.status === "in_progress") return "started";
+    return "unknown";
+  }
+
+  async function stop(run: PlanningRunInput, jobId: string): Promise<boolean> {
+    if (containerBackend(run)) return stopBackendRun(config, run.backend, jobId);
+    const mapping = requireMapping(getMapping, run.teamKey);
+    return cancelWorkflowRun(await getToken(mapping.owner), mapping.owner, mapping.repo, Number(jobId));
+  }
+
+  async function finishJob(dispatchId: string, outcome: PlanningFinishOutcome): Promise<void> {
+    const job = getJobByDispatchId(dispatchId);
+    if (!job) return;
+    // An invocation cancel is an operator decision: close the row with the conclusion `reportTerminalJob` already
+    // exempts from the breaker count, and add no stuck attempt. A retry finds the terminal row and does nothing.
+    if (outcome.kind === "cancelled") {
+      if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, "failed", "operator_cancelled");
+      // Clear the planning label, as the Legacy operator-cancel path does (`handleRunnerResult`), or the
+      // ticket stays in `AI-Planning` and no poll picks it up again. Safe to run twice; a throw retries the step.
+      const cancelledMapping = job.teamKey ? getMapping(job.teamKey) : undefined;
+      if (cancelledMapping && job.issueId) {
+        const cancelledProvider = await input.resolveProvider(cancelledMapping);
+        await cancelledProvider.clearWorkingState(job.issueId, job.teamKey ?? "", "planning");
+      }
+      return;
+    }
+    const status = outcome.kind === "deadline" ? "timed_out" : "failed";
+    const conclusion = outcome.kind === "deadline" ? "deadline_exceeded" : "ended_without_callback";
+    // A terminal row closed by the planning callback needs no handling. A row carrying this function's own marker
+    // means an earlier attempt closed it and then threw before the handling finished, so the retry runs it again.
+    const closedByThisStep = job.conclusion === "deadline_exceeded" || job.conclusion === "ended_without_callback";
+    if (TERMINAL_JOB_STATUSES.has(job.status) && !closedByThisStep) return;
+    // Local writes first (they cannot fail on the network): close the row, then park. From here no poll dispatches
+    // planning for the issue on any tracker, even if every tracker write below fails. Both are idempotent.
+    if (!TERMINAL_JOB_STATUSES.has(job.status)) updateJobStatus(job.id, status, conclusion);
+    if (job.issueId) parkIssue(job.issueId, "planning", conclusion);
+    // A comment already recorded by an earlier attempt means the tracker write is done.
+    if (job.failureCommentedAt) return;
+    const mapping = job.teamKey ? getMapping(job.teamKey) : undefined;
+    if (!mapping || !job.issueId) return;
+    let neverStarted = false;
+    let cause = outcome.kind === "deadline" ? "the run deadline passed before a planning result arrived" : "the run ended with no planning result";
+    if (outcome.kind === "run_ended" && job.executionMode === "fly-machines" && job.machineId) {
+      try {
+        if (config.flySessionsToken && config.flySessionsApp &&
+            machineNeverStarted(await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId, 10_000))) {
+          neverStarted = true;
+          cause = "Fly removed the machine before it started";
+        }
+      } catch {
+        // Diagnostic only: a failed read must never delay admission release.
+      }
+    }
+    const runUrl = buildRunUrl(job);
+    const reason =
+      `${cause}${runUrl ? ` (run: ${runUrl})` : ""}. The issue is parked and will not be retried by itself. ` +
+      (neverStarted ? FLY_MACHINE_NEVER_STARTED_REMEDIATION + " " : "") +
+      "Next: press Unpark at /admin#runners, then set the status to `Ready` (Jira) or keep the AI-Implement label (Linear).";
+    try {
+      const provider = await input.resolveProvider(mapping);
+      const commented = await provider.markPlanningFailed(job.issueId, job.teamKey ?? "", reason);
+      if (commented) markJobFailureCommented(job.id);
+    } catch (err) {
+      // Visibility only: the issue is parked and the release must not wait on the tracker. The outcome step comments.
+      console.error(`[planning-run] markPlanningFailed failed dispatch=${dispatchId}:`, err);
+    }
+  }
+
+  async function cleanup(run: PlanningRunInput, jobId: string): Promise<void> {
+    try {
+      if (run.backend === "fly-machines") {
+        if (!config.flySessionsToken || !config.flySessionsApp) throw new Error("FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP are not configured");
+        await destroyMachineRecorded(config, jobId, "planning-end");
+      } else if (run.backend === "local-docker") {
+        await removeLocalContainer(jobId);
+      }
+    } catch (err) {
+      // A machine or container that is already gone is the goal of the step, so a retry succeeds.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/\(404\)|no such container/i.test(message)) return;
+      throw err;
+    }
+  }
+
+  async function onOutcome(dispatchId: string): Promise<void> {
+    const job = getJobByDispatchId(dispatchId);
+    if (job) await input.reportTerminalJob(job);
+  }
+
+  /** Takes the reservation in the workflow's first step. `acquireDispatch` returns the active row of this dispatch id
+   *  when a step retry follows a committed reservation, so a retry never takes a second one. */
+  async function reserve(run: PlanningRunInput): Promise<boolean> {
+    const mapping = requireMapping(getMapping, run.teamKey);
+    const held = acquireDispatch({
+      dispatchId: run.dispatchId,
+      issueId: run.issueId,
+      issueIdentifier: run.issueIdentifier,
+      kind: "planning",
+      teamKey: run.teamKey,
+      maxInProgressAiIssues: mapping.maxInProgressAiIssues,
+      backend: run.backend,
+      lifecycleOwner: { kind: "restate", attemptId: run.dispatchId },
+    }).ok;
+    if (held && input.afterReserve) await input.afterReserve(run);
+    return held;
+  }
+
+  const deps: PlanningRunDependencies = {
+    reserve,
+    findExistingRun: createPlanningFindExistingRun({ getMapping, getToken, getFlySessions: () => ({ token: config.flySessionsToken, app: config.flySessionsApp }) }),
+    launch,
+    readStatus,
+    stop,
+    finishJob,
+    cleanup,
+    onOutcome,
+    release: (dispatchId, reason) => {
+      releaseByDispatchId(dispatchId, reason);
+    },
+  };
+
+  return { services: [createPlanningRunWorkflow(deps)] };
+}

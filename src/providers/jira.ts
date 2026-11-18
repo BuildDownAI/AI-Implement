@@ -1,17 +1,33 @@
 import type {
+  JiraFieldOptions,
+  JiraJqlResult,
+  JiraProjectSetupFacts,
+  JiraSetupFacts,
+  TrackerReadFailure,
   AIImplementSnapshot,
   FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
+  IssueStatusRecord,
   ProviderConfig,
   TicketIssue,
   TicketingProvider,
+  TrackerIssuePage,
+  TrackerIssueRecord,
 } from "./types.js";
-import { MissingProviderConfigError } from "./types.js";
-import { JiraApiError, JiraClient } from "./jira-client.js";
+import { ISSUE_STATUS_RECENT_MS, MissingProviderConfigError, TrackerUnavailableError } from "./types.js";
+import { JiraApiError, JiraFieldNotSelectError, JiraClient, type JiraComment, type JiraIssue } from "./jira-client.js";
 import {
+  BASE_BRANCH_FIELD_NAME,
+  buildBucketQuery,
   getCachedFieldIds,
+  JiraFieldResolutionError,
+  jqlFieldRef,
+  peekCachedFieldIds,
+  PROFILES_FIELD_NAME,
+  resolveCustomFieldIds,
   STATUS_VALUES,
+  type OverrideOptions,
   type ResolvedFieldIds,
 } from "./jira-fields.js";
 import type { RepoMapping } from "../config.js";
@@ -69,9 +85,43 @@ function descriptionText(fields: Record<string, unknown>): string | null {
   return typeof d === "string" ? d : d ? adfToPlainText(d) : null;
 }
 
-function jqlFieldRef(fieldId: string): string {
-  const match = /^customfield_(\d+)$/.exec(fieldId);
-  return match ? `cf[${match[1]}]` : fieldId;
+/** Native cancellation is independent of the AI-Implement custom status. */
+function nativeLifecycleState(fields: JiraIssue["fields"]): IssueLifecycleState {
+  const status = fields.status as { statusCategory?: { key?: string } } | null;
+  const resolution = fields.resolution as { name?: string } | null;
+  if (!resolution || status?.statusCategory?.key !== "done") return "active";
+  const resName = (resolution.name ?? "").toLowerCase();
+  return resName.includes("won't") || resName.includes("cancel") || resName === "duplicate"
+    ? "cancelled"
+    : "completed";
+}
+
+type JiraTicketingConfig = Extract<RepoMapping["ticketingConfig"], { kind: "jira" }>;
+
+/** The field-ID overrides a project sets, which key the poll's field cache. */
+function fieldOverrides(cfg: JiraTicketingConfig): OverrideOptions {
+  return {
+    statusOverride: cfg.statusFieldOverride ?? null,
+    repoOverride: cfg.repoFieldOverride ?? null,
+    profilesOverride: cfg.profilesFieldOverride ?? null,
+    baseBranchOverride: cfg.baseBranchFieldOverride ?? null,
+  };
+}
+
+/** A failed Jira call as setup facts: Jira's status when it answered, or null when it could not be reached. */
+function readFailure(err: unknown): TrackerReadFailure {
+  return { status: err instanceof JiraApiError ? err.status : null, error: err instanceof Error ? err.message : String(err) };
+}
+
+/** Optional fields with no override whose name matches several fields, which `resolveCustomFieldIds` leaves off. */
+function ambiguousOptionalFields(listed: Array<{ name: string }>, overrides: OverrideOptions): string[] {
+  const optional: Array<[string, string | null]> = [
+    [PROFILES_FIELD_NAME, overrides.profilesOverride],
+    [BASE_BRANCH_FIELD_NAME, overrides.baseBranchOverride],
+  ];
+  return optional
+    .filter(([name, override]) => override === null && listed.filter((field) => field.name === name).length > 1)
+    .map(([name]) => name);
 }
 
 /**
@@ -209,8 +259,20 @@ function incompleteBlockerKeys(issuelinks: unknown): string[] {
     .map((l) => (l.inwardIssue as { key: string }).key);
 }
 
+/** Comments the knowledge-graph export carries per issue (Linear's `comments(first: 100)`). */
+const TRACKER_EXPORT_MAX_COMMENTS = 100;
+
+/** Jira link type name → the export's relation type. Every other name is `related`. */
+function exportRelationType(typeName: string | undefined): string {
+  if (typeName === "Blocks") return "blocks";
+  if (typeName === "Duplicate") return "duplicate";
+  return "related";
+}
+
 export interface JiraProviderConstructor {
   client: JiraClient;
+  /** Whether credentials use the non-refreshing OAuth access token mode. */
+  oauth?: boolean;
   /** Per-instance cache scope label; typically the cloud ID. */
   cacheScope: string;
   /** User-facing site URL for issueUrl(); e.g. https://yourorg.atlassian.net */
@@ -229,6 +291,7 @@ const JIRA_V2_PREFIXES = [
 
 export class JiraProvider implements TicketingProvider {
   readonly id = "jira";
+  private readonly oauth: boolean;
   private readonly client: JiraClient;
   private readonly cacheScope: string;
   private readonly siteUrl: string;
@@ -237,11 +300,86 @@ export class JiraProvider implements TicketingProvider {
   private readonly notifiedMismatches = new Set<string>();
 
   constructor(c: JiraProviderConstructor) {
+    this.oauth = c.oauth ?? false;
     this.client = c.client;
     this.cacheScope = c.cacheScope;
     this.siteUrl = c.siteUrl;
     this.getMappings = c.getMappings;
     this.onRepoFieldMismatch = c.onRepoFieldMismatch ?? (() => {});
+  }
+
+  async fetchSetupFacts(projectKeys: string[]): Promise<JiraSetupFacts> {
+    try {
+      await this.client.verifyCredentials();
+    } catch (err) {
+      return { kind: "jira", credentials: "refused", ...readFailure(err) };
+    }
+    const projects: Record<string, JiraProjectSetupFacts> = {};
+    for (const key of projectKeys) {
+      const cfg = this.getMappings()[key]?.ticketingConfig;
+      if (cfg?.kind === "jira") projects[key] = await this.readProjectSetup(cfg);
+    }
+    return { kind: "jira", credentials: "accepted", oauth: this.oauth, projects };
+  }
+
+  /** One project's facts. Its fields are resolved fresh, never through the poll's cache, which `cachedIds` reads without filling. */
+  private async readProjectSetup(cfg: JiraTicketingConfig): Promise<JiraProjectSetupFacts> {
+    const overrides = fieldOverrides(cfg);
+    // One field list serves the resolution and the optional-field check, and tells a failed read from a missing field.
+    const list: { fields: Array<{ name: string }>; failure: TrackerReadFailure | null } = { fields: [], failure: null };
+    let ids: ResolvedFieldIds;
+    try {
+      ids = await resolveCustomFieldIds({
+        listFields: async () => {
+          try {
+            const fields = await this.client.listFields();
+            list.fields = fields;
+            return fields;
+          } catch (err) {
+            list.failure = readFailure(err);
+            throw err;
+          }
+        },
+      }, overrides);
+    } catch (err) {
+      if (list.failure) return { fields: "unreadable", failure: list.failure };
+      if (err instanceof JiraFieldResolutionError) return { fields: "unresolved", field: err.fieldName, fault: err.fault };
+      throw err;
+    }
+    const [statusOptions, repoOptions, jql] = await Promise.all([
+      this.readFieldOptions(ids.statusFieldId),
+      this.readFieldOptions(ids.repoFieldId),
+      this.tryProjectJql(cfg.jql, ids.statusFieldId),
+    ]);
+    return {
+      fields: "resolved",
+      ids,
+      cachedIds: peekCachedFieldIds(this.cacheScope, overrides) ?? null,
+      ambiguousOptional: ambiguousOptionalFields(list.fields, overrides),
+      statusOptions,
+      repoOptions,
+      jql,
+    };
+  }
+
+  private async readFieldOptions(fieldId: string): Promise<JiraFieldOptions> {
+    try {
+      const options = await this.client.getFieldOptions(fieldId);
+      return { read: "options", values: options.map((option) => option.value) };
+    } catch (err) {
+      if (err instanceof JiraFieldNotSelectError) return { read: "not-select" };
+      return { read: "failed", failure: readFailure(err) };
+    }
+  }
+
+  /** Runs the project's JQL as the poll runs it, asking for one result. */
+  private async tryProjectJql(jql: string, statusFieldId: string): Promise<JiraJqlResult> {
+    try {
+      await this.client.searchJqlPage(buildBucketQuery(jql, statusFieldId), [statusFieldId], undefined, 1);
+      return { accepted: true };
+    } catch (err) {
+      return { accepted: false, failure: readFailure(err) };
+    }
   }
 
   private childrenJql(parentKeys: string[], fieldIds: ResolvedFieldIds): string {
@@ -256,12 +394,7 @@ export class JiraProvider implements TicketingProvider {
     if (!m || m.ticketingConfig.kind !== "jira") {
       throw new Error(`No Jira mapping found for scopeKey=${scopeKey}`);
     }
-    return getCachedFieldIds(this.cacheScope, this.client, {
-      statusOverride: m.ticketingConfig.statusFieldOverride ?? null,
-      repoOverride: m.ticketingConfig.repoFieldOverride ?? null,
-      profilesOverride: m.ticketingConfig.profilesFieldOverride ?? null,
-      baseBranchOverride: m.ticketingConfig.baseBranchFieldOverride ?? null,
-    });
+    return getCachedFieldIds(this.cacheScope, this.client, fieldOverrides(m.ticketingConfig));
   }
 
   /** Writes the AI-Implement Status field. Merged is terminal: a run can outlive its
@@ -296,6 +429,160 @@ export class JiraProvider implements TicketingProvider {
     return true;
   }
 
+  /**
+   * One page of a mapping's issues for the knowledge-graph export. The cursor is Jira's
+   * `nextPageToken` (null → first page). The repo-field filter runs after the search, so a
+   * page can hold fewer issues, or none, while `hasNextPage` is still true; callers follow
+   * `hasNextPage`, not the issue count. `sourceSystem` and `team` are stamped by `TrackerExport`.
+   *
+   * Comments: the search response embeds a capped comment list with its `total`. Only an
+   * issue whose embedded list is shorter than `total` costs an extra `listComments` call
+   * (newest first, so the 100 kept are the newest). The embedded list is sorted newest first too.
+   */
+  async listIssuesPage(mapping: RepoMapping, cursor: string | null, filter?: { titlePrefix: string }): Promise<TrackerIssuePage> {
+    const cfg = mapping.ticketingConfig;
+    if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
+    const scopeKey = mapping.teamKey;
+    if (!scopeKey) throw new TrackerUnavailableError("mapping carries no team key");
+
+    const fieldIds = await this.fields(scopeKey);
+    const res = await this.client.searchJqlPage(
+      `(${cfg.jql})${filter ? ' AND summary ~ ' + JSON.stringify(filter.titlePrefix.replace(/[\[\]]/g, "")) : ""}`,
+      [
+        "summary", "description", "status", "labels", "project", "parent", "issuelinks", "comment",
+        fieldIds.repoFieldId,
+        ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
+      ],
+      cursor ?? undefined,
+    );
+
+    const inScope = res.issues.filter((raw) => {
+      const actual = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
+      if (actual === cfg.repoFieldValue) return true;
+      const mismatchKey = `${scopeKey}::${raw.key}`;
+      if (!this.notifiedMismatches.has(mismatchKey)) {
+        this.notifiedMismatches.add(mismatchKey);
+        this.onRepoFieldMismatch(scopeKey, raw.key, actual);
+      }
+      return false;
+    });
+
+    const issues: TrackerIssueRecord[] = [];
+    for (const raw of inScope) issues.push(await this.toTrackerRecord(raw, fieldIds));
+    return {
+      issues,
+      pageInfo: { hasNextPage: !!res.nextPageToken, endCursor: res.nextPageToken ?? null },
+    };
+  }
+
+  async listIssueStatuses(mapping: RepoMapping): Promise<IssueStatusRecord[]> {
+    const cfg = mapping.ticketingConfig;
+    if (cfg?.kind !== "jira") throw new TrackerUnavailableError("mapping has no Jira ticketing config");
+    const scopeKey = mapping.teamKey;
+    if (!scopeKey) throw new TrackerUnavailableError("mapping carries no team key");
+
+    const fieldIds = await this.fields(scopeKey);
+    const status = jqlFieldRef(fieldIds.statusFieldId);
+    const terminal = [STATUS_VALUES.MERGED, STATUS_VALUES.PLANNING_FAILED, STATUS_VALUES.IMPLEMENTATION_FAILED]
+      .map((value) => JSON.stringify(value)).join(",");
+    const jql = `(${cfg.jql}) AND ${status} is not EMPTY AND (${status} not in (${terminal}) OR updated >= -${ISSUE_STATUS_RECENT_MS / 86_400_000}d)`;
+    const states = new Map<string, Pick<IssueStatusRecord, "state" | "phase">>([
+      [STATUS_VALUES.READY, { state: "ready", phase: null }],
+      [STATUS_VALUES.PLANNING, { state: "planning", phase: null }],
+      [STATUS_VALUES.AWAITING_APPROVAL, { state: "awaiting-approval", phase: null }],
+      [STATUS_VALUES.APPROVED, { state: "plan-approved", phase: null }],
+      [STATUS_VALUES.IMPLEMENTING, { state: "implementing", phase: null }],
+      [STATUS_VALUES.PR_READY, { state: "pr-ready", phase: null }],
+      [STATUS_VALUES.MERGED, { state: "merged", phase: null }],
+      [STATUS_VALUES.PLANNING_FAILED, { state: "failed", phase: "planning" }],
+      [STATUS_VALUES.IMPLEMENTATION_FAILED, { state: "failed", phase: "implementation" }],
+    ]);
+    const issues: IssueStatusRecord[] = [];
+    let nextPageToken: string | undefined;
+    for (let page = 0; page < 20; page++) {
+      const result = await this.client.searchJqlPage(
+        jql, ["summary", "updated", fieldIds.statusFieldId, fieldIds.repoFieldId], nextPageToken,
+      );
+      for (const raw of result.issues) {
+        if (readRepoFieldValue(raw.fields[fieldIds.repoFieldId]) !== cfg.repoFieldValue) continue;
+        const workflowState = readStatusValue(raw.fields, fieldIds.statusFieldId);
+        issues.push({
+          id: raw.id,
+          identifier: raw.key,
+          title: (raw.fields.summary as string | null) ?? null,
+          url: this.issueUrl({ identifier: raw.key } as TicketIssue),
+          ...(states.get(workflowState) ?? { state: "unknown", phase: null }),
+          labels: [],
+          workflowState,
+          updatedAt: Date.parse(raw.fields.updated as string),
+        });
+      }
+      nextPageToken = result.nextPageToken;
+      if (!nextPageToken) return issues;
+    }
+    throw new TrackerUnavailableError("Jira issue status search exceeded 20 pages");
+  }
+
+  private async toTrackerRecord(raw: JiraIssue, fieldIds: ResolvedFieldIds): Promise<TrackerIssueRecord> {
+    const f = raw.fields;
+    const status = f.status as { name?: string; statusCategory?: { key?: string } } | null;
+    const labels = Array.isArray(f.labels) ? (f.labels as unknown[]).filter((l): l is string => typeof l === "string") : [];
+    const projectName = (f.project as { name?: string } | null)?.name;
+    const parentKey = effectiveParentKey(f, fieldIds);
+
+    const relations: TrackerIssueRecord["relations"]["nodes"] = [];
+    if (Array.isArray(f.issuelinks)) {
+      for (const l of f.issuelinks as JiraIssueLink[]) {
+        // An outward link reads "this issue <blocks|duplicates|…> the other". An inward one
+        // reads the other way round, and the export's `blocks`/`duplicate` are directed from
+        // the record's own issue, so an inward link is always `related`; the other issue's
+        // own record carries the directed edge.
+        if (l.outwardIssue?.key) {
+          relations.push({ type: exportRelationType(l.type?.name), relatedIssue: { identifier: l.outwardIssue.key } });
+        } else if (l.inwardIssue?.key) {
+          relations.push({ type: "related", relatedIssue: { identifier: l.inwardIssue.key } });
+        }
+      }
+    }
+
+    const embedded = f.comment as { comments?: JiraComment[]; total?: number } | null;
+    let comments = embedded?.comments ?? [];
+    if ((embedded?.total ?? 0) > comments.length) {
+      comments = await this.client.listComments(raw.key);
+    }
+
+    // Newest first on both paths, so the cap keeps the newest. Stable; a missing or
+    // unparsable `created` sorts last (NaN would break the comparator).
+    const createdMs = (c: JiraComment): number => {
+      const t = Date.parse(c.created ?? "");
+      return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
+    };
+    comments = [...comments].sort((a, b) => {
+      const ta = createdMs(a);
+      const tb = createdMs(b);
+      return ta === tb ? 0 : tb > ta ? 1 : -1;
+    });
+
+    return {
+      id: raw.id,
+      identifier: raw.key,
+      title: typeof f.summary === "string" ? f.summary : "",
+      description: descriptionText(f),
+      state: status?.name ? { name: status.name, type: status.statusCategory?.key ?? "" } : null,
+      labels: { nodes: labels.map((name) => ({ name })) },
+      project: projectName ? { name: projectName } : null,
+      parent: parentKey ? { identifier: parentKey } : null,
+      comments: {
+        nodes: comments.slice(0, TRACKER_EXPORT_MAX_COMMENTS).map((c) => ({
+          body: typeof c.body === "string" ? c.body : adfToPlainText(c.body),
+          user: c.author?.displayName ? { name: c.author.displayName } : null,
+          createdAt: c.created ?? "",
+        })),
+      },
+      relations: { nodes: relations },
+    };
+  }
+
   async fetchAIImplementSnapshot(): Promise<AIImplementSnapshot> {
     const mappings = this.getMappings();
     const jiraEntries = Object.entries(mappings).filter(
@@ -311,18 +598,7 @@ export class JiraProvider implements TicketingProvider {
       if (m.ticketingConfig.kind !== "jira") continue;
       const cfg = m.ticketingConfig;
       const fieldIds = await this.fields(scopeKey);
-      const fieldsToFetch = [
-        "summary",
-        "description",
-        "issuelinks",
-        "parent",
-        "assignee",
-        fieldIds.statusFieldId,
-        fieldIds.repoFieldId,
-        ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
-        ...(fieldIds.profilesFieldId ? [fieldIds.profilesFieldId] : []),
-        ...(fieldIds.baseBranchFieldId ? [fieldIds.baseBranchFieldId] : []),
-      ];
+      const fieldsToFetch = this.issueFields(fieldIds);
 
       // Reference the status field by its resolved customfield id, not a hardcoded
       // display name. Jira instances often name the field differently than
@@ -331,7 +607,7 @@ export class JiraProvider implements TicketingProvider {
       // customfield_N ids; JQL on some instances requires cf[N], so transform
       // before interpolating.
       const statusJqlField = jqlFieldRef(fieldIds.statusFieldId);
-      const bucketJql = `(${cfg.jql}) AND ${statusJqlField} in (Ready, "Plan Approved")`;
+      const bucketJql = buildBucketQuery(cfg.jql, fieldIds.statusFieldId);
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
       // Repo pass first, so the merged-blocker lookup below only carries keys from
@@ -436,6 +712,22 @@ export class JiraProvider implements TicketingProvider {
       }
     }
     return merged;
+  }
+
+  /** The fields the poll reads for an issue; `findByKey` with a scope key reads the same. */
+  private issueFields(fieldIds: ResolvedFieldIds): string[] {
+    return [
+      "summary",
+      "description",
+      "issuelinks",
+      "parent",
+      "assignee",
+      fieldIds.statusFieldId,
+      fieldIds.repoFieldId,
+      ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
+      ...(fieldIds.profilesFieldId ? [fieldIds.profilesFieldId] : []),
+      ...(fieldIds.baseBranchFieldId ? [fieldIds.baseBranchFieldId] : []),
+    ];
   }
 
   private toTicketIssue(
@@ -708,28 +1000,16 @@ export class JiraProvider implements TicketingProvider {
     const issues = await this.client.searchJql(jql, ["resolution", "status"]);
     const result = new Map<string, IssueLifecycleState>();
     for (const issue of issues) {
-      const status = issue.fields.status as { statusCategory?: { key?: string } } | null;
-      const resolution = issue.fields.resolution as { name?: string } | null;
-      let lifecycle: IssueLifecycleState;
-      if (resolution && status?.statusCategory?.key === "done") {
-        const resName = (resolution.name ?? "").toLowerCase();
-        if (resName.includes("won't") || resName.includes("cancel") || resName === "duplicate") {
-          lifecycle = "cancelled";
-        } else {
-          lifecycle = "completed";
-        }
-      } else {
-        lifecycle = "active";
-      }
-      result.set(issue.id, lifecycle);
+      result.set(issue.id, nativeLifecycleState(issue.fields));
     }
     return result;
   }
   async markPlanningStarted(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING);
   }
-  async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
-    await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
+  async markPlanComplete(issueId: string, scopeKey: string, opts: { awaitApproval: boolean }): Promise<void> {
+    // `Awaiting Approval` is outside the poll bucket: implementation starts only when a person sets `Plan Approved`.
+    await this.setStatus(issueId, scopeKey, opts.awaitApproval ? STATUS_VALUES.AWAITING_APPROVAL : STATUS_VALUES.APPROVED);
   }
   async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<boolean> {
     // Same misleading-late-comment rule as the implementation setters: when the write
@@ -762,8 +1042,24 @@ export class JiraProvider implements TicketingProvider {
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
     return true;
   }
-  async clearWorkingState(issueId: string, scopeKey: string): Promise<boolean> {
-    return this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
+  async clearWorkingState(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    // A failed planning run has no approved plan: Plan Approved would dispatch implementation.
+    return this.setStatus(issueId, scopeKey, phase === "planning" ? STATUS_VALUES.READY : STATUS_VALUES.APPROVED);
+  }
+  async parkForHuman(issueId: string, scopeKey: string, phase: "planning" | "implementation"): Promise<boolean> {
+    return this.setStatus(
+      issueId,
+      scopeKey,
+      phase === "planning" ? STATUS_VALUES.PLANNING_FAILED : STATUS_VALUES.IMPLEMENTATION_FAILED,
+    );
+  }
+  async markPrClosedUnmerged(issueId: string, scopeKey: string, prUrl: string): Promise<boolean> {
+    const ids = await this.fields(scopeKey);
+    const raw = await this.client.getIssue(issueId, [ids.statusFieldId, "status"]);
+    if (readStatusValue(raw.fields, ids.statusFieldId) === STATUS_VALUES.MERGED || isTerminalStatus(raw.fields)) return false;
+    await this.client.setField(issueId, ids.statusFieldId, { value: STATUS_VALUES.IMPLEMENTATION_FAILED });
+    await this.postComment(issueId, `The pull request ${prUrl} was closed without a merge. AI-Implement cancelled this issue. To run it again, set the AI-Implement status to its pickup value.`);
+    return true;
   }
   async markMerged(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.MERGED);
@@ -792,21 +1088,61 @@ export class JiraProvider implements TicketingProvider {
     return `${this.siteUrl}/browse/${issue.identifier}`;
   }
 
-  async findByKey(key: string): Promise<TicketIssue | null> {
+  async createChildIssue(parentId: string, scopeKey: string, content: { title: string; body: string }): Promise<{ id: string; identifier: string }> {
+    const ids = await this.fields(scopeKey);
+    const parent = await this.client.getIssue(parentId, ["project", "issuetype", ids.repoFieldId]);
+    const project = parent.fields.project as { id?: string } | undefined;
+    const parentType = parent.fields.issuetype as { subtask?: boolean; hierarchyLevel?: number } | undefined;
+    if (!project?.id || parentType?.subtask) throw new Error("Jira parent does not support native children");
+    const repo = parent.fields[ids.repoFieldId];
+    const mapping = this.getMappings()[scopeKey];
+    if (mapping.ticketingConfig.kind !== "jira" || !readRepoFieldValue(repo) ||
+        readRepoFieldValue(repo) !== mapping.ticketingConfig.repoFieldValue) {
+      throw new Error("Jira parent Repo does not match the mapping");
+    }
+    const types = await this.client.listCreateIssueTypes(project.id);
+    const level = parentType?.hierarchyLevel ?? 0;
+    const projectTypes = level > 0 ? await this.client.listProjectIssueTypes(project.id) : [];
+    const childType = types.find((t) => level === 0 ? t.subtask :
+      projectTypes.some((pt) => pt.id === t.id && pt.hierarchyLevel === level - 1));
+    if (!childType) throw new Error("Jira project has no compatible native child issue type");
+    const repoValue = typeof repo === "string" ? repo : { value: readRepoFieldValue(repo) };
+    const classicEpic = level === 1 && !(await this.client.getProject(project.id)).simplified;
+    // Fully overridden mappings skip field discovery, so resolve Epic Link here too.
+    const epicLinkFieldId = classicEpic
+      ? ids.epicLinkFieldId ?? (await this.client.listFields()).find((f) => f.name === "Epic Link")?.id
+      : undefined;
+    const relationship = epicLinkFieldId
+      ? { [epicLinkFieldId]: parent.key }
+      : { parent: { id: parent.id } };
+    const child = await this.client.createIssue({
+      project: { id: project.id }, ...relationship, issuetype: { id: childType.id },
+      summary: content.title, description: markdownToAdf(content.body),
+      [ids.statusFieldId]: { value: STATUS_VALUES.READY }, [ids.repoFieldId]: repoValue,
+    });
+    if (!child.id || !child.key) throw new Error("Jira child issue creation returned no identity");
+    return { id: child.id, identifier: child.key };
+  }
+
+  async findByKey(key: string, scopeKey?: string): Promise<TicketIssue | null> {
+    // With a scope key (a run that knows its mapping), read the issue as that mapping's poll
+    // does: the same fields, built by toTicketIssue. Without one (an admin lookup), a Jira key
+    // does not name the mapping, so scopeKey is "" and the custom fields are not read.
+    const fieldIds = scopeKey ? await this.fields(scopeKey) : null;
     let issue;
     try {
-      issue = await this.client.getIssue(key, ["summary", "description", "status"]);
+      issue = await this.client.getIssue(key, fieldIds ? this.issueFields(fieldIds) : ["summary", "description", "status"]);
     } catch (err) {
       if (err instanceof JiraApiError && err.status === 404) return null;
       throw err;
     }
-    // scopeKey is intentionally "" — the verb's use case (admin UI lookup)
-    // doesn't need scopeKey accuracy.
+    if (scopeKey && fieldIds) return this.toTicketIssue(issue, scopeKey, fieldIds);
     return {
       id: issue.id,
       identifier: issue.key,
       title: (issue.fields.summary as string) ?? "",
-      description: typeof issue.fields.description === "string" ? issue.fields.description : null,
+      // API v3 returns ADF: read it as text, the same way the poll does.
+      description: parseIssueConfig(descriptionText(issue.fields), issue.key).description,
       scopeKey: "",
       nativeStatus: ((issue.fields.status as { name?: string } | null)?.name) ?? "",
     };
@@ -821,8 +1157,8 @@ export function createJiraProviderFromConfig(
   if (!config.jiraToken || !config.jiraSiteUrl) {
     throw new MissingProviderConfigError("jira", "jiraToken/jiraSiteUrl");
   }
-  // Auth mode: Basic (email + API token) when jiraEmail is set — the durable
-  // Jira Cloud path; otherwise OAuth Bearer via the gateway, which needs cloudId.
+  // Auth mode: Basic (email + API token) when jiraEmail is set, the supported path.
+  // Otherwise OAuth Bearer via the gateway, which needs cloudId.
   if (!config.jiraEmail && !config.jiraCloudId) {
     throw new MissingProviderConfigError("jira", "jiraEmail (API-token auth) or jiraCloudId (OAuth)");
   }
@@ -834,6 +1170,7 @@ export function createJiraProviderFromConfig(
   });
   return new JiraProvider({
     client,
+    oauth: !config.jiraEmail,
     // Field-id cache scope: unique per deployment. Site URL in Basic mode,
     // cloud id in OAuth mode (one of the two is guaranteed present above).
     cacheScope: config.jiraEmail ? config.jiraSiteUrl : config.jiraCloudId!,

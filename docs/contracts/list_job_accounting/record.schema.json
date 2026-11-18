@@ -1,0 +1,408 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "dispatchId": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|log-[1-9][0-9]{0,15}|reviewfix-[0-9a-f]{64}(?:-[1-9][0-9]{0,2})?)$"
+    },
+    "phase": {
+      "type": "string",
+      "maxLength": 2000,
+      "pattern": "^[^\\u0000]*$"
+    },
+    "status": {
+      "type": "string",
+      "maxLength": 2000,
+      "pattern": "^[^\\u0000]*$"
+    },
+    "conclusion": {
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 2000,
+          "pattern": "^[^\\u0000]*$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lifecycleOwner": {
+      "type": "string",
+      "enum": [
+        "legacy",
+        "restate"
+      ]
+    },
+    "dispatchedAt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8640000000000000
+    },
+    "completedAt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8640000000000000
+    },
+    "changedAt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8640000000000000
+    },
+    "issue": {
+      "type": "object",
+      "properties": {
+        "identifier": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "repo": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trackerKind": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "identifier",
+        "title",
+        "repo",
+        "trackerKind",
+        "url"
+      ],
+      "additionalProperties": false
+    },
+    "pr": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "number": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "url",
+        "number"
+      ],
+      "additionalProperties": false
+    },
+    "pushedShas": {
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000]*$"
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "usage": {
+      "type": "string",
+      "enum": [
+        "unknown",
+        "partial",
+        "reported"
+      ]
+    },
+    "invocations": {
+      "maxItems": 200,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "stage": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000]*$"
+          },
+          "agent": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000]*$"
+          },
+          "provider": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000]*$"
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000]*$"
+          },
+          "status": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000]*$"
+          },
+          "tokensIn": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tokensOut": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cacheReadTokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cacheCreationTokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "costUsd": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0,
+                "exclusiveMaximum": 1000000000000000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "costStatus": {
+            "type": "string",
+            "enum": [
+              "reported",
+              "unavailable"
+            ]
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "stage",
+          "agent",
+          "provider",
+          "model",
+          "status",
+          "tokensIn",
+          "tokensOut",
+          "cacheReadTokens",
+          "cacheCreationTokens",
+          "costUsd",
+          "costStatus",
+          "attempts"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "compute": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cpuKind": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2000,
+              "pattern": "^[^\\u0000]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cpus": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memoryMb": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "startedAt": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 8640000000000000
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stoppedAt": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 8640000000000000
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "backend",
+        "cpuKind",
+        "cpus",
+        "memoryMb",
+        "startedAt",
+        "stoppedAt"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "dispatchId",
+    "phase",
+    "status",
+    "conclusion",
+    "lifecycleOwner",
+    "dispatchedAt",
+    "completedAt",
+    "changedAt",
+    "issue",
+    "pr",
+    "pushedShas",
+    "usage",
+    "invocations",
+    "compute"
+  ],
+  "additionalProperties": false
+}

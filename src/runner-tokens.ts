@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
+import { JOB_TTL_GRACE_MINUTES, normalizeGithubActionsJobTimeoutMinutes } from "./github-actions-watchdog.js";
 
 export type RunTokenAudience = "result" | "progress" | "publication";
 
@@ -37,11 +38,17 @@ export interface MintOutput {
 export type VerifyResult =
   | { ok: true; claims: RunTokenClaims; mappingTeamKey: string; consumedAt: number | null }
   // Claims on a refusal so it can be attributed to a dispatch; absent when the payload was never trustworthy.
-  | { ok: false; reason: "malformed" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" | "wrong_scope" | "revoked"; claims?: RunTokenClaims };
+  | { ok: false; reason: "malformed" | "missing_row" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" | "wrong_scope" | "revoked"; claims?: RunTokenClaims };
 
 export const PLANNING_TTL_SECONDS = 30 * 60;
 export const IMPLEMENTATION_TTL_SECONDS = 2 * 60 * 60;
 export const GAP_ANALYSIS_TTL_SECONDS = 30 * 60;
+
+/** Implementation token TTL: outlives the project's job timeout plus grace, never below the 2 h floor. */
+export function implementationTtlSeconds(maxJobMinutes: number | null | undefined): number {
+  const minutes = normalizeGithubActionsJobTimeoutMinutes(maxJobMinutes) + JOB_TTL_GRACE_MINUTES;
+  return Math.max(IMPLEMENTATION_TTL_SECONDS, minutes * 60);
+}
 
 // Distinguish consecutive claims even if they occur in the same millisecond.
 // The claim stamp is a consumed-at timestamp, not a token or a secret.
@@ -65,6 +72,9 @@ function sign(payload: string, secret: string): string {
 }
 
 export function mintRunToken(input: MintInput): MintOutput {
+  if (!input.mappingTeamKey?.trim()) {
+    throw new Error("Run tokens require a non-empty mapping key");
+  }
   const dispatchId = input.dispatchId ?? crypto.randomUUID();
   const audience = input.audience ?? "result";
   const repository = input.repository?.trim();
@@ -90,6 +100,41 @@ export function mintRunToken(input: MintInput): MintOutput {
     .run(dispatchId, claims.audience, claims.issueId, claims.phase, claims.exp, input.mappingTeamKey);
 
   return { token, dispatchId };
+}
+
+/** The run tokens each run kind gets, on every backend. */
+export const LAUNCH_TOKEN_AUDIENCES: Record<RunTokenClaims["phase"], readonly RunTokenAudience[]> = {
+  implementation: ["result", "progress", "publication"],
+  "gap-analysis": ["result", "progress", "publication"],
+  // Planning never pushes, and the vending route refuses a planning publication token.
+  planning: ["result", "progress"],
+  "kg-refresh": ["result", "progress", "publication"],
+};
+
+export interface LaunchTokens {
+  runToken: string;
+  runProgressToken: string;
+  runPublicationToken?: string;
+}
+
+/** Mints every token LAUNCH_TOKEN_AUDIENCES names for `phase`, after it deletes the unconsumed
+ *  rows of `dispatchId`, so a retried launch step can mint again. */
+export function mintLaunchTokens(input: Omit<MintInput, "audience"> & { repository: string }): LaunchTokens {
+  if (!input.mappingTeamKey?.trim()) {
+    throw new Error("Run tokens require a non-empty mapping key");
+  }
+  const dispatchId = input.dispatchId ?? crypto.randomUUID();
+  const audiences = LAUNCH_TOKEN_AUDIENCES[input.phase];
+  const base = { ...input, dispatchId };
+  return getDb().transaction((): LaunchTokens => {
+    getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ? AND consumed_at IS NULL").run(dispatchId);
+    const mint = (audience: RunTokenAudience) => mintRunToken({ ...base, audience }).token;
+    return {
+      runToken: mint("result"),
+      runProgressToken: mint("progress"),
+      ...(audiences.includes("publication") ? { runPublicationToken: mint("publication") } : {}),
+    };
+  })();
 }
 
 // Token verification is intentionally DB-only (runner_tokens table) — no in-memory state
@@ -119,8 +164,8 @@ function verifyTokenSignatureAndLoadClaims(token: string, secret: string): Verif
   const row = db
     .prepare("SELECT consumed_at, mapping_team_key FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
     .get(claims.dispatchId, claims.audience) as { consumed_at: number | null; mapping_team_key: string } | undefined;
-  // Reason stays "malformed" though the payload verified: callers map it to a status.
-  if (!row) return { ok: false, reason: "malformed", claims };
+  // Payload verified but the row is gone (e.g. retry deleted the issue's rows).
+  if (!row) return { ok: false, reason: "missing_row", claims };
 
   return { ok: true, claims, mappingTeamKey: row.mapping_team_key, consumedAt: row.consumed_at };
 }
@@ -174,6 +219,8 @@ interface PreparedAttemptTokenRow {
   deadline_at: number;
   authority_revoked_at: number | null;
   state: string;
+  execution_backend: string;
+  execution_ref: string | null;
   github_run_id: number | null;
   github_run_attempt: number | null;
   terminal_outcome_json: string | null;
@@ -195,7 +242,8 @@ function preparedAttempt(attemptId: string): PreparedAttemptTokenRow | undefined
   return getDb().prepare(`
     SELECT a.attempt_id, a.dispatch_id, a.issue_scope, a.issue_id, a.mapping_key,
            a.installation_id, a.repository, a.pr_number, a.deadline_at,
-           a.authority_revoked_at, a.state, a.github_run_id, a.github_run_attempt,
+           a.authority_revoked_at, a.state, a.execution_backend, a.execution_ref,
+           a.github_run_id, a.github_run_attempt,
            a.terminal_outcome_json, a.completed_at, a.owner, d.lifecycle_owner,
            d.mapping_key AS admission_mapping_key, d.issue_scope AS admission_issue_scope,
            d.issue_id AS admission_issue_id, d.installation_id AS admission_installation_id,
@@ -284,7 +332,7 @@ export function mintPreparedReviewFixToken(input: {
 }
 
 /** Validate a pilot bearer without burning result/progress authority before the
- * durable inbox commits. Publication alone may consume its one-shot claim, after
+ * result is accepted. Publication alone may consume its one-shot claim, after
  * all prepared-attempt scope and revocation checks pass in the same transaction. */
 export function verifyPreparedReviewFixToken(
   token: string,
@@ -292,7 +340,7 @@ export function verifyPreparedReviewFixToken(
   expectedAudience: RunTokenAudience,
   options: {
     consumePublication?: boolean;
-    publicationExecution?: { repository: string; githubRunId: number; githubRunAttempt: number };
+    publicationExecution?: { repository: string; githubRunId?: number; githubRunAttempt?: number };
   } = {},
 ): VerifyResult {
   const db = getDb();
@@ -311,14 +359,26 @@ export function verifyPreparedReviewFixToken(
       SELECT expires_at FROM runner_tokens WHERE dispatch_id = ? AND audience = ?
     `).get(claims.dispatchId, claims.audience) as { expires_at: number } | undefined;
     if (!row || claims.exp !== row.expires_at) return { ok: false, reason: "wrong_scope", claims };
-    if (!hasPreparedAdmissionAuthority(attempt)) {
+    // Ordinary result delivery can retry after the workflow releases its admission.
+    // Keep every scope and explicit revocation check; release alone ends
+    // publication/progress authority, including result-bearer pre-write checks.
+    const authority = expectedAudience === "result" && !options.publicationExecution
+      ? { ...attempt, released_at: null } : attempt;
+    if (!hasPreparedAdmissionAuthority(authority)) {
       return { ok: false, reason: "revoked", claims };
     }
     if (options.publicationExecution) {
       const execution = options.publicationExecution;
-      if (attempt.repository !== execution.repository
-        || attempt.github_run_id !== execution.githubRunId
-        || attempt.github_run_attempt !== execution.githubRunAttempt) {
+      // Machine scope comes only from the orchestrator's binding; request run
+      // IDs carry authority only for GitHub Actions attempts.
+      const executionMatches = attempt.execution_backend === "github-actions"
+        ? Number.isSafeInteger(execution.githubRunId) && (execution.githubRunId ?? 0) > 0
+          && Number.isSafeInteger(execution.githubRunAttempt) && (execution.githubRunAttempt ?? 0) > 0
+          && attempt.github_run_id === execution.githubRunId
+          && attempt.github_run_attempt === execution.githubRunAttempt
+        : (attempt.execution_backend === "fly-machines" || attempt.execution_backend === "local-docker")
+          && attempt.execution_ref !== null;
+      if (attempt.repository !== execution.repository || !executionMatches) {
         return { ok: false, reason: "wrong_scope", claims };
       }
       if (Date.now() >= attempt.deadline_at || attempt.terminal_outcome_json !== null

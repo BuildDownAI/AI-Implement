@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type {
   InvokeParams,
@@ -28,12 +29,15 @@ import {
   type DerivedToolResult,
 } from "./claude-stream.js";
 import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
+import { buildRestrictedToolArgs } from "./steps/read-only-tools.js";
 import { computeBackoffMs, type RetryPolicy } from "./retry-backoff.js";
 import { modelProcessEnv, parseForwardedSecrets } from "./process-env.js";
 
 interface AttemptResult extends Omit<LLMResult, "attempts"> {
   sawToolUse: boolean;
   sawUnsafeToolUse: boolean;
+  /** Set when this attempt's child was stopped by the invocation deadline (death confirmed). */
+  stopped?: "timeout";
 }
 
 /**
@@ -115,9 +119,9 @@ interface RetryDecisionInput {
  * fresh session with no memory of the first attempt, so once a tool has run
  * that could have mutated the workspace, re-spawning risks duplicating or
  * undoing that work. `toolUseIsSafe` sessions are restricted to read-only
- * tools, EXCEPT `Bash(curl *)` — curl can still write files or POST — so only
- * that unsafe subset is checked there; every other tool_use still blocks a
- * non-toolUseIsSafe (implement) retry.
+ * built-ins, so only a tool_use outside the proven read-only allowlist
+ * (Read/Glob/Grep) blocks there — even if telemetry shows a tool the session
+ * should not have had; any tool_use blocks a non-toolUseIsSafe (implement) retry.
  */
 function effectiveSawToolUse(toolUseIsSafe: boolean, sawAnyToolUse: boolean, sawUnsafe: boolean): boolean {
   return toolUseIsSafe ? sawUnsafe : sawAnyToolUse;
@@ -230,14 +234,28 @@ export function readTelemetryFlag(err: unknown): RunTelemetry | undefined {
 const UNRESPONSIVE_MESSAGE = "Process did not exit within 5s of SIGKILL after a stdin failure";
 
 /** Marks a rejection produced when `close` never arrived within the bounded wait after a
- *  SIGKILL escalation (see `spawnOnce`). `telemetry` — this dying attempt's own usage, not yet
+ *  SIGKILL escalation (see `spawnOnce`), or when the process group could not be proven gone.
+ *  `possiblyLive` tells a credential-owning caller the child may still run (see `isPossiblyLiveChild`). `telemetry` — this dying attempt's own usage, not yet
  *  folded into the cross-attempt running totals — is optional so a caller with nothing to
  *  report (e.g. a test constructing the error directly) doesn't have to invent an empty one. */
-function markUnresponsive(telemetry?: RunTelemetry): Error & { unresponsive: true; telemetry?: RunTelemetry } {
+function markUnresponsive(
+  telemetry?: RunTelemetry,
+  timedOut = false,
+): Error & { unresponsive: true; possiblyLive: true; timedOut?: true; telemetry?: RunTelemetry } {
   return Object.assign(new Error(UNRESPONSIVE_MESSAGE), {
     unresponsive: true as const,
+    possiblyLive: true as const,
+    ...(timedOut ? { timedOut: true as const } : {}),
     ...(telemetry ? { telemetry } : {}),
   });
+}
+
+/**
+ * True when a rejection means the child (or part of its process group) was not proven dead. A caller
+ * that owns a credential checkpoint must not release, checkpoint or reuse that credential for it.
+ */
+export function isPossiblyLiveChild(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as Record<string, unknown>).possiblyLive === true;
 }
 
 function isUnresponsive(err: unknown): boolean {
@@ -277,6 +295,57 @@ function killProcessGroup(proc: ChildProcessWithoutNullStreams, signal: NodeJS.S
 }
 
 /**
+ * Sends SIGKILL to whatever is left of the child's process group, then polls until the group no longer
+ * exists. True only on a positive `ESRCH`; EPERM or a group still present at the bound is "not proven gone".
+ * A process without a real pid (a test double) has no group to check, so its `close` is the proof.
+ */
+async function confirmGroupGone(proc: ChildProcessWithoutNullStreams, boundMs: number): Promise<boolean> {
+  const pid = proc.pid;
+  if (typeof pid !== "number") return true;
+  if (!groupHasLiveMembers(pid)) return true;
+  killProcessGroup(proc, "SIGKILL");
+  const until = Date.now() + boundMs;
+  while (Date.now() < until) {
+    await defaultSleep(20);
+    if (!groupHasLiveMembers(pid)) return true;
+  }
+  return !groupHasLiveMembers(pid);
+}
+
+/**
+ * Whether any non-zombie process still belongs to process group `pgid`. `ESRCH` on the group is the positive
+ * proof of death. A group that still answers may hold only zombies (killed, awaiting a reaper that a minimal
+ * container may lack): those cannot run, so they do not count. Where /proc cannot be read (macOS) the zombie
+ * distinction is unavailable and a group that still answers is conservatively treated as live — missing
+ * /proc is never evidence of death.
+ */
+export function groupHasLiveMembers(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return true;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+    } catch {
+      continue; // exited between listing and reading
+    }
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(fields[2]) === pgid && fields[0] !== "Z" && fields[0] !== "X") return true;
+  }
+  return false;
+}
+
+/**
  * Marks an error as not representing a process-spawn failure — the credential
  * suspend/restore step around each spawn can throw before or after the CLI
  * ran, but never because the CLI itself failed to start, so `invoke` must
@@ -288,7 +357,7 @@ function markNotASpawnFailure(err: unknown): Error & { notASpawnFailure: true } 
   return Object.assign(errOut, { notASpawnFailure: true as const });
 }
 
-function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
+export function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
   const current = spawnSync("git", ["remote", "get-url", "origin"], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
@@ -327,6 +396,11 @@ function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null
   };
 }
 
+export interface ClaudeInvokeOptions {
+  /** Selected invocation environment replacing `process.env` as the model env base for this call only. */
+  env?: Readonly<Record<string, string | undefined>>;
+}
+
 /**
  * Shells out to the Claude Code CLI in stream-json mode. Each JSONL event is
  * parsed for live logging (when logLevel="stream") and accumulated for final
@@ -342,6 +416,10 @@ export class ClaudeCliExecutor implements LLMExecutor {
     private readonly spawnImpl: typeof spawn = spawn,
     private readonly sleepImpl: (ms: number) => Promise<void> = defaultSleep,
     private readonly activityReporting?: ActivityReportingConfig,
+    /** Clock for the invocation deadline; tests inject a deterministic one. */
+    private readonly nowImpl: () => number = Date.now,
+    /** Bounded waits after SIGTERM and after SIGKILL when stopping a child. */
+    private readonly stopTimings: { termWaitMs: number; killWaitMs: number } = { termWaitMs: 5000, killWaitMs: 5000 },
   ) {}
 
   /**
@@ -351,11 +429,19 @@ export class ClaudeCliExecutor implements LLMExecutor {
    */
   private invocationSeq = 0;
 
-  async invoke(params: InvokeParams): Promise<LLMResult> {
+  /**
+   * `options.env` is the explicitly selected per-invocation environment (stage executor). It
+   * replaces `process.env` as the base of the model env, still passing through the same
+   * stripping; absent = legacy `process.env` behavior. `process.env` is never mutated.
+   */
+  async invoke(params: InvokeParams, options?: ClaudeInvokeOptions): Promise<LLMResult> {
     const invocationId = ++this.invocationSeq;
     let attempt = 1;
     let totalSleptMs = 0;
     const invokeStartedAt = Date.now();
+    const startedAtMono = this.nowImpl();
+    // `invocationTimeoutMs` bounds the whole invocation (every attempt and backoff), not each spawn.
+    const deadlineAt = params.invocationTimeoutMs != null ? startedAtMono + params.invocationTimeoutMs : null;
     const runningTelemetry = { tokensIn: 0, tokensOut: 0, costUsd: 0, numTurns: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
     // Builds an error carrying both the classified `failure` and the telemetry
@@ -364,29 +450,59 @@ export class ClaudeCliExecutor implements LLMExecutor {
     // attempt EPIPE'd, or ENOENT on the only attempt) doesn't lose the tokens/cost
     // those attempts actually burned just because none of them produced a settled
     // LLMResult to carry it on.
+    const accumulatedTelemetry = (): RunTelemetry => ({
+      outcome: "unknown" as const,
+      numTurns: runningTelemetry.numTurns,
+      durationMs: Date.now() - invokeStartedAt,
+      costUsd: runningTelemetry.costUsd,
+      tokensIn: runningTelemetry.tokensIn,
+      tokensOut: runningTelemetry.tokensOut,
+      cacheReadTokens: runningTelemetry.cacheReadTokens,
+      cacheCreationTokens: runningTelemetry.cacheCreationTokens,
+      toolTrace: [],
+    });
     const spawnFailureError = (err: unknown, failure: FailureRecord): Error & { failure: FailureRecord; telemetry: RunTelemetry } => {
       const errOut = err instanceof Error ? err : new Error(String(err));
-      return Object.assign(errOut, {
-        failure,
-        telemetry: {
-          outcome: "unknown" as const,
-          numTurns: runningTelemetry.numTurns,
-          durationMs: Date.now() - invokeStartedAt,
-          costUsd: runningTelemetry.costUsd,
-          tokensIn: runningTelemetry.tokensIn,
-          tokensOut: runningTelemetry.tokensOut,
-          cacheReadTokens: runningTelemetry.cacheReadTokens,
-          cacheCreationTokens: runningTelemetry.cacheCreationTokens,
-          toolTrace: [],
-        },
-      });
+      return Object.assign(errOut, { failure, telemetry: accumulatedTelemetry() });
+    };
+    const timeoutFailure = (failedAttempt: number): FailureRecord => ({
+      category: "crash",
+      code: "INVOCATION_TIMEOUT",
+      stage: params.stage ?? "unknown",
+      attempt: failedAttempt,
+      retryable: false,
+      message: "Claude invocation exceeded its time limit",
+      evidence: { truncated: false, llmSubtype: null, llmIsError: null, llmOutcome: null },
+    });
+    // A budget that expired before any child ran (backoff, scheduling delay, earlier attempts): nothing is spawned.
+    const expiredResult = (): LLMResult => {
+      const telemetry = accumulatedTelemetry();
+      return {
+        stdout: "",
+        stderr: "",
+        exitCode: 1,
+        tokensUsed: (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0),
+        telemetry,
+        terminalStatus: { subtype: "error", isError: true },
+        signal: null,
+        attempts: attempt - 1,
+        failure: timeoutFailure(attempt),
+      };
+    };
+    // Sleeps at most the remaining budget; the loop top then rechecks the deadline before any spawn.
+    const boundedSleep = async (backoffMs: number): Promise<void> => {
+      const ms = deadlineAt === null ? backoffMs : Math.max(0, Math.min(backoffMs, deadlineAt - this.nowImpl()));
+      totalSleptMs += ms;
+      await this.sleepImpl(ms);
     };
 
     for (;;) {
+      if (deadlineAt !== null && this.nowImpl() >= deadlineAt) return expiredResult();
       let attemptResult: AttemptResult;
       try {
-        attemptResult = await this.spawnOnce(params, attempt, invocationId);
+        attemptResult = await this.spawnOnce(params, attempt, invocationId, options?.env, deadlineAt);
       } catch (err) {
+        if (err instanceof Error && (err as Error & { deadlineExpired?: boolean }).deadlineExpired) return expiredResult();
         // A spawn-level failure (ENOENT/EAGAIN/ENOMEM from proc.on("error"), or the
         // stdin EPIPE handler) never produced an LLMResult, but it is by construction
         // a pre-tool-use failure — apply the same retry rail rather than letting it
@@ -410,15 +526,17 @@ export class ClaudeCliExecutor implements LLMExecutor {
           // as a non-retryable crash rather than waiting indefinitely for a `close`
           // that may never come. Checked ahead of the signal/spawn-error classification
           // below since this attempt never produced a `close` event to read a signal from.
-          const failure: FailureRecord = {
-            category: "crash",
-            code: "PROCESS_UNRESPONSIVE",
-            stage,
-            attempt,
-            retryable: false,
-            message: UNRESPONSIVE_MESSAGE,
-            evidence: { truncated: false, llmSubtype: null, llmIsError: null, llmOutcome: null },
-          };
+          const failure: FailureRecord = (err as { timedOut?: boolean }).timedOut
+            ? timeoutFailure(attempt)
+            : {
+                category: "crash",
+                code: "PROCESS_UNRESPONSIVE",
+                stage,
+                attempt,
+                retryable: false,
+                message: UNRESPONSIVE_MESSAGE,
+                evidence: { truncated: false, llmSubtype: null, llmIsError: null, llmOutcome: null },
+              };
           throw spawnFailureError(err, failure);
         }
 
@@ -468,16 +586,19 @@ export class ClaudeCliExecutor implements LLMExecutor {
         console.log(
           `[claude] transient spawn failure (${failure.code}) on attempt ${attempt}; retrying in ${decision.backoffMs} ms`,
         );
-        totalSleptMs += decision.backoffMs;
-        await this.sleepImpl(decision.backoffMs);
+        await boundedSleep(decision.backoffMs);
         attempt++;
         continue;
       }
 
-      const { sawToolUse: attemptSawAnyToolUse, sawUnsafeToolUse: attemptSawUnsafeToolUse, ...result } = attemptResult;
+      const { sawToolUse: attemptSawAnyToolUse, sawUnsafeToolUse: attemptSawUnsafeToolUse, stopped, ...result } = attemptResult;
       const telemetry = aggregateTelemetry(result.telemetry, runningTelemetry, attempt, invokeStartedAt);
       const tokensUsed = telemetry ? (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0) : result.tokensUsed;
       const settled: LLMResult = { ...result, telemetry, tokensUsed, attempts: attempt };
+
+      // The deadline stopped this child (death confirmed): a classified, non-retryable timeout that keeps
+      // the accumulated telemetry, whatever the child's own exit looked like.
+      if (stopped === "timeout") return { ...settled, failure: timeoutFailure(attempt) };
 
       // Classify on every invocation, not only when `retry` is supplied — the dev
       // harness and any other bare `invoke()` caller should still get a `failure`
@@ -507,13 +628,18 @@ export class ClaudeCliExecutor implements LLMExecutor {
       }
 
       console.log(`[claude] transient failure (${failure.code}) on attempt ${attempt}; retrying in ${decision.backoffMs} ms`);
-      totalSleptMs += decision.backoffMs;
-      await this.sleepImpl(decision.backoffMs);
+      await boundedSleep(decision.backoffMs);
       attempt++;
     }
   }
 
-  private spawnOnce(params: InvokeParams, attempt: number, invocationId: number): Promise<AttemptResult> {
+  private spawnOnce(
+    params: InvokeParams,
+    attempt: number,
+    invocationId: number,
+    selectedEnv?: Readonly<Record<string, string | undefined>>,
+    deadlineAt: number | null = null,
+  ): Promise<AttemptResult> {
     let restoreOrigin: (() => void) | null = null;
     if (!this.allowRepositoryWrites) {
       try {
@@ -544,6 +670,9 @@ export class ClaudeCliExecutor implements LLMExecutor {
       if (params.tools && params.tools.length > 0) {
         args.push("--allowed-tools", params.tools.join(","));
       }
+      if (params.builtinTools) {
+        args.push(...buildRestrictedToolArgs(params.builtinTools));
+      }
       if (params.jsonSchema) {
         args.push("--json-schema", JSON.stringify(params.jsonSchema));
       }
@@ -558,12 +687,24 @@ export class ClaudeCliExecutor implements LLMExecutor {
         console.log(`[runner] forwarded secrets stripped from model env: ${forwarded.join(", ")}`);
       }
 
+      // The credential suspend above and any scheduling delay may have consumed the budget: never spawn
+      // with an expired (or zero) timeout.
+      if (deadlineAt !== null && this.nowImpl() >= deadlineAt) {
+        try {
+          restoreProtectedOrigin();
+          rejectRaw(Object.assign(new Error("Invocation deadline expired before spawn"), { deadlineExpired: true }));
+        } catch (restoreErr) {
+          rejectRaw(markNotASpawnFailure(restoreErr));
+        }
+        return;
+      }
+
       let proc: ChildProcessWithoutNullStreams;
       try {
         proc = this.spawnImpl("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: modelProcessEnv(this.allowRepositoryWrites),
+          env: modelProcessEnv(this.allowRepositoryWrites, selectedEnv ? { env: selectedEnv } : undefined),
           // Makes the CLI its own process-group leader, which is what makes
           // `process.kill(-pid, …)` in killProcessGroup address the CLI and every
           // subprocess it forks, not just the CLI itself. Side effect: a SIGTERM/SIGINT
@@ -594,6 +735,8 @@ export class ClaudeCliExecutor implements LLMExecutor {
       let settled = false;
       let stdinFailure: Error | null = null;
       const selfKillSignals = new Set<string>();
+      let timeoutStop = false;
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
       let killTimer: ReturnType<typeof setTimeout> | null = null;
       let unresponsiveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -666,10 +809,12 @@ export class ClaudeCliExecutor implements LLMExecutor {
       // moment of settlement — after any trailing-buffer flush that precedes it,
       // so a tool event parsed from that flush is never missed by the marker.
       const resolve = (value: AttemptResult): void => {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
         reportActivityFinal();
         resolveRaw(value);
       };
       const reject = (err: unknown): void => {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
         reportActivityFinal();
         rejectRaw(err);
       };
@@ -699,13 +844,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
       // Promise executor immediately, skipping every registration below
       // (`close`, `stdout`/`stderr` data, the second `proc.on("error")`) and
       // discarding a child that may otherwise have completed successfully.
-      const handleStdinFailure = (err: unknown): void => {
-        // Guarded on `settled` too: if `close` or `proc.on("error")` already settled
-        // this attempt (e.g. both fire for the same underlying failure), this handler
-        // must not call `proc.kill()` or arm a SIGKILL timer that nothing will ever
-        // clear — `close` has already fired and won't fire again to clear it.
-        if (settled || stdinFailure) return;
-        stdinFailure = err instanceof Error ? err : new Error(String(err));
+      const beginKill = (): void => {
         // Record the signal we're about to send so the `close` handler below can
         // tell our own kill apart from an external one landing in the same window
         // (see that handler for the residual ambiguity this can't resolve). Accumulated
@@ -766,11 +905,20 @@ export class ClaudeCliExecutor implements LLMExecutor {
             } catch {
               // best-effort teardown — see above
             }
-            reject(markUnresponsive(telemetry));
-          }, 5000);
+            reject(markUnresponsive(telemetry, timeoutStop));
+          }, this.stopTimings.killWaitMs);
           killProcessGroup(proc, "SIGKILL");
-        }, 5000);
+        }, this.stopTimings.termWaitMs);
         killProcessGroup(proc, "SIGTERM");
+      };
+      const handleStdinFailure = (err: unknown): void => {
+        // Guarded on `settled` too: if `close` or `proc.on("error")` already settled
+        // this attempt (e.g. both fire for the same underlying failure), this handler
+        // must not call `proc.kill()` or arm a SIGKILL timer that nothing will ever
+        // clear — `close` has already fired and won't fire again to clear it.
+        if (settled || stdinFailure || timeoutStop) return;
+        stdinFailure = err instanceof Error ? err : new Error(String(err));
+        beginKill();
       };
       proc.stdin.on("error", handleStdinFailure);
       try {
@@ -808,6 +956,16 @@ export class ClaudeCliExecutor implements LLMExecutor {
         }
       });
       proc.stderr.on("data", (d: Buffer) => stderrChunks.push(d));
+
+      if (deadlineAt !== null) {
+        deadlineTimer = setTimeout(() => {
+          deadlineTimer = null;
+          if (settled || stdinFailure || timeoutStop) return;
+          timeoutStop = true;
+          console.log("[claude] invocation deadline reached; stopping the child");
+          beginKill();
+        }, Math.max(1, deadlineAt - this.nowImpl()));
+      }
 
       proc.on("close", (code, signal) => {
         if (settled) return;
@@ -860,6 +1018,37 @@ export class ClaudeCliExecutor implements LLMExecutor {
         if (stderr.trim()) console.error("[claude] stderr:", stderr.trim());
         const telemetry = extractTelemetry(events);
         console.log(summaryLine(telemetry));
+        if (timeoutStop) {
+          // The leader exited, but the group may still hold forked descendants: the write credential is
+          // restored and the attempt settles as a timeout only once the whole group is proven gone.
+          void confirmGroupGone(proc, this.stopTimings.killWaitMs).then((gone) => {
+            if (!gone) {
+              console.log("[claude] origin left protected: process group not proven gone after timeout");
+              reject(markUnresponsive(telemetry, true));
+              return;
+            }
+            try {
+              restoreProtectedOrigin();
+            } catch (err) {
+              reject(markNotASpawnFailure(err));
+              return;
+            }
+            resolve({
+              stdout: finalText(events),
+              stderr,
+              exitCode: code ?? 1,
+              tokensUsed: (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0),
+              telemetry,
+              structuredOutput: finalStructuredOutput(events),
+              terminalStatus: extractTerminalStatus(events),
+              signal: signal ?? null,
+              sawToolUse: sawToolUse(events),
+              sawUnsafeToolUse: sawUnsafeToolUse(events),
+              stopped: "timeout",
+            });
+          });
+          return;
+        }
         try {
           restoreProtectedOrigin();
         } catch (err) {
@@ -926,7 +1115,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
           } catch {
             // best-effort teardown — see above
           }
-          reject(Object.assign(attachToolUseFlags(err), { telemetry }));
+          reject(Object.assign(attachToolUseFlags(err), { telemetry, possiblyLive: true as const }));
           return;
         }
         try {

@@ -244,7 +244,7 @@ export const overviewScript = `
   function renderKpis(log, running, capacityByMapping) {
     const now = Date.now();
     const failed24h = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && e.conclusion === 'stuck_giveup')) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && (e.conclusion === 'stuck_giveup' || e.conclusion === 'stuck_review_fix'))) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     });
 
     const teams = new Set(running.filter(function (r) { return r.teamKey; }).map(function (r) { return r.teamKey; }));
@@ -359,7 +359,7 @@ export const overviewScript = `
     if (!tbody || !empty) return;
     const now = Date.now();
     const failures = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && e.conclusion === 'stuck_giveup')) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && (e.conclusion === 'stuck_giveup' || e.conclusion === 'stuck_review_fix'))) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     }).sort(function (a, b) {
       return new Date(b.dispatchedAt).getTime() - new Date(a.dispatchedAt).getTime();
     }).slice(0, 8);

@@ -45,6 +45,15 @@ export class ProviderRegistry {
     throw new Error(`Unknown ticketingProvider on mapping: ${mapping.ticketingProvider}`);
   }
 
+  /** Reconstruct tracker operations with original nonsecret project settings and current credentials. */
+  async forRecovery(mapping: RepoMapping, scopeKey: string): Promise<TicketingProvider> {
+    if (mapping.ticketingConfig.kind !== mapping.ticketingProvider) {
+      throw new Error("Recovery ticketing provider mismatch");
+    }
+    // Delegate construction to the normal registry to preserve mode and credential guards.
+    return new ProviderRegistry(this.config, () => ({ [scopeKey]: mapping })).forMapping(mapping);
+  }
+
   /**
    * Returns the unique providers needed to cover all mappings (one per
    * provider id). Snapshot polling iterates this set rather than calling

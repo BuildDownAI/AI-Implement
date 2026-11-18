@@ -1,5 +1,6 @@
 import { mkdir, rm, lstat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { sanitizeAttribution } from "../pipeline/types.js";
 import type { LocalArtifactInput, LocalRunSummary } from "./run-result.js";
 
 const DEFAULT_OUTPUT_ROOT = "/output/runs";
@@ -101,6 +102,9 @@ export async function writeRunArtifacts(input: LocalArtifactInput): Promise<stri
     repairAction: input.repairAction ?? null,
     artifactDir: dir,
   };
+  // Re-sanitized so the summary only ever carries the bounded safe projection; legacy omits the key.
+  const attribution = sanitizeAttribution(input.attribution);
+  if (attribution) summary.attribution = attribution;
 
   const files: [string, string][] = [
     [join(dir, "summary.json"), JSON.stringify(summary, null, 2)],
